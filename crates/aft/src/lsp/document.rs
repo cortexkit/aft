@@ -116,6 +116,15 @@ impl DocumentStore {
         self.entries.get(path).map(|e| e.version)
     }
 
+    /// Record an explicit version after startup coalesced several unsent edits.
+    pub(crate) fn sync_at_version(&mut self, path: PathBuf, version: i32, snapshot: &DiskSnapshot) {
+        self.open_with(path.clone(), snapshot);
+        self.entries
+            .get_mut(&path)
+            .expect("document just inserted")
+            .version = version;
+    }
+
     /// Get the full document entry, or None if not open.
     pub fn entry(&self, path: &Path) -> Option<&DocumentEntry> {
         self.entries.get(path)

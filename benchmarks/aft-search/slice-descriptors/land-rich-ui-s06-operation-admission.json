@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "rich-ui-s06-operation-admission"
+  ],
+  "note": "Rich UI slice 6: versioned carrier operation admission, a closed carrier reply serializer and an isolated carrier call ledger. Publication stays off. No changed path matches RANKING_FENCE_PREFIXES."
+}

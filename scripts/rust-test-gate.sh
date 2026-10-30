@@ -405,6 +405,7 @@ fi
 
 extract_nextest_archive_for_prewarm() {
   local archive_file="${1:-${AFT_NEXTEST_ARCHIVE_FILE:-}}"
+  local extract_to="${2:-$AFT_NEXTEST_EXTRACT_TO}"
   if [[ -z "$archive_file" ]]; then
     gate_error "AFT_NEXTEST_ARCHIVE_FILE is required to extract a nextest archive"
     return 2
@@ -414,12 +415,14 @@ extract_nextest_archive_for_prewarm() {
   # destination already holds a target/ tree (older versions merged into
   # it). CI restores a cached target/ into the workspace before this step
   # runs, so clear the collision: the archive fully replaces that tree.
-  if [ -d "$AFT_NEXTEST_EXTRACT_TO/target" ]; then
-    rm -rf "$AFT_NEXTEST_EXTRACT_TO/target"
+  mkdir -p "$extract_to"
+  df -h "$extract_to"
+  if [ -d "$extract_to/target" ]; then
+    rm -rf "$extract_to/target"
   fi
   cargo nextest list \
     --archive-file "$archive_file" \
-    --extract-to "$AFT_NEXTEST_EXTRACT_TO" \
+    --extract-to "$extract_to" \
     --workspace-remap "$PWD" \
     --list-type binaries-only \
     --message-format json \
@@ -463,6 +466,8 @@ else
   }
 fi
 
+lib_archive_args=(--archive-file "${AFT_NEXTEST_ARCHIVE_FILE:-}")
+bin_archive_args=(--archive-file "${AFT_NEXTEST_ARCHIVE_BIN_FILE:-}")
 if phase_enabled lib-shard \
   && [[ "$(uname)" == "Darwin" \
     && -n "${AFT_NEXTEST_ARCHIVE_FILE:-}" \
@@ -472,14 +477,32 @@ if phase_enabled lib-shard \
   # a timed test with its first-execution assessment.
   mkdir -p "$AFT_NEXTEST_EXTRACT_TO"
   libtest_archives=("$AFT_NEXTEST_ARCHIVE_FILE")
+  libtest_roots=("$AFT_NEXTEST_EXTRACT_TO")
   if [[ -n "${AFT_NEXTEST_ARCHIVE_BIN_FILE:-}" ]]; then
     libtest_archives+=("$AFT_NEXTEST_ARCHIVE_BIN_FILE")
+    # Keep the bin archive below the replaced target tree, but in its own root:
+    # extracting it must not delete or overwrite the prewarmed library binaries.
+    libtest_roots+=("$AFT_NEXTEST_EXTRACT_TO/target/nextest-bin")
   fi
-  for libtest_archive in "${libtest_archives[@]}"; do
+  for index in "${!libtest_archives[@]}"; do
+    extract_to="${libtest_roots[$index]}"
     run_phase "extract nextest archive for macOS libtest prewarming" \
-      extract_nextest_archive_for_prewarm "$libtest_archive"
+      extract_nextest_archive_for_prewarm "${libtest_archives[$index]}" "$extract_to"
     run_phase "warm macOS extracted libtest binaries" \
-      ./scripts/warm-macos-nextest-archive.sh
+      env AFT_NEXTEST_EXTRACT_TO="$extract_to" ./scripts/warm-macos-nextest-archive.sh
+    # Reuse these exact inodes. --archive-file would extract another copy and
+    # bypass both prewarming and its disk-space measurement.
+    extracted_args=(
+      --cargo-metadata "$extract_to/target/nextest/cargo-metadata.json"
+      --binaries-metadata "$extract_to/target/nextest/binaries-metadata.json"
+      --target-dir-remap "$extract_to/target"
+      --workspace-remap "$PWD"
+    )
+    if [[ "$index" == 0 ]]; then
+      lib_archive_args=("${extracted_args[@]}")
+    else
+      bin_archive_args=("${extracted_args[@]}")
+    fi
   done
 fi
 
@@ -490,8 +513,8 @@ if phase_enabled lib; then
   # 2026-08-09). Isolation is the fix, not a bigger budget: run it alone
   # first (seconds when serial), then exclude it from the parallel phase.
   if [[ -n "${AFT_NEXTEST_ARCHIVE_FILE:-}" ]]; then
-    run_phase "cargo nextest run --archive-file $AFT_NEXTEST_ARCHIVE_FILE -E kind(lib) platform_verifier_tls_client_subprocess (serial: keychain-latency-sensitive)" \
-      gate_cargo nextest run --archive-file "$AFT_NEXTEST_ARCHIVE_FILE" --profile gate \
+    run_phase "cargo nextest run from library archive inventory -E kind(lib) platform_verifier_tls_client_subprocess (serial: keychain-latency-sensitive)" \
+      gate_cargo nextest run "${lib_archive_args[@]}" --profile gate \
         -E 'kind(lib)' -- platform_verifier_tls_client_subprocess
   else
     run_phase "cargo test -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet (serial: keychain-latency-sensitive)" \
@@ -531,20 +554,20 @@ if phase_enabled lib-shard; then
     exit 2
   fi
   if [[ -n "${AFT_NEXTEST_ARCHIVE_BIN_FILE:-}" ]]; then
-    run_phase "cargo nextest run --archive-file $AFT_NEXTEST_ARCHIVE_FILE -E kind(lib) --partition $AFT_NEXTEST_PARTITION --profile gate" \
-      gate_cargo nextest run --archive-file "$AFT_NEXTEST_ARCHIVE_FILE" --profile gate \
+    run_phase "cargo nextest run from library archive inventory -E kind(lib) --partition $AFT_NEXTEST_PARTITION --profile gate" \
+      gate_cargo nextest run "${lib_archive_args[@]}" --profile gate \
         -E 'kind(lib)' \
         --partition "$AFT_NEXTEST_PARTITION" \
         -- \
           --skip platform_verifier_tls_client_subprocess \
           --skip panic_hook_preserves_default_backtrace_behavior_and_persists
-    run_phase "cargo nextest run --archive-file $AFT_NEXTEST_ARCHIVE_BIN_FILE -E kind(bin) --partition $AFT_NEXTEST_PARTITION --profile gate" \
-      gate_cargo nextest run --archive-file "$AFT_NEXTEST_ARCHIVE_BIN_FILE" --profile gate \
+    run_phase "cargo nextest run from binary archive inventory -E kind(bin) --partition $AFT_NEXTEST_PARTITION --profile gate" \
+      gate_cargo nextest run "${bin_archive_args[@]}" --profile gate \
         -E 'kind(bin)' \
         --partition "$AFT_NEXTEST_PARTITION"
   else
-    run_phase "cargo nextest run --archive-file $AFT_NEXTEST_ARCHIVE_FILE -E 'kind(lib) | kind(bin)' --partition $AFT_NEXTEST_PARTITION --profile gate" \
-      gate_cargo nextest run --archive-file "$AFT_NEXTEST_ARCHIVE_FILE" --profile gate \
+    run_phase "cargo nextest run from unit archive inventory -E 'kind(lib) | kind(bin)' --partition $AFT_NEXTEST_PARTITION --profile gate" \
+      gate_cargo nextest run "${lib_archive_args[@]}" --profile gate \
         -E 'kind(lib) | kind(bin)' \
         --partition "$AFT_NEXTEST_PARTITION" \
         -- \

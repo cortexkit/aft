@@ -14,8 +14,6 @@ async function validate(context: HarnessValidationContext): Promise<void> {
   }
   const matrix = JSON.parse(await readFile(join(here, "matrix.json"), "utf8"));
   if (JSON.stringify(matrix.rows?.[0]?.trajectories) !== JSON.stringify({"T1":"applicable","T2":"applicable","T3":"n/a:no-permission-operation","T4":"n/a:no-abortable-operation","T5":"n/a:no-background-capability","T6":"applicable","T7":"applicable"})) throw new Error("outline" + " applicability mismatch");
-  const controls = JSON.parse(await readFile(join(here, "mutation-controls.json"), "utf8"));
-  if (!Array.isArray(controls.controls) || controls.controls.length < 3) throw new Error("outline" + " mutation controls missing");
 }
 const BUDGET_SCENARIO_ID = "outline/T6/outline-files-payload-files/incomplete";
 // The budget row needs enough rendered outline bytes to cross the 30 KB

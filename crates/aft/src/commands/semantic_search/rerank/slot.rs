@@ -33,6 +33,9 @@ pub(crate) struct BuildInputs {
     /// True when the process serves requests for the SubC daemon (the shared
     /// multi-project host); the Synapse reranker is reachable only then.
     pub(crate) under_subc: bool,
+    pub(crate) cache_unavailable: bool,
+    pub(crate) cache_lease: Option<Arc<crate::root_cache::CacheLease>>,
+    pub(crate) cache_epoch: u64,
 }
 
 impl BuildInputs {
@@ -41,13 +44,17 @@ impl BuildInputs {
             search: config.search.clone(),
             semantic: config.semantic.clone(),
             under_subc,
+            cache_unavailable: crate::root_cache::cache_unavailable(config).is_some(),
+            cache_lease: config.cache_lease.clone(),
+            cache_epoch: config.cache_epoch,
         }
     }
 
     /// Whether these inputs select no backend at all.
     fn reranking_off(&self) -> bool {
-        RerankSettings::resolve(&self.search).backend == RerankBackendKind::Off
-            && crate::environment::non_empty_os_var(FIXTURE_PACK_ENV).is_none()
+        self.cache_unavailable
+            || (RerankSettings::resolve(&self.search).backend == RerankBackendKind::Off
+                && crate::environment::non_empty_os_var(FIXTURE_PACK_ENV).is_none())
     }
 }
 
@@ -209,6 +216,9 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// The production constructor. Runs on the slot's build thread.
 pub(crate) fn build_backend(inputs: &BuildInputs) -> Result<Option<SelectedBackend>, String> {
+    if inputs.cache_unavailable {
+        return Err(crate::root_cache::CACHE_DIR_UNAVAILABLE.into());
+    }
     if let Some(path) = crate::environment::non_empty_os_var(FIXTURE_PACK_ENV) {
         return super::fixture::shared_fixture_backend(std::path::Path::new(&path)).map(
             |backend| {
@@ -223,7 +233,11 @@ pub(crate) fn build_backend(inputs: &BuildInputs) -> Result<Option<SelectedBacke
     match settings.backend {
         RerankBackendKind::Off => Ok(None),
         RerankBackendKind::Onnx => {
-            let backend = super::onnx::shared_onnx_reranker(settings.model.as_deref())?;
+            let backend = super::onnx::shared_onnx_reranker_in(
+                settings.model.as_deref(),
+                inputs.semantic.local_cache_dir.clone(),
+                inputs.cache_lease.as_ref().map(Arc::downgrade),
+            )?;
             // Download and load now, so the backend is installed only once it
             // can score.
             backend.ensure_loaded()?;

@@ -258,25 +258,32 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
       let globPattern = expandTilde(String(args.pattern));
       let globPath = args.path ? String(args.path) : undefined;
 
-      if (!globPath && globPattern.startsWith("/")) {
+      if (!globPath && (path.isAbsolute(globPattern) || path.win32.isAbsolute(globPattern))) {
+        // Windows separators normalize to slashes; POSIX backslashes may be literal names or glob escapes.
+        if (
+          process.platform === "win32" ||
+          /^[A-Za-z]:[\\/]/.test(globPattern) ||
+          globPattern.startsWith("\\\\")
+        ) {
+          globPattern = globPattern.replaceAll("\\", "/");
+        }
         // Find the last directory component before any glob metacharacters.
         // Exact absolute paths need the same split because the bridge matches
         // glob patterns relative to the search path.
         const metaIdx = globPattern.search(/[*?{}[\]]/);
-        if (metaIdx > 0) {
-          const lastSlash = globPattern.lastIndexOf("/", metaIdx);
-          if (lastSlash > 0) {
-            globPath = globPattern.slice(0, lastSlash);
-            globPattern = `**/${globPattern.slice(lastSlash + 1)}`;
-          }
-        } else if (metaIdx === -1) {
+        const lastSlash = globPattern.lastIndexOf("/", metaIdx < 0 ? globPattern.length : metaIdx);
+        if (lastSlash >= 0) {
+          const prefix = globPattern.slice(0, lastSlash);
+          globPath = /^[A-Za-z]:$/.test(prefix) ? `${prefix}/` : prefix || "/";
+          globPattern = globPattern.slice(lastSlash + 1);
+        }
+        if (metaIdx === -1) {
           // Keep an exact file as the scope: its parent may contain artifacts
           // owned by other sessions and cannot inherit the file's permission.
           globPath =
-            searchPathKind(projectRoot, globPattern, "directory") === "file"
-              ? globPattern
-              : path.dirname(globPattern);
-          globPattern = path.basename(globPattern);
+            searchPathKind(projectRoot, expandTilde(String(args.pattern)), "directory") === "file"
+              ? expandTilde(String(args.pattern))
+              : globPath;
         }
       }
 

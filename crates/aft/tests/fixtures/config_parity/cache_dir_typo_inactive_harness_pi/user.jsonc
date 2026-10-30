@@ -1,0 +1,9 @@
+{
+  "harnesses": {
+    "future": {
+      "storge": {
+        "cache_dir": "/aft-cache"
+      }
+    }
+  }
+}

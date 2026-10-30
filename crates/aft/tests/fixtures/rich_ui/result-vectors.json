@@ -1,0 +1,48 @@
+{
+  "read": {
+    "text": "read normalized text"
+  },
+  "outline": {
+    "text": "outline normalized text"
+  },
+  "zoom": {
+    "text": "zoom normalized text"
+  },
+  "search": {
+    "text": "search normalized text"
+  },
+  "grep": {
+    "text": "grep normalized text"
+  },
+  "glob": {
+    "text": "glob normalized text"
+  },
+  "callgraph": {
+    "text": "callgraph normalized text"
+  },
+  "bash_status": {
+    "running": false,
+    "exitCode": 0
+  },
+  "bash_watch": {
+    "running": true,
+    "exitCode": null,
+    "waited": {
+      "reason": "match",
+      "limit_ms": 20000
+    }
+  },
+  "bash_output": {
+    "items": [
+      {
+        "stream": "stdout",
+        "text": "hello",
+        "bytes": 6,
+        "continued": false,
+        "firstAvailableOffset": 0,
+        "prefixDropped": false
+      }
+    ],
+    "next": null
+  }
+}

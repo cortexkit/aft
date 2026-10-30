@@ -202,16 +202,6 @@ fn wait_for_initial_edge(aft: &mut AftProcess, file: &Path) {
     }
 }
 
-/// What the save's refresh window must show before the edited edge appears.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PendingWindow {
-    /// The refresh can finish between two polls, so the window may go unseen.
-    MayBeUnobserved,
-    /// The refresh waits out a quiet window after the watcher event, so at
-    /// least one poll lands in it and must be marked incomplete.
-    MustBeObserved,
-}
-
 /// What the test has learned about whether the daemon has received the save's
 /// watcher events, and how many stale answers said they were incomplete.
 #[derive(Default)]
@@ -275,7 +265,6 @@ fn poll_round(
 fn poll_until_fresh(
     aft: &mut AftProcess,
     file: &Path,
-    window: PendingWindow,
     saved: Instant,
     evidence: &mut SaveEvidence,
 ) {
@@ -288,10 +277,6 @@ fn poll_until_fresh(
                  marked incomplete on the way",
                 saved.elapsed().as_millis(),
                 evidence.stale_marked
-            );
-            assert!(
-                window == PendingWindow::MayBeUnobserved || evidence.stale_marked > 0,
-                "no answer served while the save was pending said it was incomplete"
             );
             return;
         }
@@ -319,11 +304,11 @@ fn prepare_for_save(aft: &mut AftProcess, file: &Path) {
 /// index answers with the edit, or an earlier answer was already marked
 /// pending), every answer that still shows the old edge must carry
 /// `complete: false`: the daemon cannot take back knowledge of a pending edit.
-fn assert_atomic_save_reaches_callgraph(aft: &mut AftProcess, file: &Path, window: PendingWindow) {
+fn assert_atomic_save_reaches_callgraph(aft: &mut AftProcess, file: &Path) {
     prepare_for_save(aft, file);
     atomic_save(file, BETA_SOURCE);
     let saved = Instant::now();
-    poll_until_fresh(aft, file, window, saved, &mut SaveEvidence::default());
+    poll_until_fresh(aft, file, saved, &mut SaveEvidence::default());
 }
 
 #[test]
@@ -335,11 +320,7 @@ fn atomic_save_reaches_callgraph_on_a_plain_checkout_with_views_off() {
     init_repo(&root);
     let mut aft = AftProcess::spawn_with_real_watcher();
     configure(&mut aft, &root, &base.join("storage"), false);
-    assert_atomic_save_reaches_callgraph(
-        &mut aft,
-        &root.join("src/probe.ts"),
-        PendingWindow::MayBeUnobserved,
-    );
+    assert_atomic_save_reaches_callgraph(&mut aft, &root.join("src/probe.ts"));
     assert!(aft.shutdown().success());
 }
 
@@ -414,13 +395,7 @@ fn an_answer_given_before_the_watcher_took_the_save_is_not_judged_by_later_evide
         "callers was asked after the watcher took the save, so it names the pending file: {:#}",
         round.callers
     );
-    poll_until_fresh(
-        &mut aft,
-        &file,
-        PendingWindow::MayBeUnobserved,
-        saved,
-        &mut evidence,
-    );
+    poll_until_fresh(&mut aft, &file, saved, &mut evidence);
     assert!(aft.shutdown().success());
 }
 
@@ -444,12 +419,10 @@ fn atomic_save_reaches_callgraph_on_a_linked_worktree_with_views_on() {
     );
     let mut aft = AftProcess::spawn_with_real_watcher();
     configure(&mut aft, &checkout, &base.join("storage"), true);
-    // A view publishes only after a quiet window following the last watcher
-    // event, so the pending state is always observable here.
-    assert_atomic_save_reaches_callgraph(
-        &mut aft,
-        &checkout.join("src/probe.ts"),
-        PendingWindow::MustBeObserved,
-    );
+    // With views on, every call-graph answer comes from a bind of the
+    // checkout's v3 view that verifies the files against the disk, so there is
+    // no refresh window to observe. A stale answer, should one be served, must
+    // still say it is incomplete.
+    assert_atomic_save_reaches_callgraph(&mut aft, &checkout.join("src/probe.ts"));
     assert!(aft.shutdown().success());
 }

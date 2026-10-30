@@ -11,7 +11,7 @@ use crate::protocol::PushFrame;
 #[cfg(test)]
 use crate::watcher_filter::RescanReason;
 use crate::watcher_filter::{watcher_path_is_infra_skip_under, WatcherDispatchEvent};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-timing-hooks"))]
 use std::collections::HashMap;
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -187,14 +187,14 @@ struct SemanticRefreshRecoveryGate {
 static SEMANTIC_REFRESH_RECOVERY_GATE: OnceLock<Mutex<Option<SemanticRefreshRecoveryGate>>> =
     OnceLock::new();
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-timing-hooks"))]
 struct WatcherPhaseCommitGate {
     reached_tx: crossbeam_channel::Sender<()>,
     release_rx: crossbeam_channel::Receiver<()>,
 }
 
-#[cfg(test)]
-// Parallel libtests must not replace another path's in-flight barrier.
+#[cfg(any(test, feature = "test-timing-hooks"))]
+// Parallel tests must not replace another path's in-flight barrier.
 static WATCHER_PHASE_COMMIT_GATE: std::sync::OnceLock<
     Mutex<HashMap<PathBuf, WatcherPhaseCommitGate>>,
 > = std::sync::OnceLock::new();
@@ -252,8 +252,10 @@ fn wait_on_watcher_rescan_gate_for_test(ctx: &AppContext) {
 #[cfg(not(test))]
 fn wait_on_watcher_rescan_gate_for_test(_ctx: &AppContext) {}
 
-#[cfg(test)]
-fn install_watcher_phase_commit_gate_for_test(
+/// Hold one real watcher path application until its test releases the drain.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-timing-hooks"))]
+pub fn install_watcher_phase_commit_gate_for_test(
     target: PathBuf,
 ) -> (
     crossbeam_channel::Receiver<()>,
@@ -275,7 +277,7 @@ fn install_watcher_phase_commit_gate_for_test(
     (reached_rx, release_tx)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-timing-hooks"))]
 fn wait_on_watcher_phase_commit_gate_for_test(path: &Path) {
     let gate = WATCHER_PHASE_COMMIT_GATE
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -288,7 +290,7 @@ fn wait_on_watcher_phase_commit_gate_for_test(path: &Path) {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-timing-hooks")))]
 fn wait_on_watcher_phase_commit_gate_for_test(_path: &Path) {}
 
 #[cfg(test)]
@@ -479,6 +481,28 @@ fn delay_watcher_unit_for_test() {
 
 #[cfg(not(test))]
 fn delay_watcher_unit_for_test() {}
+
+#[cfg(test)]
+thread_local! {
+    static WATCHER_RECEIVE_TEST_DELAY: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+}
+
+/// Stand in for an expensive receive step (per-path LSP applicability checks
+/// on a large batch) by advancing the pinned drain clock.
+#[cfg(test)]
+fn delay_watcher_receive_for_test() {
+    let delay = WATCHER_RECEIVE_TEST_DELAY.with(std::cell::Cell::get);
+    if !delay.is_zero() {
+        WATCHER_DRAIN_TEST_NOW.with(|clock| {
+            if let Some(now) = clock.get() {
+                clock.set(Some(now + delay));
+            }
+        });
+    }
+}
+
+#[cfg(not(test))]
+fn delay_watcher_receive_for_test() {}
 
 pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
     crate::commands::configure::drain_deferred_configure_maintenance(ctx);
@@ -812,6 +836,10 @@ pub fn mark_semantic_corpus_refresh_success(ctx: &AppContext) {
 }
 
 pub fn drain_search_index_events(ctx: &AppContext) {
+    if ctx.config().views.enabled {
+        ctx.retire_search_index_rx("lexical views replace the legacy search loader");
+        return;
+    }
     let (latest, disconnected, receiver_generation, receiver_epoch) = {
         let rx_ref = ctx
             .search_index_rx()
@@ -853,9 +881,14 @@ pub fn drain_search_index_events(ctx: &AppContext) {
                 if !pending_paths.is_empty() {
                     replay_search_index_pending_updates(ctx, &mut index, pending_paths);
                 }
-                *ctx.search_index()
+                let mut search_index = ctx
+                    .search_index()
                     .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *search_index = Some(index);
+                // A reload can keep the same receiver generation. Retire exact
+                // sets warmed against the previous resident index during the load.
+                ctx.search_exact_memo().clear();
                 *receiver = None;
                 true
             })
@@ -921,6 +954,7 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
         fulfilled_force_token,
         receiver_generation,
         receiver_epoch,
+        reopen_epoch,
     ) = {
         let rx_ref = ctx.callgraph_store_rx().lock();
         let Some(rx) = rx_ref.as_ref() else {
@@ -933,6 +967,7 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
         let mut settled = false;
         let mut fulfilled_force_token = None;
         let mut disconnected = false;
+        let mut reopen_epoch = None;
         loop {
             match rx.try_recv() {
                 Ok(CallGraphStoreBuildEvent::Ready {
@@ -943,12 +978,24 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
                     if ctx.callgraph_persist_epoch_flag().current() == publication_epoch {
                         latest = Some(store);
                         fulfilled_force_token = token;
+                        reopen_epoch = Some(publication_epoch);
                     } else {
                         // A newer configure advanced the persist epoch after this
                         // build published; its generation is already superseded on
                         // disk, so treat the event as settled instead of installing
                         // the stale handle in RAM.
                         drop(store);
+                        settled = true;
+                    }
+                }
+                Ok(CallGraphStoreBuildEvent::Reopen {
+                    fulfilled_force_token: token,
+                    publication_epoch,
+                }) => {
+                    if ctx.callgraph_persist_epoch_flag().current() == publication_epoch {
+                        reopen_epoch = Some(publication_epoch);
+                        fulfilled_force_token = token;
+                    } else {
                         settled = true;
                     }
                 }
@@ -973,10 +1020,11 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
             fulfilled_force_token,
             ctx.callgraph_store_rx_generation(),
             ctx.callgraph_store_rx_epoch(),
+            reopen_epoch,
         )
     };
 
-    let ready_received = latest.is_some();
+    let ready_received = reopen_epoch.is_some();
     let terminal =
         ready_received || denied.is_some() || suspended.is_some() || settled || disconnected;
     if !terminal {
@@ -991,18 +1039,20 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
     wait_on_artifact_drain_commit_gate_for_test(ctx);
 
     let mut reopened = None;
-    if let Some(store) = latest {
+    let mut busy_reopen = false;
+    if ready_received {
         // Release the cold-build writer lease before opening the published
         // generation through its read-only pointer.
-        drop(store);
+        drop(latest);
         if let Some(project_root) = ctx.callgraph_project_root() {
-            match CallGraphStore::open_readonly(ctx.callgraph_store_dir(), project_root) {
+            match CallGraphStore::reopen_readonly(ctx.callgraph_store_dir(), project_root) {
                 Ok(Some(store)) => reopened = Some(Arc::new(store)),
                 Ok(None) => {
                     crate::slog_warn!(
                         "callgraph store build completed without a readable published generation"
                     );
                 }
+                Err(error) if error.is_transient_lock_contention() => busy_reopen = true,
                 Err(error) => {
                     crate::slog_warn!("failed to install read-only callgraph store: {}", error);
                 }
@@ -1056,6 +1106,13 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
             }
             if terminal {
                 *receiver = None;
+            }
+            if busy_reopen {
+                ctx.defer_callgraph_store_reopen(
+                    receiver,
+                    fulfilled_force_token,
+                    reopen_epoch.expect("completed publication"),
+                );
             }
             if installed {
                 if let Some(force_token) = fulfilled_force_token {
@@ -1268,7 +1325,8 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
                         let refresh_paths =
                             semantic_paths_with_changed_content(ctx, &index, refresh_paths);
                         index.invalidate_files(&refresh_paths);
-                        let corpus_refresh = ctx.take_pending_semantic_corpus_refresh()
+                        let corpus_refresh = (ctx.take_pending_semantic_corpus_refresh()
+                            || index.summaries_need_repair())
                             && !ctx.shared_artifacts_read_only();
                         if let Some(root) = ctx.canonical_cache_root_opt() {
                             let semantic_config = ctx.config().semantic.clone();
@@ -1358,7 +1416,15 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
             ctx.view_runtime_snapshot()
                 .map(|snapshot| snapshot.pending_paths),
         ) {
-            if let Err(error) = crate::executor::view_publication::schedule(ctx, pending, true) {
+            if let Err(error) = crate::executor::view_publication::schedule_with_reason(
+                ctx,
+                pending,
+                true,
+                crate::views::publication_reason::Reason {
+                    events: crate::views::publication_reason::Reason::SEMANTIC,
+                    ..Default::default()
+                },
+            ) {
                 aft::slog_warn!("semantic-ready view publication failed: {}", error);
             }
         }
@@ -1813,6 +1879,7 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
             SemanticRefreshEvent::Completed {
                 mut added_entries,
                 mut refused_rows,
+                mut context_skipped,
                 mut updated_metadata,
                 mut completed_paths,
             } => {
@@ -1840,6 +1907,7 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
                 updated_metadata.retain(|(path, _)| !stale.contains(path));
                 completed_paths.retain(|path| !stale.contains(path));
                 refused_rows.retain(|path, _| completed_paths.contains(path));
+                context_skipped.retain(|path, _| completed_paths.contains(path));
                 // Rows are only installed together with the freshness record of
                 // their file. A row without one (a file deleted while its batch
                 // was in flight) would be unreachable by every later freshness
@@ -1855,6 +1923,7 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
                 {
                     index.apply_refresh_update(added_entries, updated_metadata, &completed_paths);
                     index.apply_refused_rows_update(refused_rows);
+                    index.apply_context_skips_update(context_skipped);
                 }
                 mark_semantic_refresh_success(ctx, &completed_paths);
                 view_refresh_completed = true;
@@ -1949,15 +2018,29 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
                 }
             }
             SemanticRefreshEvent::CorpusFailed { paths, error } => {
+                let summary_repair_pending = !ctx.shared_artifacts_read_only()
+                    && ctx
+                        .semantic_index()
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .as_ref()
+                        .is_some_and(|index| index.summaries_need_repair());
+                if summary_repair_pending {
+                    ctx.mark_pending_semantic_corpus_refresh();
+                }
                 // A transient backend blip during a corpus refresh must NOT
                 // destroy the working index — the prior index is still valid and
                 // serving. Keep it Ready and let the next watcher/ignore change
                 // re-trigger the refresh, rather than nuking everything to
                 // `Failed` over a connection hiccup (the same park-forever trap
-                // the initial build now rides out). Permanent errors (dimension
-                // mismatch, too-many-files) still drop the index and surface the
-                // real failure.
-                if aft::semantic_index::embedding_failure_is_transient(&error) {
+                // the initial build now rides out). A deferred summary repair
+                // also keeps the published cache and records a pending corpus
+                // refresh for retry: its saved vectors are still usable even
+                // if the backend rejects the replacement input. Other permanent
+                // refresh errors still drop the index and surface the failure.
+                if aft::semantic_index::embedding_failure_is_transient(&error)
+                    || summary_repair_pending
+                {
                     let clean = aft::semantic_index::strip_transient_embedding_marker(&error);
                     let has_index = ctx
                         .semantic_index()
@@ -2110,8 +2193,15 @@ fn publish_semantic_ready_view(ctx: &AppContext) {
     let Some(root) = ctx.canonical_cache_root_opt() else {
         return;
     };
-    match crate::executor::view_publication::schedule(ctx, paths, !ctx.shared_artifacts_read_only())
-    {
+    match crate::executor::view_publication::schedule_with_reason(
+        ctx,
+        paths,
+        !ctx.shared_artifacts_read_only(),
+        crate::views::publication_reason::Reason {
+            events: crate::views::publication_reason::Reason::SEMANTIC,
+            ..Default::default()
+        },
+    ) {
         Ok(()) => crate::slog_info!(
             "content-addressed view publication scheduled after semantic refresh root={}",
             root.display()
@@ -2325,6 +2415,9 @@ fn spawn_search_corpus_refresh_admitted(
     config: Arc<aft::config::Config>,
     generation: u64,
 ) {
+    if config.views.enabled || ctx.config().views.enabled {
+        return;
+    }
     {
         let mut search_index = ctx
             .search_index()
@@ -2351,12 +2444,14 @@ fn spawn_search_corpus_refresh_admitted(
     let content_generation_flag = ctx.configure_content_generation_flag();
     let persist_epoch_flag = ctx.search_persist_epoch_flag();
     let persist_epoch = ctx.next_search_persist_epoch();
+    let publication_gate = ctx.legacy_search_publication_gate();
     let lifecycle = ctx.subc_lifecycle_admission();
     let cold_build_limiter = ctx.cold_build_limiter();
     ctx.search_corpus_refresh_lane.submit(
         root.clone(),
         Box::new(move |cancel| {
             let _terminal_guard = receiver_terminal_guard;
+            let _publication = publication_gate.install();
             log_ctx::with_session(session_id, || {
                 let Some(_permit) = crate::cold_build_limiter::acquire_blocking_while_with_limiter(
                     &cold_build_limiter,
@@ -2375,7 +2470,7 @@ fn spawn_search_corpus_refresh_admitted(
                 }
                 let cache_dir = aft::search_index::resolve_cache_dir_with_key(
                     &project_key,
-                    config.storage_dir.as_deref(),
+                    config.cache_storage_dir().as_deref(),
                 );
                 let cache_lock = if shared_artifacts_read_only {
                     None
@@ -2393,6 +2488,7 @@ fn spawn_search_corpus_refresh_admitted(
                 };
                 let keep_going = || {
                     !cancel.load(std::sync::atomic::Ordering::Acquire)
+                        && publication_gate.allowed()
                         && lifecycle.is_current(&generation_flag, generation)
                         && persist_epoch_flag.current() == persist_epoch
                 };
@@ -2480,7 +2576,7 @@ pub fn refresh_project_corpus(ctx: &AppContext, reason: &str, ignore_rules_chang
             }
         }
 
-        if config.indexes.trigram && !ctx.shared_artifacts_read_only() {
+        if config.indexes.trigram && !config.views.enabled && !ctx.shared_artifacts_read_only() {
             spawn_search_corpus_refresh_admitted(ctx, root.clone(), config.clone(), generation);
             status_changed = true;
             aft::slog_info!("{}", search_refresh_started_log(reason));
@@ -2665,10 +2761,13 @@ fn watcher_path_is_generated_for_callgraph(ctx: &AppContext, path: &Path) -> boo
 }
 
 fn published_view_owns_callgraph_writes(ctx: &AppContext) -> bool {
-    ctx.config().views.enabled
-        && ctx
-            .view_runtime_snapshot()
-            .is_some_and(|view| view.generation.is_some() && view.manifest.is_some())
+    // A views-routed root reads its call graph from its v3 view only, so no
+    // legacy store refresh runs for it.
+    ctx.views_route_root()
+        || ctx.config().views.enabled
+            && ctx
+                .view_runtime_snapshot()
+                .is_some_and(|view| view.generation.is_some() && view.manifest.is_some())
 }
 
 fn enqueue_legacy_callgraph_refresh_for_watcher(
@@ -2870,6 +2969,9 @@ fn next_watcher_apply_phase(stage: WatcherDrainApplyPhase) -> WatcherDrainApplyP
 }
 
 fn refresh_search_index_path(ctx: &AppContext, path: &Path) {
+    if ctx.config().views.enabled {
+        return;
+    }
     let max_file_size = ctx
         .search_index()
         .read()
@@ -2877,6 +2979,8 @@ fn refresh_search_index_path(ctx: &AppContext, path: &Path) {
         .as_ref()
         .map(crate::search_index::SearchIndex::max_file_size);
     let Some(max_file_size) = max_file_size else {
+        // Exact search also memoizes filesystem results before an index is ready.
+        ctx.search_exact_memo().clear();
         return;
     };
     let remove = watcher_path_is_ignored_by_current_matcher(ctx, path);
@@ -2888,6 +2992,11 @@ fn refresh_search_index_path(ctx: &AppContext, path: &Path) {
     if let Some(index) = index_ref.as_mut() {
         index.apply_search_update(update);
     }
+    // Receiver generations identify loads, not edits to a resident index.
+    // Retire exact sets (including cached absence) under the index write lock
+    // so no query can pair updated contents with an old memo. Unchanged queries
+    // still reuse their memo without hashing the corpus on each request.
+    ctx.search_exact_memo().clear();
 }
 
 /// Reconcile the final disk state when an AFT mutation finishes, including
@@ -2898,6 +3007,7 @@ pub(crate) struct FileMutationGuard<'a> {
     ctx: &'a AppContext,
     revisit: Vec<PathBuf>,
     paths: std::collections::BTreeSet<PathBuf>,
+    files_before: std::collections::BTreeMap<PathBuf, bool>,
     before: MutationRefreshBudget,
     overflowed: bool,
     _view_intent: crate::views::intent::IntentGuard,
@@ -2994,10 +3104,18 @@ pub(crate) fn record_file_mutation<'a, 'p>(
     let mut before = MutationRefreshBudget::new();
     let overflowed =
         !collect_mutation_paths(ctx, &roots, &mut paths, Some(&mut revisit), &mut before);
+    // Explicit targets also matter when ignored by the search index: a language
+    // server can still watch and import a file that an agent writes there.
+    let files_before = roots
+        .iter()
+        .chain(paths.iter())
+        .map(|path| (path.clone(), path.is_file()))
+        .collect();
     FileMutationGuard {
         ctx,
         revisit,
         paths,
+        files_before,
         before,
         overflowed,
         _view_intent: view_intent,
@@ -3027,6 +3145,7 @@ impl Drop for FileMutationGuard<'_> {
                 &mut budget,
             );
             for path in discovered.difference(&self.paths) {
+                self.files_before.entry(path.clone()).or_insert(false);
                 if budget.exhausted() {
                     overflowed = true;
                     break;
@@ -3036,6 +3155,24 @@ impl Drop for FileMutationGuard<'_> {
                 budget.refreshed += 1;
             }
         }
+        let events = self
+            .files_before
+            .iter()
+            .filter_map(|(path, existed)| {
+                let exists = path.is_file();
+                (exists != *existed).then(|| {
+                    (
+                        path.clone(),
+                        if exists {
+                            lsp_types::FileChangeType::CREATED
+                        } else {
+                            lsp_types::FileChangeType::DELETED
+                        },
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        self.ctx.lsp_notify_mutation_file_events(&events);
         let root = self.ctx.canonical_cache_root_opt();
         if overflowed
             && self.ctx.heavy_root_work_allowed()
@@ -3065,6 +3202,9 @@ impl Drop for FileMutationGuard<'_> {
 /// read-after-write ordering. Preparation reads at most the index's file-size
 /// limit, just as it does for a watcher update.
 pub(crate) fn refresh_search_index_after_write(ctx: &AppContext, path: &Path) {
+    if ctx.config().views.enabled {
+        return;
+    }
     if !ctx.heavy_root_work_allowed()
         || (ctx.shared_artifacts_read_only() && !ctx.ram_overlay_active())
     {
@@ -3489,6 +3629,13 @@ pub fn drain_on_demand_callgraph_build(ctx: &Arc<AppContext>) {
 }
 
 pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSliceState) {
+    if ctx.view_full_verification_due() && !crate::executor::view_publication::running_for(ctx) {
+        // A quiet root still needs verification after ten minutes or restart.
+        // The full request remains sticky through retries and later events.
+        state.view_publication_full = true;
+        state.view_publication_reason.periodic = true;
+        state.view_publication_due = Some(Instant::now());
+    }
     if !ctx.config().views.enabled
         || !matches!(state.phase, WatcherDrainPhase::Collect)
         || state
@@ -3503,11 +3650,15 @@ pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSl
     if ctx.retire_deleted_view_root() {
         state.view_publication_due = None;
         state.view_publication_paths.clear();
+        state.view_publication_full = false;
+        state.view_publication_reason = Default::default();
         return;
     }
     if ctx.view_runtime_snapshot().is_none() {
         state.view_publication_due = None;
         state.view_publication_paths.clear();
+        state.view_publication_full = false;
+        state.view_publication_reason = Default::default();
         return;
     }
     if let Some(due) = ctx
@@ -3519,17 +3670,27 @@ pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSl
         state.view_publication_due = Some(due);
         return;
     }
-    let changed = state
-        .view_publication_paths
-        .iter()
-        .filter_map(|path| path.strip_prefix(&root).ok())
-        .filter_map(|path| aft::views::RelPath::from_os_path(path).ok())
-        .map(|path| path.as_bytes().to_vec())
-        .collect::<BTreeSet<_>>();
-    match crate::executor::view_publication::schedule(
+    let changed = if state.view_publication_full {
+        BTreeSet::new()
+    } else {
+        state
+            .view_publication_paths
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&root).ok()
+                    .and_then(|path| aft::views::RelPath::from_os_path(path).ok())
+                    .map(|path| path.as_bytes().to_vec())
+            })
+            // Losing one spelling (including a differently cased root) loses
+            // evidence for the whole delta, not just for that one path.
+            .collect::<Option<BTreeSet<_>>>()
+            .unwrap_or_default()
+    };
+    match crate::executor::view_publication::schedule_with_reason(
         ctx,
         changed,
         !ctx.shared_artifacts_read_only(),
+        state.view_publication_reason,
     ) {
         Ok(()) => {
             aft::slog_info!(
@@ -3537,12 +3698,16 @@ pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSl
                 root.display()
             );
             state.view_publication_paths.clear();
+            state.view_publication_full = false;
+            state.view_publication_reason = Default::default();
             state.view_publication_due = None;
         }
         Err(error) => {
             if ctx.retire_deleted_view_root() || ctx.view_runtime_snapshot().is_none() {
                 state.view_publication_due = None;
                 state.view_publication_paths.clear();
+                state.view_publication_full = false;
+                state.view_publication_reason = Default::default();
                 return;
             }
             // Inline publication records and logs the failure in the same retry
@@ -3617,6 +3782,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
     {
         return outcome;
     }
+    ctx.record_checkout_pending_watcher_gap();
     let mut state = match ctx.watcher_drain_slice().lock().take() {
         Some(state) if state.configure_generation == configure_generation => state,
         // Lifecycle-only generation change (transient unbind + equivalent
@@ -3635,12 +3801,8 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
 
     {
         let rx_ref = ctx.watcher_rx().lock();
-        let Some(rx) = rx_ref.as_ref() else {
-            ctx.tick_tier2_refresh_scheduler(0);
-            return outcome;
-        };
-
-        loop {
+        // Idle verification must also run when no watcher receiver is installed.
+        while let Some(rx) = rx_ref.as_ref() {
             match rx.try_recv() {
                 Ok(
                     event @ (WatcherDispatchEvent::Paths(_)
@@ -3657,16 +3819,34 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     // packages are often gitignored but still change which
                     // TypeScript server a file gets.
                     ctx.lsp_note_watcher_batch(&paths, content_only);
+                    delay_watcher_receive_for_test();
                     if !state.rescan_required {
-                        state.pending_paths.extend(paths.into_iter().filter(|path| {
-                            !crate::watcher_filter::queued_path_is_ignored_by_matcher(
-                                &ctx.shared_gitignore(),
-                                path,
-                            )
-                        }));
+                        let mut accepted = false;
+                        state.pending_paths.extend(
+                            paths
+                                .into_iter()
+                                .filter(|path| {
+                                    !crate::watcher_filter::queued_path_is_ignored_by_matcher(
+                                        &ctx.shared_gitignore(),
+                                        path,
+                                    )
+                                })
+                                .inspect(|_| accepted = true),
+                        );
+                        if accepted {
+                            state.view_publication_reason.events |= if content_only {
+                                crate::views::publication_reason::Reason::CONTENT
+                            } else {
+                                crate::views::publication_reason::Reason::PATHS
+                            };
+                        }
                     }
                 }
                 Ok(WatcherDispatchEvent::RescanRequired(reason)) => {
+                    ctx.record_checkout_watcher_overflow();
+                    state.view_publication_reason.events |=
+                        crate::views::publication_reason::Reason::RESCAN;
+                    state.view_publication_full = true;
                     dispatch_events_received += 1;
                     // A rescan means the watcher dropped the individual
                     // changed paths, so any of them may have changed the
@@ -3686,7 +3866,23 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     state.semantic_refresh_paths.clear();
                     state.scheduler_changed_path_count = 0;
                 }
+                Ok(WatcherDispatchEvent::CookieObserved(path)) => {
+                    dispatch_events_received += 1;
+                    // Earlier batches may still await sliced Tier-2 work. Record
+                    // their intents now so the cookie cannot overtake them.
+                    for pending in &state.pending_paths {
+                        ctx.record_checkout_watcher_change(pending);
+                    }
+                    if let WatcherDrainPhase::Apply { paths, .. } = &state.phase {
+                        for pending in paths {
+                            ctx.record_checkout_watcher_change(pending);
+                        }
+                    }
+                    ctx.record_checkout_watcher_cookie(&path);
+                }
                 Ok(WatcherDispatchEvent::IgnoreRulesChanged { paths }) => {
+                    state.view_publication_reason.events |=
+                        crate::views::publication_reason::Reason::IGNORE;
                     dispatch_events_received += 1;
                     ctx.lsp_note_watcher_ignore_change();
                     if state.rescan_required {
@@ -3916,6 +4112,11 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 ctx.note_checkout_changed_for_callgraph();
                 ctx.reset_view_publication_retry();
                 state.view_publication_paths.clear();
+                state.view_publication_full = true;
+                // An earlier publication can consume the event's reason while
+                // a follow-up rescan remains pending. Record the completed rescan's cause.
+                state.view_publication_reason.events |=
+                    crate::views::publication_reason::Reason::RESCAN;
                 state.view_publication_due = Some(Instant::now() + VIEW_PUBLICATION_QUIET_WINDOW);
             }
         }
@@ -3944,8 +4145,18 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 if ctx.config().views.enabled {
                     // Changed ignore rules change which files the checkout has.
                     ctx.note_checkout_changed_for_callgraph();
+                    if ctx.views_route_root() {
+                        // The v3 checkout views reconcile their membership
+                        // in full at their next read.
+                        ctx.record_checkout_watcher_overflow();
+                    }
                     ctx.reset_view_publication_retry();
                     state.view_publication_paths.clear();
+                    state.view_publication_full = true;
+                    // File edits can publish before the ignore refresh finishes
+                    // and consume its recorded reason. Record the completed refresh's cause.
+                    state.view_publication_reason.events |=
+                        crate::views::publication_reason::Reason::IGNORE;
                     state.view_publication_due =
                         Some(Instant::now() + VIEW_PUBLICATION_QUIET_WINDOW);
                 }
@@ -3978,6 +4189,10 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 } else {
                     BTreeSet::new()
                 };
+                if !git_head_paths.is_empty() {
+                    state.view_publication_reason.events |=
+                        crate::views::publication_reason::Reason::HEAD_METADATA;
+                }
                 paths.retain(|path| !git_head_paths.contains(path));
                 if ctx.config().views.enabled {
                     // An edit or a HEAD move: the main checkout's call graph no
@@ -4038,9 +4253,13 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
         }
     }
 
-    if matches!(state.phase, WatcherDrainPhase::Apply { .. })
-        && watcher_drain_elapsed(started) < WATCHER_DRAIN_SLICE_BUDGET
-    {
+    // Enter the apply phase even when receiving and batching already used the
+    // whole slice budget. Each apply step checks the deadline only after it has
+    // applied a path, so a late entry applies exactly one path and returns.
+    // Skipping the apply phase here instead let a slice return with nothing
+    // applied, and a steady stream of watcher events whose receive cost alone
+    // fills the budget would then starve the queued batch on every slice.
+    if matches!(state.phase, WatcherDrainPhase::Apply { .. }) {
         apply_watcher_slice(ctx, &mut state, started);
     }
 
@@ -4074,9 +4293,9 @@ pub fn drain_lsp_events(ctx: &AppContext) {
     let _ = drain_lsp_events_bounded(ctx, usize::MAX);
 }
 
-/// Shut down language servers for a standalone runtime whose last request is
-/// older than `lsp.idle_minutes`. Subc uses the same helper with its own
-/// per-root activity stamp.
+/// Reap individually idle language servers, also releasing all unused clients
+/// when the standalone runtime is idle. The daemon supplies each root's last
+/// tool-call activity timestamp.
 pub fn shutdown_idle_lsp(ctx: &AppContext) {
     shutdown_idle_lsp_at(ctx, Instant::now(), ctx.last_request_at());
 }
@@ -4086,36 +4305,17 @@ pub fn shutdown_idle_lsp_at(ctx: &AppContext, now: Instant, last_activity: Insta
         return;
     };
     let idle = now.saturating_duration_since(last_activity);
-    if idle < ttl {
-        return;
-    }
     let clients = {
         // The subc frame loop runs this sweep, so it must not wait for the
-        // manager. A held manager is in use, which means the root is not
-        // idle in the way that matters here; the next sweep retries.
+        // manager. A held manager may be sending a request; the next sweep retries.
         let Some(mut lsp) = ctx.try_lsp() else {
             return;
         };
         if lsp.server_count() == 0 {
             return;
         }
-        lsp.take_all_clients()
+        lsp.take_idle_clients(now, ttl, idle >= ttl)
     };
-    let n = clients.len();
-    if n == 0 {
-        return;
-    }
-    let root = ctx
-        .config()
-        .project_root
-        .as_ref()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "standalone".to_string());
-    aft::slog_info!(
-        "idle lsp reap {root}: shut down {n} server(s) after {}m (ttl {}m)",
-        idle.as_secs() / 60,
-        ttl.as_secs() / 60
-    );
     crate::lsp::manager::LspManager::spawn_idle_lsp_reap(clients);
 }
 
@@ -4143,11 +4343,30 @@ pub fn drain_lsp_events_bounded(ctx: &AppContext, max_events: usize) -> DrainBat
         lsp.drain_events_bounded(max_events)
     };
     let outcome = DrainBatchOutcome {
-        processed: drained.events.len(),
+        processed: drained.processed,
         has_more: drained.has_more,
     };
     let mut status_changed = drained.diagnostics_changed;
-    for event in drained.events {
+    #[cfg(all(test, unix))]
+    for instance in drained.instances.iter().flatten() {
+        crate::lsp::manager::instance_regression_tests::pause_dispatch(*instance);
+    }
+    let Some(mut lsp) = ctx.try_lsp() else {
+        // Store mutations already committed during the first lock acquisition.
+        // Refresh their status without waiting or replaying the receipts; only
+        // optional dispatch logging is lost when another caller owns the lock.
+        if outcome.processed > 0 || status_changed {
+            ctx.signal_status_changed();
+        }
+        return DrainBatchOutcome {
+            has_more: true,
+            ..outcome
+        };
+    };
+    for (event, instance) in drained.events.into_iter().zip(drained.instances) {
+        if !lsp.accept_event_instance(&event, instance) {
+            continue;
+        }
         match event {
             LspEvent::DocumentDiagnosticsPulled { .. } => {
                 // The manager already stored and version-checked this reply.
@@ -4194,6 +4413,7 @@ pub fn drain_lsp_events_bounded(ctx: &AppContext, max_events: usize) -> DrainBat
             }
         }
     }
+    drop(lsp);
     if status_changed {
         ctx.signal_status_changed();
     }
@@ -4222,7 +4442,10 @@ fn finish_watcher_drain_for_test(
 }
 
 #[cfg(test)]
-fn drain_watcher_to_completion_for_test(ctx: &AppContext, max_paths: usize) -> DrainBatchOutcome {
+pub(crate) fn drain_watcher_to_completion_for_test(
+    ctx: &AppContext,
+    max_paths: usize,
+) -> DrainBatchOutcome {
     finish_watcher_drain_for_test(ctx, max_paths, drain_watcher_events_bounded(ctx, max_paths))
 }
 
@@ -4295,6 +4518,7 @@ pub(crate) fn configure_search_order_context_for_test(
     ctx.set_canonical_cache_root(canonical_root.clone());
     ctx.set_harness(crate::harness::Harness::Opencode);
     ctx.enqueue_configure_maintenance(crate::context::ConfigureMaintenanceJob {
+        artifact_root: ctx.cache_dir(),
         generation: ctx.configure_generation(),
         root_path: root.to_path_buf(),
         canonical_cache_root: canonical_root,
@@ -4954,6 +5178,7 @@ mod tests {
                 .as_ref()
                 .expect("search index installed")
                 .grep("retired_marker", true, &[], &[], &root, usize::MAX)
+                .unwrap()
                 .total_matches
         };
         assert_eq!(grep_total(&ctx), 1);
@@ -5518,6 +5743,7 @@ mod tests {
             .expect("persisted search index");
         assert_eq!(
             disk.grep("new_watcher_marker", true, &[], &[], &root_path, 10)
+                .unwrap()
                 .matches
                 .len(),
             1,
@@ -5525,6 +5751,7 @@ mod tests {
         );
         assert!(
             disk.grep("old_generation_marker", true, &[], &[], &root_path, 10)
+                .unwrap()
                 .matches
                 .is_empty(),
             "older configure build must not overwrite the newer watcher refresh"
@@ -5570,6 +5797,7 @@ mod tests {
                     .as_ref()
                     .expect("search index")
                     .grep("watcher_marker", true, &[], &[], root, 10)
+                    .unwrap()
                     .matches
                     .is_empty(),
                 "watcher work dequeued before teardown must not mutate the index after unbind"
@@ -5593,6 +5821,7 @@ mod tests {
                 .as_ref()
                 .expect("search index")
                 .grep("watcher_marker", true, &[], &[], root, 10)
+                .unwrap()
                 .matches
                 .len(),
             1,
@@ -6058,6 +6287,100 @@ mod tests {
     }
 
     #[test]
+    fn callgraph_busy_completed_reopen_retries_and_serves() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("main.rs");
+        std::fs::write(&source, "fn leaf() {}\npub fn entry() { leaf(); }\n").unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root_path = std::fs::canonicalize(root.path()).unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root_path.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root_path.clone());
+        let key = crate::search_index::artifact_cache_key(&root_path);
+        crate::root_cache::configure_artifact_access(&root_path, &key, false);
+        let store = CallGraphStore::open(ctx.callgraph_store_dir(), root_path).unwrap();
+        store.cold_build(&[source]).unwrap();
+        let blocker = store.lock_readiness_for_test();
+        let token = ctx.mark_callgraph_store_force_rebuild("retry published store");
+        let pending = root.path().join("pending.rs");
+        ctx.add_pending_callgraph_store_paths([pending.clone()]);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        {
+            let mut receiver = ctx.callgraph_store_rx().lock();
+            ctx.note_callgraph_store_rx_generation(ctx.configure_generation());
+            ctx.next_callgraph_store_rx_epoch();
+            *receiver = Some(rx);
+        }
+        tx.send(CallGraphStoreBuildEvent::Ready {
+            store,
+            fulfilled_force_token: Some(token),
+            publication_epoch: ctx.callgraph_persist_epoch_flag().current(),
+        })
+        .unwrap();
+        drop(tx);
+        let original_epoch = ctx.callgraph_store_rx_epoch();
+        drain_callgraph_store_events(&ctx);
+        assert!(
+            ctx.callgraph_store_rx().lock().is_some(),
+            "busy reopen must retain retry ownership"
+        );
+        assert_ne!(ctx.callgraph_store_rx_epoch(), original_epoch);
+        assert!(ctx
+            .with_current_callgraph_store_rx(ctx.configure_generation(), original_epoch, |rx| *rx =
+                None)
+            .is_none());
+        assert_eq!(ctx.pending_callgraph_store_force_token(), Some(token));
+        assert_eq!(
+            ctx.take_pending_callgraph_store_paths(),
+            vec![pending.clone()]
+        );
+        ctx.add_pending_callgraph_store_paths([pending]);
+        drain_callgraph_store_events(&ctx);
+        assert!(ctx.callgraph_store_rx().lock().is_some());
+        blocker.execute_batch("ROLLBACK").unwrap();
+        let crate::callgraph_store::RefreshOpenLockTestGate {
+            held: refresh_locked,
+            release: release_refresh,
+            unlocked: refresh_unlocked,
+            read_done,
+        } = crate::callgraph_store::hold_refresh_open_lock_for_test(
+            ctx.callgraph_project_root().unwrap(),
+        );
+        drain_callgraph_store_events(&ctx);
+        assert!(ctx.callgraph_store_rx().lock().is_none());
+        assert!(ctx.callgraph_store().read().unwrap().is_some());
+        assert_eq!(ctx.pending_callgraph_store_force_token(), None);
+        refresh_locked
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        let resident = ctx.callgraph_store().read().unwrap();
+        let store = resident.as_ref().unwrap();
+        // Only SQLite observing the held lock can release the writer. The
+        // callback waits for ROLLBACK before allowing the query to retry, so a
+        // delayed test thread cannot miss contention and pass without a wait.
+        let (tree, busy_observed) = store.with_busy_observer_for_test(
+            move |timeout| {
+                release_refresh.send(()).is_ok() && refresh_unlocked.recv_timeout(timeout).is_ok()
+            },
+            || store.call_tree(Path::new("main.rs"), "entry", 1),
+        );
+        // Dropping the endpoint also frees the worker on an error or panic.
+        drop(read_done);
+        let tree = tree.unwrap();
+        assert!(busy_observed, "SQLite must observe the refresh lock");
+        assert_eq!(tree.children[0].name, "leaf");
+        crate::callgraph_store::clear_callgraph_refresh_worker_test_seam(
+            &ctx.callgraph_project_root().unwrap(),
+        );
+    }
+
+    #[test]
     fn callgraph_ready_transition_schedules_tier2_dead_code_rescan() {
         // When the callgraph store transitions to ready, the drain must request a
         // tier2 refresh pull. dead_code is suppressed (callgraph_available:false)
@@ -6318,10 +6641,18 @@ mod tests {
         drain.join().unwrap();
 
         ctx.mark_subc_bound();
-        let mut guard = 0;
+        // The replay must finish: the manual dispatch channel holds no
+        // platform watcher, so `has_more` can only come from the retained
+        // Apply continuation. A bound replay advances every slice; the only
+        // zero-progress park is transient LSP contention from the
+        // applicability worker spawned by the initial batch. Yield between
+        // slices so that worker can release the manager, and bound the wait
+        // by time rather than a fixed slice count, which is brittle under
+        // CI load.
+        let deadline = Instant::now() + Duration::from_secs(30);
         while drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more {
-            guard += 1;
-            assert!(guard < 32, "rebased replay must finish");
+            assert!(Instant::now() < deadline, "rebased replay must finish");
+            std::thread::yield_now();
         }
         let search = ctx
             .search_index()
@@ -6330,7 +6661,11 @@ mod tests {
         let index = search.as_ref().expect("search index");
         for (marker, path) in [("first_marker", &first), ("second_marker", &second)] {
             assert_eq!(
-                index.grep(marker, true, &[], &[], &root, 10).matches.len(),
+                index
+                    .grep(marker, true, &[], &[], &root, 10)
+                    .expect("grep over a test index")
+                    .matches
+                    .len(),
                 1,
                 "post-rebind replay must apply {} ({})",
                 marker,
@@ -6392,14 +6727,16 @@ mod tests {
             let search = ctx.search_index().read().unwrap();
             let index = search.as_ref().unwrap();
             assert!(!index.ready);
-            let fresh = index.grep(
-                "zzzz_refreshed_token",
-                true,
-                &[],
-                &[],
-                &root,
-                MUTATION_REFRESH_ENTRY_CAP,
-            );
+            let fresh = index
+                .grep(
+                    "zzzz_refreshed_token",
+                    true,
+                    &[],
+                    &[],
+                    &root,
+                    MUTATION_REFRESH_ENTRY_CAP,
+                )
+                .expect("grep over a test index");
             assert_eq!(fresh.matches.len(), retained.len() - 1);
             assert!(fresh.files_searched > 0);
         }
@@ -6438,6 +6775,7 @@ mod tests {
         assert_eq!(
             index
                 .grep("zzzz_uncollected_token", true, &[], &[], &root, 10)
+                .expect("grep over a test index")
                 .matches
                 .len(),
             1
@@ -6512,6 +6850,7 @@ mod tests {
         let found = |token: &str| {
             index
                 .grep(token, true, &[], &[], &base, 10)
+                .expect("grep over a test index")
                 .matches
                 .into_iter()
                 .map(|found| found.file)
@@ -6617,11 +6956,14 @@ mod tests {
         assert!(response.success, "{response:?}");
         let search = ctx.search_index().read().unwrap();
         let index = search.as_ref().unwrap();
-        let fresh = index.grep("zzzz_kept_token", true, &[], &[], &root, 10);
+        let fresh = index
+            .grep("zzzz_kept_token", true, &[], &[], &root, 10)
+            .expect("grep over a test index");
         assert_eq!(fresh.matches.len(), 1);
         assert!(fresh.files_searched > 0);
         assert!(index
             .grep("qqqq_deleted_token", true, &[], &[], &root, 10)
+            .expect("grep over a test index")
             .matches
             .is_empty());
         assert!(index.glob("**/*", &root).iter().all(|path| path != &old));
@@ -6662,11 +7004,14 @@ mod tests {
         let assert_fresh = || {
             let search = ctx.search_index().read().unwrap();
             let index = search.as_ref().unwrap();
-            let fresh = index.grep("zzzz_restored_token", true, &[], &[], &root, 10);
+            let fresh = index
+                .grep("zzzz_restored_token", true, &[], &[], &root, 10)
+                .expect("grep over a test index");
             assert_eq!(fresh.matches.len(), 1);
             assert!(fresh.files_searched > 0);
             assert!(index
                 .grep("qqqq_deleted_token", true, &[], &[], &root, 10)
+                .expect("grep over a test index")
                 .matches
                 .is_empty());
             assert!(index.glob("**/*", &root).iter().all(|path| path != &old));
@@ -6675,6 +7020,69 @@ mod tests {
         tx.send(stale).unwrap();
         drain_search_index_events(&ctx);
         assert_fresh();
+    }
+
+    #[test]
+    fn exact_memo_publication_retires_stale_sets_but_keeps_warm_hits() {
+        let project = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let seed = root.join("seed.rs");
+        let edited = root.join("edited.rs");
+        std::fs::write(&seed, "// quartz meadow beacon\n").unwrap();
+        std::fs::write(&edited, "// unrelated\n").unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.clone()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.clone());
+        *ctx.semantic_index_status().write().unwrap() =
+            crate::context::SemanticIndexStatus::Disabled;
+        *ctx.search_index().write().unwrap() = Some(crate::search_index::SearchIndex::build(&root));
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "exact-memo-publication",
+            "command": "semantic_search",
+            "query": "quartz meadow beacon",
+            "hint": "literal",
+            "top_k": 10,
+        }))
+        .unwrap();
+        let search = || {
+            let response = serde_json::to_value(
+                crate::commands::semantic_search::handle_semantic_search(&request, &ctx),
+            )
+            .unwrap();
+            assert_eq!(response["success"], true, "{response}");
+            response
+        };
+        assert_eq!(search()["result_count"], 1);
+        assert_eq!(search()["result_count"], 1);
+        assert_eq!(ctx.search_exact_memo().verifier_call_count(), 1);
+
+        let receiver_generation = ctx.search_index_rx_generation();
+        std::fs::write(&edited, "// quartz meadow beacon\n").unwrap();
+        refresh_search_index_after_write(&ctx, &edited);
+        assert_eq!(ctx.search_index_rx_generation(), receiver_generation);
+        assert_eq!(search()["result_count"], 2);
+        assert_eq!(search()["result_count"], 2);
+        assert_eq!(ctx.search_exact_memo().verifier_call_count(), 2);
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        ctx.install_search_index_rx(rx, ctx.configure_generation());
+        assert_eq!(ctx.search_index_rx_generation(), receiver_generation);
+        // A query may warm the memo against the old resident contents after a
+        // replacement receiver is installed but before its result is published.
+        assert_eq!(search()["result_count"], 2);
+        assert_eq!(ctx.search_exact_memo().verifier_call_count(), 2);
+        std::fs::write(&seed, "// retired\n").unwrap();
+        tx.send(crate::search_index::SearchIndex::build(&root))
+            .unwrap();
+        drain_search_index_events(&ctx);
+        assert_eq!(search()["result_count"], 1);
+        assert_eq!(search()["result_count"], 1);
+        assert_eq!(ctx.search_exact_memo().verifier_call_count(), 3);
     }
 
     #[test]
@@ -6704,6 +7112,7 @@ mod tests {
             assert_eq!(
                 index
                     .grep("fresh_write_marker", true, &[], &[], &root, 10)
+                    .expect("grep over a test index")
                     .matches
                     .len(),
                 1,
@@ -6711,6 +7120,7 @@ mod tests {
             );
             assert!(index
                 .grep("old_write_marker", true, &[], &[], &root, 10)
+                .expect("grep over a test index")
                 .matches
                 .is_empty());
         };
@@ -6768,6 +7178,7 @@ mod tests {
                 .as_ref()
                 .expect("installed search index")
                 .grep("repaired_marker", true, &[], &[], &root, 10)
+                .unwrap()
                 .matches
                 .len(),
             1,
@@ -6916,6 +7327,7 @@ mod tests {
             .as_ref()
             .expect("installed replacement index")
             .grep("LostLoadNeedle", true, &[], &[], &root, 10)
+            .unwrap()
             .matches
             .len();
         assert_eq!(
@@ -7626,6 +8038,7 @@ mod tests {
         event_tx
             .send(SemanticRefreshEvent::Completed {
                 refused_rows: Default::default(),
+                context_skipped: Default::default(),
                 added_entries: update.added_entries,
                 updated_metadata: update.updated_metadata,
                 completed_paths: update.completed_paths,
@@ -7772,6 +8185,7 @@ mod tests {
         event_tx
             .send(SemanticRefreshEvent::Completed {
                 refused_rows: Default::default(),
+                context_skipped: Default::default(),
                 added_entries: update.added_entries,
                 updated_metadata: update.updated_metadata,
                 completed_paths: update.completed_paths,
@@ -7851,6 +8265,7 @@ mod tests {
             } else {
                 SemanticRefreshEvent::Completed {
                     refused_rows: Default::default(),
+                    context_skipped: Default::default(),
                     added_entries: first.added_entries,
                     updated_metadata: first.updated_metadata,
                     completed_paths: first.completed_paths,
@@ -7880,6 +8295,7 @@ mod tests {
         event_tx
             .send(SemanticRefreshEvent::Completed {
                 refused_rows: Default::default(),
+                context_skipped: Default::default(),
                 added_entries: second.added_entries,
                 updated_metadata: second.updated_metadata,
                 completed_paths: second.completed_paths,
@@ -8295,7 +8711,7 @@ mod tests {
 mod watcher_slice_tests {
     use super::*;
     use crate::config::Config;
-    use crate::context::{default_language_provider_factory, AppContext, ViewRuntimeSnapshot};
+    use crate::context::{default_language_provider_factory, AppContext};
 
     #[test]
     fn request_watcher_drain_applies_at_most_one_slice() {
@@ -8368,46 +8784,15 @@ mod watcher_slice_tests {
     }
 
     #[test]
-    fn views_published_watcher_batch_skips_legacy_refresh_and_still_schedules_publication() {
+    fn views_routed_watcher_batch_skips_legacy_refresh_and_publishes_no_v1_view() {
         let root = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
         let (ctx, tx) = context_with_watcher(root.path());
         ctx.update_config(|config| {
             config.indexes.callgraph = true;
             config.views.enabled = true;
         });
         ctx.set_cache_writer_capabilities(false, false);
-        let family = crate::search_index::artifact_cache_key(root.path());
-        let scope = crate::path_identity::project_scope_key(root.path());
-        let view = crate::views::ViewStore::open(storage.path(), &scope).unwrap();
-        ctx.install_view_runtime(
-            ViewRuntimeSnapshot {
-                query_pin: None,
-                storage: storage.path().to_path_buf(),
-                family,
-                scope,
-                view_dir: view.view_dir().to_path_buf(),
-                generation: Some("1-published".to_owned()),
-                manifest: Some(
-                    crate::views::Manifest::new(std::iter::empty::<(
-                        crate::views::RelPath,
-                        crate::views::ManifestEntry,
-                    )>())
-                    .unwrap(),
-                ),
-                head_fingerprint: "published".to_owned(),
-                head_metadata: crate::alias::capture_git_head_metadata(root.path(), None)
-                    .unwrap_or_else(|_| crate::alias::GitHeadMetadata {
-                        head_path: root.path().join(".git/HEAD"),
-                        head_mtime: None,
-                        resolved_ref_path: None,
-                        resolved_ref_mtime: None,
-                    }),
-                pending_paths: BTreeSet::new(),
-                pending_inputs: Default::default(),
-            },
-            None,
-        );
+        assert!(ctx.views_route_root());
         reset_legacy_watcher_refreshes_for_test();
         tx.send(WatcherDispatchEvent::Paths(vec![root
             .path()
@@ -8420,15 +8805,16 @@ mod watcher_slice_tests {
         assert_eq!(
             legacy_watcher_refreshes_for_test(),
             0,
-            "a published view must own watcher callgraph writes"
+            "a routed root's v3 views must own watcher callgraph writes"
         );
-        assert!(
-            ctx.watcher_drain_slice()
-                .lock()
-                .as_ref()
-                .is_some_and(|state| state.view_publication_due.is_some()),
-            "view publication must remain scheduled"
-        );
+        // Even once the batch's publication deadline passes, nothing is
+        // assembled or published into a v1 view.
+        if let Some(state) = ctx.watcher_drain_slice().lock().as_mut() {
+            state.view_publication_due = Some(Instant::now());
+        }
+        drain_watcher_to_completion_for_test(&ctx, 1);
+        assert_eq!(ctx.view_publication_attempts_for_test(), 0);
+        assert!(ctx.view_runtime_snapshot().is_none());
 
         ctx.update_config(|config| config.views.enabled = false);
         tx.send(WatcherDispatchEvent::Paths(vec![root
@@ -8452,6 +8838,79 @@ mod watcher_slice_tests {
 
     fn clear_watcher_unit_test_seam() {
         set_watcher_unit_test_seam(Duration::ZERO, None);
+    }
+
+    #[test]
+    fn watcher_slice_applies_a_path_when_receiving_exhausts_the_budget() {
+        // Every slice receives one new event whose processing alone uses the
+        // whole slice budget (the pinned clock advances by the budget). The
+        // queued batch must still move forward by one path per slice instead
+        // of waiting for the event stream to go quiet.
+        struct ResetReceiveDelay;
+        impl Drop for ResetReceiveDelay {
+            fn drop(&mut self) {
+                WATCHER_RECEIVE_TEST_DELAY.with(|delay| delay.set(Duration::ZERO));
+            }
+        }
+        let _clock = WatcherDrainTestClock::freeze();
+        WATCHER_RECEIVE_TEST_DELAY.with(|delay| delay.set(WATCHER_DRAIN_SLICE_BUDGET));
+        let _reset = ResetReceiveDelay;
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, tx) = context_with_watcher(temp.path());
+        let batch = 4;
+        tx.send(WatcherDispatchEvent::Paths(
+            (0..batch)
+                .map(|index| temp.path().join(format!("first-{index}.rs")))
+                .collect(),
+        ))
+        .unwrap();
+        let apply_position = |ctx: &AppContext| {
+            let slice = ctx.watcher_drain_slice().lock();
+            let state = slice.as_ref().expect("watcher continuation is retained");
+            let WatcherDrainPhase::Apply {
+                stage, remaining, ..
+            } = &state.phase
+            else {
+                panic!("the first batch must still be applying");
+            };
+            (*stage, *remaining, state.pending_paths.len())
+        };
+
+        let outcome = drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+        assert_eq!(outcome.processed, batch);
+        assert!(outcome.has_more);
+        assert_eq!(
+            apply_position(&ctx),
+            (WatcherDrainApplyPhase::PendingTier2, batch - 1, 0),
+            "a slice whose receive step used the budget must still apply one path"
+        );
+
+        for slice in 1..batch {
+            tx.send(WatcherDispatchEvent::Paths(vec![temp
+                .path()
+                .join(format!("later-{slice}.rs"))]))
+                .unwrap();
+            assert!(drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more);
+            assert_eq!(
+                apply_position(&ctx),
+                (
+                    WatcherDrainApplyPhase::PendingTier2,
+                    batch - 1 - slice,
+                    slice
+                ),
+                "slice {slice} under sustained events must apply one more path"
+            );
+        }
+        // The emptied stage hands the batch to the next one on the next slice.
+        tx.send(WatcherDispatchEvent::Paths(vec![temp
+            .path()
+            .join("later-final.rs")]))
+            .unwrap();
+        drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+        assert_eq!(
+            apply_position(&ctx),
+            (WatcherDrainApplyPhase::PendingIndexes, batch, batch)
+        );
     }
 
     #[test]
@@ -9019,6 +9478,7 @@ mod watcher_slice_tests {
             .as_ref()
             .expect("resident search index")
             .grep(pattern, true, &[], &[], root, 10)
+            .unwrap()
             .matches
             .len()
     }
@@ -9345,6 +9805,7 @@ mod watcher_slice_tests {
         assert_eq!(
             restored
                 .grep("new owner token", true, &[], &[], &canonical, 10)
+                .unwrap()
                 .matches
                 .len(),
             1,
@@ -9366,11 +9827,23 @@ mod idle_lsp_tests {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn idle_lsp_standalone_reaps_unused_package_while_requests_keep_root_busy() {
+        let fixture = crate::lsp::manager::regression_tests::IdleLspFixture::new();
+        let busy_pid = fixture.pid(&fixture.busy).unwrap();
+        for _ in 0..3 {
+            fixture.hover(&fixture.busy);
+            super::shutdown_idle_lsp(&fixture.ctx);
+        }
+        fixture.assert_only_busy();
+        assert_eq!(fixture.pid(&fixture.busy), Some(busy_pid));
+    }
+
     #[cfg(unix)]
     fn spawn_sleep_client(ctx: &AppContext, root: std::path::PathBuf) -> u32 {
         let registry = LspChildRegistry::new();
         ctx.lsp().set_child_registry(registry.clone());
-        let client = LspClient::spawn(
+        let client = LspClient::spawn_with_reclaim_root(
             ServerKind::TypeScript,
             root,
             Path::new("sh"),
@@ -9378,6 +9851,8 @@ mod idle_lsp_tests {
             &HashMap::new(),
             ctx.lsp().event_sender_for_test(),
             registry,
+            None,
+            false,
         )
         .expect("spawn idle-lsp stand-in");
         let pid = client.child_pid();

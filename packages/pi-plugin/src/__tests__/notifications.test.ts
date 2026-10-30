@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
+import { __test__ } from "../index.js";
 import {
   type ConfigureWarning,
   deliverConfigureWarnings,
@@ -441,5 +442,72 @@ describe("sendFeatureAnnouncement storage", () => {
 
     expect(readFileSync(join(storageDir, "pi", "last_announced_version"), "utf8")).toBe("0.30.1");
     expect(existsSync(join(storageDir, "last_announced_version"))).toBe(false);
+  });
+});
+
+describe("configure warning retry", () => {
+  test("failed UI delivery retains warnings until a session UI becomes available", async () => {
+    const storageDir = createStorageDir();
+    const { bridge, send } = createStateBridge();
+    const context = {
+      projectRoot: storageDir,
+      sessionId: "session-ui-retry",
+      storageDir,
+      pluginVersion: "1.0.0",
+      bridge,
+    };
+    await __test__.handleConfigureWarningsForSession({
+      ...context,
+      client: {
+        hasUI: false,
+        ui: {
+          notify: () => {
+            throw new Error("headless UI called");
+          },
+        },
+      },
+      warnings: [baseWarning()],
+    });
+    expect(dbSetCalls(send)).toHaveLength(0);
+    const { client, messages } = createClient();
+    await __test__.handleConfigureWarningsForSession({ ...context, client, warnings: [] });
+    await __test__.handleConfigureWarningsForSession({ ...context, client, warnings: [] });
+    expect(messages).toHaveLength(1);
+    expect(dbSetCalls(send)).toHaveLength(1);
+  });
+
+  test("unknown dedup state retains buffered warnings for a later configured call", async () => {
+    const storageDir = createStorageDir();
+    const { client, messages } = createClient();
+    const context = {
+      projectRoot: storageDir,
+      storageDir,
+      pluginVersion: "1.0.0",
+      client,
+      warnings: [baseWarning()],
+      bridge: createFailingBridge().bridge,
+    };
+    await __test__.handleConfigureWarningsForSession(context);
+    await __test__.handleConfigureWarningsForSession({
+      ...context,
+      sessionId: "session-retry",
+      warnings: [],
+    });
+    expect(messages).toHaveLength(0);
+    const recovered = createStateBridge();
+    await __test__.handleConfigureWarningsForSession({
+      ...context,
+      sessionId: "session-retry",
+      warnings: [],
+      bridge: recovered.bridge,
+    });
+    expect(messages).toHaveLength(1);
+    await __test__.handleConfigureWarningsForSession({
+      ...context,
+      sessionId: "session-retry",
+      warnings: [],
+      bridge: recovered.bridge,
+    });
+    expect(messages).toHaveLength(1);
   });
 });

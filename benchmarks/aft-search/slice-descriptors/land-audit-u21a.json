@@ -1,0 +1,14 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/search_b2/embed_counter.rs",
+    "crates/aft/src/search_index.rs",
+    "crates/aft/src/semantic_index.rs"
+  ],
+  "note": "u21a: cache hardening; ranking-fenced files touched but rows expected byte-identical (finite-score order unchanged) Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}

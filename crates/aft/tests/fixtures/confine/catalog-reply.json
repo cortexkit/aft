@@ -1,6 +1,6 @@
 {
-  "generation": "8cc3a71d49d61cda6b84464707ab63db5bed6352187694fd01654bbffcc9b47d",
-  "catalog_digest": "8cc3a71d49d61cda6b84464707ab63db5bed6352187694fd01654bbffcc9b47d",
+  "generation": "59ff402e31959b3612048411ed521bda1926786a71bd418768992ed53a3c5700",
+  "catalog_digest": "59ff402e31959b3612048411ed521bda1926786a71bd418768992ed53a3c5700",
   "tools": [
     {
       "name": "read",
@@ -15,6 +15,7 @@
         "prepend",
         "append"
       ],
+      "result_format": "tool-result/v1",
       "capabilities": [
         "code.read/v1"
       ],
@@ -66,6 +67,7 @@
         "codemode",
         "flow"
       ],
+      "result_format": "tool-result/v1",
       "capabilities": [
         "code.search/v1"
       ],
@@ -104,6 +106,7 @@
         "codemode",
         "flow"
       ],
+      "result_format": "tool-result/v1",
       "capabilities": [
         "code.search/v1"
       ],
@@ -133,6 +136,7 @@
         "codemode",
         "flow"
       ],
+      "result_format": "tool-result/v1",
       "capabilities": [
         "code.outline/v1"
       ],

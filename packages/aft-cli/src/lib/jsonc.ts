@@ -1,4 +1,16 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname } from "node:path";
 import {
   assign as assignJsonc,
@@ -49,18 +61,34 @@ export function readJsoncFile(path: string): {
 
 /**
  * Write a JSON/JSONC file, preserving comments when possible. Creates parent
- * directories. When `format === "jsonc"` and the value was produced by
- * `comment-json`'s `parse`, embedded comments are retained via `stringifyJsonc`.
+ * directories. Both extensions can contain comments accepted by the reader.
+ * Replace the resolved target so dotfile symlinks and existing modes survive.
  */
 export function writeJsoncFile(
   path: string,
   value: Record<string, unknown>,
-  format: JsoncFormat = "json",
+  _format: JsoncFormat = "json",
 ): void {
   mkdirSync(dirname(path), { recursive: true });
-  const serialized =
-    format === "jsonc" ? stringifyJsonc(value, null, 2) : JSON.stringify(value, null, 2);
-  writeFileSync(path, `${serialized}\n`);
+  // existsSync follows links, so a dangling link must not be treated as a new file.
+  const link = lstatSync(path, { throwIfNoEntry: false });
+  if (link?.isSymbolicLink() && !existsSync(path)) {
+    throw new Error(`Cannot write ${path}: config symlink target is missing or unreadable`);
+  }
+  const target = existsSync(path) ? realpathSync(path) : path;
+  const mode = existsSync(target) ? statSync(target).mode & 0o777 : undefined;
+  const temporary = `${target}.tmp-${randomUUID()}`;
+  try {
+    writeFileSync(temporary, `${stringifyJsonc(value, null, 2)}\n`, { flag: "wx", mode });
+    if (mode !== undefined) chmodSync(temporary, mode);
+    renameSync(temporary, target);
+  } catch (error) {
+    // Diagnostics should name the user's config, not an unpublished temporary.
+    if (error && typeof error === "object" && "path" in error) error.path = path;
+    throw error;
+  } finally {
+    rmSync(temporary, { force: true });
+  }
 }
 
 /** Canonical URL of the published AFT config schema. */

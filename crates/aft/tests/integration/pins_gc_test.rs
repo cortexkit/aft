@@ -22,6 +22,7 @@ fn sweep_request<'a>(
     references: SweepReferences,
 ) -> SweepRequest<'a> {
     SweepRequest {
+        durable_storage: storage.path(),
         storage: storage.path(),
         family: "family-a",
         view_dir: view.path(),

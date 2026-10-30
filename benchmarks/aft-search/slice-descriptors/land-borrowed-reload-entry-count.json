@@ -1,0 +1,14 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/search_index.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs"
+  ],
+  "slices": [
+    "borrowed-reload-entry-count"
+  ],
+  "note": "Test-only. search_index.rs gains a #[cfg(test)] per-root counter of records read on the borrowed-load path; semantic_search/mod.rs and readonly_artifacts.rs tests assert the reload read between 1 and the entry budget instead of timing it. No product code in the fence changes, so ranked rows must remain byte-identical to the committed reference."
+}

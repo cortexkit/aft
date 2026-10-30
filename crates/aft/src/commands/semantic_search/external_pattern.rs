@@ -84,7 +84,7 @@ impl Corpus<'_> {
         &self,
         compiled: &pattern_compile::CompiledPattern,
         include_tests: bool,
-    ) -> crate::search_index::GrepFileCollection {
+    ) -> std::io::Result<crate::search_index::GrepFileCollection> {
         let mut collection = self.index.snapshot().collect_grep_matches_by_file(
             compiled,
             &PathFilters::default(),
@@ -93,11 +93,11 @@ impl Corpus<'_> {
             regex_route::limits(),
             &regex_route::examine_priority,
             &regex_route::keep_past_line_limit,
-        );
+        )?;
         // Even a completed examination of the postings cannot claim that the
         // pattern matched nothing if the walk or re-read left files unchecked.
         collection.examination_capped |= !self.check.verified();
-        collection
+        Ok(collection)
     }
 
     fn semantic_index(&self, ctx: &AppContext) -> Option<&SemanticIndex> {
@@ -243,7 +243,8 @@ pub(super) fn handle(
     root: &Path,
 ) -> Response {
     let config = ctx.config();
-    let source = ExternalReadinessSource::new(ctx, root, config.storage_dir.as_deref());
+    let storage = config.cache_storage_dir();
+    let source = ExternalReadinessSource::new(ctx, root, storage.as_deref());
     let mut readiness = extensions.sample_readiness(&extensions::Root::new(
         root,
         &source as &dyn extensions::ReadinessSource,

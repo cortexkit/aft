@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "gh-shim-plexus-contract-tests"
+  ],
+  "note": "The gh shim's stand-in holder judges every relayed request against Plexus's vendored gh.route contract vectors, a test proves every request the shim builds is accepted, and the shim now sends the bare thread number when given an issue or pull URL. Only gh shim code and tests change; no changed path matches RANKING_FENCE_PREFIXES."
+}

@@ -1,0 +1,12 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/commands/semantic_search/mod.rs"
+  ],
+  "note": "The ranking-fenced semantic_search change only adds the existing bounded-walk disclosure and keeps the trigram lane labelled building when the index finished loading after the plan was made. Ranking and routing are unchanged; benchmark rows must remain byte-identical. Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}

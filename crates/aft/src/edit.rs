@@ -11,7 +11,7 @@ use crate::config::Config;
 use crate::context::AppContext;
 use crate::error::AftError;
 use crate::format;
-use crate::parser::{detect_language, parse_source_with_cached_parser, FileParser};
+use crate::parser::{detect_language, parse_source_with_cached_parser, FileParser, LangId};
 
 #[cfg(windows)]
 mod windows_replace;
@@ -1131,7 +1131,47 @@ pub fn validate_syntax_with_parser(
 pub fn validate_syntax_str(content: &str, path: &Path) -> Option<bool> {
     let lang = detect_language(path)?;
     let tree = parse_source_with_cached_parser(path, content, lang).ok()?;
-    Some(!tree.root_node().has_error())
+    Some(first_tree_syntax_error_line(&tree, content, lang).is_none())
+}
+
+/// [`validate_syntax`] for a file an edit just wrote. It adds the checks that
+/// [`validate_syntax_str`] makes beyond tree-sitter's ERROR and MISSING nodes
+/// (Python block indentation), so an edit is judged the same way whichever
+/// path validates it. Outline keeps using [`validate_syntax`]: it only needs
+/// to know whether tree-sitter could recover the symbols.
+pub(crate) fn validate_edited_file_syntax(path: &Path) -> Result<Option<bool>, AftError> {
+    let verdict = validate_syntax(path)?;
+    if verdict != Some(true) || detect_language(path) != Some(LangId::Python) {
+        return Ok(verdict);
+    }
+    let source = read_edit_text(path).map_err(|error| AftError::IoError {
+        path: path.display().to_string(),
+        message: error.to_string(),
+    })?;
+    Ok(validate_syntax_str(&source, path))
+}
+
+/// 1-based line of the first syntax error in a parsed edit result, or `None`
+/// when the result is valid. tree-sitter's ERROR and MISSING nodes come
+/// first. A Python tree without them is then checked for block indentation
+/// that tree-sitter-python accepts but CPython rejects (see
+/// [`python_indent`]); without that check an edit that leaves an
+/// IndentationError would be reported as valid and never rolled back.
+pub(crate) fn first_tree_syntax_error_line(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    lang: LangId,
+) -> Option<usize> {
+    let root = tree.root_node();
+    if root.has_error() {
+        // `has_error` guarantees an ERROR or MISSING node; line 1 is only a
+        // fallback that the walk never reaches.
+        return Some(first_syntax_error_line(root).unwrap_or(1));
+    }
+    if lang == LangId::Python {
+        return python_indent::first_indentation_error_line(tree, source);
+    }
+    None
 }
 
 /// Check if the caller requested diff info in the response.
@@ -1955,6 +1995,7 @@ pub(crate) fn full_validation_requested(config: &Config, params: &serde_json::Va
 /// Validate the completed multi-file operation, never its intermediate writes.
 /// Call only after all writes succeeded and rollback is no longer needed.
 pub(crate) fn validate_written_files(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
     paths: &[std::path::PathBuf],
     config: &Config,
     params: &serde_json::Value,
@@ -1964,7 +2005,7 @@ pub(crate) fn validate_written_files(
     }
     notify_full_validation_start();
     let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Validate);
-    Some(format::validate_full_batch(paths, config))
+    Some(format::validate_full_batch(tool_policy, paths, config))
 }
 
 /// Write content to disk, auto-format, then validate syntax.
@@ -1980,16 +2021,27 @@ pub(crate) fn validate_written_files(
 /// the project's type checker is invoked after syntax validation and the
 /// results are included in `WriteResult`.
 pub fn write_format_validate(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
     path: &Path,
     content: &str,
     config: &Config,
     params: &serde_json::Value,
 ) -> Result<WriteResult, AftError> {
-    write_format_validate_impl(path, content, config, params, false, None, false)
+    write_format_validate_impl(
+        tool_policy,
+        path,
+        content,
+        config,
+        params,
+        false,
+        None,
+        false,
+    )
 }
 
 /// Reuse the captured original only while its strong file identity still matches.
 pub(crate) fn write_format_validate_observed(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
     path: &Path,
     content: &str,
     config: &Config,
@@ -2003,18 +2055,37 @@ pub(crate) fn write_format_validate_observed(
         .and(observation.version)
         .filter(|version| Some(*version) == crate::backup::DiskFileVersion::of_path(path))
         .map(|_| original);
-    write_format_validate_impl(path, content, config, params, false, pre, false)
+    write_format_validate_impl(
+        tool_policy,
+        path,
+        content,
+        config,
+        params,
+        false,
+        pre,
+        false,
+    )
 }
 
 /// Write, format and syntax-check now; the caller checks the completed project
 /// with `validate_written_files` after every file has been written successfully.
 pub(crate) fn write_format_validate_deferred(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
     path: &Path,
     content: &str,
     config: &Config,
     params: &serde_json::Value,
 ) -> Result<WriteResult, AftError> {
-    write_format_validate_impl(path, content, config, params, true, None, false)
+    write_format_validate_impl(
+        tool_policy,
+        path,
+        content,
+        config,
+        params,
+        true,
+        None,
+        false,
+    )
 }
 
 /// Write and format a file that did not exist before the caller's
@@ -2024,17 +2095,21 @@ pub(crate) fn write_format_validate_deferred(
 /// checks the file's final content once with [`check_created_file_syntax`]
 /// after its last step. `syntax_valid` and `syntax_error_line` are `None`.
 pub(crate) fn write_format_deferred_created(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
     path: &Path,
     content: &str,
     config: &Config,
     params: &serde_json::Value,
 ) -> Result<WriteResult, AftError> {
-    write_format_validate_impl(path, content, config, params, true, None, true)
+    write_format_validate_impl(tool_policy, path, content, config, params, true, None, true)
 }
 
+mod bash;
+mod python_indent;
 mod swift;
 
 fn write_format_validate_impl(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
     path: &Path,
     content: &str,
     config: &Config,
@@ -2077,7 +2152,7 @@ fn write_format_validate_impl(
 
     // Step 2: Format (before validate so we validate the formatted content)
     let format_phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Format);
-    let (formatted, format_skipped_reason) = format::auto_format(path, config);
+    let (formatted, format_skipped_reason) = format::auto_format(tool_policy, path, config);
     drop(format_phase);
 
     // Step 3: Validate syntax
@@ -2092,19 +2167,30 @@ fn write_format_validate_impl(
         .filter(|_| !syntax_checked_by_caller)
         .and_then(|source| {
             if !existed {
-                let check = check_created_file_syntax(path, source);
+                let check = check_created_file_syntax(tool_policy, path, source);
                 syntax_error_line = check.first_error_line;
                 syntax_skipped_reason = check.skipped_reason;
                 return check.valid;
             }
             let syntax_valid = validate_captured_syntax(path, source);
-            swift::confirm_if_needed(
-                path,
-                source,
-                pre_write_content.as_deref(),
-                &mut was_syntax_valid,
-                syntax_valid,
-            )
+            if bash::applies(path) {
+                bash::confirm_if_needed(
+                    tool_policy,
+                    source,
+                    pre_write_content.as_deref(),
+                    &mut was_syntax_valid,
+                    syntax_valid,
+                )
+            } else {
+                swift::confirm_if_needed(
+                    tool_policy,
+                    path,
+                    source,
+                    pre_write_content.as_deref(),
+                    &mut was_syntax_valid,
+                    syntax_valid,
+                )
+            }
         });
     let rolled_back = if was_syntax_valid == Some(true) && syntax_valid == Some(false) {
         if let Some(original) = pre_write_content.as_ref() {
@@ -2133,7 +2219,7 @@ fn write_format_validate_impl(
     let (validation_errors, validate_skipped_reason) = if validate_requested {
         notify_full_validation_start();
         let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Validate);
-        format::validate_full(path, config)
+        format::validate_full(tool_policy, path, config)
     } else {
         (Vec::new(), None)
     };
@@ -2173,15 +2259,28 @@ fn write_format_validate_impl(
 }
 
 fn validate_captured_syntax(path: &Path, source: &str) -> Option<bool> {
-    parse_captured_syntax(path, source).map(|tree| !tree.root_node().has_error())
+    parse_captured_syntax_with_lang(path, source)
+        .map(|(tree, lang)| first_tree_syntax_error_line(&tree, source, lang).is_none())
 }
 
+#[cfg(test)]
 fn parse_captured_syntax(path: &Path, source: &str) -> Option<tree_sitter::Tree> {
+    parse_captured_syntax_with_lang(path, source).map(|(tree, _)| tree)
+}
+
+/// Parse an edit result for syntax checking, returning the language too so
+/// language-specific checks (Python indentation) can run on the same tree.
+fn parse_captured_syntax_with_lang(
+    path: &Path,
+    source: &str,
+) -> Option<(tree_sitter::Tree, LangId)> {
     let lang = detect_language(path)?;
     #[cfg(test)]
     A03_SYNTAX_PARSES.with(|count| count.set(count.get() + 1));
     let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Syntax);
-    crate::parser::parse_source_with_cached_parser(path, source, lang).ok()
+    crate::parser::parse_source_with_cached_parser(path, source, lang)
+        .ok()
+        .map(|tree| (tree, lang))
 }
 
 /// Syntax verdict for a file the current call created.
@@ -2200,25 +2299,49 @@ pub(crate) struct CreatedFileSyntax {
 /// A new file cannot be rolled back to earlier content, so an invalid result
 /// is kept on disk and reported to the agent instead. The error line comes
 /// from the same tree-sitter parse that produced the verdict. Swift files that
-/// tree-sitter rejects are confirmed with `swiftc -parse` first, so a file the
-/// compiler accepts counts as valid and carries no error line. An unavailable
-/// compiler verdict is unknown and carries a reason instead of an error line.
-pub(crate) fn check_created_file_syntax(path: &Path, source: &str) -> CreatedFileSyntax {
-    let Some(tree) = parse_captured_syntax(path, source) else {
+/// tree-sitter rejects are confirmed with `swiftc -parse` first, and bash
+/// files with `bash -n`, so a file the compiler or shell accepts counts as
+/// valid and carries no error line. For a bash error the shell confirms, the
+/// line bash names is preferred over tree-sitter's. An unavailable compiler or
+/// shell verdict is unknown and carries a reason instead of an error line;
+/// for bash that includes a missing shell, since tree-sitter-bash alone
+/// rejects some valid scripts.
+pub(crate) fn check_created_file_syntax(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    path: &Path,
+    source: &str,
+) -> CreatedFileSyntax {
+    let Some((tree, lang)) = parse_captured_syntax_with_lang(path, source) else {
         return CreatedFileSyntax {
             valid: None,
             skipped_reason: None,
             first_error_line: None,
         };
     };
-    let root = tree.root_node();
-    let (valid, skipped_reason) =
-        match swift::confirm_created(path, source, Some(!root.has_error())) {
+    // tree-sitter's verdict, including the Python indentation check, is
+    // computed once; the bash and Swift confirmations below re-judge only a
+    // rejection, exactly as they do for an existing file's edit.
+    let error_line = first_tree_syntax_error_line(&tree, source, lang);
+    let tree_valid = Some(error_line.is_none());
+    // The line bash itself named for a syntax error it confirmed.
+    let mut shell_error_line = None;
+    let (valid, skipped_reason) = if tree_valid == Some(false) && bash::applies(path) {
+        match bash::confirm_created(tool_policy, source) {
+            Ok(bash::ShellVerdict::Valid) => (Some(true), None),
+            Ok(bash::ShellVerdict::Broken(line)) => {
+                shell_error_line = line;
+                (Some(false), None)
+            }
+            Err(reason) => (None, Some(reason)),
+        }
+    } else {
+        match swift::confirm_created(tool_policy, path, source, tree_valid) {
             Ok(valid) => (valid, None),
             Err(reason) => (None, Some(reason)),
-        };
+        }
+    };
     let first_error_line = if valid == Some(false) {
-        first_syntax_error_line(root)
+        shell_error_line.or(error_line)
     } else {
         None
     };
@@ -2229,30 +2352,35 @@ pub(crate) fn check_created_file_syntax(path: &Path, source: &str) -> CreatedFil
     }
 }
 
-/// 1-based start line of the first ERROR or MISSING node in document order.
+/// 1-based line of the first token the parser could not fit, in document
+/// order: the first stray token inside an ERROR node, or a MISSING node.
 ///
-/// tree-sitter sets `has_error` on a node exactly when its subtree contains an
-/// ERROR or MISSING node, so the walk only descends into subtrees that carry
-/// one and returns `None` only for a tree without errors. It is iterative
-/// because deeply nested syntax trees could overflow a recursive walk.
-pub(crate) fn first_syntax_error_line(root: tree_sitter::Node<'_>) -> Option<usize> {
-    let mut cursor = root.walk();
-    loop {
-        let node = cursor.node();
-        if node.is_error() || node.is_missing() {
-            return Some(node.start_position().row + 1);
+/// Error recovery can wrap many valid statements in one ERROR node whose
+/// start is a line with no mistake on it; the tokens the parser actually got
+/// stuck on follow those complete statements. So inside an ERROR the walk
+/// skips complete, error-free subtrees and comments, and reports the first
+/// bare token, or descends into a nested error that comes first. Outside an
+/// ERROR it follows the first child whose subtree carries an error
+/// (tree-sitter's `has_error`). An ERROR with nothing else to point at is
+/// reported at its own start. Returns `None` only for a tree without errors.
+/// The walk is iterative so deeply nested trees cannot overflow the stack.
+pub(crate) fn first_syntax_error_line(mut node: tree_sitter::Node<'_>) -> Option<usize> {
+    let line = |node: tree_sitter::Node<'_>| node.start_position().row + 1;
+    'descend: loop {
+        if node.is_missing() {
+            return Some(line(node));
         }
-        if node.has_error() && cursor.goto_first_child() {
-            continue;
-        }
-        loop {
-            if cursor.goto_next_sibling() {
-                break;
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.has_error() || child.is_error() || child.is_missing() {
+                node = child;
+                continue 'descend;
             }
-            if !cursor.goto_parent() {
-                return None;
+            if node.is_error() && !child.is_extra() && child.child_count() == 0 {
+                return Some(line(child));
             }
         }
+        return node.is_error().then(|| line(node));
     }
 }
 
@@ -2287,8 +2415,14 @@ mod tests {
                 format_on_edit: false,
                 ..Config::default()
             };
-            let mut result =
-                write_format_validate(&path, updated, &config, &serde_json::json!({})).unwrap();
+            let mut result = write_format_validate(
+                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                &path,
+                updated,
+                &config,
+                &serde_json::json!({}),
+            )
+            .unwrap();
             assert!(!result.rolled_back);
             assert_eq!(result.syntax_valid, Some(true));
             assert_eq!(result.final_content(&path), Some(updated));
@@ -2301,26 +2435,129 @@ mod tests {
 
     use super::*;
 
+    /// A valid script whose escaped `[ ... \< ... ]` comparison tree-sitter-bash
+    /// cannot parse. Error recovery wraps lines 6-69 in one ERROR that starts
+    /// at `set -u`; inside it, the complete statements of lines 6-18 are
+    /// followed by the bare `while` and `[` tokens of line 19, where the parse
+    /// got stuck.
+    const BASH_GRAMMAR_GAP_FIXTURE: &str = include_str!("../tests/fixtures/aft-window-6deceda4.sh");
+
+    #[test]
+    fn syntax_error_line_points_at_stuck_token_not_recovery_wrapper() {
+        let path = Path::new("new.sh");
+        let tree = parse_captured_syntax(path, BASH_GRAMMAR_GAP_FIXTURE).unwrap();
+        let mut cursor = tree.root_node().walk();
+        let outer = tree
+            .root_node()
+            .children(&mut cursor)
+            .find(|child| child.is_error())
+            .unwrap();
+        assert_eq!(outer.start_position().row + 1, 6);
+        assert_eq!(first_syntax_error_line(tree.root_node()), Some(19));
+
+        // Truly broken: the recovery ERROR starts at `in` on line 3 and holds
+        // the valid `a)` item before the stray `b` on line 5, the line
+        // `bash -n` reports.
+        let broken_case = "set -u\necho a\ncase x in\n  a) echo ;;\n  b echo ;;\nesac\n";
+        let tree = parse_captured_syntax(path, broken_case).unwrap();
+        assert_eq!(first_syntax_error_line(tree.root_node()), Some(5));
+
+        let broken = "#!/usr/bin/env bash\nset -u\nif true; then\n  )\nfi\n";
+        let tree = parse_captured_syntax(path, broken).unwrap();
+        assert_eq!(first_syntax_error_line(tree.root_node()), Some(4));
+        let clean = parse_captured_syntax(path, "set -u\necho ok\n").unwrap();
+        assert_eq!(first_syntax_error_line(clean.root_node()), None);
+    }
+
+    /// The bisected trigger: an escaped `\<` (or `\>`) string comparison inside
+    /// `[ ... ]`. The other suspects in the fixture parse cleanly on their own.
+    #[test]
+    fn bash_syntax_grammar_gap_is_escaped_comparison() {
+        let path = Path::new("new.sh");
+        for source in [
+            "[ a \\< b ]\n",
+            "[ a \\> b ]\n",
+            "while [ a \\< b ]; do :; done\n",
+        ] {
+            let tree = parse_captured_syntax(path, source).unwrap();
+            assert!(
+                tree.root_node().has_error(),
+                "{}",
+                tree.root_node().to_sexp()
+            );
+        }
+        let fixture_lines: Vec<&str> = BASH_GRAMMAR_GAP_FIXTURE.lines().collect();
+        for source in [
+            // `aft_pid()`: `python3 -c` with a single-quoted program after a
+            // `\` line continuation (fixture lines 14-17).
+            fixture_lines[13..17].join("\n"),
+            // `awk 'NR==2{...}'` inside `$(...)` (fixture line 20).
+            fixture_lines[19].to_string(),
+            "while [ a = b ]; do :; done\n".to_string(),
+        ] {
+            let tree = parse_captured_syntax(path, &source).unwrap();
+            assert!(
+                !tree.root_node().has_error(),
+                "{}",
+                tree.root_node().to_sexp()
+            );
+        }
+    }
+
     #[test]
     fn created_file_syntax_reports_first_error_line() {
         let path = Path::new("new.ts");
         // ERROR node on line 3 (later lines are broken too).
         let check = check_created_file_syntax(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
             path,
             "const a = 1;\nconst b = 2;\nfunction broken( {{\nconst c = ;\n",
         );
         assert_eq!(check.valid, Some(false));
         assert_eq!(check.first_error_line, Some(3));
         // A MISSING node (unclosed call) also counts.
-        let missing = check_created_file_syntax(path, "const a = 1;\nfoo(1\n");
+        let missing = check_created_file_syntax(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            path,
+            "const a = 1;\nfoo(1\n",
+        );
         assert_eq!(missing.valid, Some(false));
         assert!(missing.first_error_line.is_some_and(|line| line >= 2));
-        let valid = check_created_file_syntax(path, "const a = 1;\n");
+        let valid = check_created_file_syntax(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            path,
+            "const a = 1;\n",
+        );
         assert_eq!(valid.valid, Some(true));
         assert_eq!(valid.first_error_line, None);
-        let unsupported = check_created_file_syntax(Path::new("notes.unknownext"), "{{");
+        let unsupported = check_created_file_syntax(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            Path::new("notes.unknownext"),
+            "{{",
+        );
         assert_eq!(unsupported.valid, None);
         assert_eq!(unsupported.first_error_line, None);
+    }
+
+    /// A Python file tree-sitter accepts but CPython rejects for its block
+    /// indentation is judged invalid on the same path as bash and Swift files,
+    /// with the line of the misplaced statement. Neither the bash nor the
+    /// Swift confirmation re-judges a Python verdict.
+    #[test]
+    fn created_python_file_reports_indentation_error_line() {
+        let path = Path::new("new.py");
+        let broken = "def g():\n    if True:\n        return 2\n            y = 5\n    return 3\n";
+        let policy = crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test();
+        let check = check_created_file_syntax(&policy, path, broken);
+        assert_eq!(check.valid, Some(false));
+        assert_eq!(check.skipped_reason, None);
+        assert_eq!(check.first_error_line, Some(4));
+        assert_eq!(validate_syntax_str(broken, path), Some(false));
+        let valid = "def g():\n    if True:\n        return 2\n    return 3\n";
+        assert_eq!(
+            check_created_file_syntax(&policy, path, valid).valid,
+            Some(true)
+        );
     }
 
     #[test]
@@ -2332,7 +2569,14 @@ mod tests {
         };
         let path = temp.path().join("new.ts");
         let broken = "const a = 1;\n\nfunction {\n";
-        let result = write_format_validate(&path, broken, &config, &serde_json::json!({})).unwrap();
+        let result = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            broken,
+            &config,
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert!(!result.rolled_back);
         assert_eq!(result.syntax_valid, Some(false));
         assert_eq!(result.syntax_error_line, Some(3));
@@ -2342,8 +2586,14 @@ mod tests {
         // carries no created-file line.
         let existing = temp.path().join("existing.ts");
         std::fs::write(&existing, "const a = 1;\n").unwrap();
-        let result =
-            write_format_validate(&existing, broken, &config, &serde_json::json!({})).unwrap();
+        let result = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &existing,
+            broken,
+            &config,
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert!(result.rolled_back);
         assert_eq!(result.syntax_error_line, None);
     }
@@ -2498,7 +2748,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             ctx.backup().lock().history("freshness", &path)[0]
-                .content_bytes
+                .content_bytes()
+                .unwrap()
                 .as_ref(),
             b"external\n"
         );
@@ -2511,6 +2762,7 @@ mod tests {
         std::fs::write(&path, "const value = 1;\n").unwrap();
         let (source, observation) = read_edit_source(&path).unwrap();
         let mut result = write_format_validate_observed(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
             &path,
             "function {",
             &Config::default(),
@@ -2528,6 +2780,7 @@ mod tests {
         // A stale valid source must not cause rollback against a now-invalid file.
         std::fs::write(&path, "function { external-invalid").unwrap();
         let mut result = write_format_validate_observed(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
             &path,
             "function { new-invalid",
             &Config::default(),
@@ -2576,6 +2829,7 @@ mod tests {
             A03_SYNTAX_PARSES.with(|count| count.set(0));
             let params = serde_json::json!({"validate": if full {"full"} else {"syntax"}, "include_diff_content": true});
             let mut result = write_format_validate_observed(
+                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
                 &path,
                 "const value = 2;\n",
                 &config,
@@ -2665,8 +2919,14 @@ mod tests {
         };
         WRITE_PIPELINE_READS.with(|count| count.set(0));
         crate::parser::work_counters::TREE_SOURCE_READS.with(|count| count.set(0));
-        let result =
-            write_format_validate(&path, &updated, &config, &serde_json::json!({})).unwrap();
+        let result = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            &updated,
+            &config,
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(result.syntax_valid, Some(true));
         assert!(!result.rolled_back);
         assert!(result.reformatted_excerpt.is_none());
@@ -2674,8 +2934,14 @@ mod tests {
         let reads = WRITE_PIPELINE_READS.with(|count| count.get())
             + crate::parser::work_counters::TREE_SOURCE_READS.with(|count| count.get());
         assert_eq!(reads, 2, "shared write pipeline content reads");
-        let invalid =
-            write_format_validate(&path, "function {", &config, &serde_json::json!({})).unwrap();
+        let invalid = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            "function {",
+            &config,
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(invalid.syntax_valid, Some(false));
         assert!(invalid.rolled_back);
         assert!(invalid.reformatted_excerpt.is_none());
@@ -2704,8 +2970,14 @@ func decode(data: Data) throws {
             ..Config::default()
         };
 
-        let result =
-            write_format_validate(&path, updated, &config, &serde_json::json!({})).unwrap();
+        let result = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            updated,
+            &config,
+            &serde_json::json!({}),
+        )
+        .unwrap();
 
         assert_eq!(result.syntax_valid, Some(true));
         assert!(!result.rolled_back);
@@ -2730,8 +3002,14 @@ func decode(data: Data) throws {
             ..Config::default()
         };
 
-        let result =
-            write_format_validate(&path, updated, &config, &serde_json::json!({})).unwrap();
+        let result = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            updated,
+            &config,
+            &serde_json::json!({}),
+        )
+        .unwrap();
 
         assert_eq!(result.syntax_valid, Some(true));
         assert!(!result.rolled_back);
@@ -2961,8 +3239,14 @@ mod audit11_regressions {
             ..Default::default()
         };
         let updated = "\u{feff}let x = 2;\r\n";
-        let result =
-            write_format_validate(&path, updated, &config, &serde_json::json!({})).unwrap();
+        let result = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            updated,
+            &config,
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert!(!result.rolled_back);
         assert_eq!(std::fs::read(&path).unwrap(), updated.as_bytes());
         assert_ne!(std::fs::metadata(&path).unwrap().ino(), inode);
@@ -2972,8 +3256,14 @@ mod audit11_regressions {
         );
         let held_updated = std::fs::File::open(&path).unwrap();
         let inode = held_updated.metadata().unwrap().ino();
-        let result =
-            write_format_validate(&path, "function {", &config, &serde_json::json!({})).unwrap();
+        let result = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            "function {",
+            &config,
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert!(result.rolled_back);
         assert_ne!(std::fs::metadata(&path).unwrap().ino(), inode);
         assert_eq!(std::fs::read(&path).unwrap(), updated.as_bytes());
@@ -3050,7 +3340,14 @@ mod source_write_access_tests {
         };
         let before = acl_of(&path).expect("ACL stored");
 
-        write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
+        write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            "new\n",
+            &plain_config(),
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
         assert_eq!(acl_of(&path).as_ref(), Some(&before));
         assert_eq!(
@@ -3107,7 +3404,14 @@ mod source_write_access_tests {
                 .any(|entry| entry.starts_with("user:") && entry.ends_with(":deny:read")),
             "{before:?}"
         );
-        write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
+        write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            "new\n",
+            &plain_config(),
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
         assert_eq!(acl_of(&path), before);
     }
@@ -3140,7 +3444,14 @@ mod source_write_access_tests {
         );
         assert_eq!(acl_of(&path), None);
 
-        write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
+        write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            "new\n",
+            &plain_config(),
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
         assert_eq!(acl_of(&path), None);
         let mode = atomic_write_source(&path, b"third\n").unwrap().mode;
@@ -3213,7 +3524,14 @@ mod source_write_access_tests {
         );
         assert_eq!(acl_of(&path), None);
 
-        write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
+        write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            "new\n",
+            &plain_config(),
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
         assert_eq!(acl_of(&path), None);
         assert_eq!(
@@ -3238,7 +3556,14 @@ mod source_write_access_tests {
         std::fs::write(&path, "old\n").unwrap();
         std::fs::hard_link(&path, &other_name).unwrap();
         let inode = std::fs::metadata(&path).unwrap().ino();
-        write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
+        write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            "new\n",
+            &plain_config(),
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
         assert_eq!(std::fs::read(&other_name).unwrap(), b"new\n");
         assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
@@ -3274,7 +3599,14 @@ mod source_write_access_tests {
         std::fs::write(&path, "old\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
         std::os::unix::fs::chown(&path, None, Some(group)).unwrap();
-        write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
+        write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            "new\n",
+            &plain_config(),
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
         let metadata = std::fs::metadata(&path).unwrap();
         assert_eq!(metadata.gid(), group);
@@ -3412,8 +3744,14 @@ mod in_place_write_tests {
             .path()
             .join(format!(".aft-source-{}-notes.txt.orig", "0".repeat(32)));
         std::fs::write(&leftover, "saved\n").unwrap();
-        let result =
-            write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
+        let result = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            "new\n",
+            &plain_config(),
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
         assert_eq!(
             result.write_warnings.len(),
@@ -3445,9 +3783,14 @@ mod in_place_write_tests {
             return;
         }
         std::fs::hard_link(&path, &other_name).unwrap();
-        let result =
-            write_format_validate(&path, "echo new\n", &plain_config(), &serde_json::json!({}))
-                .unwrap();
+        let result = write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            "echo new\n",
+            &plain_config(),
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&other_name).unwrap(), b"echo new\n");
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
@@ -3505,7 +3848,14 @@ mod in_place_write_tests {
             before.contains("Backup Operators") || before.contains("S-1-5-32-551"),
             "{before}"
         );
-        write_format_validate(&path, "new\n", &plain_config(), &serde_json::json!({})).unwrap();
+        write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            "new\n",
+            &plain_config(),
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
         assert_eq!(icacls(&path), before);
         let outcome = atomic_write_source(&path, b"third\n").unwrap();

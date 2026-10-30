@@ -89,6 +89,59 @@ fn db_hints_foreground_trailer_independent_of_compression_and_switch() {
 }
 
 #[test]
+fn db_hints_production_shapes_cd_uri_and_var_assignment() {
+    for enabled in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut aft = AftProcess::spawn();
+        configure(&mut aft, &dir, enabled);
+        let dir_str = dir.path().to_string_lossy().to_string();
+        // Production case #1: `cd <dir> && sqlite3 -readonly 'file:...?mode=ro'`.
+        let cd_command = format!(
+            "cd '{dir_str}' && sqlite3 -readonly 'file:store.db?mode=ro' 'SELECT substrate FROM tasks'"
+        );
+        let response = aft.send(
+            &json!({"id":"db-prod-cd", "method":"bash", "params": {
+                "command": cd_command,
+                "foreground_orchestrate":true, "compressed":false,
+            }})
+            .to_string(),
+        );
+        assert_eq!(response["status"], "failed", "{response}");
+        let output = response["output"].as_str().unwrap();
+        assert_eq!(
+            output.matches("[aft: no column").count(),
+            usize::from(enabled),
+            "{output}"
+        );
+        if enabled {
+            assert!(output.contains("tasks: id TEXT, kind TEXT"), "{output}");
+        }
+        // Production case #3: `DB=...; sqlite3 -readonly "$DB" ...`.
+        let var_command = format!(
+            "DB='{dir_str}/store.db'; sqlite3 -readonly \"$DB\" 'SELECT substrate FROM tasks'"
+        );
+        let response = aft.send(
+            &json!({"id":"db-prod-var", "method":"bash", "params": {
+                "command": var_command,
+                "foreground_orchestrate":true, "compressed":false,
+            }})
+            .to_string(),
+        );
+        assert_eq!(response["status"], "failed", "{response}");
+        let output = response["output"].as_str().unwrap();
+        assert_eq!(
+            output.matches("[aft: no column").count(),
+            usize::from(enabled),
+            "{output}"
+        );
+        if enabled {
+            assert!(output.contains("tasks: id TEXT, kind TEXT"), "{output}");
+        }
+        assert!(aft.shutdown().success());
+    }
+}
+
+#[test]
 fn db_hints_background_completion_keeps_trailer_after_preview_cap() {
     let dir = tempfile::tempdir().unwrap();
     let mut aft = AftProcess::spawn();

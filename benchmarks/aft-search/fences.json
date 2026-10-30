@@ -5,7 +5,6 @@
     "benchmarks/aft-search/** except benchmarks/aft-search/engine-fixtures/**",
     "scripts/telemetry/cost-gate.sh",
     "scripts/telemetry/imports-resolve.sh",
-    "scripts/telemetry/mutate.sh",
     "scripts/telemetry/postA-remeasure.sh",
     ".github/workflows/tests.yml#search-quality-gate-and-pr-filter"
   ],
@@ -14,7 +13,6 @@
     "benchmarks/aft-search/!(engine-fixtures|real-query-baseline.json|manifest.sha256)/**",
     "scripts/telemetry/cost-gate.sh",
     "scripts/telemetry/imports-resolve.sh",
-    "scripts/telemetry/mutate.sh",
     "scripts/telemetry/postA-remeasure.sh",
     ".github/workflows/tests.yml"
   ],

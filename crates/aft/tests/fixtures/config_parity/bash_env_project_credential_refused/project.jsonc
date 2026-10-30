@@ -1,0 +1,7 @@
+{
+  "bash": {
+    "env": {
+      "PARITY_API_KEY": "project-value"
+    }
+  }
+}

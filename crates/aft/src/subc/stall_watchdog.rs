@@ -240,6 +240,7 @@ pub(super) struct FrameLoopTestHooks {
     pub(super) metrics: Arc<DispatchPathMetrics>,
     pub(super) config: Option<StallWatchdogConfig>,
     pub(super) before_frame: Arc<dyn Fn() + Send + Sync>,
+    pub(super) before_turn_work: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) writer_setup: Option<Arc<dyn Fn(super::WriterSender) + Send + Sync>>,
 }
 
@@ -795,37 +796,62 @@ mod tests {
     const TEST_PID: u32 = 4242;
 
     #[test]
+    fn frame_loop_context_names_decoded_tool_and_request() {
+        use super::super::*;
+        let metrics = DispatchPathMetrics::new();
+        let frame = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            125,
+            1,
+            892,
+            b"{}".to_vec(),
+        )
+        .unwrap();
+        metrics.mark_frame_loop_frame(&frame);
+        metrics.mark_frame_loop_tool("read", frame.header.corr);
+        let context = metrics.frame_loop_context();
+        assert!(
+            context.contains(
+                "entry=handle_tool_call command=\"read\" request_id=892 step_elapsed_ms="
+            ),
+            "{context}"
+        );
+    }
+
+    #[test]
     fn frame_loop_context_names_control_operation_root_and_session() {
         use super::super::*;
         let metrics = DispatchPathMetrics::new();
+        let request = ModuleControlRequest::RouteBind {
+            route_channel: 125,
+            epoch: 1,
+            target: subc_protocol::RouteTarget::ToolProvider {
+                module_id: "aft".to_string(),
+            },
+            identity: subc_protocol::BindIdentity::new(
+                PathBuf::from("/isolated/root"),
+                "runner".to_string(),
+                "sidekick-session".to_string(),
+            ),
+            principal: None,
+            consumer_capabilities: None,
+            admission_facts: Default::default(),
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        };
         let frame = Frame::build(
             FrameType::Request,
             control_flags(),
             0,
             0,
             133,
-            serde_json::to_vec(&ModuleControlRequest::RouteBind {
-                route_channel: 125,
-                epoch: 1,
-                target: subc_protocol::RouteTarget::ToolProvider {
-                    module_id: "aft".to_string(),
-                },
-                identity: subc_protocol::BindIdentity::new(
-                    PathBuf::from("/isolated/root"),
-                    "runner".to_string(),
-                    "sidekick-session".to_string(),
-                ),
-                principal: None,
-                consumer_capabilities: None,
-                admission_facts: Default::default(),
-                scope: None,
-                role_versions: None,
-                call_mode: None,
-            })
-            .unwrap(),
+            serde_json::to_vec(&request).unwrap(),
         )
         .unwrap();
         metrics.mark_frame_loop_frame(&frame);
+        metrics.mark_frame_loop_control(&request, &frame);
         let diagnostics = crate::lock_diagnostics::LockDiagnostics::new("executor_holder.rs");
         let _held = diagnostics.hold();
         metrics.mark_frame_loop_wait(
@@ -990,6 +1016,13 @@ mod tests {
 
     impl FrameLoopFixture {
         async fn start(before_frame: Arc<dyn Fn() + Send + Sync>) -> Self {
+            Self::start_with_turn_hook(before_frame, None).await
+        }
+
+        async fn start_with_turn_hook(
+            before_frame: Arc<dyn Fn() + Send + Sync>,
+            before_turn_work: Option<Arc<dyn Fn() + Send + Sync>>,
+        ) -> Self {
             use super::super::*;
             let storage = tempfile::tempdir().unwrap();
             let path = storage.path().to_path_buf();
@@ -1012,6 +1045,7 @@ mod tests {
                 metrics: Arc::clone(&metrics),
                 config: Some(config),
                 before_frame,
+                before_turn_work,
                 writer_setup: None,
             };
             let (mut daemon, module_stream) = tokio::io::duplex(64 * 1024);
@@ -1090,6 +1124,235 @@ mod tests {
         fn finish(self) {
             drop(self.daemon);
             self.module.join().unwrap().unwrap();
+        }
+    }
+
+    fn stderr_ping_probe(test_name: &str, action: &'static str, subc: bool) {
+        const PROBE: &str = "AFT_TEST_SUBC_STDERR_PROBE";
+        // libtest's exact names omit the crate prefix from module_path!().
+        let test_name = test_name.split_once("::").unwrap().1;
+        if std::env::var(PROBE).ok().as_deref() != Some(test_name) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture", "--color=never"])
+                .env(PROBE, test_name)
+                .env("RUST_LOG", "off")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "stderr probe failed: stdout={:?} stderr={:?}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use super::super::*;
+            use std::io::Write;
+            if subc {
+                crate::logging::init_subc();
+            } else {
+                crate::logging::init();
+            }
+            let tee = Arc::new(Mutex::new(crate::logging::subc_stderr_tee_for_test()));
+            let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let before_frame_armed = Arc::clone(&armed);
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let mut fixture = FrameLoopFixture::start(Arc::new(move || {
+                if !before_frame_armed.swap(false, Ordering::Relaxed) {
+                    return;
+                }
+                let mut tee = tee.lock().unwrap();
+                entered_tx.send(()).unwrap();
+                match action {
+                    "write" => tee.write_all(b"[aft] WARN held stderr probe\n").unwrap(),
+                    "flush" => tee.flush().unwrap(),
+                    _ => unreachable!(),
+                }
+            }))
+            .await;
+            fixture.ping(90).await;
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let holder = thread::spawn(move || {
+                let stderr = std::io::stderr();
+                let _held = stderr.lock();
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            });
+            held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            armed.store(true, Ordering::Relaxed);
+            fixture.send_ping(891).await;
+            let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+            let pong =
+                tokio::time::timeout(Duration::from_secs(1), read_frame(&mut fixture.daemon)).await;
+            let _ = release_tx.send(());
+            holder.join().unwrap();
+            fixture.finish();
+            entered.expect("stderr probe callback never entered");
+            if subc {
+                let pong = pong
+                    .expect("stderr callback blocked frame-loop Ping")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!((pong.header.ty, pong.header.corr), (FrameType::Pong, 891));
+            } else {
+                assert!(pong.is_err(), "standalone stderr stopped being synchronous");
+            }
+        });
+    }
+
+    #[test]
+    fn subc_stderr_write_keeps_ping_live() {
+        stderr_ping_probe(
+            concat!(module_path!(), "::subc_stderr_write_keeps_ping_live"),
+            "write",
+            true,
+        );
+    }
+
+    #[test]
+    fn subc_stderr_flush_keeps_ping_live() {
+        stderr_ping_probe(
+            concat!(module_path!(), "::subc_stderr_flush_keeps_ping_live"),
+            "flush",
+            true,
+        );
+    }
+
+    #[test]
+    fn standalone_stderr_write_preserves_synchronous_delivery() {
+        stderr_ping_probe(
+            concat!(
+                module_path!(),
+                "::standalone_stderr_write_preserves_synchronous_delivery"
+            ),
+            "write",
+            false,
+        );
+    }
+
+    #[test]
+    fn standalone_stderr_flush_preserves_synchronous_delivery() {
+        stderr_ping_probe(
+            concat!(
+                module_path!(),
+                "::standalone_stderr_flush_preserves_synchronous_delivery"
+            ),
+            "flush",
+            false,
+        );
+    }
+
+    #[tokio::test]
+    async fn frame_loop_answers_ping_while_watch_diagnostic_database_is_locked() {
+        use super::super::*;
+        let (storage, root) = test_support::test_root("watch-diagnostic-disk-lock");
+        let ctx = Arc::new(crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.as_path().into()),
+                storage_dir: Some(storage.path().join("storage")),
+                ..Default::default()
+            },
+        ));
+        ctx.set_harness(crate::harness::Harness::Opencode);
+        let db = Arc::new(Mutex::new(
+            crate::db::open(&storage.path().join("aft.db")).unwrap(),
+        ));
+        ctx.bash_background().set_db_pool(Arc::clone(&db));
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), ctx));
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let mut subscriptions = BgSubsBySession::new();
+        subscriptions.insert(
+            (root, "watch-session".into()),
+            HashSet::from([route_key(125, 1)]),
+        );
+        let held = db.lock().unwrap();
+        let mut fixture = FrameLoopFixture::start_with_turn_hook(
+            Arc::new(|| {}),
+            Some(Arc::new(move || {
+                metrics.warn_stuck_pending_watches(&executor, &subscriptions);
+            })),
+        )
+        .await;
+        fixture.send_ping(891).await;
+        // The lock stays held until the read ends, so a frame loop that waits
+        // on it never answers. A generous bound still proves that, without
+        // failing when a loaded runner takes longer than one stall threshold.
+        let reply =
+            tokio::time::timeout(Duration::from_secs(30), read_frame(&mut fixture.daemon)).await;
+        drop(held);
+        fixture.finish();
+        let pong = reply
+            .expect("frame loop waited on the watch diagnostic's SQLite mutex")
+            .unwrap()
+            .unwrap();
+        assert_eq!((pong.header.ty, pong.header.corr), (FrameType::Pong, 891));
+    }
+
+    #[tokio::test]
+    async fn stalled_turn_work_snapshot_names_entry_without_waiting_for_loop() {
+        let (parked_tx, parked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let first = std::sync::atomic::AtomicBool::new(true);
+        let fixture = FrameLoopFixture::start_with_turn_hook(
+            Arc::new(|| {}),
+            Some(Arc::new(move || {
+                if !first.swap(false, Ordering::Relaxed) {
+                    return;
+                }
+                parked_tx.send(()).unwrap();
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(90));
+            })),
+        )
+        .await;
+        parked_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        // The watchdog fires one threshold after the step parks, but on a
+        // loaded runner its thread may run much later. Wait for the exit
+        // line while the step is still held rather than for a fixed time.
+        let waited = Instant::now();
+        while fixture.stderr.lines().is_empty() && waited.elapsed() < Duration::from_secs(60) {
+            tokio::time::sleep(TEST_THRESHOLD).await;
+        }
+        let terminal = fixture.stderr.lines();
+        let snapshots: Vec<_> = fixture
+            .capture
+            .calls()
+            .iter()
+            .map(|(_, path)| std::fs::read_to_string(path.with_extension("txt")).unwrap())
+            .collect();
+        release_tx.send(()).unwrap();
+        fixture.finish();
+        assert_eq!(
+            terminal.len(),
+            1,
+            "snapshot and watchdog exit must finish while the step is held"
+        );
+        assert_eq!(snapshots.len(), 1);
+        for text in terminal.iter().chain(snapshots.iter()) {
+            assert!(text.contains("phase=turn_work"), "{text}");
+            assert!(text.contains("entry=logging::perf_tick"), "{text}");
+            let elapsed: u64 = text
+                .split("step_elapsed_ms=")
+                .nth(1)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(elapsed >= TEST_THRESHOLD.as_millis() as u64, "{text}");
         }
     }
 
@@ -1214,6 +1477,12 @@ mod tests {
         assert!(capture_written, "a capture was actually written");
         let line = &stderr[0];
         eprintln!("captured terminal stderr: {line}");
+        assert!(
+            line.contains("entry=run_module_loop/handle_frame"),
+            "{line}"
+        );
+        assert!(line.contains("command=\"ping\" request_id=91"), "{line}");
+        assert!(line.contains("step_elapsed_ms="), "{line}");
         assert!(
             line.starts_with("stall watchdog: exiting marker=subc_frame_loop stalled_for_ms="),
             "{line}"

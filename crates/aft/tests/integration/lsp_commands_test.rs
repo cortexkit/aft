@@ -489,10 +489,10 @@ fn edit_notification_reaches_the_server_after_a_busy_manager_frees() {
     let ctx = app_context_with_fake_lsp();
     let canonical = fs::canonicalize(&main_rs).expect("canonical main.rs");
     let config = ctx.config();
-    let opened = ctx
-        .lsp()
-        .ensure_file_open(&canonical, &config)
-        .expect("open main.rs");
+    let opened = crate::test_helpers::settled_lsp(&mut ctx.lsp(), |manager| {
+        manager.ensure_file_open(&canonical, &config)
+    })
+    .expect("open main.rs");
     assert_eq!(
         opened.server_keys.len(),
         1,

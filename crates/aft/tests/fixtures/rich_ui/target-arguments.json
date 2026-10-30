@@ -1,0 +1,275 @@
+[
+  {
+    "operation": "read",
+    "field": "path",
+    "form": "https://example.test/a",
+    "refused_by": "step5",
+    "code": "args_invalid"
+  },
+  {
+    "operation": "read",
+    "field": "path",
+    "form": "http://example.test/a",
+    "refused_by": "step5",
+    "code": "args_invalid"
+  },
+  {
+    "operation": "read",
+    "field": "path",
+    "form": "issue://1",
+    "refused_by": "gate",
+    "code": "carrier_read_only"
+  },
+  {
+    "operation": "read",
+    "field": "path",
+    "form": "pr://1",
+    "refused_by": "gate",
+    "code": "carrier_read_only"
+  },
+  {
+    "operation": "outline",
+    "field": "target",
+    "form": "https://example.test/a",
+    "refused_by": "gate",
+    "code": "carrier_read_only"
+  },
+  {
+    "operation": "outline",
+    "field": "target",
+    "form": "http://example.test/a",
+    "refused_by": "gate",
+    "code": "carrier_read_only"
+  },
+  {
+    "operation": "outline",
+    "field": "target",
+    "form": "issue://1",
+    "refused_by": "gate",
+    "code": "carrier_read_only"
+  },
+  {
+    "operation": "outline",
+    "field": "target",
+    "form": "pr://1",
+    "refused_by": "gate",
+    "code": "carrier_read_only"
+  },
+  {
+    "operation": "outline",
+    "field": "target[]",
+    "form": "https://example.test/a",
+    "refused_by": "gate",
+    "code": "carrier_read_only"
+  },
+  {
+    "operation": "outline",
+    "field": "target[]",
+    "form": "http://example.test/a",
+    "refused_by": "gate",
+    "code": "carrier_read_only"
+  },
+  {
+    "operation": "outline",
+    "field": "target[]",
+    "form": "issue://1",
+    "refused_by": "gate",
+    "code": "carrier_read_only"
+  },
+  {
+    "operation": "outline",
+    "field": "target[]",
+    "form": "pr://1",
+    "refused_by": "gate",
+    "code": "carrier_read_only"
+  },
+  {
+    "operation": "zoom",
+    "field": "batch[].target",
+    "form": "https://example.test/a",
+    "refused_by": "gate",
+    "code": "carrier_read_only"
+  },
+  {
+    "operation": "zoom",
+    "field": "batch[].target",
+    "form": "http://example.test/a",
+    "refused_by": "gate",
+    "code": "carrier_read_only"
+  },
+  {
+    "operation": "zoom",
+    "field": "batch[].target",
+    "form": "issue://1",
+    "refused_by": "gate",
+    "code": "carrier_read_only"
+  },
+  {
+    "operation": "zoom",
+    "field": "batch[].target",
+    "form": "pr://1",
+    "refused_by": "gate",
+    "code": "carrier_read_only"
+  },
+  {
+    "operation": "search",
+    "field": "path",
+    "form": "https://example.test/a",
+    "refused_by": "step5",
+    "code": "args_invalid"
+  },
+  {
+    "operation": "search",
+    "field": "path",
+    "form": "http://example.test/a",
+    "refused_by": "step5",
+    "code": "args_invalid"
+  },
+  {
+    "operation": "search",
+    "field": "path",
+    "form": "issue://1",
+    "refused_by": "step5",
+    "code": "args_invalid"
+  },
+  {
+    "operation": "search",
+    "field": "path",
+    "form": "pr://1",
+    "refused_by": "step5",
+    "code": "args_invalid"
+  },
+  {
+    "operation": "grep",
+    "field": "path",
+    "form": "https://example.test/a",
+    "refused_by": "step5",
+    "code": "args_invalid"
+  },
+  {
+    "operation": "grep",
+    "field": "path",
+    "form": "http://example.test/a",
+    "refused_by": "step5",
+    "code": "args_invalid"
+  },
+  {
+    "operation": "grep",
+    "field": "path",
+    "form": "issue://1",
+    "refused_by": "step5",
+    "code": "args_invalid"
+  },
+  {
+    "operation": "grep",
+    "field": "path",
+    "form": "pr://1",
+    "refused_by": "step5",
+    "code": "args_invalid"
+  },
+  {
+    "operation": "glob",
+    "field": "path",
+    "form": "https://example.test/a",
+    "refused_by": "step5",
+    "code": "args_invalid"
+  },
+  {
+    "operation": "glob",
+    "field": "path",
+    "form": "http://example.test/a",
+    "refused_by": "step5",
+    "code": "args_invalid"
+  },
+  {
+    "operation": "glob",
+    "field": "path",
+    "form": "issue://1",
+    "refused_by": "step5",
+    "code": "args_invalid"
+  },
+  {
+    "operation": "glob",
+    "field": "path",
+    "form": "pr://1",
+    "refused_by": "step5",
+    "code": "args_invalid"
+  },
+  {
+    "operation": "callgraph",
+    "field": "path",
+    "form": "https://example.test/a",
+    "refused_by": "step5",
+    "code": "args_invalid"
+  },
+  {
+    "operation": "callgraph",
+    "field": "path",
+    "form": "http://example.test/a",
+    "refused_by": "step5",
+    "code": "args_invalid"
+  },
+  {
+    "operation": "callgraph",
+    "field": "path",
+    "form": "issue://1",
+    "refused_by": "step5",
+    "code": "args_invalid"
+  },
+  {
+    "operation": "callgraph",
+    "field": "path",
+    "form": "pr://1",
+    "refused_by": "step5",
+    "code": "args_invalid"
+  },
+  {
+    "operation": "callgraph",
+    "field": "toPath",
+    "form": "https://example.test/a",
+    "refused_by": "step5",
+    "code": "args_invalid"
+  },
+  {
+    "operation": "callgraph",
+    "field": "toPath",
+    "form": "http://example.test/a",
+    "refused_by": "step5",
+    "code": "args_invalid"
+  },
+  {
+    "operation": "callgraph",
+    "field": "toPath",
+    "form": "issue://1",
+    "refused_by": "step5",
+    "code": "args_invalid"
+  },
+  {
+    "operation": "callgraph",
+    "field": "toPath",
+    "form": "pr://1",
+    "refused_by": "step5",
+    "code": "args_invalid"
+  },
+  {
+    "operation": "read",
+    "field": "ref",
+    "form": "HEAD",
+    "refused_by": "step5",
+    "code": "args_invalid"
+  },
+  {
+    "operation": "outline",
+    "field": "ref",
+    "form": "HEAD",
+    "refused_by": "step5",
+    "code": "args_invalid"
+  },
+  {
+    "operation": "zoom",
+    "field": "ref",
+    "form": "HEAD",
+    "refused_by": "step5",
+    "code": "args_invalid"
+  }
+]

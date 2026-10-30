@@ -42,7 +42,9 @@ jobs:
     name: Check for OpenCode upstream drift
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Read current pin
         id: current
@@ -50,6 +52,10 @@ jobs:
           version=$(tr -d '[:space:]' < .github/opencode-version.txt)
           if [ -z "$version" ]; then
             echo "::error::.github/opencode-version.txt is empty"
+            exit 1
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::.github/opencode-version.txt must contain a semantic version (X.Y.Z or X.Y.Z-prerelease)"
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -72,24 +78,33 @@ jobs:
           fi
           # Strip leading 'v' if present (1.14.39 not v1.14.39).
           version="${tag#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Latest OpenCode release tag must contain a semantic version (X.Y.Z or X.Y.Z-prerelease)"
+            exit 1
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Latest release: $version (tag: $tag)"
 
       - name: Compare versions
         id: compare
+        env:
+          CURRENT: ${{ steps.current.outputs.version }}
+          LATEST: ${{ steps.latest.outputs.version }}
         run: |
-          if [ "${{ steps.current.outputs.version }}" = "${{ steps.latest.outputs.version }}" ]; then
+          if [ "$CURRENT" = "$LATEST" ]; then
             echo "Pin is already at latest. Nothing to do."
             echo "drift=false" >> "$GITHUB_OUTPUT"
           else
-            echo "Drift: pin=${{ steps.current.outputs.version }} latest=${{ steps.latest.outputs.version }}"
+            echo "Drift: pin=$CURRENT latest=$LATEST"
             echo "drift=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Update pin file
         if: steps.compare.outputs.drift == 'true'
+        env:
+          LATEST: ${{ steps.latest.outputs.version }}
         run: |
-          echo "${{ steps.latest.outputs.version }}" > .github/opencode-version.txt
+          echo "$LATEST" > .github/opencode-version.txt
 
       # The V1 leg of OC2 parity relies on a capture tied to the exact pin.
       # Generate it before opening a PR so changed host behavior is reviewed
@@ -98,6 +113,9 @@ jobs:
         if: steps.compare.outputs.drift == 'true'
         env:
           CAPTURE_VERSION: ${{ steps.latest.outputs.version }}
+          # The capture records which AFT commit produced it; pass it explicitly
+          # instead of reading it from git.
+          AFT_CAPTURE_SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           echo "Recapturing host1 provider and edit-family contracts for $CAPTURE_VERSION"
@@ -116,7 +134,7 @@ jobs:
       - name: Mint PR token
         if: steps.compare.outputs.drift == 'true'
         id: pr_token
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
         with:
           app-id: ${{ secrets.CK_PUBLIC_BOT_APP_ID }}
           private-key: ${{ secrets.CK_PUBLIC_BOT_PRIVATE_KEY }}
@@ -127,12 +145,14 @@ jobs:
         if: steps.compare.outputs.drift == 'true'
         id: pr
         env:
+          CURRENT: ${{ steps.current.outputs.version }}
+          LATEST: ${{ steps.latest.outputs.version }}
           GH_TOKEN: ${{ steps.pr_token.outputs.token }}
           PAT_PRESENT: "yes"
         run: |
           set -euo pipefail
-          old="${{ steps.current.outputs.version }}"
-          new="${{ steps.latest.outputs.version }}"
+          old="$CURRENT"
+          new="$LATEST"
           branch="ci/bump-opencode-${new}"
 
           # If the bump branch already exists (we opened the same PR previously
@@ -228,10 +248,11 @@ jobs:
       - name: Dispatch Tests on bump branch (GITHUB_TOKEN fallback)
         if: steps.compare.outputs.drift == 'true' && steps.pr.outputs.needs_dispatch == 'true'
         env:
+          BRANCH: ${{ steps.pr.outputs.branch }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          branch="${{ steps.pr.outputs.branch }}"
+          branch="$BRANCH"
           if [ -z "$branch" ]; then
             echo "::error::No bump branch recorded; cannot dispatch Tests."
             exit 1

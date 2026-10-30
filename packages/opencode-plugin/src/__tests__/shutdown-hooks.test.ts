@@ -114,4 +114,25 @@ describe("registerShutdownCleanup", () => {
     expect(resourceCleanupCalls).toBe(1);
     expect(__shutdownCleanupInvocationCountForTests(ownedCleanup)).toBe(1);
   });
+
+  test("concurrent process drains await the same cleanup", async () => {
+    let release!: () => void;
+    registerShutdownCleanup(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    const first = runCleanups("beforeExit");
+    let secondFinished = false;
+    const second = runCleanups("SIGTERM").then(() => {
+      secondFinished = true;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(secondFinished).toBe(false);
+    release();
+    await Promise.all([first, second]);
+    expect(secondFinished).toBe(true);
+  });
 });

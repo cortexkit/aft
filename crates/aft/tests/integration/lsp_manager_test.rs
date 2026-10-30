@@ -49,7 +49,12 @@ fn rust_worker_config_disables_all_compilation_and_head_config_is_unchanged() {
     let log = temp.path().join("initialization.jsonl");
     let mut manager = rust_worker_logged_manager(&log);
     let config = Config::default();
-    assert_eq!(manager.ensure_server_for_file(&file, &config).len(), 1);
+    assert_eq!(
+        crate::test_helpers::settled_lsp(&mut manager, |startup_manager| startup_manager
+            .ensure_server_for_file(&file, &config))
+        .len(),
+        1
+    );
     manager.shutdown_all();
     manager.disable_rust_cargo_for_worker();
     let mut worker_config = config.clone();
@@ -65,7 +70,9 @@ fn rust_worker_config_disables_all_compilation_and_head_config_is_unchanged() {
         ..Default::default()
     });
     assert_eq!(
-        manager.ensure_server_for_file(&file, &worker_config).len(),
+        crate::test_helpers::settled_lsp(&mut manager, |startup_manager| startup_manager
+            .ensure_server_for_file(&file, &worker_config))
+        .len(),
         1
     );
     let rows: Vec<Value> = fs::read_to_string(&log)
@@ -105,18 +112,33 @@ fn rust_worker_shared_root_restarts_head_analyzer_and_never_reenables_cargo() {
     let log = temp.path().join("initialization.jsonl");
     let mut manager = rust_worker_logged_manager(&log);
     let config = Config::default();
-    assert_eq!(manager.ensure_server_for_file(&file, &config).len(), 1);
+    assert_eq!(
+        crate::test_helpers::settled_lsp(&mut manager, |startup_manager| startup_manager
+            .ensure_server_for_file(&file, &config))
+        .len(),
+        1
+    );
     manager.disable_rust_cargo_for_worker();
     assert_eq!(
         manager.server_count(),
         0,
         "worker admission must retire the head's analyzer"
     );
-    assert_eq!(manager.ensure_server_for_file(&file, &config).len(), 1);
+    assert_eq!(
+        crate::test_helpers::settled_lsp(&mut manager, |startup_manager| startup_manager
+            .ensure_server_for_file(&file, &config))
+        .len(),
+        1
+    );
     // Simulate a primary session reading another file after a delegated
     // session arrived. Both share the root's analyzer, so the primary read
     // must not turn compilation back on for the delegated session.
-    assert_eq!(manager.ensure_server_for_file(&other, &config).len(), 1);
+    assert_eq!(
+        crate::test_helpers::settled_lsp(&mut manager, |startup_manager| startup_manager
+            .ensure_server_for_file(&other, &config))
+        .len(),
+        1
+    );
     manager.disable_rust_cargo_for_worker();
     assert_eq!(manager.server_count(), 1, "worker admission is idempotent");
     let rows: Vec<Value> = fs::read_to_string(&log)
@@ -147,16 +169,24 @@ fn rust_worker_cap_refuses_n_plus_one_without_spawn() {
     let config = Config::default();
     for index in 0..2 {
         assert_eq!(
-            managers[index]
-                .ensure_server_for_file(&fixtures[index].1, &config)
-                .len(),
+            crate::test_helpers::settled_lsp(&mut managers[index], |startup_manager| {
+                startup_manager.ensure_server_for_file(&fixtures[index].1, &config)
+            })
+            .len(),
             1
         );
     }
     let pid_dir = fixtures[2].0.path().join("pids");
     fs::create_dir(&pid_dir).unwrap();
     managers[2].set_extra_env("AFT_FAKE_LSP_PID_DIR", &pid_dir.display().to_string());
-    let result = managers[2].ensure_server_for_file_detailed(&fixtures[2].1, &config);
+    let result = {
+        let manager = std::cell::RefCell::new(&mut managers[2]);
+        aft::lsp::manager::ensure_server_for_file_detailed_unlocked(
+            || std::cell::RefMut::map(manager.borrow_mut(), |manager| &mut **manager),
+            &fixtures[2].1,
+            &config,
+        )
+    };
     assert!(
         result.successful.is_empty(),
         "the third analyzer must not be admitted"
@@ -189,13 +219,21 @@ fn rust_worker_cap_admits_next_request_after_slot_release_without_restart() {
     let config = Config::default();
     for index in 0..2 {
         assert_eq!(
-            managers[index]
-                .ensure_server_for_file(&fixtures[index].1, &config)
-                .len(),
+            crate::test_helpers::settled_lsp(&mut managers[index], |startup_manager| {
+                startup_manager.ensure_server_for_file(&fixtures[index].1, &config)
+            })
+            .len(),
             1
         );
     }
-    let refused = managers[2].ensure_server_for_file_detailed(&fixtures[2].1, &config);
+    let refused = {
+        let manager = std::cell::RefCell::new(&mut managers[2]);
+        aft::lsp::manager::ensure_server_for_file_detailed_unlocked(
+            || std::cell::RefMut::map(manager.borrow_mut(), |manager| &mut **manager),
+            &fixtures[2].1,
+            &config,
+        )
+    };
     assert!(refused.successful.is_empty());
     assert!(refused.attempts[0]
         .result
@@ -203,8 +241,7 @@ fn rust_worker_cap_admits_next_request_after_slot_release_without_restart() {
         .contains("rust_analyzer_capacity_exhausted"));
     drop(managers.remove(0));
     assert_eq!(
-        managers[1]
-            .ensure_server_for_file(&fixtures[2].1, &config)
+        crate::test_helpers::settled_lsp(&mut managers[1], |startup_manager| startup_manager.ensure_server_for_file(&fixtures[2].1, &config))
             .len(),
         1,
         "the very next request must start after slot release without clearing failures or restarting"
@@ -226,9 +263,10 @@ fn rust_worker_cap_never_counts_or_refuses_head_analyzers() {
     // after both worker slots are full. Neither may consume or need a slot.
     for index in 0..4 {
         assert_eq!(
-            managers[index]
-                .ensure_server_for_file(&fixtures[index].1, &Config::default())
-                .len(),
+            crate::test_helpers::settled_lsp(&mut managers[index], |startup_manager| {
+                startup_manager.ensure_server_for_file(&fixtures[index].1, &Config::default())
+            })
+            .len(),
             1,
             "head analyzers must not consume or be refused worker capacity (start {index})"
         );
@@ -653,6 +691,7 @@ def notification(method, params):
 
 mode = os.environ.get("AFT_PROTOCOL_LSP_MODE", "watch")
 next_request_id = 100
+watched_count = 0
 
 while True:
     message = read_message()
@@ -683,6 +722,7 @@ while True:
             })
             next_request_id += 1
     elif method == "workspace/didChangeWatchedFiles":
+        watched_count += 1
         notification("custom/watchedFilesChanged", message.get("params"))
         request(next_request_id, "client/unregisterCapability", {
             "unregisterations": [{
@@ -691,6 +731,8 @@ while True:
             }]
         })
         next_request_id += 1
+    elif method == "textDocument/didSave":
+        notification("custom/watchedCount", {"count": watched_count})
     elif method == "workspace/diagnostic":
         pass
     elif method == "$/cancelRequest":
@@ -707,7 +749,9 @@ fn test_manager_spawns_server_on_first_touch() {
     let mut manager = LspManager::new();
     manager.override_binary(ServerKind::Rust, fake_server_path());
 
-    let keys = manager.ensure_server_for_file_default(&main_rs);
+    let keys = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file_default(&main_rs)
+    });
 
     assert_eq!(keys.len(), 1);
     assert_eq!(
@@ -729,8 +773,12 @@ fn test_manager_reuses_existing_server() {
     let mut manager = LspManager::new();
     manager.override_binary(ServerKind::Rust, fake_server_path());
 
-    let first = manager.ensure_server_for_file_default(&main_rs);
-    let second = manager.ensure_server_for_file_default(&lib_rs);
+    let first = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file_default(&main_rs)
+    });
+    let second = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file_default(&lib_rs)
+    });
 
     assert_eq!(first.len(), 1);
     assert_eq!(second.len(), 1);
@@ -744,8 +792,12 @@ fn rust_workspace_members_share_one_analyzer_root() {
     let mut manager = LspManager::new();
     manager.override_binary(ServerKind::Rust, fake_server_path());
 
-    let first = manager.ensure_server_for_file_default(&first_source);
-    let second = manager.ensure_server_for_file_default(&second_source);
+    let first = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file_default(&first_source)
+    });
+    let second = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file_default(&second_source)
+    });
 
     let expected_root = canonicalize_lsp_root(&workspace);
     assert_eq!(first.len(), 1);
@@ -761,7 +813,9 @@ fn test_manager_shutdown_all() {
     let mut manager = LspManager::new();
     manager.override_binary(ServerKind::Rust, fake_server_path());
 
-    manager.ensure_server_for_file_default(&main_rs);
+    crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file_default(&main_rs)
+    });
     assert_eq!(manager.active_client_count(), 1);
 
     manager.shutdown_all();
@@ -781,7 +835,9 @@ fn shutdown_taken_clients_shares_deadline_across_roots_and_reaps_every_server() 
         manager.set_child_registry(registry.clone());
         manager.override_binary(ServerKind::Rust, fake_server_path());
         manager.set_extra_env("AFT_FAKE_LSP_IGNORE_SHUTDOWN", "1");
-        manager.ensure_server_for_file_default(main_rs);
+        crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+            startup_manager.ensure_server_for_file_default(main_rs)
+        });
         managers.push(manager);
     }
     let pids = registry.pids();
@@ -824,7 +880,9 @@ fn shutdown_all_bounds_unresponsive_servers_and_reaps_them() {
     manager.set_extra_env("AFT_FAKE_LSP_IGNORE_SHUTDOWN", "1");
 
     for (_, main_rs, _) in &fixtures {
-        manager.ensure_server_for_file_default(main_rs);
+        crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+            startup_manager.ensure_server_for_file_default(main_rs)
+        });
     }
     let pids = registry.pids();
     assert_eq!(pids.len(), 6, "each fixture must have its own LSP child");
@@ -856,8 +914,8 @@ fn shutdown_all_bounds_unresponsive_servers_and_reaps_them() {
 
 /// A server that ignores both the Shutdown request and SIGTERM, and lingers
 /// after its client goes away, stops only for a kill that cannot be ignored.
-/// The shutdown must deliver that kill and wait for it inside its budget,
-/// and leave no server alive. The fake server's injected 30 s exit delay keeps
+/// The shutdown must dispatch that kill inside its budget and leave no server
+/// alive shortly afterward. The fake server's injected 30 s exit delay keeps
 /// it alive even after EOF, without competing for the runner's CPUs.
 #[cfg(unix)]
 #[test]
@@ -873,27 +931,27 @@ fn shutdown_all_force_kills_servers_ignoring_sigterm_within_the_budget_with_dela
     manager.set_extra_env("AFT_FAKE_LSP_IGNORE_SIGTERM", "1");
     manager.set_extra_env("AFT_FAKE_LSP_EXIT_DELAY_MS", "30000");
     for (_, main_rs, _) in &fixtures {
-        manager.ensure_server_for_file_default(main_rs);
+        crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+            startup_manager.ensure_server_for_file_default(main_rs)
+        });
     }
     let pids = registry.pids();
     assert_eq!(pids.len(), 6, "each fixture must have its own LSP child");
 
+    let started = Instant::now();
     let outcome = manager.shutdown_all();
-    eprintln!("delayed-exit shutdown: {outcome:?}");
+    let elapsed = started.elapsed();
+    eprintln!("delayed-exit shutdown: {outcome:?} wall={elapsed:?}");
     assert!(
-        outcome.elapsed <= LSP_SHUTDOWN_ALL_BUDGET + Duration::from_millis(150),
-        "LSP shutdown ran past its {LSP_SHUTDOWN_ALL_BUDGET:?} ceiling: {outcome:?}"
+        elapsed <= LSP_SHUTDOWN_ALL_BUDGET + Duration::from_millis(150),
+        "LSP shutdown ran past its {LSP_SHUTDOWN_ALL_BUDGET:?} ceiling: {outcome:?} wall={elapsed:?}"
     );
     assert_eq!(outcome.graceful, 0, "{outcome:?}");
     assert_eq!(outcome.forced, 6, "{outcome:?}");
-    assert_eq!(
-        outcome.unreaped, 0,
-        "every killed server must be reaped: {outcome:?}"
-    );
-    assert!(registry.pids().is_empty(), "killed pids must be untracked");
+    assert!(outcome.unreaped <= outcome.forced, "{outcome:?}");
 
-    // A server the shutdown could not reap in time was still sent the kill,
-    // so every one is gone shortly after, long before its 30 s linger ends.
+    // The dispatcher and reaping workers continue after a budget timeout, so
+    // every server is gone shortly after, long before its 30 s linger ends.
     let deadline = Instant::now() + Duration::from_secs(2);
     for pid in pids {
         while aft::bash_background::process::is_process_alive(pid) && Instant::now() < deadline {
@@ -904,6 +962,10 @@ fn shutdown_all_force_kills_servers_ignoring_sigterm_within_the_budget_with_dela
             "LSP pid {pid} ignored SIGTERM and survived the shutdown ({outcome:?})"
         );
     }
+    while !registry.pids().is_empty() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(registry.pids().is_empty(), "killed pids must be untracked");
 }
 
 #[cfg(unix)]
@@ -916,7 +978,9 @@ fn shutdown_all_reports_graceful_servers_within_the_budget() {
     manager.override_binary(ServerKind::Rust, fake_server_path());
 
     for (_, main_rs, _) in &fixtures {
-        manager.ensure_server_for_file_default(main_rs);
+        crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+            startup_manager.ensure_server_for_file_default(main_rs)
+        });
     }
     assert_eq!(manager.active_client_count(), 2);
 
@@ -943,7 +1007,9 @@ fn test_server_lifecycle_states() {
     let mut manager = LspManager::new();
     manager.override_binary(ServerKind::Rust, fake_server_path());
 
-    manager.ensure_server_for_file_default(&main_rs);
+    crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file_default(&main_rs)
+    });
 
     let client = manager
         .client_for_file_default(&main_rs)
@@ -960,7 +1026,9 @@ fn test_manager_handles_missing_binary() {
         PathBuf::from("/definitely/missing/fake-lsp-server"),
     );
 
-    let keys = manager.ensure_server_for_file_default(&main_rs);
+    let keys = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file_default(&main_rs)
+    });
 
     assert!(keys.is_empty());
     assert_eq!(manager.active_client_count(), 0);
@@ -1006,7 +1074,9 @@ fn test_custom_server_env_and_initialization_options_reach_spawned_server() {
         fake_server_path(),
     );
 
-    let keys = manager.ensure_server_for_file(&main_typ, &config);
+    let keys = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file(&main_typ, &config)
+    });
     assert_eq!(keys.len(), 1);
     assert_eq!(manager.active_client_count(), 1);
 
@@ -1041,7 +1111,9 @@ fn astro_uses_the_nearest_project_typescript_sdk() {
     let mut manager = LspManager::new();
     manager.override_binary(ServerKind::Astro, fake_server_path());
 
-    let outcomes = manager.ensure_server_for_file_detailed(&page, &config);
+    let outcomes = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file_detailed(&page, &config)
+    });
     assert_eq!(outcomes.successful.len(), 1, "outcomes: {outcomes:?}");
     let initialized = collect_notification(&mut manager, "custom/initialized");
     // Compare with normalized separators: the product joins the tsdk tail with
@@ -1086,7 +1158,9 @@ fn astro_user_initialization_options_override_the_computed_tsdk() {
     let mut manager = LspManager::new();
     manager.override_binary(ServerKind::Astro, fake_server_path());
 
-    let outcomes = manager.ensure_server_for_file_detailed(&page, &config);
+    let outcomes = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file_detailed(&page, &config)
+    });
     assert_eq!(outcomes.successful.len(), 1, "outcomes: {outcomes:?}");
     let initialized = collect_notification(&mut manager, "custom/initialized");
     assert_eq!(
@@ -1119,7 +1193,9 @@ fn astro_without_project_typescript_is_unavailable_without_spawning() {
         &started_signal.to_string_lossy(),
     );
 
-    let outcomes = manager.ensure_server_for_file_detailed(&page, &config);
+    let outcomes = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file_detailed(&page, &config)
+    });
     assert!(outcomes.successful.is_empty());
     let astro_attempt = outcomes
         .attempts
@@ -1150,7 +1226,9 @@ fn watched_file_capability_defaults_false_when_initialize_has_no_field() {
     // initialize result so the client's capability tracker defaults to false.
     manager.set_extra_env("AFT_FAKE_LSP_NO_WATCHED_FILES", "1");
 
-    let keys = manager.ensure_server_for_file(&main_rs, &config);
+    let keys = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file(&main_rs, &config)
+    });
     assert_eq!(keys.len(), 1);
 
     let client = manager.client_for_file(&main_rs, &config).expect("client");
@@ -1161,7 +1239,111 @@ fn watched_file_capability_defaults_false_when_initialize_has_no_field() {
 }
 
 #[test]
-fn static_watched_file_capability_allows_notification_without_dynamic_registration() {
+fn watched_file_batch_continues_after_a_server_rejects_send() {
+    assert!(
+        protocol_server_prerequisites_available(),
+        "protocol fixture requires Python"
+    );
+    let temp = tempdir().unwrap();
+    let physical_roots = temp.path().join("physical-roots");
+    fs::create_dir_all(&physical_roots).unwrap();
+    // Exercise caller aliases on Linux as well as macOS's /var spelling.
+    #[cfg(unix)]
+    let caller_roots = {
+        let alias = temp.path().join("caller-roots");
+        std::os::unix::fs::symlink(&physical_roots, &alias).unwrap();
+        alias
+    };
+    #[cfg(not(unix))]
+    let caller_roots = physical_roots;
+    let (_script_dir, script) = executable_protocol_server_script();
+    let mut manager = LspManager::new();
+    let mut config = Config::default();
+    let mut sources = Vec::new();
+    for id in ["batch-a", "batch-b"] {
+        let root = caller_roots.join(id);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("marker.txt"), "marker").unwrap();
+        let source = root.join(format!("main.{id}"));
+        fs::write(&source, "content").unwrap();
+        config.lsp_servers.push(UserServerDef {
+            id: id.into(),
+            extensions: vec![id.into()],
+            binary: id.into(),
+            args: Vec::new(),
+            root_markers: vec!["marker.txt".into()],
+            env: HashMap::new(),
+            initialization_options: None,
+            disabled: false,
+        });
+        manager.override_binary(ServerKind::Custom(Arc::from(id)), script.clone());
+        sources.push(source);
+    }
+    let mut sources_by_key = HashMap::new();
+    for source in sources {
+        let started = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+            startup_manager.ensure_server_for_file(&source, &config)
+        });
+        assert_eq!(started.len(), 1, "the fixture must start one producer");
+        let key = started
+            .into_iter()
+            .next()
+            .expect("one producer was started");
+        #[cfg(unix)]
+        assert_ne!(
+            key.root.as_path(),
+            source.parent().unwrap(),
+            "the caller alias must differ from the product's canonical identity"
+        );
+        sources_by_key.insert(key, source);
+        collect_event(
+            &mut manager,
+            |event| {
+                matches!(event,
+            LspEvent::ServerRequest { method, .. } if method == "client/registerCapability")
+            },
+            Duration::from_secs(5),
+        )
+        .expect("watch registration");
+    }
+    // Use the manager's own iteration order so the rejected send precedes the
+    // healthy recipient without depending on HashMap's randomized ordering.
+    let keys = manager.active_server_keys();
+    let [failed_key, healthy_key] = keys.as_slice() else {
+        panic!("expected two fixture producers, got {keys:?}");
+    };
+    let failed_source = sources_by_key
+        .get(failed_key)
+        .unwrap_or_else(|| panic!("failed producer key {failed_key:?} has no fixture source"));
+    assert!(
+        sources_by_key.contains_key(healthy_key),
+        "healthy producer key {healthy_key:?} has no fixture source"
+    );
+    let failed = manager.client_for_file_mut(failed_source, &config).unwrap();
+    failed.shutdown().unwrap();
+    assert!(
+        failed.child_exited(),
+        "shutdown must reap the fixture child"
+    );
+    let changes = keys
+        .iter()
+        .map(|key| (key.root.join("config.json"), FileChangeType::CHANGED))
+        .collect::<Vec<_>>();
+    assert!(manager
+        .notify_files_watched_changed(&changes, &config)
+        .is_err());
+    let received = collect_notification(&mut manager, "custom/watchedFilesChanged");
+    assert_eq!(received["changes"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        received["changes"][0]["uri"],
+        aft::lsp::position::uri_for_path(&healthy_key.root.join("config.json"))
+            .unwrap()
+            .as_str()
+    );
+}
+
+#[test]
+fn echoed_client_watched_file_capability_does_not_enable_notifications() {
     if skip_if_protocol_server_prerequisites_missing() {
         return;
     }
@@ -1194,27 +1376,39 @@ fn static_watched_file_capability_allows_notification_without_dynamic_registrati
     manager.override_binary(server_kind, protocol_server);
     manager.set_extra_env("AFT_PROTOCOL_LSP_MODE", "static-watch");
 
-    let keys = manager.ensure_server_for_file(&source, &config);
+    let keys = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file(&source, &config)
+    });
     assert_eq!(keys.len(), 1);
     assert!(
-        manager
+        !manager
             .client_for_file(&source, &config)
             .expect("client")
             .supports_watched_files(),
-        "initialize-time watched-file support should be captured"
+        "a client capability echoed by the server must not enable notifications"
     );
 
     manager
         .notify_files_watched_changed(&[(changed, FileChangeType::CHANGED)], &config)
         .expect("send watched-file change");
 
-    let watched = collect_optional_notification(
-        &mut manager,
-        "custom/watchedFilesChanged",
-        Duration::from_secs(2),
-    )
-    .expect("static watched-file support should receive notification");
-    assert_eq!(watched["changes"][0]["type"], 2);
+    manager
+        .client_for_file_mut(&source, &config)
+        .unwrap()
+        .send_notification::<lsp_types::notification::DidSaveTextDocument>(
+            lsp_types::DidSaveTextDocumentParams {
+                text_document: lsp_types::TextDocumentIdentifier::new(
+                    aft::lsp::position::uri_for_path(&source).unwrap(),
+                ),
+                text: None,
+            },
+        )
+        .unwrap();
+    let barrier = collect_notification(&mut manager, "custom/watchedCount");
+    assert_eq!(
+        barrier["count"], 0,
+        "unregistered server received watched-file notifications"
+    );
 }
 
 #[test]
@@ -1253,7 +1447,9 @@ fn watched_file_notifications_require_dynamic_registration_and_stop_after_unregi
     manager.override_binary(server_kind, protocol_server);
     manager.set_extra_env("AFT_PROTOCOL_LSP_MODE", "watch");
 
-    let keys = manager.ensure_server_for_file(&source, &config);
+    let keys = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file(&source, &config)
+    });
     assert_eq!(keys.len(), 1);
 
     let registered = collect_event(
@@ -1345,7 +1541,9 @@ fn workspace_pull_timeout_sends_cancel_request() {
     manager.override_binary(server_kind, protocol_server);
     manager.set_extra_env("AFT_PROTOCOL_LSP_MODE", "workspace-timeout");
 
-    let keys = manager.ensure_server_for_file(&source, &config);
+    let keys = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file(&source, &config)
+    });
     assert_eq!(keys.len(), 1);
 
     let started = Instant::now();
@@ -1392,7 +1590,9 @@ fn failed_spawn_is_cached_and_not_retried_on_second_call() {
     );
 
     // First call — must produce a BinaryNotInstalled attempt.
-    let first = manager.ensure_server_for_file_detailed(&main_rs, &Config::default());
+    let first = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file_detailed(&main_rs, &Config::default())
+    });
     assert_eq!(first.attempts.len(), 1);
     let first_result = &first.attempts[0].result;
     assert!(
@@ -1403,7 +1603,9 @@ fn failed_spawn_is_cached_and_not_retried_on_second_call() {
     assert_eq!(manager.active_client_count(), 0);
 
     // Second call — must return the SAME cached classification, no new spawn.
-    let second = manager.ensure_server_for_file_detailed(&main_rs, &Config::default());
+    let second = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file_detailed(&main_rs, &Config::default())
+    });
     assert_eq!(second.attempts.len(), 1);
     let second_result = &second.attempts[0].result;
     // The cached result is cloned, so the variant must match the first call's.
@@ -1427,7 +1629,9 @@ fn failed_spawn_dedup_persists_across_many_calls() {
     // Simulate the production case: many file events in a row. Without dedup,
     // each one would log a fresh ERROR and try to spawn the missing binary.
     for _ in 0..10 {
-        let outcome = manager.ensure_server_for_file_detailed(&main_rs, &Config::default());
+        let outcome = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+            startup_manager.ensure_server_for_file_detailed(&main_rs, &Config::default())
+        });
         assert_eq!(outcome.attempts.len(), 1);
         assert_eq!(manager.active_client_count(), 0);
     }
@@ -1447,7 +1651,9 @@ fn failed_spawn_for_one_root_does_not_block_a_different_root() {
         ServerKind::Rust,
         PathBuf::from("/definitely/missing/fake-lsp-server-XYZZY"),
     );
-    let outcome_a = manager.ensure_server_for_file_detailed(&main_rs_a, &Config::default());
+    let outcome_a = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file_detailed(&main_rs_a, &Config::default())
+    });
     assert_eq!(outcome_a.successful.len(), 0);
     assert_eq!(manager.active_client_count(), 0);
 
@@ -1459,11 +1665,15 @@ fn failed_spawn_for_one_root_does_not_block_a_different_root() {
     // Workspace A still returns the cached failure (no retry on a different
     // binary path — the cache deliberately survives override changes mid-session
     // because runtime overrides are a test-only feature).
-    let outcome_a_again = manager.ensure_server_for_file_detailed(&main_rs_a, &Config::default());
+    let outcome_a_again = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file_detailed(&main_rs_a, &Config::default())
+    });
     assert_eq!(outcome_a_again.successful.len(), 0);
 
     // Workspace B is a fresh (kind, root) pair → not in the failed cache → spawns.
-    let outcome_b = manager.ensure_server_for_file_detailed(&main_rs_b, &Config::default());
+    let outcome_b = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file_detailed(&main_rs_b, &Config::default())
+    });
     assert_eq!(outcome_b.successful.len(), 1);
     assert_eq!(manager.active_client_count(), 1);
 }
@@ -1612,7 +1822,9 @@ fn transient_handshake_timeout_on_file_events_is_retried_after_backoff_window() 
     );
     manager.set_extra_env("AFT_FAKE_LSP_PID_DIR", &pid_dir.display().to_string());
 
-    let first = manager.ensure_server_for_file_detailed(&main_rs, &Config::default());
+    let first = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file_detailed(&main_rs, &Config::default())
+    });
     assert!(first.successful.is_empty(), "{first:?}");
     assert_eq!(fake_server_spawns(&pid_dir), 1);
     let ServerAttemptResult::SpawnFailed { reason, .. } = &first.attempts[0].result else {
@@ -1626,7 +1838,9 @@ fn transient_handshake_timeout_on_file_events_is_retried_after_backoff_window() 
     // Every file event inside the window replays the failure.
     for _ in 0..5 {
         offset.fetch_add(5_000, Ordering::SeqCst);
-        let replay = manager.ensure_server_for_file_detailed(&lib_rs, &Config::default());
+        let replay = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+            startup_manager.ensure_server_for_file_detailed(&lib_rs, &Config::default())
+        });
         assert!(replay.successful.is_empty(), "{replay:?}");
     }
     assert_eq!(
@@ -1636,7 +1850,9 @@ fn transient_handshake_timeout_on_file_events_is_retried_after_backoff_window() 
     );
 
     offset.fetch_add(5_000, Ordering::SeqCst);
-    let retried = manager.ensure_server_for_file_detailed(&main_rs, &Config::default());
+    let retried = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file_detailed(&main_rs, &Config::default())
+    });
     assert_eq!(fake_server_spawns(&pid_dir), 2, "{retried:?}");
     assert_eq!(retried.successful.len(), 1, "{retried:?}");
     assert_eq!(manager.active_client_count(), 1);
@@ -1659,7 +1875,9 @@ fn permanent_missing_binary_failure_is_replayed_after_backoff_window() {
         ServerKind::Rust,
         PathBuf::from("/definitely/missing/fake-lsp-server-XYZZY"),
     );
-    let first = manager.ensure_server_for_file_detailed(&main_rs, &Config::default());
+    let first = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file_detailed(&main_rs, &Config::default())
+    });
     assert!(
         matches!(
             first.attempts[0].result,
@@ -1671,7 +1889,9 @@ fn permanent_missing_binary_failure_is_replayed_after_backoff_window() {
     // Make the binary available, then step past the longest backoff.
     manager.override_binary(ServerKind::Rust, fake_server_path());
     offset.fetch_add(60 * 60 * 1_000, Ordering::SeqCst);
-    let later = manager.ensure_server_for_file_detailed(&main_rs, &Config::default());
+    let later = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file_detailed(&main_rs, &Config::default())
+    });
     assert!(
         matches!(
             later.attempts[0].result,
@@ -1711,7 +1931,9 @@ fn spawned_lsp_child_is_tracked_in_registry() {
         "registry should start empty before any spawn"
     );
 
-    let keys = manager.ensure_server_for_file_default(&main_rs);
+    let keys = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file_default(&main_rs)
+    });
     assert_eq!(keys.len(), 1);
     assert_eq!(manager.active_client_count(), 1);
 
@@ -1731,7 +1953,9 @@ fn shutdown_all_untracks_pids_from_registry() {
     manager.set_child_registry(registry.clone());
     manager.override_binary(ServerKind::Rust, fake_server_path());
 
-    manager.ensure_server_for_file_default(&main_rs);
+    crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_server_for_file_default(&main_rs)
+    });
     assert_eq!(registry.pids().len(), 1);
 
     manager.shutdown_all();
@@ -1753,7 +1977,9 @@ fn dropping_manager_untracks_pids_from_registry() {
         let mut manager = LspManager::new();
         manager.set_child_registry(registry.clone());
         manager.override_binary(ServerKind::Rust, fake_server_path());
-        manager.ensure_server_for_file_default(&main_rs);
+        crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+            startup_manager.ensure_server_for_file_default(&main_rs)
+        });
         assert_eq!(registry.pids().len(), 1);
     } // manager and its LspClients drop here
 

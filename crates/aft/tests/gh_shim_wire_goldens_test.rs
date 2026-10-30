@@ -23,6 +23,7 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -34,6 +35,16 @@ use serde_json::{json, Value};
 use subc_protocol::{Flags, Frame, FrameType, ModuleHelloAckBody, Priority, PROTOCOL_VERSION};
 use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
 use subc_transport::{DAEMON_ID_LEN, KEY_LEN};
+
+#[path = "../src/gh_shim/plexus_bindings_contract.rs"]
+mod plexus_bindings_contract;
+/// The stand-in holder's copy of Plexus's published `gh.route` request
+/// contract (`crates/aft/src/gh_shim/plexus_contract_judge.rs`, vendored
+/// fixtures under `crates/aft/tests/fixtures/gh_shim/plexus-contract/`).
+/// Judging every incoming `gh.route` request against it is what keeps a test
+/// stand-in from ever again being more lenient than Plexus's real route.
+#[path = "../src/gh_shim/plexus_contract_judge.rs"]
+mod plexus_contract_judge;
 
 /// Seed of the dev manifest-signing key compiled into debug builds; see
 /// `crates/aft/tests/fixtures/gh_shim/README.md`.
@@ -371,6 +382,16 @@ struct CapturedFrame {
 fn relay_reply(gh_route_response: &[u8]) -> Vec<u8> {
     let response: Value =
         serde_json::from_slice(gh_route_response).expect("gh.route response is JSON");
+    // Plexus's reply vectors already carry the facade envelope. Preserve it
+    // intact instead of translating it through the retired holder protocol.
+    if response.get("repo_binding_generation").is_some() {
+        return serde_json::to_vec(&json!({
+            "op": "gh_shim.bot_request",
+            "status": "ok",
+            "data": response,
+        }))
+        .expect("native facade relay reply");
+    }
     let result = match response["outcome"].as_str() {
         Some("result") => json!({"status": "completed", "result": response["result"]}),
         Some("applied") => {
@@ -393,19 +414,20 @@ fn relay_reply(gh_route_response: &[u8]) -> Vec<u8> {
     .expect("relay reply")
 }
 
-/// Plexus's bindings, matching the test manifest so the shim's version check
-/// passes.
-fn relay_bindings_reply() -> Vec<u8> {
+/// The fake AFT relay returns only the selected agent's view. The handler's
+/// reply shape comes from Plexus's vectors; repository identities are local fixtures.
+fn relay_bindings_reply(agent: &str) -> Vec<u8> {
+    let reply = match agent {
+        "alfonso-aft" => plexus_bindings_contract::agent_reply(REPOSITORY, agent, "h1", 3),
+        OTHER_BOUND_AGENT => {
+            plexus_bindings_contract::agent_reply(OTHER_BOUND_REPOSITORY, agent, "h2", 3)
+        }
+        _ => plexus_bindings_contract::vector("none").1,
+    };
     serde_json::to_vec(&json!({
         "op": "gh_shim.bindings_read",
         "status": "ok",
-        "data": {
-            "repo_binding_generation": 1,
-            "bindings": [
-                {"repository": REPOSITORY, "app_handle_id": "h1", "agent_id": "alfonso-aft"},
-                {"repository": OTHER_BOUND_REPOSITORY, "app_handle_id": "h2", "agent_id": OTHER_BOUND_AGENT},
-            ],
-        },
+        "data": reply["result"],
     }))
     .expect("bindings reply")
 }
@@ -413,6 +435,26 @@ fn relay_bindings_reply() -> Vec<u8> {
 /// Stands in for the ticket the daemon gives an agent's command; the fake
 /// holder accepts any ticket.
 const TEST_GH_SHIM_TICKET: &str = "00112233445566778899aabbccddeeff";
+
+/// What the loopback stand-in holder answers a relayed `gh.route` request
+/// with: the canned reply when the request meets Plexus's published contract,
+/// else a refusal carrying the contract's exact code. A refused request never
+/// reaches the canned reply, so a shim that builds a refused shape fails its
+/// round trip here instead of against live Plexus. Silence (`None` canned) is
+/// preserved for the outcome-unknown rows: an accepted request with no canned
+/// reply still gets no answer.
+fn stand_in_route_reply(request: &Value, canned: Option<&[u8]>) -> Option<Vec<u8>> {
+    match plexus_contract_judge::judge(request) {
+        Ok(_) => canned.map(relay_reply),
+        Err(code) => Some(relay_reply(
+            &serde_json::to_vec(&json!({
+                "outcome": "refusal",
+                "refusal_code": code,
+            }))
+            .expect("refusal reply"),
+        )),
+    }
+}
 
 /// Loopback subc daemon that advertises `aft` serving the gh shim relay on its
 /// management surface, opens route channel 42, records every request frame
@@ -445,6 +487,20 @@ fn response_frame(request: &Frame, body: Vec<u8>) -> Frame {
 
 impl CapturingHolder {
     fn spawn(reply: Option<Vec<u8>>) -> Self {
+        Self::spawn_with_binding_override(reply, None)
+    }
+
+    /// Like `spawn`, answering the relay's bindings read with
+    /// `bindings_reply`, so a manifest with other bindings passes the shim's
+    /// manifest-versus-holder check.
+    fn spawn_with_bindings(reply: Option<Vec<u8>>, bindings_reply: Vec<u8>) -> Self {
+        Self::spawn_with_binding_override(reply, Some(bindings_reply))
+    }
+
+    fn spawn_with_binding_override(
+        reply: Option<Vec<u8>>,
+        bindings_reply: Option<Vec<u8>>,
+    ) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake holder");
         listener
             .set_nonblocking(true)
@@ -476,6 +532,7 @@ impl CapturingHolder {
                                 daemon_id,
                                 Arc::clone(&server_captured),
                                 reply.clone(),
+                                bindings_reply.clone(),
                             ));
                         }
                     }
@@ -532,6 +589,7 @@ async fn serve_connection(
     daemon_id: [u8; DAEMON_ID_LEN],
     captured: Arc<Mutex<Vec<CapturedFrame>>>,
     reply: Option<Vec<u8>>,
+    bindings_reply: Option<Vec<u8>>,
 ) {
     if subc_transport::authenticate_server(
         &mut stream,
@@ -625,11 +683,29 @@ async fn serve_connection(
                             .expect("route close body"),
                     )),
                     Some("gh_shim.bindings_read") if frame.header.channel == ROUTE_CHANNEL => {
-                        Some(response_frame(&frame, relay_bindings_reply()))
+                        let agent = decoded
+                            .as_ref()
+                            .and_then(|request| request["params"]["agent_id"].as_str())
+                            .expect("shim binding read names its signed target agent");
+                        Some(response_frame(
+                            &frame,
+                            bindings_reply
+                                .clone()
+                                .unwrap_or_else(|| relay_bindings_reply(agent)),
+                        ))
                     }
-                    _ if bot_write => reply
-                        .as_deref()
-                        .map(|bytes| response_frame(&frame, relay_reply(bytes))),
+                    _ if bot_write => {
+                        // The captured frame body above holds these same bytes;
+                        // read the request from the decoded frame because that
+                        // body was moved into the capture.
+                        let request = decoded
+                            .as_ref()
+                            .and_then(|value| value.get("params"))
+                            .and_then(|params| params.get("request"))
+                            .expect("relayed bot write carries params.request");
+                        stand_in_route_reply(request, reply.as_deref())
+                            .map(|bytes| response_frame(&frame, bytes))
+                    }
                     _ => None,
                 }
             }
@@ -1373,9 +1449,11 @@ fn speech_with_a_thread_url_naming_a_bound_repository_routes_as_its_bot_from_out
         Governance::Available,
     );
     assert_routed_as(&run, OTHER_BOUND_REPOSITORY, OTHER_BOUND_AGENT);
+    // The route holder routes on the bare thread number: the shim sends the
+    // URL's digits, not the URL.
     assert_eq!(
         run.route_request.as_ref().unwrap()["target"]["number"],
-        json!(url)
+        json!("513")
     );
 }
 
@@ -1515,4 +1593,1115 @@ fn admin_from_a_bound_checkout_aimed_at_an_unbound_repository_still_needs_the_by
         json!(UNBOUND_REPOSITORY)
     );
     assert_eq!(bypassed.bypass_audit[0]["tuple"], json!("pr merge"));
+}
+
+// ---------------------------------------------------------------------------
+// Manifest v22 rows: the routed request each bot-speech row sends
+// ---------------------------------------------------------------------------
+
+/// Environment variables that make an AFT worker shell route governed writes
+/// through the live daemon's worker broker. The v22 runs remove them so the
+/// governed route can only reach the loopback stand-in holder.
+const WORKER_BROKER_ENV: &[&str] = &[
+    "AFT_GH_SHIM_WORKER",
+    "AFT_GH_READ_SOCKET",
+    "AFT_GH_READ_CAPABILITY_FILE",
+    "AFT_GH_SHIMS_DIR",
+];
+
+const V22_RESOLVE: &str = r#"query=mutation { resolveReviewThread(input: {threadId: "PRRT_v22probe"}) { thread { isResolved } } }"#;
+const V22_UNRESOLVE: &str = r#"query=mutation($id: ID!) { unresolveReviewThread(input: {threadId: $id}) { thread { isResolved } } }"#;
+
+/// What a v22 row must do.
+enum V22Expect {
+    /// Reach the holder with exactly these routed fields (besides the fixed
+    /// envelope fields checked for every request), then exit 0.
+    Routed(Value),
+    /// Refuse with this code before anything reaches the holder.
+    Refused(&'static str),
+}
+
+struct V22Row {
+    name: &'static str,
+    argv: Vec<&'static str>,
+    expect: V22Expect,
+}
+
+fn routed(action: &str, target: Value, body: Value, own: bool) -> V22Expect {
+    let mut fields = json!({
+        "action": action,
+        "target": target,
+        "body": body,
+        "repository": REPOSITORY,
+    });
+    if own {
+        fields["author_scope"] = json!("own");
+    }
+    V22Expect::Routed(fields)
+}
+
+/// The GraphQL documents that name a review-thread mutation but are not the
+/// one admitted shape.
+const V22_LOOKALIKES: &[(&str, &str)] = &[
+    (
+        "refuse-graphql-second-mutation",
+        r#"query=mutation { resolveReviewThread(input: {threadId: "PRRT_a"}) { thread { id } } addComment(input: {subjectId: "X", body: "y"}) { clientMutationId } }"#,
+    ),
+    (
+        "refuse-graphql-input-extra-field",
+        r#"query=mutation { resolveReviewThread(input: {threadId: "PRRT_a", clientMutationId: "c"}) { thread { id } } }"#,
+    ),
+    (
+        "refuse-graphql-query-fragment",
+        r#"query=query { ...F } fragment F on Mutation { resolveReviewThread(input: {threadId: "PRRT_a"}) { thread { id } } }"#,
+    ),
+    (
+        "refuse-graphql-query-alias",
+        r#"query=query { x: resolveReviewThread(input: {threadId: "PRRT_a"}) { thread { id } } }"#,
+    ),
+    (
+        "refuse-graphql-mutation-alias",
+        r#"query=mutation { x: resolveReviewThread(input: {threadId: "PRRT_a"}) { thread { id } } }"#,
+    ),
+    (
+        "refuse-graphql-two-operations",
+        r#"query=mutation A { resolveReviewThread(input: {threadId: "PRRT_a"}) { thread { id } } } mutation B { unresolveReviewThread(input: {threadId: "PRRT_a"}) { thread { id } } }"#,
+    ),
+];
+
+fn v22_rows() -> Vec<V22Row> {
+    let reply_tuple = "api:POST:/repos/*/*/pulls/*/comments/*/replies";
+    let mut rows = vec![
+        V22Row {
+            name: "01-pr-edit-title",
+            argv: vec!["pr", "edit", "1", "--title", "v22 round-trip probe"],
+            expect: routed(
+                "pr edit",
+                json!({"number": "1"}),
+                json!({"title": "v22 round-trip probe"}),
+                true,
+            ),
+        },
+        V22Row {
+            name: "02-pr-edit-title-and-body",
+            argv: vec!["pr", "edit", "1", "-t", "probe", "--body", "v22 body"],
+            expect: routed(
+                "pr edit",
+                json!({"number": "1"}),
+                json!({"title": "probe", "body": "v22 body"}),
+                true,
+            ),
+        },
+        V22Row {
+            name: "03-review-reply",
+            argv: vec![
+                "api",
+                "-X",
+                "POST",
+                "repos/cortexkit/aft/pulls/1/comments/1/replies",
+                "-f",
+                "body=v22 round-trip probe",
+            ],
+            expect: routed(
+                reply_tuple,
+                json!({"number": "1", "comment_id": "1"}),
+                json!({"body": "v22 round-trip probe"}),
+                false,
+            ),
+        },
+        V22Row {
+            name: "04-review-reply-implicit-post",
+            argv: vec![
+                "api",
+                "repos/cortexkit/aft/pulls/1/comments/1/replies",
+                "-f",
+                "body=v22 round-trip probe",
+            ],
+            expect: routed(
+                reply_tuple,
+                json!({"number": "1", "comment_id": "1"}),
+                json!({"body": "v22 round-trip probe"}),
+                false,
+            ),
+        },
+        V22Row {
+            name: "05-pull-patch",
+            argv: vec![
+                "api",
+                "-X",
+                "PATCH",
+                "repos/cortexkit/aft/pulls/1",
+                "-f",
+                "title=v22 round-trip probe",
+            ],
+            expect: routed(
+                "pr edit",
+                json!({"number": "1"}),
+                json!({"title": "v22 round-trip probe"}),
+                true,
+            ),
+        },
+        V22Row {
+            name: "06-resolve-thread",
+            argv: vec!["api", "graphql", "-f", V22_RESOLVE],
+            expect: routed(
+                "graphql resolvereviewthread",
+                json!({"thread_id": "PRRT_v22probe"}),
+                json!({}),
+                false,
+            ),
+        },
+        V22Row {
+            name: "07-unresolve-thread",
+            argv: vec![
+                "api",
+                "graphql",
+                "-f",
+                V22_UNRESOLVE,
+                "-f",
+                "id=PRRT_v22probe",
+            ],
+            expect: routed(
+                "graphql unresolvereviewthread",
+                json!({"thread_id": "PRRT_v22probe"}),
+                json!({}),
+                false,
+            ),
+        },
+        V22Row {
+            name: "08-stack-create",
+            argv: vec![
+                "api",
+                "-X",
+                "POST",
+                "repos/cortexkit/aft/stacks",
+                "-F",
+                "pull_requests[]=1",
+                "-F",
+                "pull_requests[]=2",
+            ],
+            expect: routed(
+                "api:POST:/repos/*/*/stacks",
+                json!({}),
+                json!({"pull_requests": [1, 2]}),
+                false,
+            ),
+        },
+        V22Row {
+            name: "09-stack-add",
+            argv: vec![
+                "api",
+                "-X",
+                "POST",
+                "repos/cortexkit/aft/stacks/1/add",
+                "-F",
+                "pull_requests[]=3",
+            ],
+            expect: routed(
+                "api:POST:/repos/*/*/stacks/*/add",
+                json!({"stack_number": "1"}),
+                json!({"pull_requests": [3]}),
+                false,
+            ),
+        },
+        V22Row {
+            name: "10-stack-unstack",
+            argv: vec!["api", "-X", "POST", "repos/cortexkit/aft/stacks/1/unstack"],
+            expect: routed(
+                "api:POST:/repos/*/*/stacks/*/unstack",
+                json!({"stack_number": "1"}),
+                json!({}),
+                false,
+            ),
+        },
+        V22Row {
+            name: "refuse-pull-patch-base",
+            argv: vec![
+                "api",
+                "-X",
+                "PATCH",
+                "repos/cortexkit/aft/pulls/1",
+                "-f",
+                "title=x",
+                "-f",
+                "base=x",
+            ],
+            expect: V22Expect::Refused("gh_shim_unclassified"),
+        },
+        V22Row {
+            name: "refuse-pr-edit-base",
+            argv: vec!["pr", "edit", "1", "--title", "x", "--base", "main"],
+            expect: V22Expect::Refused("gh_shim_unsupported_flag"),
+        },
+        V22Row {
+            name: "refuse-pr-edit-label",
+            argv: vec!["pr", "edit", "1", "--add-label", "probe"],
+            expect: V22Expect::Refused("gh_shim_unsupported_flag"),
+        },
+    ];
+    for (name, query) in V22_LOOKALIKES {
+        rows.push(V22Row {
+            name,
+            argv: vec!["api", "graphql", "-f", query],
+            // Every GraphQL mutation other than the admitted shape is an
+            // unbound write (it names no /repos/ endpoint), refused before
+            // any governance contact, exactly as before v22.
+            expect: V22Expect::Refused("gh_shim_unbound_target"),
+        });
+    }
+    rows
+}
+
+/// The tracked v20 manifest fixture with the v22 additions applied the way
+/// `scripts/prepare-gh-shim-v22.py` applies them, bound only to this test's
+/// repository.
+fn synthetic_v22_manifest(now: u64) -> Vec<u8> {
+    let mut manifest: Value =
+        serde_json::from_str(include_str!("fixtures/gh_shim/v20-manifest.json"))
+            .expect("parse v20 manifest fixture");
+    let additions: Value =
+        serde_json::from_str(include_str!("fixtures/gh_shim/v22-additions.json"))
+            .expect("parse v22 additions");
+    for removed in additions["removed_from_admin"].as_array().unwrap() {
+        manifest["tiers"]["admin"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|row| &row["tuple"] != removed);
+    }
+    for (tier, rows) in additions["tiers"].as_object().unwrap() {
+        manifest["tiers"][tier]
+            .as_array_mut()
+            .unwrap()
+            .extend(rows.as_array().unwrap().iter().cloned());
+    }
+    manifest["api_rules"]
+        .as_array_mut()
+        .unwrap()
+        .extend(additions["api_rules"].as_array().unwrap().iter().cloned());
+    for (tuple, canonical) in additions["canonicalization"].as_object().unwrap() {
+        manifest["canonicalization"][tuple] = canonical.clone();
+    }
+    manifest["manifest_version"] = json!(22);
+    manifest["issued_at_unix_secs"] = json!(now);
+    manifest["bindings"] = json!({ REPOSITORY: "alfonso-aft" });
+    serde_json::to_vec(&manifest).expect("serialize synthetic v22 manifest")
+}
+
+fn write_signed_manifest_bytes(state_dir: &Path, manifest_bytes: &[u8], now: u64) {
+    let key = Ed25519KeyPair::from_seed_unchecked(&DEV_MANIFEST_SEED).expect("dev signing key");
+    let envelope = json!({
+        "artifact_id": "gh-routing-manifest",
+        "envelope_version": 2,
+        "key_id": "gh-routing-dev-test-key-v1",
+        "fetched_at_unix_secs": now,
+        "signature": base64::engine::general_purpose::STANDARD.encode(key.sign(manifest_bytes).as_ref()),
+        "manifest_bytes": std::str::from_utf8(manifest_bytes).expect("manifest is UTF-8"),
+    });
+    fs::create_dir_all(state_dir).expect("create shim state directory");
+    fs::write(
+        state_dir.join("gh-routing-manifest.json"),
+        serde_json::to_vec(&envelope).expect("serialize envelope"),
+    )
+    .expect("write manifest envelope");
+}
+
+/// Everything one v22 row produced.
+struct V22Run {
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    upstream_invocations: Option<String>,
+    routed_request: Option<Value>,
+}
+
+/// Run one row through the real shim with the given signed manifest bytes,
+/// governance reachable through the loopback stand-in holder, and the
+/// recording stand-in for upstream `gh` first on PATH.
+fn run_v22_row(row: &V22Row, manifest_bytes: &[u8], agent_id: &str) -> V22Run {
+    let reply = fs::read(goldens_dir().join("responses/success-result.response.json"))
+        .expect("read success response");
+    run_v22_row_with_reply(row, manifest_bytes, agent_id, reply)
+}
+
+fn run_v22_row_with_reply(
+    row: &V22Row,
+    manifest_bytes: &[u8],
+    agent_id: &str,
+    reply: Vec<u8>,
+) -> V22Run {
+    run_v22_row_with_input(row, manifest_bytes, agent_id, reply, "")
+}
+
+fn run_v22_row_with_input(
+    row: &V22Row,
+    manifest_bytes: &[u8],
+    agent_id: &str,
+    reply: Vec<u8>,
+    input: &str,
+) -> V22Run {
+    let bindings = serde_json::to_vec(&json!({
+        "op": "gh_shim.bindings_read",
+        "status": "ok",
+        "data": plexus_bindings_contract::agent_reply(REPOSITORY, agent_id, "h1", 3)["result"],
+    }))
+    .expect("bindings reply");
+    let holder = CapturingHolder::spawn_with_bindings(Some(reply), bindings);
+    let temp = tempfile::tempdir().expect("temp root");
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let state_dir = state_home.join("cortexkit/aft/gh-shim");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).expect("create HOME");
+    let project = write_project_repo(temp.path());
+    let connection_file = temp.path().join("subc-connection.json");
+    holder.write_connection_file(&connection_file);
+    write_user_config(&config_home, &connection_file);
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream_bin);
+    let now = unix_seconds();
+    write_signed_manifest_bytes(&state_dir, manifest_bytes, now);
+
+    let inherited_path = std::env::var_os("PATH").expect("test PATH");
+    let path = std::env::join_paths(
+        std::iter::once(upstream_bin).chain(std::env::split_paths(&inherited_path)),
+    )
+    .expect("build PATH");
+    let mut command = Command::new(aft_binary());
+    command
+        .arg("gh-shim")
+        .args(&row.argv)
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("AFT_GH_SHIM_STATE_DIR", &state_dir)
+        .env("AFT_STORAGE_DIR", state_home.join("aft-test-storage"))
+        .env("PATH", path)
+        .env("GH_SHIM_TEST_RECORD", &recorder)
+        .env("AFT_GH_SHIM_TICKET", TEST_GH_SHIM_TICKET)
+        .env("AFT_GH_SHIM_RELAY_TIMEOUT_MS", "5000")
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_ENTERPRISE_TOKEN")
+        .env_remove("GH_SHIM_BYPASS")
+        .env_remove("GH_REPO")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for name in WORKER_BROKER_ENV {
+        command.env_remove(name);
+    }
+    let mut child = command.spawn().expect("run gh shim");
+    child
+        .stdin
+        .take()
+        .expect("shim stdin")
+        .write_all(input.as_bytes())
+        .expect("write shim stdin");
+    let output = child.wait_with_output().expect("wait for gh shim");
+    let routed = holder
+        .captured()
+        .into_iter()
+        .filter(|frame| frame.on_route)
+        .map(|frame| serde_json::from_slice::<Value>(&frame.body).expect("routed request is JSON"))
+        .collect::<Vec<_>>();
+    assert!(
+        routed.len() <= 1,
+        "{}: the shim sent {} governed requests",
+        row.name,
+        routed.len()
+    );
+    V22Run {
+        exit_code: output.status.code(),
+        stdout: String::from_utf8(output.stdout).expect("stdout is UTF-8"),
+        stderr: String::from_utf8(output.stderr).expect("stderr is UTF-8"),
+        upstream_invocations: fs::read_to_string(&recorder).ok(),
+        routed_request: routed.into_iter().next(),
+    }
+}
+
+fn check_v22_row(row: &V22Row, run: &V22Run, agent_id: &str) {
+    assert_eq!(
+        run.upstream_invocations, None,
+        "{}: a v22 speech row must never reach upstream gh",
+        row.name
+    );
+    match &row.expect {
+        V22Expect::Routed(fields) => {
+            let request = run.routed_request.as_ref().unwrap_or_else(|| {
+                panic!("{}: nothing reached the holder: {}", row.name, run.stderr)
+            });
+            assert_eq!(run.exit_code, Some(0), "{}: {}", row.name, run.stderr);
+            assert_eq!(request["operation"], json!("gh.route"), "{}", row.name);
+            assert_eq!(request["gh_route_schema"], json!(1), "{}", row.name);
+            assert_eq!(request["manifest_version"], json!(22), "{}", row.name);
+            assert_eq!(
+                request["metadata"]["agent_id"],
+                json!(agent_id),
+                "{}",
+                row.name
+            );
+            assert!(request["rung_as_of_unix_secs"].is_u64(), "{}", row.name);
+            let mut expected_keys = vec![
+                "operation",
+                "gh_route_schema",
+                "manifest_version",
+                "metadata",
+                "rung_as_of_unix_secs",
+            ];
+            let fields = fields.as_object().unwrap();
+            expected_keys.extend(fields.keys().map(String::as_str));
+            expected_keys.sort_unstable();
+            let mut keys = request
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            keys.sort_unstable();
+            assert_eq!(keys, expected_keys, "{}: routed request fields", row.name);
+            for (key, value) in fields {
+                assert_eq!(&request[key], value, "{}: routed {key}", row.name);
+            }
+        }
+        V22Expect::Refused(code) => {
+            assert!(
+                run.routed_request.is_none(),
+                "{}: a refused row reached the holder",
+                row.name
+            );
+            assert_eq!(run.exit_code, Some(86), "{}", row.name);
+            assert!(
+                run.stderr.starts_with(&format!("gh-shim: {code}: ")),
+                "{}: {}",
+                row.name,
+                run.stderr
+            );
+        }
+    }
+}
+
+/// The stand-in holder's reply decision, the seam the contract pins: an
+/// accepted `gh.route` request gets its canned reply (or silence when none
+/// is canned, preserving the outcome-unknown rows), while a request Plexus's
+/// contract refuses gets a refusal carrying the contract's exact code —
+/// never the canned reply.
+#[test]
+fn stand_in_holder_answers_routed_requests_from_the_plexus_contract() {
+    let canned = serde_json::to_vec(&json!({
+        "outcome": "result",
+        "gh_route_schema": 1,
+        "result": {"url": "https://github.com/cortexkit/aft/issues/42"},
+        "field_order": ["url"],
+    }))
+    .expect("canned reply");
+    let vectors = plexus_contract_judge::load_vectors();
+    for vector in &vectors {
+        let expected = match &vector.expect {
+            plexus_contract_judge::ContractExpect::Accepted => Some(relay_reply(&canned)),
+            plexus_contract_judge::ContractExpect::Refused(code) => Some(relay_reply(
+                &serde_json::to_vec(&json!({"outcome": "refusal", "refusal_code": code})).unwrap(),
+            )),
+        };
+        assert_eq!(
+            stand_in_route_reply(&vector.request, Some(&canned)),
+            expected,
+            "{}",
+            vector.name,
+        );
+        let expected_without_canned = match vector.expect {
+            plexus_contract_judge::ContractExpect::Accepted => None,
+            plexus_contract_judge::ContractExpect::Refused(_) => expected,
+        };
+        assert_eq!(
+            stand_in_route_reply(&vector.request, None),
+            expected_without_canned,
+            "{}: no canned reply",
+            vector.name,
+        );
+    }
+}
+
+/// Construct argv for each reply vector's request, failing on a new family
+/// rather than silently leaving a native reply without a real-shim exchange.
+fn reply_contract_row(vector: &Value) -> V22Row {
+    let request = &vector["request"];
+    let text = |value: &Value| value.as_str().expect("request string").to_string();
+    let action = request["action"]
+        .as_str()
+        .or(request["verb"].as_str())
+        .unwrap();
+    let argv: Vec<String> = match action {
+        "pr ready" => {
+            let mut argv = vec!["pr".into(), "ready".into(), text(&request["number"])];
+            if request["undo"] == true {
+                argv.push("--undo".into());
+            }
+            argv
+        }
+        "pr edit" => vec![
+            "pr".into(),
+            "edit".into(),
+            text(&request["target"]["number"]),
+            "--title".into(),
+            text(&request["body"]["title"]),
+        ],
+        "graphql resolvereviewthread" | "graphql unresolvereviewthread" => {
+            let mutation = if action == "graphql resolvereviewthread" {
+                "resolveReviewThread"
+            } else {
+                "unresolveReviewThread"
+            };
+            vec!["api".into(), "graphql".into(), "-f".into(), format!(
+                "query=mutation {{ {mutation}(input: {{threadId: \"{}\"}}) {{ thread {{ id }} }} }}",
+                text(&request["target"]["thread_id"]),
+            )]
+        }
+        "api:POST:/repos/*/*/stacks"
+        | "api:POST:/repos/*/*/stacks/*/add"
+        | "api:POST:/repos/*/*/stacks/*/unstack" => {
+            let mut endpoint = format!("repos/{REPOSITORY}/stacks");
+            if action.ends_with("/add") || action.ends_with("/unstack") {
+                endpoint += &format!(
+                    "/{}/{}",
+                    text(&request["target"]["stack_number"]),
+                    action.rsplit('/').next().unwrap()
+                );
+            }
+            let mut argv = vec!["api".into(), "-X".into(), "POST".into(), endpoint];
+            if let Some(numbers) = request["body"]["pull_requests"].as_array() {
+                for number in numbers {
+                    argv.extend(["-F".into(), format!("pull_requests[]={number}")]);
+                }
+            }
+            argv
+        }
+        other => panic!("{}: untested reply request {other}", vector["name"]),
+    };
+    V22Row {
+        name: leak(text(&vector["name"])),
+        argv: argv.into_iter().map(leak).collect(),
+        expect: V22Expect::Routed(request.clone()),
+    }
+}
+
+#[test]
+fn every_plexus_reply_vector_round_trips_through_the_real_shim() {
+    let vectors = plexus_contract_judge::load_reply_vectors();
+    assert_eq!(vectors.len(), 17);
+    let manifest = synthetic_v22_manifest(unix_seconds());
+    for vector in vectors {
+        let row = reply_contract_row(&vector);
+        let native = serde_json::to_vec(&vector["reply"]).unwrap();
+        let wrapped: Value = serde_json::from_slice(
+            &stand_in_route_reply(&vector["request"], Some(&native)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(wrapped["data"], vector["reply"], "{}", row.name);
+        let run = run_v22_row_with_reply(&row, &manifest, "alfonso-aft", native);
+        assert!(
+            run.upstream_invocations.is_none(),
+            "{} delegated to gh",
+            row.name
+        );
+        let mut routed = run.routed_request.expect("one request, with no retries");
+        let mut expected = vector["request"].clone();
+        expected["repository"] = json!(REPOSITORY);
+        for request in [&mut routed, &mut expected] {
+            request
+                .as_object_mut()
+                .unwrap()
+                .remove("rung_as_of_unix_secs");
+            request.as_object_mut().unwrap().remove("metadata");
+        }
+        assert_eq!(routed, expected, "{}", row.name);
+        let result = &vector["reply"]["result"];
+        if result["status"] == "completed" {
+            assert_eq!(run.exit_code, Some(0), "{}: {}", row.name, run.stderr);
+            assert_eq!(row.name, "resolve-thread-own", "unhandled completed vector");
+            assert_eq!(run.stdout, "id: \"PRRT_kwDOAbc123\"\nresolved: true\n");
+        } else {
+            assert_eq!(run.exit_code, Some(86), "{}: {}", row.name, run.stderr);
+            assert!(run.stdout.is_empty(), "{}", row.name);
+            assert!(
+                run.stderr
+                    .contains(result["refusal_code"].as_str().unwrap()),
+                "{}",
+                row.name
+            );
+            assert!(!run.stderr.contains("outcome unknown"), "{}", row.name);
+            if row.name == "resolve-thread-not-own" {
+                assert_eq!(run.stderr, "gh-shim: gh_shim_seam_refusal: Plexus refused the bot write: review_thread_not_own. 'resolveReviewThread' works only on pull requests this repository's bot opened (app-fixture[bot]); #7 was opened by octocat. Reply to the finding as the bot, then resolve the thread as the operator. Nothing reached GitHub. The agent must change the request.\n");
+            }
+        }
+    }
+}
+
+#[test]
+fn v22_speech_rows_route_exactly_the_declared_requests_and_lookalikes_never_route() {
+    let manifest = synthetic_v22_manifest(unix_seconds());
+    for row in v22_rows() {
+        let run = run_v22_row(&row, &manifest, "alfonso-aft");
+        check_v22_row(&row, &run, "alfonso-aft");
+    }
+}
+
+#[test]
+fn api_typed_patch_body_file_reaches_the_real_relay_as_contents() {
+    let temp = tempfile::tempdir().expect("body fixture");
+    let path = temp.path().join("ship-note.md");
+    let contents = "Ship note with **formatting**.\nSecond line.\n";
+    fs::write(&path, contents).expect("write body fixture");
+    let row = V22Row {
+        name: "api-typed-patch-body-file",
+        argv: vec![
+            "api",
+            "-X",
+            "PATCH",
+            "repos/cortexkit/aft/issues/comments/1",
+            "-F",
+            leak(format!("body=@{}", path.display())),
+        ],
+        expect: routed(
+            "api:PATCH:/repos/*/*/issues/comments/*",
+            json!({"comment_id": "1"}),
+            json!({"body": contents}),
+            true,
+        ),
+    };
+    let run = run_v22_row(&row, &synthetic_v22_manifest(unix_seconds()), "alfonso-aft");
+    check_v22_row(&row, &run, "alfonso-aft");
+}
+
+#[test]
+fn api_comment_field_wire_goldens_preserve_file_stdin_and_raw_semantics() {
+    let temp = tempfile::tempdir().expect("body fixtures");
+    let path = temp.path().join("body.md");
+    let contents = "true\nA Unicode ship note: 🚢\n";
+    fs::write(&path, contents).expect("write body fixture");
+    let document = temp.path().join("body.json");
+    fs::write(
+        &document,
+        serde_json::to_vec(&json!({"body": contents})).unwrap(),
+    )
+    .expect("write JSON fixture");
+    let manifest = synthetic_v22_manifest(unix_seconds());
+    for (method, endpoint, action, target, own) in [
+        (
+            "PATCH",
+            "repos/cortexkit/aft/issues/comments/1",
+            "api:PATCH:/repos/*/*/issues/comments/*",
+            json!({"comment_id": "1"}),
+            true,
+        ),
+        (
+            "POST",
+            "repos/cortexkit/aft/pulls/1/comments/1/replies",
+            "api:POST:/repos/*/*/pulls/*/comments/*/replies",
+            json!({"number": "1", "comment_id": "1"}),
+            false,
+        ),
+    ] {
+        for (flag, value, input, expected) in [
+            ("-F", format!("body=@{}", path.display()), "", contents),
+            ("--field", format!("body=@{}", path.display()), "", contents),
+            ("-F", "body=@-".into(), contents, contents),
+            ("-f", "body=@literal".into(), "", "@literal"),
+            ("--raw-field", "body=@literal".into(), "", "@literal"),
+            ("--input", document.to_str().unwrap().into(), "", contents),
+            (
+                "--input",
+                "-".into(),
+                "{\"body\":\"stdin document\"}",
+                "stdin document",
+            ),
+        ] {
+            let row = V22Row {
+                name: leak(format!("{method}-{flag}-{value}")),
+                argv: vec!["api", "-X", method, endpoint, flag, leak(value)],
+                expect: routed(action, target.clone(), json!({"body": expected}), own),
+            };
+            let reply = fs::read(goldens_dir().join("responses/success-result.response.json"))
+                .expect("success response");
+            let run = run_v22_row_with_input(&row, &manifest, "alfonso-aft", reply, input);
+            check_v22_row(&row, &run, "alfonso-aft");
+        }
+        for source in [temp.path().join("missing.md"), temp.path().to_path_buf()] {
+            let row = V22Row {
+                name: "unreadable-typed-comment-file",
+                argv: vec![
+                    "api",
+                    "-X",
+                    method,
+                    endpoint,
+                    "-F",
+                    leak(format!("body=@{}", source.display())),
+                ],
+                expect: V22Expect::Refused("gh_shim_unclassified"),
+            };
+            let run = run_v22_row(&row, &manifest, "alfonso-aft");
+            check_v22_row(&row, &run, "alfonso-aft");
+            assert!(
+                run.stderr.contains("could not read body file"),
+                "{}",
+                run.stderr
+            );
+        }
+        for scalar in ["true", "false", "null", "123", "-2", "+03"] {
+            let row = V22Row {
+                name: "non-string-typed-comment-body",
+                argv: vec![
+                    "api",
+                    "-X",
+                    method,
+                    endpoint,
+                    "-F",
+                    leak(format!("body={scalar}")),
+                ],
+                expect: V22Expect::Refused("gh_shim_unclassified"),
+            };
+            let run = run_v22_row(&row, &manifest, "alfonso-aft");
+            check_v22_row(&row, &run, "alfonso-aft");
+            assert!(
+                run.stderr.contains("needs body as a string"),
+                "{}",
+                run.stderr
+            );
+        }
+        for flags in [
+            vec!["--input", document.to_str().unwrap(), "-f", "body=query"],
+            vec!["-f", "body=query", "--input", document.to_str().unwrap()],
+            vec![
+                "--input",
+                document.to_str().unwrap(),
+                "--input",
+                document.to_str().unwrap(),
+            ],
+        ] {
+            let mut argv = vec!["api", "-X", method, endpoint];
+            argv.extend(flags.into_iter().map(|value| leak(value.to_string())));
+            let row = V22Row {
+                name: "input-query-fields-not-representable",
+                argv,
+                expect: V22Expect::Refused("gh_shim_unclassified"),
+            };
+            let run = run_v22_row(&row, &manifest, "alfonso-aft");
+            check_v22_row(&row, &run, "alfonso-aft");
+            assert!(run.stderr.contains("--input cannot"), "{}", run.stderr);
+        }
+    }
+}
+
+#[test]
+fn api_other_governed_rows_keep_types_or_refuse_before_relay() {
+    let temp = tempfile::tempdir().expect("API fixtures");
+    let path = temp.path().join("title.md");
+    fs::write(&path, "true").expect("write string-looking scalar fixture");
+    let manifest = synthetic_v22_manifest(unix_seconds());
+    let mut rows = vec![
+        V22Row {
+            name: "pull-edit-typed-file-is-still-a-string",
+            argv: vec![
+                "api",
+                "-X",
+                "PATCH",
+                "repos/cortexkit/aft/pulls/1",
+                "-F",
+                leak(format!("title=@{}", path.display())),
+            ],
+            expect: routed(
+                "pr edit",
+                json!({"number": "1"}),
+                json!({"title": "true"}),
+                true,
+            ),
+        },
+        V22Row {
+            name: "pull-edit-typed-boolean-is-not-prose",
+            argv: vec![
+                "api",
+                "-X",
+                "PATCH",
+                "repos/cortexkit/aft/pulls/1",
+                "-F",
+                "title=true",
+            ],
+            expect: V22Expect::Refused("gh_shim_unclassified"),
+        },
+        V22Row {
+            name: "pull-edit-raw-placeholder-is-literal",
+            argv: vec![
+                "api",
+                "-X",
+                "PATCH",
+                "repos/cortexkit/aft/pulls/1",
+                "-f",
+                "title={repo}",
+            ],
+            expect: routed(
+                "pr edit",
+                json!({"number": "1"}),
+                json!({"title": "{repo}"}),
+                true,
+            ),
+        },
+        V22Row {
+            name: "pull-edit-typed-placeholder-is-not-guessed",
+            argv: vec![
+                "api",
+                "-X",
+                "PATCH",
+                "repos/cortexkit/aft/pulls/1",
+                "-F",
+                "title={repo}",
+            ],
+            expect: V22Expect::Refused("gh_shim_unclassified"),
+        },
+        V22Row {
+            name: "pull-edit-cannot-replay-stdin-twice",
+            argv: vec![
+                "api",
+                "-X",
+                "PATCH",
+                "repos/cortexkit/aft/pulls/1",
+                "-F",
+                "title=@-",
+                "--field",
+                "body=@-",
+            ],
+            expect: V22Expect::Refused("gh_shim_unclassified"),
+        },
+    ];
+    for (endpoint, action, target) in [
+        (
+            "repos/cortexkit/aft/stacks",
+            "api:POST:/repos/*/*/stacks",
+            json!({}),
+        ),
+        (
+            "repos/cortexkit/aft/stacks/1/add",
+            "api:POST:/repos/*/*/stacks/*/add",
+            json!({"stack_number": "1"}),
+        ),
+    ] {
+        for (integer, expected) in [("1", 1_i64), ("+02", 2), ("9223372036854775807", i64::MAX)] {
+            rows.push(V22Row {
+                name: "stack-typed-decimal-integer",
+                argv: vec![
+                    "api",
+                    endpoint,
+                    "-F",
+                    leak(format!("pull_requests[]={integer}")),
+                ],
+                expect: routed(
+                    action,
+                    target.clone(),
+                    json!({"pull_requests": [expected]}),
+                    false,
+                ),
+            });
+        }
+        for (flag, value) in [
+            ("-f", "1"),
+            ("-F", "true"),
+            ("-F", "false"),
+            ("-F", "null"),
+            ("-F", "1.5"),
+            ("-F", "9223372036854775808"),
+        ] {
+            rows.push(V22Row {
+                name: "stack-non-integer-is-not-coerced",
+                argv: vec![
+                    "api",
+                    endpoint,
+                    flag,
+                    leak(format!("pull_requests[]={value}")),
+                ],
+                expect: V22Expect::Refused("gh_shim_unclassified"),
+            });
+        }
+    }
+    for field in [
+        "id=true",
+        "id=false",
+        "id=null",
+        "id=123",
+        "id=@-",
+        "id={repo}",
+    ] {
+        rows.push(V22Row {
+            name: "graphql-variable-rewrite-is-refused",
+            argv: vec!["api", "graphql", "-f", V22_UNRESOLVE, "-F", field],
+            expect: V22Expect::Refused("gh_shim_unbound_target"),
+        });
+    }
+    for row in rows {
+        let run = run_v22_row(&row, &manifest, "alfonso-aft");
+        check_v22_row(&row, &run, "alfonso-aft");
+    }
+}
+
+#[test]
+fn command_body_file_wire_goldens_read_paths_and_stdin_not_api_fields() {
+    let temp = tempfile::tempdir().expect("command body fixtures");
+    let path = temp.path().join("command-body.md");
+    let contents = "Command body from file or stdin.\n";
+    fs::write(&path, contents).expect("write command body");
+    let manifest = synthetic_v22_manifest(unix_seconds());
+    for (head, action, target, own, extra) in [
+        (
+            vec!["issue", "comment", "1"],
+            "issue comment",
+            json!({"number": "1"}),
+            false,
+            json!({}),
+        ),
+        (
+            vec!["pr", "comment", "1"],
+            "pr comment",
+            json!({"number": "1"}),
+            false,
+            json!({}),
+        ),
+        (
+            vec!["issue", "create", "--title", "probe"],
+            "issue create",
+            json!({}),
+            false,
+            json!({"title": "probe"}),
+        ),
+        (
+            vec!["issue", "edit", "1"],
+            "issue edit",
+            json!({"number": "1"}),
+            true,
+            json!({}),
+        ),
+        (
+            vec![
+                "pr", "create", "--title", "probe", "--base", "main", "--head", "topic",
+            ],
+            "pr create",
+            json!({}),
+            false,
+            json!({"title": "probe", "base": "main", "head": "topic", "draft": false}),
+        ),
+        (
+            vec!["pr", "edit", "1"],
+            "pr edit",
+            json!({"number": "1"}),
+            true,
+            json!({}),
+        ),
+        (
+            vec!["pr", "review", "1", "--comment"],
+            "pr review",
+            json!({"number": "1"}),
+            false,
+            json!({"event": "COMMENT"}),
+        ),
+    ] {
+        for (flag, source, input) in [
+            ("--body-file", path.to_str().unwrap(), ""),
+            ("-F", path.to_str().unwrap(), ""),
+            ("--body-file", "-", contents),
+            ("-F", "-", contents),
+        ] {
+            let mut argv = head.clone();
+            argv.extend([flag, leak(source.to_string())]);
+            let mut body = extra.clone();
+            body["body"] = json!(contents);
+            let row = V22Row {
+                name: leak(format!("{action}-{flag}-{source}")),
+                argv,
+                expect: routed(action, target.clone(), body, own),
+            };
+            let reply = fs::read(goldens_dir().join("responses/success-result.response.json"))
+                .expect("success response");
+            let run = run_v22_row_with_input(&row, &manifest, "alfonso-aft", reply, input);
+            check_v22_row(&row, &run, "alfonso-aft");
+        }
+        let mut argv = head.clone();
+        argv.extend([
+            "--body-file",
+            leak(temp.path().join("missing.md").display().to_string()),
+        ]);
+        let row = V22Row {
+            name: "missing-command-body-file",
+            argv,
+            expect: V22Expect::Refused("gh_shim_unclassified"),
+        };
+        let run = run_v22_row(&row, &manifest, "alfonso-aft");
+        check_v22_row(&row, &run, "alfonso-aft");
+        assert!(
+            run.stderr.contains("could not read body file"),
+            "{}",
+            run.stderr
+        );
+    }
+}
+
+/// The same rows against an unsigned v22 manifest payload (the bytes that
+/// will later be signed for production), signed here with the dev key byte
+/// for byte, to record each routed request before the production signing.
+/// Run with
+/// `AFT_GH_SHIM_V22_RIG_PAYLOAD=<unsigned payload>` and
+/// `AFT_GH_SHIM_V22_RIG_EVIDENCE=<directory>`; each row's argv, exit code,
+/// output and routed request are written to the evidence directory.
+#[test]
+#[ignore = "manual evidence run: needs an unsigned v22 payload path"]
+fn v22_payload_draft_round_trip_records_each_routed_request() {
+    let payload_path = std::env::var_os("AFT_GH_SHIM_V22_RIG_PAYLOAD")
+        .map(PathBuf::from)
+        .expect("AFT_GH_SHIM_V22_RIG_PAYLOAD");
+    let evidence = std::env::var_os("AFT_GH_SHIM_V22_RIG_EVIDENCE")
+        .map(PathBuf::from)
+        .expect("AFT_GH_SHIM_V22_RIG_EVIDENCE");
+    fs::create_dir_all(&evidence).expect("create evidence directory");
+    let payload = fs::read(&payload_path).expect("read payload");
+    let digest = |bytes: &[u8]| {
+        use sha2::Digest;
+        format!("{:x}", sha2::Sha256::digest(bytes))
+    };
+    let before = digest(&payload);
+    let parsed: Value = serde_json::from_slice(&payload).expect("payload is JSON");
+    assert_eq!(parsed["manifest_version"], json!(22));
+    let agent_id = parsed["bindings"][REPOSITORY]
+        .as_str()
+        .expect("the payload binds the test repository")
+        .to_string();
+    let mut index = Vec::new();
+    for row in v22_rows() {
+        let run = run_v22_row(&row, &payload, &agent_id);
+        let record = json!({
+            "row": row.name,
+            "argv": std::iter::once("gh").chain(row.argv.iter().copied()).collect::<Vec<_>>(),
+            "exit_code": run.exit_code,
+            "stdout": run.stdout,
+            "stderr": run.stderr,
+            "upstream_gh_invoked": run.upstream_invocations.is_some(),
+            "routed_request": run.routed_request,
+        });
+        let mut text = serde_json::to_string_pretty(&record).expect("serialize record");
+        text.push('\n');
+        fs::write(evidence.join(format!("{}.json", row.name)), text).expect("write record");
+        check_v22_row(&row, &run, &agent_id);
+        index.push(row.name);
+        assert_eq!(
+            digest(&fs::read(&payload_path).expect("re-read payload")),
+            before,
+            "{}: the payload changed",
+            row.name
+        );
+    }
+    fs::write(
+        evidence.join("payload.sha256"),
+        format!("{before}  {}\n", payload_path.display()),
+    )
+    .expect("write payload digest");
+    println!(
+        "V22_ROUND_TRIP rows={} payload_sha256={before}",
+        index.len()
+    );
 }

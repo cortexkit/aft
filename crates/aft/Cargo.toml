@@ -1,6 +1,6 @@
 [package]
 name = "agent-file-tools"
-version = "0.62.0"
+version = "0.63.3"
 edition = "2021"
 description = "Agent File Tools — tree-sitter powered code analysis for AI agents"
 license = "MIT"
@@ -86,6 +86,12 @@ path = "tests/daemon_malloc_small_growth_repro.rs"
 name = "applicability_cost"
 path = "tests/applicability_cost.rs"
 
+# The cold trigram build's peak heap is counted process-wide by its own
+# allocator, so it needs a binary of its own.
+[[test]]
+name = "search_index_build_memory"
+path = "tests/search_index_build_memory.rs"
+
 [lints.rust]
 # The ignored navigation profile is enabled explicitly for manual measurements.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)', 'cfg(aft_fake_lsp_helper)'] }
@@ -95,13 +101,19 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)'
 test-timing-hooks = []
 # In-process integration fixtures need the real binary for native re-exec.
 test-sandbox-launcher = []
+# Deterministic producer inputs for real-wire conformance fixtures, never production.
+test-conformance-result-inputs = []
+# Compiles the test-only secret vault (V5). Nothing in the product reads it:
+# a release profile must never enable it, and
+# `scripts/check-secret-test-fake.sh` fails CI when one does.
+secret-test-fake = []
 semantic-chunk-census = []
 
 [dependencies]
 log = "0.4"
 env_logger = "0.11"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 apollo-parser = "0.8.6"
 lsp-types = "0.97"
 crossbeam-channel = "0.5"
@@ -153,7 +165,7 @@ regex-syntax = "0.8"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 globset = "0.4"
 sha1 = "0.10"
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["compress"] }
 crc32fast = "1"
 blake3 = "1"
 oxc_allocator = "0.126"
@@ -166,13 +178,26 @@ oxc_span = "0.126"
 oxc_str = "0.126"
 rustc-hash = "2"
 rustc-demangle = "0.1"
-rusqlite = { version = "0.32", features = ["bundled", "backup", "trace"] }
-aft-tokenizer = { path = "../aft-tokenizer", version = "0.62.0" }
+rusqlite = { version = "0.32", features = ["bundled", "backup", "trace", "functions"] }
+aft-tokenizer = { path = "../aft-tokenizer", version = "0.63.3" }
+# The placeholder grammar, key-location rules and audit record AFT's vault
+# seam speaks. AFT owns the crate; basal links it later.
+secret-rules = { path = "../secret-rules", version = "0.63.3", package = "aft-secret-rules" }
+zeroize = "1"
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
+async-compression = { version = "0.4", features = ["tokio", "gzip", "zlib", "brotli"] }
+rcgen = "0.13"
 # Shared CortexKit-neutral path-canonicalization primitive (ProjectRootId).
 # Lives in github.com/cortexkit/commons (product-neutral, used without subc);
 # its CI runs the cfg(windows) verbatim/UNC/drive-case vectors continuously.
 cortexkit-paths = "0.1"
-cortexkit-exec-remote-types = "0.2.7"
+cortexkit-exec-remote-types = "=0.2.15"
 
 glob = "0.3"
 which = "7"
@@ -216,15 +241,18 @@ markup5ever_rcdom = "0.38"
 # Keep protocol and transport pinned in lockstep: the transport Frame codec and
 # the protocol's control bodies must agree on the wire-v2 epoch envelope. Tokio
 # runs only at the --subc transport edge; AFT's command core stays synchronous.
-cortexkit-role-tool-provider = "=0.7.2"
+cortexkit-role-tool-provider = "=0.13.0"
+cortexkit-role-agent-data = "=0.2.3"
+cortexkit-project-identity = "=0.1.4"
+cortexkit-agent-identity = "=0.1.1"
 jsonschema = { version = "0.33", default-features = false }
-subc-protocol = "=0.31.0"
-subc-transport = "=0.12.0"
-subc-client-rs = "=0.28.0"
+subc-protocol = "=0.33.5"
+subc-transport = "=0.14.0"
+subc-client-rs = "=0.32.7"
 # The one reader of the daemon's launch nonce (pipe first, environment copy
 # second). subc-client-rs reads through the same cached accessor, so this pin
 # must match the version subc-client-rs depends on.
-subc-os = "=0.1.14"
+subc-os = "=0.1.18"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 vt100 = "0.16"
 jsonc-parser = { version = "0.33", features = ["cst"] }
@@ -237,6 +265,7 @@ landlock = "=0.4.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 fsevent-sys = "4.1"
+libproc = "0.14"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
@@ -249,17 +278,18 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Com",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",
+    "Win32_System_JobObjects",
     "Win32_UI_Shell",
 ] }
 
 [dev-dependencies]
 # Enable the launcher seam only in test builds, not ordinary aft binaries.
-agent-file-tools = { path = ".", features = ["test-sandbox-launcher"] }
+agent-file-tools = { path = ".", features = ["test-sandbox-launcher", "test-conformance-result-inputs"] }
 graphql-parser = "0.4.1"
-cortexkit-role-tool-provider-conformance = "=0.7.1"
+cortexkit-role-tool-provider-conformance = "=0.13.1"
+cortexkit-role-agent-data = { version = "=0.2.3", features = ["test-vectors"] }
 cortexkit-role-harness = "=0.1.0"
 async-trait = "0.1"
 tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"
 filetime = "0.2"
-rcgen = "0.13"

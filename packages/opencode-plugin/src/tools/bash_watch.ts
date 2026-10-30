@@ -12,6 +12,7 @@ import {
   TERMINAL_SCAN_INCOMPLETE_TEXT,
   taskKillDeadlineText,
   taskKillDeadlineWithinHandoffMargin,
+  WATCH_EACH_LINE_NEEDS_BACKGROUND,
   WATCH_SYNC_DEFAULTS_DESCRIPTION,
   WATCH_TIMEOUT_PARAM_DESCRIPTION,
   WATCH_UNAVAILABLE_GIVE_UP_MS,
@@ -45,6 +46,7 @@ import {
 } from "../v2-session-lifecycle.js";
 import { callBashBridge, coerceOptionalInt, optionalInt, projectRootFor } from "./_shared.js";
 import { bashCompanionRegistered } from "./bash.js";
+import { metadataUpdater } from "./metadata.js";
 
 const z = tool.schema;
 const REGEX_WAIT_SCAN_WINDOW_BYTES = 64 * 1024;
@@ -145,6 +147,12 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
           "When true, register an async watch and return immediately. Defaults to false (sync wait).",
         ),
       timeoutMs: optionalInt(1, 1800000).describe(WATCH_TIMEOUT_PARAM_DESCRIPTION),
+      deliver: z
+        .literal("each_line")
+        .optional()
+        .describe(
+          "Async-only: batch every matching complete line, fold consecutive duplicates, and report cap drops with byte offsets.",
+        ),
       once: z
         .boolean()
         .optional()
@@ -168,6 +176,12 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
         requestedAsync && subagentStatus !== false && !bashCfg.subagent_background;
       const isSubagent = subagentStatus === true;
       const asyncMode = requestedAsync && !subagentForcedSync;
+      if (args.deliver !== undefined && !asyncMode) {
+        throw new Error(WATCH_EACH_LINE_NEEDS_BACKGROUND);
+      }
+      if (args.deliver !== undefined && args.deliver !== "each_line") {
+        throw new Error("invalid_request: bash_watch deliver must be each_line");
+      }
 
       if (asyncMode) {
         if (!waitFor) {
@@ -179,6 +193,7 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
           task_id: taskId,
           once: coerceBoolean(args.once, true),
         };
+        if (args.deliver !== undefined) notifyParams.deliver = args.deliver;
         if (waitFor.kind === "regex") notifyParams.regex = waitFor.source;
         else notifyParams.pattern = waitFor.value;
         markExplicitControl(context.sessionID, taskId, false);
@@ -197,9 +212,7 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
           throw new Error(`${code}: ${message}`);
         }
         await trackV2Watch(ctx, context, taskId, registered.watch_id);
-        const metadata = (context as { metadata?: (data: Record<string, unknown>) => void })
-          .metadata;
-        metadata?.({ taskId, registered: true, watchId: registered.watch_id });
+        await metadataUpdater(context)({ taskId, registered: true, watchId: registered.watch_id });
         return `Watch registered: ${registered.watch_id} on task ${taskId}\nA notification will fire when the pattern matches or the task exits.`;
       }
 
@@ -246,13 +259,16 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
           waited.elapsed_ms,
           role,
         );
-        const metadata = (context as { metadata?: (data: Record<string, unknown>) => void })
-          .metadata;
-        metadata?.({ taskId, status: data.status, waited, convertedToAsync: true });
+        await metadataUpdater(context)({
+          taskId,
+          status: data.status,
+          waited,
+          convertedToAsync: true,
+        });
         return withKillDeadline(convertedText, data, role);
       }
-      const metadata = (context as { metadata?: (data: Record<string, unknown>) => void }).metadata;
-      if (waited) metadata?.({ taskId, status: data.status, waited, effectiveWaitMs });
+      if (waited)
+        await metadataUpdater(context)({ taskId, status: data.status, waited, effectiveWaitMs });
       return withKillDeadline(
         formatWatchResultText(taskId, data, waited, role, syncWaitCap),
         data,

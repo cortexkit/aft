@@ -6,6 +6,8 @@ use super::*;
 #[derive(Clone, Copy, Debug)]
 pub(super) struct RunBudget {
     deadline: Option<Instant>,
+    #[cfg(test)]
+    now_for_test: Option<Instant>,
 }
 
 impl RunBudget {
@@ -22,13 +24,15 @@ impl RunBudget {
         Self {
             deadline: expires_at_ms
                 .map(|at| Instant::now() + Duration::from_millis(at.saturating_sub(now_ms))),
+            #[cfg(test)]
+            now_for_test: None,
         }
     }
 
     /// Fit a codemode program's shell call to its run. A PTY needs someone to
     /// drive it interactively, so it is refused. A background command is
-    /// allowed: it joins the head agent's session, so the agent can read it
-    /// with `bash_status`, but it sends no completion wake, because the
+    /// allowed: it joins its owner route's session (the head agent's, or a
+    /// worker run's own worker's), so that owner can read it with `bash_status`, but it sends no completion wake, because the
     /// program is the one waiting for it; the run's end kills it. A
     /// foreground command blocks until it completes, and its wait is cut at
     /// the run's deadline.
@@ -43,9 +47,10 @@ impl RunBudget {
             ));
         }
         let remaining = self.deadline.map(|deadline| {
-            deadline
-                .saturating_duration_since(Instant::now())
-                .as_millis() as u64
+            let now = Instant::now();
+            #[cfg(test)]
+            let now = self.now_for_test.unwrap_or(now);
+            deadline.saturating_duration_since(now).as_millis() as u64
         });
         if remaining == Some(0) {
             return Err(ErrorBody::new(
@@ -401,7 +406,13 @@ impl RunScopes {
         let args = raw_args.get("params").unwrap_or(raw_args);
         let background_error = if matches!(name, "bash" | "powershell" | "bash_watch") {
             let mut args = args.as_object().cloned().unwrap_or_default();
-            RunBudget { deadline: None }.constrain_bash(&mut args).err()
+            RunBudget {
+                deadline: None,
+                #[cfg(test)]
+                now_for_test: None,
+            }
+            .constrain_bash(&mut args)
+            .err()
         } else {
             None
         };
@@ -483,6 +494,15 @@ impl RunBudget {
 #[cfg(test)]
 impl RunScope {
     pub(super) fn for_test(deadline: Option<Instant>) -> Arc<Self> {
+        Self::for_test_with_clock(deadline, None)
+    }
+
+    // Freeze only the budget constraint's clock. Process startup and the
+    // registry's hard-kill timer still run normally with the clamped timeout.
+    pub(super) fn for_test_with_clock(
+        deadline: Option<Instant>,
+        now: Option<Instant>,
+    ) -> Arc<Self> {
         let (writer, _) = mpsc::channel(8);
         let scopes = RunScopes::new(Arc::new(readiness::DaemonControl::new(
             writer,
@@ -502,7 +522,10 @@ impl RunScope {
             .unwrap(),
             control: scopes.control,
             describe_lock: tokio::sync::Mutex::new(()),
-            budget: StdMutex::new(Some(RunBudget { deadline })),
+            budget: StdMutex::new(Some(RunBudget {
+                deadline,
+                now_for_test: now,
+            })),
             revoked: AtomicBool::new(false),
             parked_asks: StdMutex::new(Vec::new()),
         })
@@ -564,6 +587,7 @@ mod lifetime_tests {
         .with_cancellation(cancel.clone());
         let mut pending = RunBudget {
             deadline: Some(Instant::now()),
+            now_for_test: None,
         }
         .guard_pending(pending);
         let response = (pending.poll)(&test_support::test_ctx())

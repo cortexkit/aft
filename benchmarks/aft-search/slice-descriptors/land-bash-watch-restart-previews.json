@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "bash-watch-restart-previews"
+  ],
+  "note": "Bash background only: a substring watch reports its own pattern as the matched text and keeps it visible in each_line rows; a watch preview or each_line row withheld after a daemon restart names the output file; the secret environment-name rule no longer counts AUTH inside the word AUTHOR (crates/aft/src/bash_background/, crates/aft/src/log_redact.rs, crates/aft/src/test_env.rs). No aft_search ranking, fusion, lane admission or truncation change."
+}

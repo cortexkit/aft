@@ -16,11 +16,22 @@ use htmd::{
 };
 use markup5ever_rcdom::{Node, NodeData};
 use reqwest::blocking::{Client, Response as HttpResponse};
-use reqwest::header::{ACCEPT, CONTENT_TYPE, LOCATION, USER_AGENT};
+use reqwest::header::{
+    ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, LOCATION, USER_AGENT,
+};
 use reqwest::redirect::Policy;
+use secret_rules::audit::{AuditReason, AuditRecordV1, Decision};
+use secret_rules::location::{
+    evaluate_request_with_connect, location_kind_token, LabelOutcome, LabelRule, Location,
+    RequestView,
+};
+use secret_rules::material::{check_admissible, encode_for_location};
+use secret_rules::scrub::{MatcherSet, ScrubError, Scrubber};
+use secret_rules::target::{normalize_request_target, ConnectAuthority, RequestTarget, RuleTarget};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
+use zeroize::Zeroizing;
 
 use crate::parser::detect_language;
 
@@ -49,6 +60,10 @@ pub(crate) const URL_REPLY_MARGIN: Duration = Duration::from_secs(1);
 /// reading the document back. A download that ends at its deadline still has
 /// this much time for that work.
 const URL_READ_BACK_RESERVE: Duration = Duration::from_secs(2);
+/// The part of the read-back reserve a placeholder fetch's final residual
+/// key check may use, counted from the end of the download deadline. The
+/// rest stays for writing and reading the document back.
+const RESIDUAL_CHECK_RESERVE: Duration = Duration::from_millis(1500);
 /// A transient failure is retried only when the backoff plus at least this
 /// much time for the next attempt still fit before the fetch deadline.
 const MIN_USEFUL_ATTEMPT: Duration = Duration::from_secs(1);
@@ -91,6 +106,10 @@ pub struct UrlFetchOptions {
     /// connecting, standing in for a host that does not answer the connect.
     #[doc(hidden)]
     pub connect_delay: Option<Duration>,
+    /// Test hook: the TLS configuration to use instead of the platform
+    /// verifier, so a test can trust a local HTTPS server's certificate.
+    #[doc(hidden)]
+    pub tls_config: Option<rustls::ClientConfig>,
 }
 
 /// A host name lookup: the host's addresses, or the lookup's error.
@@ -150,6 +169,24 @@ impl UrlFetchError {
             phase: Some(phase),
             ..Self::new(message)
         }
+    }
+
+    /// A placeholder fetch refused by its secret rules or the vault, with the
+    /// secret reply code (`secret_refused`, `secrets_unavailable`, ...).
+    fn secret(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            ..Self::new(message)
+        }
+    }
+
+    /// This error reworded for a refusal that came after a request carrying a
+    /// key was sent; any other error is returned unchanged.
+    fn after_secret_sent(mut self) -> Self {
+        if let Some(rest) = self.message.strip_prefix(SECRET_FETCH_REFUSED) {
+            self.message = format!("{SECRET_FETCH_REFUSED_AFTER_SEND}{rest}");
+        }
+        self
     }
 
     fn http_status(status: u16, message: impl Into<String>) -> Self {
@@ -669,6 +706,901 @@ fn download_to_cache(
     Ok(content_file)
 }
 
+/// The fresh cached copy of `url` under `storage_dir`, if there is one. Reads
+/// only: it creates no folder, writes nothing and downloads nothing. The cache
+/// check is bounded by the call's deadline like a remembered failure's (a
+/// stalled cache drive counts as a miss), and a cached copy passes the same
+/// scheme and private-address checks as a download before it is served.
+pub fn cached_url_document(
+    url: &str,
+    storage_dir: &Path,
+    options: &UrlFetchOptions,
+) -> Result<Option<PathBuf>, UrlFetchError> {
+    let parsed = Url::parse(url).map_err(|_| UrlFetchError::new(format!("Invalid URL: {url}")))?;
+    let deadline = FetchDeadline::for_current_call();
+    let fetch_url = rewrite_url_for_fetch(&parsed);
+    let hash = hash_url(url);
+    let check = CacheCheckInput {
+        storage_dir: storage_dir.to_path_buf(),
+        meta_file: meta_path(storage_dir, &hash),
+        hash,
+        url: fetch_url.clone(),
+    };
+    let key = FailureKey::new(storage_dir, url, options.allow_private);
+    let Some(cached) = bounded_cache_check(&key, check, cache_check_deadline())? else {
+        return Ok(None);
+    };
+    validate_public_url(&fetch_url, options, &deadline, &ApprovedHosts::default())?;
+    Ok(Some(cached))
+}
+
+/// Folder, under the cache root, that holds the private per-call folders of
+/// placeholder fetches. It is a sibling of the URL cache, never inside it.
+pub(crate) const SECRET_FETCH_DIR: &str = "url_secret_fetch";
+
+/// The start of every refusal a placeholder fetch makes on its own (as opposed
+/// to a refusal the vault decided) before any request carrying a key was sent.
+/// One constant so the wording is reviewed once; the message goes on to name a
+/// stable reason token and the URL as the agent wrote it, with the
+/// placeholder and never a key.
+pub(crate) const SECRET_FETCH_REFUSED: &str =
+    "Secret placeholder fetch refused; no request carrying the secret was sent";
+
+/// The start of the same refusals once a request carrying a key has been sent:
+/// the response (or a later hop) was refused, so the claim above would be
+/// false.
+pub(crate) const SECRET_FETCH_REFUSED_AFTER_SEND: &str =
+    "Secret placeholder fetch stopped after a request carrying the secret was sent; its response was not used";
+
+/// A stand-in key used only to plan where a placeholder fetch would
+/// substitute. Real vault bytes are asked for only once a rule matches.
+const SECRET_PLANNING_KEY: &[u8] = b"url-fetch-planning-value-0000";
+
+/// The most content codings a placeholder fetch decodes from one response.
+const MAX_SECRET_CODINGS: usize = 4;
+
+/// Every label of a well-formed placeholder in `url`, in order and without
+/// repeats, or `None` when the URL mentions no placeholder at all.
+///
+/// A percent-encoded placeholder counts as well as a literal one, because a
+/// query value is compared after decoding. `Some` with no labels means the URL
+/// mentions the placeholder prefix only in a malformed way: such a URL still
+/// takes the placeholder path (no cache, no web-view rewrite), it just has
+/// nothing to substitute.
+pub(crate) fn secret_labels_in_url(url: &str) -> Option<Vec<String>> {
+    if !secret_rules::placeholder::contains_placeholder_prefix_loose(url) {
+        return None;
+    }
+    let decoded = percent_decode_path_segment(url);
+    let mut labels: Vec<String> = Vec::new();
+    for text in [url, decoded.as_str()] {
+        for placeholder in secret_rules::placeholder::scan(text) {
+            if !labels.iter().any(|label| label == placeholder.label) {
+                labels.push(placeholder.label.to_string());
+            }
+        }
+    }
+    Some(labels)
+}
+
+/// Create the private folder one placeholder fetch writes its document into,
+/// under `storage_dir` but outside the URL cache. The caller owns the folder
+/// and deletes it when its call returns.
+pub(crate) fn create_secret_fetch_dir(storage_dir: &Path) -> Result<PathBuf, UrlFetchError> {
+    let parent = storage_dir.join(SECRET_FETCH_DIR);
+    let failed = |error: io::Error| {
+        UrlFetchError::new(format!(
+            "Failed to create a private folder for a placeholder fetch under {}: {error}",
+            parent.display()
+        ))
+    };
+    crate::private_storage::open_dir(storage_dir, &parent).map_err(failed)?;
+    let dir = parent.join(random_nonce());
+    // `create_dir` fails when the folder exists, so no other call shares it.
+    crate::private_storage::create_dir(&dir).map_err(failed)?;
+    Ok(dir)
+}
+
+/// What a placeholder fetch may do with its secrets.
+pub struct SecretFetch<'a> {
+    /// The vault `material` and `audit` go to.
+    pub vault: &'a dyn crate::secret::SecretVault,
+    /// The call's authorization scope; `None` only when the URL holds no
+    /// well-formed placeholder, in which case nothing is resolved or audited.
+    pub authorization: Option<crate::secret::SecretScope>,
+    /// Every label found in the URL, in order. Each has a rule in `rules`.
+    pub labels: Vec<String>,
+    /// The rule the vault granted for each label, carrying its grant id.
+    pub rules: Vec<LabelRule>,
+    /// The fetch call's id: audit records name it, plus the hop index.
+    pub call_id: String,
+}
+
+/// Keys the vault released during one placeholder fetch. They are kept, wiped
+/// on drop, only until the fetch returns, so every header and body read after
+/// a key was sent is scrubbed of it.
+#[derive(Default)]
+struct HeldKeys(Vec<(String, Zeroizing<Vec<u8>>)>);
+
+impl HeldKeys {
+    fn matchers(&self) -> Result<Vec<MatcherSet>, ScrubError> {
+        self.0
+            .iter()
+            .map(|(label, key)| MatcherSet::new(label, key))
+            .collect()
+    }
+
+    /// Hold `key` for `label`, refusing a key whose matcher would collide with
+    /// one already held (the scrubber could then write one key into a reply).
+    fn hold(&mut self, label: &str, key: &[u8]) -> Result<(), ScrubError> {
+        if self
+            .0
+            .iter()
+            .any(|(held, bytes)| held == label && bytes.as_slice() == key)
+        {
+            return Ok(());
+        }
+        let mut matchers = self.matchers()?;
+        matchers.push(MatcherSet::new(label, key)?);
+        Scrubber::new(matchers)?;
+        self.0
+            .push((label.to_string(), Zeroizing::new(key.to_vec())));
+        Ok(())
+    }
+
+    /// `bytes` with every held key replaced by its label's placeholder.
+    fn scrub(&self, bytes: &[u8]) -> Result<Vec<u8>, ScrubError> {
+        let mut scrubber = Scrubber::new(self.matchers()?)?;
+        let mut clean = scrubber.push(bytes);
+        clean.extend_from_slice(&scrubber.finish());
+        Ok(clean)
+    }
+
+    fn keys(&self) -> Vec<&[u8]> {
+        self.0.iter().map(|(_, key)| key.as_slice()).collect()
+    }
+
+    /// Error text from a library (reqwest, the decoders) with every held key
+    /// replaced by its placeholder. Text that still spells a key after that,
+    /// or that cannot be scrubbed, is dropped whole.
+    fn sanitize_detail(&self, detail: &str) -> String {
+        let deadline = Instant::now() + DETAIL_CHECK_LIMIT;
+        match self.scrub(detail.as_bytes()) {
+            Ok(clean) if self.reveal(&clean, deadline).is_clean() => {
+                String::from_utf8_lossy(&clean).into_owned()
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// Whether `bytes` still spell a held key, as they stand or after a URL
+    /// parser or reader normalizes them, checked until `deadline` (see
+    /// [`secret_rules::reveal_outcome`]).
+    fn reveal(&self, bytes: &[u8], deadline: Instant) -> secret_rules::RevealOutcome {
+        secret_rules::reveal_outcome(bytes, &self.keys(), Some(deadline))
+    }
+}
+
+/// The longest the residual check of a library error's text may run; such
+/// text is short, and text the check cannot clear in time is dropped.
+const DETAIL_CHECK_LIMIT: Duration = Duration::from_millis(100);
+
+/// Refuse unless the residual check found `bytes` clean: `found` names the
+/// refusal when a key was spelled, and a check that could not finish refuses
+/// as exhausted or timed out.
+fn refuse_unless_clean(
+    outcome: secret_rules::RevealOutcome,
+    found: &str,
+    url: &str,
+) -> Result<(), UrlFetchError> {
+    match outcome {
+        secret_rules::RevealOutcome::Clean => Ok(()),
+        secret_rules::RevealOutcome::Found => Err(secret_fetch_refused(found, url)),
+        secret_rules::RevealOutcome::Exhausted => {
+            Err(secret_fetch_refused("residual_check_exhausted", url))
+        }
+        secret_rules::RevealOutcome::OutOfTime => {
+            Err(secret_fetch_refused("residual_check_timeout", url))
+        }
+    }
+}
+
+fn secret_fetch_refused(reason: &str, url: &str) -> UrlFetchError {
+    UrlFetchError::secret(
+        crate::secret::SECRET_REFUSED,
+        format!("{SECRET_FETCH_REFUSED} ({reason}): {url}"),
+    )
+}
+
+fn scrub_refusal(url: &str) -> impl Fn(ScrubError) -> UrlFetchError + '_ {
+    move |_| secret_fetch_refused("scrubber_unavailable", url)
+}
+
+/// Fetch `logical_url`, a URL that mentions a secret placeholder, into
+/// `document_dir` and return the converted document's path.
+///
+/// The URL cache is never read or written, and the web-view rewrite is
+/// skipped, so the URL the vault's rule is matched against is the one the
+/// agent gave. Every hop, redirects included, is checked against the private
+/// address policy and then evaluated from scratch against the granted rules:
+/// only a hop a rule covers gets a copy of the URL with the key in its query.
+/// Every response header this function reads (`Location` first of all) and
+/// the body are scrubbed of each key released so far before they are used, and
+/// every message names `logical_url` (or a scrubbed redirect target), never a
+/// URL that held a key.
+pub fn fetch_url_with_secrets(
+    logical_url: &str,
+    document_dir: &Path,
+    options: UrlFetchOptions,
+    secrets: &SecretFetch<'_>,
+) -> Result<PathBuf, UrlFetchError> {
+    let key_sent = std::cell::Cell::new(false);
+    fetch_with_secrets(logical_url, document_dir, options, secrets, &key_sent).map_err(|error| {
+        // A refusal written as "nothing was sent" is reworded once a request
+        // carrying the key has gone out.
+        if key_sent.get() {
+            error.after_secret_sent()
+        } else {
+            error
+        }
+    })
+}
+
+/// [`fetch_url_with_secrets`], recording in `key_sent` when a request that
+/// carried a key has been sent (or attempted).
+fn fetch_with_secrets(
+    logical_url: &str,
+    document_dir: &Path,
+    options: UrlFetchOptions,
+    secrets: &SecretFetch<'_>,
+    key_sent: &std::cell::Cell<bool>,
+) -> Result<PathBuf, UrlFetchError> {
+    let mut current = Url::parse(logical_url)
+        .map_err(|_| UrlFetchError::new(format!("Invalid URL: {logical_url}")))?;
+    // A fragment never reaches a server, and a rule never matches one.
+    current.set_fragment(None);
+    let start = current.clone();
+    let deadline = FetchDeadline::for_current_call();
+    let approved = Arc::new(ApprovedHosts::default());
+    let progress = Arc::new(ConnectProgress::default());
+    let client = build_client(&options, Arc::clone(&approved), Arc::clone(&progress))?;
+    let mut held = HeldKeys::default();
+    let mut hop = 0;
+    let response = loop {
+        validate_public_url(&current, &options, &deadline, &approved)?;
+        let outbound = secret_hop(&current, hop, secrets, &mut held)?;
+        if outbound.is_some() {
+            key_sent.set(true);
+        }
+        let sent = send_request(
+            &client,
+            outbound.as_ref().unwrap_or(&current),
+            Some((current.as_str(), &held)),
+            &deadline,
+            &progress,
+        );
+        // Wipe this function's copy of the key-bearing URL now that it is sent.
+        drop(outbound.map(|url| Zeroizing::new(String::from(url))));
+        let response = sent?;
+        if !response.status().is_redirection() {
+            break response;
+        }
+        if hop == MAX_REDIRECTS {
+            return Err(UrlFetchError::new(format!(
+                "Too many redirects fetching {logical_url}"
+            )));
+        }
+        // A control byte never belongs in a Location, and URL parsing would
+        // drop some of them (a tab), joining text the scrubber saw apart.
+        if response.headers().get_all(LOCATION).iter().any(|value| {
+            value
+                .as_bytes()
+                .iter()
+                .any(|byte| *byte < 0x20 || *byte == 0x7f)
+        }) {
+            return Err(secret_fetch_refused("redirect_control_byte", logical_url));
+        }
+        let location = scrubbed_header(&response, LOCATION, &held, logical_url, &deadline)?
+            .filter(|value| value.bytes().all(|byte| (0x20..0x7f).contains(&byte)))
+            .ok_or_else(|| {
+                UrlFetchError::new(format!(
+                    "Redirect from {} missing Location header",
+                    current.as_str()
+                ))
+            })?;
+        let mut next = current.join(&location).map_err(|error| {
+            UrlFetchError::new(format!(
+                "Invalid redirect Location '{location}' from {}: {error}",
+                current.as_str()
+            ))
+        })?;
+        next.set_fragment(None);
+        // Joining normalizes the URL (dot segments collapse, the host is
+        // lowercased, escapes are kept), which can reassemble a key the
+        // header scrub did not see. Check the URL exactly as it will be
+        // looked up, sent and named, before any of that happens.
+        refuse_unless_clean(
+            held.reveal(next.as_str().as_bytes(), header_check_deadline(&deadline)),
+            "redirect_discloses_key",
+            logical_url,
+        )?;
+        current = next;
+        hop += 1;
+    };
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(UrlFetchError::http_status(
+            status.as_u16(),
+            format!(
+                "HTTP {} {} fetching {logical_url}",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("")
+            ),
+        ));
+    }
+    let content_type = scrubbed_header(&response, CONTENT_TYPE, &held, logical_url, &deadline)?
+        .unwrap_or_else(|| "text/plain".to_string());
+    // `HeaderMap::get` reads only the first field. A second Content-Encoding
+    // field could name a coding behind an `identity` first one, so repeated
+    // fields refuse the response rather than being read in part.
+    if response.headers().get_all(CONTENT_ENCODING).iter().count() > 1 {
+        return Err(secret_fetch_refused("content_encoding", logical_url));
+    }
+    let codings = match scrubbed_header(&response, CONTENT_ENCODING, &held, logical_url, &deadline)?
+    {
+        Some(value) => secret_content_codings(&value, logical_url)?,
+        None if response.headers().contains_key(CONTENT_ENCODING) => {
+            return Err(secret_fetch_refused("content_encoding", logical_url));
+        }
+        None => Vec::new(),
+    };
+    let (extension, from_source_path) = resolve_fetch_extension(&start, &content_type)
+        .ok_or_else(|| {
+            UrlFetchError::new(format!(
+                "Unsupported content type '{content_type}' for {logical_url}. Supported: text/html, text/markdown, application/json, text/plain; source files via URL path extension (e.g. .rs, .ts, .mjs)"
+            ))
+        })?;
+    // An HTML response is converted whatever its path says (an index.php
+    // page, or a .json endpoint answering with an HTML error page). Kept raw,
+    // its markup would hide a key split across tags or spelled with entities
+    // from the scrub while any browser shows it; converted, the residual
+    // check below sees the text a reader sees.
+    let is_html =
+        extension == ".html" || resolve_extension_from_content_type(&content_type) == Some(".html");
+    let total_bytes = codings
+        .is_empty()
+        .then(|| response.content_length())
+        .flatten();
+    // A failed read's text comes from reqwest and may name the request URL,
+    // which held the key; it is scrubbed like everything else read back.
+    let sanitize = |detail: &str| held.sanitize_detail(detail);
+    #[cfg(test)]
+    let response: Box<dyn Read + Send> =
+        match TEST_BODY_READ_ERROR.with(|slot| slot.borrow().clone()) {
+            Some(message) => Box::new(FailingBody(message)),
+            None => Box::new(response),
+        };
+    let (raw, mut download_truncated) =
+        read_response_body_with(response, logical_url, &deadline, &sanitize)?;
+    let raw = Zeroizing::new(raw);
+    let decoded = decode_secret_body(&raw, &codings, &mut download_truncated, logical_url)?;
+    let mut body = held.scrub(&decoded).map_err(scrub_refusal(logical_url))?;
+    drop(decoded);
+    let downloaded_bytes = body.len();
+    if download_truncated {
+        if let Err(error) = std::str::from_utf8(&body) {
+            if error.error_len().is_none() {
+                body.truncate(error.valid_up_to());
+            }
+        }
+    }
+    if from_source_path && !is_html && body_contains_nul_in_prefix(&body) {
+        return Err(UrlFetchError::new(format!(
+            "Binary content detected for source URL {logical_url}"
+        )));
+    }
+    let (body, content_type, extension) = if is_html {
+        // Converting HTML can decode entities into new text, so the converted
+        // document is scrubbed again before it is written.
+        let markdown = convert_html_body_to_markdown(&body, logical_url)?;
+        (
+            held.scrub(&markdown).map_err(scrub_refusal(logical_url))?,
+            CONVERTED_MARKDOWN_CONTENT_TYPE.to_string(),
+            ".md",
+        )
+    } else {
+        (body, content_type, extension)
+    };
+
+    // The scrub replaced every spelling it recognised, but conversion and
+    // plain readers undo more (a Markdown-escaped `\*`, an HTML entity kept in
+    // a page served under a source path). A document that still spells a held
+    // key after those is refused, never written; so is one the check could
+    // not finish, within its work budget or before its share of the call's
+    // read-back reserve ran out.
+    refuse_unless_clean(
+        held.reveal(&body, residual_check_deadline(&deadline)),
+        "document_discloses_key",
+        logical_url,
+    )?;
+    let content_file = document_dir.join(format!("document{extension}"));
+    write_secret_document(&content_file, &body)?;
+    // The metadata sits where `download_notice` looks for it, so a truncated
+    // download is disclosed exactly as a cached one is.
+    let meta = CacheMeta {
+        url: logical_url.to_string(),
+        content_type,
+        extension: extension.to_string(),
+        fetched_at: now_ms(),
+        download_truncated,
+        downloaded_bytes,
+        total_bytes,
+    };
+    let meta_bytes = serde_json::to_vec(&meta).map_err(|error| {
+        UrlFetchError::new(format!("Failed to encode URL fetch metadata: {error}"))
+    })?;
+    write_secret_document(&content_file.with_extension("meta.json"), &meta_bytes)?;
+    Ok(content_file)
+}
+
+fn write_secret_document(path: &Path, bytes: &[u8]) -> Result<(), UrlFetchError> {
+    crate::private_storage::write(path, bytes).map_err(|error| {
+        UrlFetchError::new(format!(
+            "Failed to write placeholder fetch document {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+/// A response header's value, scrubbed of every held key before anything
+/// reads it; `None` when the header is absent or not text.
+fn scrubbed_header(
+    response: &HttpResponse,
+    name: reqwest::header::HeaderName,
+    held: &HeldKeys,
+    url: &str,
+    deadline: &FetchDeadline,
+) -> Result<Option<String>, UrlFetchError> {
+    let Some(value) = response.headers().get(&name) else {
+        return Ok(None);
+    };
+    let clean = held.scrub(value.as_bytes()).map_err(scrub_refusal(url))?;
+    // The scrubbed value is read, joined or quoted next; a key it still
+    // spells in a form the scrub missed refuses the response instead.
+    refuse_unless_clean(
+        held.reveal(&clean, header_check_deadline(deadline)),
+        "header_discloses_key",
+        url,
+    )?;
+    Ok(String::from_utf8(clean).ok())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// When set, a placeholder fetch's body read fails with this text, so a
+    /// test can check what the call site does with a library error.
+    static TEST_BODY_READ_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Make this thread's placeholder fetches fail their body read with
+/// `message` until the returned guard drops.
+#[cfg(test)]
+pub(crate) fn inject_secret_body_read_error_for_test(message: String) -> impl Drop {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_BODY_READ_ERROR.with(|slot| slot.replace(None));
+        }
+    }
+    TEST_BODY_READ_ERROR.with(|slot| slot.replace(Some(message)));
+    Restore
+}
+
+/// A response body whose every read fails with the injected text.
+#[cfg(test)]
+struct FailingBody(String);
+
+#[cfg(test)]
+impl Read for FailingBody {
+    fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::other(self.0.clone()))
+    }
+}
+
+/// When a placeholder fetch's final residual key check must stop: its share
+/// of the read-back reserve after the download deadline, or sooner in a test
+/// that injects a shorter limit.
+fn residual_check_deadline(deadline: &FetchDeadline) -> Instant {
+    #[cfg(test)]
+    if let Some(limit) = TEST_RESIDUAL_LIMIT.with(std::cell::Cell::get) {
+        return Instant::now() + limit;
+    }
+    deadline.at + RESIDUAL_CHECK_RESERVE
+}
+
+/// When the residual check of a response header or a joined redirect URL
+/// must stop: the download deadline, since those checks run while the fetch
+/// is still downloading, or sooner in a test that injects a shorter limit.
+fn header_check_deadline(deadline: &FetchDeadline) -> Instant {
+    #[cfg(test)]
+    if let Some(limit) = TEST_RESIDUAL_LIMIT.with(std::cell::Cell::get) {
+        return Instant::now() + limit;
+    }
+    deadline.at
+}
+
+#[cfg(test)]
+thread_local! {
+    /// When set, each of a placeholder fetch's residual checks (headers,
+    /// redirect URLs, the document) stops this long after it starts, so a
+    /// test can reach the timeout without a slow document.
+    static TEST_RESIDUAL_LIMIT: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+/// Make this thread's placeholder fetches stop their residual check `limit`
+/// after it starts, until the returned guard drops.
+#[cfg(test)]
+pub(crate) fn limit_secret_residual_check_for_test(limit: Duration) -> impl Drop {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_RESIDUAL_LIMIT.with(|slot| slot.set(None));
+        }
+    }
+    TEST_RESIDUAL_LIMIT.with(|slot| slot.set(Some(limit)));
+    Restore
+}
+
+/// A content coding a placeholder fetch can undo before scrubbing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretCoding {
+    Identity,
+    Gzip,
+    Deflate,
+    Brotli,
+}
+
+/// The codings a response declares, in the order they were applied. A server
+/// may encode the body although the request asked for `identity`; any coding
+/// this function cannot undo refuses the document, because an encoded key
+/// cannot be scrubbed. A coding named twice refuses it too: no ordinary server
+/// encodes a body twice the same way, and the limit on stacked codings stays
+/// meaningful.
+fn secret_content_codings(value: &str, url: &str) -> Result<Vec<SecretCoding>, UrlFetchError> {
+    let mut codings = Vec::new();
+    for token in value.split(',').map(str::trim) {
+        let coding = if token.eq_ignore_ascii_case("identity") {
+            SecretCoding::Identity
+        } else if token.eq_ignore_ascii_case("gzip") || token.eq_ignore_ascii_case("x-gzip") {
+            SecretCoding::Gzip
+        } else if token.eq_ignore_ascii_case("deflate") {
+            SecretCoding::Deflate
+        } else if token.eq_ignore_ascii_case("br") {
+            SecretCoding::Brotli
+        } else {
+            return Err(secret_fetch_refused("content_encoding", url));
+        };
+        if codings.len() >= MAX_SECRET_CODINGS || codings.contains(&coding) {
+            return Err(secret_fetch_refused("content_encoding", url));
+        }
+        codings.push(coding);
+    }
+    Ok(codings)
+}
+
+/// Undo `codings` (last applied first), keeping at most
+/// [`MAX_RESPONSE_BYTES`] of output. A body whose download was cut short keeps
+/// what decoded before the cut; any other decoding failure refuses it.
+fn decode_secret_body(
+    body: &[u8],
+    codings: &[SecretCoding],
+    truncated: &mut bool,
+    url: &str,
+) -> Result<Zeroizing<Vec<u8>>, UrlFetchError> {
+    use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, ZlibDecoder};
+    use tokio::io::{AsyncRead, BufReader};
+
+    let mut data = Zeroizing::new(body.to_vec());
+    for coding in codings.iter().rev() {
+        let input: &[u8] = &data;
+        let reader: std::pin::Pin<Box<dyn AsyncRead + Send + '_>> = match coding {
+            SecretCoding::Identity => continue,
+            SecretCoding::Gzip => {
+                let mut decoder = GzipDecoder::new(BufReader::new(input));
+                decoder.multiple_members(true);
+                Box::pin(decoder)
+            }
+            SecretCoding::Deflate => Box::pin(ZlibDecoder::new(BufReader::new(input))),
+            SecretCoding::Brotli => Box::pin(BrotliDecoder::new(BufReader::new(input))),
+        };
+        let input_truncated = *truncated;
+        let (output, cut) = drain_decoder(reader, input_truncated).map_err(|()| {
+            UrlFetchError::new(format!("Failed to decode the response body for {url}"))
+        })?;
+        if cut {
+            *truncated = true;
+        }
+        data = output;
+    }
+    Ok(data)
+}
+
+/// Read a decoder over an in-memory body to its end, keeping at most
+/// [`MAX_RESPONSE_BYTES`]. Returns the output and whether the ceiling cut it.
+/// A body whose download was already cut (`input_truncated`) ends mid-stream;
+/// what decoded before the cut is kept as a usable prefix.
+fn drain_decoder(
+    mut reader: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + '_>>,
+    input_truncated: bool,
+) -> Result<(Zeroizing<Vec<u8>>, bool), ()> {
+    use std::future::Future;
+    use tokio::io::AsyncReadExt;
+
+    let mut output = Zeroizing::new(Vec::new());
+    let polled = {
+        let decoding = async {
+            let mut buffer = Zeroizing::new(vec![0u8; 16 * 1024]);
+            loop {
+                match reader.read(&mut buffer).await {
+                    Ok(0) => return Ok(false),
+                    Ok(count) => {
+                        let room = (MAX_RESPONSE_BYTES as usize).saturating_sub(output.len());
+                        output.extend_from_slice(&buffer[..count.min(room)]);
+                        if count > room {
+                            return Ok(true);
+                        }
+                    }
+                    Err(_) if input_truncated => return Ok(false),
+                    Err(_) => return Err(()),
+                }
+            }
+        };
+        // The input is already in memory, so no read ever waits: one poll
+        // runs the decoder to its end without an async runtime.
+        let mut decoding = std::pin::pin!(decoding);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        decoding.as_mut().poll(&mut context)
+    };
+    match polled {
+        std::task::Poll::Ready(Ok(cut)) => Ok((output, cut)),
+        std::task::Poll::Ready(Err(())) | std::task::Poll::Pending => Err(()),
+    }
+}
+
+/// Decide one hop of a placeholder fetch; every hop, redirects included, is
+/// evaluated as a new request.
+///
+/// Returns the URL to send when a rule substitutes a key into this hop, or
+/// `None` to send `current` itself, whose placeholders then go out literally.
+/// Only `query` rules substitute; a rule with any other location leaves its
+/// placeholder literal. Each scanned label gets one audit record for the hop,
+/// and a hop whose records cannot be written is not sent.
+fn secret_hop(
+    current: &Url,
+    hop: usize,
+    secrets: &SecretFetch<'_>,
+    held: &mut HeldKeys,
+) -> Result<Option<Url>, UrlFetchError> {
+    let logical = current.as_str();
+    let path = current.path();
+    let target = match current.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path.to_string(),
+    };
+    // Only an HTTPS hop can carry a key.
+    let authority = (current.scheme() == "https")
+        .then(|| current.host_str().zip(current.port_or_known_default()))
+        .flatten()
+        .and_then(|(host, port)| {
+            secret_rules::target::canonical_host(host)
+                .ok()
+                .map(|host| ConnectAuthority { host, port })
+        });
+    let Some(authority) = authority else {
+        emit_hop_audit(secrets, held, hop, None, |_| {
+            (Decision::Literal, AuditReason::OutOfScope)
+        })
+        .map_err(|_| secret_fetch_refused("audit_unavailable", logical))?;
+        return Ok(None);
+    };
+    let refused = |held: &HeldKeys, reason: &str| {
+        let _ = emit_hop_audit(secrets, held, hop, Some(&authority), |_| {
+            (Decision::Refused, AuditReason::Refused)
+        });
+        secret_fetch_refused(reason, logical)
+    };
+
+    let rules: Vec<LabelRule> = secrets
+        .rules
+        .iter()
+        .filter(|rule| matches!(rule.location, Location::Query(_)))
+        .cloned()
+        .collect();
+    let request = RequestTarget {
+        host: authority.host.clone(),
+        port: authority.port,
+        scheme: "https",
+        target: &target,
+    };
+    let matched: Vec<bool> = rules
+        .iter()
+        .map(|rule| {
+            request
+                .matches(&RuleTarget {
+                    host: &rule.host,
+                    port: rule.port,
+                    path_prefix: &rule.path_prefix,
+                })
+                .is_ok()
+        })
+        .collect();
+    // Plan with a stand-in key first: the rules decide where a key would go,
+    // and refuse an ambiguous request, before the vault releases anything.
+    let planning: Vec<(String, Vec<u8>)> = rules
+        .iter()
+        .map(|rule| (rule.label.clone(), SECRET_PLANNING_KEY.to_vec()))
+        .collect();
+    let view = RequestView::new(&target, Vec::new());
+    let plan = evaluate_request_with_connect(&view, &authority, &rules, &planning);
+    if let Some(refusal) = plan.refusal {
+        return Err(refused(&*held, refusal.reason()));
+    }
+
+    // Material is asked only for a rule this hop actually substitutes. A
+    // rule whose host and path match while its placeholder is absent, not the
+    // whole value, or in another parameter needs no key, and asking anyway
+    // would spend a single-use grant on a request that sends none.
+    let mut materials = Vec::with_capacity(rules.len());
+    for ((rule, matched), planned) in rules.iter().zip(&matched).zip(&plan.labels) {
+        if !matched || !planned.is_substituted() {
+            materials.push(None);
+            continue;
+        }
+        let Some(scope) = secrets.authorization.as_ref() else {
+            return Err(refused(&*held, "missing_material"));
+        };
+        let material = match secrets.vault.material(scope, &rule.label, &rule.grant_id) {
+            Ok(material) => material,
+            Err(error) => {
+                let _ = emit_hop_audit(secrets, held, hop, Some(&authority), |_| {
+                    (Decision::Refused, AuditReason::Refused)
+                });
+                return Err(
+                    match crate::secret::outcome_for_material(&rule.label, &error) {
+                        crate::secret::LabelOutcome::Refuse { code, message } => {
+                            UrlFetchError::secret(code, message)
+                        }
+                        _ => secret_fetch_refused("missing_material", logical),
+                    },
+                );
+            }
+        };
+        if check_admissible(material.expose(), &rule.label, &rule.location).is_err() {
+            return Err(refused(&*held, "material_not_admissible"));
+        }
+        // The matcher is installed before any byte of this hop is sent.
+        if held.hold(&rule.label, material.expose()).is_err() {
+            return Err(refused(&*held, "replacement_discloses_key"));
+        }
+        materials.push(Some(material));
+    }
+
+    let query_start = path.len() + 1;
+    let mut edits: Vec<(usize, usize, Zeroizing<Vec<u8>>)> = Vec::new();
+    for ((rule, outcome), material) in rules.iter().zip(&plan.labels).zip(&materials) {
+        if let LabelOutcome::Substituted {
+            byte_start,
+            byte_end,
+            ..
+        } = outcome
+        {
+            let (Some(material), true) = (material, *byte_start >= query_start) else {
+                return Err(refused(&*held, "missing_material"));
+            };
+            let encoded = encode_for_location(material.expose(), &rule.label, &rule.location)
+                .map_err(|_| refused(&*held, "material_not_admissible"))?;
+            edits.push((
+                byte_start - query_start,
+                byte_end - query_start,
+                Zeroizing::new(encoded),
+            ));
+        }
+    }
+    let decide = |label: &str| -> (Decision, AuditReason) {
+        let outcome = rules
+            .iter()
+            .position(|rule| rule.label == label)
+            .and_then(|index| plan.labels.get(index));
+        match outcome {
+            Some(LabelOutcome::Substituted { .. }) => (Decision::Substituted, AuditReason::Matched),
+            Some(LabelOutcome::NotWholeValue) => (Decision::Literal, AuditReason::NotWholeValue),
+            _ => (Decision::Literal, AuditReason::OutOfScope),
+        }
+    };
+    if edits.is_empty() {
+        emit_hop_audit(secrets, held, hop, Some(&authority), decide)
+            .map_err(|_| secret_fetch_refused("audit_unavailable", logical))?;
+        return Ok(None);
+    }
+
+    edits.sort_by_key(|(start, _, _)| *start);
+    let query = current.query().unwrap_or_default().as_bytes();
+    let mut substituted = Zeroizing::new(Vec::with_capacity(query.len() + 64));
+    let mut cursor = 0;
+    for (start, end, replacement) in &edits {
+        substituted.extend_from_slice(&query[cursor..*start]);
+        substituted.extend_from_slice(replacement);
+        cursor = *end;
+    }
+    substituted.extend_from_slice(&query[cursor..]);
+    let Ok(substituted) = std::str::from_utf8(&substituted) else {
+        return Err(refused(&*held, "malformed_query"));
+    };
+    // The path sent with a key is the normalized path the rule matched,
+    // never another spelling of it.
+    let Ok(normalized) = normalize_request_target(path) else {
+        return Err(refused(&*held, "malformed_path"));
+    };
+    let Ok(wire_path) = std::str::from_utf8(&normalized.wire) else {
+        return Err(refused(&*held, "malformed_path"));
+    };
+    let mut outbound = current.clone();
+    outbound.set_path(wire_path);
+    outbound.set_query(Some(substituted));
+    emit_hop_audit(secrets, held, hop, Some(&authority), decide)
+        .map_err(|_| secret_fetch_refused("audit_unavailable", logical))?;
+    Ok(Some(outbound))
+}
+
+/// One audit record per scanned label for one hop. A record is handed to the
+/// vault only after the crate's writer checked it against every held key.
+fn emit_hop_audit(
+    secrets: &SecretFetch<'_>,
+    held: &HeldKeys,
+    hop: usize,
+    authority: Option<&ConnectAuthority>,
+    decide: impl Fn(&str) -> (Decision, AuditReason),
+) -> Result<(), ()> {
+    let origin = format!("{}#{hop}", secrets.call_id);
+    let keys = held.keys();
+    let mut failed = false;
+    for label in &secrets.labels {
+        let (decision, reason) = decide(label);
+        let mut record = AuditRecordV1::new(
+            crate::secret::now_ms(),
+            label,
+            decision,
+            reason,
+            &secrets.call_id,
+            &origin,
+        )
+        .with_scope(
+            secrets
+                .authorization
+                .as_ref()
+                .map(crate::secret::SecretScope::to_scope_ref),
+        );
+        let rule = secrets.rules.iter().find(|rule| &rule.label == label);
+        if let (Some(authority), Some(rule)) = (authority, rule) {
+            record = record.with_rule(
+                &authority.host,
+                authority.port,
+                &rule.path_prefix,
+                location_kind_token(&rule.location),
+            );
+        }
+        if record.to_json_line_with_keys(&keys).is_err() || secrets.vault.audit(&record).is_err() {
+            failed = true;
+        }
+    }
+    if failed {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
 /// What a cleanup sweep learned from one metadata file, kept so the next sweep
 /// can skip re-reading it. `len` and `modified` identify the file version the
 /// fetch time was read from: the cache rewrites metadata only through a rename
@@ -1021,22 +1953,41 @@ fn send_with_transient_retries(
     deadline: &FetchDeadline,
     progress: &ConnectProgress,
 ) -> Result<HttpResponse, UrlFetchError> {
+    send_request(client, target, None, deadline, progress)
+}
+
+/// [`send_with_transient_retries`] for one request. With `secret` set, the
+/// request belongs to a placeholder fetch: every message names the given
+/// placeholder URL instead of `target`, a failure is reported through
+/// [`send_failure`] with the held keys, and the request asks for an unencoded
+/// response so the body can be scrubbed byte for byte.
+fn send_request(
+    client: &Client,
+    target: &Url,
+    secret: Option<(&str, &HeldKeys)>,
+    deadline: &FetchDeadline,
+    progress: &ConnectProgress,
+) -> Result<HttpResponse, UrlFetchError> {
+    let named = secret.map_or(target.as_str(), |(shown, _)| shown);
+    let held = secret.map(|(_, held)| held);
     let mut attempt = 0;
     loop {
         let remaining = deadline.remaining();
         if remaining.is_zero() {
-            return Err(deadline.timeout_error(FetchPhase::Connect, target.as_str()));
+            return Err(deadline.timeout_error(FetchPhase::Connect, named));
         }
         // A per-request timeout replaces reqwest's default 30 s, which would
         // otherwise let one silent server hold each attempt for 30 s.
         progress.begin_attempt();
-        let result = client
+        let mut request = client
             .get(target.clone())
             .header(USER_AGENT, USER_AGENT_VALUE)
             .header(ACCEPT, ACCEPT_HEADER)
-            .timeout(remaining.min(HEADERS_TIMEOUT))
-            .send();
-        let error = match result {
+            .timeout(remaining.min(HEADERS_TIMEOUT));
+        if held.is_some() {
+            request = request.header(ACCEPT_ENCODING, "identity");
+        }
+        let error = match request.send() {
             Ok(response) => return Ok(response),
             Err(error) => error,
         };
@@ -1056,15 +2007,38 @@ fn send_with_transient_retries(
             attempt += 1;
             continue;
         }
-        if let Some(phase) = phase {
-            return Err(request_timeout_error(&error, phase, deadline, target));
-        }
-        return Err(UrlFetchError::new(format!(
-            "Failed to fetch {}: {}",
-            target.as_str(),
-            reqwest_error_detail(&error)
-        )));
+        return Err(send_failure(error, phase, deadline, named, held));
     }
+}
+
+/// The error for a request that failed for good, naming `named`. For a
+/// placeholder fetch (`held` set) reqwest's error first loses its URL, which
+/// carried the key, and the detail left is scrubbed of every held key (or
+/// dropped if it still spells one).
+fn send_failure(
+    error: reqwest::Error,
+    phase: Option<FetchPhase>,
+    deadline: &FetchDeadline,
+    named: &str,
+    held: Option<&HeldKeys>,
+) -> UrlFetchError {
+    let error = if held.is_some() {
+        error.without_url()
+    } else {
+        error
+    };
+    let detail = reqwest_error_detail(&error);
+    let detail = match held {
+        Some(held) => held.sanitize_detail(&detail),
+        None => detail,
+    };
+    if let Some(phase) = phase {
+        return request_timeout_error(&detail, phase, deadline, named);
+    }
+    if detail.is_empty() {
+        return UrlFetchError::new(format!("Failed to fetch {named}"));
+    }
+    UrlFetchError::new(format!("Failed to fetch {named}: {detail}"))
 }
 
 /// Name the phase a timed-out request was in: a name lookup still running in
@@ -1081,13 +2055,13 @@ fn timed_out_phase(error: &reqwest::Error, progress: &ConnectProgress) -> FetchP
 }
 
 fn request_timeout_error(
-    error: &reqwest::Error,
+    detail: &str,
     phase: FetchPhase,
     deadline: &FetchDeadline,
-    target: &Url,
+    target: &str,
 ) -> UrlFetchError {
     if deadline.expired() {
-        return deadline.timeout_error(phase, target.as_str());
+        return deadline.timeout_error(phase, target);
     }
     let limit = match phase {
         FetchPhase::Dns | FetchPhase::Connect => CONNECT_TIMEOUT,
@@ -1099,8 +2073,8 @@ fn request_timeout_error(
             "URL fetch timed out in the {} phase after the {}ms limit fetching {}: {}",
             phase.as_str(),
             limit.as_millis(),
-            target.as_str(),
-            reqwest_error_detail(error)
+            target,
+            detail
         ),
     )
 }
@@ -1138,9 +2112,12 @@ fn build_client(
         })
         .dns_resolver(Arc::new(resolver));
 
-    let tls_config = crate::platform_tls::client_config().map_err(|error| {
-        UrlFetchError::new(format!("Failed to configure URL fetch TLS: {error}"))
-    })?;
+    let tls_config = match &options.tls_config {
+        Some(config) => config.clone(),
+        None => crate::platform_tls::client_config().map_err(|error| {
+            UrlFetchError::new(format!("Failed to configure URL fetch TLS: {error}"))
+        })?,
+    };
 
     builder
         .use_preconfigured_tls(tls_config)
@@ -1519,7 +2496,9 @@ fn is_private_ipv6(ip: Ipv6Addr) -> bool {
     }
 
     let first = segments[0];
-    (0xfe80..=0xfebf).contains(&first) || (0xfc00..=0xfdff).contains(&first) || first >= 0xff00
+    // fe80::/10 link-local, fec0::/10 deprecated site-local (still routed
+    // inside some networks), fc00::/7 unique local, ff00::/8 multicast.
+    (0xfe80..=0xfeff).contains(&first) || (0xfc00..=0xfdff).contains(&first) || first >= 0xff00
 }
 
 const BINARY_SNIFF_PREFIX: usize = 8 * 1024;
@@ -1998,6 +2977,17 @@ fn read_response_body(
     url: &str,
     deadline: &FetchDeadline,
 ) -> Result<(Vec<u8>, bool), UrlFetchError> {
+    read_response_body_with(response, url, deadline, &|detail: &str| detail.to_string())
+}
+
+/// [`read_response_body`] with `detail` applied to the text of a failed read
+/// before it goes into the error, so a placeholder fetch can scrub it.
+fn read_response_body_with(
+    response: impl Read + Send + 'static,
+    url: &str,
+    deadline: &FetchDeadline,
+    detail: &dyn Fn(&str) -> String,
+) -> Result<(Vec<u8>, bool), UrlFetchError> {
     // Bound the producer, not just its consumer: an unbounded channel can
     // queue the entire response before the caller notices the byte ceiling.
     let (tx, rx) = mpsc::sync_channel(1);
@@ -2054,7 +3044,13 @@ fn read_response_body(
             }
             Ok(BodyReadEvent::Done) => return Ok((chunks, false)),
             Ok(BodyReadEvent::Error(kind, message, waited)) => {
-                return Err(body_read_failure(deadline, url, kind, &message, waited));
+                return Err(body_read_failure(
+                    deadline,
+                    url,
+                    kind,
+                    &detail(&message),
+                    waited,
+                ));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => return Err(slow_body_error()),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -2082,6 +3078,9 @@ fn body_read_failure(
     }
     if waited >= BODY_CHUNK_TIMEOUT || is_body_stall_kind(kind) {
         return body_stall_error(url);
+    }
+    if message.is_empty() {
+        return UrlFetchError::new(format!("Failed to read response body for {url}"));
     }
     UrlFetchError::new(format!("Failed to read response body for {url}: {message}"))
 }
@@ -2579,6 +3578,90 @@ mod tests {
         assert_eq!(code_fence_for("`inline` ``double``"), "```");
         assert_eq!(code_fence_for("```"), "````");
         assert_eq!(code_fence_for("``` and ````"), "`````");
+    }
+
+    /// htmd decodes an HTML entity into its character and then escapes that
+    /// character for Markdown, so the converted text spells a key in a form
+    /// the byte matchers alone do not recognise.
+    #[test]
+    fn html_conversion_markdown_escapes_an_entity_decoded_character() {
+        let markdown =
+            convert_html_body_to_markdown(b"<p>abcdef&#42;1234567890</p>", "https://example.test/")
+                .unwrap();
+        let text = String::from_utf8(markdown).unwrap();
+        assert!(text.contains("abcdef\\*1234567890"), "{text}");
+    }
+
+    /// The text of a failed body read can name the request URL, which held
+    /// the key in a placeholder fetch; it is scrubbed before it is reported.
+    #[test]
+    fn a_failed_body_read_in_a_placeholder_fetch_is_scrubbed_of_held_keys() {
+        struct Failing;
+        impl Read for Failing {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other(
+                    "error reading body for url (https://api.test/v1?key=fetch-secret-key%2F0123456789%2Babc)",
+                ))
+            }
+        }
+        let mut held = HeldKeys::default();
+        held.hold("test", b"fetch-secret-key/0123456789+abc")
+            .unwrap();
+        let deadline = FetchDeadline::for_current_call();
+        let sanitize = |detail: &str| held.sanitize_detail(detail);
+        let error = read_response_body_with(Failing, "https://api.test/v1", &deadline, &sanitize)
+            .expect_err("the read fails");
+        let text = error.to_string();
+        assert!(!text.contains("fetch-secret-key"), "{text}");
+        assert!(text.contains("key={{ck-secret:test}})"), "{text}");
+    }
+
+    /// reqwest prints the request URL in its own error text; a placeholder
+    /// fetch's failure must drop it (the URL held the key), not merely scrub
+    /// the key out of it.
+    #[test]
+    fn a_placeholder_fetch_send_failure_drops_the_request_url() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            // Accept one connection and hold it open without answering.
+            let accepted = listener.accept();
+            thread::sleep(Duration::from_secs(5));
+            drop(accepted);
+        });
+        let url = format!("http://{addr}/v1?key=fetch-secret-key%2F0123456789%2Babc");
+        let error = Client::builder()
+            .timeout(Duration::from_millis(300))
+            .build()
+            .unwrap()
+            .get(&url)
+            .send()
+            .expect_err("the silent server times the request out");
+        assert!(error.to_string().contains("for url"), "{error}");
+        let mut held = HeldKeys::default();
+        held.hold("test", b"fetch-secret-key/0123456789+abc")
+            .unwrap();
+        let deadline = FetchDeadline::for_current_call();
+        let failure = send_failure(
+            error,
+            Some(FetchPhase::Headers),
+            &deadline,
+            "http://api.test/v1?key={{ck-secret:test}}",
+            Some(&held),
+        );
+        let text = failure.to_string();
+        assert!(text.contains("timed out"), "{text}");
+        assert!(!text.contains("for url"), "{text}");
+        assert!(!text.contains("fetch-secret-key"), "{text}");
+    }
+
+    #[test]
+    fn deprecated_site_local_ipv6_is_private() {
+        for address in ["fec0::1", "feff::1", "fef0:1::1"] {
+            let ip: IpAddr = address.parse().unwrap();
+            assert!(is_private_ip(ip), "{address}");
+        }
+        assert!(!is_private_ip("2606:4700::1".parse().unwrap()));
     }
 }
 

@@ -17,7 +17,13 @@ runs:
           $env:RUNNER_TEMP
           (Join-Path $env:USERPROFILE '.cargo')
         ) | Where-Object { $_ } | Sort-Object -Unique
-        Add-MpPreference -ExclusionPath $paths
-        Set-MpPreference -DisableRealtimeMonitoring $true
-        Write-Host "Defender exclusions: $($paths -join '; ')"
-        Get-MpComputerStatus | Select-Object AntivirusEnabled, RealTimeProtectionEnabled
+        # Defender tuning only speeds up builds. If the runner's Defender
+        # service refuses the change (seen: 0x800106ba), build without it.
+        try {
+          Add-MpPreference -ExclusionPath $paths
+          Set-MpPreference -DisableRealtimeMonitoring $true
+          Write-Host "Defender exclusions: $($paths -join '; ')"
+          Get-MpComputerStatus | Select-Object AntivirusEnabled, RealTimeProtectionEnabled
+        } catch {
+          Write-Host "::warning::Defender tuning skipped: $($_.Exception.Message)"
+        }

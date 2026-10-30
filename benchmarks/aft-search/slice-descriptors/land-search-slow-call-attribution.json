@@ -1,0 +1,12 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/commands/semantic_search/mod.rs"
+  ],
+  "note": "Slow search log lines name the planner's query shape and selected lanes (enum labels only, never query text); plan metadata gains selected_lanes. Ranking unchanged; rows must stay byte-identical. Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}

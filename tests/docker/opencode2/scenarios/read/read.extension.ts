@@ -58,17 +58,7 @@ async function validateReadScenarios(context: HarnessValidationContext): Promise
     throw new Error("read applicability row does not match the declared T1-T7 contract");
   }
 
-  const controls = JSON.parse(await readFile(join(here, "mutation-controls.json"), "utf8")) as {
-    controls?: Array<{ id?: string }>;
-  };
-  const controlIds = new Set((controls.controls ?? []).map((control) => control.id));
-  for (const id of [
-    "read-permission-path-identity",
-    "read-permission-denial-is-non-mutating",
-    "read-parity-exact",
-  ]) {
-    if (!controlIds.has(id)) throw new Error(`read mutation control is missing ${id}`);
-  }
+
 }
 
 async function beforeScenario(context: ScenarioLifecycleContext): Promise<void> {

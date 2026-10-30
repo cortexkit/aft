@@ -17,11 +17,18 @@ export const BASH_HOST_FALLBACK_REFUSAL = "AFT module connection is down";
  * the rest. Shared by the OpenCode and Pi tools and the module catalog.
  */
 export const BASH_RUNON_DESCRIPTION =
-  'Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add ",net" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options).';
+  'Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add ",net" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options). `macos` sends the command to a macOS machine for builds and tests that need macOS (no vCPU or network options).';
+
+/**
+ * The bash `return_paths` argument's description, offered only beside `runon`.
+ * Shared by the OpenCode and Pi tools and the module catalog.
+ */
+export const BASH_RETURN_PATHS_DESCRIPTION =
+  "With runon: up to 64 files to copy back from the build server after the command, as paths relative to workdir inside the project (10 MiB in total). Each verified file replaces the local file at the same path; the result lists every path as returned or not returned, with the reason.";
 
 /** Guidance served only beside an available remote-run parameter. */
 export const BASH_RUNON_GUIDANCE =
-  'When remote runs are available, put `runon: "linux"` on build and test lines (cargo, bun test), including chains and pipes. Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs this machine\'s own operating system or hardware (its sandbox, code signing, service manager, permission prompts or GUI frameworks) or runs a binary that already exists on this machine; building and testing still go remote, and a remote build leaves no binaries or target/ output in the local worktree. Add `,Nc` to request N vCPUs (`linux,4c`); without it the job gets 2 vCPUs. The job sees exactly the CPUs it gets, so ask for what the command uses: 2c (the default) for a single test binary or script, 4c for `cargo check`/clippy on one crate, 8c for a workspace test suite, and 16c for a large release build.';
+  'When remote runs are available, put `runon: "linux"` on build and test lines (cargo, bun test), including chains and pipes. Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs this machine\'s own operating system or hardware (its sandbox, code signing, service manager, permission prompts or GUI frameworks) or runs a binary that already exists on this machine; a build or test that needs only macOS (its sandbox, code signing or file watching) can use runon: "macos" instead; building and testing still go remote, and a remote build leaves no binaries or target/ output in the local worktree. Add `,Nc` to request N vCPUs (`linux,4c`); without it the job gets 2 vCPUs. The job sees exactly the CPUs it gets, so ask for what the command uses: 2c (the default) for a single test binary or script, 4c for `cargo check`/clippy on one crate, 8c for a workspace test suite, and 16c for a large release build.';
 
 export interface BashHostFallbackOptions {
   command: string;

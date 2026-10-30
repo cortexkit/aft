@@ -292,6 +292,12 @@ pub struct Readiness<'a> {
     retained: RetainedReadinessSnapshots<'a>,
     #[serde(skip)]
     cancelled: bool,
+    /// The semantic status the sample observed. It can differ from the shared
+    /// status: a views-on root is sampled in its checkout lane's state (still
+    /// loading, failed to load, or unable to build its index) even when the
+    /// shared status reads ready.
+    #[serde(skip)]
+    semantic_status: Option<SemanticIndexStatus>,
 }
 
 impl PartialEq for Readiness<'_> {
@@ -343,7 +349,19 @@ impl<'a> Readiness<'a> {
             reasons,
             retained,
             cancelled,
+            semantic_status: None,
         }
+    }
+
+    /// Records the semantic status the sample observed; see `semantic_status`.
+    pub fn with_semantic_status(mut self, status: Option<SemanticIndexStatus>) -> Self {
+        self.semantic_status = status;
+        self
+    }
+
+    /// The semantic status the sample observed, if it was sampled.
+    pub fn semantic_status(&self) -> Option<&SemanticIndexStatus> {
+        self.semantic_status.as_ref()
     }
 
     pub fn retained(&self) -> &RetainedReadinessSnapshots<'a> {
@@ -408,7 +426,11 @@ pub trait SearchExtensions: Send + Sync {
         default_lane_plan(*shape, facts, readiness.clone())
     }
 
-    fn execute_lane(&self, lane: &dyn SearchLane, input: &LaneInput<'_>) -> LaneExecution {
+    fn execute_lane(
+        &self,
+        lane: &dyn SearchLane,
+        input: &LaneInput<'_>,
+    ) -> std::io::Result<LaneExecution> {
         lane.execute(input)
     }
 }

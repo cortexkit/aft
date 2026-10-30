@@ -1,0 +1,3 @@
+[
+  {"request":{"method":"agent.where","params":{"agent_id":"agent_0000000000000108"}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"result":{"cut_id":null,"epoch":1,"holder":"1111111111111111","holder_name":"This machine","known":true,"moving":{"cut_id":"cut-moving-agent","message":"waiting for the target machine to pick up the move","peer":"2222222222222222","peer_name":"Other machine","side":"source","status":"waiting_for_target","step":"published","waiting_ms":50,"waiting_since_ms":650},"read_at_ms":700,"stale":false,"status":"held_here"}}}
+]

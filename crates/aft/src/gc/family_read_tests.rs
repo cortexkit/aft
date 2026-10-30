@@ -65,7 +65,9 @@ pub(crate) fn build(storage: &Path, rows: u64, marked: impl Fn(u64) -> bool) -> 
     let registry = FamilyRegistry::open(storage, FAMILY).unwrap();
     let root = storage.join("root");
     fs::create_dir_all(&root).unwrap();
-    let view = registry.register_view("a", &root).unwrap();
+    let view = registry
+        .register_view_with_storage(storage, "a", &root)
+        .unwrap();
     // Registration may start a background disk-limit pass; let it finish so
     // it cannot sweep the store while a test measures its own pass.
     crate::views::eviction::wait_for_background_enforcement(&registry);
@@ -1188,12 +1190,14 @@ fn all_live_preflight_reads_each_manifest_once_and_reclaims_dead_owners() {
     let fixture = build(dir.path(), 4, |_| true);
     let view_store = fixture.view.view_store().unwrap();
     let protected_generation = view_store.current_generation().unwrap().unwrap();
-    publish_marks(&fixture.view, 0..3);
-    let current_generation = view_store.current_generation().unwrap().unwrap();
-    assert_ne!(current_generation, protected_generation);
+    // Reader protection must exist before replacement can make it obsolete.
     let live_reader =
         crate::root_cache::ReadMarker::create(fixture.view.view_dir(), &protected_generation)
             .unwrap();
+    publish_marks(&fixture.view, 0..3);
+    let current_generation = view_store.current_generation().unwrap().unwrap();
+    assert_ne!(current_generation, protected_generation);
+    crate::views::wait_for_generation_maintenance_for_test(fixture.view.view_dir());
     let live_pin =
         crate::pins::AssemblyPin::create_v2(&fixture.view, "live-assembly", &[chunk_key(0)])
             .unwrap();

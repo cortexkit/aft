@@ -87,9 +87,15 @@ fn git_diff_preserves_file_boundaries() {
 
 #[test]
 fn cargo_build_keeps_warnings_and_drops_compiling_lines() {
-    let output = "   Updating crates.io index\n   Compiling dep v1.2.3\n   Compiling app v0.1.0\nwarning: unused variable: `x`\n  --> src/lib.rs:1:9\n   |\n1  | let x = 1;\n   |     ^\n\n    Finished dev [unoptimized + debuginfo] target(s) in 1.23s\n";
+    // Enough `Compiling` lines to pass the cargo compressor's 1 KiB raw
+    // passthrough, below which output is returned as printed.
+    let compiling = (0..40)
+        .map(|index| format!("   Compiling dep{index} v1.2.3\n"))
+        .collect::<String>();
+    let output = format!("   Updating crates.io index\n{compiling}   Compiling app v0.1.0\nwarning: unused variable: `x`\n  --> src/lib.rs:1:9\n   |\n1  | let x = 1;\n   |     ^\n\n    Finished dev [unoptimized + debuginfo] target(s) in 1.23s\n");
+    assert!(output.len() > 1024);
 
-    let compressed = CargoCompressor.compress("cargo build", output);
+    let compressed = CargoCompressor.compress("cargo build", &output);
     assert!(compressed.contains("warning: unused variable"));
     assert!(compressed.contains("--> src/lib.rs:1:9"));
     assert!(compressed.contains("Finished dev"));
@@ -99,10 +105,16 @@ fn cargo_build_keeps_warnings_and_drops_compiling_lines() {
 
 #[test]
 fn cargo_test_preserves_failures_verbatim() {
-    let output = "running 2 tests\ntest ok_test ... ok\ntest failing_test ... FAILED\n\nfailures:\n\n---- failing_test stdout ----\nthread 'failing_test' panicked at src/lib.rs:2:5:\nboom\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\nfailures:\n    failing_test\n\ntest result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n";
+    // Enough passing tests to pass the cargo compressor's 1 KiB raw
+    // passthrough, below which output is returned as printed.
+    let passing = (0..40)
+        .map(|index| format!("test ok_test_{index} ... ok\n"))
+        .collect::<String>();
+    let output = format!("running 42 tests\ntest ok_test ... ok\n{passing}test failing_test ... FAILED\n\nfailures:\n\n---- failing_test stdout ----\nthread 'failing_test' panicked at src/lib.rs:2:5:\nboom\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\nfailures:\n    failing_test\n\ntest result: FAILED. 41 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n");
+    assert!(output.len() > 1024);
 
-    let compressed = CargoCompressor.compress("cargo test", output);
-    assert!(compressed.contains("running 2 tests"));
+    let compressed = CargoCompressor.compress("cargo test", &output);
+    assert!(compressed.contains("running 42 tests"));
     assert!(!compressed.contains("test ok_test ... ok"));
     assert!(compressed.contains("---- failing_test stdout ----"));
     assert!(compressed.contains("boom"));

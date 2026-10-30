@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use crate::callgraph_store::{CallGraphStore, DiskReconcileReport};
 
@@ -122,22 +122,133 @@ pub struct CallgraphReconcileOutcome {
     pub action: CallgraphReconcileAction,
 }
 
+#[derive(Debug, Default)]
+struct ReconcileQueryResult {
+    whole_store: bool,
+    paths: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+struct ReconcileQueryCheck {
+    generation: u64,
+    result: parking_lot::Mutex<Option<ReconcileQueryResult>>,
+}
+
+#[derive(Debug)]
+struct ReconcileQueryObservation {
+    generation: u64,
+    root: PathBuf,
+    checks: parking_lot::Mutex<Vec<Arc<ReconcileQueryCheck>>>,
+}
+
+/// Comparisons a query overlaps, including one started when that query opens
+/// a reused reader. An unchanged result can clear the uncertainty before the
+/// reply is finalized; discovered edits remain attached to that query.
+#[derive(Clone, Debug)]
+pub(crate) struct CallgraphReconcileQuery(Arc<ReconcileQueryObservation>);
+
+impl PartialEq for CallgraphReconcileQuery {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for CallgraphReconcileQuery {}
+
+impl CallgraphReconcileQuery {
+    pub(crate) fn pending(&self) -> (bool, std::collections::BTreeSet<String>) {
+        let mut whole_store = false;
+        let mut paths = std::collections::BTreeSet::new();
+        for check in self.0.checks.lock().iter() {
+            let result = check.result.lock();
+            match result.as_ref() {
+                None => whole_store = true,
+                Some(result) => {
+                    whole_store |= result.whole_store;
+                    paths.extend(result.paths.iter().map(|path| {
+                        path.strip_prefix(&self.0.root)
+                            .unwrap_or(path)
+                            .to_string_lossy()
+                            .replace('\\', "/")
+                    }));
+                }
+            }
+        }
+        (whole_store, paths)
+    }
+}
+
 /// Reconcile demand for one context: the reason of a requested reconcile that
 /// has not started, whether one is running, and the last finished outcome.
 #[derive(Debug, Default)]
 pub(crate) struct CallgraphReconcileState {
     pending: parking_lot::Mutex<Vec<String>>,
     running: AtomicBool,
+    pending_checks: parking_lot::Mutex<Vec<Arc<ReconcileQueryCheck>>>,
+    running_checks: parking_lot::Mutex<Vec<Arc<ReconcileQueryCheck>>>,
+    /// Keeps query registration atomic with reconcile request/start/restore,
+    /// so a query observes a comparison started at the same time instead of
+    /// capturing no active checks.
+    queries: parking_lot::Mutex<Vec<Weak<ReconcileQueryObservation>>>,
     last: parking_lot::Mutex<Option<CallgraphReconcileOutcome>>,
     completed: AtomicU64,
+    /// Test-only count of read-only opens the owning context finished before
+    /// starting a comparison. The ordering test reads it through the entry
+    /// hold to prove the caller's open completed first.
+    #[cfg(test)]
+    ensure_open_completed: AtomicU64,
+    #[cfg(all(test, target_os = "linux"))]
+    finished_at: parking_lot::Mutex<Option<std::time::Instant>>,
+    #[cfg(test)]
+    hold: parking_lot::Mutex<Option<(std::sync::mpsc::Sender<u64>, std::sync::mpsc::Receiver<()>)>>,
+    #[cfg(test)]
+    settled: parking_lot::Condvar,
 }
 
 impl CallgraphReconcileState {
+    #[cfg(test)]
     pub(crate) fn request(&self, reason: &str) {
+        self.request_for_generation(reason, 0);
+    }
+
+    pub(crate) fn request_for_generation(&self, reason: &str, generation: u64) {
+        let mut queries = self.queries.lock();
         let mut pending = self.pending.lock();
         if !pending.iter().any(|known| known == reason) {
             pending.push(reason.to_string());
         }
+        let mut checks = self.pending_checks.lock();
+        if !checks.iter().any(|check| check.generation == generation) {
+            let check = Arc::new(ReconcileQueryCheck {
+                generation,
+                result: parking_lot::Mutex::new(None),
+            });
+            checks.push(Arc::clone(&check));
+            queries.retain(|query| {
+                if let Some(query) = query.upgrade() {
+                    if query.generation == generation {
+                        query.checks.lock().push(Arc::clone(&check));
+                    }
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+    }
+
+    pub(crate) fn observe_query(&self, generation: u64, root: PathBuf) -> CallgraphReconcileQuery {
+        let mut queries = self.queries.lock();
+        let mut checks = self.pending_checks.lock().clone();
+        checks.extend(self.running_checks.lock().iter().cloned());
+        checks.retain(|check| check.generation == generation);
+        let query = Arc::new(ReconcileQueryObservation {
+            generation,
+            root,
+            checks: parking_lot::Mutex::new(checks),
+        });
+        queries.retain(|query| query.strong_count() > 0);
+        queries.push(Arc::downgrade(&query));
+        CallgraphReconcileQuery(query)
     }
 
     pub(crate) fn pending_reason(&self) -> Option<String> {
@@ -145,10 +256,16 @@ impl CallgraphReconcileState {
         (!pending.is_empty()).then(|| pending.join(", "))
     }
 
+    #[cfg(test)]
+    pub(crate) fn outstanding(&self) -> bool {
+        !self.pending.lock().is_empty() || self.running.load(Ordering::SeqCst)
+    }
+
     /// Take the pending request and mark a reconcile as running. Returns None
     /// when nothing is pending or a reconcile is already running; a request
     /// made while one runs stays pending for the next start.
     pub(crate) fn begin(self: &Arc<Self>) -> Option<CallgraphReconcileOwnership> {
+        let _queries = self.queries.lock();
         let mut pending = self.pending.lock();
         if pending.is_empty() {
             return None;
@@ -160,19 +277,30 @@ impl CallgraphReconcileState {
         {
             return None;
         }
+        let checks = std::mem::take(&mut *self.pending_checks.lock());
+        *self.running_checks.lock() = checks.clone();
         Some(CallgraphReconcileOwnership {
             state: Arc::clone(self),
             reasons: std::mem::take(&mut *pending),
+            checks,
             finished: false,
         })
     }
 
     pub(crate) fn clear_pending(&self) {
+        let _queries = self.queries.lock();
         self.pending.lock().clear();
+        for check in self.pending_checks.lock().drain(..) {
+            *check.result.lock() = Some(ReconcileQueryResult::default());
+        }
     }
 
     fn finish(&self, outcome: CallgraphReconcileOutcome) {
         *self.last.lock() = Some(outcome);
+        #[cfg(all(test, target_os = "linux"))]
+        {
+            *self.finished_at.lock() = Some(std::time::Instant::now());
+        }
         self.completed.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -183,6 +311,49 @@ impl CallgraphReconcileState {
     pub(crate) fn completed(&self) -> u64 {
         self.completed.load(Ordering::SeqCst)
     }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn finished_at_for_test(&self) -> std::time::Instant {
+        self.finished_at.lock().expect("comparison finished")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_idle_for_test(&self, hang_cap: std::time::Duration) -> bool {
+        let mut queries = self.queries.lock();
+        let deadline = std::time::Instant::now() + hang_cap;
+        while self.completed() == 0 || self.outstanding() {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return false;
+            };
+            if self.settled.wait_for(&mut queries, remaining).timed_out() {
+                return self.completed() > 0 && !self.outstanding();
+            }
+        }
+        true
+    }
+
+    /// Record that the owning context finished a read-only open before
+    /// starting the next comparison.
+    #[cfg(test)]
+    pub(crate) fn note_ensure_open_completed_for_test(&self) {
+        self.ensure_open_completed.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// How many read-only opens finished before the current comparison.
+    #[cfg(test)]
+    pub(crate) fn ensure_open_completed_for_test(&self) -> u64 {
+        self.ensure_open_completed.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_next_for_test(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<u64>, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *self.hold.lock() = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
 }
 
 /// Owns the reconciliation running flag before thread spawn, so a failed spawn
@@ -190,11 +361,31 @@ impl CallgraphReconcileState {
 pub(crate) struct CallgraphReconcileOwnership {
     state: Arc<CallgraphReconcileState>,
     reasons: Vec<String>,
+    checks: Vec<Arc<ReconcileQueryCheck>>,
     finished: bool,
 }
 
 impl CallgraphReconcileOwnership {
+    pub(crate) fn startup_only(&self) -> bool {
+        self.reasons.len() == 1 && self.reasons[0] == "startup"
+    }
+
     fn finish(&mut self, outcome: CallgraphReconcileOutcome) {
+        for check in &self.checks {
+            let result = match &outcome.action {
+                CallgraphReconcileAction::Unchanged
+                | CallgraphReconcileAction::NoPublishedStore => ReconcileQueryResult::default(),
+                CallgraphReconcileAction::Refreshed(paths) => ReconcileQueryResult {
+                    whole_store: false,
+                    paths: paths.clone(),
+                },
+                _ => ReconcileQueryResult {
+                    whole_store: true,
+                    paths: Vec::new(),
+                },
+            };
+            *check.result.lock() = Some(result);
+        }
         self.state.finish(outcome);
         self.finished = true;
     }
@@ -202,14 +393,25 @@ impl CallgraphReconcileOwnership {
 
 impl Drop for CallgraphReconcileOwnership {
     fn drop(&mut self) {
+        let _queries = self.state.queries.lock();
         // Spawn failure and unwinding must preserve demand, not silently lose
         // the watcher gap. Restore it before allowing another job to start.
         if !self.finished {
+            let mut pending = self.state.pending.lock();
             for reason in &self.reasons {
-                self.state.request(reason);
+                if !pending.contains(reason) {
+                    pending.push(reason.clone());
+                }
             }
+            self.state
+                .pending_checks
+                .lock()
+                .extend(self.checks.iter().cloned());
         }
+        self.state.running_checks.lock().clear();
         self.state.running.store(false, Ordering::SeqCst);
+        #[cfg(test)]
+        self.state.settled.notify_all();
     }
 }
 
@@ -238,6 +440,17 @@ impl CallgraphReconcileJob {
             enqueue_refresh,
         } = self;
         let reason = ownership.reasons.join(", ");
+        #[cfg(test)]
+        {
+            let hold = ownership.state.hold.lock().take();
+            if let Some((entered, release)) = hold {
+                // The entry hold reports how many of the caller's opens had
+                // finished when this thread started: with the spawn ordered
+                // after the open, that already includes the current reopen.
+                let _ = entered.send(ownership.state.ensure_open_completed_for_test());
+                let _ = release.recv_timeout(std::time::Duration::from_secs(30));
+            }
+        }
         let report = match CallGraphStore::open_readonly(callgraph_dir, project_root.clone()) {
             Ok(Some(store)) => store.reconcile_with_disk(max_examined),
             Ok(None) => {
@@ -293,6 +506,9 @@ fn settle_reconcile(
     }
     let (report, action) = match report {
         Ok(report) => {
+            let confirmed_changes = report
+                .changed_count()
+                .saturating_sub(report.unverified_files);
             let action = if report.truncated {
                 let fallback = format!(
                     "{reason}: reconcile stopped at its bound of {} files",
@@ -300,13 +516,12 @@ fn settle_reconcile(
                 );
                 force.mark(&fallback);
                 CallgraphReconcileAction::ForcedRebuild(fallback)
-            } else if report.changed_count() >= RECONCILE_REBUILD_MIN_CHANGED
-                && report.changed_count().saturating_mul(2) > report.stored_files
+            } else if confirmed_changes >= RECONCILE_REBUILD_MIN_CHANGED
+                && confirmed_changes.saturating_mul(2) > report.stored_files
             {
                 let fallback = format!(
                     "{reason}: {} of {} stored files changed",
-                    report.changed_count(),
-                    report.stored_files
+                    confirmed_changes, report.stored_files
                 );
                 force.mark(&fallback);
                 CallgraphReconcileAction::ForcedRebuild(fallback)
@@ -393,6 +608,43 @@ mod tests {
     }
 
     #[test]
+    fn stat_first_unverified_legacy_rows_refresh_without_a_cold_build() {
+        let state = Arc::new(CallgraphReconcileState::default());
+        state.request("startup");
+        let ownership = state.begin().unwrap();
+        let force = CallgraphForceDemand::default();
+        let mut paths = (0..RECONCILE_REBUILD_MIN_CHANGED)
+            .map(|index| PathBuf::from(format!("source{index}.ts")))
+            .collect::<Vec<_>>();
+        paths.sort();
+        let queued = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&queued);
+        let outcome = settle_reconcile(
+            ownership,
+            "startup".into(),
+            Ok(DiskReconcileReport {
+                stored_files: paths.len(),
+                modified: paths.clone(),
+                unverified_files: paths.len(),
+                ..DiskReconcileReport::default()
+            }),
+            std::path::Path::new("workspace"),
+            &force,
+            Box::new(move |paths| *observed.lock().unwrap() = paths),
+        );
+        assert_eq!(
+            force.pending(),
+            None,
+            "missing hints are not proof of corpus drift"
+        );
+        assert_eq!(
+            outcome.action,
+            CallgraphReconcileAction::Refreshed(paths.clone())
+        );
+        assert_eq!(*queued.lock().unwrap(), paths);
+    }
+
+    #[test]
     fn busy_reconcile_keeps_demand_pending_instead_of_forcing_a_rebuild() {
         let state = Arc::new(CallgraphReconcileState::default());
         state.request("watcher overflow");
@@ -456,4 +708,60 @@ mod tests {
         state.request("custom, reason");
         assert_eq!(state.pending_reason().as_deref(), Some("custom, reason"));
     }
+}
+#[test]
+fn reconcile_query_only_tracks_real_checks_and_clears_unchanged() {
+    let state = Arc::new(CallgraphReconcileState::default());
+    let query = state.observe_query(1, PathBuf::from("workspace"));
+    assert_eq!(
+        query.pending(),
+        (false, Default::default()),
+        "a cold query has no comparison"
+    );
+    state.request_for_generation("startup", 1);
+    let mut owned = state.begin().unwrap();
+    assert!(query.pending().0);
+    owned.finish(CallgraphReconcileOutcome {
+        reason: "startup".into(),
+        report: None,
+        action: CallgraphReconcileAction::Unchanged,
+    });
+    assert_eq!(
+        query.pending(),
+        (false, Default::default()),
+        "completion clears uncertainty before reply finalization"
+    );
+    drop(owned);
+    assert_eq!(
+        state.observe_query(1, PathBuf::from("workspace")).pending(),
+        (false, Default::default())
+    );
+}
+
+#[test]
+fn reconcile_query_keeps_discovered_paths_and_ignores_other_generations() {
+    let state = Arc::new(CallgraphReconcileState::default());
+    let query = state.observe_query(1, PathBuf::from("workspace"));
+    let newer_query = state.observe_query(2, PathBuf::from("workspace"));
+    state.request_for_generation("startup", 1);
+    let mut first = state.begin().unwrap();
+    first.finish(CallgraphReconcileOutcome {
+        reason: "startup".into(),
+        report: None,
+        action: CallgraphReconcileAction::Refreshed(vec![PathBuf::from("workspace/changed.rs")]),
+    });
+    drop(first);
+    state.request_for_generation("watcher gap", 1);
+    let mut second = state.begin().unwrap();
+    second.finish(CallgraphReconcileOutcome {
+        reason: "watcher gap".into(),
+        report: None,
+        action: CallgraphReconcileAction::Unchanged,
+    });
+    drop(second);
+    assert_eq!(
+        query.pending(),
+        (false, ["changed.rs".to_string()].into_iter().collect())
+    );
+    assert_eq!(newer_query.pending(), (false, Default::default()));
 }

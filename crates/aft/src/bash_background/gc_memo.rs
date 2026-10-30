@@ -14,9 +14,11 @@
 //! beside it), the task folder (its `control/` or `io/` folder replaced), and
 //! the metadata file itself. Metadata is always written by atomic replacement,
 //! so any rewrite gives the file a new identity and a new modification time.
-//! Checking those takes a few `stat` calls and opens nothing. Conditions that
-//! can change without any file in the store changing are evaluated again
-//! every visit: the end of the modification grace, the age and
+//! A rate-limited validation cursor checks those stamps, including changes
+//! made by foreign writers. An ordered deadline index also selects tasks at
+//! the end of the modification grace or the abandonment age without walking
+//! unrelated history. Conditions that can change without any file in the
+//! store changing are evaluated again on validation visits: the age and
 //! missing-worktree tests that retire an abandoned completion, whether a
 //! running task's recorded process is still alive, and whether a registry in
 //! this process still owns a finished task whose scratch folder it is
@@ -28,10 +30,10 @@
 //! next to the walk position kept by `gc_cursor`. A restart starts both from
 //! scratch, so the first lap after a restart evaluates every task once.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -70,14 +72,13 @@ impl Stamp {
     }
 }
 
-/// True while a file modified at `modified` is inside `grace`. Matches the
-/// sweep's own grace test: a modification time in the future is not inside it.
-pub(crate) fn within_grace(modified: SystemTime, grace: Duration) -> bool {
-    SystemTime::now()
-        .duration_since(modified)
+/// True while a file is within its modification grace. A future timestamp has
+/// an unknown age, so retain it rather than treating it as expired.
+pub(crate) fn within_grace_at(modified: SystemTime, grace: Duration, now: SystemTime) -> bool {
+    now.duration_since(modified)
         .ok()
         .map(|age| age < grace)
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// Whether an undelivered, finished task's result is abandoned: it finished
@@ -119,6 +120,24 @@ pub(crate) enum Wait {
     ScratchOwner { session_id: Arc<str> },
 }
 
+impl Wait {
+    fn deadline(&self, metadata: &Stamp, now: SystemTime) -> Option<SystemTime> {
+        match self {
+            Self::Grace => metadata
+                .modified
+                .checked_add(super::registry::PERSISTED_GC_GRACE),
+            Self::Abandonment {
+                finished_at: Some(finished),
+                ..
+            } => finished
+                .checked_add(7 * 24 * 60 * 60 * 1000 + 1)
+                .and_then(|ms| UNIX_EPOCH.checked_add(Duration::from_millis(ms))),
+            _ => None,
+        }
+        .filter(|deadline| *deadline > now)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Verdict {
     layout: TaskLayout,
@@ -149,7 +168,7 @@ impl Verdict {
         session: &Stamp,
         task_id: &str,
         grace: Duration,
-        now_ms: u64,
+        now: SystemTime,
     ) -> bool {
         if self.session != *session {
             return false;
@@ -167,12 +186,20 @@ impl Verdict {
             return false;
         }
         match &self.wait {
-            Wait::Grace => within_grace(self.metadata.modified, grace),
+            Wait::Grace => within_grace_at(self.metadata.modified, grace, now),
             Wait::Abandonment {
                 finished_at,
                 project_root,
                 workdir,
-            } => !abandonment_due(*finished_at, project_root.as_deref(), workdir, now_ms),
+            } => !abandonment_due(
+                *finished_at,
+                project_root.as_deref(),
+                workdir,
+                now.duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+            ),
             Wait::RecordedProcess { pids, started_at } => pids
                 .iter()
                 .any(|pid| super::process::is_recorded_process_alive(*pid, *started_at)),
@@ -185,6 +212,9 @@ impl Verdict {
 
 struct Remembered {
     verdict: Verdict,
+    deadline: Option<SystemTime>,
+    /// The deadline is a retry installed by selection, not a writer wakeup.
+    provisional_retry: bool,
     /// The lap in which the sweep last reached this task. Entries not reached
     /// during a whole lap belong to deleted tasks and are dropped at its end.
     seen_lap: u64,
@@ -205,8 +235,8 @@ pub struct PersistedGcHealth {
     /// the last.
     pub last_pass_out_of_budget: bool,
     pub passes_out_of_budget: u64,
-    /// Task names the last pass reached, how many of them it had to open and
-    /// judge, and how many it skipped because a remembered verdict still held.
+    /// Task candidates reached through discovery or the deadline index, how
+    /// many were opened and judged, and how many remembered verdicts held.
     pub last_pass_tasks: usize,
     pub last_pass_evaluated: usize,
     pub last_pass_unchanged: usize,
@@ -227,6 +257,10 @@ struct RootState {
     /// Generation of the current store walk, including walks with read errors.
     lap: u64,
     sessions: HashMap<PathBuf, HashMap<String, Remembered>>,
+    deadlines: BTreeSet<(SystemTime, PathBuf, String)>,
+    validation_after: Option<Instant>,
+    validation_lap_started: Option<Instant>,
+    write_generation: u64,
     /// Sessions whose task listings were read during the current store walk.
     read_sessions: HashSet<PathBuf>,
     /// Sessions whose task listings were incomplete during the current store walk.
@@ -263,6 +297,72 @@ fn roots() -> &'static Mutex<HashMap<PathBuf, RootState>> {
     ROOTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// A daemon metadata replacement may change eligibility before an old
+/// deadline. Wake only an already indexed task; discovery handles new tasks
+/// and foreign writers. Calls bracket replacement, even on failure: a rename
+/// can succeed before a directory-sync error, and a concurrent sweep may read
+/// the old file while replacement is in flight.
+pub(crate) fn metadata_written(path: &Path) {
+    let Some(parent) = path.parent() else { return };
+    let (session, id) = if path
+        .file_name()
+        .is_some_and(|name| name == super::persistence::METADATA_FILE)
+    {
+        let Some(task_dir) = parent.parent() else {
+            return;
+        };
+        let Some(session) = task_dir.parent() else {
+            return;
+        };
+        let Some(id) = task_dir.file_name().and_then(|id| id.to_str()) else {
+            return;
+        };
+        (session, id)
+    } else {
+        let Some(id) = path.file_stem().and_then(|id| id.to_str()) else {
+            return;
+        };
+        (parent, id)
+    };
+    let Some(root) = session.parent() else { return };
+    let mut roots = roots()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The store key is canonical, but remembered sessions retain the caller's
+    // spelling (for example /var versus /private/var on macOS). Match that
+    // session on an alias miss without adding filesystem I/O to every write.
+    let key = if roots.contains_key(root) {
+        root.to_path_buf()
+    } else {
+        let Some(key) = roots
+            .iter()
+            .find_map(|(key, state)| state.sessions.contains_key(session).then(|| key.clone()))
+        else {
+            return;
+        };
+        key
+    };
+    let state = roots.get_mut(&key).expect("known GC store");
+    state.write_generation = state.write_generation.wrapping_add(1);
+    let Some(entry) = state
+        .sessions
+        .get_mut(session)
+        .and_then(|tasks| tasks.get_mut(id))
+    else {
+        return;
+    };
+    if let Some(deadline) = entry.deadline {
+        state
+            .deadlines
+            .remove(&(deadline, session.to_path_buf(), id.to_string()));
+    }
+    entry.deadline = Some(UNIX_EPOCH);
+    entry.provisional_retry = false;
+    state
+        .deadlines
+        .insert((UNIX_EPOCH, session.to_path_buf(), id.to_string()));
+}
+
 fn with_root<R>(root: &Path, work: impl FnOnce(&mut RootState) -> R) -> R {
     let mut roots = roots()
         .lock()
@@ -291,6 +391,7 @@ pub(crate) struct Evidence {
     pub session: Stamp,
     pub task_dir: Option<Stamp>,
     pub metadata: Stamp,
+    pub write_generation: u64,
 }
 
 /// Input for [`Wait::Abandonment`], borrowed from the task's metadata.
@@ -305,6 +406,76 @@ impl GcMemo {
         Self { root }
     }
 
+    pub(crate) fn write_generation(&self, session_dir: &Path) -> u64 {
+        with_root(&self.root, |state| {
+            state.sessions.entry(session_dir.to_path_buf()).or_default();
+            state.write_generation
+        })
+    }
+
+    /// Scheduled requests may arrive from many roots or replays. Validation
+    /// advances at most once a minute, and a small store starts no more than
+    /// one full lap per ten minutes. Deadline work is independent of this gate.
+    pub(crate) fn validation_due(&self, now: Instant) -> bool {
+        with_root(&self.root, |state| {
+            if state.validation_after.is_some_and(|after| now < after) {
+                return false;
+            }
+            state.validation_lap_started.get_or_insert(now);
+            state.validation_after = Some(now + Duration::from_secs(60));
+            true
+        })
+    }
+
+    /// Select directly from the ordered deadline prefix, not by filtering the
+    /// task map. The iterator budget includes a possible first future entry.
+    /// Keep a one-minute retry until evaluation replaces or forgets the
+    /// verdict, so skipping a session being restored does not consume its
+    /// deadline without evaluating it.
+    pub(crate) fn due_batches(&self, now: SystemTime) -> Vec<super::gc_cursor::Batch> {
+        with_root(&self.root, |state| {
+            let due: Vec<_> = state
+                .deadlines
+                .iter()
+                .inspect(|_| {
+                    #[cfg(test)]
+                    super::persistence::work_counts::record_gc_deadline();
+                })
+                .take(super::gc_cursor::GC_ENTRY_BUDGET)
+                .take_while(|(deadline, _, _)| *deadline <= now)
+                .cloned()
+                .collect();
+            let mut batches: Vec<super::gc_cursor::Batch> = Vec::new();
+            for key in due {
+                state.deadlines.remove(&key);
+                let (_, session, id) = key;
+                if let Some(entry) = state
+                    .sessions
+                    .get_mut(&session)
+                    .and_then(|tasks| tasks.get_mut(&id))
+                {
+                    let retry = now.checked_add(Duration::from_secs(60));
+                    entry.deadline = retry;
+                    entry.provisional_retry = true;
+                    if let Some(retry) = retry {
+                        state.deadlines.insert((retry, session.clone(), id.clone()));
+                    }
+                }
+                if let Some(batch) = batches.iter_mut().find(|batch| batch.session == session) {
+                    batch.ids.push(id);
+                } else {
+                    batches.push(super::gc_cursor::Batch {
+                        session,
+                        ids: vec![id],
+                        invalid: Vec::new(),
+                        names: Vec::new(),
+                    });
+                }
+            }
+            batches
+        })
+    }
+
     /// True when the task was judged not deletable earlier and nothing it was
     /// judged on has changed. Opens nothing: at most two `stat` calls, plus
     /// two for the worktree checks of an undelivered result old enough to be
@@ -316,7 +487,7 @@ impl GcMemo {
         session: Option<&Stamp>,
         task_id: &str,
         grace: Duration,
-        now_ms: u64,
+        now: SystemTime,
     ) -> bool {
         let Some(session) = session else {
             return false;
@@ -331,9 +502,41 @@ impl GcMemo {
             return false;
         };
         // The stats run without the lock held: other roots' sweeps share it.
-        let waiting = verdict.still_waiting(session_dir, session, task_id, grace, now_ms);
+        let waiting = verdict.still_waiting(session_dir, session, task_id, grace, now);
         if !waiting {
             self.forget(session_dir, task_id);
+        } else {
+            // A still-valid verdict goes back to its natural deadline, or to
+            // validation for conditions without a future deadline. Do not turn
+            // an unchanged task into minute polling or erase a newer writer's
+            // immediate invalidation while replacing the provisional retry.
+            let next = verdict.wait.deadline(&verdict.metadata, now);
+            with_root(&self.root, |state| {
+                if let Some(entry) = state
+                    .sessions
+                    .get_mut(session_dir)
+                    .and_then(|tasks| tasks.get_mut(task_id))
+                {
+                    if entry.provisional_retry {
+                        entry.provisional_retry = false;
+                        if let Some(deadline) = entry.deadline.take() {
+                            state.deadlines.remove(&(
+                                deadline,
+                                session_dir.to_path_buf(),
+                                task_id.to_string(),
+                            ));
+                        }
+                        entry.deadline = next;
+                        if let Some(next) = next {
+                            state.deadlines.insert((
+                                next,
+                                session_dir.to_path_buf(),
+                                task_id.to_string(),
+                            ));
+                        }
+                    }
+                }
+            });
         }
         waiting
     }
@@ -394,6 +597,30 @@ impl GcMemo {
         with_root(&self.root, |state| {
             let wait = wait(state);
             let lap = state.lap;
+            let deadline = wait.deadline(&evidence.metadata, SystemTime::now());
+            // A writer can replace metadata between evidence capture and
+            // remembering it. Recheck that verdict promptly instead of
+            // replacing the writer's invalidation with an old deadline.
+            let deadline = if evidence.write_generation != state.write_generation {
+                Some(UNIX_EPOCH)
+            } else {
+                deadline
+            };
+            if let Some(old) = state
+                .sessions
+                .get(session_dir)
+                .and_then(|tasks| tasks.get(task_id))
+                .and_then(|entry| entry.deadline)
+            {
+                state
+                    .deadlines
+                    .remove(&(old, session_dir.to_path_buf(), task_id.to_string()));
+            }
+            if let Some(deadline) = deadline {
+                state
+                    .deadlines
+                    .insert((deadline, session_dir.to_path_buf(), task_id.to_string()));
+            }
             state
                 .sessions
                 .entry(session_dir.to_path_buf())
@@ -401,6 +628,8 @@ impl GcMemo {
                 .insert(
                     task_id.to_string(),
                     Remembered {
+                        deadline,
+                        provisional_retry: false,
                         verdict: Verdict {
                             layout: evidence.layout,
                             session: evidence.session,
@@ -440,7 +669,15 @@ impl GcMemo {
     pub(crate) fn forget(&self, session_dir: &Path, task_id: &str) {
         with_root(&self.root, |state| {
             if let Some(tasks) = state.sessions.get_mut(session_dir) {
-                tasks.remove(task_id);
+                if let Some(entry) = tasks.remove(task_id) {
+                    if let Some(deadline) = entry.deadline {
+                        state.deadlines.remove(&(
+                            deadline,
+                            session_dir.to_path_buf(),
+                            task_id.to_string(),
+                        ));
+                    }
+                }
                 if tasks.is_empty() {
                     state.sessions.remove(session_dir);
                 }
@@ -464,18 +701,37 @@ impl GcMemo {
         with_root(&self.root, |state| {
             state.last_pass_seq = seq;
             if pass.walk_finished {
+                if let Some(started) = state.validation_lap_started.take() {
+                    let after = started + Duration::from_secs(10 * 60);
+                    state.validation_after =
+                        Some(state.validation_after.map_or(after, |next| next.max(after)));
+                }
                 let lap = state.lap;
                 let read_sessions = std::mem::take(&mut state.read_sessions);
                 let unreadable_sessions = std::mem::take(&mut state.unreadable_sessions);
                 let root_directory_unreadable =
                     std::mem::replace(&mut state.root_directory_unreadable, false);
+                let deadlines = &mut state.deadlines;
                 state.sessions.retain(|session_dir, tasks| {
                     if unreadable_sessions.contains(session_dir) {
                         // A partial listing cannot prove which remembered tasks
                         // disappeared, so preserve the session's verdicts.
                     } else if read_sessions.contains(session_dir) {
-                        tasks.retain(|_, entry| entry.seen_lap >= lap);
+                        tasks.retain(|id, entry| {
+                            if entry.seen_lap >= lap {
+                                return true;
+                            }
+                            if let Some(deadline) = entry.deadline {
+                                deadlines.remove(&(deadline, session_dir.clone(), id.clone()));
+                            }
+                            false
+                        });
                     } else if !root_directory_unreadable {
+                        for (id, entry) in tasks.iter() {
+                            if let Some(deadline) = entry.deadline {
+                                deadlines.remove(&(deadline, session_dir.clone(), id.clone()));
+                            }
+                        }
                         return false;
                     }
                     !tasks.is_empty()
@@ -489,7 +745,8 @@ impl GcMemo {
             let remembered = state.remembered_tasks();
             let health = &mut state.health;
             health.passes = health.passes.saturating_add(1);
-            health.last_pass_out_of_budget = !pass.walk_finished && pass.error.is_none();
+            health.last_pass_out_of_budget =
+                !pass.validation_skipped && !pass.walk_finished && pass.error.is_none();
             if health.last_pass_out_of_budget {
                 health.passes_out_of_budget = health.passes_out_of_budget.saturating_add(1);
             }
@@ -508,6 +765,7 @@ impl GcMemo {
 #[derive(Debug, Default)]
 pub(crate) struct PassReport {
     pub walk_finished: bool,
+    pub validation_skipped: bool,
     /// The `bash-tasks` folder does not exist, so there is nothing to sweep
     /// or remember.
     pub root_missing: bool,
@@ -592,6 +850,108 @@ pub(crate) fn persisted_gc_health_for(root: &Path) -> Option<PersistedGcHealth> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gc_grace_keeps_future_mtime() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert!(within_grace_at(
+            now + Duration::from_secs(60),
+            super::super::registry::PERSISTED_GC_GRACE,
+            now
+        ));
+    }
+
+    #[test]
+    fn expired_abandonment_age_with_live_worktree_returns_to_validation() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = storage.path().join("bash-tasks");
+        let session = root.join("session");
+        let task = session.join("bash-0000000000000001");
+        let metadata = task
+            .join("control")
+            .join(super::super::persistence::METADATA_FILE);
+        std::fs::create_dir_all(metadata.parent().unwrap()).unwrap();
+        std::fs::write(&metadata, b"{}").unwrap();
+        let memo = GcMemo::new(root);
+        let session_stamp = Stamp::of(&session).unwrap();
+        let finished = crate::bash_background::persistence::unix_millis();
+        memo.remember_undelivered(
+            &session,
+            "bash-0000000000000001",
+            Evidence {
+                layout: TaskLayout::Directory,
+                session: session_stamp,
+                task_dir: Some(Stamp::of(&task).unwrap()),
+                metadata: Stamp::of(&metadata).unwrap(),
+                write_generation: memo.write_generation(&session),
+            },
+            AbandonmentInput {
+                finished_at: Some(finished),
+                project_root: Some(storage.path()),
+                workdir: storage.path(),
+            },
+        );
+        let due = UNIX_EPOCH + Duration::from_millis(finished + 7 * 24 * 60 * 60 * 1000 + 1);
+        assert_eq!(memo.due_batches(due).len(), 1);
+        assert!(memo.still_waiting(
+            &session,
+            Some(&session_stamp),
+            "bash-0000000000000001",
+            super::super::registry::PERSISTED_GC_GRACE,
+            due
+        ));
+        assert!(memo.due_batches(due + Duration::from_secs(60)).is_empty());
+    }
+
+    #[test]
+    fn metadata_write_during_evaluation_keeps_its_invalidation() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = storage.path().join("bash-tasks");
+        let session = root.join("..").join("bash-tasks").join("session");
+        let task_dir = session.join("bash-0000000000000001");
+        let metadata = task_dir
+            .join("control")
+            .join(super::super::persistence::METADATA_FILE);
+        std::fs::create_dir_all(metadata.parent().unwrap()).unwrap();
+        std::fs::write(&metadata, b"{}").unwrap();
+        let memo = GcMemo::new(root.canonicalize().unwrap());
+        let evidence = Evidence {
+            layout: TaskLayout::Directory,
+            session: Stamp::of(&session).unwrap(),
+            task_dir: Some(Stamp::of(&task_dir).unwrap()),
+            metadata: Stamp::of(&metadata).unwrap(),
+            write_generation: memo.write_generation(&session),
+        };
+        metadata_written(&metadata);
+        memo.remember_grace(&session, "bash-0000000000000001", evidence);
+        let now = SystemTime::now();
+        let batches = memo.due_batches(now);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].ids, ["bash-0000000000000001"]);
+        assert!(memo.still_waiting(
+            &session,
+            Some(&Stamp::of(&session).unwrap()),
+            "bash-0000000000000001",
+            super::super::registry::PERSISTED_GC_GRACE,
+            now + Duration::from_secs(1)
+        ));
+        assert!(
+            memo.due_batches(now + Duration::from_secs(60)).is_empty(),
+            "an unchanged grace verdict became minute polling"
+        );
+    }
+
+    #[test]
+    fn grace_keeps_its_exact_boundary() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let grace = super::super::registry::PERSISTED_GC_GRACE;
+        assert!(within_grace_at(
+            now - grace + Duration::from_micros(1),
+            grace,
+            now
+        ));
+        assert!(!within_grace_at(now - grace, grace, now));
+    }
+
     use super::*;
 
     /// Task metadata is written by atomic replacement. A rewrite that lands
@@ -607,5 +967,20 @@ mod tests {
         assert_eq!(Stamp::of(&metadata).unwrap(), before);
         crate::file_identity::replace_keeping_times(&metadata, br#"{"status":"stopped"}"#);
         assert_ne!(Stamp::of(&metadata).unwrap(), before);
+    }
+    #[test]
+    fn completed_validation_laps_are_rate_limited() {
+        let storage = tempfile::tempdir().unwrap();
+        let memo = GcMemo::new(storage.path().to_path_buf());
+        let now = Instant::now();
+        assert!(memo.validation_due(now));
+        assert!(!memo.validation_due(now + Duration::from_secs(59)));
+        assert!(memo.validation_due(now + Duration::from_secs(60)));
+        memo.finish_pass(PassReport {
+            walk_finished: true,
+            ..PassReport::default()
+        });
+        assert!(!memo.validation_due(now + Duration::from_secs(599)));
+        assert!(memo.validation_due(now + Duration::from_secs(600)));
     }
 }

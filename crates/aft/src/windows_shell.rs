@@ -87,16 +87,23 @@ impl WindowsShell {
         }
     }
 
-    /// Args for invoking a wrapper file under a PTY-attached shell.
+    /// Args for invoking a private wrapper file without executing a PowerShell script file.
     /// Returns owned strings so callers can pass temporary wrapper paths.
-    pub(crate) fn pty_wrapper_args(&self, wrapper_path: &Path) -> Vec<String> {
+    pub(crate) fn wrapper_file_args(&self, wrapper_path: &Path) -> Vec<String> {
         match self {
-            WindowsShell::Cmd => vec!["/c".into(), wrapper_path.display().to_string()],
+            // Disable registry AutoRun before cmd reads and executes the wrapper.
+            WindowsShell::Cmd => vec!["/D".into(), "/c".into(), wrapper_path.display().to_string()],
             WindowsShell::Pwsh | WindowsShell::Powershell => vec![
                 "-NoProfile".into(),
                 "-NonInteractive".into(),
-                "-File".into(),
-                wrapper_path.display().to_string(),
+                // Execution policy can forbid unsigned .ps1 files, including
+                // under Group Policy. Reading our private wrapper as command
+                // text keeps the launch subject to command, not script, policy.
+                "-Command".into(),
+                format!(
+                    "& ([scriptblock]::Create([System.IO.File]::ReadAllText({})))",
+                    powershell_single_quote(&wrapper_path.display().to_string())
+                ),
             ],
             WindowsShell::Posix(_) => vec![wrapper_path.display().to_string()],
         }
@@ -104,9 +111,8 @@ impl WindowsShell {
 
     /// Build a `Command` that runs an inline background wrapper script.
     ///
-    /// Production background bash now writes wrappers to `.bat` / `.ps1` temp
-    /// files and invokes those files directly, so paths containing `!` remain
-    /// literal and cmd.exe does not have to parse a long inline wrapper. This
+    /// Production background bash writes private wrapper files, so paths
+    /// containing `!` remain literal and cmd.exe does not have to parse a long inline wrapper. This
     /// helper is retained for tests that exercise the legacy shell-arg shape.
     #[allow(dead_code)]
     pub(crate) fn bg_command(&self, wrapper: &str) -> Command {
@@ -143,7 +149,9 @@ impl WindowsShell {
         cmd
     }
 
-    /// Wrap a background command so the child writes its own exit marker.
+    /// Build shell text for a background command. PowerShell status is recorded
+    /// by the cmd waiter when available. The direct PowerShell fallback records
+    /// normal-return status; cmd and POSIX wrappers publish their own markers.
     ///
     /// On Windows the sandbox is never active (`native_sandbox_enforced` is
     /// `cfg!(unix)`-gated; strict refuses and relaxed reports unenforced denies),
@@ -151,8 +159,8 @@ impl WindowsShell {
     /// and is authoritative for its own exit code. Windows also has no zombie
     /// reaping, so once the spawning daemon's child handle closes across a
     /// detach/rebind the exit code is unrecoverable daemon-side — only a
-    /// child-side write records it. The write goes into the child-writable
-    /// `io/` plane via temp-file + `Move-Item`/`move` rename: an in-place write
+    /// child-side waiter or wrapper records it. The write goes into the child-writable
+    /// `io/` directory via temp-file + atomic replacement: an in-place write
     /// is refused because the daemon retains the pre-opened `io/exit` handle,
     /// but the rename succeeds (the retained handle is opened with
     /// `FILE_SHARE_DELETE`) and atomically swaps in a fully-written file, so the
@@ -164,37 +172,10 @@ impl WindowsShell {
     /// code. Unix bash/zsh pipeline diagnostics live in the Unix payload wrapper.
     pub(crate) fn wrapper_script(&self, command: &str, exit_path: &Path) -> String {
         match self {
-            WindowsShell::Pwsh | WindowsShell::Powershell => {
-                // CRITICAL: no literal double-quotes — inner `"` breaks the
-                // outer `-File` parse on some Windows console hosts. Use only
-                // single-quoted strings and `+` concat.
-                let exit_path = powershell_single_quote(&exit_path.display().to_string());
-                let command = powershell_single_quote(command);
-                // Invoke-Expression can report success after a command-not-found
-                // error. Catch invocation errors before publishing a success
-                // marker, even if an earlier native command set LASTEXITCODE.
-                format!(
-                    concat!(
-                        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ",
-                        "$OutputEncoding = [Console]::OutputEncoding; ",
-                        "$exitPath = {exit_path}; ",
-                        "$tmpPath = $exitPath + '.tmp.' + $PID; ",
-                        "$global:LASTEXITCODE = $null; ",
-                        "try {{ Invoke-Expression {command}; ",
-                        "$success = $?; ",
-                        "$nativeCode = $global:LASTEXITCODE; ",
-                        "if ($null -ne $nativeCode) {{ $code = [int]$nativeCode }} ",
-                        "elseif ($success) {{ $code = 0 }} ",
-                        "else {{ $code = 1 }} ",
-                        "}} catch {{ [Console]::Error.WriteLine($_.ToString()); $code = 1 }}; ",
-                        "[System.IO.File]::WriteAllText($tmpPath, [string]$code); ",
-                        "Move-Item -LiteralPath $tmpPath -Destination $exitPath -Force; ",
-                        "exit $code"
-                    ),
-                    exit_path = exit_path,
-                    command = command
-                )
-            }
+            WindowsShell::Pwsh | WindowsShell::Powershell => powershell_payload(
+                command,
+                (!crate::bash_background::windows_waiter::available()).then_some(exit_path),
+            ),
             WindowsShell::Cmd => {
                 // Written to a `.bat` invoked as `cmd /D /C <wrapper.bat>`.
                 // The user command does not appear in the file: batch
@@ -263,6 +244,109 @@ impl WindowsShell {
             WindowsShell::Cmd | WindowsShell::Posix(_) => script.into_bytes(),
         }
     }
+
+    fn memory_gate_script(&self, exit_path: &Path) -> String {
+        match self {
+            // PowerShell console reads can block during ConPTY initialization.
+            // A private file gate leaves terminal input available for the command.
+            Self::Pwsh | Self::Powershell => format!("$aftMemoryDeadline = [DateTime]::UtcNow.AddSeconds(30)\r\nwhile (-not (Test-Path -LiteralPath '{}')) {{ if ([DateTime]::UtcNow -ge $aftMemoryDeadline) {{ exit 125 }}; Start-Sleep -Milliseconds 10 }}\r\n", memory_gate_path(exit_path).display().to_string().replace('\'', "''")),
+            Self::Cmd => "@set /p _aft_memory_ready=\r\n@if not \"%_aft_memory_ready%\"==\"aft-memory-ready\" exit /B 125\r\n".into(),
+            Self::Posix(_) => "read -r _aft_memory_ready && [ \"$_aft_memory_ready\" = aft-memory-ready ] || exit 125\n".into(),
+        }
+    }
+
+    pub(crate) fn memory_gated_wrapper_bytes(&self, command: &str, exit_path: &Path) -> Vec<u8> {
+        let script = format!(
+            "{}{}",
+            self.memory_gate_script(exit_path),
+            self.wrapper_script(command, exit_path)
+        );
+        let mut bytes = if matches!(self, Self::Pwsh | Self::Powershell) {
+            vec![0xEF, 0xBB, 0xBF]
+        } else {
+            Vec::new()
+        };
+        bytes.extend_from_slice(script.as_bytes());
+        bytes
+    }
+
+    pub(crate) fn uses_memory_file_gate(&self) -> bool {
+        matches!(self, Self::Pwsh | Self::Powershell)
+    }
+
+    /// Keep command text off the Windows command line and inside the task's
+    /// private directory. The wrapper is read as text, never executed as a .ps1.
+    pub(crate) fn write_wrapper(
+        &self,
+        command: &str,
+        exit_path: &Path,
+        wrapper_path: &Path,
+    ) -> std::io::Result<()> {
+        crate::private_storage::write(wrapper_path, self.wrapper_script_bytes(command, exit_path))
+    }
+
+    /// Preserve the original single-shell path when cmd cannot retain the
+    /// requested working folder or cannot transport the generated invocation.
+    /// For network-share (UNC) paths, long working folders, and environment or
+    /// transport edge cases, live calls still obtain the real process exit code.
+    /// An explicit `exit N` skips this wrapper's marker, so losing the daemon's
+    /// child handle before it records that code can leave a detached piped task
+    /// as `FateUnknown`.
+    pub(crate) fn write_direct_wrapper(
+        &self,
+        command: &str,
+        exit_path: &Path,
+        wrapper_path: &Path,
+        memory_gated: bool,
+    ) -> std::io::Result<()> {
+        let gate = if memory_gated {
+            self.memory_gate_script(exit_path)
+        } else {
+            String::new()
+        };
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(
+            format!("{gate}{}", powershell_payload(command, Some(exit_path))).as_bytes(),
+        );
+        crate::private_storage::write(wrapper_path, bytes)
+    }
+}
+
+fn memory_gate_path(exit_path: &Path) -> PathBuf {
+    exit_path.with_extension("memory-ready")
+}
+
+pub(crate) fn release_memory_file_gate(exit_path: &Path) -> Result<(), String> {
+    crate::private_storage::write(&memory_gate_path(exit_path), b"")
+        .map_err(|error| format!("memory cap launch gate failed: {error}"))
+}
+
+fn powershell_payload(command: &str, fallback_marker: Option<&Path>) -> String {
+    // Invoke-Expression can report success after a command-not-found error.
+    // Catch invocation errors even if an earlier native command set LASTEXITCODE.
+    // When cmd cannot safely host the invocation, preserve the original direct
+    // wrapper's normal-return marker instead of starting PowerShell twice.
+    let marker = fallback_marker.map(|path| format!(concat!(
+        "$exitPath = {path}; $tmpPath = $exitPath + '.tmp.' + $PID; ",
+        "[IO.File]::WriteAllText($tmpPath, [string]$code); ",
+        "if ([IO.File]::Exists($exitPath)) {{ ",
+        "[IO.File]::Replace($tmpPath, $exitPath, [System.Management.Automation.Language.NullString]::Value) ",
+        "}} else {{ [IO.File]::Move($tmpPath, $exitPath) }}; ",
+    ), path=powershell_single_quote(&path.display().to_string()))).unwrap_or_default();
+    format!(
+        concat!(
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ",
+        "$OutputEncoding = [Console]::OutputEncoding; ",
+        "$global:LASTEXITCODE = $null; ",
+        "try {{ Invoke-Expression {command}; $success = $?; $nativeCode = $global:LASTEXITCODE; ",
+        "if ($null -ne $nativeCode) {{ $code = [int]$nativeCode }} ",
+        "elseif ($success) {{ $code = 0 }} else {{ $code = 1 }} ",
+        "}} catch {{ [Console]::Error.WriteLine($_.ToString()); $code = 1 }}; ",
+        "{marker}exit $code"
+    ),
+        command = powershell_single_quote(command),
+        marker = marker
+    )
 }
 
 /// All Windows shells that the PATH probe believes are reachable, returned
@@ -693,24 +777,69 @@ mod tests {
 
     #[cfg(windows)]
     fn assert_powershell_wrapper(shell: WindowsShell, command: &str, code: i32, stdout: &str) {
+        assert_powershell_wrapper_with_policy(shell, command, code, stdout, "Bypass");
+    }
+
+    #[cfg(windows)]
+    fn assert_powershell_wrapper_with_policy(
+        shell: WindowsShell,
+        command: &str,
+        code: i32,
+        stdout: &str,
+        policy: &str,
+    ) {
+        use std::os::windows::process::CommandExt;
         let Ok(binary) = which::which(shell.binary().as_ref()) else {
             eprintln!("skipping {shell:?}: shell is not installed");
             return;
         };
-        let temp = tempfile::tempdir().unwrap();
-        let wrapper = temp.path().join("wrapper.ps1");
-        let marker = temp.path().join("exit.txt");
-        std::fs::write(&wrapper, shell.wrapper_script_bytes(command, &marker)).unwrap();
-        let output = Command::new(binary)
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-            ])
-            .arg(&wrapper)
+        let temp = tempfile::Builder::new()
+            .prefix("aft %NO_SUCH%!&^' héllo ")
+            .tempdir()
+            .unwrap();
+        // TEMP may use an 8.3 alias while PowerShell reports a long spelling.
+        // Request a canonical fixture path; alias handling is checked separately
+        // by directory identity rather than by presentation strings.
+        let cwd = crate::windows_path::normalize_windows_path(
+            &std::fs::canonicalize(temp.path()).unwrap(),
+        );
+        let layout = crate::bash_background::windows_waiter::test_task_layout(
+            temp.path(),
+            "wrapper-test",
+            command,
+        );
+        let paths = &layout.paths;
+        let wrapper = paths.dir.join("wrapper.ps1");
+        let marker = paths.exit.clone();
+        crate::private_storage::write(&marker, b"").unwrap();
+        shell.write_wrapper(command, &marker, &wrapper).unwrap();
+        let mut args = vec![std::ffi::OsString::from("-ExecutionPolicy"), policy.into()];
+        args.extend(
+            shell
+                .wrapper_file_args(&wrapper)
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        let waiter = crate::bash_background::windows_waiter::wrap(
+            binary.as_os_str(),
+            &args,
+            paths,
+            &cwd,
+            &std::collections::HashMap::new(),
+            false,
+            false,
+        )
+        .unwrap()
+        .expect("native cmd waiter available");
+        let output = Command::new(waiter.program)
+            .args(waiter.args)
+            .env(waiter.environment.0, waiter.environment.1)
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
             .env("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+            .env("AFT_EXIT_TEST_VALUE", "héllo ! '")
+            .env("AFT_EXPECTED_CWD", &cwd)
+            .env("ERRORLEVEL", "999")
+            .current_dir(&cwd)
             .output()
             .unwrap();
         assert_eq!(
@@ -721,12 +850,533 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(
-            std::fs::read_to_string(marker).unwrap().trim(),
+            std::fs::read_to_string(&marker)
+                .unwrap_or_else(|error| panic!(
+                    "{shell:?} command={command:?}: missing exit marker {marker:?}: {error}"
+                ))
+                .trim(),
             code.to_string()
         );
-        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), stdout);
-        if code == 1 {
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .replace("\r\n", "\n")
+                .trim(),
+            stdout
+        );
+        if command.contains("aft_missing_command_7961") {
             assert!(String::from_utf8_lossy(&output.stderr).contains("aft_missing_command_7961"));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_wrappers_preserve_exit_under_restrictive_process_policies() {
+        for shell in [WindowsShell::Pwsh, WindowsShell::Powershell] {
+            for policy in ["Restricted", "AllSigned"] {
+                assert_powershell_wrapper_with_policy(
+                    shell.clone(),
+                    "Write-Output $env:PSExecutionPolicyPreference; exit 3",
+                    3,
+                    policy,
+                    policy,
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_wrappers_preserve_command_environment_and_workdir() {
+        for shell in [WindowsShell::Pwsh, WindowsShell::Powershell] {
+            assert_powershell_wrapper(
+                shell,
+                "Write-Output $env:AFT_EXIT_TEST_VALUE; Write-Output (((Get-Location).Path -eq $env:AFT_EXPECTED_CWD) -and ([Environment]::CurrentDirectory -eq $env:AFT_EXPECTED_CWD)); Write-Output $args.Count; Write-Output ($null -eq $LASTEXITCODE); exit 3",
+                3,
+                "héllo ! '\nTrue\n0\nTrue",
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_waiter_preserves_complete_environment() {
+        use std::os::windows::process::CommandExt;
+        for shell in [WindowsShell::Pwsh, WindowsShell::Powershell] {
+            let temp = tempfile::tempdir().unwrap();
+            let layout = crate::bash_background::windows_waiter::test_task_layout(
+                temp.path(),
+                "environment",
+                "environment",
+            );
+            let paths = &layout.paths;
+            let wrapper = paths.dir.join("wrapper.ps1");
+            let command = "[Environment]::GetEnvironmentVariables().GetEnumerator() | Sort-Object Key | ForEach-Object { Write-Output ($_.Key + '=' + $_.Value) }; exit 0";
+            shell.write_wrapper(command, &paths.exit, &wrapper).unwrap();
+            let binary = which::which(shell.binary().as_ref()).unwrap();
+            let mut args = vec![
+                std::ffi::OsString::from("-ExecutionPolicy"),
+                "Bypass".into(),
+            ];
+            args.extend(
+                shell
+                    .wrapper_file_args(&wrapper)
+                    .into_iter()
+                    .map(std::ffi::OsString::from),
+            );
+            let occupied = format!(
+                "__AFT_WAITER_{}",
+                paths.task_id.replace('-', "_").to_ascii_uppercase()
+            )
+            .to_ascii_lowercase();
+            let request_environment =
+                std::collections::HashMap::from([(occupied.clone(), "user value".into())]);
+            let waiter = crate::bash_background::windows_waiter::wrap(
+                binary.as_os_str(),
+                &args,
+                paths,
+                temp.path(),
+                &request_environment,
+                false,
+                false,
+            )
+            .unwrap()
+            .unwrap();
+            let mut direct = Command::new(binary);
+            direct.args(&args);
+            let mut waited = Command::new(waiter.program);
+            waited
+                .args(waiter.args)
+                .env(waiter.environment.0, waiter.environment.1);
+            for process in [&mut direct, &mut waited] {
+                process
+                    .current_dir(temp.path())
+                    .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+                    .env("ERRORLEVEL", "999")
+                    .env(&occupied, "user value")
+                    .env("AFT_ENV_VALUE", "héllo ! %VALUE% ^ & '");
+            }
+            let direct = direct.output().unwrap();
+            let waited = waited.output().unwrap();
+            assert_eq!(direct.status.code(), Some(0));
+            assert_eq!(waited.status.code(), Some(0));
+            // Windows environment names are case-insensitive. Compare values
+            // in memory: environment values must not be printed into a
+            // failure log, where inherited credentials could otherwise escape.
+            let parse = |bytes: &[u8]| {
+                String::from_utf8_lossy(bytes)
+                    .lines()
+                    .filter_map(|line| {
+                        line.split_once('=')
+                            .map(|(key, value)| (key.to_ascii_uppercase(), value.to_owned()))
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let expected = parse(&direct.stdout);
+            let actual = parse(&waited.stdout);
+            let different_keys = expected
+                .keys()
+                .chain(actual.keys())
+                .filter(|key| expected.get(*key) != actual.get(*key))
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            assert!(
+                expected == actual,
+                "{shell:?}: waiter changed environment keys {different_keys:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_waiter_preserves_long_environment_values() {
+        use sha2::{Digest, Sha256};
+        use std::collections::HashMap;
+        use std::ffi::OsString;
+        use std::os::windows::process::CommandExt;
+
+        let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        let path_prefix = std::env::join_paths([
+            system.join("System32"),
+            system.join("System32/WindowsPowerShell/v1.0"),
+        ])
+        .unwrap()
+        .into_string()
+        .unwrap();
+        let mut long_path = path_prefix + ";";
+        long_path.push_str(&"Z".repeat(9000 - long_path.len()));
+        let mut cases = vec![("MASON_LONG_ENV_VALUE", "normal".to_string())];
+        for length in [8191, 8192, 16000, 32000] {
+            cases.push(("MASON_LONG_ENV_VALUE", "a".repeat(length)));
+        }
+        cases.push(("MASON_LONG_ENV_VALUE", "λ".repeat(16000)));
+        cases.push(("PATH", long_path));
+
+        for shell in [WindowsShell::Pwsh, WindowsShell::Powershell] {
+            let binary =
+                which::which(shell.binary().as_ref()).expect("native PowerShell installed");
+            let temp = tempfile::tempdir().unwrap();
+            for (key, value) in &cases {
+                let command = format!("$v=[Environment]::GetEnvironmentVariable('{key}'); $h=[Security.Cryptography.SHA256]::Create(); Write-Output (([string]$v.Length) + ':' + [BitConverter]::ToString($h.ComputeHash([Text.Encoding]::UTF8.GetBytes($v))).Replace('-','').ToLowerInvariant()); exit 0");
+                let layout = crate::bash_background::windows_waiter::test_task_layout(
+                    temp.path(),
+                    "long-environment",
+                    &command,
+                );
+                let paths = &layout.paths;
+                let wrapper = paths.dir.join("wrapper.ps1");
+                crate::private_storage::write(&paths.exit, b"").unwrap();
+                shell
+                    .write_wrapper(&command, &paths.exit, &wrapper)
+                    .unwrap();
+                let mut args = vec![OsString::from("-ExecutionPolicy"), "Bypass".into()];
+                args.extend(
+                    shell
+                        .wrapper_file_args(&wrapper)
+                        .into_iter()
+                        .map(OsString::from),
+                );
+                let environment = HashMap::from([(key.to_string(), value.clone())]);
+                let waiter = crate::bash_background::windows_waiter::wrap(
+                    binary.as_os_str(),
+                    &args,
+                    paths,
+                    temp.path(),
+                    &environment,
+                    false,
+                    false,
+                )
+                .unwrap()
+                .expect("long values must be tested through the cmd waiter, not a direct fallback");
+                assert_eq!(
+                    Path::new(&waiter.program)
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_ascii_lowercase(),
+                    "cmd.exe"
+                );
+                let mut direct = Command::new(&binary);
+                direct.args(&args);
+                let mut waited = Command::new(waiter.program);
+                waited
+                    .args(waiter.args)
+                    .env(waiter.environment.0, waiter.environment.1);
+                for process in [&mut direct, &mut waited] {
+                    process
+                        .envs(&environment)
+                        .current_dir(temp.path())
+                        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+                }
+                let direct = direct.output().unwrap();
+                let waited = waited.output().unwrap();
+                assert_eq!(direct.status.code(), Some(0), "{shell:?} direct {key}");
+                assert_eq!(waited.status.code(), Some(0), "{shell:?} cmd {key}");
+                assert!(
+                    waited.stderr == direct.stderr,
+                    "{shell:?}: cmd added an environment-probe diagnostic"
+                );
+                let expected = if *key == "PATH" {
+                    // PowerShell can add its installation directory to PATH.
+                    // The direct host is the baseline for that normalization.
+                    let observed = String::from_utf8_lossy(&direct.stdout).trim().to_owned();
+                    assert!(
+                        observed
+                            .split(':')
+                            .next()
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap()
+                            >= 9000
+                    );
+                    observed
+                } else {
+                    format!(
+                        "{}:{:x}",
+                        value.encode_utf16().count(),
+                        Sha256::digest(value.as_bytes())
+                    )
+                };
+                assert_eq!(
+                    String::from_utf8_lossy(&direct.stdout).trim(),
+                    expected,
+                    "{shell:?} direct {key}"
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&waited.stdout).trim(),
+                    expected,
+                    "{shell:?} cmd {key}"
+                );
+                assert_eq!(std::fs::read_to_string(&paths.exit).unwrap().trim(), "0");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_waiter_preserves_directory_identity_for_short_paths() {
+        use std::collections::HashMap;
+        use std::ffi::OsString;
+        use std::os::windows::{
+            ffi::{OsStrExt, OsStringExt},
+            process::CommandExt,
+        };
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+
+        let temp = tempfile::Builder::new()
+            .prefix("aft directory spelling long name ")
+            .tempdir()
+            .unwrap();
+        let long = crate::windows_path::normalize_windows_path(
+            &std::fs::canonicalize(temp.path()).unwrap(),
+        );
+        let wide: Vec<u16> = long.as_os_str().encode_wide().chain(Some(0)).collect();
+        let required = unsafe { GetShortPathNameW(wide.as_ptr(), std::ptr::null_mut(), 0) };
+        assert_ne!(
+            required,
+            0,
+            "short-path query: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut buffer = vec![0u16; required as usize];
+        let length = unsafe { GetShortPathNameW(wide.as_ptr(), buffer.as_mut_ptr(), required) };
+        assert!(length > 0 && length < required);
+        let short = PathBuf::from(OsString::from_wide(&buffer[..length as usize]));
+        let (directory, expected_identity) = crate::file_identity::metadata(&long).unwrap();
+        assert!(directory.is_dir());
+        assert!(matches!(
+            expected_identity,
+            crate::file_identity::FileIdentity::Known { .. }
+        ));
+        println!(
+            "CWD_ALIAS long={} short={} distinct={}",
+            long.display(),
+            short.display(),
+            long != short
+        );
+
+        for shell in [WindowsShell::Pwsh, WindowsShell::Powershell] {
+            let binary = which::which(shell.binary().as_ref()).unwrap();
+            for cwd in [&long, &short] {
+                let command = "Write-Output ('version:' + $PSVersionTable.PSVersion); Write-Output ('expected:' + $env:AFT_CWD_PROBE); Write-Output ('native:' + [Environment]::CurrentDirectory); Write-Output ('powershell:' + (Get-Location).Path); Write-Output ('literal:' + (((Get-Location).Path -eq $env:AFT_CWD_PROBE) -and ([Environment]::CurrentDirectory -eq $env:AFT_CWD_PROBE))); exit 0";
+                let layout = crate::bash_background::windows_waiter::test_task_layout(
+                    temp.path(),
+                    "cwd-alias",
+                    command,
+                );
+                let paths = &layout.paths;
+                let wrapper = paths.dir.join("wrapper.ps1");
+                crate::private_storage::write(&paths.exit, b"").unwrap();
+                shell.write_wrapper(command, &paths.exit, &wrapper).unwrap();
+                let mut args = vec![OsString::from("-ExecutionPolicy"), "Bypass".into()];
+                args.extend(
+                    shell
+                        .wrapper_file_args(&wrapper)
+                        .into_iter()
+                        .map(OsString::from),
+                );
+                let waiter = crate::bash_background::windows_waiter::wrap(
+                    binary.as_os_str(),
+                    &args,
+                    paths,
+                    cwd,
+                    &HashMap::new(),
+                    false,
+                    false,
+                )
+                .unwrap()
+                .unwrap();
+                let mut direct = Command::new(&binary);
+                direct.args(&args);
+                let mut waited = Command::new(waiter.program);
+                waited
+                    .args(waiter.args)
+                    .env(waiter.environment.0, waiter.environment.1);
+                for (route, process) in [("direct", &mut direct), ("cmd", &mut waited)] {
+                    let output = process
+                        .current_dir(cwd)
+                        .env("AFT_CWD_PROBE", cwd)
+                        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+                        .output()
+                        .unwrap();
+                    assert_eq!(output.status.code(), Some(0), "{shell:?} {route}");
+                    let text = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+                    println!(
+                        "CWD_PROBE shell={shell:?} route={route} requested={} output={text:?}",
+                        cwd.display()
+                    );
+                    for prefix in ["native:", "powershell:"] {
+                        let actual = text
+                            .lines()
+                            .find_map(|line| line.strip_prefix(prefix))
+                            .unwrap();
+                        let (metadata, identity) =
+                            crate::file_identity::metadata(Path::new(actual)).unwrap();
+                        assert!(metadata.is_dir());
+                        assert_eq!(
+                            identity, expected_identity,
+                            "{shell:?} {route} {prefix} named another directory"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_wrappers_keep_large_commands_off_the_command_line() {
+        let command = format!("#{}\nWrite-Output héllo; exit 3", "x".repeat(40_000));
+        for shell in [WindowsShell::Pwsh, WindowsShell::Powershell] {
+            assert_powershell_wrapper(shell, &command, 3, "héllo");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_wrappers_preserve_script_exit_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("command.ps1");
+        crate::private_storage::write(&script, b"Write-Output from-script; exit 1").unwrap();
+        let command = format!(
+            "& {}",
+            powershell_single_quote(&script.display().to_string())
+        );
+        for shell in [WindowsShell::Pwsh, WindowsShell::Powershell] {
+            assert_powershell_wrapper(shell, &command, 1, "from-script");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_direct_fallback_keeps_original_exit_semantics() {
+        for shell in [WindowsShell::Pwsh, WindowsShell::Powershell] {
+            let temp = tempfile::tempdir().unwrap();
+            let marker = temp.path().join("exit");
+            for (command, expected_code, expected_marker) in
+                [("cmd.exe /D /C exit /B 5", 5, "5"), ("exit 3", 3, "")]
+            {
+                crate::private_storage::write(&marker, b"").unwrap();
+                let script = powershell_payload(command, Some(&marker));
+                assert!(!script.contains("-EncodedCommand"));
+                let output = Command::new(shell.binary().as_ref())
+                    .args(shell.args(&script))
+                    .output()
+                    .unwrap();
+                assert_eq!(output.status.code(), Some(expected_code), "{output:?}");
+                assert_eq!(std::fs::read_to_string(&marker).unwrap(), expected_marker);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_waiter_startup_time() {
+        use std::os::windows::process::CommandExt;
+        let temp = tempfile::tempdir().unwrap();
+        for shell in [WindowsShell::Pwsh, WindowsShell::Powershell] {
+            let binary =
+                which::which(shell.binary().as_ref()).expect("native PowerShell installed");
+            let layout = crate::bash_background::windows_waiter::test_task_layout(
+                temp.path(),
+                "timing",
+                "exit 3",
+            );
+            let paths = &layout.paths;
+            let wrapper = paths.dir.join("wrapper.ps1");
+            crate::private_storage::write(&paths.exit, b"").unwrap();
+            shell
+                .write_wrapper(
+                    "Write-Output $PSVersionTable.PSVersion.ToString(); exit 3",
+                    &paths.exit,
+                    &wrapper,
+                )
+                .unwrap();
+            let mut direct_args = vec![
+                std::ffi::OsString::from("-ExecutionPolicy"),
+                "Bypass".into(),
+            ];
+            direct_args.extend(
+                shell
+                    .wrapper_file_args(&wrapper)
+                    .into_iter()
+                    .map(std::ffi::OsString::from),
+            );
+            let waiter = crate::bash_background::windows_waiter::wrap(
+                binary.as_os_str(),
+                &direct_args,
+                paths,
+                temp.path(),
+                &std::collections::HashMap::new(),
+                false,
+                false,
+            )
+            .unwrap()
+            .expect("native cmd waiter available");
+            let mut direct_samples = Vec::new();
+            let mut waiter_samples = Vec::new();
+            for _ in 0..5 {
+                // Each benchmark iteration resets the empty placeholder rather
+                // than reusing a result published by an earlier iteration.
+                crate::private_storage::write(&paths.exit, b"").unwrap();
+                let start = std::time::Instant::now();
+                let direct = Command::new(&binary)
+                    .args(&direct_args)
+                    .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+                    .output()
+                    .unwrap();
+                direct_samples.push(start.elapsed().as_micros());
+                assert_eq!(direct.status.code(), Some(3), "{direct:?}");
+                let start = std::time::Instant::now();
+                let waited = Command::new(&waiter.program)
+                    .args(&waiter.args)
+                    .env(&waiter.environment.0, &waiter.environment.1)
+                    .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+                    .output()
+                    .unwrap();
+                waiter_samples.push(start.elapsed().as_micros());
+                assert_eq!(waited.status.code(), Some(3), "{waited:?}");
+                assert_eq!(direct.stdout, waited.stdout);
+                assert!(String::from_utf8_lossy(&direct.stdout).starts_with(
+                    if matches!(shell, WindowsShell::Pwsh) {
+                        "7."
+                    } else {
+                        "5.1."
+                    }
+                ));
+                assert_eq!(direct.stderr, waited.stderr);
+                assert_eq!(std::fs::read_to_string(&paths.exit).unwrap().trim(), "3");
+            }
+            direct_samples.sort_unstable();
+            waiter_samples.sort_unstable();
+            println!("POWERSHELL_WAITER_STARTUP shell={shell:?} direct_median_us={} waiter_median_us={} added_us={} direct_samples_us={direct_samples:?} waiter_samples_us={waiter_samples:?}", direct_samples[2], waiter_samples[2], waiter_samples[2] as i128 - direct_samples[2] as i128);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pwsh_wrapper_preserves_explicit_exit_marker() {
+        for (command, code, stdout) in [
+            ("exit 3", 3, ""),
+            ("Write-Output hi; exit 3", 3, "hi"),
+            ("exit 0", 0, ""),
+            ("cmd.exe /D /C exit /B 5", 5, ""),
+            ("throw 'boom'", 1, ""),
+        ] {
+            assert_powershell_wrapper(WindowsShell::Pwsh, command, code, stdout);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_5_wrapper_preserves_explicit_exit_marker() {
+        for (command, code, stdout) in [
+            ("exit 3", 3, ""),
+            ("Write-Output hi; exit 3", 3, "hi"),
+            ("exit 0", 0, ""),
+            ("cmd.exe /D /C exit /B 5", 5, ""),
+            ("throw 'boom'", 1, ""),
+        ] {
+            assert_powershell_wrapper(WindowsShell::Powershell, command, code, stdout);
         }
     }
 
@@ -871,24 +1521,41 @@ mod tests {
     }
 
     #[test]
-    fn pty_wrapper_args_are_owned_and_shell_specific() {
-        let wrapper = PathBuf::from(r"C:\tmp\task.bat");
+    fn wrapper_file_args_are_owned_and_shell_specific() {
+        let wrapper = PathBuf::from(r"C:\tmp\owner's ! task.bat");
         assert_eq!(
-            WindowsShell::Cmd.pty_wrapper_args(&wrapper),
-            vec!["/c".to_string(), wrapper.display().to_string()]
-        );
-        assert_eq!(
-            WindowsShell::Pwsh.pty_wrapper_args(&wrapper),
+            WindowsShell::Cmd.wrapper_file_args(&wrapper),
             vec![
-                "-NoProfile".to_string(),
-                "-NonInteractive".to_string(),
-                "-File".to_string(),
-                wrapper.display().to_string(),
+                "/D".to_string(),
+                "/c".to_string(),
+                wrapper.display().to_string()
             ]
         );
         assert_eq!(
-            WindowsShell::Posix(PathBuf::from(r"C:\Git\bin\bash.exe")).pty_wrapper_args(&wrapper),
+            WindowsShell::Pwsh.wrapper_file_args(&wrapper),
+            vec![
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                r"& ([scriptblock]::Create([System.IO.File]::ReadAllText('C:\tmp\owner''s ! task.bat')))".to_string(),
+            ]
+        );
+        assert_eq!(
+            WindowsShell::Posix(PathBuf::from(r"C:\Git\bin\bash.exe")).wrapper_file_args(&wrapper),
             vec![wrapper.display().to_string()]
+        );
+    }
+
+    #[test]
+    fn pty_cmd_wrapper_disables_autorun_before_the_wrapper() {
+        let wrapper = PathBuf::from(r"C:\tmp\task.bat");
+        assert_eq!(
+            WindowsShell::Cmd.wrapper_file_args(&wrapper),
+            vec![
+                "/D".to_string(),
+                "/c".to_string(),
+                wrapper.display().to_string()
+            ]
         );
     }
 

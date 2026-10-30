@@ -11,7 +11,6 @@ pub struct CompressionEventRow<'a> {
     pub project_key: &'a str,
     pub tool: &'a str,
     pub task_id: Option<&'a str>,
-    pub command: Option<&'a str>,
     pub compressor: &'a str,
     pub original_bytes: i64,
     pub compressed_bytes: i64,
@@ -241,10 +240,10 @@ pub fn insert_compression_event(
     let inserted = conn.execute(
         r#"
         INSERT OR IGNORE INTO compression_events (
-            harness, session_id, project_key, tool, task_id, command, compressor,
+            harness, session_id, project_key, tool, task_id, compressor,
             original_bytes, compressed_bytes, original_tokens, compressed_tokens, created_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
         "#,
         params![
             row.harness,
@@ -252,7 +251,6 @@ pub fn insert_compression_event(
             row.project_key,
             row.tool,
             row.task_id,
-            row.command,
             row.compressor,
             row.original_bytes,
             row.compressed_bytes,
@@ -615,6 +613,13 @@ fn apply_prepared_retention_tick_timed(
     let task_delete_micros = task_delete_started.elapsed().as_micros();
     let event_prune_started = Instant::now();
     let compression_events_removed = prune_compression_events_in_transaction(&tx, now_ms)?;
+    crate::db::rich_ui::prune_presets(&tx, now_ms)?;
+    // Templates stay while any record references them; the tick removes the
+    // rest, keeping only digests the binary ships (none until publication).
+    crate::db::rich_ui::prune_orphaned_templates(
+        &tx,
+        &crate::db::rich_ui::shipped_template_digests(),
+    )?;
     let event_prune_micros = event_prune_started.elapsed().as_micros();
     let commit_started = Instant::now();
     tx.commit()?;
@@ -1727,7 +1732,6 @@ mod tests {
             project_key,
             tool: "bash",
             task_id: Some(task_id),
-            command: Some("echo ok"),
             compressor: "zstd",
             original_bytes: i64::from(original_tokens) * 4,
             compressed_bytes: i64::from(compressed_tokens) * 4,

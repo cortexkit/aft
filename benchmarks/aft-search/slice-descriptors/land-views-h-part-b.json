@@ -1,0 +1,12 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "views-h-part-b"
+  ],
+  "note": "Views step H part B: the semantic member moves to the v3 route with base-owner fills, and v3-only registries skip legacy eviction. The fenced semantic_search/mod.rs edit changes only a test; search ranking and routing are unchanged."
+}

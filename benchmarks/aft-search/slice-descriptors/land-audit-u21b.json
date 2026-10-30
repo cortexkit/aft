@@ -1,0 +1,24 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/commands/semantic_search/anchored_lane.rs",
+    "crates/aft/src/commands/semantic_search/exact_lane.rs",
+    "crates/aft/src/commands/semantic_search/extensions.rs",
+    "crates/aft/src/commands/semantic_search/external_disk_check.rs",
+    "crates/aft/src/commands/semantic_search/external_exact.rs",
+    "crates/aft/src/commands/semantic_search/external_pattern.rs",
+    "crates/aft/src/commands/semantic_search/lexical_lane.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/commands/semantic_search/recall_audit.rs",
+    "crates/aft/src/commands/semantic_search/regex_route.rs",
+    "crates/aft/src/commands/semantic_search/split_query.rs",
+    "crates/aft/src/search_index.rs",
+    "crates/aft/src/semantic_index.rs"
+  ],
+  "note": "Audit slice u21b: lexical and semantic I/O failures surface instead of empty complete replies; grep fallback, merge counts, negative export scores, summary budgets. Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}

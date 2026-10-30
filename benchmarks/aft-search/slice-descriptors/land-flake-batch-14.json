@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "flake-batch-14"
+  ],
+  "note": "Test-only: the Rich UI chunk route test retries database_busy on lookups that are not about busy replies; two Windows cold-build timing tests wait for all arrivals and a slow reply with a generous safety deadline. No changed path matches RANKING_FENCE_PREFIXES."
+}

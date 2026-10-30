@@ -244,15 +244,27 @@ fn callgraph_worktree_publishes_unique_source_without_an_owner_writer_or_overlay
         aft::views::callgraph::PRODUCER,
     )
     .full_key();
-    let blobs = aft::blob_store::BlobStore::open(
+    // With views on, the worktree's own content lands in the family's v3
+    // call-graph plane; the v1 blob store is a legacy writer a views-routed
+    // root no longer runs.
+    let family = ctx.memoized_artifact_cache_key(&checkout);
+    let rows = aft::blob_store::v3::PlaneReader::open_existing(
         &storage,
-        aft::search_index::artifact_cache_key(&checkout),
-        aft::blob_store::BlobPlane::Callgraph,
+        &family,
+        aft::blob_store::v2::FamilyPlane::Callgraph,
     )
     .unwrap();
     assert!(
-        blobs.contains(&key).unwrap(),
-        "worktree must put its own immutable blob"
+        rows.contains(&aft::blob_store::v2::FamilyKey::from(&key))
+            .unwrap(),
+        "worktree must put its own immutable row"
+    );
+    assert!(
+        !storage
+            .join("blobs")
+            .join(aft::search_index::artifact_cache_key(&checkout))
+            .exists(),
+        "a views-routed worktree must not open a v1 blob store"
     );
     assert!(
         aft::callgraph_store::CallGraphStore::open_readonly(ctx.callgraph_store_dir(), checkout)
@@ -457,16 +469,19 @@ fn callgraph_unindexed_path_differs_from_missing_symbol() {
     let ctx = configure(&checkout, &storage, true);
     let unindexed = checkout.join("not-yet-indexed.ts");
     std::fs::write(&unindexed, source("newCaller")).unwrap();
+    // With views on, a new file is part of the checkout view the query binds,
+    // so it is answered at once rather than reported as not yet indexed.
     for operation in OPERATIONS {
         let response = callgraph_when_ready(operation, || {
             query_file(&ctx, &unindexed, operation, "newCaller")
         });
-        assert_eq!(
+        assert_ne!(
             response.data["code"], "not_indexed",
             "{operation}: {response:?}"
         );
-        assert_eq!(response.data["reason"], "not_in_generation");
     }
+    let response = query_file(&ctx, &unindexed, "callers", "newCaller");
+    assert!(response.success, "{response:?}");
     let response = callgraph_when_ready("callers", || {
         aft::commands::callers::handle_callers(
             &request(json!({
@@ -517,55 +532,9 @@ fn callgraph_worktree_published_owner_assembles_its_own_changed_source() {
     std::fs::write(checkout.join("index.ts"), source("checkoutCaller")).unwrap();
     commit(&checkout);
     let ctx = configure_deferred(&checkout, &storage, true);
-    let response = query(&ctx, &checkout, "callers", "checkoutCaller");
-    assert_eq!(response.data["code"], "callgraph_building", "{response:?}");
-    assert_eq!(response.data["index"]["callgraph"]["status"], "building");
-    assert_eq!(response.data["progress"]["phase"], "configure_maintenance");
-    assert_eq!(response.data["progress"]["pending_paths"], Value::Null);
-    let message = response.data["message"].as_str().unwrap();
-    assert!(
-        message.contains("this worktree") && message.contains("assembling"),
-        "{message}"
-    );
-    assert!(
-        message.contains("grep or aft_search with pattern"),
-        "{message}"
-    );
-    assert!(!message.contains("main checkout"), "{message}");
-
-    // The worktree contributes its own source blob during maintenance. The
-    // owner keeps its original source and is never asked to build this branch.
-    let ctx = std::sync::Arc::new(ctx);
-    let (prepared, release, installed) =
-        aft::context::install_callgraph_view_install_test_gate(checkout.clone());
-    let executor = aft::executor::Executor::new();
-    let root_id = cortexkit_paths::ProjectRootId::from_path(&checkout).unwrap();
-    executor.register_actor(root_id.clone(), ctx.clone());
-    let maintenance = executor.submit(
-        root_id,
-        aft::executor::Lane::Mutating,
-        "worktree-maintenance".into(),
-        Box::new(|ctx| {
-            aft::runtime_drain::drain_deferred_configure_maintenance(ctx);
-            Response::success("worktree-maintenance", json!({}))
-        }),
-    );
-    let generation = prepared
-        .recv_timeout(std::time::Duration::from_secs(30))
-        .expect("worktree lazy callgraph generation was not prepared");
-    // Configure maintenance schedules lazy publication but does not join it.
-    // Release the prepared graph, then await installation of that exact
-    // generation before asking either query path to use the worktree reader.
-    release.send(()).unwrap();
-    assert_eq!(
-        installed
-            .recv_timeout(std::time::Duration::from_secs(30))
-            .unwrap_or_else(|_| panic!(
-                "worktree lazy callgraph generation {generation} was not installed for {}",
-                checkout.display()
-            )),
-        generation
-    );
+    // With views on, the first query binds this worktree's own checkout view
+    // from its own source, before configure maintenance has run: it never
+    // answers from the owner's graph and never reports the owner's callers.
     match ctx.callgraph_store_for_ops() {
         aft::context::CallgraphStoreAccess::Ready(store) => {
             assert_eq!(store.reader_kind(), "view");
@@ -579,6 +548,8 @@ fn callgraph_worktree_published_owner_assembles_its_own_changed_source() {
     assert!(response.data.to_string().contains("checkoutCaller"));
     assert!(!response.data.to_string().contains("ownerCaller"));
     assert!(response.data.get("borrowed_callgraph").is_none());
+    assert!(ctx.callgraph_view_route_count() > 0);
+    aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
     assert_eq!(
         std::fs::read_to_string(owner.join("index.ts")).unwrap(),
         source("ownerCaller")
@@ -588,12 +559,6 @@ fn callgraph_worktree_published_owner_assembles_its_own_changed_source() {
         owner_view.current_generation().unwrap(),
         owner_generation,
         "worktree publication must not replace the owner's view"
-    );
-    assert!(
-        maintenance
-            .recv_timeout(std::time::Duration::from_secs(30))
-            .expect("worktree configure maintenance did not finish")
-            .success
     );
     assert!(
         aft::callgraph_store::CallGraphStore::open_readonly(ctx.callgraph_store_dir(), checkout)

@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs"
+  ],
+  "slices": [
+    "flake-batch-8"
+  ],
+  "note": "Test-only. The ranking fence hit is commands/semantic_search/mod.rs, changed only inside #[cfg(test)] code: a held-inference test loosens two wall-clock bounds whose point is shown by the held gate and the busy-reply text. The view publication tests wait up to 60 s to settle. No product code in the fence changes, so ranked rows must remain byte-identical to the committed reference."
+}

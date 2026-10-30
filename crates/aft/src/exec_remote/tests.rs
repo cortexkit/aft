@@ -33,7 +33,7 @@ fn accepted_021_vector_and_single_locked_contract_are_pinned() {
         .filter(|p| p["name"].as_str() == Some("cortexkit-exec-remote-types"))
         .collect();
     assert_eq!(packages.len(), 1);
-    assert_eq!(packages[0]["version"].as_str(), Some("0.2.7"));
+    assert_eq!(packages[0]["version"].as_str(), Some("0.2.15"));
 }
 
 fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
@@ -54,7 +54,7 @@ fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
         .filter(|package| package["name"].as_str() == Some("cortexkit-exec-remote-types"))
         .map(|package| package["version"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(versions, ["0.2.7"], "exactly one caller contract version");
+    assert_eq!(versions, ["0.2.15"], "exactly one caller contract version");
     let vectors: serde_json::Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/exec-remote/published-v0.2.0.json"
     ))
@@ -71,6 +71,83 @@ fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
     }
     cases.sort_by(|a, b| a.0.cmp(&b.0));
     cases
+}
+
+#[test]
+fn cancel_before_start_has_a_confirmed_verdict() {
+    let mut terminal = TerminalRecord::new(job_id(), Outcome::Cancelled, 1, 0, 0);
+    terminal.ran = Some(Ran::None);
+    assert_eq!(grade(&terminal), Verdict::Cancelled);
+}
+
+#[test]
+fn cancelled_running_exit_has_a_confirmed_verdict() {
+    for code in [143, 137] {
+        let mut terminal = TerminalRecord::new(job_id(), Outcome::Exit { code }, 1, 0, 0)
+            .with_killed(Killed::Cancel);
+        terminal.ran = Some(Ran::Remote);
+        assert_eq!(grade(&terminal), Verdict::CancelKilled, "exit {code}");
+    }
+}
+
+#[test]
+fn cancelled_running_signal_has_a_confirmed_verdict() {
+    for signal in [15, 9] {
+        let mut terminal = TerminalRecord::new(job_id(), Outcome::Signal { signal }, 1, 0, 0)
+            .with_killed(Killed::Cancel);
+        terminal.ran = Some(Ran::Remote);
+        assert_eq!(grade(&terminal), Verdict::CancelKilled, "signal {signal}");
+    }
+}
+
+#[test]
+fn cancel_with_unknown_exit_and_no_liveness_proof_stays_unknown() {
+    let terminal = wire_tests::cancel_exit_status_unknown_terminal();
+    assert_eq!(grade(&terminal), Verdict::OutcomeUnknown);
+}
+
+#[test]
+fn cancel_with_typed_execution_ended_proof_is_killed() {
+    let terminal = wire_tests::cancel_exit_status_unknown_terminal().with_execution_ended();
+    assert!(terminal.execution_ended());
+    assert_eq!(grade(&terminal), Verdict::CancelKilled);
+}
+
+#[test]
+fn cancel_with_execution_ended_false_or_absent_stays_unknown() {
+    for proof in [None, Some(false)] {
+        let mut value =
+            serde_json::to_value(wire_tests::cancel_exit_status_unknown_terminal()).unwrap();
+        if let Some(proof) = proof {
+            value["execution_ended"] = proof.into();
+        } else {
+            value.as_object_mut().unwrap().remove("execution_ended");
+        }
+        let terminal: TerminalRecord = serde_json::from_value(value).unwrap();
+        assert!(!terminal.execution_ended());
+        assert_eq!(grade(&terminal), Verdict::OutcomeUnknown, "proof {proof:?}");
+    }
+}
+
+#[test]
+fn execution_ended_proof_does_not_supply_an_exit_status_or_unknown_kind() {
+    for killed in [
+        None,
+        Some(Killed::Deadline),
+        Some(Killed::Unknown("future_kill".into())),
+    ] {
+        let mut terminal = wire_tests::cancel_exit_status_unknown_terminal().with_execution_ended();
+        terminal.killed = killed;
+        assert_eq!(grade(&terminal), Verdict::OutcomeUnknown);
+    }
+    let mut terminal = wire_tests::cancel_exit_status_unknown_terminal().with_execution_ended();
+    terminal.outcome = Outcome::Unknown {
+        kind: "future_outcome".into(),
+    };
+    assert_eq!(grade(&terminal), Verdict::OutcomeUnknown);
+    terminal.outcome = Outcome::OutcomeUnknown;
+    terminal.ran = Some(Ran::Unknown("future_ran".into()));
+    assert_eq!(grade(&terminal), Verdict::OutcomeUnknown);
 }
 
 #[test]
@@ -163,6 +240,7 @@ fn published_outcomes_have_explicit_grades() {
                 job_id: terminal.job_id,
                 last_seq: Some(6),
                 gap_recovery: None,
+                last_output_seq: None,
             })
         } else {
             StreamConsumer::new()
@@ -524,6 +602,7 @@ fn request_copies_shell_inputs_without_executor_metadata() {
         weight_hint: Some(16),
         queue_wait_limit_s: Some(0),
         network: None,
+        return_paths: Vec::new(),
     };
     let request = build_request(
         &worktree,
@@ -804,6 +883,7 @@ fn retained_history_truncation_is_explicit_and_replay_continues() {
         job_id: job_id(),
         last_seq: Some(0),
         gap_recovery: None,
+        last_output_seq: None,
     });
     let mut sink = MemorySink::default();
     consumer
@@ -973,6 +1053,7 @@ fn unknown_records_without_a_terminal_require_recovery() {
         job_id: job_id(),
         last_seq: None,
         gap_recovery: None,
+        last_output_seq: None,
     });
     let mut sink = MemorySink::default();
     consumer

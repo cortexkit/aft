@@ -70,7 +70,7 @@ const refusal =
 
 describe("bash OpenCode 2 scenarios", () => {
   test("load through the harness loader and satisfy the slice validator", async () => {
-    expect(loaded.length).toBe(19);
+    expect(loaded.length).toBe(24);
     await extension.validate?.({
       repo_root: resolve(import.meta.dir, "../../../../../.."),
       platform: "linux",
@@ -78,6 +78,29 @@ describe("bash OpenCode 2 scenarios", () => {
       matrix: {},
       pinned_host_version: "2.0.3",
     });
+  });
+
+  test("changed-files T6 pairs enable their user-only mode and declare real writes", () => {
+    for (const [name, mode, surface, incompleteEffects] of [
+      ["bash-changed-files", "list", "bash.changed_files.bash.changed_files", 41],
+      ["bash-diff-lines", "diff", "bash.diff_lines.bash.diff_lines", 1],
+    ] as const) {
+      for (const kind of ["complete", "incomplete"] as const) {
+        const row = scenario(`bash/T6/${name}/${kind}`);
+        expect(row.user_config).toEqual({ bash: { changed_files: mode } });
+        expect(row.project_config).toBeUndefined();
+        expect(row.metadata?.t6).toMatchObject({ surface_id: surface, owner: "bash", fixture: kind });
+        const call = row.turns.flatMap((turn) => turn.response.kind === "tool_calls" ? turn.response.calls : [])
+          .find((call) => call.id === row.compare_call_id);
+        expect(call?.arguments).toMatchObject({ wait: true, compressed: false });
+        expect(call?.disk_effects).toHaveLength(kind === "complete" ? 1 : incompleteEffects);
+        expect(call?.non_mutating_evidence).toBeUndefined();
+        if (kind === "incomplete") {
+          expect(row.metadata?.t6).toMatchObject({ triggered_reason: "cap" });
+          expect(call?.arguments.command).toContain(mode === "list" ? "-lt 41" : "-lt 250");
+        }
+      }
+    }
   });
 });
 

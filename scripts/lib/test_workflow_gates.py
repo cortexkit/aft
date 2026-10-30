@@ -11,6 +11,7 @@ import re
 import subprocess
 import tempfile
 import unittest
+import unittest.mock
 
 
 MODULE_PATH = Path(__file__).with_name("workflow-gates.py")
@@ -215,13 +216,23 @@ class CISpeedWorkflowTests(unittest.TestCase):
         self.assertEqual(len(caches), 1)
         cache = caches[0]
         self.assertEqual(cache["uses"], "actions/cache/restore@v4")
-        self.assertEqual(cache["with"]["path"], "target/release/aft")
+        self.assertEqual(cache["with"]["path"], "target/ci-storm/aft")
         self.assertIn("${{ github.sha }}", cache["with"]["key"])
         self.assertIn("${{ steps.rust.outputs.cachekey }}", cache["with"]["key"])
         self.assertNotIn("restore-keys", cache["with"])
-        build = next(step for step in producer["steps"] if step.get("name") == "Build shared release AFT")
+        build = next(step for step in producer["steps"] if step.get("name") == "Build shared search-quality AFT")
         self.assertIn("release-binary.outputs.cache-hit", build["if"])
-        self.assertEqual(build["run"], "cargo build --release --locked -p agent-file-tools --bin aft")
+        self.assertEqual(build["run"], "cargo build --profile ci-storm --locked -p agent-file-tools --bin aft")
+        # The gate must read the same profile's binary it downloads, and its
+        # fallback build must produce it, or the benchmark would score a
+        # binary of a different build than the producer measured.
+        gate = workflow["jobs"]["search-quality-gate"]
+        download = next(step for step in gate["steps"] if step.get("id") == "download-release-aft")
+        self.assertEqual(download["with"]["path"], "target/ci-storm")
+        fallback = next(step for step in gate["steps"] if step.get("name") == "Build the product binary when the artifact is absent")
+        self.assertEqual(fallback["run"], build["run"])
+        evaluate = next(step for step in gate["steps"] if step.get("name") == "Evaluate committed search-quality reference")
+        self.assertEqual(evaluate["env"]["AFT_BINARY_PATH"], "${{ github.workspace }}/target/ci-storm/aft")
 
     def test_direct_ci_storm_nextest_run_keeps_all_failures(self) -> None:
         root = Path(__file__).resolve().parents[2]
@@ -544,12 +555,152 @@ class WindowsUnitWorkflowTests(unittest.TestCase):
         gate = next(step for step in shard["steps"] if "./scripts/rust-test-gate.sh" in step.get("run", ""))
         self.assertEqual(gate["env"]["AFT_GATE_PHASES"], "lib-shard")
         self.assertEqual(gate["env"]["AFT_UNIT_TEST_RUNNER"], "nextest")
-        self.assertEqual(gate["env"]["AFT_NEXTEST_PARTITION"], "hash:${{ matrix.shard }}/3")
+        self.assertEqual(gate["env"]["AFT_NEXTEST_PARTITION"], "hash:${{ matrix.shard }}/6")
         self.assertEqual(gate["env"]["AFT_NEXTEST_ARCHIVE_FILE"], "${{ runner.temp }}/windows-nextest.tar.zst")
         self.assertEqual(shard["needs"], "unit-windows-nextest-archive")
 
 
+class UnitShardPartitionCountTests(unittest.TestCase):
+    """Each inventory proof must partition lib/bin tests the way its shards do.
+
+    The shard matrix size, the nextest partition spec and the proof's
+    AFT_UNIT_PARTITION_COUNT are written separately in the workflow. If they
+    disagree, shards may skip tests or the proof may check a split that no
+    shard runs. The shard job's displayed name must also show the matrix size.
+    """
+
+    # (libtest shard job, job whose step runs the inventory proof)
+    LANES = (
+        ("unit-linux-libtest-shard", "unit-linux-nextest-archive"),
+        ("unit-macos-libtest-shard", "unit-macos-inventory-proof"),
+        ("unit-windows-libtest-shard", "unit-windows-nextest-archive"),
+    )
+
+    def setUp(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        self.jobs = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))["jobs"]
+
+    def test_proof_partition_count_matches_each_shard_matrix(self) -> None:
+        for shard_job, proof_job in self.LANES:
+            with self.subTest(shard_job=shard_job):
+                job = self.jobs[shard_job]
+                shards = job["strategy"]["matrix"]["shard"]
+                count = len(shards)
+                self.assertEqual(shards, [str(index) for index in range(1, count + 1)])
+                self.assertEqual(job["strategy"]["max-parallel"], str(count))
+                self.assertTrue(
+                    job["name"].startswith(f"Cargo libtest shard ${{{{ matrix.shard }}}}/{count} ("),
+                    job["name"],
+                )
+                gate = next(step for step in job["steps"] if "./scripts/rust-test-gate.sh" in step.get("run", ""))
+                self.assertEqual(gate["env"]["AFT_NEXTEST_PARTITION"], f"hash:${{{{ matrix.shard }}}}/{count}")
+                proof = next(
+                    step for step in self.jobs[proof_job]["steps"]
+                    if "scripts/rust-test-inventory-proof.py" in step.get("run", "")
+                )
+                self.assertEqual(proof["env"].get("AFT_UNIT_PARTITION_COUNT"), str(count))
+
+    def _proof_partition_functions(self, list_calls: list[list[str]]) -> dict:
+        """Load the proof's partition helpers with cargo replaced by a recorder."""
+        import ast
+
+        tree = ast.parse(PROOF_TEXT)
+        wanted = {"INTEGRATION_PARTITION_COUNT", "unit_partition_count", "partition_nextest_entries"}
+        nodes = [
+            node for node in tree.body
+            if (isinstance(node, ast.FunctionDef) and node.name in wanted)
+            or (isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id in wanted for target in node.targets
+            ))
+        ]
+        self.assertEqual(len(nodes), 3)
+        namespace = {
+            "os": os,
+            "sys": __import__("sys"),
+            "NextestEntry": object,
+            "run_command": lambda command, merge_stderr=True: list_calls.append(command) or "",
+            "parse_nextest_list": lambda output, kinds=None, matching_tests_only=False: [],
+        }
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "rust-test-inventory-proof.py", "exec"), namespace)
+        return namespace
+
+    def test_proof_lists_one_partition_per_configured_shard(self) -> None:
+        for env_value, expected in ((None, 3), ("5", 5), ("6", 6)):
+            with self.subTest(env_value=env_value):
+                calls: list[list[str]] = []
+                proof = self._proof_partition_functions(calls)
+                env = {key: value for key, value in os.environ.items() if key != "AFT_UNIT_PARTITION_COUNT"}
+                if env_value is not None:
+                    env["AFT_UNIT_PARTITION_COUNT"] = env_value
+                with unittest.mock.patch.dict(os.environ, env, clear=True):
+                    count = proof["unit_partition_count"]()
+                self.assertEqual(count, expected)
+                partitions = proof["partition_nextest_entries"](["cargo", "nextest", "list", "--", "--skip", "x"], None, count)
+                self.assertEqual(len(partitions), expected)
+                self.assertEqual(
+                    [call[call.index("--partition") + 1] for call in calls],
+                    [f"hash:{shard}/{expected}" for shard in range(1, expected + 1)],
+                )
+                # The partition flag must stay ahead of the libtest `--` arguments.
+                self.assertTrue(all(call.index("--partition") < call.index("--") for call in calls))
+
+    def test_proof_integration_partitions_match_the_integration_shard_action(self) -> None:
+        calls: list[list[str]] = []
+        proof = self._proof_partition_functions(calls)
+        self.assertEqual(proof["INTEGRATION_PARTITION_COUNT"], 3)
+        proof["partition_nextest_entries"](["cargo", "nextest", "list"])
+        self.assertEqual([call[-1] for call in calls], ["hash:1/3", "hash:2/3", "hash:3/3"])
+
+    def test_proof_rejects_a_non_positive_partition_count(self) -> None:
+        proof = self._proof_partition_functions([])
+        for value in ("0", "-2", "three"):
+            with self.subTest(value=value):
+                with unittest.mock.patch.dict(os.environ, {"AFT_UNIT_PARTITION_COUNT": value}):
+                    with self.assertRaises(SystemExit) as raised:
+                        proof["unit_partition_count"]()
+                self.assertEqual(raised.exception.code, 2)
+
+
 class MacOSUnitWorkflowTests(unittest.TestCase):
+    def test_macos_conformance_job_has_room_for_a_cold_build(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        suite = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))
+        job = suite["jobs"]["unit-macos-conformance"]
+        # A cold-cache build alone has taken 15 minutes on this runner, and
+        # 30-minute runs were cancelled while their tests were still passing.
+        self.assertEqual(job["timeout-minutes"], "45")
+
+    def test_libtest_codegen_is_split_without_rebuilding_dependencies(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        suite = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))
+        job = suite["jobs"]["unit-macos-libtest-archive"]
+        self.assertEqual(
+            job["env"].get("LIBTEST_CARGO_CONFIG"),
+            "profile.test.package.agent-file-tools.codegen-units=256",
+        )
+        self.assertEqual(job["env"]["CARGO_INCREMENTAL"], "0")
+        self.assertNotIn("CARGO_PROFILE_TEST_CODEGEN_UNITS", job["env"])
+        # 45 minutes: the split build still runs 19-28 min, and a slow
+        # macOS runner has reached 30.
+        self.assertEqual(job["timeout-minutes"], "45")
+        cargo_steps = [step["run"] for step in job["steps"] if "run" in step]
+        build_steps = [command for command in cargo_steps if command.startswith("cargo ")]
+        self.assertEqual(len(build_steps), 3)
+        for command in build_steps:
+            self.assertIn('--config "$LIBTEST_CARGO_CONFIG"', command)
+        archive = next(command for command in build_steps if "nextest archive" in command)
+        self.assertIn("--timings", archive)
+        upload = next(step for step in job["steps"] if step.get("with", {}).get("name") == "macos-libtest-archive")
+        paths = upload["with"]["path"].splitlines()
+        self.assertTrue(all(path.startswith("${{ runner.temp }}/") for path in paths))
+        # Timings survive a failure in any step after the archive build.
+        timings = next(step for step in job["steps"] if step.get("with", {}).get("name") == "macos-libtest-timings")
+        self.assertIn("always()", timings["if"])
+        self.assertEqual(timings["with"]["path"], "target/cargo-timings/")
+        steps = job["steps"]
+        archive_index = next(i for i, step in enumerate(steps) if "nextest archive" in step.get("run", ""))
+        self.assertEqual(steps.index(timings), archive_index + 1)
+
     def test_unit_archive_compilation_isolated_and_real_cli_is_retained(self) -> None:
         lib = workflow_job("unit-macos-libtest-archive")
         binary = workflow_job("unit-macos-bin-archive")
@@ -623,10 +774,10 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertIn("unit-macos-bin-archive", libtest)
         self.assertIn("macos-libtest-archive", libtest)
         self.assertIn("macos-bin-archive", libtest)
-        self.assertIn("max-parallel: 3", libtest)
+        self.assertIn("max-parallel: 5", libtest)
         self.assertIn("AFT_NEXTEST_ARCHIVE_BIN_FILE", libtest)
         self.assertIn("AFT_GATE_PHASES: ${{ matrix.shard == 1 && 'lib,lib-shard' || 'lib-shard' }}", libtest)
-        self.assertIn("AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/3", libtest)
+        self.assertIn("AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/5", libtest)
         self.assertIn("AFT_NEXTEST_EXTRACT_TO: ${{ github.workspace }}", libtest)
 
         integration = workflow_job("unit-macos-nextest")
@@ -717,6 +868,24 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertLess(warm, keychain)
         self.assertIn("extract_nextest_archive_for_prewarm", GATE_TEXT[prewarm_start:keychain])
         self.assertIn("AFT_NEXTEST_ARCHIVE_BIN_FILE", GATE_TEXT[prewarm_start:keychain])
+        extract_helper = GATE_TEXT[GATE_TEXT.index("extract_nextest_archive_for_prewarm() {"):prewarm_start]
+        self.assertLess(extract_helper.index('df -h "$extract_to"'), extract_helper.index("cargo nextest list"))
+
+    def test_macos_libtest_downloads_verify_before_extract(self) -> None:
+        suite = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/_unit-suite.yml"))
+        for job in ("unit-macos-libtest-shard", "unit-macos-inventory-proof"):
+            steps = suite["jobs"][job]["steps"]
+            consumer = next(index for index, step in enumerate(steps) if step.get("run") in (
+                "./scripts/rust-test-gate.sh", "python3 scripts/rust-test-inventory-proof.py",
+            ))
+            for artifact, archive in (("macos-libtest-archive", "macos-libtest-nextest.tar.zst"),
+                                      ("macos-bin-archive", "macos-bin-nextest.tar.zst")):
+                download = next(step for step in steps if step.get("with", {}).get("name") == artifact)
+                with self.subTest(job=job, artifact=artifact):
+                    self.assertEqual(download["uses"], DOWNLOAD_RETRY)
+                    self.assertEqual(download["with"].get("verify-zstd"), archive)
+                    self.assertNotIn("continue-on-error", download)
+                    self.assertLess(steps.index(download), consumer)
 
     def test_macos_backtrace_probe_runs_once_in_archive_builder_not_shards(self) -> None:
         probe = "cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists"
@@ -755,8 +924,8 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertIn("AFT_NEXTEST_ARCHIVE_BIN_FILE", inventory)
         self.assertIn('"lib": partition_coverage_errors(lib_entries, [lib_archive_entries])', PROOF_TEXT)
         self.assertIn('"bin": partition_coverage_errors(bin_entries, [bin_archive_entries])', PROOF_TEXT)
-        self.assertIn('lib_partitions = partition_nextest_entries(lib_command, {"lib"})', PROOF_TEXT)
-        self.assertIn('bin_partitions = partition_nextest_entries(bin_command, {"bin"})', PROOF_TEXT)
+        self.assertIn("lib_partitions = partition_nextest_entries(\n        lib_command, {\"lib\"}, unit_partitions_total\n    )", PROOF_TEXT)
+        self.assertIn("bin_partitions = partition_nextest_entries(\n        bin_command, {\"bin\"}, unit_partitions_total\n    )", PROOF_TEXT)
         self.assertIn("any(unexpected_archives.values())", PROOF_TEXT)
         self.assertIn("or any(source_archive_errors)", PROOF_TEXT)
         self.assertIn("any(partition_errors)", PROOF_TEXT)
@@ -971,6 +1140,31 @@ class ArtifactRetryTests(unittest.TestCase):
         ):
             self.assertIn(expected, files)
 
+    def test_download_verification_rejects_a_truncated_zstd_frame(self) -> None:
+        document = workflow_gates.parse_workflow(str(_local_target(DOWNLOAD_RETRY)))
+        steps = document["runs"]["steps"]
+        verifications = [step for step in steps if str(step.get("id", "")).startswith("verify-")]
+        self.assertEqual(len(verifications), 3)
+        self.assertEqual([step.get("continue-on-error") for step in verifications], ["true", "true", None])
+        for index, verify in enumerate(verifications, 1):
+            with self.subTest(attempt=index):
+                self.assertEqual(verify["id"], f"verify-{index}")
+                self.assertIn(f"steps.attempt-{index}.outcome == 'success'", verify["if"])
+                self.assertIn("inputs.verify-zstd != ''", verify["if"])
+                self.assertEqual(verify["env"]["ARCHIVE_PATH"], "${{ inputs.path }}/${{ inputs.verify-zstd }}")
+                self.assertLess(steps.index(next(step for step in steps if step.get("id") == f"attempt-{index}")),
+                                steps.index(verify))
+                with tempfile.TemporaryDirectory() as temp:
+                    archive = Path(temp) / "archive with spaces.tar.zst"
+                    compressed = subprocess.run(["zstd", "-q", "-c"], input=b"nextest test executable" * 1000,
+                                                capture_output=True, check=True).stdout
+                    env = dict(os.environ, ARCHIVE_PATH=str(archive))
+                    for payload, valid in ((compressed, True), (compressed[:-1], False)):
+                        archive.write_bytes(payload)
+                        result = subprocess.run(["bash", "-c", verify["run"]], env=env,
+                                                text=True, capture_output=True, check=False)
+                        self.assertEqual(result.returncode == 0, valid, result.stdout + result.stderr)
+
     def test_required_check_artifact_steps_use_the_retrying_actions(self) -> None:
         wrappers = {str(_local_target(action).relative_to(REPO_ROOT)) for action in RETRY_ACTIONS}
         offenders = []
@@ -1016,22 +1210,28 @@ class ArtifactRetryTests(unittest.TestCase):
                 document = workflow_gates.parse_workflow(str(_local_target(action)))
                 self.assertEqual(document["runs"]["using"], "composite")
                 steps = document["runs"]["steps"]
-                kinds = ["attempt" if step.get("uses") == inner else step.get("run") for step in steps]
+                transfer_steps = [step for step in steps if not str(step.get("id", "")).startswith("verify-")]
+                kinds = ["attempt" if step.get("uses") == inner else step.get("run") for step in transfer_steps]
                 self.assertEqual(kinds, ["attempt", "sleep 60", "attempt", "sleep 120", "attempt"])
                 attempts = [step for step in steps if step.get("uses") == inner]
                 self.assertEqual([step["id"] for step in attempts], ["attempt-1", "attempt-2", "attempt-3"])
                 self.assertEqual(attempts[0]["if"], "${{ !cancelled() }}")
                 for index in (1, 2):
-                    retry_if = f"${{{{ !cancelled() && steps.attempt-{index}.outcome == 'failure' }}}}"
+                    failure = f"steps.attempt-{index}.outcome == 'failure'"
+                    if action == DOWNLOAD_RETRY:
+                        failure = f"({failure} || steps.verify-{index}.outcome == 'failure')"
+                    retry_if = f"${{{{ !cancelled() && {failure} }}}}"
                     self.assertEqual(attempts[index]["if"], retry_if)
-                    self.assertEqual(steps[2 * index - 1]["if"], retry_if)
-                    self.assertEqual(steps[2 * index - 1]["shell"], "bash")
+                    self.assertEqual(transfer_steps[2 * index - 1]["if"], retry_if)
+                    self.assertEqual(transfer_steps[2 * index - 1]["shell"], "bash")
                 # Only the last attempt may fail the action: that is what keeps
                 # a missing artifact failing the job.
                 self.assertEqual([step.get("continue-on-error") for step in attempts], ["true", "true", None])
                 inputs = document["inputs"]
                 for step in attempts:
                     for name in inputs:
+                        if name == "verify-zstd":
+                            continue
                         self.assertEqual(step["with"][name], f"${{{{ inputs.{name} }}}}")
                 if action == UPLOAD_RETRY:
                     self.assertEqual(inputs["if-no-files-found"]["default"], "warn")

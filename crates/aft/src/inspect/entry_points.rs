@@ -154,6 +154,9 @@ fn collect_manifests(project_root: &Path, manifests: &mut ManifestPaths) {
 }
 
 fn entry_point_walk_files(project_root: &Path) -> Vec<PathBuf> {
+    // Skip nested linked worktrees of this repository; the walk root itself
+    // is always admitted (depth 0).
+    let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(project_root);
     let mut builder = ignore::WalkBuilder::new(project_root);
     // Prevent a disappearing child mount from making ReadDir::drop abort on ENXIO.
     builder
@@ -164,7 +167,12 @@ fn entry_point_walk_files(project_root: &Path) -> Vec<PathBuf> {
         .git_exclude(true)
         .require_git(false)
         .add_custom_ignore_filename(".aftignore")
-        .filter_entry(|entry| {
+        .filter_entry(move |entry| {
+            // Manifests inside a nested linked worktree of this repository
+            // belong to that checkout's own scope, not this one.
+            if crate::search_index::is_nested_worktree_entry(entry, &worktrees) {
+                return false;
+            }
             !entry
                 .file_type()
                 .is_some_and(|file_type| file_type.is_dir())
@@ -581,6 +589,9 @@ fn collect_framework_route_files(
 
 fn framework_route_walk_files(package_dir: &Path) -> Vec<PathBuf> {
     let package_dir = snapshot_path(package_dir);
+    // Skip nested linked worktrees of this repository; the walk root itself
+    // is always admitted (depth 0).
+    let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(&package_dir);
     // A vanished framework mount could otherwise make ReadDir::drop abort on ENXIO.
     let mut builder = ignore::WalkBuilder::new(&package_dir);
     let package_root = package_dir.clone();
@@ -593,6 +604,9 @@ fn framework_route_walk_files(package_dir: &Path) -> Vec<PathBuf> {
         .require_git(false)
         .add_custom_ignore_filename(".aftignore")
         .filter_entry(move |entry| {
+            if crate::search_index::is_nested_worktree_entry(entry, &worktrees) {
+                return false;
+            }
             if !entry
                 .file_type()
                 .is_some_and(|file_type| file_type.is_dir())
@@ -1128,6 +1142,29 @@ pub(crate) fn top_preview_symbols(items: &[Value]) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entry_point_manifests_skip_nested_linked_worktrees() {
+        // package.json files inside a nested linked worktree belong to that
+        // checkout's own scope, not this one's.
+        let dir = tempfile::tempdir().unwrap();
+        let fixture =
+            crate::git_probe::init_repo_with_nested_worktree_for_test(dir.path(), "entry_points");
+        for manifest_dir in [&fixture.root, &fixture.worktree] {
+            std::fs::write(manifest_dir.join("package.json"), r#"{"name": "fixture"}"#).unwrap();
+        }
+        let manifests = collect_entry_point_manifests(&fixture.root);
+        assert!(
+            manifests.contains(&snapshot_path(&fixture.root.join("package.json"))),
+            "missing main manifest: {manifests:?}"
+        );
+        assert!(
+            !manifests
+                .iter()
+                .any(|path| path.starts_with(snapshot_path(&fixture.worktree))),
+            "nested linked worktree manifests were collected: {manifests:?}"
+        );
+    }
 
     fn published_api_fixture(wildcard: bool, index: &str, default_live: bool) {
         use crate::inspect::oxc_engine::{

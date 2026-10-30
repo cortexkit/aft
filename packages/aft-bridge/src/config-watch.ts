@@ -37,12 +37,14 @@ export interface LiveConfigKey<C> {
 
 /** The bash settings this module needs from a host's `resolveBashConfig`. */
 export interface ResolvedBashForLiveReload {
+  changed_files?: "off" | "list" | "diff";
   foreground_wait_window_ms: number;
   host_fallback: boolean;
   runon_enabled?: boolean;
   subagent_background: boolean;
   watch_sync_max_ms: number;
   worker_wait_max_ms: number;
+  memory_limit_mib?: number;
   env: Record<string, string>;
 }
 
@@ -133,7 +135,9 @@ export function aftLiveConfigKeys<C>(
     bashKey<C>("subagent_background", resolveBash),
     bashKey<C>("watch_sync_max_ms", resolveBash),
     bashKey<C>("worker_wait_max_ms", resolveBash),
+    bashKey<C>("memory_limit_mib", resolveBash),
     bashKey<C>("env", resolveBash),
+    bashKey<C>("changed_files", resolveBash),
   ];
 }
 

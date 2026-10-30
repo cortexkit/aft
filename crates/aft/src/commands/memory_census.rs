@@ -14,7 +14,13 @@ pub fn evictable_in_ms(bound_routes: usize, idle_ttl_ms: u64, age_ms: u64) -> Op
 /// Render a complete, uncapped census with a fresh allocator observation.
 pub fn handle_memory_census(req: &RawRequest, ctx: &AppContext) -> Response {
     let snapshot = ctx.memory_snapshot_uncapped();
-    Response::success(&req.id, render_memory_census(&snapshot, None))
+    let mut census = render_memory_census(&snapshot, None);
+    census["cache_dir"] = serde_json::json!(ctx.cache_dir());
+    census["cache_unavailable_reason"] = serde_json::json!(ctx
+        .cache_unavailable_reason()
+        .map(|reason| crate::root_cache::unavailable_code(&reason)));
+    census["storage_dir"] = serde_json::json!(ctx.storage_dir());
+    Response::success(&req.id, census)
 }
 
 pub fn render_memory_census(

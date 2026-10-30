@@ -1,0 +1,2394 @@
+{
+  "source_commit": "a209fc15f4ac5866ad3afe5ea111d7ca44ae74e9",
+  "source_description": "origin/main at task start, before the catalog flip; only test-only status/response-id input hooks overlaid",
+  "renderer_git_blobs": {
+    "subc/wire.rs": "323dd1bb64dc9d48fbd5e01bbe04d969ff68d35c",
+    "subc_format.rs": "64d5b4b4b7c7d7d86917c8de320d4944bd702df0",
+    "run_tool_call.rs": "ce5eb9f1c762183455f3c640ae6338ac82f3343f"
+  },
+  "binary_sha256": "d4481e723c9ecd4b3844c583fa61a892b2b1e65b62f55d65e1bb74198d5a424a",
+  "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "profile": "debug, test-conformance-result-inputs",
+  "normalization": "only the disposable project root is replaced with {PROJECT}; status snapshot and response id are fixed producer inputs",
+  "fixture_project_sha256": "76855e7de25ca208e6d1a449ff591bf5898ec8822021c651aea67fad50e0f58f",
+  "status_snapshot": {
+    "backup_skipped_too_large_total": 0,
+    "backup_skipped_temp_path_total": 0,
+    "version": "0.62.0",
+    "project_root": "/conformance",
+    "canonical_root": "/conformance",
+    "cache_role": "main",
+    "artifact_owner": null,
+    "degraded": false,
+    "degraded_reasons": [],
+    "features": {
+      "format_on_edit": false,
+      "validate_on_edit": "off",
+      "restrict_to_project_root": false,
+      "search_index": false,
+      "semantic_search": false,
+      "callgraph_store": false,
+      "backup": true
+    },
+    "search_index": {
+      "status": "disabled"
+    },
+    "semantic_index": {
+      "status": "disabled",
+      "state": "disabled",
+      "refreshing_count": 0,
+      "backend": "fastembed",
+      "model": "all-MiniLM-L6-v2"
+    },
+    "callgraph_refresh": null,
+    "status_bar": null,
+    "status_bar_values": {
+      "errors": null,
+      "warnings": null,
+      "diagnostics": "no_language_server",
+      "diagnostics_gaps": [],
+      "dead_code": null,
+      "unused_exports": null,
+      "duplicates": null,
+      "todos": null,
+      "tier2_stale": false
+    },
+    "disk": {
+      "storage_dir": "/conformance",
+      "cache_dir": "/conformance",
+      "project_cache_key": null,
+      "trigram_disk_bytes": 0,
+      "semantic_disk_bytes": 0
+    },
+    "lsp_servers": 0,
+    "symbol_cache": {
+      "local_entries": 0,
+      "warm_entries": 0
+    },
+    "watcher": {
+      "exclusion_planning": null,
+      "fsevents_stream_creations_total": 0,
+      "raw_events_total": 0,
+      "raw_events_since_last_rescan": 0,
+      "invalidating_events_total": 0,
+      "invalidating_events_since_last_rescan": 0,
+      "paths_after_gitignore_total": 0,
+      "paths_after_gitignore_since_last_rescan": 0,
+      "paths_dispatched_total": 0,
+      "paths_dispatched_since_last_rescan": 0,
+      "overflows_total": 0,
+      "watch_lost_races_total": 0,
+      "overflows_during_rescan": 0,
+      "last_overflow_prefixes": [],
+      "rescans_buffer_overflow_total": 0,
+      "rescans_kernel_dropped_total": 0,
+      "rescans_user_dropped_total": 0,
+      "rescans_unknown_total": 0,
+      "last_rescan_at_ms": null,
+      "last_rescan_cost_ms": null,
+      "last_rescan_rss_delta_bytes": null
+    },
+    "runtime": {
+      "live_watchers": 0,
+      "live_actor_roots": 1,
+      "open_routes": 1,
+      "callgraph_commits_60s_total": 0,
+      "callgraph_pages_or_bytes_written_60s_total": 0,
+      "bash_spawn": {
+        "backend": "posix_spawn",
+        "missing_capability": null,
+        "fallback_spawns": 0,
+        "pty_backend": "fork"
+      }
+    },
+    "compression": {
+      "project": {
+        "events": 0,
+        "original_tokens": 0,
+        "compressed_tokens": 0,
+        "savings_tokens": 0
+      },
+      "session": {
+        "events": 0,
+        "original_tokens": 0,
+        "compressed_tokens": 0,
+        "savings_tokens": 0
+      }
+    },
+    "storage_dir": "/conformance",
+    "cache_dir": "/conformance",
+    "cache_unavailable_reason": null,
+    "checkpoints_total": 0,
+    "session": {
+      "id": "conformance-session",
+      "tracked_files": 0,
+      "checkpoints": 0
+    },
+    "memory": {
+      "roots_status": "ready",
+      "roots": {
+        "/motor-home/tmp/.tmpQgOXCR/project": {
+          "status": "ready",
+          "attributed_bytes": 0,
+          "semantic": {
+            "status": "ready",
+            "bytes_status": "estimated",
+            "estimated_bytes": 0,
+            "checkout_overlay_bytes": 0,
+            "entries": 0,
+            "serving_index_bytes": 0,
+            "worker_index_bytes": 0
+          },
+          "trigram": {
+            "status": "ready",
+            "bytes_status": "estimated",
+            "estimated_bytes": 0,
+            "files": 0
+          },
+          "symbols": {
+            "status": "ready",
+            "bytes_status": "estimated",
+            "estimated_bytes": 0,
+            "entries": 0,
+            "symbols": 0
+          },
+          "callgraph": {
+            "status": "ready",
+            "bytes_status": "estimated",
+            "estimated_bytes": 0,
+            "open_generation_handles": 0
+          },
+          "callgraph_projection": {
+            "status": "ready",
+            "bytes_status": "estimated",
+            "estimated_bytes": 0,
+            "callgraph_projection_snapshot_bytes": 0,
+            "callgraph_projection_snapshots": 0
+          },
+          "inspect": {
+            "status": "ready",
+            "bytes_status": "partial",
+            "estimated_bytes": 0,
+            "not_estimated": [
+              "oxc_fact_bytes"
+            ],
+            "memory_aggregates": 0,
+            "open_generation_handles": 0,
+            "oxc_fact_entries": 0
+          },
+          "bash": {
+            "status": "ready",
+            "bytes_status": "estimated",
+            "estimated_bytes": 0,
+            "completion_caches": 0,
+            "output_ring_bytes": 0,
+            "sessions": 0,
+            "tasks": 0,
+            "terminal_output_caches": 0
+          },
+          "lsp": {
+            "status": "ready",
+            "bytes_status": "estimated",
+            "estimated_bytes": 0,
+            "diagnostic_entries": 0,
+            "diagnostics": 0,
+            "document_stores": 0,
+            "documents": 0,
+            "servers": 0
+          },
+          "parser_pool": {
+            "status": "ready",
+            "bytes_status": "not_estimated",
+            "estimated_bytes": null,
+            "not_estimated": [
+              "tree_sitter_parser_bytes"
+            ],
+            "pooled_parsers": 0
+          },
+          "pending_install": {
+            "status": "ready",
+            "bytes_status": "estimated",
+            "estimated_bytes": 0,
+            "search_bytes": 0,
+            "search_loads": 0,
+            "semantic_bytes": 0,
+            "semantic_loads": 0
+          }
+        }
+      },
+      "roots_total": 1,
+      "roots_omitted": 0,
+      "roots_omitted_bytes": 0,
+      "shared_semantic_bases": {
+        "status": "ready",
+        "bytes_status": "estimated",
+        "estimated_bytes": 0,
+        "bases": 0,
+        "entries": 0,
+        "frozen_owner_bases": 0,
+        "hits": 0,
+        "loads": 0,
+        "metadata_bytes": 0,
+        "text_bytes": 0,
+        "vector_bytes": 0
+      },
+      "semantic_arenas": {
+        "bytes": 0,
+        "resident_chunks": 0,
+        "families": []
+      },
+      "process": {
+        "rss_status": "estimated",
+        "rss_bytes": 120868864,
+        "sqlite": {
+          "status": "measured",
+          "memory_used_bytes": 467216,
+          "memory_highwater_bytes": 564672
+        },
+        "allocator": {
+          "status": "measured",
+          "bytes_in_use": 1230880,
+          "size_allocated": 3129344,
+          "retained_slack_bytes": 1898464,
+          "retained_slack_label": "address-space slack: allocator-mapped bytes minus in-use bytes; includes free pages already returned to the OS, so it is not resident memory"
+        },
+        "allocator_slack_measured": true,
+        "allocator_observation_age_ms": 330,
+        "total_attributed_bytes": 467216,
+        "semantic_arena_bytes": 0,
+        "embedding_sessions": 0,
+        "embedding_model_bytes": 0,
+        "semantic_resident_chunks": 0,
+        "unattributed_bytes": 120401648,
+        "root_count": 1,
+        "busy_subsystems": 0,
+        "not_estimated_subsystems": 1
+      }
+    },
+    "lsp": {
+      "children_total": 0,
+      "children_by_root": [],
+      "children_roots_total": 0,
+      "children_roots_omitted": 0,
+      "children_omitted_total": 0,
+      "children_omitted_rss_bytes": 0,
+      "children_without_client": 0,
+      "children_with_deleted_cwd": 0,
+      "applicability_by_root": {}
+    },
+    "threads": {
+      "total": 16,
+      "classified": true,
+      "by_class": {
+        "aft-callgraph": 0,
+        "aft-fs-lock-heartbeat": 0,
+        "aft-health-rollup": 1,
+        "aft-inspect": 2,
+        "aft-lsp": 0,
+        "aft-mem": 0,
+        "notify-rs fsevents loop": 0,
+        "reqwest-internal-sync-runtime": 0,
+        "tokio-rt-worker": 0,
+        "unnamed": 13
+      },
+      "classified_age_ms": 0
+    },
+    "sqlite": {
+      "open_connections": 0,
+      "open_by_store": [
+        {
+          "store": "aft.db",
+          "count": 0
+        },
+        {
+          "store": "blob_stores",
+          "count": 0
+        },
+        {
+          "store": "callgraph_generations",
+          "count": 0
+        },
+        {
+          "store": "callgraph_cold_generations",
+          "count": 0
+        },
+        {
+          "store": "inspect_scope_caches",
+          "count": 0
+        },
+        {
+          "store": "breaker_files",
+          "count": 0
+        }
+      ],
+      "uninstrumented_openers": [
+        "alias::AliasStore::open: the raw WAL writer uses SQLite's built-in autocheckpoint and installs no attribution hook (unmeasurable)",
+        "alias::ManifestSqliteStore::open: the raw rollback-journal connection exposes no pager byte counter (unmeasurable)",
+        "gc::sweep_plane: the raw blob-store WAL writer uses SQLite's built-in autocheckpoint and installs no attribution hook (unmeasurable)",
+        "views::assembly::assemble: the connection only keeps the derived WAL alive and reads sqlite_schema; checkpointing is classified at checkpoint_derived (no_writes)",
+        "views::generation::clone_derived source: the SQLite backup source is read-only at this seam (no_writes)",
+        "views::generation::clone_derived destination: the enclosing publication clone phase credits its process-I/O delta to views_derived (attributed_elsewhere)",
+        "views::generation::clone_quiescent source: its only write is a TRUNCATE checkpoint of the donor's WAL; the enclosing publication clone phase credits its process-I/O delta to views_derived (attributed_elsewhere)",
+        "views::assembly::derived_index: index lookups run inside the publication's clone phase; the row write runs after commit and is measured as the publication's derived_index interval; both are credited to views_derived (attributed_elsewhere)",
+        "views::generation::checkpoint_derived: a successful TRUNCATE checkpoint returns zero frame counts and the raw connection has no earlier WAL-hook baseline (unmeasurable)",
+        "views::materialization::materialize: the enclosing publication materialize phase credits its process-I/O delta to views_derived (attributed_elsewhere)",
+        "views::materialization::blob_reader: the materializer uses this connection only to read immutable blob payloads (no_writes)",
+        "views::ViewStore::open_pointer_connection: the enclosing publication closure phase credits the pointer transaction's process-I/O delta to views_closure (attributed_elsewhere)",
+        "views::sync_database_with_passive_checkpoint: the enclosing publication closure phase credits the durability checkpoint's process-I/O delta to views_closure (attributed_elsewhere)",
+        "views::checkpoint_and_sync_database: the enclosing publication closure phase credits the durability checkpoint's process-I/O delta to views_closure (attributed_elsewhere)",
+        "views::checkpoint_pointer_after_cas: the publication profile remains in its closure phase until the pointer checkpoint completes (attributed_elsewhere)",
+        "path_status::PathStatusStore::open_at: the raw rollback-journal connection exposes no pager byte counter (unmeasurable)"
+      ]
+    },
+    "children": {
+      "detached_total": 0
+    },
+    "fds": {
+      "open": 18,
+      "soft_limit": 1024
+    },
+    "storage_refusals": [],
+    "storage_retention": null,
+    "git": {
+      "available": true
+    }
+  },
+  "presets": {
+    "head": [
+      {
+        "tool": "status",
+        "arguments": {},
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "AFT 0.62.0 — /conformance\nindexes: search disabled | semantic disabled [all-MiniLM-L6-v2] | callgraph disabled\nfeatures: format_on_edit off, validate_on_edit off, restrict_to_project_root off, search_index off, semantic_search off, callgraph_store off, backup on\nstorage: /conformance (trigram 0 B, semantic 0 B)\nsession: 0 tracked file(s), 0 checkpoint(s) | lsp servers: 0\n\nMemory: RSS 115.3 MiB | attributed 456.3 KiB | unattributed 114.8 MiB\n  /motor-home/tmp/.tmpQgOXCR/project: 0 B (semantic 0 B, trigram 0 B, symbols 0 B, callgraph 0 B, inspect 0 B, bash 0 B, lsp 0 B, parsers not estimated)"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": true,
+            "backup_skipped_too_large_total": 0,
+            "backup_skipped_temp_path_total": 0,
+            "version": "0.62.0",
+            "project_root": "/conformance",
+            "canonical_root": "/conformance",
+            "cache_role": "main",
+            "artifact_owner": null,
+            "degraded": false,
+            "degraded_reasons": [],
+            "features": {
+              "format_on_edit": false,
+              "validate_on_edit": "off",
+              "restrict_to_project_root": false,
+              "search_index": false,
+              "semantic_search": false,
+              "callgraph_store": false,
+              "backup": true
+            },
+            "search_index": {
+              "status": "disabled"
+            },
+            "semantic_index": {
+              "status": "disabled",
+              "state": "disabled",
+              "refreshing_count": 0,
+              "backend": "fastembed",
+              "model": "all-MiniLM-L6-v2"
+            },
+            "callgraph_refresh": null,
+            "status_bar": null,
+            "status_bar_values": {
+              "errors": null,
+              "warnings": null,
+              "diagnostics": "no_language_server",
+              "diagnostics_gaps": [],
+              "dead_code": null,
+              "unused_exports": null,
+              "duplicates": null,
+              "todos": null,
+              "tier2_stale": false
+            },
+            "disk": {
+              "storage_dir": "/conformance",
+              "cache_dir": "/conformance",
+              "project_cache_key": null,
+              "trigram_disk_bytes": 0,
+              "semantic_disk_bytes": 0
+            },
+            "lsp_servers": 0,
+            "symbol_cache": {
+              "local_entries": 0,
+              "warm_entries": 0
+            },
+            "watcher": {
+              "exclusion_planning": null,
+              "fsevents_stream_creations_total": 0,
+              "raw_events_total": 0,
+              "raw_events_since_last_rescan": 0,
+              "invalidating_events_total": 0,
+              "invalidating_events_since_last_rescan": 0,
+              "paths_after_gitignore_total": 0,
+              "paths_after_gitignore_since_last_rescan": 0,
+              "paths_dispatched_total": 0,
+              "paths_dispatched_since_last_rescan": 0,
+              "overflows_total": 0,
+              "watch_lost_races_total": 0,
+              "overflows_during_rescan": 0,
+              "last_overflow_prefixes": [],
+              "rescans_buffer_overflow_total": 0,
+              "rescans_kernel_dropped_total": 0,
+              "rescans_user_dropped_total": 0,
+              "rescans_unknown_total": 0,
+              "last_rescan_at_ms": null,
+              "last_rescan_cost_ms": null,
+              "last_rescan_rss_delta_bytes": null
+            },
+            "runtime": {
+              "live_watchers": 0,
+              "live_actor_roots": 1,
+              "open_routes": 1,
+              "callgraph_commits_60s_total": 0,
+              "callgraph_pages_or_bytes_written_60s_total": 0,
+              "bash_spawn": {
+                "backend": "posix_spawn",
+                "missing_capability": null,
+                "fallback_spawns": 0,
+                "pty_backend": "fork"
+              }
+            },
+            "compression": {
+              "project": {
+                "events": 0,
+                "original_tokens": 0,
+                "compressed_tokens": 0,
+                "savings_tokens": 0
+              },
+              "session": {
+                "events": 0,
+                "original_tokens": 0,
+                "compressed_tokens": 0,
+                "savings_tokens": 0
+              }
+            },
+            "storage_dir": "/conformance",
+            "cache_dir": "/conformance",
+            "cache_unavailable_reason": null,
+            "checkpoints_total": 0,
+            "session": {
+              "id": "conformance-session",
+              "tracked_files": 0,
+              "checkpoints": 0
+            },
+            "memory": {
+              "roots_status": "ready",
+              "roots": {
+                "/motor-home/tmp/.tmpQgOXCR/project": {
+                  "status": "ready",
+                  "attributed_bytes": 0,
+                  "semantic": {
+                    "status": "ready",
+                    "bytes_status": "estimated",
+                    "estimated_bytes": 0,
+                    "checkout_overlay_bytes": 0,
+                    "entries": 0,
+                    "serving_index_bytes": 0,
+                    "worker_index_bytes": 0
+                  },
+                  "trigram": {
+                    "status": "ready",
+                    "bytes_status": "estimated",
+                    "estimated_bytes": 0,
+                    "files": 0
+                  },
+                  "symbols": {
+                    "status": "ready",
+                    "bytes_status": "estimated",
+                    "estimated_bytes": 0,
+                    "entries": 0,
+                    "symbols": 0
+                  },
+                  "callgraph": {
+                    "status": "ready",
+                    "bytes_status": "estimated",
+                    "estimated_bytes": 0,
+                    "open_generation_handles": 0
+                  },
+                  "callgraph_projection": {
+                    "status": "ready",
+                    "bytes_status": "estimated",
+                    "estimated_bytes": 0,
+                    "callgraph_projection_snapshot_bytes": 0,
+                    "callgraph_projection_snapshots": 0
+                  },
+                  "inspect": {
+                    "status": "ready",
+                    "bytes_status": "partial",
+                    "estimated_bytes": 0,
+                    "not_estimated": [
+                      "oxc_fact_bytes"
+                    ],
+                    "memory_aggregates": 0,
+                    "open_generation_handles": 0,
+                    "oxc_fact_entries": 0
+                  },
+                  "bash": {
+                    "status": "ready",
+                    "bytes_status": "estimated",
+                    "estimated_bytes": 0,
+                    "completion_caches": 0,
+                    "output_ring_bytes": 0,
+                    "sessions": 0,
+                    "tasks": 0,
+                    "terminal_output_caches": 0
+                  },
+                  "lsp": {
+                    "status": "ready",
+                    "bytes_status": "estimated",
+                    "estimated_bytes": 0,
+                    "diagnostic_entries": 0,
+                    "diagnostics": 0,
+                    "document_stores": 0,
+                    "documents": 0,
+                    "servers": 0
+                  },
+                  "parser_pool": {
+                    "status": "ready",
+                    "bytes_status": "not_estimated",
+                    "estimated_bytes": null,
+                    "not_estimated": [
+                      "tree_sitter_parser_bytes"
+                    ],
+                    "pooled_parsers": 0
+                  },
+                  "pending_install": {
+                    "status": "ready",
+                    "bytes_status": "estimated",
+                    "estimated_bytes": 0,
+                    "search_bytes": 0,
+                    "search_loads": 0,
+                    "semantic_bytes": 0,
+                    "semantic_loads": 0
+                  }
+                }
+              },
+              "roots_total": 1,
+              "roots_omitted": 0,
+              "roots_omitted_bytes": 0,
+              "shared_semantic_bases": {
+                "status": "ready",
+                "bytes_status": "estimated",
+                "estimated_bytes": 0,
+                "bases": 0,
+                "entries": 0,
+                "frozen_owner_bases": 0,
+                "hits": 0,
+                "loads": 0,
+                "metadata_bytes": 0,
+                "text_bytes": 0,
+                "vector_bytes": 0
+              },
+              "semantic_arenas": {
+                "bytes": 0,
+                "resident_chunks": 0,
+                "families": []
+              },
+              "process": {
+                "rss_status": "estimated",
+                "rss_bytes": 120868864,
+                "sqlite": {
+                  "status": "measured",
+                  "memory_used_bytes": 467216,
+                  "memory_highwater_bytes": 564672
+                },
+                "allocator": {
+                  "status": "measured",
+                  "bytes_in_use": 1230880,
+                  "size_allocated": 3129344,
+                  "retained_slack_bytes": 1898464,
+                  "retained_slack_label": "address-space slack: allocator-mapped bytes minus in-use bytes; includes free pages already returned to the OS, so it is not resident memory"
+                },
+                "allocator_slack_measured": true,
+                "allocator_observation_age_ms": 330,
+                "total_attributed_bytes": 467216,
+                "semantic_arena_bytes": 0,
+                "embedding_sessions": 0,
+                "embedding_model_bytes": 0,
+                "semantic_resident_chunks": 0,
+                "unattributed_bytes": 120401648,
+                "root_count": 1,
+                "busy_subsystems": 0,
+                "not_estimated_subsystems": 1
+              }
+            },
+            "lsp": {
+              "children_total": 0,
+              "children_by_root": [],
+              "children_roots_total": 0,
+              "children_roots_omitted": 0,
+              "children_omitted_total": 0,
+              "children_omitted_rss_bytes": 0,
+              "children_without_client": 0,
+              "children_with_deleted_cwd": 0,
+              "applicability_by_root": {}
+            },
+            "threads": {
+              "total": 16,
+              "classified": true,
+              "by_class": {
+                "aft-callgraph": 0,
+                "aft-fs-lock-heartbeat": 0,
+                "aft-health-rollup": 1,
+                "aft-inspect": 2,
+                "aft-lsp": 0,
+                "aft-mem": 0,
+                "notify-rs fsevents loop": 0,
+                "reqwest-internal-sync-runtime": 0,
+                "tokio-rt-worker": 0,
+                "unnamed": 13
+              },
+              "classified_age_ms": 0
+            },
+            "sqlite": {
+              "open_connections": 0,
+              "open_by_store": [
+                {
+                  "store": "aft.db",
+                  "count": 0
+                },
+                {
+                  "store": "blob_stores",
+                  "count": 0
+                },
+                {
+                  "store": "callgraph_generations",
+                  "count": 0
+                },
+                {
+                  "store": "callgraph_cold_generations",
+                  "count": 0
+                },
+                {
+                  "store": "inspect_scope_caches",
+                  "count": 0
+                },
+                {
+                  "store": "breaker_files",
+                  "count": 0
+                }
+              ],
+              "uninstrumented_openers": [
+                "alias::AliasStore::open: the raw WAL writer uses SQLite's built-in autocheckpoint and installs no attribution hook (unmeasurable)",
+                "alias::ManifestSqliteStore::open: the raw rollback-journal connection exposes no pager byte counter (unmeasurable)",
+                "gc::sweep_plane: the raw blob-store WAL writer uses SQLite's built-in autocheckpoint and installs no attribution hook (unmeasurable)",
+                "views::assembly::assemble: the connection only keeps the derived WAL alive and reads sqlite_schema; checkpointing is classified at checkpoint_derived (no_writes)",
+                "views::generation::clone_derived source: the SQLite backup source is read-only at this seam (no_writes)",
+                "views::generation::clone_derived destination: the enclosing publication clone phase credits its process-I/O delta to views_derived (attributed_elsewhere)",
+                "views::generation::clone_quiescent source: its only write is a TRUNCATE checkpoint of the donor's WAL; the enclosing publication clone phase credits its process-I/O delta to views_derived (attributed_elsewhere)",
+                "views::assembly::derived_index: index lookups run inside the publication's clone phase; the row write runs after commit and is measured as the publication's derived_index interval; both are credited to views_derived (attributed_elsewhere)",
+                "views::generation::checkpoint_derived: a successful TRUNCATE checkpoint returns zero frame counts and the raw connection has no earlier WAL-hook baseline (unmeasurable)",
+                "views::materialization::materialize: the enclosing publication materialize phase credits its process-I/O delta to views_derived (attributed_elsewhere)",
+                "views::materialization::blob_reader: the materializer uses this connection only to read immutable blob payloads (no_writes)",
+                "views::ViewStore::open_pointer_connection: the enclosing publication closure phase credits the pointer transaction's process-I/O delta to views_closure (attributed_elsewhere)",
+                "views::sync_database_with_passive_checkpoint: the enclosing publication closure phase credits the durability checkpoint's process-I/O delta to views_closure (attributed_elsewhere)",
+                "views::checkpoint_and_sync_database: the enclosing publication closure phase credits the durability checkpoint's process-I/O delta to views_closure (attributed_elsewhere)",
+                "views::checkpoint_pointer_after_cas: the publication profile remains in its closure phase until the pointer checkpoint completes (attributed_elsewhere)",
+                "path_status::PathStatusStore::open_at: the raw rollback-journal connection exposes no pager byte counter (unmeasurable)"
+              ]
+            },
+            "children": {
+              "detached_total": 0
+            },
+            "fds": {
+              "open": 18,
+              "soft_limit": 1024
+            },
+            "storage_refusals": [],
+            "storage_retention": null,
+            "git": {
+              "available": true
+            },
+            "text": "AFT 0.62.0 — /conformance\nindexes: search disabled | semantic disabled [all-MiniLM-L6-v2] | callgraph disabled\nfeatures: format_on_edit off, validate_on_edit off, restrict_to_project_root off, search_index off, semantic_search off, callgraph_store off, backup on\nstorage: /conformance (trigram 0 B, semantic 0 B)\nsession: 0 tracked file(s), 0 checkpoint(s) | lsp servers: 0\n\nMemory: RSS 115.3 MiB | attributed 456.3 KiB | unattributed 114.8 MiB\n  /motor-home/tmp/.tmpQgOXCR/project: 0 B (semantic 0 B, trigram 0 B, symbols 0 B, callgraph 0 B, inspect 0 B, bash 0 B, lsp 0 B, parsers not estimated)"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"AFT 0.62.0 — /conformance\\nindexes: search disabled | semantic disabled [all-MiniLM-L6-v2] | callgraph disabled\\nfeatures: format_on_edit off, validate_on_edit off, restrict_to_project_root off, search_index off, semantic_search off, callgraph_store off, backup on\\nstorage: /conformance (trigram 0 B, semantic 0 B)\\nsession: 0 tracked file(s), 0 checkpoint(s) | lsp servers: 0\\n\\nMemory: RSS 115.3 MiB | attributed 456.3 KiB | unattributed 114.8 MiB\\n  /motor-home/tmp/.tmpQgOXCR/project: 0 B (semantic 0 B, trigram 0 B, symbols 0 B, callgraph 0 B, inspect 0 B, bash 0 B, lsp 0 B, parsers not estimated)\"}],\"isError\":false,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":true,\"backup_skipped_too_large_total\":0,\"backup_skipped_temp_path_total\":0,\"version\":\"0.62.0\",\"project_root\":\"/conformance\",\"canonical_root\":\"/conformance\",\"cache_role\":\"main\",\"artifact_owner\":null,\"degraded\":false,\"degraded_reasons\":[],\"features\":{\"format_on_edit\":false,\"validate_on_edit\":\"off\",\"restrict_to_project_root\":false,\"search_index\":false,\"semantic_search\":false,\"callgraph_store\":false,\"backup\":true},\"search_index\":{\"status\":\"disabled\"},\"semantic_index\":{\"status\":\"disabled\",\"state\":\"disabled\",\"refreshing_count\":0,\"backend\":\"fastembed\",\"model\":\"all-MiniLM-L6-v2\"},\"callgraph_refresh\":null,\"status_bar\":null,\"status_bar_values\":{\"errors\":null,\"warnings\":null,\"diagnostics\":\"no_language_server\",\"diagnostics_gaps\":[],\"dead_code\":null,\"unused_exports\":null,\"duplicates\":null,\"todos\":null,\"tier2_stale\":false},\"disk\":{\"storage_dir\":\"/conformance\",\"cache_dir\":\"/conformance\",\"project_cache_key\":null,\"trigram_disk_bytes\":0,\"semantic_disk_bytes\":0},\"lsp_servers\":0,\"symbol_cache\":{\"local_entries\":0,\"warm_entries\":0},\"watcher\":{\"exclusion_planning\":null,\"fsevents_stream_creations_total\":0,\"raw_events_total\":0,\"raw_events_since_last_rescan\":0,\"invalidating_events_total\":0,\"invalidating_events_since_last_rescan\":0,\"paths_after_gitignore_total\":0,\"paths_after_gitignore_since_last_rescan\":0,\"paths_dispatched_total\":0,\"paths_dispatched_since_last_rescan\":0,\"overflows_total\":0,\"watch_lost_races_total\":0,\"overflows_during_rescan\":0,\"last_overflow_prefixes\":[],\"rescans_buffer_overflow_total\":0,\"rescans_kernel_dropped_total\":0,\"rescans_user_dropped_total\":0,\"rescans_unknown_total\":0,\"last_rescan_at_ms\":null,\"last_rescan_cost_ms\":null,\"last_rescan_rss_delta_bytes\":null},\"runtime\":{\"live_watchers\":0,\"live_actor_roots\":1,\"open_routes\":1,\"callgraph_commits_60s_total\":0,\"callgraph_pages_or_bytes_written_60s_total\":0,\"bash_spawn\":{\"backend\":\"posix_spawn\",\"missing_capability\":null,\"fallback_spawns\":0,\"pty_backend\":\"fork\"}},\"compression\":{\"project\":{\"events\":0,\"original_tokens\":0,\"compressed_tokens\":0,\"savings_tokens\":0},\"session\":{\"events\":0,\"original_tokens\":0,\"compressed_tokens\":0,\"savings_tokens\":0}},\"storage_dir\":\"/conformance\",\"cache_dir\":\"/conformance\",\"cache_unavailable_reason\":null,\"checkpoints_total\":0,\"session\":{\"id\":\"conformance-session\",\"tracked_files\":0,\"checkpoints\":0},\"memory\":{\"roots_status\":\"ready\",\"roots\":{\"/motor-home/tmp/.tmpQgOXCR/project\":{\"status\":\"ready\",\"attributed_bytes\":0,\"semantic\":{\"status\":\"ready\",\"bytes_status\":\"estimated\",\"estimated_bytes\":0,\"checkout_overlay_bytes\":0,\"entries\":0,\"serving_index_bytes\":0,\"worker_index_bytes\":0},\"trigram\":{\"status\":\"ready\",\"bytes_status\":\"estimated\",\"estimated_bytes\":0,\"files\":0},\"symbols\":{\"status\":\"ready\",\"bytes_status\":\"estimated\",\"estimated_bytes\":0,\"entries\":0,\"symbols\":0},\"callgraph\":{\"status\":\"ready\",\"bytes_status\":\"estimated\",\"estimated_bytes\":0,\"open_generation_handles\":0},\"callgraph_projection\":{\"status\":\"ready\",\"bytes_status\":\"estimated\",\"estimated_bytes\":0,\"callgraph_projection_snapshot_bytes\":0,\"callgraph_projection_snapshots\":0},\"inspect\":{\"status\":\"ready\",\"bytes_status\":\"partial\",\"estimated_bytes\":0,\"not_estimated\":[\"oxc_fact_bytes\"],\"memory_aggregates\":0,\"open_generation_handles\":0,\"oxc_fact_entries\":0},\"bash\":{\"status\":\"ready\",\"bytes_status\":\"estimated\",\"estimated_bytes\":0,\"completion_caches\":0,\"output_ring_bytes\":0,\"sessions\":0,\"tasks\":0,\"terminal_output_caches\":0},\"lsp\":{\"status\":\"ready\",\"bytes_status\":\"estimated\",\"estimated_bytes\":0,\"diagnostic_entries\":0,\"diagnostics\":0,\"document_stores\":0,\"documents\":0,\"servers\":0},\"parser_pool\":{\"status\":\"ready\",\"bytes_status\":\"not_estimated\",\"estimated_bytes\":null,\"not_estimated\":[\"tree_sitter_parser_bytes\"],\"pooled_parsers\":0},\"pending_install\":{\"status\":\"ready\",\"bytes_status\":\"estimated\",\"estimated_bytes\":0,\"search_bytes\":0,\"search_loads\":0,\"semantic_bytes\":0,\"semantic_loads\":0}}},\"roots_total\":1,\"roots_omitted\":0,\"roots_omitted_bytes\":0,\"shared_semantic_bases\":{\"status\":\"ready\",\"bytes_status\":\"estimated\",\"estimated_bytes\":0,\"bases\":0,\"entries\":0,\"frozen_owner_bases\":0,\"hits\":0,\"loads\":0,\"metadata_bytes\":0,\"text_bytes\":0,\"vector_bytes\":0},\"semantic_arenas\":{\"bytes\":0,\"resident_chunks\":0,\"families\":[]},\"process\":{\"rss_status\":\"estimated\",\"rss_bytes\":120868864,\"sqlite\":{\"status\":\"measured\",\"memory_used_bytes\":467216,\"memory_highwater_bytes\":564672},\"allocator\":{\"status\":\"measured\",\"bytes_in_use\":1230880,\"size_allocated\":3129344,\"retained_slack_bytes\":1898464,\"retained_slack_label\":\"address-space slack: allocator-mapped bytes minus in-use bytes; includes free pages already returned to the OS, so it is not resident memory\"},\"allocator_slack_measured\":true,\"allocator_observation_age_ms\":330,\"total_attributed_bytes\":467216,\"semantic_arena_bytes\":0,\"embedding_sessions\":0,\"embedding_model_bytes\":0,\"semantic_resident_chunks\":0,\"unattributed_bytes\":120401648,\"root_count\":1,\"busy_subsystems\":0,\"not_estimated_subsystems\":1}},\"lsp\":{\"children_total\":0,\"children_by_root\":[],\"children_roots_total\":0,\"children_roots_omitted\":0,\"children_omitted_total\":0,\"children_omitted_rss_bytes\":0,\"children_without_client\":0,\"children_with_deleted_cwd\":0,\"applicability_by_root\":{}},\"threads\":{\"total\":16,\"classified\":true,\"by_class\":{\"aft-callgraph\":0,\"aft-fs-lock-heartbeat\":0,\"aft-health-rollup\":1,\"aft-inspect\":2,\"aft-lsp\":0,\"aft-mem\":0,\"notify-rs fsevents loop\":0,\"reqwest-internal-sync-runtime\":0,\"tokio-rt-worker\":0,\"unnamed\":13},\"classified_age_ms\":0},\"sqlite\":{\"open_connections\":0,\"open_by_store\":[{\"store\":\"aft.db\",\"count\":0},{\"store\":\"blob_stores\",\"count\":0},{\"store\":\"callgraph_generations\",\"count\":0},{\"store\":\"callgraph_cold_generations\",\"count\":0},{\"store\":\"inspect_scope_caches\",\"count\":0},{\"store\":\"breaker_files\",\"count\":0}],\"uninstrumented_openers\":[\"alias::AliasStore::open: the raw WAL writer uses SQLite's built-in autocheckpoint and installs no attribution hook (unmeasurable)\",\"alias::ManifestSqliteStore::open: the raw rollback-journal connection exposes no pager byte counter (unmeasurable)\",\"gc::sweep_plane: the raw blob-store WAL writer uses SQLite's built-in autocheckpoint and installs no attribution hook (unmeasurable)\",\"views::assembly::assemble: the connection only keeps the derived WAL alive and reads sqlite_schema; checkpointing is classified at checkpoint_derived (no_writes)\",\"views::generation::clone_derived source: the SQLite backup source is read-only at this seam (no_writes)\",\"views::generation::clone_derived destination: the enclosing publication clone phase credits its process-I/O delta to views_derived (attributed_elsewhere)\",\"views::generation::clone_quiescent source: its only write is a TRUNCATE checkpoint of the donor's WAL; the enclosing publication clone phase credits its process-I/O delta to views_derived (attributed_elsewhere)\",\"views::assembly::derived_index: index lookups run inside the publication's clone phase; the row write runs after commit and is measured as the publication's derived_index interval; both are credited to views_derived (attributed_elsewhere)\",\"views::generation::checkpoint_derived: a successful TRUNCATE checkpoint returns zero frame counts and the raw connection has no earlier WAL-hook baseline (unmeasurable)\",\"views::materialization::materialize: the enclosing publication materialize phase credits its process-I/O delta to views_derived (attributed_elsewhere)\",\"views::materialization::blob_reader: the materializer uses this connection only to read immutable blob payloads (no_writes)\",\"views::ViewStore::open_pointer_connection: the enclosing publication closure phase credits the pointer transaction's process-I/O delta to views_closure (attributed_elsewhere)\",\"views::sync_database_with_passive_checkpoint: the enclosing publication closure phase credits the durability checkpoint's process-I/O delta to views_closure (attributed_elsewhere)\",\"views::checkpoint_and_sync_database: the enclosing publication closure phase credits the durability checkpoint's process-I/O delta to views_closure (attributed_elsewhere)\",\"views::checkpoint_pointer_after_cas: the publication profile remains in its closure phase until the pointer checkpoint completes (attributed_elsewhere)\",\"path_status::PathStatusStore::open_at: the raw rollback-journal connection exposes no pager byte counter (unmeasurable)\"]},\"children\":{\"detached_total\":0},\"fds\":{\"open\":18,\"soft_limit\":1024},\"storage_refusals\":[],\"storage_retention\":null,\"git\":{\"available\":true},\"text\":\"AFT 0.62.0 — /conformance\\nindexes: search disabled | semantic disabled [all-MiniLM-L6-v2] | callgraph disabled\\nfeatures: format_on_edit off, validate_on_edit off, restrict_to_project_root off, search_index off, semantic_search off, callgraph_store off, backup on\\nstorage: /conformance (trigram 0 B, semantic 0 B)\\nsession: 0 tracked file(s), 0 checkpoint(s) | lsp servers: 0\\n\\nMemory: RSS 115.3 MiB | attributed 456.3 KiB | unattributed 114.8 MiB\\n  /motor-home/tmp/.tmpQgOXCR/project: 0 B (semantic 0 B, trigram 0 B, symbols 0 B, callgraph 0 B, inspect 0 B, bash 0 B, lsp 0 B, parsers not estimated)\"}}"
+      },
+      {
+        "tool": "bash",
+        "arguments": {
+          "command": "exit 7",
+          "wait": true,
+          "pty": true
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "bash: wait:true cannot be used with pty:true because PTY sessions run in background"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "invalid_request",
+            "message": "bash: wait:true cannot be used with pty:true because PTY sessions run in background",
+            "text": "bash: wait:true cannot be used with pty:true because PTY sessions run in background"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"bash: wait:true cannot be used with pty:true because PTY sessions run in background\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"invalid_request\",\"message\":\"bash: wait:true cannot be used with pty:true because PTY sessions run in background\",\"text\":\"bash: wait:true cannot be used with pty:true because PTY sessions run in background\"}}"
+      },
+      {
+        "tool": "read",
+        "arguments": {
+          "path": ".cortexkit/no-such-file.txt"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "read: file not found: {PROJECT}/.cortexkit/no-such-file.txt"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "not_found",
+            "message": "read: file not found: {PROJECT}/.cortexkit/no-such-file.txt",
+            "text": "read: file not found: {PROJECT}/.cortexkit/no-such-file.txt"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"read: file not found: {PROJECT}/.cortexkit/no-such-file.txt\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"not_found\",\"message\":\"read: file not found: {PROJECT}/.cortexkit/no-such-file.txt\",\"text\":\"read: file not found: {PROJECT}/.cortexkit/no-such-file.txt\"}}"
+      },
+      {
+        "tool": "write",
+        "arguments": {
+          "path": ".cortexkit",
+          "content": "unused"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "Is a directory (os error 21)"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "io_error",
+            "message": "Is a directory (os error 21)",
+            "text": "Is a directory (os error 21)"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"Is a directory (os error 21)\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"io_error\",\"message\":\"Is a directory (os error 21)\",\"text\":\"Is a directory (os error 21)\"}}"
+      },
+      {
+        "tool": "edit",
+        "arguments": {
+          "path": ".cortexkit"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "edit: exactly one of `appendContent`, `edits`, or `symbol` plus `content` is required. Omit unused optional fields entirely; do not send empty strings or empty arrays for them."
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "invalid_request",
+            "message": "edit: exactly one of `appendContent`, `edits`, or `symbol` plus `content` is required. Omit unused optional fields entirely; do not send empty strings or empty arrays for them.",
+            "text": "edit: exactly one of `appendContent`, `edits`, or `symbol` plus `content` is required. Omit unused optional fields entirely; do not send empty strings or empty arrays for them."
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"edit: exactly one of `appendContent`, `edits`, or `symbol` plus `content` is required. Omit unused optional fields entirely; do not send empty strings or empty arrays for them.\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"invalid_request\",\"message\":\"edit: exactly one of `appendContent`, `edits`, or `symbol` plus `content` is required. Omit unused optional fields entirely; do not send empty strings or empty arrays for them.\",\"text\":\"edit: exactly one of `appendContent`, `edits`, or `symbol` plus `content` is required. Omit unused optional fields entirely; do not send empty strings or empty arrays for them.\"}}"
+      },
+      {
+        "tool": "apply_patch",
+        "arguments": {
+          "patchText": "not a patch"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "Invalid patch format: missing *** Begin Patch / *** End Patch markers"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "invalid_request",
+            "message": "Invalid patch format: missing *** Begin Patch / *** End Patch markers",
+            "text": "Invalid patch format: missing *** Begin Patch / *** End Patch markers"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"Invalid patch format: missing *** Begin Patch / *** End Patch markers\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"invalid_request\",\"message\":\"Invalid patch format: missing *** Begin Patch / *** End Patch markers\",\"text\":\"Invalid patch format: missing *** Begin Patch / *** End Patch markers\"}}"
+      },
+      {
+        "tool": "grep",
+        "arguments": {
+          "pattern": "["
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "invalid regex: regex parse error:\n    [\n    ^\nerror: unclosed character class"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "invalid_pattern",
+            "message": "invalid regex: regex parse error:\n    [\n    ^\nerror: unclosed character class",
+            "pattern": "[",
+            "text": "invalid regex: regex parse error:\n    [\n    ^\nerror: unclosed character class"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"invalid regex: regex parse error:\\n    [\\n    ^\\nerror: unclosed character class\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"invalid_pattern\",\"message\":\"invalid regex: regex parse error:\\n    [\\n    ^\\nerror: unclosed character class\",\"pattern\":\"[\",\"text\":\"invalid regex: regex parse error:\\n    [\\n    ^\\nerror: unclosed character class\"}}"
+      },
+      {
+        "tool": "glob",
+        "arguments": {
+          "pattern": "*",
+          "path": ".tool-result-missing-directory"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "glob: search path does not exist: {PROJECT}/.tool-result-missing-directory"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "path_not_found",
+            "message": "glob: search path does not exist: {PROJECT}/.tool-result-missing-directory",
+            "text": "glob: search path does not exist: {PROJECT}/.tool-result-missing-directory"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"glob: search path does not exist: {PROJECT}/.tool-result-missing-directory\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"path_not_found\",\"message\":\"glob: search path does not exist: {PROJECT}/.tool-result-missing-directory\",\"text\":\"glob: search path does not exist: {PROJECT}/.tool-result-missing-directory\"}}"
+      },
+      {
+        "tool": "search",
+        "arguments": {
+          "pattern": "["
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "semantic_search: invalid_pattern — invalid regex: regex parse error:\n    [\n    ^\nerror: unclosed character class"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "invalid_pattern",
+            "message": "invalid regex: regex parse error:\n    [\n    ^\nerror: unclosed character class",
+            "pattern": "[",
+            "text": "semantic_search: invalid_pattern — invalid regex: regex parse error:\n    [\n    ^\nerror: unclosed character class"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"semantic_search: invalid_pattern — invalid regex: regex parse error:\\n    [\\n    ^\\nerror: unclosed character class\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"invalid_pattern\",\"message\":\"invalid regex: regex parse error:\\n    [\\n    ^\\nerror: unclosed character class\",\"pattern\":\"[\",\"text\":\"semantic_search: invalid_pattern — invalid regex: regex parse error:\\n    [\\n    ^\\nerror: unclosed character class\"}}"
+      },
+      {
+        "tool": "zoom",
+        "arguments": {
+          "batch": [
+            {
+              "target": ".cortexkit/no-such.rs",
+              "symbols": "missing"
+            }
+          ]
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "Incomplete zoom results: one or more symbols failed.\n\nSymbol \"missing\" not found in .cortexkit/no-such.rs: file not found: {PROJECT}/.cortexkit/no-such.rs. Retrying this exact zoom call will fail again. Set `target` to an existing file path or a reachable HTTP/HTTPS URL."
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": true,
+            "targets": [
+              {
+                "targetLabel": ".cortexkit/no-such.rs",
+                "name": "missing",
+                "response": {
+                  "id": "conformance-result-probe",
+                  "success": false,
+                  "code": "file_not_found",
+                  "message": "file not found: {PROJECT}/.cortexkit/no-such.rs. Retrying this exact zoom call will fail again. Set `target` to an existing file path or a reachable HTTP/HTTPS URL.",
+                  "content_files": []
+                }
+              }
+            ],
+            "content_files": [],
+            "text": "Incomplete zoom results: one or more symbols failed.\n\nSymbol \"missing\" not found in .cortexkit/no-such.rs: file not found: {PROJECT}/.cortexkit/no-such.rs. Retrying this exact zoom call will fail again. Set `target` to an existing file path or a reachable HTTP/HTTPS URL."
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"Incomplete zoom results: one or more symbols failed.\\n\\nSymbol \\\"missing\\\" not found in .cortexkit/no-such.rs: file not found: {PROJECT}/.cortexkit/no-such.rs. Retrying this exact zoom call will fail again. Set `target` to an existing file path or a reachable HTTP/HTTPS URL.\"}],\"isError\":false,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":true,\"targets\":[{\"targetLabel\":\".cortexkit/no-such.rs\",\"name\":\"missing\",\"response\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"file_not_found\",\"message\":\"file not found: {PROJECT}/.cortexkit/no-such.rs. Retrying this exact zoom call will fail again. Set `target` to an existing file path or a reachable HTTP/HTTPS URL.\",\"content_files\":[]}}],\"content_files\":[],\"text\":\"Incomplete zoom results: one or more symbols failed.\\n\\nSymbol \\\"missing\\\" not found in .cortexkit/no-such.rs: file not found: {PROJECT}/.cortexkit/no-such.rs. Retrying this exact zoom call will fail again. Set `target` to an existing file path or a reachable HTTP/HTTPS URL.\"}}"
+      },
+      {
+        "tool": "inspect",
+        "arguments": {
+          "sections": "__invalid_probe_section__"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "PHASE-FAILED — inspect could not complete: inspect: unknown inspect category '__invalid_probe_section__' (root_resolution_failed). Retry aft_inspect, or narrow the scope."
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "inspect_terminal": "phase_failed",
+            "completed_phases": [],
+            "failure_reason": "root_resolution_failed",
+            "failure_detail": "inspect: unknown inspect category '__invalid_probe_section__'",
+            "text": "PHASE-FAILED — inspect could not complete: inspect: unknown inspect category '__invalid_probe_section__' (root_resolution_failed). Retry aft_inspect, or narrow the scope."
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"PHASE-FAILED — inspect could not complete: inspect: unknown inspect category '__invalid_probe_section__' (root_resolution_failed). Retry aft_inspect, or narrow the scope.\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"inspect_terminal\":\"phase_failed\",\"completed_phases\":[],\"failure_reason\":\"root_resolution_failed\",\"failure_detail\":\"inspect: unknown inspect category '__invalid_probe_section__'\",\"text\":\"PHASE-FAILED — inspect could not complete: inspect: unknown inspect category '__invalid_probe_section__' (root_resolution_failed). Retry aft_inspect, or narrow the scope.\"}}"
+      },
+      {
+        "tool": "callgraph",
+        "arguments": {
+          "op": "callers",
+          "path": ".cortexkit/aft.jsonc",
+          "symbol": "missing"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "callers: callgraph_off — callers: the callgraph index is off (indexes.callgraph: false); enable it with aft setup to use callgraph queries\ndata: {\n  \"index\": {\n    \"callgraph\": {\n      \"status\": \"off\",\n      \"reason\": null\n    }\n  },\n  \"results\": null\n}"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "callgraph_off",
+            "message": "callers: the callgraph index is off (indexes.callgraph: false); enable it with aft setup to use callgraph queries",
+            "index": {
+              "callgraph": {
+                "status": "off",
+                "reason": null
+              }
+            },
+            "results": null,
+            "text": "callers: callgraph_off — callers: the callgraph index is off (indexes.callgraph: false); enable it with aft setup to use callgraph queries\ndata: {\n  \"index\": {\n    \"callgraph\": {\n      \"status\": \"off\",\n      \"reason\": null\n    }\n  },\n  \"results\": null\n}"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"callers: callgraph_off — callers: the callgraph index is off (indexes.callgraph: false); enable it with aft setup to use callgraph queries\\ndata: {\\n  \\\"index\\\": {\\n    \\\"callgraph\\\": {\\n      \\\"status\\\": \\\"off\\\",\\n      \\\"reason\\\": null\\n    }\\n  },\\n  \\\"results\\\": null\\n}\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"callgraph_off\",\"message\":\"callers: the callgraph index is off (indexes.callgraph: false); enable it with aft setup to use callgraph queries\",\"index\":{\"callgraph\":{\"status\":\"off\",\"reason\":null}},\"results\":null,\"text\":\"callers: callgraph_off — callers: the callgraph index is off (indexes.callgraph: false); enable it with aft setup to use callgraph queries\\ndata: {\\n  \\\"index\\\": {\\n    \\\"callgraph\\\": {\\n      \\\"status\\\": \\\"off\\\",\\n      \\\"reason\\\": null\\n    }\\n  },\\n  \\\"results\\\": null\\n}\"}}"
+      },
+      {
+        "tool": "conflicts",
+        "arguments": {
+          "path": ".cortexkit/aft.jsonc"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "path is not inside a git repository: {PROJECT}/.cortexkit/aft.jsonc"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "not_a_git_repository",
+            "message": "path is not inside a git repository: {PROJECT}/.cortexkit/aft.jsonc",
+            "text": "path is not inside a git repository: {PROJECT}/.cortexkit/aft.jsonc"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"path is not inside a git repository: {PROJECT}/.cortexkit/aft.jsonc\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"not_a_git_repository\",\"message\":\"path is not inside a git repository: {PROJECT}/.cortexkit/aft.jsonc\",\"text\":\"path is not inside a git repository: {PROJECT}/.cortexkit/aft.jsonc\"}}"
+      },
+      {
+        "tool": "ast_search",
+        "arguments": {
+          "pattern": "catch",
+          "lang": "javascript"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "No files matched the scope (paths/globs resolved to zero files)"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": true,
+            "matches": [],
+            "total_matches": 0,
+            "files_with_matches": 0,
+            "files_searched": 0,
+            "no_files_matched_scope": true,
+            "scope_warnings": [],
+            "complete": true,
+            "skipped_files": [],
+            "text": "No files matched the scope (paths/globs resolved to zero files)"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"No files matched the scope (paths/globs resolved to zero files)\"}],\"isError\":false,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":true,\"matches\":[],\"total_matches\":0,\"files_with_matches\":0,\"files_searched\":0,\"no_files_matched_scope\":true,\"scope_warnings\":[],\"complete\":true,\"skipped_files\":[],\"text\":\"No files matched the scope (paths/globs resolved to zero files)\"}}"
+      },
+      {
+        "tool": "ast_replace",
+        "arguments": {
+          "pattern": "console.log($MSG)",
+          "rewrite": "logger.info($$$)",
+          "lang": "javascript",
+          "dryRun": true
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "ast_replace: anonymous `$$$` in rewrite is not supported by ast-grep (it would be emitted as the literal string `$$$` instead of expanding the captured nodes). Use a NAMED variadic in BOTH pattern and rewrite, e.g. pattern: `test($NAME, () => { $$$BODY })`, rewrite: `test($NAME, async () => { $$$BODY })`. Single-node `$VAR` and named variadic `$$$VAR` work as expected."
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "invalid_rewrite",
+            "message": "ast_replace: anonymous `$$$` in rewrite is not supported by ast-grep (it would be emitted as the literal string `$$$` instead of expanding the captured nodes). Use a NAMED variadic in BOTH pattern and rewrite, e.g. pattern: `test($NAME, () => { $$$BODY })`, rewrite: `test($NAME, async () => { $$$BODY })`. Single-node `$VAR` and named variadic `$$$VAR` work as expected.",
+            "text": "ast_replace: anonymous `$$$` in rewrite is not supported by ast-grep (it would be emitted as the literal string `$$$` instead of expanding the captured nodes). Use a NAMED variadic in BOTH pattern and rewrite, e.g. pattern: `test($NAME, () => { $$$BODY })`, rewrite: `test($NAME, async () => { $$$BODY })`. Single-node `$VAR` and named variadic `$$$VAR` work as expected."
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"ast_replace: anonymous `$$$` in rewrite is not supported by ast-grep (it would be emitted as the literal string `$$$` instead of expanding the captured nodes). Use a NAMED variadic in BOTH pattern and rewrite, e.g. pattern: `test($NAME, () => { $$$BODY })`, rewrite: `test($NAME, async () => { $$$BODY })`. Single-node `$VAR` and named variadic `$$$VAR` work as expected.\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"invalid_rewrite\",\"message\":\"ast_replace: anonymous `$$$` in rewrite is not supported by ast-grep (it would be emitted as the literal string `$$$` instead of expanding the captured nodes). Use a NAMED variadic in BOTH pattern and rewrite, e.g. pattern: `test($NAME, () => { $$$BODY })`, rewrite: `test($NAME, async () => { $$$BODY })`. Single-node `$VAR` and named variadic `$$$VAR` work as expected.\",\"text\":\"ast_replace: anonymous `$$$` in rewrite is not supported by ast-grep (it would be emitted as the literal string `$$$` instead of expanding the captured nodes). Use a NAMED variadic in BOTH pattern and rewrite, e.g. pattern: `test($NAME, () => { $$$BODY })`, rewrite: `test($NAME, async () => { $$$BODY })`. Single-node `$VAR` and named variadic `$$$VAR` work as expected.\"}}"
+      },
+      {
+        "tool": "import",
+        "arguments": {
+          "op": "organize",
+          "path": ".cortexkit/aft.jsonc"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "organize_imports: import management not yet supported for Json"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "unsupported_language",
+            "message": "organize_imports: import management not yet supported for Json",
+            "text": "organize_imports: import management not yet supported for Json"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"organize_imports: import management not yet supported for Json\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"unsupported_language\",\"message\":\"organize_imports: import management not yet supported for Json\",\"text\":\"organize_imports: import management not yet supported for Json\"}}"
+      },
+      {
+        "tool": "safety",
+        "arguments": {
+          "op": "restore",
+          "name": "tool-result-no-such-checkpoint"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "checkpoint not found: tool-result-no-such-checkpoint; no durable checkpoints found on disk; in-memory checkpoints do not survive restarts"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "checkpoint_not_found",
+            "message": "checkpoint not found: tool-result-no-such-checkpoint; no durable checkpoints found on disk; in-memory checkpoints do not survive restarts",
+            "text": "checkpoint not found: tool-result-no-such-checkpoint; no durable checkpoints found on disk; in-memory checkpoints do not survive restarts"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"checkpoint not found: tool-result-no-such-checkpoint; no durable checkpoints found on disk; in-memory checkpoints do not survive restarts\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"checkpoint_not_found\",\"message\":\"checkpoint not found: tool-result-no-such-checkpoint; no durable checkpoints found on disk; in-memory checkpoints do not survive restarts\",\"text\":\"checkpoint not found: tool-result-no-such-checkpoint; no durable checkpoints found on disk; in-memory checkpoints do not survive restarts\"}}"
+      },
+      {
+        "tool": "bash_status",
+        "arguments": {
+          "taskId": "tool-result-no-such-task"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "background task not found: tool-result-no-such-task. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`."
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "task_not_found",
+            "message": "background task not found: tool-result-no-such-task. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`.",
+            "text": "background task not found: tool-result-no-such-task. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`."
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"background task not found: tool-result-no-such-task. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`.\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"task_not_found\",\"message\":\"background task not found: tool-result-no-such-task. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`.\",\"text\":\"background task not found: tool-result-no-such-task. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`.\"}}"
+      },
+      {
+        "tool": "bash_kill",
+        "arguments": {
+          "taskId": "tool-result-no-such-task"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "background task not found: tool-result-no-such-task. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`."
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "task_not_found",
+            "message": "background task not found: tool-result-no-such-task. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`.",
+            "text": "background task not found: tool-result-no-such-task. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`."
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"background task not found: tool-result-no-such-task. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`.\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"task_not_found\",\"message\":\"background task not found: tool-result-no-such-task. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`.\",\"text\":\"background task not found: tool-result-no-such-task. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`.\"}}"
+      },
+      {
+        "tool": "bash_write",
+        "arguments": {
+          "taskId": "tool-result-no-such-task",
+          "input": "unused"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "background task not found: tool-result-no-such-task. To run a command, use `bash`; `bash_write` only types into a task that `bash` started."
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "task_not_found",
+            "message": "background task not found: tool-result-no-such-task. To run a command, use `bash`; `bash_write` only types into a task that `bash` started.",
+            "text": "background task not found: tool-result-no-such-task. To run a command, use `bash`; `bash_write` only types into a task that `bash` started."
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"background task not found: tool-result-no-such-task. To run a command, use `bash`; `bash_write` only types into a task that `bash` started.\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"task_not_found\",\"message\":\"background task not found: tool-result-no-such-task. To run a command, use `bash`; `bash_write` only types into a task that `bash` started.\",\"text\":\"background task not found: tool-result-no-such-task. To run a command, use `bash`; `bash_write` only types into a task that `bash` started.\"}}"
+      },
+      {
+        "tool": "powershell",
+        "arguments": {
+          "command": "exit 7",
+          "wait": true,
+          "pty": true
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "bash: wait:true cannot be used with pty:true because PTY sessions run in background"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "invalid_request",
+            "message": "bash: wait:true cannot be used with pty:true because PTY sessions run in background",
+            "text": "bash: wait:true cannot be used with pty:true because PTY sessions run in background"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"bash: wait:true cannot be used with pty:true because PTY sessions run in background\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"invalid_request\",\"message\":\"bash: wait:true cannot be used with pty:true because PTY sessions run in background\",\"text\":\"bash: wait:true cannot be used with pty:true because PTY sessions run in background\"}}"
+      }
+    ],
+    "worker": [
+      {
+        "tool": "status",
+        "arguments": {},
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "AFT 0.62.0 — /conformance\nindexes: search disabled | semantic disabled [all-MiniLM-L6-v2] | callgraph disabled\nfeatures: format_on_edit off, validate_on_edit off, restrict_to_project_root off, search_index off, semantic_search off, callgraph_store off, backup on\nstorage: /conformance (trigram 0 B, semantic 0 B)\nsession: 0 tracked file(s), 0 checkpoint(s) | lsp servers: 0\n\nMemory: RSS 115.3 MiB | attributed 456.3 KiB | unattributed 114.8 MiB\n  /motor-home/tmp/.tmpQgOXCR/project: 0 B (semantic 0 B, trigram 0 B, symbols 0 B, callgraph 0 B, inspect 0 B, bash 0 B, lsp 0 B, parsers not estimated)"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": true,
+            "backup_skipped_too_large_total": 0,
+            "backup_skipped_temp_path_total": 0,
+            "version": "0.62.0",
+            "project_root": "/conformance",
+            "canonical_root": "/conformance",
+            "cache_role": "main",
+            "artifact_owner": null,
+            "degraded": false,
+            "degraded_reasons": [],
+            "features": {
+              "format_on_edit": false,
+              "validate_on_edit": "off",
+              "restrict_to_project_root": false,
+              "search_index": false,
+              "semantic_search": false,
+              "callgraph_store": false,
+              "backup": true
+            },
+            "search_index": {
+              "status": "disabled"
+            },
+            "semantic_index": {
+              "status": "disabled",
+              "state": "disabled",
+              "refreshing_count": 0,
+              "backend": "fastembed",
+              "model": "all-MiniLM-L6-v2"
+            },
+            "callgraph_refresh": null,
+            "status_bar": null,
+            "status_bar_values": {
+              "errors": null,
+              "warnings": null,
+              "diagnostics": "no_language_server",
+              "diagnostics_gaps": [],
+              "dead_code": null,
+              "unused_exports": null,
+              "duplicates": null,
+              "todos": null,
+              "tier2_stale": false
+            },
+            "disk": {
+              "storage_dir": "/conformance",
+              "cache_dir": "/conformance",
+              "project_cache_key": null,
+              "trigram_disk_bytes": 0,
+              "semantic_disk_bytes": 0
+            },
+            "lsp_servers": 0,
+            "symbol_cache": {
+              "local_entries": 0,
+              "warm_entries": 0
+            },
+            "watcher": {
+              "exclusion_planning": null,
+              "fsevents_stream_creations_total": 0,
+              "raw_events_total": 0,
+              "raw_events_since_last_rescan": 0,
+              "invalidating_events_total": 0,
+              "invalidating_events_since_last_rescan": 0,
+              "paths_after_gitignore_total": 0,
+              "paths_after_gitignore_since_last_rescan": 0,
+              "paths_dispatched_total": 0,
+              "paths_dispatched_since_last_rescan": 0,
+              "overflows_total": 0,
+              "watch_lost_races_total": 0,
+              "overflows_during_rescan": 0,
+              "last_overflow_prefixes": [],
+              "rescans_buffer_overflow_total": 0,
+              "rescans_kernel_dropped_total": 0,
+              "rescans_user_dropped_total": 0,
+              "rescans_unknown_total": 0,
+              "last_rescan_at_ms": null,
+              "last_rescan_cost_ms": null,
+              "last_rescan_rss_delta_bytes": null
+            },
+            "runtime": {
+              "live_watchers": 0,
+              "live_actor_roots": 1,
+              "open_routes": 1,
+              "callgraph_commits_60s_total": 0,
+              "callgraph_pages_or_bytes_written_60s_total": 0,
+              "bash_spawn": {
+                "backend": "posix_spawn",
+                "missing_capability": null,
+                "fallback_spawns": 0,
+                "pty_backend": "fork"
+              }
+            },
+            "compression": {
+              "project": {
+                "events": 0,
+                "original_tokens": 0,
+                "compressed_tokens": 0,
+                "savings_tokens": 0
+              },
+              "session": {
+                "events": 0,
+                "original_tokens": 0,
+                "compressed_tokens": 0,
+                "savings_tokens": 0
+              }
+            },
+            "storage_dir": "/conformance",
+            "cache_dir": "/conformance",
+            "cache_unavailable_reason": null,
+            "checkpoints_total": 0,
+            "session": {
+              "id": "conformance-session",
+              "tracked_files": 0,
+              "checkpoints": 0
+            },
+            "memory": {
+              "roots_status": "ready",
+              "roots": {
+                "/motor-home/tmp/.tmpQgOXCR/project": {
+                  "status": "ready",
+                  "attributed_bytes": 0,
+                  "semantic": {
+                    "status": "ready",
+                    "bytes_status": "estimated",
+                    "estimated_bytes": 0,
+                    "checkout_overlay_bytes": 0,
+                    "entries": 0,
+                    "serving_index_bytes": 0,
+                    "worker_index_bytes": 0
+                  },
+                  "trigram": {
+                    "status": "ready",
+                    "bytes_status": "estimated",
+                    "estimated_bytes": 0,
+                    "files": 0
+                  },
+                  "symbols": {
+                    "status": "ready",
+                    "bytes_status": "estimated",
+                    "estimated_bytes": 0,
+                    "entries": 0,
+                    "symbols": 0
+                  },
+                  "callgraph": {
+                    "status": "ready",
+                    "bytes_status": "estimated",
+                    "estimated_bytes": 0,
+                    "open_generation_handles": 0
+                  },
+                  "callgraph_projection": {
+                    "status": "ready",
+                    "bytes_status": "estimated",
+                    "estimated_bytes": 0,
+                    "callgraph_projection_snapshot_bytes": 0,
+                    "callgraph_projection_snapshots": 0
+                  },
+                  "inspect": {
+                    "status": "ready",
+                    "bytes_status": "partial",
+                    "estimated_bytes": 0,
+                    "not_estimated": [
+                      "oxc_fact_bytes"
+                    ],
+                    "memory_aggregates": 0,
+                    "open_generation_handles": 0,
+                    "oxc_fact_entries": 0
+                  },
+                  "bash": {
+                    "status": "ready",
+                    "bytes_status": "estimated",
+                    "estimated_bytes": 0,
+                    "completion_caches": 0,
+                    "output_ring_bytes": 0,
+                    "sessions": 0,
+                    "tasks": 0,
+                    "terminal_output_caches": 0
+                  },
+                  "lsp": {
+                    "status": "ready",
+                    "bytes_status": "estimated",
+                    "estimated_bytes": 0,
+                    "diagnostic_entries": 0,
+                    "diagnostics": 0,
+                    "document_stores": 0,
+                    "documents": 0,
+                    "servers": 0
+                  },
+                  "parser_pool": {
+                    "status": "ready",
+                    "bytes_status": "not_estimated",
+                    "estimated_bytes": null,
+                    "not_estimated": [
+                      "tree_sitter_parser_bytes"
+                    ],
+                    "pooled_parsers": 0
+                  },
+                  "pending_install": {
+                    "status": "ready",
+                    "bytes_status": "estimated",
+                    "estimated_bytes": 0,
+                    "search_bytes": 0,
+                    "search_loads": 0,
+                    "semantic_bytes": 0,
+                    "semantic_loads": 0
+                  }
+                }
+              },
+              "roots_total": 1,
+              "roots_omitted": 0,
+              "roots_omitted_bytes": 0,
+              "shared_semantic_bases": {
+                "status": "ready",
+                "bytes_status": "estimated",
+                "estimated_bytes": 0,
+                "bases": 0,
+                "entries": 0,
+                "frozen_owner_bases": 0,
+                "hits": 0,
+                "loads": 0,
+                "metadata_bytes": 0,
+                "text_bytes": 0,
+                "vector_bytes": 0
+              },
+              "semantic_arenas": {
+                "bytes": 0,
+                "resident_chunks": 0,
+                "families": []
+              },
+              "process": {
+                "rss_status": "estimated",
+                "rss_bytes": 120868864,
+                "sqlite": {
+                  "status": "measured",
+                  "memory_used_bytes": 467216,
+                  "memory_highwater_bytes": 564672
+                },
+                "allocator": {
+                  "status": "measured",
+                  "bytes_in_use": 1230880,
+                  "size_allocated": 3129344,
+                  "retained_slack_bytes": 1898464,
+                  "retained_slack_label": "address-space slack: allocator-mapped bytes minus in-use bytes; includes free pages already returned to the OS, so it is not resident memory"
+                },
+                "allocator_slack_measured": true,
+                "allocator_observation_age_ms": 330,
+                "total_attributed_bytes": 467216,
+                "semantic_arena_bytes": 0,
+                "embedding_sessions": 0,
+                "embedding_model_bytes": 0,
+                "semantic_resident_chunks": 0,
+                "unattributed_bytes": 120401648,
+                "root_count": 1,
+                "busy_subsystems": 0,
+                "not_estimated_subsystems": 1
+              }
+            },
+            "lsp": {
+              "children_total": 0,
+              "children_by_root": [],
+              "children_roots_total": 0,
+              "children_roots_omitted": 0,
+              "children_omitted_total": 0,
+              "children_omitted_rss_bytes": 0,
+              "children_without_client": 0,
+              "children_with_deleted_cwd": 0,
+              "applicability_by_root": {}
+            },
+            "threads": {
+              "total": 16,
+              "classified": true,
+              "by_class": {
+                "aft-callgraph": 0,
+                "aft-fs-lock-heartbeat": 0,
+                "aft-health-rollup": 1,
+                "aft-inspect": 2,
+                "aft-lsp": 0,
+                "aft-mem": 0,
+                "notify-rs fsevents loop": 0,
+                "reqwest-internal-sync-runtime": 0,
+                "tokio-rt-worker": 0,
+                "unnamed": 13
+              },
+              "classified_age_ms": 0
+            },
+            "sqlite": {
+              "open_connections": 0,
+              "open_by_store": [
+                {
+                  "store": "aft.db",
+                  "count": 0
+                },
+                {
+                  "store": "blob_stores",
+                  "count": 0
+                },
+                {
+                  "store": "callgraph_generations",
+                  "count": 0
+                },
+                {
+                  "store": "callgraph_cold_generations",
+                  "count": 0
+                },
+                {
+                  "store": "inspect_scope_caches",
+                  "count": 0
+                },
+                {
+                  "store": "breaker_files",
+                  "count": 0
+                }
+              ],
+              "uninstrumented_openers": [
+                "alias::AliasStore::open: the raw WAL writer uses SQLite's built-in autocheckpoint and installs no attribution hook (unmeasurable)",
+                "alias::ManifestSqliteStore::open: the raw rollback-journal connection exposes no pager byte counter (unmeasurable)",
+                "gc::sweep_plane: the raw blob-store WAL writer uses SQLite's built-in autocheckpoint and installs no attribution hook (unmeasurable)",
+                "views::assembly::assemble: the connection only keeps the derived WAL alive and reads sqlite_schema; checkpointing is classified at checkpoint_derived (no_writes)",
+                "views::generation::clone_derived source: the SQLite backup source is read-only at this seam (no_writes)",
+                "views::generation::clone_derived destination: the enclosing publication clone phase credits its process-I/O delta to views_derived (attributed_elsewhere)",
+                "views::generation::clone_quiescent source: its only write is a TRUNCATE checkpoint of the donor's WAL; the enclosing publication clone phase credits its process-I/O delta to views_derived (attributed_elsewhere)",
+                "views::assembly::derived_index: index lookups run inside the publication's clone phase; the row write runs after commit and is measured as the publication's derived_index interval; both are credited to views_derived (attributed_elsewhere)",
+                "views::generation::checkpoint_derived: a successful TRUNCATE checkpoint returns zero frame counts and the raw connection has no earlier WAL-hook baseline (unmeasurable)",
+                "views::materialization::materialize: the enclosing publication materialize phase credits its process-I/O delta to views_derived (attributed_elsewhere)",
+                "views::materialization::blob_reader: the materializer uses this connection only to read immutable blob payloads (no_writes)",
+                "views::ViewStore::open_pointer_connection: the enclosing publication closure phase credits the pointer transaction's process-I/O delta to views_closure (attributed_elsewhere)",
+                "views::sync_database_with_passive_checkpoint: the enclosing publication closure phase credits the durability checkpoint's process-I/O delta to views_closure (attributed_elsewhere)",
+                "views::checkpoint_and_sync_database: the enclosing publication closure phase credits the durability checkpoint's process-I/O delta to views_closure (attributed_elsewhere)",
+                "views::checkpoint_pointer_after_cas: the publication profile remains in its closure phase until the pointer checkpoint completes (attributed_elsewhere)",
+                "path_status::PathStatusStore::open_at: the raw rollback-journal connection exposes no pager byte counter (unmeasurable)"
+              ]
+            },
+            "children": {
+              "detached_total": 0
+            },
+            "fds": {
+              "open": 18,
+              "soft_limit": 1024
+            },
+            "storage_refusals": [],
+            "storage_retention": null,
+            "git": {
+              "available": true
+            },
+            "text": "AFT 0.62.0 — /conformance\nindexes: search disabled | semantic disabled [all-MiniLM-L6-v2] | callgraph disabled\nfeatures: format_on_edit off, validate_on_edit off, restrict_to_project_root off, search_index off, semantic_search off, callgraph_store off, backup on\nstorage: /conformance (trigram 0 B, semantic 0 B)\nsession: 0 tracked file(s), 0 checkpoint(s) | lsp servers: 0\n\nMemory: RSS 115.3 MiB | attributed 456.3 KiB | unattributed 114.8 MiB\n  /motor-home/tmp/.tmpQgOXCR/project: 0 B (semantic 0 B, trigram 0 B, symbols 0 B, callgraph 0 B, inspect 0 B, bash 0 B, lsp 0 B, parsers not estimated)"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"AFT 0.62.0 — /conformance\\nindexes: search disabled | semantic disabled [all-MiniLM-L6-v2] | callgraph disabled\\nfeatures: format_on_edit off, validate_on_edit off, restrict_to_project_root off, search_index off, semantic_search off, callgraph_store off, backup on\\nstorage: /conformance (trigram 0 B, semantic 0 B)\\nsession: 0 tracked file(s), 0 checkpoint(s) | lsp servers: 0\\n\\nMemory: RSS 115.3 MiB | attributed 456.3 KiB | unattributed 114.8 MiB\\n  /motor-home/tmp/.tmpQgOXCR/project: 0 B (semantic 0 B, trigram 0 B, symbols 0 B, callgraph 0 B, inspect 0 B, bash 0 B, lsp 0 B, parsers not estimated)\"}],\"isError\":false,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":true,\"backup_skipped_too_large_total\":0,\"backup_skipped_temp_path_total\":0,\"version\":\"0.62.0\",\"project_root\":\"/conformance\",\"canonical_root\":\"/conformance\",\"cache_role\":\"main\",\"artifact_owner\":null,\"degraded\":false,\"degraded_reasons\":[],\"features\":{\"format_on_edit\":false,\"validate_on_edit\":\"off\",\"restrict_to_project_root\":false,\"search_index\":false,\"semantic_search\":false,\"callgraph_store\":false,\"backup\":true},\"search_index\":{\"status\":\"disabled\"},\"semantic_index\":{\"status\":\"disabled\",\"state\":\"disabled\",\"refreshing_count\":0,\"backend\":\"fastembed\",\"model\":\"all-MiniLM-L6-v2\"},\"callgraph_refresh\":null,\"status_bar\":null,\"status_bar_values\":{\"errors\":null,\"warnings\":null,\"diagnostics\":\"no_language_server\",\"diagnostics_gaps\":[],\"dead_code\":null,\"unused_exports\":null,\"duplicates\":null,\"todos\":null,\"tier2_stale\":false},\"disk\":{\"storage_dir\":\"/conformance\",\"cache_dir\":\"/conformance\",\"project_cache_key\":null,\"trigram_disk_bytes\":0,\"semantic_disk_bytes\":0},\"lsp_servers\":0,\"symbol_cache\":{\"local_entries\":0,\"warm_entries\":0},\"watcher\":{\"exclusion_planning\":null,\"fsevents_stream_creations_total\":0,\"raw_events_total\":0,\"raw_events_since_last_rescan\":0,\"invalidating_events_total\":0,\"invalidating_events_since_last_rescan\":0,\"paths_after_gitignore_total\":0,\"paths_after_gitignore_since_last_rescan\":0,\"paths_dispatched_total\":0,\"paths_dispatched_since_last_rescan\":0,\"overflows_total\":0,\"watch_lost_races_total\":0,\"overflows_during_rescan\":0,\"last_overflow_prefixes\":[],\"rescans_buffer_overflow_total\":0,\"rescans_kernel_dropped_total\":0,\"rescans_user_dropped_total\":0,\"rescans_unknown_total\":0,\"last_rescan_at_ms\":null,\"last_rescan_cost_ms\":null,\"last_rescan_rss_delta_bytes\":null},\"runtime\":{\"live_watchers\":0,\"live_actor_roots\":1,\"open_routes\":1,\"callgraph_commits_60s_total\":0,\"callgraph_pages_or_bytes_written_60s_total\":0,\"bash_spawn\":{\"backend\":\"posix_spawn\",\"missing_capability\":null,\"fallback_spawns\":0,\"pty_backend\":\"fork\"}},\"compression\":{\"project\":{\"events\":0,\"original_tokens\":0,\"compressed_tokens\":0,\"savings_tokens\":0},\"session\":{\"events\":0,\"original_tokens\":0,\"compressed_tokens\":0,\"savings_tokens\":0}},\"storage_dir\":\"/conformance\",\"cache_dir\":\"/conformance\",\"cache_unavailable_reason\":null,\"checkpoints_total\":0,\"session\":{\"id\":\"conformance-session\",\"tracked_files\":0,\"checkpoints\":0},\"memory\":{\"roots_status\":\"ready\",\"roots\":{\"/motor-home/tmp/.tmpQgOXCR/project\":{\"status\":\"ready\",\"attributed_bytes\":0,\"semantic\":{\"status\":\"ready\",\"bytes_status\":\"estimated\",\"estimated_bytes\":0,\"checkout_overlay_bytes\":0,\"entries\":0,\"serving_index_bytes\":0,\"worker_index_bytes\":0},\"trigram\":{\"status\":\"ready\",\"bytes_status\":\"estimated\",\"estimated_bytes\":0,\"files\":0},\"symbols\":{\"status\":\"ready\",\"bytes_status\":\"estimated\",\"estimated_bytes\":0,\"entries\":0,\"symbols\":0},\"callgraph\":{\"status\":\"ready\",\"bytes_status\":\"estimated\",\"estimated_bytes\":0,\"open_generation_handles\":0},\"callgraph_projection\":{\"status\":\"ready\",\"bytes_status\":\"estimated\",\"estimated_bytes\":0,\"callgraph_projection_snapshot_bytes\":0,\"callgraph_projection_snapshots\":0},\"inspect\":{\"status\":\"ready\",\"bytes_status\":\"partial\",\"estimated_bytes\":0,\"not_estimated\":[\"oxc_fact_bytes\"],\"memory_aggregates\":0,\"open_generation_handles\":0,\"oxc_fact_entries\":0},\"bash\":{\"status\":\"ready\",\"bytes_status\":\"estimated\",\"estimated_bytes\":0,\"completion_caches\":0,\"output_ring_bytes\":0,\"sessions\":0,\"tasks\":0,\"terminal_output_caches\":0},\"lsp\":{\"status\":\"ready\",\"bytes_status\":\"estimated\",\"estimated_bytes\":0,\"diagnostic_entries\":0,\"diagnostics\":0,\"document_stores\":0,\"documents\":0,\"servers\":0},\"parser_pool\":{\"status\":\"ready\",\"bytes_status\":\"not_estimated\",\"estimated_bytes\":null,\"not_estimated\":[\"tree_sitter_parser_bytes\"],\"pooled_parsers\":0},\"pending_install\":{\"status\":\"ready\",\"bytes_status\":\"estimated\",\"estimated_bytes\":0,\"search_bytes\":0,\"search_loads\":0,\"semantic_bytes\":0,\"semantic_loads\":0}}},\"roots_total\":1,\"roots_omitted\":0,\"roots_omitted_bytes\":0,\"shared_semantic_bases\":{\"status\":\"ready\",\"bytes_status\":\"estimated\",\"estimated_bytes\":0,\"bases\":0,\"entries\":0,\"frozen_owner_bases\":0,\"hits\":0,\"loads\":0,\"metadata_bytes\":0,\"text_bytes\":0,\"vector_bytes\":0},\"semantic_arenas\":{\"bytes\":0,\"resident_chunks\":0,\"families\":[]},\"process\":{\"rss_status\":\"estimated\",\"rss_bytes\":120868864,\"sqlite\":{\"status\":\"measured\",\"memory_used_bytes\":467216,\"memory_highwater_bytes\":564672},\"allocator\":{\"status\":\"measured\",\"bytes_in_use\":1230880,\"size_allocated\":3129344,\"retained_slack_bytes\":1898464,\"retained_slack_label\":\"address-space slack: allocator-mapped bytes minus in-use bytes; includes free pages already returned to the OS, so it is not resident memory\"},\"allocator_slack_measured\":true,\"allocator_observation_age_ms\":330,\"total_attributed_bytes\":467216,\"semantic_arena_bytes\":0,\"embedding_sessions\":0,\"embedding_model_bytes\":0,\"semantic_resident_chunks\":0,\"unattributed_bytes\":120401648,\"root_count\":1,\"busy_subsystems\":0,\"not_estimated_subsystems\":1}},\"lsp\":{\"children_total\":0,\"children_by_root\":[],\"children_roots_total\":0,\"children_roots_omitted\":0,\"children_omitted_total\":0,\"children_omitted_rss_bytes\":0,\"children_without_client\":0,\"children_with_deleted_cwd\":0,\"applicability_by_root\":{}},\"threads\":{\"total\":16,\"classified\":true,\"by_class\":{\"aft-callgraph\":0,\"aft-fs-lock-heartbeat\":0,\"aft-health-rollup\":1,\"aft-inspect\":2,\"aft-lsp\":0,\"aft-mem\":0,\"notify-rs fsevents loop\":0,\"reqwest-internal-sync-runtime\":0,\"tokio-rt-worker\":0,\"unnamed\":13},\"classified_age_ms\":0},\"sqlite\":{\"open_connections\":0,\"open_by_store\":[{\"store\":\"aft.db\",\"count\":0},{\"store\":\"blob_stores\",\"count\":0},{\"store\":\"callgraph_generations\",\"count\":0},{\"store\":\"callgraph_cold_generations\",\"count\":0},{\"store\":\"inspect_scope_caches\",\"count\":0},{\"store\":\"breaker_files\",\"count\":0}],\"uninstrumented_openers\":[\"alias::AliasStore::open: the raw WAL writer uses SQLite's built-in autocheckpoint and installs no attribution hook (unmeasurable)\",\"alias::ManifestSqliteStore::open: the raw rollback-journal connection exposes no pager byte counter (unmeasurable)\",\"gc::sweep_plane: the raw blob-store WAL writer uses SQLite's built-in autocheckpoint and installs no attribution hook (unmeasurable)\",\"views::assembly::assemble: the connection only keeps the derived WAL alive and reads sqlite_schema; checkpointing is classified at checkpoint_derived (no_writes)\",\"views::generation::clone_derived source: the SQLite backup source is read-only at this seam (no_writes)\",\"views::generation::clone_derived destination: the enclosing publication clone phase credits its process-I/O delta to views_derived (attributed_elsewhere)\",\"views::generation::clone_quiescent source: its only write is a TRUNCATE checkpoint of the donor's WAL; the enclosing publication clone phase credits its process-I/O delta to views_derived (attributed_elsewhere)\",\"views::assembly::derived_index: index lookups run inside the publication's clone phase; the row write runs after commit and is measured as the publication's derived_index interval; both are credited to views_derived (attributed_elsewhere)\",\"views::generation::checkpoint_derived: a successful TRUNCATE checkpoint returns zero frame counts and the raw connection has no earlier WAL-hook baseline (unmeasurable)\",\"views::materialization::materialize: the enclosing publication materialize phase credits its process-I/O delta to views_derived (attributed_elsewhere)\",\"views::materialization::blob_reader: the materializer uses this connection only to read immutable blob payloads (no_writes)\",\"views::ViewStore::open_pointer_connection: the enclosing publication closure phase credits the pointer transaction's process-I/O delta to views_closure (attributed_elsewhere)\",\"views::sync_database_with_passive_checkpoint: the enclosing publication closure phase credits the durability checkpoint's process-I/O delta to views_closure (attributed_elsewhere)\",\"views::checkpoint_and_sync_database: the enclosing publication closure phase credits the durability checkpoint's process-I/O delta to views_closure (attributed_elsewhere)\",\"views::checkpoint_pointer_after_cas: the publication profile remains in its closure phase until the pointer checkpoint completes (attributed_elsewhere)\",\"path_status::PathStatusStore::open_at: the raw rollback-journal connection exposes no pager byte counter (unmeasurable)\"]},\"children\":{\"detached_total\":0},\"fds\":{\"open\":18,\"soft_limit\":1024},\"storage_refusals\":[],\"storage_retention\":null,\"git\":{\"available\":true},\"text\":\"AFT 0.62.0 — /conformance\\nindexes: search disabled | semantic disabled [all-MiniLM-L6-v2] | callgraph disabled\\nfeatures: format_on_edit off, validate_on_edit off, restrict_to_project_root off, search_index off, semantic_search off, callgraph_store off, backup on\\nstorage: /conformance (trigram 0 B, semantic 0 B)\\nsession: 0 tracked file(s), 0 checkpoint(s) | lsp servers: 0\\n\\nMemory: RSS 115.3 MiB | attributed 456.3 KiB | unattributed 114.8 MiB\\n  /motor-home/tmp/.tmpQgOXCR/project: 0 B (semantic 0 B, trigram 0 B, symbols 0 B, callgraph 0 B, inspect 0 B, bash 0 B, lsp 0 B, parsers not estimated)\"}}"
+      },
+      {
+        "tool": "bash",
+        "arguments": {
+          "command": "exit 7",
+          "wait": true,
+          "pty": true
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "bash: wait:true cannot be used with pty:true because PTY sessions run in background"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "invalid_request",
+            "message": "bash: wait:true cannot be used with pty:true because PTY sessions run in background",
+            "text": "bash: wait:true cannot be used with pty:true because PTY sessions run in background"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"bash: wait:true cannot be used with pty:true because PTY sessions run in background\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"invalid_request\",\"message\":\"bash: wait:true cannot be used with pty:true because PTY sessions run in background\",\"text\":\"bash: wait:true cannot be used with pty:true because PTY sessions run in background\"}}"
+      },
+      {
+        "tool": "read",
+        "arguments": {
+          "path": ".cortexkit/no-such-file.txt"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "read: file not found: {PROJECT}/.cortexkit/no-such-file.txt"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "not_found",
+            "message": "read: file not found: {PROJECT}/.cortexkit/no-such-file.txt",
+            "text": "read: file not found: {PROJECT}/.cortexkit/no-such-file.txt"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"read: file not found: {PROJECT}/.cortexkit/no-such-file.txt\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"not_found\",\"message\":\"read: file not found: {PROJECT}/.cortexkit/no-such-file.txt\",\"text\":\"read: file not found: {PROJECT}/.cortexkit/no-such-file.txt\"}}"
+      },
+      {
+        "tool": "write",
+        "arguments": {
+          "path": ".cortexkit",
+          "content": "unused"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "Is a directory (os error 21)"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "io_error",
+            "message": "Is a directory (os error 21)",
+            "text": "Is a directory (os error 21)"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"Is a directory (os error 21)\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"io_error\",\"message\":\"Is a directory (os error 21)\",\"text\":\"Is a directory (os error 21)\"}}"
+      },
+      {
+        "tool": "edit",
+        "arguments": {
+          "path": ".cortexkit"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "edit: exactly one of `appendContent`, `edits`, or `symbol` plus `content` is required. Omit unused optional fields entirely; do not send empty strings or empty arrays for them."
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "invalid_request",
+            "message": "edit: exactly one of `appendContent`, `edits`, or `symbol` plus `content` is required. Omit unused optional fields entirely; do not send empty strings or empty arrays for them.",
+            "text": "edit: exactly one of `appendContent`, `edits`, or `symbol` plus `content` is required. Omit unused optional fields entirely; do not send empty strings or empty arrays for them."
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"edit: exactly one of `appendContent`, `edits`, or `symbol` plus `content` is required. Omit unused optional fields entirely; do not send empty strings or empty arrays for them.\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"invalid_request\",\"message\":\"edit: exactly one of `appendContent`, `edits`, or `symbol` plus `content` is required. Omit unused optional fields entirely; do not send empty strings or empty arrays for them.\",\"text\":\"edit: exactly one of `appendContent`, `edits`, or `symbol` plus `content` is required. Omit unused optional fields entirely; do not send empty strings or empty arrays for them.\"}}"
+      },
+      {
+        "tool": "apply_patch",
+        "arguments": {
+          "patchText": "not a patch"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "Invalid patch format: missing *** Begin Patch / *** End Patch markers"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "invalid_request",
+            "message": "Invalid patch format: missing *** Begin Patch / *** End Patch markers",
+            "text": "Invalid patch format: missing *** Begin Patch / *** End Patch markers"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"Invalid patch format: missing *** Begin Patch / *** End Patch markers\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"invalid_request\",\"message\":\"Invalid patch format: missing *** Begin Patch / *** End Patch markers\",\"text\":\"Invalid patch format: missing *** Begin Patch / *** End Patch markers\"}}"
+      },
+      {
+        "tool": "grep",
+        "arguments": {
+          "pattern": "["
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "invalid regex: regex parse error:\n    [\n    ^\nerror: unclosed character class"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "invalid_pattern",
+            "message": "invalid regex: regex parse error:\n    [\n    ^\nerror: unclosed character class",
+            "pattern": "[",
+            "text": "invalid regex: regex parse error:\n    [\n    ^\nerror: unclosed character class"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"invalid regex: regex parse error:\\n    [\\n    ^\\nerror: unclosed character class\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"invalid_pattern\",\"message\":\"invalid regex: regex parse error:\\n    [\\n    ^\\nerror: unclosed character class\",\"pattern\":\"[\",\"text\":\"invalid regex: regex parse error:\\n    [\\n    ^\\nerror: unclosed character class\"}}"
+      },
+      {
+        "tool": "glob",
+        "arguments": {
+          "pattern": "*",
+          "path": ".tool-result-missing-directory"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "glob: search path does not exist: {PROJECT}/.tool-result-missing-directory"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "path_not_found",
+            "message": "glob: search path does not exist: {PROJECT}/.tool-result-missing-directory",
+            "text": "glob: search path does not exist: {PROJECT}/.tool-result-missing-directory"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"glob: search path does not exist: {PROJECT}/.tool-result-missing-directory\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"path_not_found\",\"message\":\"glob: search path does not exist: {PROJECT}/.tool-result-missing-directory\",\"text\":\"glob: search path does not exist: {PROJECT}/.tool-result-missing-directory\"}}"
+      },
+      {
+        "tool": "search",
+        "arguments": {
+          "pattern": "["
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "semantic_search: invalid_pattern — invalid regex: regex parse error:\n    [\n    ^\nerror: unclosed character class"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "invalid_pattern",
+            "message": "invalid regex: regex parse error:\n    [\n    ^\nerror: unclosed character class",
+            "pattern": "[",
+            "text": "semantic_search: invalid_pattern — invalid regex: regex parse error:\n    [\n    ^\nerror: unclosed character class"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"semantic_search: invalid_pattern — invalid regex: regex parse error:\\n    [\\n    ^\\nerror: unclosed character class\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"invalid_pattern\",\"message\":\"invalid regex: regex parse error:\\n    [\\n    ^\\nerror: unclosed character class\",\"pattern\":\"[\",\"text\":\"semantic_search: invalid_pattern — invalid regex: regex parse error:\\n    [\\n    ^\\nerror: unclosed character class\"}}"
+      },
+      {
+        "tool": "zoom",
+        "arguments": {
+          "batch": [
+            {
+              "target": ".cortexkit/no-such.rs",
+              "symbols": "missing"
+            }
+          ]
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "Incomplete zoom results: one or more symbols failed.\n\nSymbol \"missing\" not found in .cortexkit/no-such.rs: file not found: {PROJECT}/.cortexkit/no-such.rs. Retrying this exact zoom call will fail again. Set `target` to an existing file path or a reachable HTTP/HTTPS URL."
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": true,
+            "targets": [
+              {
+                "targetLabel": ".cortexkit/no-such.rs",
+                "name": "missing",
+                "response": {
+                  "id": "conformance-result-probe",
+                  "success": false,
+                  "code": "file_not_found",
+                  "message": "file not found: {PROJECT}/.cortexkit/no-such.rs. Retrying this exact zoom call will fail again. Set `target` to an existing file path or a reachable HTTP/HTTPS URL.",
+                  "content_files": []
+                }
+              }
+            ],
+            "content_files": [],
+            "text": "Incomplete zoom results: one or more symbols failed.\n\nSymbol \"missing\" not found in .cortexkit/no-such.rs: file not found: {PROJECT}/.cortexkit/no-such.rs. Retrying this exact zoom call will fail again. Set `target` to an existing file path or a reachable HTTP/HTTPS URL."
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"Incomplete zoom results: one or more symbols failed.\\n\\nSymbol \\\"missing\\\" not found in .cortexkit/no-such.rs: file not found: {PROJECT}/.cortexkit/no-such.rs. Retrying this exact zoom call will fail again. Set `target` to an existing file path or a reachable HTTP/HTTPS URL.\"}],\"isError\":false,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":true,\"targets\":[{\"targetLabel\":\".cortexkit/no-such.rs\",\"name\":\"missing\",\"response\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"file_not_found\",\"message\":\"file not found: {PROJECT}/.cortexkit/no-such.rs. Retrying this exact zoom call will fail again. Set `target` to an existing file path or a reachable HTTP/HTTPS URL.\",\"content_files\":[]}}],\"content_files\":[],\"text\":\"Incomplete zoom results: one or more symbols failed.\\n\\nSymbol \\\"missing\\\" not found in .cortexkit/no-such.rs: file not found: {PROJECT}/.cortexkit/no-such.rs. Retrying this exact zoom call will fail again. Set `target` to an existing file path or a reachable HTTP/HTTPS URL.\"}}"
+      },
+      {
+        "tool": "inspect",
+        "arguments": {
+          "sections": "__invalid_probe_section__"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "PHASE-FAILED — inspect could not complete: inspect: unknown inspect category '__invalid_probe_section__' (root_resolution_failed). Retry aft_inspect, or narrow the scope."
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "inspect_terminal": "phase_failed",
+            "completed_phases": [],
+            "failure_reason": "root_resolution_failed",
+            "failure_detail": "inspect: unknown inspect category '__invalid_probe_section__'",
+            "text": "PHASE-FAILED — inspect could not complete: inspect: unknown inspect category '__invalid_probe_section__' (root_resolution_failed). Retry aft_inspect, or narrow the scope."
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"PHASE-FAILED — inspect could not complete: inspect: unknown inspect category '__invalid_probe_section__' (root_resolution_failed). Retry aft_inspect, or narrow the scope.\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"inspect_terminal\":\"phase_failed\",\"completed_phases\":[],\"failure_reason\":\"root_resolution_failed\",\"failure_detail\":\"inspect: unknown inspect category '__invalid_probe_section__'\",\"text\":\"PHASE-FAILED — inspect could not complete: inspect: unknown inspect category '__invalid_probe_section__' (root_resolution_failed). Retry aft_inspect, or narrow the scope.\"}}"
+      },
+      {
+        "tool": "callgraph",
+        "arguments": {
+          "op": "callers",
+          "path": ".cortexkit/aft.jsonc",
+          "symbol": "missing"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "callers: callgraph_off — callers: the callgraph index is off (indexes.callgraph: false); enable it with aft setup to use callgraph queries\ndata: {\n  \"index\": {\n    \"callgraph\": {\n      \"status\": \"off\",\n      \"reason\": null\n    }\n  },\n  \"results\": null\n}"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "callgraph_off",
+            "message": "callers: the callgraph index is off (indexes.callgraph: false); enable it with aft setup to use callgraph queries",
+            "index": {
+              "callgraph": {
+                "status": "off",
+                "reason": null
+              }
+            },
+            "results": null,
+            "text": "callers: callgraph_off — callers: the callgraph index is off (indexes.callgraph: false); enable it with aft setup to use callgraph queries\ndata: {\n  \"index\": {\n    \"callgraph\": {\n      \"status\": \"off\",\n      \"reason\": null\n    }\n  },\n  \"results\": null\n}"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"callers: callgraph_off — callers: the callgraph index is off (indexes.callgraph: false); enable it with aft setup to use callgraph queries\\ndata: {\\n  \\\"index\\\": {\\n    \\\"callgraph\\\": {\\n      \\\"status\\\": \\\"off\\\",\\n      \\\"reason\\\": null\\n    }\\n  },\\n  \\\"results\\\": null\\n}\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"callgraph_off\",\"message\":\"callers: the callgraph index is off (indexes.callgraph: false); enable it with aft setup to use callgraph queries\",\"index\":{\"callgraph\":{\"status\":\"off\",\"reason\":null}},\"results\":null,\"text\":\"callers: callgraph_off — callers: the callgraph index is off (indexes.callgraph: false); enable it with aft setup to use callgraph queries\\ndata: {\\n  \\\"index\\\": {\\n    \\\"callgraph\\\": {\\n      \\\"status\\\": \\\"off\\\",\\n      \\\"reason\\\": null\\n    }\\n  },\\n  \\\"results\\\": null\\n}\"}}"
+      },
+      {
+        "tool": "conflicts",
+        "arguments": {
+          "path": ".cortexkit/aft.jsonc"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "path is not inside a git repository: {PROJECT}/.cortexkit/aft.jsonc"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "not_a_git_repository",
+            "message": "path is not inside a git repository: {PROJECT}/.cortexkit/aft.jsonc",
+            "text": "path is not inside a git repository: {PROJECT}/.cortexkit/aft.jsonc"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"path is not inside a git repository: {PROJECT}/.cortexkit/aft.jsonc\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"not_a_git_repository\",\"message\":\"path is not inside a git repository: {PROJECT}/.cortexkit/aft.jsonc\",\"text\":\"path is not inside a git repository: {PROJECT}/.cortexkit/aft.jsonc\"}}"
+      },
+      {
+        "tool": "ast_search",
+        "arguments": {
+          "pattern": "catch",
+          "lang": "javascript"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "No files matched the scope (paths/globs resolved to zero files)"
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": true,
+            "matches": [],
+            "total_matches": 0,
+            "files_with_matches": 0,
+            "files_searched": 0,
+            "no_files_matched_scope": true,
+            "scope_warnings": [],
+            "complete": true,
+            "skipped_files": [],
+            "text": "No files matched the scope (paths/globs resolved to zero files)"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"No files matched the scope (paths/globs resolved to zero files)\"}],\"isError\":false,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":true,\"matches\":[],\"total_matches\":0,\"files_with_matches\":0,\"files_searched\":0,\"no_files_matched_scope\":true,\"scope_warnings\":[],\"complete\":true,\"skipped_files\":[],\"text\":\"No files matched the scope (paths/globs resolved to zero files)\"}}"
+      },
+      {
+        "tool": "ast_replace",
+        "arguments": {
+          "pattern": "console.log($MSG)",
+          "rewrite": "logger.info($$$)",
+          "lang": "javascript",
+          "dryRun": true
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "ast_replace: anonymous `$$$` in rewrite is not supported by ast-grep (it would be emitted as the literal string `$$$` instead of expanding the captured nodes). Use a NAMED variadic in BOTH pattern and rewrite, e.g. pattern: `test($NAME, () => { $$$BODY })`, rewrite: `test($NAME, async () => { $$$BODY })`. Single-node `$VAR` and named variadic `$$$VAR` work as expected."
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "invalid_rewrite",
+            "message": "ast_replace: anonymous `$$$` in rewrite is not supported by ast-grep (it would be emitted as the literal string `$$$` instead of expanding the captured nodes). Use a NAMED variadic in BOTH pattern and rewrite, e.g. pattern: `test($NAME, () => { $$$BODY })`, rewrite: `test($NAME, async () => { $$$BODY })`. Single-node `$VAR` and named variadic `$$$VAR` work as expected.",
+            "text": "ast_replace: anonymous `$$$` in rewrite is not supported by ast-grep (it would be emitted as the literal string `$$$` instead of expanding the captured nodes). Use a NAMED variadic in BOTH pattern and rewrite, e.g. pattern: `test($NAME, () => { $$$BODY })`, rewrite: `test($NAME, async () => { $$$BODY })`. Single-node `$VAR` and named variadic `$$$VAR` work as expected."
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"ast_replace: anonymous `$$$` in rewrite is not supported by ast-grep (it would be emitted as the literal string `$$$` instead of expanding the captured nodes). Use a NAMED variadic in BOTH pattern and rewrite, e.g. pattern: `test($NAME, () => { $$$BODY })`, rewrite: `test($NAME, async () => { $$$BODY })`. Single-node `$VAR` and named variadic `$$$VAR` work as expected.\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"invalid_rewrite\",\"message\":\"ast_replace: anonymous `$$$` in rewrite is not supported by ast-grep (it would be emitted as the literal string `$$$` instead of expanding the captured nodes). Use a NAMED variadic in BOTH pattern and rewrite, e.g. pattern: `test($NAME, () => { $$$BODY })`, rewrite: `test($NAME, async () => { $$$BODY })`. Single-node `$VAR` and named variadic `$$$VAR` work as expected.\",\"text\":\"ast_replace: anonymous `$$$` in rewrite is not supported by ast-grep (it would be emitted as the literal string `$$$` instead of expanding the captured nodes). Use a NAMED variadic in BOTH pattern and rewrite, e.g. pattern: `test($NAME, () => { $$$BODY })`, rewrite: `test($NAME, async () => { $$$BODY })`. Single-node `$VAR` and named variadic `$$$VAR` work as expected.\"}}"
+      },
+      {
+        "tool": "import",
+        "arguments": {
+          "op": "organize",
+          "path": ".cortexkit/aft.jsonc"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "organize_imports: import management not yet supported for Json"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "unsupported_language",
+            "message": "organize_imports: import management not yet supported for Json",
+            "text": "organize_imports: import management not yet supported for Json"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"organize_imports: import management not yet supported for Json\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"unsupported_language\",\"message\":\"organize_imports: import management not yet supported for Json\",\"text\":\"organize_imports: import management not yet supported for Json\"}}"
+      },
+      {
+        "tool": "safety",
+        "arguments": {
+          "op": "restore",
+          "name": "tool-result-no-such-checkpoint"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "checkpoint not found: tool-result-no-such-checkpoint; no durable checkpoints found on disk; in-memory checkpoints do not survive restarts"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "checkpoint_not_found",
+            "message": "checkpoint not found: tool-result-no-such-checkpoint; no durable checkpoints found on disk; in-memory checkpoints do not survive restarts",
+            "text": "checkpoint not found: tool-result-no-such-checkpoint; no durable checkpoints found on disk; in-memory checkpoints do not survive restarts"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"checkpoint not found: tool-result-no-such-checkpoint; no durable checkpoints found on disk; in-memory checkpoints do not survive restarts\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"checkpoint_not_found\",\"message\":\"checkpoint not found: tool-result-no-such-checkpoint; no durable checkpoints found on disk; in-memory checkpoints do not survive restarts\",\"text\":\"checkpoint not found: tool-result-no-such-checkpoint; no durable checkpoints found on disk; in-memory checkpoints do not survive restarts\"}}"
+      },
+      {
+        "tool": "bash_status",
+        "arguments": {
+          "taskId": "tool-result-no-such-task"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "background task not found: tool-result-no-such-task. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`."
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "task_not_found",
+            "message": "background task not found: tool-result-no-such-task. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`.",
+            "text": "background task not found: tool-result-no-such-task. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`."
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"background task not found: tool-result-no-such-task. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`.\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"task_not_found\",\"message\":\"background task not found: tool-result-no-such-task. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`.\",\"text\":\"background task not found: tool-result-no-such-task. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`.\"}}"
+      },
+      {
+        "tool": "bash_kill",
+        "arguments": {
+          "taskId": "tool-result-no-such-task"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "background task not found: tool-result-no-such-task. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`."
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "task_not_found",
+            "message": "background task not found: tool-result-no-such-task. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`.",
+            "text": "background task not found: tool-result-no-such-task. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`."
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"background task not found: tool-result-no-such-task. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`.\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"task_not_found\",\"message\":\"background task not found: tool-result-no-such-task. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`.\",\"text\":\"background task not found: tool-result-no-such-task. This session has no record of it (a record can be lost across an AFT restart). To run a command, use `bash`.\"}}"
+      },
+      {
+        "tool": "bash_write",
+        "arguments": {
+          "taskId": "tool-result-no-such-task",
+          "input": "unused"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "background task not found: tool-result-no-such-task. To run a command, use `bash`; `bash_write` only types into a task that `bash` started."
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "task_not_found",
+            "message": "background task not found: tool-result-no-such-task. To run a command, use `bash`; `bash_write` only types into a task that `bash` started.",
+            "text": "background task not found: tool-result-no-such-task. To run a command, use `bash`; `bash_write` only types into a task that `bash` started."
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"background task not found: tool-result-no-such-task. To run a command, use `bash`; `bash_write` only types into a task that `bash` started.\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"task_not_found\",\"message\":\"background task not found: tool-result-no-such-task. To run a command, use `bash`; `bash_write` only types into a task that `bash` started.\",\"text\":\"background task not found: tool-result-no-such-task. To run a command, use `bash`; `bash_write` only types into a task that `bash` started.\"}}"
+      },
+      {
+        "tool": "bash_watch",
+        "arguments": {
+          "taskId": "tool-result-no-such-task",
+          "pattern": {
+            "regex": "["
+          },
+          "timeoutMs": 1
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "invalid_regex: regex parse error:\n    [\n    ^\nerror: unclosed character class"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "invalid_request",
+            "message": "invalid_regex: regex parse error:\n    [\n    ^\nerror: unclosed character class",
+            "text": "invalid_regex: regex parse error:\n    [\n    ^\nerror: unclosed character class"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"invalid_regex: regex parse error:\\n    [\\n    ^\\nerror: unclosed character class\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"invalid_request\",\"message\":\"invalid_regex: regex parse error:\\n    [\\n    ^\\nerror: unclosed character class\",\"text\":\"invalid_regex: regex parse error:\\n    [\\n    ^\\nerror: unclosed character class\"}}"
+      },
+      {
+        "tool": "powershell",
+        "arguments": {
+          "command": "exit 7",
+          "wait": true,
+          "pty": true
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "bash: wait:true cannot be used with pty:true because PTY sessions run in background"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "invalid_request",
+            "message": "bash: wait:true cannot be used with pty:true because PTY sessions run in background",
+            "text": "bash: wait:true cannot be used with pty:true because PTY sessions run in background"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"bash: wait:true cannot be used with pty:true because PTY sessions run in background\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"invalid_request\",\"message\":\"bash: wait:true cannot be used with pty:true because PTY sessions run in background\",\"text\":\"bash: wait:true cannot be used with pty:true because PTY sessions run in background\"}}"
+      }
+    ],
+    "reader": [
+      {
+        "tool": "read",
+        "arguments": {
+          "path": ".cortexkit/no-such-file.txt"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "read: file not found: {PROJECT}/.cortexkit/no-such-file.txt"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "not_found",
+            "message": "read: file not found: {PROJECT}/.cortexkit/no-such-file.txt",
+            "text": "read: file not found: {PROJECT}/.cortexkit/no-such-file.txt"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"read: file not found: {PROJECT}/.cortexkit/no-such-file.txt\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"not_found\",\"message\":\"read: file not found: {PROJECT}/.cortexkit/no-such-file.txt\",\"text\":\"read: file not found: {PROJECT}/.cortexkit/no-such-file.txt\"}}"
+      },
+      {
+        "tool": "grep",
+        "arguments": {
+          "pattern": "["
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "invalid regex: regex parse error:\n    [\n    ^\nerror: unclosed character class"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "invalid_pattern",
+            "message": "invalid regex: regex parse error:\n    [\n    ^\nerror: unclosed character class",
+            "pattern": "[",
+            "text": "invalid regex: regex parse error:\n    [\n    ^\nerror: unclosed character class"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"invalid regex: regex parse error:\\n    [\\n    ^\\nerror: unclosed character class\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"invalid_pattern\",\"message\":\"invalid regex: regex parse error:\\n    [\\n    ^\\nerror: unclosed character class\",\"pattern\":\"[\",\"text\":\"invalid regex: regex parse error:\\n    [\\n    ^\\nerror: unclosed character class\"}}"
+      },
+      {
+        "tool": "glob",
+        "arguments": {
+          "pattern": "*",
+          "path": ".tool-result-missing-directory"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "glob: search path does not exist: {PROJECT}/.tool-result-missing-directory"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "path_not_found",
+            "message": "glob: search path does not exist: {PROJECT}/.tool-result-missing-directory",
+            "text": "glob: search path does not exist: {PROJECT}/.tool-result-missing-directory"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"glob: search path does not exist: {PROJECT}/.tool-result-missing-directory\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"path_not_found\",\"message\":\"glob: search path does not exist: {PROJECT}/.tool-result-missing-directory\",\"text\":\"glob: search path does not exist: {PROJECT}/.tool-result-missing-directory\"}}"
+      },
+      {
+        "tool": "search",
+        "arguments": {
+          "pattern": "["
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "semantic_search: invalid_pattern — invalid regex: regex parse error:\n    [\n    ^\nerror: unclosed character class"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "invalid_pattern",
+            "message": "invalid regex: regex parse error:\n    [\n    ^\nerror: unclosed character class",
+            "pattern": "[",
+            "text": "semantic_search: invalid_pattern — invalid regex: regex parse error:\n    [\n    ^\nerror: unclosed character class"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"semantic_search: invalid_pattern — invalid regex: regex parse error:\\n    [\\n    ^\\nerror: unclosed character class\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"invalid_pattern\",\"message\":\"invalid regex: regex parse error:\\n    [\\n    ^\\nerror: unclosed character class\",\"pattern\":\"[\",\"text\":\"semantic_search: invalid_pattern — invalid regex: regex parse error:\\n    [\\n    ^\\nerror: unclosed character class\"}}"
+      },
+      {
+        "tool": "zoom",
+        "arguments": {
+          "batch": [
+            {
+              "target": ".cortexkit/no-such.rs",
+              "symbols": "missing"
+            }
+          ]
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "Incomplete zoom results: one or more symbols failed.\n\nSymbol \"missing\" not found in .cortexkit/no-such.rs: file not found: {PROJECT}/.cortexkit/no-such.rs. Retrying this exact zoom call will fail again. Set `target` to an existing file path or a reachable HTTP/HTTPS URL."
+            }
+          ],
+          "isError": false,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": true,
+            "targets": [
+              {
+                "targetLabel": ".cortexkit/no-such.rs",
+                "name": "missing",
+                "response": {
+                  "id": "conformance-result-probe",
+                  "success": false,
+                  "code": "file_not_found",
+                  "message": "file not found: {PROJECT}/.cortexkit/no-such.rs. Retrying this exact zoom call will fail again. Set `target` to an existing file path or a reachable HTTP/HTTPS URL.",
+                  "content_files": []
+                }
+              }
+            ],
+            "content_files": [],
+            "text": "Incomplete zoom results: one or more symbols failed.\n\nSymbol \"missing\" not found in .cortexkit/no-such.rs: file not found: {PROJECT}/.cortexkit/no-such.rs. Retrying this exact zoom call will fail again. Set `target` to an existing file path or a reachable HTTP/HTTPS URL."
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"Incomplete zoom results: one or more symbols failed.\\n\\nSymbol \\\"missing\\\" not found in .cortexkit/no-such.rs: file not found: {PROJECT}/.cortexkit/no-such.rs. Retrying this exact zoom call will fail again. Set `target` to an existing file path or a reachable HTTP/HTTPS URL.\"}],\"isError\":false,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":true,\"targets\":[{\"targetLabel\":\".cortexkit/no-such.rs\",\"name\":\"missing\",\"response\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"file_not_found\",\"message\":\"file not found: {PROJECT}/.cortexkit/no-such.rs. Retrying this exact zoom call will fail again. Set `target` to an existing file path or a reachable HTTP/HTTPS URL.\",\"content_files\":[]}}],\"content_files\":[],\"text\":\"Incomplete zoom results: one or more symbols failed.\\n\\nSymbol \\\"missing\\\" not found in .cortexkit/no-such.rs: file not found: {PROJECT}/.cortexkit/no-such.rs. Retrying this exact zoom call will fail again. Set `target` to an existing file path or a reachable HTTP/HTTPS URL.\"}}"
+      },
+      {
+        "tool": "inspect",
+        "arguments": {
+          "sections": "__invalid_probe_section__"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "PHASE-FAILED — inspect could not complete: inspect: unknown inspect category '__invalid_probe_section__' (root_resolution_failed). Retry aft_inspect, or narrow the scope."
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "inspect_terminal": "phase_failed",
+            "completed_phases": [],
+            "failure_reason": "root_resolution_failed",
+            "failure_detail": "inspect: unknown inspect category '__invalid_probe_section__'",
+            "text": "PHASE-FAILED — inspect could not complete: inspect: unknown inspect category '__invalid_probe_section__' (root_resolution_failed). Retry aft_inspect, or narrow the scope."
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"PHASE-FAILED — inspect could not complete: inspect: unknown inspect category '__invalid_probe_section__' (root_resolution_failed). Retry aft_inspect, or narrow the scope.\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"inspect_terminal\":\"phase_failed\",\"completed_phases\":[],\"failure_reason\":\"root_resolution_failed\",\"failure_detail\":\"inspect: unknown inspect category '__invalid_probe_section__'\",\"text\":\"PHASE-FAILED — inspect could not complete: inspect: unknown inspect category '__invalid_probe_section__' (root_resolution_failed). Retry aft_inspect, or narrow the scope.\"}}"
+      },
+      {
+        "tool": "callgraph",
+        "arguments": {
+          "op": "callers",
+          "path": ".cortexkit/aft.jsonc",
+          "symbol": "missing"
+        },
+        "reply": {
+          "content": [
+            {
+              "type": "text",
+              "text": "callers: callgraph_off — callers: the callgraph index is off (indexes.callgraph: false); enable it with aft setup to use callgraph queries\ndata: {\n  \"index\": {\n    \"callgraph\": {\n      \"status\": \"off\",\n      \"reason\": null\n    }\n  },\n  \"results\": null\n}"
+            }
+          ],
+          "isError": true,
+          "structuredContent": {
+            "id": "conformance-result-probe",
+            "success": false,
+            "code": "callgraph_off",
+            "message": "callers: the callgraph index is off (indexes.callgraph: false); enable it with aft setup to use callgraph queries",
+            "index": {
+              "callgraph": {
+                "status": "off",
+                "reason": null
+              }
+            },
+            "results": null,
+            "text": "callers: callgraph_off — callers: the callgraph index is off (indexes.callgraph: false); enable it with aft setup to use callgraph queries\ndata: {\n  \"index\": {\n    \"callgraph\": {\n      \"status\": \"off\",\n      \"reason\": null\n    }\n  },\n  \"results\": null\n}"
+          }
+        },
+        "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"callers: callgraph_off — callers: the callgraph index is off (indexes.callgraph: false); enable it with aft setup to use callgraph queries\\ndata: {\\n  \\\"index\\\": {\\n    \\\"callgraph\\\": {\\n      \\\"status\\\": \\\"off\\\",\\n      \\\"reason\\\": null\\n    }\\n  },\\n  \\\"results\\\": null\\n}\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"callgraph_off\",\"message\":\"callers: the callgraph index is off (indexes.callgraph: false); enable it with aft setup to use callgraph queries\",\"index\":{\"callgraph\":{\"status\":\"off\",\"reason\":null}},\"results\":null,\"text\":\"callers: callgraph_off — callers: the callgraph index is off (indexes.callgraph: false); enable it with aft setup to use callgraph queries\\ndata: {\\n  \\\"index\\\": {\\n    \\\"callgraph\\\": {\\n      \\\"status\\\": \\\"off\\\",\\n      \\\"reason\\\": null\\n    }\\n  },\\n  \\\"results\\\": null\\n}\"}}"
+      }
+    ]
+  },
+  "optional_tool_captures": {
+    "powershell": {
+      "source_commit": "a209fc15f4ac5866ad3afe5ea111d7ca44ae74e9",
+      "binary_sha256": "ba027ea8b7c1a74fc62a82733860185bf594b8c5b0ab23f686dfae2f3f82f5d5",
+      "catalog_references": [
+        "p1_runner_pwsh",
+        "worker_preset_pwsh"
+      ],
+      "availability": "executable-presence pwsh fixture on PATH; invocation marker remained absent",
+      "capture": "real pre-flip tool.call powershell; production wait:true/pty:true validation refusal"
+    }
+  },
+  "platform_overrides": {
+    "windows": {
+      "presets": {
+        "head": [
+          {
+            "tool": "write",
+            "arguments": {
+              "path": ".cortexkit",
+              "content": "unused"
+            },
+            "reply": {
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Access is denied. (os error 5)"
+                }
+              ],
+              "isError": true,
+              "structuredContent": {
+                "id": "conformance-result-probe",
+                "success": false,
+                "code": "io_error",
+                "message": "Access is denied. (os error 5)",
+                "text": "Access is denied. (os error 5)"
+              }
+            },
+            "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"Access is denied. (os error 5)\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"io_error\",\"message\":\"Access is denied. (os error 5)\",\"text\":\"Access is denied. (os error 5)\"}}"
+          }
+        ],
+        "worker": [
+          {
+            "tool": "write",
+            "arguments": {
+              "path": ".cortexkit",
+              "content": "unused"
+            },
+            "reply": {
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Access is denied. (os error 5)"
+                }
+              ],
+              "isError": true,
+              "structuredContent": {
+                "id": "conformance-result-probe",
+                "success": false,
+                "code": "io_error",
+                "message": "Access is denied. (os error 5)",
+                "text": "Access is denied. (os error 5)"
+              }
+            },
+            "wire_body": "{\"content\":[{\"type\":\"text\",\"text\":\"Access is denied. (os error 5)\"}],\"isError\":true,\"structuredContent\":{\"id\":\"conformance-result-probe\",\"success\":false,\"code\":\"io_error\",\"message\":\"Access is denied. (os error 5)\",\"text\":\"Access is denied. (os error 5)\"}}"
+          }
+        ]
+      },
+      "provenance": {
+        "source_commit": "a209fc15f4ac5866ad3afe5ea111d7ca44ae74e9",
+        "binary_sha256": "c58ab913a9438774266cdfc9e1c9afe5b8cfcb7bd417fd7d1f43891c8df000fe",
+        "capture": "native Windows write to an existing directory; original-main renderer with declaration=false and authorized input hooks"
+      }
+    }
+  }
+}

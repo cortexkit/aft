@@ -1,1 +1,0 @@
-- On Windows, a module stopping or restarting no longer risks cutting off its last responses to the daemon: AFT now finishes writing, signals the end of its output, and reads any remaining daemon input before closing the connection, so the socket closes normally instead of being reset.

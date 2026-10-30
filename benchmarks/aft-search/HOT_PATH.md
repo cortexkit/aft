@@ -108,8 +108,8 @@ row differences. A changing row is not permission to update the baseline.
 
 `HOT_PATH_MEASURED.md` is the final counts/latency table; the preliminary source
 checks and first measurements are retained separately in `HOT_PATH_RESULTS.md`.
-The machine-readable counts, recall rows, standalone parity and mutation
-controls live in `hot-path-*.json`.
+The machine-readable counts, recall rows and standalone parity live in
+`hot-path-*.json`.
 
 ```bash
 python3 benchmarks/aft-search/compare_hot_path.py before.json after.json
@@ -129,7 +129,3 @@ exact/concept recall and search-quality gate to remain unchanged.
 The work-count comparator normalizes only temporary corpus-root prefixes before
 hashing lane results. The measurement tests assert nonempty corpora and an
 8000-chunk semantic fixture, so skipped indexing cannot look like free work.
-The eight old-code counting controls each failed by name; four independent
-result-parity controls remained green. Both comparison guards were separately
-neutralized and their dedicated tests failed while unrelated tests passed.
-Full evidence and staged-restore diff pairs: `hot-path-mutations.json`.

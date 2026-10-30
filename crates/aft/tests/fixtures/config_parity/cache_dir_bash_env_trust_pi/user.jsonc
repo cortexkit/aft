@@ -1,0 +1,22 @@
+{
+  "storage": {
+    "cache_dir": "{ABSOLUTE_ROOT}/aft-cache"
+  },
+  "bash": {
+    "env": {
+      "TZ": "UTC"
+    }
+  },
+  "harnesses": {
+    "pi": {
+      "storage": {
+        "cache_dir": "/ignored-cache"
+      },
+      "bash": {
+        "env": {
+          "TZ": "Etc/GMT"
+        }
+      }
+    }
+  }
+}

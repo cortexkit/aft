@@ -1,1 +1,0 @@
-- Ticket-only background completion and watch previews stay visible after a daemon restart; only the task's revoked gh-shim ticket is redacted.

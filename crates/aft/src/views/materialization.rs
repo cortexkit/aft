@@ -10,6 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 pub mod dispatch;
 
 use self::profile::{PhaseProbe, WritePhase};
+use crate::callgraph_store::join::ManifestBlobReader;
 use crate::callgraph_store::{
     initialize_schema, join, set_meta_ready, CallGraphStoreError, Result, PROVENANCE_TREESITTER,
 };
@@ -131,12 +132,13 @@ mod module_digest;
 pub(crate) mod parity;
 pub(crate) mod profile;
 mod resolution_facts;
+mod stable_rows;
 
 // Rebuild older generations rather than retaining rows produced by the
 // per-reference skip optimization when reference ordinals collide, or Go
 // bindings whose package file listings were not recorded (an added sibling
 // `.go` file would never reselect them).
-const MATERIALIZATION_VERSION: &str = "12";
+pub(crate) const MATERIALIZATION_VERSION: &str = "12";
 
 const BASE_FINGERPRINT_MISMATCH: &str =
     "derived manifest fingerprint mismatch; cold materialization required";
@@ -205,7 +207,7 @@ pub(crate) fn manifest_diff_size(
 
 fn fingerprint(manifest: &crate::views::Manifest) -> Result<String> {
     let bytes = manifest
-        .to_json_bytes()
+        .json_bytes()
         .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
@@ -275,6 +277,28 @@ pub fn materialize_from_blob_reader(
     materialize_reading(database_path, manifest, None, reader, None).map(|_| ())
 }
 
+/// [`apply_manifest_diff`] over an immutable blob reader, for a private clone
+/// of a sealed donor built from `base_manifest`. Without the legacy blob
+/// table there are no per-fact resolution inputs, so callers that may read a
+/// changed fact are re-resolved; rows are still rewritten only where they
+/// change. A clone whose recorded fingerprint is not `base_manifest`'s is
+/// refused unchanged (see [`is_base_fingerprint_mismatch`]).
+pub(crate) fn apply_manifest_diff_from_blob_reader(
+    database_path: &Path,
+    base_manifest: &crate::views::Manifest,
+    new_manifest: &crate::views::Manifest,
+    reader: &impl join::ManifestBlobReader,
+) -> Result<MaterializeStats> {
+    materialize_reading(
+        database_path,
+        new_manifest,
+        Some(base_manifest),
+        reader,
+        None,
+    )
+    .map(|(stats, _)| stats)
+}
+
 fn materialize_reading(
     database_path: &Path,
     manifest: &crate::views::Manifest,
@@ -282,6 +306,22 @@ fn materialize_reading(
     reader: &impl join::ManifestBlobReader,
     blob_connection: Option<&Connection>,
 ) -> Result<(MaterializeStats, profile::PhaseTimings)> {
+    let shared_reader = join::SharedBlobReader {
+        inner: reader,
+        decoded: Default::default(),
+    };
+    let reader = &shared_reader;
+    // Existing databases may be incremental baselines or legacy upgrades. Only
+    // a newly created, unpublished file can trade recovery for cheaper writes.
+    let private_cold = base.is_none() && !database_path.exists();
+    let mut unpublished =
+        private_cold.then(|| super::generation::UnpublishedDerived::new(database_path));
+    #[cfg(test)]
+    let (relaxed, deferred_indexes) = tests::COLD_BUILD_MODE
+        .get()
+        .unwrap_or((private_cold, false));
+    #[cfg(not(test))]
+    let relaxed = private_cold;
     let write_probe = profile::WriteProbe::start(database_path);
     let mut profile = profile::PhaseTimer::new(if base.is_some() {
         "incremental"
@@ -297,10 +337,48 @@ fn materialize_reading(
         },
         "views::materialization::materialize",
     )?;
-    configure_materialization_connection(&connection)?;
+    // A private cold output may use DELETE mode. Do not change its header to
+    // WAL for an identical-manifest patch that promises to write nothing.
+    if let Some(base) = base.filter(|base| *base == manifest) {
+        let metadata = connection.query_row(
+            "SELECT (SELECT v FROM meta WHERE k = 'view_manifest_fingerprint'),
+                    (SELECT v FROM meta WHERE k = 'view_materialization_version')",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        );
+        if let Ok((Some(recorded), Some(version))) = metadata {
+            if recorded == fingerprint(base)? && version == MATERIALIZATION_VERSION {
+                profile.finish("load_bindings_select");
+                return Ok((MaterializeStats::default(), profile.into_timings()));
+            }
+        }
+    }
+    if relaxed {
+        configure_private_connection(&connection)?;
+    } else {
+        configure_materialization_connection(&connection)?;
+    }
     initialize_schema(&connection)?;
+    #[cfg(test)]
+    if tests::COLD_WRITE_LIMIT.get() {
+        let pages: u64 = connection.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        connection.pragma_update(None, "max_page_count", pages)?;
+    }
+    #[cfg(test)]
+    let dirty_probe = tests::dirty_pages::observe(&connection, database_path);
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // Deferred index rebuilding increased physical disk writes in paired
+    // measurements. Production keeps indexes live; the benchmark compares both.
+    #[cfg(test)]
+    if deferred_indexes {
+        crate::callgraph_store::drop_cold_build_secondary_indexes(&transaction)?;
+    }
     let mut base_fingerprint = None;
     if let Some(base_manifest) = base {
         let recorded: Option<String> = transaction
@@ -330,6 +408,11 @@ fn materialize_reading(
             base = None;
         } else if base_manifest == manifest {
             profile.finish("load_bindings_select");
+            #[cfg(test)]
+            {
+                drop(transaction);
+                tests::dirty_pages::finish(dirty_probe, &connection);
+            }
             return Ok((MaterializeStats::default(), profile.into_timings()));
         } else if manifest_callgraph_equivalent(base_manifest, manifest) {
             profile.finish("load_bindings_select");
@@ -341,6 +424,8 @@ fn materialize_reading(
             module_digest::advance_unchanged(&transaction, &base_fp, &next_fp)?;
             transaction.commit()?;
             profile.finish("commit");
+            #[cfg(test)]
+            tests::dirty_pages::finish(dirty_probe, &connection);
             return Ok((MaterializeStats::default(), profile.into_timings()));
         }
         base_fingerprint = Some(base_fp);
@@ -500,6 +585,11 @@ fn materialize_reading(
         transaction.execute_batch(
             "CREATE TEMP TABLE changed_view_paths (
                  path TEXT PRIMARY KEY
+             ) WITHOUT ROWID;
+             CREATE TEMP TABLE emitted_view_rows (
+                 table_name TEXT NOT NULL,
+                 row_key TEXT NOT NULL,
+                 PRIMARY KEY(table_name, row_key)
              ) WITHOUT ROWID",
         )?;
         {
@@ -515,28 +605,31 @@ fn materialize_reading(
         }
         existing_binding_paths = existing_changed_paths(&transaction, "view_bindings")?;
         existing_surface_paths = existing_changed_paths(&transaction, "view_file_surfaces")?;
-        // Edges are owned through their ref_id, not their target. Delete them
-        // before refs so cross-file incoming edges remain available. Starting
-        // every lookup from the bounded path table keeps deletion on the diff.
-        stats.deleted += transaction.execute(
-            "DELETE FROM edges WHERE ref_id IN (
+        // Keep the logical replacement counts, but retain surviving keys until
+        // emission can update their changed fields without churning rowids.
+        stats.deleted += transaction.query_row(
+            "SELECT COUNT(*) FROM edges WHERE ref_id IN (
                  SELECT refs.ref_id FROM changed_view_paths
                  CROSS JOIN refs INDEXED BY idx_refs_caller_file
                      ON refs.caller_file = changed_view_paths.path
              )",
             [],
+            |row| row.get::<_, usize>(0),
         )?;
-        stats.deleted += transaction.execute(
-            "DELETE FROM refs WHERE caller_file IN (SELECT path FROM changed_view_paths)",
+        stats.deleted += transaction.query_row(
+            "SELECT COUNT(*) FROM refs WHERE caller_file IN (SELECT path FROM changed_view_paths)",
             [],
+            |row| row.get::<_, usize>(0),
         )?;
-        stats.deleted += transaction.execute(
-            "DELETE FROM nodes WHERE file_path IN (SELECT path FROM changed_view_paths)",
+        stats.deleted += transaction.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE file_path IN (SELECT path FROM changed_view_paths)",
             [],
+            |row| row.get::<_, usize>(0),
         )?;
-        stats.deleted += transaction.execute(
-            "DELETE FROM files WHERE path IN (SELECT path FROM changed_view_paths)",
+        stats.deleted += transaction.query_row(
+            "SELECT COUNT(*) FROM files WHERE path IN (SELECT path FROM changed_view_paths)",
             [],
+            |row| row.get::<_, usize>(0),
         )?;
         stats.dependency_deleted += transaction.query_row(
             "SELECT COUNT(*) FROM file_dependencies
@@ -619,6 +712,7 @@ fn materialize_reading(
                     name: symbol.name.clone(),
                     scoped_name: symbol.scoped_name.clone(),
                     kind: symbol.kind.clone(),
+                    is_test: symbol.is_test,
                     start_line: symbol.start_line,
                     start_col: symbol.start_col,
                     end_line: symbol.end_line,
@@ -644,30 +738,97 @@ fn materialize_reading(
         }
     }
 
-    stats.inserted += profile.measure(WritePhase::Files, &transaction, || {
-        let mut insert = transaction.prepare(
-            "INSERT OR REPLACE INTO files
-             (path, content_hash, mtime_ns, size, lang, is_dead_code_root, is_public_api,
-              surface_fingerprint, indexed_at)
-             VALUES (?1, ?2, 0, 0, ?3, 0, 0, '', 0)",
+    #[cfg(test)]
+    crate::test_allocations::heap_marker("materialization", "owned_rows_prepared");
+    if changed.is_some() {
+        profile.measure(
+            WritePhase::DeleteRows,
+            &transaction,
+            || -> rusqlite::Result<()> {
+                transaction.execute_batch(
+                    "CREATE TEMP TABLE next_view_node_positions (
+                     id TEXT PRIMARY KEY, start_line INTEGER, start_col INTEGER,
+                     end_line INTEGER, end_col INTEGER, range_ordinal INTEGER
+                 ) WITHOUT ROWID",
+                )?;
+                let mut insert = transaction.prepare(
+                "INSERT OR REPLACE INTO next_view_node_positions VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+                for row in &owned_nodes {
+                    insert.execute(params![
+                        row.id,
+                        row.start_line,
+                        row.start_col,
+                        row.end_line,
+                        row.end_col,
+                        row.ordinal
+                    ])?;
+                }
+                // Moving a node can occupy another old node's unique source range.
+                // Vacate only moving/removed ranges, without deleting their rowids.
+                // Negative ordinals exist only inside this transaction: emission or
+                // pruning replaces every one before the generation can be published.
+                transaction.execute_batch(
+                    "UPDATE nodes SET range_ordinal = -rowid - 1
+                 WHERE file_path IN (SELECT path FROM changed_view_paths)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM next_view_node_positions AS next
+                       WHERE next.id=nodes.id AND next.start_line=nodes.start_line
+                         AND next.start_col=nodes.start_col AND next.end_line=nodes.end_line
+                         AND next.end_col=nodes.end_col AND next.range_ordinal=nodes.range_ordinal
+                   )",
+                )?;
+                Ok(())
+            },
         )?;
+    }
+    stats.inserted += profile.measure(WritePhase::Files, &transaction, || {
         owned_files.iter().try_fold(0, |count, row| {
-            insert
-                .execute(params![row.path, row.content_hash, row.language])
-                .map(|written| count + written)
+            stable_rows::write(
+                &transaction,
+                "files",
+                &[
+                    "path",
+                    "content_hash",
+                    "mtime_ns",
+                    "size",
+                    "lang",
+                    "is_dead_code_root",
+                    "is_public_api",
+                    "surface_fingerprint",
+                    "indexed_at",
+                ],
+                params![row.path, row.content_hash, 0, 0, row.language, 0, 0, "", 0],
+                changed.is_some(),
+            )
+            .map(|written| count + written)
         })
     })?;
     stats.inserted += profile.measure(WritePhase::Nodes, &transaction, || {
-        let mut insert = transaction.prepare(
-            "INSERT OR REPLACE INTO nodes
-             (id, file_path, name, scoped_name, kind, start_line, start_col, end_line,
-              end_col, range_ordinal, signature, exported, is_default_export,
-              is_type_like, is_callgraph_entry_point, provenance)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, ?15, ?14)",
-        )?;
         owned_nodes.iter().try_fold(0, |count, row| {
-            insert
-                .execute(params![
+            stable_rows::write(
+                &transaction,
+                "nodes",
+                &[
+                    "id",
+                    "file_path",
+                    "name",
+                    "scoped_name",
+                    "kind",
+                    "start_line",
+                    "start_col",
+                    "end_line",
+                    "end_col",
+                    "range_ordinal",
+                    "signature",
+                    "exported",
+                    "is_default_export",
+                    "is_type_like",
+                    "is_callgraph_entry_point",
+                    "provenance",
+                    "is_test",
+                ],
+                params![
                     row.id,
                     row.file_path,
                     row.name,
@@ -681,12 +842,19 @@ fn materialize_reading(
                     row.signature,
                     i64::from(row.exported),
                     i64::from(row.default_export),
-                    PROVENANCE_TREESITTER,
+                    0,
                     i64::from(row.entry_point),
-                ])
-                .map(|written| count + written)
+                    PROVENANCE_TREESITTER,
+                    row.is_test.map(i64::from),
+                ],
+                changed.is_some(),
+            )
+            .map(|written| count + written)
         })
     })?;
+    drop((owned_files, owned_nodes));
+    #[cfg(test)]
+    crate::test_allocations::heap_marker("materialization", "owned_rows_released");
     if changed.is_none() {
         module_digest::compute_full(&transaction, manifest, |path, _| {
             Ok(cold_module_facts.remove(path))
@@ -742,7 +910,7 @@ fn materialize_reading(
         join::DispatchTypeTargetPlan::All
     };
     let selected_join_probe = PhaseProbe::start(&transaction);
-    let joined = join::join_selected_manifest_reusing_surfaces(
+    let joined = join::join_selected_manifest_for_materialization(
         manifest,
         reader,
         selected.as_ref(),
@@ -949,6 +1117,20 @@ fn materialize_reading(
     stats.dependency_deleted += binding_deleted;
     stats.dependency_inserted += binding_inserted;
     profile.finish("write_bindings");
+    drop((surface_updates, binding_updates));
+    drop((
+        surface_rows,
+        surface_deletes,
+        binding_inserts,
+        binding_deletes,
+        dependency_deletes,
+        dependency_inserts,
+        changed_dependencies,
+        cached,
+        joined.bindings,
+    ));
+    #[cfg(test)]
+    crate::test_allocations::heap_marker("materialization", "bindings_released");
     type ExistingRef = (
         Option<String>,
         String,
@@ -961,6 +1143,8 @@ fn materialize_reading(
     let mut ref_deletes = Vec::new();
     let mut pending_refs = Vec::new();
     let mut pending_edges = Vec::new();
+    let mut ordinary_edge_refs = HashSet::new();
+    let mut rewritten_ref_files = BTreeSet::new();
     let mut load_refs = transaction.prepare("SELECT ref_id, caller_node, status, target_node, target_file, target_symbol FROM refs WHERE caller_file = ?1")?;
     #[cfg(test)]
     let mut control_lookup = transaction.prepare("SELECT EXISTS(SELECT 1 FROM refs WHERE ref_id=?1 AND caller_node IS ?2 AND status=?3 AND target_node IS ?4 AND target_file IS ?5 AND target_symbol IS ?6)")?;
@@ -1073,13 +1257,43 @@ fn materialize_reading(
             }
             ref_deletes.push(ref_id.clone());
         }
-        if row.kind == join::BlobRefKind::Call {
+        if matches!(
+            row.kind,
+            join::BlobRefKind::Call
+                | join::BlobRefKind::Construction
+                | join::BlobRefKind::CallbackRef
+        ) {
             if let (Some(source_node), Some(target_file), Some(edge_target_symbol)) = (
                 caller_node.clone(),
                 target_path.clone(),
                 target_symbol.clone(),
             ) {
+                ordinary_edge_refs.insert(ref_id.clone());
                 pending_edges.push(PendingEdgeRow {
+                    kind: match row.kind {
+                        join::BlobRefKind::Construction
+                            if !target_node
+                                .as_deref()
+                                .map(|id| {
+                                    transaction
+                                        .query_row(
+                                            "SELECT kind FROM nodes WHERE id = ?1",
+                                            [id],
+                                            |row| row.get::<_, String>(0),
+                                        )
+                                        .optional()
+                                })
+                                .transpose()?
+                                .flatten()
+                                .is_some_and(|kind| {
+                                    matches!(kind.as_str(), "function" | "method")
+                                }) =>
+                        {
+                            "value_ref"
+                        }
+                        join::BlobRefKind::CallbackRef => "callback_ref",
+                        _ => "call",
+                    },
                     ref_id: ref_id.clone(),
                     source_node,
                     target_node: target_node.clone(),
@@ -1090,6 +1304,7 @@ fn materialize_reading(
                 });
             }
         }
+        rewritten_ref_files.insert(caller_path.clone());
         pending_refs.push(PendingRefRow {
             ref_id,
             caller_node,
@@ -1112,8 +1327,21 @@ fn materialize_reading(
             target_symbol,
             relink,
         });
+        // Every row is emitted; the batch bounds temporary ownership, not output.
+        if private_cold && pending_refs.len() >= 4096 {
+            let (_, refs) = profile.measure(WritePhase::Refs, &transaction, || {
+                write_pending_refs(&transaction, &pending_refs, false)
+            })?;
+            let (_, edges) = profile.measure(WritePhase::Edges, &transaction, || {
+                write_pending_edges(&transaction, &pending_edges, false)
+            })?;
+            stats.inserted += refs + edges;
+            pending_refs.clear();
+            pending_edges.clear();
+        }
     }
     drop(load_refs);
+    drop((nodes, loaded_paths));
     #[cfg(test)]
     drop(control_lookup);
     let edges_deleted = profile.measure(WritePhase::Edges, &transaction, || {
@@ -1128,80 +1356,13 @@ fn materialize_reading(
             let deleted = ref_deletes.iter().try_fold(0, |count, ref_id| {
                 delete.execute([ref_id]).map(|written| count + written)
             })?;
-            let mut insert = transaction.prepare(
-                "INSERT OR REPLACE INTO refs
-                 (ref_id, caller_node, caller_file, kind, short_name, full_ref, module_path,
-                  import_kind, local_name, requested_name, namespace_alias, wildcard, line,
-                  byte_start, byte_end, status, target_node, target_file, target_symbol, provenance, callee_last_segment)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                         ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
-            )?;
-            let mut relinked = 0;
-            let mut owned = 0;
-            for row in &pending_refs {
-                let written = insert.execute(params![
-                    row.ref_id,
-                    row.caller_node,
-                    row.caller_file,
-                    row.kind,
-                    row.short_name,
-                    row.full_ref,
-                    row.module_path,
-                    row.import_kind,
-                    row.local_name,
-                    row.requested_name,
-                    row.namespace_alias,
-                    i64::from(row.wildcard),
-                    i64::from(row.line),
-                    row.byte_start as i64,
-                    row.byte_end as i64,
-                    row.status,
-                    row.target_node,
-                    row.target_file,
-                    row.target_symbol,
-                    PROVENANCE_TREESITTER,
-                    row.short_name.as_deref().map(crate::callgraph_store::callee_last_segment),
-                ])?;
-                if row.relink {
-                    relinked += written;
-                } else {
-                    owned += written;
-                }
-            }
+            let (relinked, owned) =
+                write_pending_refs(&transaction, &pending_refs, changed.is_some())?;
             Ok((deleted, relinked, owned))
         })?;
-    let (relinked_edges, owned_edges) = profile.measure(
-        WritePhase::Edges,
-        &transaction,
-        || -> rusqlite::Result<_> {
-            let mut insert = transaction.prepare(
-                "INSERT OR REPLACE INTO edges
-                 (edge_id, ref_id, source_node, target_node, target_file, target_symbol,
-                  kind, line, provenance)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'call', ?7, ?8)",
-            )?;
-            let mut relinked = 0;
-            let mut owned = 0;
-            for row in &pending_edges {
-                let written = insert.execute(params![
-                    format!("edge:{}", row.ref_id),
-                    row.ref_id,
-                    row.source_node,
-                    row.target_node,
-                    row.target_file,
-                    row.target_symbol,
-                    i64::from(row.line),
-                    PROVENANCE_TREESITTER,
-                ])?;
-                if row.relink {
-                    relinked += written;
-                } else {
-                    owned += written;
-                }
-            }
-            Ok((relinked, owned))
-        },
-    )?;
+    let (relinked_edges, owned_edges) = profile.measure(WritePhase::Edges, &transaction, || {
+        write_pending_edges(&transaction, &pending_edges, changed.is_some())
+    })?;
     stats.relinked_deleted += refs_deleted + edges_deleted;
     stats.relinked_inserted += relinked_refs + relinked_edges;
     stats.inserted += owned_refs + owned_edges;
@@ -1209,6 +1370,11 @@ fn materialize_reading(
         eprintln!("view_profile emission identical_refs_skipped={identical_refs} stats={stats:?}");
     }
     profile.finish("emit_refs_edges");
+    if changed.is_some() {
+        profile.measure(WritePhase::DeleteRows, &transaction, || {
+            stable_rows::prune(&transaction)
+        })?;
+    }
     for phase in [
         WritePhase::Files,
         WritePhase::Nodes,
@@ -1221,18 +1387,28 @@ fn materialize_reading(
         // A table with no emitted rows is still an observed zero, not a missing timer.
         profile.observe_empty(phase);
     }
-    // Secondary indexes remain live because updating them as rows change is cheaper
-    // than rebuilding them; that maintenance cost is included in row-phase timings.
+    // The offline deferred-index control rebuilds after the bulk graph load.
+    // Dispatch needs these indexes for its per-file ref and node lookups.
+    #[cfg(test)]
+    if deferred_indexes {
+        let phase = PhaseProbe::start(&transaction);
+        crate::callgraph_store::create_cold_build_secondary_indexes(&transaction)?;
+        profile.record(WritePhase::IndexMaintenance, phase.finish(&transaction));
+    }
     profile.observe_empty(WritePhase::IndexMaintenance);
-    let ordinary_edge_refs = pending_edges
-        .iter()
-        .map(|edge| edge.ref_id.clone())
-        .collect::<HashSet<_>>();
-    let rewritten_ref_files = pending_refs
-        .iter()
-        .map(|row| row.caller_file.clone())
-        .collect::<BTreeSet<_>>();
-    let dispatch_work = dispatch::emit(
+    drop((pending_refs, pending_edges, ref_deletes, existing));
+    let mut dispatch_inputs = dispatch::DecodedFiles::default();
+    for (path, emission) in &parsed {
+        if !dispatch_reuse || changed_strings.contains(path) {
+            if let Some(parse) = emission.blob.parse() {
+                dispatch_inputs.insert(path.clone(), parse)?;
+            }
+        }
+    }
+    drop(parsed);
+    #[cfg(test)]
+    crate::test_allocations::heap_marker("materialization", "dispatch_inputs_only");
+    let dispatch_work = dispatch::emit_from_decoded(
         &transaction,
         manifest,
         reader,
@@ -1243,6 +1419,7 @@ fn materialize_reading(
             type_targets: &joined.dispatch_type_targets,
             reuse: dispatch_reuse,
         },
+        dispatch_inputs,
     )?;
     stats.dispatch_decoded_blobs = dispatch_work.decoded_blobs;
     stats.dispatch_resolved_files = dispatch_work.resolved_files;
@@ -1266,6 +1443,13 @@ fn materialize_reading(
         work.dispatch_type_target_files
             .fetch_add(joined.dispatch_type_targets.len() as u64, Relaxed);
     }
+    drop((
+        joined.dispatch_type_targets,
+        joined.resolved_callers,
+        joined.rebuilt_surface_paths,
+        ordinary_edge_refs,
+        rewritten_ref_files,
+    ));
     profile.finish("dispatch");
     let mut commit_stage = profile::StageTimer::new("commit");
     set_meta_ready(&transaction, true)?;
@@ -1285,6 +1469,9 @@ fn materialize_reading(
         .then(|| profile::wal_len(database_path));
     commit_stage.finish("metadata", format_args!(""));
     transaction.commit()?;
+    if relaxed {
+        finish_private_database(&connection)?;
+    }
     if let Some(wal_before) = wal_before_commit {
         let autocheckpoint = connection
             .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get::<_, i64>(0))
@@ -1300,22 +1487,29 @@ fn materialize_reading(
         commit_stage.finish("sqlite_commit", format_args!(""));
     }
     profile.finish("commit");
+    #[cfg(test)]
+    tests::dirty_pages::finish(dirty_probe, &connection);
     if let Some(probe) = write_probe {
         probe.finish(&connection, database_path);
     }
-    // Include destruction in the bracket: freeing decoded blobs and closing
-    // SQLite handles happens before the caller observes materialization complete.
-    drop((parsed, nodes, cached));
-    drop(joined.bindings);
+    // Graph inputs have already been released before dispatch. Close SQLite
+    // before the caller observes materialization completion too.
     profile.finish("cleanup_memory");
     drop(connection);
+    if let Some(unpublished) = unpublished.as_mut() {
+        unpublished.complete();
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if private_cold {
+        crate::memory::relieve_allocator_pressure();
+    }
     profile.finish("cleanup_connections");
     Ok((stats, profile.into_timings()))
 }
 
 struct ManifestViewBlobReader<'a> {
     connection: &'a Connection,
-    decoded: RefCell<HashMap<String, Arc<join::CallgraphBlob>>>,
+    decoded: RefCell<HashMap<String, std::sync::Weak<join::CallgraphBlob>>>,
 }
 
 impl<'a> ManifestViewBlobReader<'a> {
@@ -1345,8 +1539,13 @@ impl<'a> ManifestViewBlobReader<'a> {
         &self,
         full_key: &str,
     ) -> std::result::Result<Option<Arc<join::CallgraphBlob>>, join::ManifestJoinError> {
-        if let Some(blob) = self.decoded.borrow().get(full_key) {
-            return Ok(Some(blob.clone()));
+        if let Some(blob) = self
+            .decoded
+            .borrow()
+            .get(full_key)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return Ok(Some(blob));
         }
         let Some(payload) = self.read_payload(full_key)? else {
             return Ok(None);
@@ -1354,7 +1553,7 @@ impl<'a> ManifestViewBlobReader<'a> {
         let blob = Arc::new(join::CallgraphBlob::from_bytes(&payload)?);
         self.decoded
             .borrow_mut()
-            .insert(full_key.to_string(), blob.clone());
+            .insert(full_key.to_string(), Arc::downgrade(&blob));
         Ok(Some(blob))
     }
 }
@@ -1385,8 +1584,13 @@ impl join::ManifestBlobReader for ManifestViewBlobReader<'_> {
         let mut pending = HashMap::<&str, usize>::new();
         let mut order = Vec::with_capacity(full_keys.len());
         for key in full_keys {
-            if let Some(blob) = self.decoded.borrow().get(*key) {
-                order.push(Some(Ok(blob.clone())));
+            if let Some(blob) = self
+                .decoded
+                .borrow()
+                .get(*key)
+                .and_then(std::sync::Weak::upgrade)
+            {
+                order.push(Some(Ok(blob)));
                 continue;
             }
             if let Some(position) = pending.get(key) {
@@ -1410,7 +1614,7 @@ impl join::ManifestBlobReader for ManifestViewBlobReader<'_> {
         let decoded = if payloads.len() > 1 {
             rayon::ThreadPoolBuilder::new()
                 .num_threads(crate::callgraph_store::build_pool_size())
-                .thread_name(|index| format!("aft-view-decode-{index}"))
+                .thread_name(|index| format!("aft-rayon-view-decode-{index}"))
                 .build()
                 .map_or_else(|_| decode(), |pool| pool.install(decode))
         } else {
@@ -1427,7 +1631,7 @@ impl join::ManifestBlobReader for ManifestViewBlobReader<'_> {
                     break;
                 }
             };
-            cache.insert((*key).to_string(), blob.clone());
+            cache.insert((*key).to_string(), Arc::downgrade(&blob));
             blobs.push(Some(blob));
         }
         Ok(blobs)
@@ -1448,6 +1652,8 @@ const fn manifest_ref_kind(kind: join::BlobRefKind) -> &'static str {
     match kind {
         join::BlobRefKind::Call => "call",
         join::BlobRefKind::ValueRef => "value_ref",
+        join::BlobRefKind::Construction => "construction",
+        join::BlobRefKind::CallbackRef => "callback_ref",
         join::BlobRefKind::Import => "import",
         join::BlobRefKind::Module => "module",
         join::BlobRefKind::Reexport => "reexport",
@@ -1477,8 +1683,61 @@ pub(crate) fn configure_materialization_connection(connection: &Connection) -> R
     Ok(())
 }
 
+fn configure_private_connection(connection: &Connection) -> Result<()> {
+    connection.busy_timeout(Duration::from_secs(5))?;
+    // No reader can reach this generation. Errors discard the entire file, and
+    // restart sweeping discards interrupted builds instead of recovering them.
+    connection.pragma_update(None, "journal_mode", "OFF")?;
+    connection.pragma_update(None, "synchronous", "OFF")?;
+    connection.pragma_update(None, "temp_store", "MEMORY")?;
+    // The builder already owns decoded graph inputs. Avoid another 256 MiB
+    // of mapped resident pages; sealed readers retain their normal policy.
+    connection.pragma_update(None, "mmap_size", 0)?;
+    Ok(())
+}
+
+fn finish_private_database(connection: &Connection) -> Result<()> {
+    connection.pragma_update(None, "journal_mode", "DELETE")?;
+    connection.pragma_update(None, "synchronous", "FULL")?;
+    // Sync the writer's own VFS file, never a second descriptor: closing a
+    // second descriptor could release this process's SQLite locks.
+    use rusqlite::ffi;
+    let mut file: *mut ffi::sqlite3_file = std::ptr::null_mut();
+    // SAFETY: the connection and returned VFS file remain owned and open for
+    // this call; FILE_POINTER writes one sqlite3_file pointer to the out slot.
+    let result = unsafe {
+        ffi::sqlite3_file_control(
+            connection.handle(),
+            c"main".as_ptr(),
+            ffi::SQLITE_FCNTL_FILE_POINTER,
+            std::ptr::from_mut(&mut file).cast(),
+        )
+    };
+    if result != ffi::SQLITE_OK {
+        return Err(rusqlite::Error::SqliteFailure(ffi::Error::new(result), None).into());
+    }
+    // SAFETY: SQLite's main file exposes the VFS methods while its owning
+    // connection is alive. Fail closed if the VFS cannot provide xSync.
+    let sync = unsafe {
+        file.as_ref()
+            .and_then(|file| file.pMethods.as_ref())
+            .and_then(|methods| methods.xSync)
+    }
+    .ok_or_else(|| CallGraphStoreError::Unavailable("private derived VFS has no xSync".into()))?;
+    let result = unsafe { sync(file, ffi::SQLITE_SYNC_FULL) };
+    if result != ffi::SQLITE_OK {
+        return Err(rusqlite::Error::SqliteFailure(ffi::Error::new(result), None).into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use tests::dirty_pages::open_probe_connection;
+#[cfg(test)]
+pub(crate) use tests::dirty_pages::publication::{probe_checkpoint, probe_connection, probe_wal};
 
 // The measurement harness reads process CPU time through getrusage.
 #[cfg(all(test, unix))]
@@ -1681,6 +1940,7 @@ struct OwnedFileRow {
 }
 
 struct OwnedNodeRow {
+    is_test: Option<bool>,
     id: String,
     file_path: String,
     name: String,
@@ -1721,6 +1981,7 @@ struct PendingRefRow {
 }
 
 struct PendingEdgeRow {
+    kind: &'static str,
     ref_id: String,
     source_node: String,
     target_node: Option<String>,
@@ -1728,6 +1989,120 @@ struct PendingEdgeRow {
     target_symbol: String,
     line: u32,
     relink: bool,
+}
+
+fn write_pending_refs(
+    transaction: &rusqlite::Transaction<'_>,
+    rows: &[PendingRefRow],
+    preserve_rowids: bool,
+) -> rusqlite::Result<(usize, usize)> {
+    let mut relinked = 0;
+    let mut owned = 0;
+    for row in rows {
+        let written = stable_rows::write(
+            transaction,
+            "refs",
+            &[
+                "ref_id",
+                "caller_node",
+                "caller_file",
+                "kind",
+                "short_name",
+                "full_ref",
+                "module_path",
+                "import_kind",
+                "local_name",
+                "requested_name",
+                "namespace_alias",
+                "wildcard",
+                "line",
+                "byte_start",
+                "byte_end",
+                "status",
+                "target_node",
+                "target_file",
+                "target_symbol",
+                "provenance",
+                "callee_last_segment",
+            ],
+            params![
+                row.ref_id,
+                row.caller_node,
+                row.caller_file,
+                row.kind,
+                row.short_name,
+                row.full_ref,
+                row.module_path,
+                row.import_kind,
+                row.local_name,
+                row.requested_name,
+                row.namespace_alias,
+                i64::from(row.wildcard),
+                i64::from(row.line),
+                row.byte_start as i64,
+                row.byte_end as i64,
+                row.status,
+                row.target_node,
+                row.target_file,
+                row.target_symbol,
+                PROVENANCE_TREESITTER,
+                row.short_name
+                    .as_deref()
+                    .map(crate::callgraph_store::callee_last_segment)
+            ],
+            preserve_rowids,
+        )?;
+        if row.relink {
+            relinked += written;
+        } else {
+            owned += written;
+        }
+    }
+    Ok((relinked, owned))
+}
+
+fn write_pending_edges(
+    transaction: &rusqlite::Transaction<'_>,
+    rows: &[PendingEdgeRow],
+    preserve_rowids: bool,
+) -> rusqlite::Result<(usize, usize)> {
+    let mut relinked = 0;
+    let mut owned = 0;
+    for row in rows {
+        let written = stable_rows::write(
+            transaction,
+            "edges",
+            &[
+                "edge_id",
+                "ref_id",
+                "source_node",
+                "target_node",
+                "target_file",
+                "target_symbol",
+                "kind",
+                "line",
+                "provenance",
+            ],
+            params![
+                format!("edge:{}", row.ref_id),
+                row.ref_id,
+                row.source_node,
+                row.target_node,
+                row.target_file,
+                row.target_symbol,
+                row.kind,
+                i64::from(row.line),
+                PROVENANCE_TREESITTER
+            ],
+            preserve_rowids,
+        )?;
+        if row.relink {
+            relinked += written;
+        } else {
+            owned += written;
+        }
+    }
+    Ok((relinked, owned))
 }
 
 struct EmissionParse {

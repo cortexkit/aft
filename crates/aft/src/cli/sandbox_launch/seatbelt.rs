@@ -56,6 +56,7 @@ fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
         "(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write* (literal \"/dev/null\"))\n",
     );
     render_signal_scope(&mut source, profile);
+    render_secret_memory_boundary(&mut source, profile);
 
     for root in profile.write_allow_roots() {
         source.push_str(&format!(
@@ -144,6 +145,7 @@ fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
 fn render_relaxed_profile(profile: &SandboxProfile) -> Result<String, String> {
     let mut source = String::from("(version 1)\n(allow default)\n");
     render_signal_scope(&mut source, profile);
+    render_secret_memory_boundary(&mut source, profile);
     for path in &profile.write_deny {
         source.push_str(&format!(
             "(deny file-write* {})\n",
@@ -240,6 +242,42 @@ fn render_relaxed_profile(profile: &SandboxProfile) -> Result<String, String> {
     Ok(source)
 }
 
+fn render_secret_memory_boundary(source: &mut String, profile: &SandboxProfile) {
+    if profile.secret_proxy {
+        source.push_str("(deny mach-priv-task-port)\n");
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn secret_bash_task_ports_are_denied_only_for_secret_profiles() {
+    let root = tempfile::tempdir().unwrap();
+    let mut profile = SandboxProfile::build(
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        root.path().to_owned(),
+    )
+    .unwrap();
+    for mode in [
+        aft::config::SandboxMode::Strict,
+        aft::config::SandboxMode::Relaxed,
+    ] {
+        profile.mode = mode;
+        profile.secret_proxy = false;
+        let ordinary = render_profile(&profile).unwrap();
+        assert!(!ordinary.contains("mach-priv-task-port"));
+        profile.secret_proxy = true;
+        let secret = render_profile(&profile).unwrap();
+        assert!(secret.contains("(deny mach-priv-task-port)\n"));
+        assert_eq!(secret.replace("(deny mach-priv-task-port)\n", ""), ordinary);
+    }
+}
+
 fn render_signal_scope(source: &mut String, profile: &SandboxProfile) {
     if !profile.worker_jail {
         return;
@@ -248,6 +286,9 @@ fn render_signal_scope(source: &mut String, profile: &SandboxProfile) {
     // identical profile. Host-side AFT cancellation remains available across
     // commands; a command may signal only processes in its own sandbox.
     source.push_str("(deny signal)\n(allow signal (target same-sandbox))\n");
+    // Signal 0 existence probes deliver no signal; scripts use their success
+    // to judge liveness, including for processes outside this command.
+    source.push_str("(allow signal (signal-number 0))\n");
 }
 
 fn render_worker_keychain_denies(
@@ -517,6 +558,77 @@ fn escape_path(path: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    // Seatbelt rendering is macOS-only in production, and this fixture builds
+    // the /var -> /private/var alias with a Unix symlink.
+    #[cfg(unix)]
+    #[test]
+    fn scoped_var_folder_grants_render_canonical_write_and_read_allows() {
+        use aft::access_policy::{AccessGrant, AccessOperation, AccessPolicy, GrantKind};
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let real = root.join("private/var/folders");
+        let project = real.join("project");
+        let data = real.join("private-data");
+        let write = data.join("write");
+        let read = data.join("read");
+        let home = root.join("home");
+        let temp = root.join("temp");
+        for path in [&project, &write, &read, &home, &temp] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::os::unix::fs::symlink(root.join("private/var"), root.join("var")).unwrap();
+        let alias = root.join("var/folders");
+        let alias_write = alias.join("private-data/write");
+        let alias_read = alias.join("private-data/read");
+        let mut policy = AccessPolicy::from_config(
+            &aft::config::Config::default(),
+            &root.join("store"),
+            vec![alias.join("project")],
+            &home,
+        );
+        policy.grants = vec![
+            AccessGrant {
+                path: alias_write.clone(),
+                operation: AccessOperation::Write,
+                kind: GrantKind::Subtree,
+            },
+            AccessGrant {
+                path: alias_read.clone(),
+                operation: AccessOperation::Read,
+                kind: GrantKind::Subtree,
+            },
+        ];
+        let mut profile = policy.compile_shell(temp, Vec::new(), Vec::new()).unwrap();
+        // Seatbelt reads are default-allowed. A data-store deny makes the held
+        // read capability observable as a narrow exception to that deny.
+        profile.data_policy.deny.push(alias.join("private-data"));
+        let profile: SandboxProfile =
+            serde_json::from_slice(&serde_json::to_vec(&profile).unwrap()).unwrap();
+        let profile = profile.canonicalize_for_launch().unwrap();
+        assert!(profile.writable_roots.contains(&write));
+        assert!(profile.data_policy.read_allow.contains(&read));
+        let source = render_profile(&profile).unwrap();
+        let write = escape_path(&write).unwrap();
+        let read = escape_path(&read).unwrap();
+        let data = escape_path(&data).unwrap();
+        assert!(
+            source.contains(&format!("(allow file-write* (subpath \"{write}\"))")),
+            "{source}"
+        );
+        assert!(source.contains(&format!(
+            "(deny file-write* (require-all (subpath \"{data}\") (require-not (subpath \"{write}\"))))"
+        )), "{source}");
+        assert!(source.contains(&format!(
+            "(deny file-read* (require-all (subpath \"{data}\") (require-not (subpath \"{read}\")) (require-not (subpath \"{write}\"))))"
+        )), "{source}");
+        for alias_path in [&alias_write, &alias_read] {
+            assert!(
+                !source.contains(&format!("\"{}\"", escape_path(alias_path).unwrap())),
+                "{source}"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -541,9 +653,11 @@ mod tests {
             profile.worker_jail = false;
             let operator = render_profile(&profile).unwrap();
             assert!(!operator.contains("(deny signal)"));
+            assert!(!operator.contains("(signal-number 0)"));
             profile.worker_jail = true;
             let source = render_profile(&profile).unwrap();
             assert!(source.contains("(deny signal)\n(allow signal (target same-sandbox))\n"));
+            assert!(source.contains("(allow signal (signal-number 0))\n"));
             assert!(!source.contains("(target pgrp)"));
         }
     }
@@ -770,6 +884,7 @@ mod tests {
         std::fs::create_dir_all(&nested_deny).expect("nested deny directory");
         std::fs::create_dir_all(&task_temp).expect("task temp directory");
         let profile = SandboxProfile {
+            secret_proxy: false,
             v: 1,
             mode: aft::config::SandboxMode::Strict,
             worker_jail: false,
@@ -812,6 +927,7 @@ mod tests {
             .map(|path| path.parent().unwrap().to_path_buf())
             .collect::<Vec<_>>();
         let mut profile = SandboxProfile {
+            secret_proxy: false,
             v: 1,
             mode: aft::config::SandboxMode::Strict,
             worker_jail: false,

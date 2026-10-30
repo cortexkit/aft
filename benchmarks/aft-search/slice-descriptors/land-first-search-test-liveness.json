@@ -1,0 +1,12 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/commands/semantic_search/mod.rs"
+  ],
+  "note": "Test-only: the two first-search tests prove refusal and liveness instead of a 1 s wall-clock bound; production changes are cfg(test) walk counters only, so ranking rows are byte-identical. Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}

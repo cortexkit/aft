@@ -69,7 +69,7 @@ fn seeded_dispatch_incremental_equals_independent_cold_through_switches() {
     let seed = dir.path().join("seed.sqlite");
     materialize_manifest_view_database(&seed, &blob_path, &manifests[0]).unwrap();
     let incremental = dir.path().join("incremental.sqlite");
-    std::fs::copy(&seed, &incremental).unwrap();
+    crate::views::generation::clone_derived_for_test(&seed, &incremental).unwrap();
     let mut previous = 0;
     for (step, next) in [1, 2, 0, 2, 1, 0].into_iter().enumerate() {
         apply_manifest_diff(
@@ -499,7 +499,7 @@ fn site_whose_caller_has_no_node_gets_no_method_call_edge() {
         let database = dir
             .path()
             .join(format!("without-caller-{row_by_row}.sqlite"));
-        std::fs::copy(&base, &database).unwrap();
+        crate::views::generation::clone_derived_for_test(&base, &database).unwrap();
         emit_without_caller_node(&database, &blob_path, &manifest, row_by_row);
         databases.push(database);
     }
@@ -551,7 +551,7 @@ fn ordinary_edge_on_a_method_call_site_ref_is_deleted() {
         let database = dir
             .path()
             .join(format!("ordinary-edge-{row_by_row}.sqlite"));
-        std::fs::copy(&base, &database).unwrap();
+        crate::views::generation::clone_derived_for_test(&base, &database).unwrap();
         let mut connection = Connection::open(&database).unwrap();
         let transaction = connection.transaction().unwrap();
         transaction

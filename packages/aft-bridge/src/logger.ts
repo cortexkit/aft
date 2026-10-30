@@ -11,6 +11,8 @@
  */
 export interface Logger {
   log(message: string, meta?: LogMeta): void;
+  /** Optional for compatibility with hosts predating DEBUG forwarding. */
+  debug?(message: string, meta?: LogMeta): void;
   warn(message: string, meta?: LogMeta): void;
   error(message: string, meta?: LogMeta): void;
   /**
@@ -21,6 +23,8 @@ export interface Logger {
 }
 
 export interface LogMeta {
+  /** Already persisted by the engine; durable plugin sinks must not copy it. */
+  engineRecord?: boolean;
   /** Optional session id for correlating multi-session host activity. */
   sessionId?: string;
   /** Optional structured metadata (pid, exit code, etc.). */

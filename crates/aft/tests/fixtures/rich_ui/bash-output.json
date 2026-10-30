@@ -1,0 +1,332 @@
+{
+  "lineRule": "One item is one physical line without LF/CRLF terminator, or a whole-unit part of an oversized line. Bare CR is text. bytes includes the consumed terminator on the final part; it is a source-byte count, not decoded UTF-8 text length.",
+  "continuedRule": "continued is true on all non-final parts of the same physical line and false on its last part. A running unterminated suffix is withheld until LF/CRLF, terminal EOF, or enough lookahead proves another nonempty part follows. No zero-byte closure items are emitted.",
+  "ordering": "Per-stream byte order only. Each poll reads at most one 64 KiB backend page per stream and emits stdout parts before stderr parts, within item/page limits; a deferred stream keeps its offset. There is no recoverable chronological interleave between separate stdout/stderr artifacts. PTY uses only stream pty in its combined capture order.",
+  "nextRule": "next is a task-bound opaque cursor carrying per-stream positions and a monotonic read sequence. Every successful non-terminal-drained page increments that sequence, so even a no-progress read returns a different cursor at the same positions. Null only after terminal status and complete drain. Tampered, foreign-task and malformed cursors refuse malformed_cursor.",
+  "cursorOffsets": "original once a durable per-stream prefix base exists; legacy unknown-origin cursors must remain explicitly unknown/retained-relative and never claim original zero",
+  "startRule": "No cursor starts at original zero on an untrimmed stream, or at the first available original offset after a trim. Each item repeats that stream firstAvailableOffset/prefixDropped; the page must not label a retained tail as original line 1.",
+  "retention": {
+    "perStreamBytes": 104857600,
+    "when": "terminal output handling",
+    "method": "atomic UTF-8-aligned tail replacement; no promise to keep the beginning",
+    "untrimmed": {
+      "firstAvailableOffset": 0,
+      "prefixDropped": false
+    },
+    "trackedTrim": {
+      "firstAvailableOffset": 4096,
+      "prefixDropped": true
+    },
+    "legacyTrim": {
+      "firstAvailableOffset": null,
+      "prefixDropped": true
+    }
+  },
+  "storageDependency": "The later bash_output/storage slice must durably initialize and maintain each stream cumulative dropped-prefix base in the task record at every trim, preserving it across restart and accumulating further removals. Cursor offsets are original offsets; clamp unread positions below the retained base to that base. Legacy tasks trimmed before tracking may use null only with prefixDropped true. Never emit base zero for a trimmed stream.",
+  "sources": {
+    "paging": "crates/aft/src/commands/bash_status.rs:244-305,403-430; crates/aft/src/bash_background/registry.rs:1663-1667,1979-2054",
+    "cap": "crates/aft/src/bash_background/buffer.rs:14,356-369",
+    "replacement": "crates/aft/src/bash_background/persistence.rs:4380-4398",
+    "currentPrefixMetadata": "crates/aft/src/bash_background/registry.rs:13018,13145-13149 (transient recovery text, not a durable stream base)"
+  },
+  "vectors": [
+    {
+      "name": "lf-crlf-and-empty-lines",
+      "terminal": true,
+      "raw": {
+        "stdout": [
+          111,
+          110,
+          101,
+          10,
+          13,
+          10,
+          116,
+          119,
+          111,
+          13,
+          10
+        ]
+      },
+      "page": {
+        "items": [
+          {
+            "stream": "stdout",
+            "text": "one",
+            "bytes": 4,
+            "continued": false,
+            "firstAvailableOffset": 0,
+            "prefixDropped": false
+          },
+          {
+            "stream": "stdout",
+            "text": "",
+            "bytes": 2,
+            "continued": false,
+            "firstAvailableOffset": 0,
+            "prefixDropped": false
+          },
+          {
+            "stream": "stdout",
+            "text": "two",
+            "bytes": 5,
+            "continued": false,
+            "firstAvailableOffset": 0,
+            "prefixDropped": false
+          }
+        ],
+        "next": null
+      }
+    },
+    {
+      "name": "invalid-utf8-line",
+      "terminal": true,
+      "raw": {
+        "stdout": [
+          255,
+          10
+        ]
+      },
+      "page": {
+        "items": [
+          {
+            "stream": "stdout",
+            "text": "�",
+            "bytes": 2,
+            "continued": false,
+            "firstAvailableOffset": 0,
+            "prefixDropped": false
+          }
+        ],
+        "next": null
+      }
+    },
+    {
+      "name": "oversized-line-parts",
+      "terminal": true,
+      "raw": {
+        "stdout": {
+          "repeatByte": 120,
+          "count": 8191,
+          "suffix": [
+            121,
+            10
+          ],
+          "sha256": "3b76096d7f649fe3064dadfd3d985024e51af3a6709919ddbfcefc6286f4f58f"
+        }
+      },
+      "page": {
+        "items": [
+          {
+            "stream": "stdout",
+            "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "bytes": 8191,
+            "continued": true,
+            "firstAvailableOffset": 0,
+            "prefixDropped": false
+          },
+          {
+            "stream": "stdout",
+            "text": "y",
+            "bytes": 2,
+            "continued": false,
+            "firstAvailableOffset": 0,
+            "prefixDropped": false
+          }
+        ],
+        "next": null
+      }
+    },
+    {
+      "name": "running-exhausted-read",
+      "terminal": false,
+      "raw": {
+        "stdout": []
+      },
+      "page": {
+        "items": [],
+        "next": "opaque-cursor-at-current-offsets"
+      }
+    },
+    {
+      "name": "running-unterminated-tail",
+      "terminal": false,
+      "raw": {
+        "stdout": [
+          119,
+          97,
+          105,
+          116
+        ]
+      },
+      "page": {
+        "items": [],
+        "next": "opaque-cursor-before-unclosed-line"
+      }
+    },
+    {
+      "name": "tracked-trim",
+      "terminal": true,
+      "raw": {
+        "stdout": [
+          116,
+          97,
+          105,
+          108,
+          10
+        ]
+      },
+      "page": {
+        "items": [
+          {
+            "stream": "stdout",
+            "text": "tail",
+            "bytes": 5,
+            "continued": false,
+            "firstAvailableOffset": 4096,
+            "prefixDropped": true
+          }
+        ],
+        "next": null
+      }
+    },
+    {
+      "name": "legacy-unknown-origin",
+      "terminal": true,
+      "raw": {
+        "stdout": [
+          116,
+          97,
+          105,
+          108,
+          10
+        ]
+      },
+      "page": {
+        "items": [
+          {
+            "stream": "stdout",
+            "text": "tail",
+            "bytes": 5,
+            "continued": false,
+            "firstAvailableOffset": null,
+            "prefixDropped": true
+          }
+        ],
+        "next": null
+      }
+    },
+    {
+      "name": "stdout-before-stderr-not-chronology",
+      "terminal": true,
+      "raw": {
+        "stdout": [
+          111,
+          10
+        ],
+        "stderr": [
+          101,
+          10
+        ]
+      },
+      "page": {
+        "items": [
+          {
+            "stream": "stdout",
+            "text": "o",
+            "bytes": 2,
+            "continued": false,
+            "firstAvailableOffset": 0,
+            "prefixDropped": false
+          },
+          {
+            "stream": "stderr",
+            "text": "e",
+            "bytes": 2,
+            "continued": false,
+            "firstAvailableOffset": 0,
+            "prefixDropped": false
+          }
+        ],
+        "next": null
+      }
+    }
+  ],
+  "cursorContract": {
+    "opaque": true,
+    "positions": "per-stream original positions once a durable prefix base exists",
+    "readSequence": "strictly increasing by one along each cursor chain, no wrap; not a clock or per-task database counter",
+    "binding": "keyed MAC or task-bound encoding authenticates positions and sequence against the viewed task and session",
+    "noProgress": "next differs from request even when positions are equal",
+    "refusalCode": "malformed_cursor",
+    "fixedMessage": "The page cursor is invalid for this read.",
+    "frameRetry": "Identical frame-key replay returns the already stored body, including cursor; use a fresh frame key for a fresh page evaluation."
+  },
+  "cursorVectors": [
+    {
+      "name": "no-progress",
+      "request": {
+        "cursor": "opaque-task-A-seq7-at0",
+        "positions": {
+          "stdout": 0,
+          "stderr": 0
+        },
+        "readSequence": 7
+      },
+      "response": {
+        "next": "opaque-task-A-seq8-at0",
+        "positions": {
+          "stdout": 0,
+          "stderr": 0
+        },
+        "readSequence": 8
+      }
+    },
+    {
+      "name": "progress",
+      "request": {
+        "cursor": "opaque-task-A-seq8-at0",
+        "positions": {
+          "stdout": 0,
+          "stderr": 0
+        },
+        "readSequence": 8
+      },
+      "response": {
+        "next": "opaque-task-A-seq9-at6",
+        "positions": {
+          "stdout": 6,
+          "stderr": 0
+        },
+        "readSequence": 9
+      }
+    },
+    {
+      "name": "terminal-drained",
+      "request": {
+        "cursor": "opaque-task-A-seq9-at6",
+        "positions": {
+          "stdout": 6,
+          "stderr": 0
+        },
+        "readSequence": 9
+      },
+      "response": {
+        "next": null
+      }
+    },
+    {
+      "name": "tampered",
+      "refusal": "malformed_cursor"
+    },
+    {
+      "name": "foreign-task",
+      "refusal": "malformed_cursor"
+    },
+    {
+      "name": "malformed",
+      "refusal": "malformed_cursor"
+    }
+  ],
+  "cursorVectorNote": "Cursor strings are symbolic contract vectors, not the future implementation encoding; positions/sequence are explanatory test metadata, never extra page-body members."
+}

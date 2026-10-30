@@ -151,6 +151,29 @@ pub fn finalize_tool_response(
     attach_command: &str,
     allow_bg_completions: bool,
 ) {
+    finalize_tool_response_with_visibility(
+        response,
+        text,
+        ctx,
+        session_id,
+        attach_command,
+        allow_bg_completions,
+        true,
+    );
+}
+
+/// Native plugin calls share tool dispatch with agent calls, but their replies are not
+/// shown to the agent. They must leave cancelled-call notices pending for a visible reply.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finalize_tool_response_with_visibility(
+    response: &mut Response,
+    text: &mut String,
+    ctx: &AppContext,
+    session_id: &str,
+    attach_command: &str,
+    allow_bg_completions: bool,
+    agent_visible: bool,
+) {
     let (publish, counts) = finalize_prefix(
         response,
         ctx,
@@ -158,7 +181,9 @@ pub fn finalize_tool_response(
         attach_command,
         allow_bg_completions,
     );
-    append_cancelled_call_notices(text, ctx, session_id, attach_command);
+    if agent_visible {
+        append_cancelled_call_notices(response, text, ctx, session_id);
+    }
     if let Some(line) = status_bar_line(ctx, publish, attach_command, session_id, counts) {
         append_trailing_line(text, &line);
     }
@@ -175,6 +200,19 @@ fn acknowledge_terminal_bash_reply(
     command: &str,
 ) {
     if !response.success || !matches!(command, "bash" | "bash_watch") {
+        return;
+    }
+    // A fast background child can exit before its launch reply is built. That
+    // reply has a terminal status but only launch guidance in `output`; only a
+    // foreground result includes the command's `output_preview`. Acknowledging
+    // launch guidance would discard a queued completion or suppress its later
+    // publication, even though the caller has not received the result.
+    if command == "bash"
+        && !response
+            .data
+            .get("output_preview")
+            .is_some_and(Value::is_string)
+    {
         return;
     }
     if !response
@@ -196,19 +234,19 @@ fn acknowledge_terminal_bash_reply(
     }
 }
 
-/// A bash-family reply names tasks the session has not heard about: commands
+/// An agent-visible reply names tasks the session has not heard about: commands
 /// still running after their waiting call was cancelled, and commands stopped
 /// by an owner cancellation. The registry supplies the appropriate status for each.
-fn append_cancelled_call_notices(
+pub(crate) fn append_cancelled_call_notices(
+    response: &Response,
     text: &mut String,
     ctx: &AppContext,
     session_id: &str,
-    command: &str,
 ) {
-    if !matches!(
-        command,
-        "bash" | "powershell" | "bash_status" | "bash_watch" | "bash_kill" | "bash_write"
-    ) {
+    // An internal access ask is held for consent and replaced by a later tool reply.
+    if response.data.get("code").and_then(Value::as_str)
+        == Some(crate::access_policy::ACCESS_ASK_REQUIRED)
+    {
         return;
     }
     for line in ctx
@@ -1339,7 +1377,9 @@ pub fn query_pending(
     let pending = ctx.pending_changes_for_query(callgraph_command);
     (
         watcher_command && pending.watcher,
-        Some(pending.callgraph).filter(|changes| callgraph_command && !changes.is_empty()),
+        Some(pending.callgraph).filter(|changes| {
+            callgraph_command && (!changes.is_empty() || changes.observe_reconciles())
+        }),
     )
 }
 
@@ -1362,6 +1402,10 @@ pub fn attach_callgraph_pending_gaps(
         return;
     };
     if !response.success {
+        return;
+    }
+    let pending = pending.resolved();
+    if pending.is_empty() {
         return;
     }
     let Some(data) = response.data.as_object_mut() else {
@@ -1391,6 +1435,12 @@ pub fn attach_callgraph_pending_gaps(
         added.push(serde_json::json!({
             "kind": "view_pending",
             "reason": "checkout changes not yet installed in the call graph",
+        }));
+    }
+    if pending.whole_store {
+        added.push(serde_json::json!({
+            "kind": "callgraph_pending",
+            "reason": STORE_PENDING_REASON,
         }));
     }
     let gaps = data
@@ -1524,7 +1574,7 @@ mod checkout_transport_tests {
         ctx.set_heavy_root_work_allowed(true);
         let owner = crate::views::registry::FamilyRegistry::open(storage, "family")
             .unwrap()
-            .register_view("local", storage)
+            .register_view_with_storage(storage, "local", storage)
             .unwrap();
         let manifest = ManifestV2::new(ManifestHeader {
             producers: Producers {
@@ -1603,6 +1653,8 @@ mod callgraph_pending_tests {
             store_paths: store.iter().map(|path| path.to_string()).collect(),
             view_paths: view.iter().map(|path| path.to_string()).collect(),
             whole_checkout,
+            whole_store: false,
+            reconcile_query: None,
         }
     }
 

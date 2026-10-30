@@ -7,6 +7,7 @@ import {
   readSync,
   statSync,
 } from "node:fs";
+import { join } from "node:path";
 import {
   isOrtAutoDownloadSupported,
   resolveCortexKitProjectConfigPath,
@@ -95,6 +96,7 @@ export interface HarnessDiagnostic {
     /** True when the directory exists and is readable + writable. */
     accessible: boolean;
     sizesByKey: Record<string, number>;
+    cacheRoot?: string;
     legacyDuplication?: LegacyPartitionDuplicationSummary;
   };
   onnxRuntime: {
@@ -247,6 +249,7 @@ async function diagnoseHarness(adapter: HarnessAdapter): Promise<HarnessDiagnost
       exists: existsSync(storage),
       accessible: storageAccessible,
       sizesByKey: describeStorage,
+      ...(pluginLoad.cacheDir ? { cacheRoot: join(pluginLoad.cacheDir, "aft") } : {}),
       ...(legacyDuplication.totalPartitions > 0 ? { legacyDuplication } : {}),
     },
     onnxRuntime: {

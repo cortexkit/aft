@@ -1,0 +1,9 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "note": "Second merge-queue flake batch: test drains and fixtures plus the call-graph reopen ordering fix in context.rs. No search, ranking or routing code changes."
+}

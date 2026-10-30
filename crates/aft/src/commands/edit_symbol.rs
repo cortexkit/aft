@@ -130,7 +130,11 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // LSP-enhanced disambiguation (S03)
     let filtered = if let Some(hints) = lsp_hints::parse_lsp_hints(req) {
-        lsp_hints::apply_lsp_disambiguation(filtered, &hints)
+        lsp_hints::apply_lsp_disambiguation(
+            filtered,
+            &hints,
+            &ctx.resolve_relative_path(Path::new(".")),
+        )
     } else {
         filtered
     };
@@ -319,7 +323,9 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     // Write, format, and validate via shared pipeline
+    let tool_policy = &crate::sandbox_spawn::ToolLaunchPolicy::for_request(ctx);
     let mut write_result = match edit::write_format_validate_observed(
+        tool_policy,
         &path,
         &new_source,
         &ctx.config(),

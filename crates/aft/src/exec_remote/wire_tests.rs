@@ -11,6 +11,22 @@ pub(crate) fn id() -> Uuid {
     "0192a64a-1234-7000-8000-000000000001".parse().unwrap()
 }
 
+pub(crate) fn cancel_exit_status_unknown_terminal() -> TerminalRecord {
+    // The captured tree hash is redacted; its value supplies no process-liveness proof.
+    serde_json::from_value(json!({
+        "job_id": "01a16b6f-5136-775f-a4f9-0ff89d117615",
+        "outcome": {"type": "outcome_unknown"},
+        "killed": "cancel",
+        "wall_ms": 61620,
+        "queue_wait_ms": 27,
+        "bundle_bytes": 487115,
+        "ran": "remote",
+        "tree_hash": "f6be28c…",
+        "workspace_changes": []
+    }))
+    .unwrap()
+}
+
 /// The terminal record of a published `crate-local-server-reports-*` vector
 /// (see `fixtures/SOURCE.md`), after checking its bytes against the published
 /// SHA-256. Its job ID is [`id`].
@@ -91,10 +107,30 @@ pub(crate) fn signer_refusal(detail: &str, retry_after_ms: Option<u64>) -> Termi
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy)]
 pub(crate) enum Script {
+    SubmissionFreshReplyLost,
+    SubmissionGapExpired {
+        unknown: bool,
+    },
+    Submission {
+        never_accepted: bool,
+        mismatch: bool,
+        always_unknown: bool,
+        disconnect: bool,
+    },
     Lost,
     Refused,
+    /// Hold the first record until `acceptance_gate`, then refuse without Accepted.
+    GatedPreStartRefusal {
+        reason: &'static str,
+        detail: Option<&'static str>,
+    },
     Restart,
     Cancel,
+    /// Hold the run stream open until cancellation; attach returns this terminal.
+    CancelTerminal {
+        terminal: fn() -> TerminalRecord,
+        stderr: &'static str,
+    },
     CancelRefused,
     MissingTerminal,
     KnownRefused,
@@ -192,6 +228,24 @@ pub(crate) enum Script {
     QueueWaitOwner {
         holder: Uuid,
     },
+    /// Answer the run with this published chunked-return vector's records,
+    /// after an acceptance when the vector has none. A replay vector starts
+    /// past seq 0, so empty output stands in for the seqs before it. An
+    /// attach replays the vector's records from the requested seq.
+    ReturnVector(&'static str),
+    /// Like `ReturnVector`, but the terminal record reports these
+    /// checkout-relative paths as changed, as ck-motor's Linux runner does
+    /// (its list includes untracked files; it sends no separate list).
+    ReturnVectorReporting(&'static str, &'static [&'static str]),
+    /// Refuse the run with ck-motor's pinned final refusal for return_paths
+    /// on a runner that does not copy files back.
+    ReturnPathsUnsupported,
+    /// Like `ReturnVector`, but nothing is sent, not even the acceptance,
+    /// until `Daemon::acceptance_gate` is notified.
+    GatedReturnVector(&'static str),
+    /// The published expired replay reshaped as ck-motor sends it: its
+    /// 10-byte file had one chunk, so the manifest follows at seq 4.
+    MotorExpiredReplay,
 }
 
 pub(crate) struct Daemon {
@@ -272,6 +326,7 @@ pub(crate) async fn daemon_with_capabilities(
     let claims: Vec<String> = claims.iter().map(|claim| (*claim).to_string()).collect();
     let server = tokio::spawn(async move {
         let mut runs = 0;
+        let mut submission: Option<Value> = None;
         for _ in 0..clients {
             let (mut socket, _) = listener.accept().await.unwrap();
             subc_transport::authenticate_server(
@@ -327,9 +382,136 @@ pub(crate) async fn daemon_with_capabilities(
                 },
                 FrameType::Request => {
                     match body["method"].as_str().unwrap() {
+                        "exec.run" if matches!(script, Script::ReturnPathsUnsupported) => {
+                            let terminal: Value = serde_json::from_str(include_str!("fixtures/motor/return-paths-unsupported.json")).unwrap();
+                            replies.push(reply(FrameType::StreamData, terminal));
+                            replies.push(Frame::build_with_version(header.ver, FrameType::StreamEnd, header.flags, header.channel, header.epoch, header.corr, vec![]).unwrap());
+                        }
+                        "exec.attach" if matches!(script, Script::ReturnVector(_)) => {
+                            // Replay the vector from the requested seq, as a
+                            // runner that still keeps the job's files does.
+                            let Script::ReturnVector(name) = script else { unreachable!() };
+                            let from = body["params"]["from_seq"].as_u64().unwrap();
+                            for record in super::return_vectors::return_vector_records(name) {
+                                let seq = match &record {
+                                    StreamRecord::Accepted(_) => continue,
+                                    StreamRecord::Started(started) => Some(started.seq),
+                                    StreamRecord::Output(output) => Some(output.seq),
+                                    StreamRecord::ReturnChunk(chunk) => Some(chunk.seq),
+                                    StreamRecord::ReturnManifest(manifest) => Some(manifest.seq),
+                                    _ => None,
+                                };
+                                if seq.is_none_or(|seq| seq >= from) {
+                                    replies.push(reply(FrameType::StreamData, serde_json::to_value(record).unwrap()));
+                                }
+                            }
+                            replies.push(Frame::build_with_version(header.ver, FrameType::StreamEnd, header.flags, header.channel, header.epoch, header.corr, vec![]).unwrap());
+                        }
+                        "exec.run" if matches!(script, Script::ReturnVector(_) | Script::ReturnVectorReporting(..) | Script::GatedReturnVector(_) | Script::MotorExpiredReplay) => {
+                            let records = match script {
+                                Script::ReturnVector(name) | Script::ReturnVectorReporting(name, _) | Script::GatedReturnVector(name) => super::return_vectors::return_vector_records(name),
+                                _ => super::return_vectors::motor_expired_replay(4, None),
+                            };
+                            if !matches!(records.first(), Some(StreamRecord::Accepted(_))) {
+                                replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(Accepted::new(id(), 1))).unwrap()));
+                            }
+                            // A replay vector starts after the records the caller
+                            // already had; stand in for them with empty output.
+                            let first_seq = records.iter().find_map(|record| match record {
+                                StreamRecord::Started(started) => Some(started.seq),
+                                StreamRecord::Output(output) => Some(output.seq),
+                                StreamRecord::ReturnChunk(chunk) => Some(chunk.seq),
+                                StreamRecord::ReturnManifest(manifest) => Some(manifest.seq),
+                                _ => None,
+                            }).unwrap_or(0);
+                            let mut records = records.into_iter();
+                            if let Some(accepted) = records.as_slice().first().filter(|record| matches!(record, StreamRecord::Accepted(_))).cloned() {
+                                records.next();
+                                replies.push(reply(FrameType::StreamData, serde_json::to_value(accepted).unwrap()));
+                            }
+                            for seq in 0..first_seq {
+                                replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Output(Output::new(seq, OutputStream::Stdout, BytePayload(Vec::new())))).unwrap()));
+                            }
+                            for mut record in records {
+                                if let (Script::ReturnVectorReporting(_, reported), StreamRecord::Terminal(terminal)) = (script, &mut record) {
+                                    terminal.workspace_changes = Some(reported.iter().map(|path| path.to_string()).collect());
+                                }
+                                replies.push(reply(FrameType::StreamData, serde_json::to_value(record).unwrap()));
+                            }
+                            replies.push(Frame::build_with_version(header.ver, FrameType::StreamEnd, header.flags, header.channel, header.epoch, header.corr, vec![]).unwrap());
+                            if matches!(script, Script::GatedReturnVector(_)) {
+                                // Hold every record, acceptance included, until the test releases them.
+                                let frames = std::mem::take(&mut replies);
+                                let writer = writer.clone();
+                                let gate = server_acceptance_gate.clone();
+                                producers.push(tokio::spawn(async move {
+                                    gate.notified().await;
+                                    for frame in frames {
+                                        let _ = subc_transport::write_frame(&mut *writer.lock().await, &frame).await;
+                                    }
+                                }));
+                            }
+                        }
                         "exec.run" | "exec.attach" => {
                             let attaching = body["method"] == "exec.attach";
                             if !attaching { runs += 1; }
+                            if matches!(script, Script::SubmissionFreshReplyLost) {
+                                if runs == 1 {
+                                    replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Terminal(TerminalRecord::new(
+                                        Uuid::from_bytes([0x77;16]), Outcome::RefusedBeforeStart { reason: RefusalReason::SubmissionNeverAccepted }, 0, 0, 0,
+                                    ))).unwrap()));
+                                    replies.push(reply(FrameType::StreamEnd, Value::Null));
+                                }
+                                // Later requests may be running, but provide no admission or result.
+                            } else if let Script::SubmissionGapExpired { unknown } = script {
+                                let initial = !attaching && runs == 1;
+                                if initial {
+                                    replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(Accepted::new(id(), 1))).unwrap()));
+                                    for (seq, bytes) in [(0, b"A".to_vec()), (2, b"C".to_vec())] {
+                                        replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Output(Output::new(seq, OutputStream::Stdout, BytePayload(bytes)))).unwrap()));
+                                    }
+                                }
+                                let outcome = if initial { Outcome::Exit { code: 0 } } else if unknown { Outcome::OutcomeUnknown } else { Outcome::HistoryExpired };
+                                replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Terminal(TerminalRecord::new(id(), outcome, 0, 0, 0))).unwrap()));
+                                replies.push(reply(FrameType::StreamEnd, Value::Null));
+                            } else if let Script::Submission { never_accepted, mismatch, always_unknown, disconnect } = script {
+                                let mut request = body["params"].clone();
+                                request.as_object_mut().unwrap().remove("progress");
+                                let cursor = request.as_object_mut().unwrap().remove("resume_from_seq").and_then(|v| v.as_u64());
+                                let keyed = request["submission_key"].is_string();
+                                let same_key = keyed && submission.as_ref().is_some_and(|old| old["submission_key"] == request["submission_key"]);
+                                let refusal = same_key && (mismatch || submission.as_ref() != Some(&request) || never_accepted);
+                                let unknown = runs == 1 || always_unknown;
+                                if !same_key { submission = Some(request); }
+                                if refusal {
+                                    // Refusals have their own ID, never the existing job's ID.
+                                    let mut refusal_id = [0x77; 16];
+                                    refusal_id[8..].copy_from_slice(&(runs as u64).to_be_bytes());
+                                    let record = TerminalRecord::new(Uuid::from_bytes(refusal_id), Outcome::RefusedBeforeStart {
+                                        reason: if never_accepted { RefusalReason::SubmissionNeverAccepted } else { RefusalReason::RequestRejected }
+                                    }, 0, 0, 0).with_refusal_detail(if never_accepted { "submission_never_accepted" } else { "submission_key_mismatch" });
+                                    replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Terminal(record)).unwrap()));
+                                } else {
+                                    if !(never_accepted && unknown) {
+                                        replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(Accepted::new(id(), 1).with_attached(same_key))).unwrap()));
+                                        // ck-motor's keyed replay cursor is exclusive. Without a cursor
+                                        // it replays the whole stream, including already delivered lines.
+                                        let from = cursor.map_or(0, |seq| seq + 1);
+                                        let end = if unknown { 2 } else { 4 };
+                                        for seq in from..end {
+                                            replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Output(Output::new(seq, OutputStream::Stdout, BytePayload(format!("line-{seq}\n").into_bytes())))).unwrap()));
+                                        }
+                                    }
+                                    if !(disconnect && runs == 1) {
+                                        replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Terminal(TerminalRecord::new(id(), if unknown { Outcome::OutcomeUnknown } else { Outcome::Exit { code: 0 } }, 0, 0, 0))).unwrap()));
+                                    }
+                                }
+                                if !(disconnect && runs == 1) { replies.push(reply(FrameType::StreamEnd, Value::Null)); }
+                            } else {
+                            if !attaching && body["params"]["progress"] == true && claims.iter().any(|claim| claim == PROGRESS_CAPABILITY) {
+                                let progress = Progress::new(ProgressPhase::Upload, 14_000, Some("plain <detail>".into())).unwrap();
+                                replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Progress(progress)).unwrap()));
+                            }
                             let draining = matches!(script, Script::Draining { refusals, .. } | Script::DiskFull { refusals, .. } | Script::SignerRefused { refusals, .. } if runs <= refusals)
                                 || matches!(script, Script::DrainingThenSigner { signer_refusals, .. } if runs <= 1 + signer_refusals)
                                 || matches!(script, Script::DrainingGatedAcceptance) && runs == 1;
@@ -341,7 +523,7 @@ pub(crate) async fn daemon_with_capabilities(
                                 // Drop the connection and listener with the run in flight.
                                 return;
                             }
-                            if !attaching && !draining && !matches!(script, Script::Refused | Script::KnownRefused | Script::WorkspaceSetupRefused | Script::RefusedWithDetail | Script::NetworkUnsupported | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::GatedAdmission { .. } | Script::DrainingGatedAcceptance) {
+                            if !attaching && !draining && !matches!(script, Script::Refused | Script::GatedPreStartRefusal { .. } | Script::KnownRefused | Script::WorkspaceSetupRefused | Script::RefusedWithDetail | Script::NetworkUnsupported | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::GatedAdmission { .. } | Script::DrainingGatedAcceptance) {
                                 let mut accepted = Accepted::new(id(), if let Script::Staged { position, .. } | Script::GatedStages { position } = script { position } else { 1 });
                                 if matches!(script, Script::Windows { acknowledge: true, .. }) {
                                     accepted = accepted.with_platform(Platform::Windows);
@@ -377,7 +559,7 @@ pub(crate) async fn daemon_with_capabilities(
                                     Script::Windows { code: None, .. } => Outcome::OutcomeUnknown,
                                     _ => Outcome::Exit { code: 0 },
                                 }};
-                            if matches!(script, Script::Cancel | Script::CancelRefused | Script::Continuous | Script::GappedCancel | Script::Staged { .. } | Script::GatedStages { .. } | Script::Started | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::GatedAdmission { .. } | Script::DrainingGatedAcceptance) && !attaching && !draining { /* held-open run stream */ }
+                            if matches!(script, Script::Cancel | Script::CancelTerminal { .. } | Script::CancelRefused | Script::Continuous | Script::GappedCancel | Script::Staged { .. } | Script::GatedStages { .. } | Script::Started | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::GatedPreStartRefusal { .. } | Script::GatedAdmission { .. } | Script::DrainingGatedAcceptance) && !attaching && !draining { /* held-open run stream */ }
                             else if attaching && matches!(script, Script::GappedAttach | Script::GappedCancel) { /* output is sent below; completion waits for the test's release */ }
                             else {
                                 if matches!(script, Script::Restart) {
@@ -437,6 +619,12 @@ pub(crate) async fn daemon_with_capabilities(
                                         }
                                     }
                                     if cancelled && !matches!(script, Script::PersistentTerminalGap | Script::TransientTerminalGap | Script::TerminalGapOnce) { terminal = terminal.with_killed(Killed::Cancel); }
+                                    if let (true, true, Script::CancelTerminal { terminal: record, stderr }) = (attaching, cancelled, script) {
+                                        terminal = record();
+                                        if !stderr.is_empty() {
+                                            replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Output(Output::new(0, OutputStream::Stderr, BytePayload(stderr.as_bytes().to_vec())))).unwrap()));
+                                        }
+                                    }
                                     if matches!(script, Script::Deadline) { terminal = terminal.with_killed(Killed::Deadline); }
                                     if matches!(script, Script::Reported) { terminal = report_vector("all"); }
                                     if matches!(script, Script::Utf8) {
@@ -446,6 +634,7 @@ pub(crate) async fn daemon_with_capabilities(
                                     replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Terminal(terminal)).unwrap()));
                                 }
                                 replies.push(Frame::build_with_version(header.ver, FrameType::StreamEnd, header.flags, header.channel, header.epoch, header.corr, vec![]).unwrap());
+                            }
                             }
                         },
                         "exec.cancel" if matches!(script, Script::CancelRefused) => replies.push(reply(FrameType::Error, json!({"code":"cancel_refused","message":"runner unavailable"}))),
@@ -461,6 +650,17 @@ pub(crate) async fn daemon_with_capabilities(
                     subc_transport::write_frame(&mut *writer.lock().await, &response)
                         .await
                         .unwrap();
+                }
+                if matches!(
+                    script,
+                    Script::Submission {
+                        disconnect: true,
+                        ..
+                    }
+                ) && runs == 1
+                    && body["method"] == "exec.run"
+                {
+                    break;
                 }
                 if let Script::GatedAdmission { refuse } = script {
                     if body["method"] == "exec.run" {
@@ -537,6 +737,7 @@ pub(crate) async fn daemon_with_capabilities(
                     Script::GatedAcceptance
                         | Script::GatedAcceptanceThenExit
                         | Script::GatedAcceptanceThenRefused
+                        | Script::GatedPreStartRefusal { .. }
                 ) || matches!(script, Script::DrainingGatedAcceptance) && runs > 1)
                     && body["method"] == "exec.run"
                 {
@@ -544,22 +745,27 @@ pub(crate) async fn daemon_with_capabilities(
                     let gate = server_acceptance_gate.clone();
                     producers.push(tokio::spawn(async move {
                         gate.notified().await;
-                        let accepted = Frame::build_with_version(
-                            header.ver,
-                            FrameType::StreamData,
-                            header.flags,
-                            header.channel,
-                            header.epoch,
-                            header.corr,
-                            serde_json::to_vec(&StreamRecord::Accepted(Accepted::new(id(), 1)))
-                                .unwrap(),
-                        )
-                        .unwrap();
-                        let _ =
-                            subc_transport::write_frame(&mut *writer.lock().await, &accepted).await;
+                        if !matches!(script, Script::GatedPreStartRefusal { .. }) {
+                            let accepted = Frame::build_with_version(
+                                header.ver,
+                                FrameType::StreamData,
+                                header.flags,
+                                header.channel,
+                                header.epoch,
+                                header.corr,
+                                serde_json::to_vec(&StreamRecord::Accepted(Accepted::new(id(), 1)))
+                                    .unwrap(),
+                            )
+                            .unwrap();
+                            let _ =
+                                subc_transport::write_frame(&mut *writer.lock().await, &accepted)
+                                    .await;
+                        }
                         if matches!(
                             script,
-                            Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused
+                            Script::GatedAcceptanceThenExit
+                                | Script::GatedAcceptanceThenRefused
+                                | Script::GatedPreStartRefusal { .. }
                         ) {
                             let record = |ty, body: Vec<u8>| {
                                 Frame::build_with_version(
@@ -573,17 +779,24 @@ pub(crate) async fn daemon_with_capabilities(
                                 )
                                 .unwrap()
                             };
-                            let outcome = if matches!(script, Script::GatedAcceptanceThenRefused) {
-                                Outcome::RefusedBeforeStart {
-                                    reason: RefusalReason::Unreachable,
-                                }
-                            } else {
-                                Outcome::Exit { code: 0 }
-                            };
-                            let terminal = serde_json::to_vec(&StreamRecord::Terminal(
-                                TerminalRecord::new(id(), outcome, 1, 0, 0),
-                            ))
-                            .unwrap();
+                            let outcome =
+                                if let Script::GatedPreStartRefusal { reason, .. } = script {
+                                    Outcome::RefusedBeforeStart {
+                                        reason: RefusalReason::Unknown(reason.into()),
+                                    }
+                                } else if matches!(script, Script::GatedAcceptanceThenRefused) {
+                                    Outcome::RefusedBeforeStart {
+                                        reason: RefusalReason::Unreachable,
+                                    }
+                                } else {
+                                    Outcome::Exit { code: 0 }
+                                };
+                            let mut terminal = TerminalRecord::new(id(), outcome, 1, 0, 0);
+                            if let Script::GatedPreStartRefusal { detail, .. } = script {
+                                terminal.refusal_detail = detail.map(str::to_owned);
+                            }
+                            let terminal =
+                                serde_json::to_vec(&StreamRecord::Terminal(terminal)).unwrap();
                             for frame in [
                                 record(FrameType::StreamData, terminal),
                                 record(FrameType::StreamEnd, vec![]),
@@ -903,6 +1116,15 @@ fn outage_job_records() -> Vec<StreamRecord> {
 
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) async fn outage_daemon() -> OutageDaemon {
+    outage_daemon_with_started_job(true).await
+}
+
+#[cfg(unix)]
+pub(crate) async fn queued_outage_daemon() -> OutageDaemon {
+    outage_daemon_with_started_job(false).await
+}
+
+async fn outage_daemon_with_started_job(started: bool) -> OutageDaemon {
     use std::sync::atomic::{AtomicBool, Ordering};
     use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1024,11 +1246,13 @@ pub(crate) async fn outage_daemon() -> OutageDaemon {
                                         id(),
                                         1,
                                     ))));
-                                    for job_record in &outage_job_records()[..2] {
-                                        replies.push(record(job_record));
+                                    if started {
+                                        for job_record in &outage_job_records()[..2] {
+                                            replies.push(record(job_record));
+                                        }
                                     }
-                                    // The provider restarts: its route closes with the job
-                                    // still running, and it stays away until restored.
+                                    // The provider restarts while the job is still queued or running.
+                                    // Its route closes, and the provider stays unavailable until restored.
                                     up.store(false, Ordering::SeqCst);
                                     drop_route = true;
                                 }
@@ -1123,7 +1347,7 @@ async fn drain(stream: &mut RemoteStream, sink: &mut MemorySink) -> Result<Verdi
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match stream.next(sink).await? {
-                StreamProgress::Record => {}
+                StreamProgress::Record | StreamProgress::AdmissionProgress => {}
                 StreamProgress::Complete(verdict) => return Ok(verdict),
             }
         }
@@ -1180,6 +1404,50 @@ async fn daemon_route_uses_hyphenated_capability_and_dotted_operations() {
             .filter_map(|(_, body)| body["method"].as_str())
             .collect();
         assert_eq!(operations, ["exec.run", "exec.status", "exec.cancel"]);
+    }
+}
+
+#[tokio::test]
+async fn remote_progress_is_requested_only_with_the_advertised_capability() {
+    for supported in [false, true] {
+        let claims = if supported {
+            vec![client::CAPABILITY, PROGRESS_CAPABILITY]
+        } else {
+            vec![client::CAPABILITY]
+        };
+        let daemon = daemon_with_capabilities(Script::Utf8, &claims, 1).await;
+        let client = client(&daemon).await;
+        // Enable a default request on a new executor, but remove a saved
+        // opt-in when today's executor no longer advertises progress.
+        let request = RunRequest::new("/workspace", "/src/repo", "/workspace", "test")
+            .with_progress(!supported);
+        let mut stream = client.run(&request).await.unwrap();
+        let mut sink = MemorySink::default();
+        if supported {
+            assert_eq!(
+                stream.next(&mut sink).await.unwrap(),
+                StreamProgress::AdmissionProgress
+            );
+            assert!(!stream.received_frame());
+            assert_eq!(stream.resume_point(), None);
+            assert!(sink.seqs.is_empty());
+        }
+        assert_eq!(
+            drain(&mut stream, &mut sink).await.unwrap(),
+            Verdict::Exited { code: 0 }
+        );
+        let log = daemon.log.lock().unwrap();
+        let run = log
+            .iter()
+            .find(|(_, body)| body["method"] == "exec.run")
+            .unwrap();
+        assert_eq!(
+            run.1["params"]["progress"].as_bool().unwrap_or(false),
+            supported
+        );
+        if !supported {
+            assert!(run.1["params"].get("progress").is_none());
+        }
     }
 }
 

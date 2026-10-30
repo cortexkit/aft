@@ -61,6 +61,11 @@ pub struct OutlineEntry {
 ///
 /// Output is capped at 30KB; if exceeded, truncates with a narrowing hint.
 pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
+    let _fetch_temp = super::url_resolution::FetchTempScope::enter();
+    ctx.with_read_policy_snapshot(&req.id, || handle_outline_with_snapshot(req, ctx))
+}
+
+fn handle_outline_with_snapshot(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut response = crate::bounded_io::command(req, ctx, handle_outline_inner);
     super::url_output::redact_url_cache_paths(req, ctx, &mut response);
     super::read_manifest::normalize_response_content_files(ctx, &mut response.data);
@@ -127,8 +132,7 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         let (rendered, skipped_files) = match outline_many_files(
             &files,
             ctx,
-            &req.id,
-            req.session(),
+            req,
             project_root.as_deref(),
             &excluded,
             MultiFileBudget {
@@ -145,11 +149,12 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         let mut body = serde_json::json!({
             "text": rendered.text,
             "discovered": true,
-            "complete": !walk_incomplete && !rendered.truncated && !rendered.cut_short,
+            "complete": !skipped_files.iter().any(|file| file.reason == "denied_floor") && !walk_incomplete && !rendered.truncated && !rendered.cut_short && !rendered.content_incomplete,
             "output_truncated": rendered.truncated,
             "files_shown": rendered.shown,
             "structure_footer": rendered.footer,
             "walk_truncated": discovery.walk_truncated,
+            "entries_examined": discovery.entries_examined,
             "collection_truncated": discovery.collection_truncated,
             "skipped_foreign_mounts": discovery.skipped_foreign_mounts,
             "skipped_files": skipped_files,
@@ -171,8 +176,7 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         let (rendered, skipped_files) = match outline_many_files(
             &files,
             ctx,
-            &req.id,
-            req.session(),
+            req,
             project_root.as_deref(),
             &excluded,
             MultiFileBudget {
@@ -192,7 +196,7 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         // left unexamined by the file cap, output budget or deadline.
         let mut body = serde_json::json!({
             "text": rendered.text,
-            "complete": skipped_files.is_empty() && !rendered.truncated && !rendered.cut_short,
+            "complete": skipped_files.is_empty() && !rendered.truncated && !rendered.cut_short && !rendered.content_incomplete,
             "output_truncated": rendered.truncated,
             "files_shown": rendered.shown,
             "structure_footer": rendered.footer,
@@ -223,6 +227,12 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
+    outline_single_target(req, ctx, file)
+}
+
+/// Resolve and outline one target, sharing URL fetching and rendering between
+/// single-target calls and entries in a batch.
+fn outline_single_target(req: &RawRequest, ctx: &AppContext, file: &str) -> Response {
     if is_github_read_target(file) {
         return handle_github_outline(req, ctx, file);
     }
@@ -1495,6 +1505,11 @@ fn build_outline_gitignore(
     if !ignore_file.is_file() {
         return None;
     }
+    if crate::project_content::storage_root_for_path(ignore_file).is_some()
+        || crate::db::file_identity::is_live_sqlite_file(ignore_file)
+    {
+        return None;
+    }
     let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
     let _ = builder.add(ignore_file);
     builder.build().ok().map(Arc::new)
@@ -1563,10 +1578,22 @@ fn handle_outline_files_mode(
     let mut collection_truncated = false;
     let mut skipped_foreign_mounts = 0usize;
     let mut empty_targets = Vec::new();
+    let mut skipped_files = Vec::new();
 
     for target in targets {
+        if is_http_url(&target) {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                "files mode requires directory targets; URLs aren't directories",
+            );
+        }
         let dir_path = match ctx.validate_read_path(&req.id, req.session(), Path::new(&target)) {
             Ok(path) => path,
+            Err(response) if multiple_targets && response.data["code"] == "denied_floor" => {
+                skipped_files.push(SkippedFile::new(&target, "denied_floor"));
+                continue;
+            }
             Err(response) => return response,
         };
         // In a confined call, refuse a directory outside the confined root or
@@ -1599,6 +1626,18 @@ fn handle_outline_files_mode(
         discovery
             .files
             .retain(|file| !is_read_excluded(&excluded, Path::new(file)));
+        let mut admitted_files = Vec::new();
+        for file in std::mem::take(&mut discovery.files) {
+            match ctx.validate_read_path(&req.id, req.session(), Path::new(&file)) {
+                Ok(_) => admitted_files.push(file),
+                Err(response) if response.data["code"] == "denied_floor" => {
+                    skipped_files.push(SkippedFile::new(file, "denied_floor"));
+                    discovery.ignored_entries += 1;
+                }
+                Err(response) => return response,
+            }
+        }
+        discovery.files = admitted_files;
         entries_examined += discovery.entries_examined;
         walk_truncated |= discovery.walk_truncated;
         collection_truncated |= discovery.collection_truncated;
@@ -1723,6 +1762,7 @@ fn handle_outline_files_mode(
         "complete": !walk_truncated
             && !collection_truncated
             && skipped_foreign_mounts == 0
+            && skipped_files.is_empty()
             && unknown_lines.is_empty(),
         "line_count_gaps": unknown_lines,
         "entries_examined": entries_examined,
@@ -1733,6 +1773,9 @@ fn handle_outline_files_mode(
         "unchecked_files": unchecked_files,
         "rollup_count": rollup_count,
     });
+    if !skipped_files.is_empty() {
+        response_data["skipped_files"] = serde_json::json!(skipped_files);
+    }
     if let Some(env) = envelope {
         response_data["files_list_envelope"] = serde_json::to_value(&env).unwrap();
     }
@@ -2578,16 +2621,31 @@ pub(crate) fn outline_examined_files(req: &RawRequest) -> Vec<&str> {
 fn outline_many_files(
     files: &[String],
     ctx: &AppContext,
-    req_id: &str,
-    session_id: &str,
+    req: &RawRequest,
     project_root: Option<&Path>,
     excluded: &HashSet<PathBuf>,
     budget: MultiFileBudget,
 ) -> Result<(RenderedOutline, Vec<SkippedFile>), Response> {
-    let paths = files
-        .iter()
-        .map(|file| ctx.validate_read_path(req_id, session_id, Path::new(file)))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut paths = Vec::new();
+    let mut admitted_files = Vec::new();
+    // Keep request indices so denied leaves and parse failures share one list.
+    let mut skipped_files: Vec<(usize, SkippedFile)> = Vec::new();
+    for (index, file) in files.iter().enumerate() {
+        if is_http_url(file) {
+            admitted_files.push((index, file, None));
+            continue;
+        }
+        match ctx.validate_read_path(&req.id, req.session(), Path::new(file)) {
+            Ok(path) => {
+                paths.push(path.clone());
+                admitted_files.push((index, file, Some(path)));
+            }
+            Err(response) if response.data["code"] == "denied_floor" => {
+                skipped_files.push((index, SkippedFile::new(file, "denied_floor")));
+            }
+            Err(response) => return Err(response),
+        }
+    }
     let display_root = project_root
         .filter(|root| paths.iter().all(|path| path.starts_with(root)))
         .map(Path::to_path_buf)
@@ -2595,12 +2653,13 @@ fn outline_many_files(
 
     // Visit files in rendering order (stable, so equal display paths keep
     // their request order) so that the budget check below can stop early.
-    let mut ordered = files
-        .iter()
-        .zip(paths)
-        .enumerate()
-        .map(|(index, (file, path))| {
-            let rel_path = display_path(&path, file, display_root.as_deref());
+    let mut ordered = admitted_files
+        .into_iter()
+        .map(|(index, file, path)| {
+            let rel_path = path
+                .as_deref()
+                .map(|path| display_path(path, file, display_root.as_deref()))
+                .unwrap_or_else(|| file.to_string());
             (index, file, path, rel_path)
         })
         .collect::<Vec<_>>();
@@ -2608,7 +2667,6 @@ fn outline_many_files(
 
     let mut writer = MultiFileTreeWriter::new(&budget);
     // Skipped files are reported in request order, keyed by request index.
-    let mut skipped_files: Vec<(usize, SkippedFile)> = Vec::new();
     // One parser for the whole batch, sharing the provider's symbol cache:
     // the syntax check below leaves its tree in this parser's tree cache, and
     // symbol extraction for the same file then reuses that tree instead of
@@ -2623,13 +2681,40 @@ fn outline_many_files(
     let mut fallback_parser = FileParser::new();
 
     for (examined, (index, file, path, rel_path)) in ordered.into_iter().enumerate() {
-        if is_read_excluded(excluded, &path) {
+        if path
+            .as_deref()
+            .is_some_and(|path| is_read_excluded(excluded, path))
+        {
             continue;
         }
         if outline_batch_deadline_reached(examined) {
             writer.stop_at_deadline();
             break;
         }
+        let Some(path) = path else {
+            let response = outline_single_target(req, ctx, file);
+            if !response.success {
+                let code = response.data["code"].as_str().unwrap_or("error");
+                let reason = response.data["message"]
+                    .as_str()
+                    .map(|message| format!("{code}: {message}"))
+                    .unwrap_or_else(|| code.to_string());
+                skipped_files.push((index, SkippedFile::new(file, reason)));
+                continue;
+            }
+            writer.content_incomplete |= response.data["complete"] == false;
+            if !writer.push_text(
+                response.data["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                Vec::new(),
+                None,
+            ) {
+                break;
+            }
+            continue;
+        };
         if crate::bounded_io::metadata(&path).is_err() {
             skipped_files.push((index, SkippedFile::new(file, "file_not_found")));
             continue;
@@ -2645,14 +2730,19 @@ fn outline_many_files(
 
         let structure = match batch_parser.as_mut() {
             Some(parser) => {
-                let structure = batch_file_structure(&path, parser, ctx, req_id, session_id);
+                let structure = batch_file_structure(&path, parser, ctx, &req.id, req.session());
                 // Extraction and test classification share the validated parse tree.
                 parser.evict_parse_tree(&path);
                 structure
             }
             None => {
-                let structure =
-                    fallback_file_structure(&path, &mut fallback_parser, ctx, req_id, session_id);
+                let structure = fallback_file_structure(
+                    &path,
+                    &mut fallback_parser,
+                    ctx,
+                    &req.id,
+                    req.session(),
+                );
                 fallback_parser.evict_parse_tree(&path);
                 structure
             }
@@ -2790,18 +2880,31 @@ fn discover_outline_files_with_options(
             ignored_entries: 0,
         };
     }
-    crate::bounded_io::run(directory, None, move |directory| {
-        Ok(discover_outline_files_unbounded(&directory, breadth_first))
-    })
-    .unwrap_or_else(|_| OutlineFileDiscovery {
+    let initial = OutlineFileDiscovery {
         entries_examined: 0,
         files: Vec::new(),
         directories: Vec::new(),
-        walk_truncated: true,
-        collection_truncated: true,
+        walk_truncated: false,
+        collection_truncated: false,
         skipped_foreign_mounts: 0,
         ignored_entries: 0,
-    })
+    };
+    let deadline = crate::bounded_io::current().map(|budget| budget.deadline);
+    let deadline = deadline.and_then(|at| at.checked_sub(std::time::Duration::from_millis(100)));
+    let (mut discovery, partial) =
+        crate::bounded_io::run_walk(directory, deadline, initial, move |directory, progress| {
+            Ok(discover_outline_files_unbounded(
+                &directory,
+                breadth_first,
+                &progress,
+            ))
+        });
+    if partial.incomplete {
+        discovery.collection_truncated = true;
+    }
+    discovery.files.sort();
+    discovery.directories.sort();
+    discovery
 }
 
 /// The files and directories one outline walk discovers below `directory`
@@ -2815,7 +2918,11 @@ pub(crate) fn discover_outline_paths_for_test(directory: &Path, files_mode: bool
     paths
 }
 
-fn discover_outline_files_unbounded(directory: &Path, breadth_first: bool) -> OutlineFileDiscovery {
+fn discover_outline_files_unbounded(
+    directory: &Path,
+    breadth_first: bool,
+    progress: &crate::bounded_io::WalkProgress<OutlineFileDiscovery>,
+) -> OutlineFileDiscovery {
     let mut files = Vec::new();
     let mut directories = Vec::new();
     let mut entries_examined = 0;
@@ -2839,9 +2946,10 @@ fn discover_outline_files_unbounded(directory: &Path, breadth_first: bool) -> Ou
                 &boundary,
                 &ignore_stack,
                 &mut ignored_entries,
+                progress,
             );
         } else {
-            collect_outline_files_with_device_lookup(
+            entries_examined = collect_outline_files_with_device_lookup(
                 directory,
                 &mut files,
                 &mut directories,
@@ -2850,6 +2958,7 @@ fn discover_outline_files_unbounded(directory: &Path, breadth_first: bool) -> Ou
                 &mut skipped_foreign_mounts,
                 &boundary,
                 crate::walk_boundary::filesystem_device_id,
+                Some(progress),
             );
         }
     } else {
@@ -2895,12 +3004,14 @@ fn collect_outline_files_with_device_lookup<F>(
     skipped_foreign_mounts: &mut usize,
     boundary: &crate::walk_boundary::DeviceBoundary,
     device_lookup: F,
-) where
+    progress: Option<&crate::bounded_io::WalkProgress<OutlineFileDiscovery>>,
+) -> usize
+where
     F: Fn(&Path) -> std::io::Result<Option<u64>> + Copy + Send + Sync + 'static,
 {
     if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
         *walk_truncated = true;
-        return;
+        return 0;
     }
     let skipped_mounts = Arc::new(AtomicUsize::new(0));
     let boundary_failed = Arc::new(AtomicBool::new(false));
@@ -2915,6 +3026,9 @@ fn collect_outline_files_with_device_lookup<F>(
         let boundary_failed = Arc::clone(&boundary_failed);
         let boundary = *boundary;
         builder.filter_entry(move |entry| {
+            if !crate::bounded_io::walk_path(entry.path()) {
+                return false;
+            }
             if !crate::bash_background::registry::safe_task_entry(entry.path()) {
                 return false;
             }
@@ -2956,7 +3070,20 @@ fn collect_outline_files_with_device_lookup<F>(
         });
     }
 
-    for entry in builder.build() {
+    let mut entries_examined = 0;
+    let mut walker = builder.build();
+    loop {
+        if progress.is_some_and(|p| p.stopped()) {
+            *collection_truncated = true;
+            break;
+        }
+        let Some(entry) = walker.next() else {
+            break;
+        };
+        entries_examined += 1;
+        if let Some(progress) = progress {
+            progress.update(|state| state.entries_examined = entries_examined);
+        }
         if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
             *walk_truncated = true;
             break;
@@ -2976,14 +3103,21 @@ fn collect_outline_files_with_device_lookup<F>(
         let path = entry.into_path();
         if file_type.is_dir() {
             directories.push(path.to_string_lossy().to_string());
+            if let Some(progress) = progress {
+                progress.update(|state| state.directories.push(path.to_string_lossy().to_string()));
+            }
         } else if file_type.is_file() {
             files.push(path.to_string_lossy().to_string());
+            if let Some(progress) = progress {
+                progress.update(|state| state.files.push(path.to_string_lossy().to_string()));
+            }
         }
     }
     *skipped_foreign_mounts += skipped_mounts.load(Ordering::Relaxed);
     if boundary_failed.load(Ordering::Relaxed) {
         *collection_truncated = true;
     }
+    entries_examined
 }
 
 fn collect_outline_files_breadth_first_with_device_lookup(
@@ -2996,43 +3130,68 @@ fn collect_outline_files_breadth_first_with_device_lookup(
     boundary: &crate::walk_boundary::DeviceBoundary,
     root_ignore_stack: &OutlineIgnoreStack,
     ignored_entries: &mut usize,
+    progress: &crate::bounded_io::WalkProgress<OutlineFileDiscovery>,
 ) -> usize {
     let root_stack = root_ignore_stack.clone();
-    let mut pending = VecDeque::from([(directory.to_path_buf(), root_stack)]);
+    let mut pending = VecDeque::from([(directory.to_path_buf(), root_stack, false)]);
     let mut entries_examined = 0usize;
 
-    while let Some((current, ignore_stack)) = pending.pop_front() {
+    while let Some((current, inherited_ignores, load_child_rules)) = pending.pop_front() {
+        if progress.stopped() {
+            *collection_truncated = true;
+            return entries_examined;
+        }
+        if !crate::bounded_io::walk_path(&current) {
+            *collection_truncated = true;
+            return entries_examined;
+        }
+        if entries_examined >= ENTRY_BUDGET {
+            *collection_truncated = true;
+            return entries_examined;
+        }
         if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
             *walk_truncated = true;
             return entries_examined;
         }
+        // Load rules only for directories the entry budget lets us enter.
+        let ignore_stack = if load_child_rules {
+            inherited_ignores.for_child_directory(&current)
+        } else {
+            inherited_ignores
+        };
         let Ok(entries) = std::fs::read_dir(&current) else {
             *collection_truncated = true;
             continue;
         };
         let remaining = ENTRY_BUDGET.saturating_sub(entries_examined);
-        let mut entries = entries
-            .take(remaining.saturating_add(1))
-            .collect::<Vec<_>>();
-        entries_examined += entries.len();
-        if entries.len() > remaining {
-            entries.truncate(remaining);
-            *collection_truncated = true;
-        }
-        let mut entries = entries
-            .into_iter()
-            .filter_map(|entry| match entry {
-                Ok(entry) => Some(entry),
-                Err(_) => {
-                    *collection_truncated = true;
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        entries.sort_by_key(|entry| entry.path());
         let mut child_directories = Vec::new();
-        let mut child_files = Vec::new();
-        for entry in entries {
+        let mut entries = entries.take(remaining.saturating_add(1));
+        loop {
+            if progress.stopped() {
+                *collection_truncated = true;
+                return entries_examined;
+            }
+            if !crate::bounded_io::walk_path(&current) {
+                *collection_truncated = true;
+                return entries_examined;
+            }
+            let Some(entry) = entries.next() else {
+                break;
+            };
+            entries_examined += 1;
+            progress.update(|state| state.entries_examined = entries_examined);
+            if entries_examined > ENTRY_BUDGET {
+                *collection_truncated = true;
+                break;
+            }
+            let Ok(entry) = entry else {
+                *collection_truncated = true;
+                continue;
+            };
+            if !crate::bounded_io::walk_path(&entry.path()) {
+                *collection_truncated = true;
+                return entries_examined;
+            }
             if !crate::bash_background::registry::safe_task_entry(&entry.path()) {
                 continue;
             }
@@ -3046,13 +3205,32 @@ fn collect_outline_files_breadth_first_with_device_lookup(
             if file_type.is_dir() {
                 child_directories.push(entry.path());
             } else if file_type.is_file() {
-                child_files.push(entry.path());
+                let path = entry.path();
+                if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
+                    *walk_truncated = true;
+                    continue;
+                }
+                if ignore_stack.is_ignored(&path, false) {
+                    *ignored_entries += 1;
+                } else if ignore_stack.admits(&path) {
+                    files.push(path.to_string_lossy().to_string());
+                    progress.update(|state| state.files.push(path.to_string_lossy().to_string()));
+                }
             }
         }
 
-        // Queue directories before counting sibling files so the traversal keeps
-        // its breadth-first coverage when the 10,000-file limit is reached.
+        // Keep examined directories in the breadth-first queue even when sibling
+        // files fill the file budget.
+        child_directories.sort();
         for path in child_directories {
+            if progress.stopped() {
+                *collection_truncated = true;
+                return entries_examined;
+            }
+            if !crate::bounded_io::walk_path(&path) {
+                *collection_truncated = true;
+                return entries_examined;
+            }
             if should_skip_directory(&path) || ignore_stack.is_ignored(&path, true) {
                 *ignored_entries += 1;
                 continue;
@@ -3063,7 +3241,9 @@ fn collect_outline_files_breadth_first_with_device_lookup(
             match boundary.should_descend(&path) {
                 Ok(true) => {
                     directories.push(path.to_string_lossy().to_string());
-                    pending.push_back((path.clone(), ignore_stack.for_child_directory(&path)));
+                    progress
+                        .update(|state| state.directories.push(path.to_string_lossy().to_string()));
+                    pending.push_back((path, ignore_stack.clone(), true));
                 }
                 Ok(false) => *skipped_foreign_mounts += 1,
                 Err(_) => {
@@ -3073,17 +3253,10 @@ fn collect_outline_files_breadth_first_with_device_lookup(
             }
         }
 
-        for path in child_files {
-            if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
-                *walk_truncated = true;
-                return entries_examined;
-            }
-            if ignore_stack.is_ignored(&path, false) {
-                *ignored_entries += 1;
-            } else if ignore_stack.admits(&path) {
-                files.push(path.to_string_lossy().to_string());
-            }
-        }
+        progress.update(|state| {
+            state.ignored_entries = *ignored_entries;
+            state.skipped_foreign_mounts = *skipped_foreign_mounts;
+        });
         if *collection_truncated {
             return entries_examined;
         }
@@ -3470,6 +3643,8 @@ struct RenderedOutline {
     cut_short: bool,
     /// Outlining stopped because the request deadline was close.
     deadline_reached: bool,
+    /// A shown URL was incomplete even though its outline fit the batch budget.
+    content_incomplete: bool,
     shown: usize,
     footer: String,
     /// The files whose outlines were rendered, as a sorted set like every
@@ -3508,11 +3683,12 @@ struct MultiFileTreeWriter {
     files_capped: bool,
     /// Outlining stopped near the request deadline.
     deadline_reached: bool,
+    content_incomplete: bool,
     files_shown: usize,
     content_files: BTreeSet<PathBuf>,
     /// Where each shown file's text starts in `output`, and its path, so a
     /// longer deadline footer can take back the last file if it must.
-    shown_blocks: Vec<(usize, PathBuf)>,
+    shown_blocks: Vec<(usize, Option<PathBuf>)>,
     /// Path components of the last shown file, for directory grouping.
     prev_parts: Vec<String>,
     max_bytes: usize,
@@ -3521,7 +3697,7 @@ struct MultiFileTreeWriter {
     trailer_reserve: usize,
     /// A rendered file that fits only if no trailer follows it, which is
     /// known only once no later file is offered.
-    pending: Option<(String, Vec<String>, PathBuf)>,
+    pending: Option<(String, Vec<String>, Option<PathBuf>)>,
 }
 
 impl MultiFileTreeWriter {
@@ -3541,6 +3717,7 @@ impl MultiFileTreeWriter {
             truncated: false,
             files_capped: budget.files_capped,
             deadline_reached: false,
+            content_incomplete: false,
             files_shown: 0,
             content_files: BTreeSet::new(),
             shown_blocks: Vec::new(),
@@ -3568,15 +3745,6 @@ impl MultiFileTreeWriter {
     /// spent: this file and every later one would not be shown, so the
     /// caller stops outlining files.
     fn push(&mut self, fo: &FileOutline) -> bool {
-        if self.truncated {
-            return false;
-        }
-        if self.pending.take().is_some() {
-            // The held file was not the last one, so it needed room for the
-            // trailer and does not fit.
-            self.truncated = true;
-            return false;
-        }
         let mut file_output = String::new();
         let parts: Vec<&str> = fo.path.split('/').collect();
         let file_name = parts.last().copied().unwrap_or(&fo.path);
@@ -3611,24 +3779,45 @@ impl MultiFileTreeWriter {
         );
 
         let parts = parts.iter().map(|part| part.to_string()).collect();
+        self.push_text(file_output, parts, Some(fo.absolute_path.clone()))
+    }
+
+    /// URL blocks use their single-target rendering and have no local read manifest.
+    fn push_text(
+        &mut self,
+        file_output: String,
+        parts: Vec<String>,
+        path: Option<PathBuf>,
+    ) -> bool {
+        if self.truncated {
+            return false;
+        }
+        if self.pending.take().is_some() {
+            // The held file was not the last one, so it needed room for the
+            // trailer and does not fit.
+            self.truncated = true;
+            return false;
+        }
         let used = self.output.len() + file_output.len();
         if used + self.trailer_reserve <= self.max_bytes {
-            self.accept(file_output, parts, fo.absolute_path.clone());
+            self.accept(file_output, parts, path);
             return true;
         }
         if !self.walk_incomplete && !self.cut_short() && used <= self.max_bytes {
             // Fits only as the last file; keep looking for a later one.
-            self.pending = Some((file_output, parts, fo.absolute_path.clone()));
+            self.pending = Some((file_output, parts, path));
             return true;
         }
         self.truncated = true;
         false
     }
 
-    fn accept(&mut self, file_output: String, parts: Vec<String>, path: PathBuf) {
+    fn accept(&mut self, file_output: String, parts: Vec<String>, path: Option<PathBuf>) {
         self.shown_blocks.push((self.output.len(), path.clone()));
         self.output.push_str(&file_output);
-        self.content_files.insert(path);
+        if let Some(path) = path {
+            self.content_files.insert(path);
+        }
         self.files_shown += 1;
         self.prev_parts = parts;
     }
@@ -3643,7 +3832,12 @@ impl MultiFileTreeWriter {
         // A `files` list can name the same file twice. The read manifest must
         // keep a path while any block still shown in the text came from it,
         // or a host checking read rules against the manifest would miss it.
-        if !self.shown_blocks.iter().any(|(_, shown)| *shown == path) {
+        if let Some(path) = path.filter(|path| {
+            !self
+                .shown_blocks
+                .iter()
+                .any(|(_, shown)| shown.as_ref() == Some(path))
+        }) {
             self.content_files.remove(&path);
         }
         self.files_shown -= 1;
@@ -3692,6 +3886,7 @@ impl MultiFileTreeWriter {
             truncated: self.truncated,
             cut_short: self.files_capped || self.deadline_reached,
             deadline_reached: self.deadline_reached,
+            content_incomplete: self.content_incomplete,
             shown: self.files_shown,
             footer,
             content_files: self.content_files,
@@ -3715,8 +3910,84 @@ pub(crate) fn symbol_to_entry(sym: &Symbol) -> OutlineEntry {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn files_walk_stall_keeps_examined_paths_and_named_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let keep = dir.path().join("keep.rs");
+        let child = dir.path().join("child");
+        let blocked = child.join("blocked");
+        std::fs::write(&keep, "fn keep() {}\n").unwrap();
+        std::fs::create_dir_all(&blocked).unwrap();
+        // Files mode examines every root entry before descending into child, so
+        // keep.rs is retained before blocked is checked in either readdir order.
+        let stall = crate::bounded_io::stall_running_helper(&blocked);
+        let budget = crate::bounded_io::Budget::after(std::time::Duration::from_secs(5))
+            .with_access_budget(std::time::Duration::from_millis(200));
+        let response = crate::bounded_io::with_budget(Some(budget), || {
+            let discovery = discover_outline_files_with_options(dir.path(), true);
+            assert_eq!(discovery.files, [keep.to_string_lossy().to_string()]);
+            assert!(discovery.collection_truncated);
+            assert_eq!(discovery.entries_examined, 3);
+            crate::bounded_io::finish_response(Response::success(
+                "outline-stall",
+                serde_json::json!({
+                    "complete": true, "files": discovery.files, "entries_examined": discovery.entries_examined,
+                }),
+            ))
+        });
+        stall
+            .reached
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["complete"], false);
+        assert_eq!(response.data["files"], serde_json::json!([keep]));
+        assert_eq!(response.data["entries_examined"], 3);
+        assert_eq!(response.data["gaps"].as_array().unwrap().len(), 1);
+        assert!(!response.data["gaps"].to_string().contains(
+            "Directory walk reached its time budget; only examined entries are reported."
+        ));
+        assert!(!response.data["text"].as_str().unwrap().contains(
+            "Directory walk reached its time budget; only examined entries are reported."
+        ));
+        assert!(
+            response.data["gaps"][0]
+                .as_str()
+                .unwrap()
+                .contains(&format!("read_blocked: {}:", blocked.display())),
+            "{:?}",
+            response.data
+        );
+        assert!(response.data["text"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("read_blocked: {}:", blocked.display())));
+    }
     use super::*;
     use crate::symbols::SymbolKind;
+
+    #[test]
+    fn outline_files_mode_refuses_raw_url_array_targets() {
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let req: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "url-directories",
+            "command": "outline",
+            "files": true,
+            "target": ["https://example.com/docs"]
+        }))
+        .unwrap();
+        let response = handle_outline(&req, &ctx);
+        assert!(!response.success, "{response:?}");
+        assert_eq!(response.data["code"], "invalid_request");
+        assert!(response.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("URLs aren't directories"));
+    }
 
     fn navigation_fixture() -> (tempfile::TempDir, Vec<PathBuf>, AppContext) {
         let temp = tempfile::tempdir().unwrap();
@@ -5273,8 +5544,7 @@ mod tests {
         let (rendered, _) = outline_many_files(
             &files,
             &ctx,
-            "budget",
-            "budget-session",
+            &files_request(&files),
             None,
             &HashSet::new(),
             MultiFileBudget {
@@ -5586,7 +5856,7 @@ mod tests {
             .collect()
     }
 
-    fn files_request(files: &[PathBuf]) -> RawRequest {
+    fn files_request(files: &[impl serde::Serialize]) -> RawRequest {
         serde_json::from_value(serde_json::json!({
             "id": "files-bound", "command": "outline", "files": files,
         }))
@@ -5730,8 +6000,7 @@ mod tests {
             let (rendered, _) = outline_many_files(
                 &files,
                 &ctx,
-                "deadline-footer",
-                "deadline-session",
+                &files_request(&files),
                 None,
                 &HashSet::new(),
                 MultiFileBudget {
@@ -5777,8 +6046,7 @@ mod tests {
             let (rendered, _) = outline_many_files(
                 files,
                 ctx,
-                "deadline-manifest",
-                "deadline-session",
+                &files_request(files),
                 None,
                 &HashSet::new(),
                 MultiFileBudget {
@@ -6189,8 +6457,7 @@ impl<T> Boxed for GenericBox<T> { pub fn boxed(&self) {} }
         let (rendered, skipped) = outline_many_files(
             &files,
             &ctx,
-            "outline-fixture",
-            "fixture-session",
+            &files_request(&files),
             None,
             &HashSet::new(),
             MultiFileBudget {
@@ -6289,6 +6556,7 @@ impl<T> Boxed for GenericBox<T> { pub fn boxed(&self) {} }
             &mut skipped_foreign_mounts,
             &boundary,
             lookup,
+            None,
         );
 
         assert_eq!(skipped_foreign_mounts, 1, "foreign mount is disclosed");

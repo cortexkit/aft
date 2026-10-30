@@ -28,13 +28,14 @@ export const NOT_STARTED_STATUS_TEXT = "Starts on the first tool call.";
 export function formatSemanticIndexLabel(
   semantic: Pick<
     AftStatusSnapshot["semantic_index"],
-    "status" | "stage" | "error" | "reason" | "backend_url"
+    "status" | "stage" | "error" | "reason" | "backend_url" | "pending_reason"
   >,
 ): string {
-  return formatSemanticIndexStatus(semantic.status, semantic.stage, semantic.error, {
+  const label = formatSemanticIndexStatus(semantic.status, semantic.stage, semantic.error, {
     reason: semantic.reason,
     backendUrl: semantic.backend_url,
   });
+  return semantic.pending_reason ? `${label} — ${semantic.pending_reason}` : label;
 }
 
 export interface StatusCompressionAggregate {
@@ -117,6 +118,17 @@ export interface AftStatusSnapshot {
     reason?: string | null;
     /** Configured remote embedding backend URL, when there is one. */
     backend_url?: string | null;
+    /** Operator-only coordination line; never an agent tool failure reason. */
+    pending_reason?: string | null;
+    coordination_error?: {
+      state: string;
+      kind: string;
+      reason: string;
+      detail: string;
+      retryable: boolean;
+      retry_scheduled: boolean;
+      retry_in_ms: number | null;
+    };
   };
   disk: {
     storage_dir: string | null;
@@ -323,6 +335,7 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
   const features = asRecord(response.features);
   const searchIndex = asRecord(response.search_index);
   const semanticIndex = asRecord(response.semantic_index);
+  const coordination = asRecord(semanticIndex.coordination_error);
   const semanticConfig = {
     ...asRecord(response.semantic),
     ...asRecord((response as { semantic_config?: unknown }).semantic_config),
@@ -370,6 +383,23 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
       error: readNullableString(semanticIndex.error),
       reason: readNullableString(semanticIndex.reason),
       backend_url: readNullableString(semanticIndex.backend_url),
+      ...(typeof semanticIndex.pending_reason === "string" &&
+      semanticIndex.pending_reason.length > 0
+        ? { pending_reason: semanticIndex.pending_reason }
+        : {}),
+      ...(Object.keys(coordination).length > 0
+        ? {
+            coordination_error: {
+              state: readString(coordination.state),
+              kind: readString(coordination.kind),
+              reason: readString(coordination.reason),
+              detail: readString(coordination.detail),
+              retryable: readBoolean(coordination.retryable),
+              retry_scheduled: readBoolean(coordination.retry_scheduled),
+              retry_in_ms: readOptionalNumber(coordination.retry_in_ms),
+            },
+          }
+        : {}),
     },
     disk: {
       storage_dir: readNullableString(disk.storage_dir),

@@ -56,6 +56,9 @@ runs:
       with:
         name: ${{ inputs.platform }}-nextest-archive
         path: ${{ runner.temp }}
+        # A transfer that passes the artifact digest can still leave a truncated
+        # zstd frame on this runner; test the archive and download again if so.
+        verify-zstd: ${{ inputs.platform }}-nextest.tar.zst
 
     - name: Require the real Linux rust-analyzer
       if: inputs.platform == 'linux'

@@ -36,18 +36,28 @@ pub(crate) fn request_has_url(req: &RawRequest) -> bool {
             .is_some_and(is_http_url)
     }) || req
         .params
-        .get("targets")
-        .and_then(|v| v.as_array())
-        .is_some_and(|targets| {
-            targets.iter().any(|target| {
-                ["file", "path", "url"].iter().any(|key| {
-                    target
-                        .get(*key)
-                        .and_then(|v| v.as_str())
-                        .is_some_and(is_http_url)
+        .get("files")
+        .and_then(|value| value.as_array())
+        .is_some_and(|files| {
+            files
+                .iter()
+                .filter_map(|file| file.as_str())
+                .any(is_http_url)
+        })
+        || req
+            .params
+            .get("targets")
+            .and_then(|v| v.as_array())
+            .is_some_and(|targets| {
+                targets.iter().any(|target| {
+                    ["file", "path", "url"].iter().any(|key| {
+                        target
+                            .get(*key)
+                            .and_then(|v| v.as_str())
+                            .is_some_and(is_http_url)
+                    })
                 })
             })
-        })
 }
 
 /// Replace cached-document paths before a URL response is shown to an agent.
@@ -60,9 +70,26 @@ pub(crate) fn redact_url_cache_paths(
     if !request_has_url(req) {
         return;
     }
-    let storage_dir = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
-    let cache_dir = storage_dir.join("url_cache").to_string_lossy().into_owned();
-    redact_cache_paths_in_value(&mut response.data, &cache_dir);
+    // Downloads are written under the cache root (`AppContext::cache_dir`),
+    // which is the `storage.cache_dir` volume when one is set; downloads from
+    // before that setting stay under the durable storage root. Redact both.
+    let config = ctx.config();
+    let mut roots = vec![ctx.cache_dir()];
+    if let Some(configured) = &config.cache_dir_configured {
+        roots.push(configured.spelling.join("aft"));
+    }
+    roots.push(crate::bash_background::storage_dir(
+        config.storage_dir.as_deref(),
+    ));
+    roots.dedup();
+    for root in roots {
+        // A placeholder fetch's private document lives beside the URL cache
+        // and is redacted the same way.
+        for folder in ["url_cache", crate::url_fetch::SECRET_FETCH_DIR] {
+            let cache_dir = root.join(folder).to_string_lossy().into_owned();
+            redact_cache_paths_in_value(&mut response.data, &cache_dir);
+        }
+    }
 }
 
 fn redact_cache_paths_in_value(value: &mut serde_json::Value, cache_dir: &str) {
@@ -403,6 +430,47 @@ mod tests {
     }
 
     #[test]
+    fn outline_url_array_errors_redact_cached_document_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("private-storage");
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(storage.clone()),
+                ..Default::default()
+            },
+        );
+        let url = "https://example.com/docs.md";
+        let req = serde_json::from_value(serde_json::json!({
+            "id": "url-array-cache-redaction",
+            "command": "outline",
+            "files": ["local.rs", url]
+        }))
+        .unwrap();
+        let cache_file = storage.join("url_cache").join("c7502988ff3e8388.md");
+        let mut response = Response::success(
+            "url-array-cache-redaction",
+            serde_json::json!({
+                "complete": false,
+                "skipped_files": [{
+                    "file": url,
+                    "reason": format!("parse_error: syntax errors in {}", cache_file.display())
+                }]
+            }),
+        );
+
+        redact_url_cache_paths(&req, &ctx, &mut response);
+
+        assert_eq!(response.data["skipped_files"][0]["file"], url);
+        let reason = response.data["skipped_files"][0]["reason"]
+            .as_str()
+            .unwrap();
+        assert!(reason.contains("the requested URL"), "{reason}");
+        assert!(!reason.contains("url_cache"), "{reason}");
+        assert!(!reason.contains("c7502988ff3e8388.md"), "{reason}");
+    }
+
+    #[test]
     fn url_responses_replace_cached_document_paths_with_the_requested_url() {
         let temp = tempfile::tempdir().unwrap();
         let storage = temp.path().join("private-storage");
@@ -432,5 +500,92 @@ mod tests {
         assert!(message.contains("the requested URL"), "{message}");
         assert!(!message.contains("url_cache"), "{message}");
         assert!(!message.contains("c7502988ff3e8388.md"), "{message}");
+    }
+
+    /// With `storage.cache_dir` set, downloads live under the cache root on
+    /// another path, and their paths must be redacted too.
+    #[test]
+    fn url_responses_redact_cached_document_paths_under_a_separate_cache_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("private-storage");
+        let cache_parent = temp.path().join("cache-volume");
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(storage.clone()),
+                cache_dir: Some(cache_parent.clone()),
+                ..Default::default()
+            },
+        );
+        assert_ne!(ctx.cache_dir(), storage);
+        let req = serde_json::from_value(serde_json::json!({
+            "id": "url-cache-redaction-split",
+            "command": "outline",
+            "file": "https://example.com/docs.md"
+        }))
+        .unwrap();
+        let cached = ctx
+            .cache_dir()
+            .join("url_cache")
+            .join("c7502988ff3e8388.md");
+        let legacy = storage.join("url_cache").join("0123456789abcdef.md");
+        let mut response = Response::error(
+            "url-cache-redaction-split",
+            "parse_error",
+            format!(
+                "syntax errors in {} and {}",
+                cached.display(),
+                legacy.display()
+            ),
+        );
+
+        redact_url_cache_paths(&req, &ctx, &mut response);
+
+        let message = response.data["message"].as_str().unwrap();
+        assert!(!message.contains("cache-volume"), "{message}");
+        assert!(!message.contains("url_cache"), "{message}");
+        assert!(!message.contains("c7502988ff3e8388.md"), "{message}");
+        assert!(!message.contains("0123456789abcdef.md"), "{message}");
+    }
+
+    /// A placeholder fetch's private document lives beside the URL cache, and
+    /// its path is redacted the same way.
+    #[test]
+    fn url_responses_redact_placeholder_fetch_document_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("private-storage");
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(storage.clone()),
+                ..Default::default()
+            },
+        );
+        let req = serde_json::from_value(serde_json::json!({
+            "id": "secret-fetch-redaction",
+            "command": "outline",
+            "file": "https://example.com/docs.md?key={{ck-secret:test}}"
+        }))
+        .unwrap();
+        let document = ctx
+            .cache_dir()
+            .join(crate::url_fetch::SECRET_FETCH_DIR)
+            .join("0123456789abcdef")
+            .join("document.md");
+        let mut response = Response::error(
+            "secret-fetch-redaction",
+            "parse_error",
+            format!("syntax errors in {}", document.display()),
+        );
+
+        redact_url_cache_paths(&req, &ctx, &mut response);
+
+        let message = response.data["message"].as_str().unwrap();
+        assert!(message.contains("the requested URL"), "{message}");
+        assert!(
+            !message.contains(crate::url_fetch::SECRET_FETCH_DIR),
+            "{message}"
+        );
+        assert!(!message.contains("document.md"), "{message}");
     }
 }

@@ -1,1 +1,0 @@
-- After a restart, editing a file no longer re-reads its unchanged semantic vectors from disk, so semantic indexing does much less disk I/O right after AFT restarts.

@@ -196,7 +196,17 @@ export interface ConfigFixFile {
 }
 
 export type ConfigFixRun =
-  | { ok: true; files: ConfigFixFile[] }
+  | {
+      ok: true;
+      files: ConfigFixFile[];
+      cacheCleanup?: {
+        removed: string[];
+        skipped?: string[];
+        partial?: { path: string; removed_entries: number }[];
+        warnings?: string[];
+        error: string | null;
+      };
+    }
   | { ok: false; error: string; missingBinary: boolean };
 
 /**
@@ -207,8 +217,18 @@ export type ConfigFixRun =
 export function runConfigFix(run: NativeRunner = runNative): ConfigFixRun {
   const result = run(["fix-config"]);
   try {
-    const report = JSON.parse(result.stdout) as { files?: ConfigFixFile[] };
-    if (Array.isArray(report.files)) return { ok: true, files: report.files };
+    const report = JSON.parse(result.stdout) as {
+      files?: ConfigFixFile[];
+      cache_cleanup?: {
+        removed: string[];
+        skipped?: string[];
+        partial?: { path: string; removed_entries: number }[];
+        warnings?: string[];
+        error: string | null;
+      };
+    };
+    if (Array.isArray(report.files))
+      return { ok: true, files: report.files, cacheCleanup: report.cache_cleanup };
   } catch {
     // Fall through: an older binary without the command prints usage instead.
   }

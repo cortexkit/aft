@@ -87,9 +87,15 @@ disarm_auto_merge() {
 }
 
 wait_for_greptile_review() {
-  local head_sha="$1" timeout poll started now review_status review_conclusion review_result
+  local head_sha="$1" timeout poll absent_grace started now review_status review_conclusion review_result
   timeout="${AFT_MERGE_PR_GREPTILE_TIMEOUT_SECONDS:-1200}"
   poll="${AFT_MERGE_PR_GREPTILE_POLL_SECONDS:-15}"
+  # Greptile creates its check run (queued) within seconds of a push. When it
+  # has created nothing for a head after this long, it is not reviewing this
+  # repository (an outage or a spent allowance), and the PR goes ahead without
+  # it. A review that exists is still waited for, and a failed one still
+  # refuses. Set it to 0 to require a Greptile review again.
+  absent_grace="${AFT_MERGE_PR_GREPTILE_ABSENT_GRACE_SECONDS:-180}"
   started=$(date -u +%s)
   while :; do
     review_result=$("$OPERATOR_GH" api "repos/$OWNER_REPO/commits/$head_sha/check-runs?per_page=100" \
@@ -108,6 +114,10 @@ wait_for_greptile_review() {
       esac
     fi
     now=$(date -u +%s)
+    if [[ -z "$review_status" ]] && (( absent_grace > 0 && now - started >= absent_grace )); then
+      echo "merge-pr: WARNING: Greptile created no review for head $head_sha within ${absent_grace}s; submitting without it" >&2
+      return 0
+    fi
     if (( now - started >= timeout )); then
       hard_refuse "Greptile Review did not complete for head $head_sha within ${timeout}s; refusing blind submission"
     fi

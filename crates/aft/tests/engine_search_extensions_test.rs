@@ -18,12 +18,12 @@ impl SearchLane for CountingLane {
         SearchLaneKind::Lexical
     }
 
-    fn execute(&self, _input: &LaneInput<'_>) -> LaneExecution {
+    fn execute(&self, _input: &LaneInput<'_>) -> std::io::Result<LaneExecution> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        LaneExecution {
+        Ok(LaneExecution {
             kind: self.kind(),
             candidates: Vec::new(),
-        }
+        })
     }
 }
 
@@ -83,7 +83,9 @@ fn registered_lane_execution_uses_the_extension_callback() {
     };
     let extensions = DefaultSearchExtensions;
     let registered = registry.get(SearchLaneKind::Lexical).unwrap();
-    let output = extensions.execute_lane(registered.as_ref(), &input);
+    let output = extensions
+        .execute_lane(registered.as_ref(), &input)
+        .unwrap();
 
     assert_eq!(output.kind, SearchLaneKind::Lexical);
     assert_eq!(lane.calls.load(Ordering::SeqCst), 1);

@@ -223,7 +223,7 @@ process.stdin.on("data", (chunk) => {
     buffer = buffer.slice(newline + 1);
     const req = JSON.parse(line);
     appendFileSync(require("node:path").join(process.cwd(), "abort-requests.ndjson"), JSON.stringify(req) + "\\n");
-    if (req.command === "tool_call" && req.name === "search") {
+    if (req.command === "tool_call" && req.name === "search" && req.handles_progress === true) {
       process.stdout.write(JSON.stringify({
         type: "progress",
         request_id: req.id,
@@ -281,6 +281,20 @@ process.stdin.on("data", (chunk) => {
       expect(cancelRequest).toMatchObject({
         params: { id: searchRequest?.id },
       });
+      expect(searchRequest?.handles_progress).toBe(true);
+      expect(cancelRequest).not.toHaveProperty("handles_progress");
+      await bridge.send("bash", { command: "echo hello" }, { onProgress: () => {} });
+      const nativeRequest = readFileSync(requestsPath, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line))
+        .at(-1);
+      expect(nativeRequest).toMatchObject({
+        command: "bash",
+        handles_progress: true,
+        params: { command: "echo hello" },
+      });
+      expect(nativeRequest.params).not.toHaveProperty("handles_progress");
     } finally {
       await bridge.shutdown();
     }

@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "foreground-bash-live-output"
+  ],
+  "note": "Foreground bash live output is transport-opted-in harness behavior. The capability is tracked per request outside RawRequest, leaving ranking files and the tool-call parity fixture unchanged. No changed path matches RANKING_FENCE_PREFIXES."
+}

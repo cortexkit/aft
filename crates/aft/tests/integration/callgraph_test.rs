@@ -1416,10 +1416,20 @@ fn callgraph_workspace_package_cache_refreshes_after_reconfigure() {
 
     let mut aft = AftProcess::spawn();
     configure_project(&mut aft, root);
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"callers","file":{},"symbol":"target","depth":1}}"#,
-        crate::helpers::json_string(&pkg.join("src/index.ts").display())
-    ));
+    // The first build runs in the background after configure; on a busy
+    // runner the query can still answer `callgraph_building`, so retry as an
+    // agent would, the same way the post-reconfigure query below does.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let resp = loop {
+        let resp = aft.send(&format!(
+            r#"{{"id":"1","command":"callers","file":{},"symbol":"target","depth":1}}"#,
+            crate::helpers::json_string(&pkg.join("src/index.ts").display())
+        ));
+        if resp["code"] != "callgraph_building" || std::time::Instant::now() >= deadline {
+            break resp;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
     assert_eq!(
         resp["success"], true,
         "first callers should succeed: {resp:?}"
@@ -1469,7 +1479,7 @@ fn callgraph_indexes_tsx_jsx_components_and_new_expressions() {
 
     let mut aft = AftProcess::spawn();
     configure_project(&mut aft, root);
-    for (id, symbol) in [("1", "Widget"), ("2", "Service")] {
+    for (id, symbol, count) in [("1", "Widget", 1), ("2", "Service", 0)] {
         let resp = aft.send(&format!(
             r#"{{"id":"{}","command":"callers","file":{},"symbol":"{}","depth":1}}"#,
             id,
@@ -1478,8 +1488,8 @@ fn callgraph_indexes_tsx_jsx_components_and_new_expressions() {
         ));
         assert_eq!(resp["success"], true, "callers should succeed: {resp:?}");
         assert_eq!(
-            resp["total_callers"], 1,
-            "{symbol} should be indexed from JSX/new: {resp:?}"
+            resp["total_callers"], count,
+            "JSX invokes a component; construction without a constructor does not invoke the class: {symbol}: {resp:?}"
         );
     }
     aft.shutdown();

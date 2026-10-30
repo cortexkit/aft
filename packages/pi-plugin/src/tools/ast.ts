@@ -190,9 +190,15 @@ export function buildAstSearchSections(payload: unknown, theme: Theme): string[]
       lines.push(`  ${index + 1}. ${theme.fg("muted", `${line}:${column}`)} ${snippet}`);
 
       const metaVars = asRecord(match.meta_variables);
+      // A `$$$` capture's node list includes punctuation (`["1", ",", "2"]`);
+      // show its source text instead when the engine supplied it, as the
+      // native reply does.
+      const captureText = asRecord(match.meta_variable_text);
       if (metaVars && Object.keys(metaVars).length > 0) {
         Object.entries(metaVars).forEach(([name, value]) => {
-          lines.push(`     ${theme.fg("muted", `${name} =`)} ${formatValue(value)}`);
+          const text = captureText?.[name];
+          const shown = typeof text === "string" ? text : value;
+          lines.push(`     ${theme.fg("muted", `${name} =`)} ${formatValue(shown)}`);
         });
       }
 

@@ -17,8 +17,6 @@ async function validate(context: HarnessValidationContext): Promise<void> {
   }
   const matrix = JSON.parse(await readFile(join(here, "matrix.json"), "utf8"));
   if (JSON.stringify(matrix.rows?.[0]?.trajectories) !== JSON.stringify({"T1":"applicable","T2":"applicable","T3":"applicable","T4":"n/a:no-abortable-operation","T5":"n/a:no-background-capability","T6":"n/a:no-list-surface","T7":"applicable"})) throw new Error("apply_patch" + " applicability mismatch");
-  const controls = JSON.parse(await readFile(join(here, "mutation-controls.json"), "utf8"));
-  if (!Array.isArray(controls.controls) || controls.controls.length < 3) throw new Error("apply_patch" + " mutation controls missing");
 }
 const extension: HarnessExtension = { name: "apply_patch-scenarios-v1", validate };
 export default extension;

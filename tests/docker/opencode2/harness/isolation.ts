@@ -122,6 +122,7 @@ export async function createScenarioIsolation(options: {
   binaryPath?: string;
   mockBaseUrl: string;
   projectConfig?: Record<string, unknown>;
+  userConfig?: Record<string, unknown>;
   scenarioEnv?: Record<string, string>;
   /** The provider object this host generation was observed to accept. */
   providerConfig: Record<string, unknown>;
@@ -267,7 +268,7 @@ export async function createScenarioIsolation(options: {
   await mkdir(join(paths.config, "cortexkit"), { recursive: true });
   await writeFile(
     join(paths.config, "cortexkit", "aft.jsonc"),
-    `${JSON.stringify({ disabled_tools: [] }, null, 2)}\n`,
+    `${JSON.stringify({ disabled_tools: [], ...options.userConfig }, null, 2)}\n`,
   );
   await mkdir(join(paths.project, ".cortexkit"), { recursive: true });
   await writeFile(

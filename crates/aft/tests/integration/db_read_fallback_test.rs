@@ -55,6 +55,7 @@ fn spawn_task(registry: &BgTaskRegistry, storage: &Path, project: &Path, command
             project.to_path_buf(),
             HashMap::new(),
             aft::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             storage.to_path_buf(),
             16,
             true,

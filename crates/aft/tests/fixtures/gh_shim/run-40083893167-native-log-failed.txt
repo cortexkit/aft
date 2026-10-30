@@ -1,0 +1,10 @@
+Landing policy	Original PR commit identity and agent attribution	﻿2026-10-24T09:57:22.0377671Z ##[group]Run python3 scripts/landing-policy.py --event "$GITHUB_EVENT_NAME" --event-path "$GITHUB_EVENT_PATH"
+Landing policy	Original PR commit identity and agent attribution	2026-10-24T09:57:22.0378541Z ^[[36;1mpython3 scripts/landing-policy.py --event "$GITHUB_EVENT_NAME" --event-path "$GITHUB_EVENT_PATH"^[[0m
+Landing policy	Original PR commit identity and agent attribution	2026-10-24T09:57:22.0617800Z shell: /usr/bin/bash -e {0}
+Landing policy	Original PR commit identity and agent attribution	2026-10-24T09:57:22.0618126Z env:
+Landing policy	Original PR commit identity and agent attribution	2026-10-24T09:57:22.0618373Z   SCCACHE_IDLE_TIMEOUT: 0
+Landing policy	Original PR commit identity and agent attribution	2026-10-24T09:57:22.0618676Z   SCCACHE_GHA_RW_MODE: READ_ONLY
+Landing policy	Original PR commit identity and agent attribution	2026-10-24T09:57:22.0621812Z   GH_TOKEN: ***
+Landing policy	Original PR commit identity and agent attribution	2026-10-24T09:57:22.0622085Z ##[endgroup]
+Landing policy	Original PR commit identity and agent attribution	2026-10-24T09:57:22.1681583Z Landing policy: REFUSED: 7e98a53e8e8d856b919fe52ad0ea8d6662fafc8f: land/storage-floor agent commit missing alfonso-aft co-author trailer
+Landing policy	Original PR commit identity and agent attribution	2026-10-24T09:57:22.1783195Z ##[error]Process completed with exit code 1.

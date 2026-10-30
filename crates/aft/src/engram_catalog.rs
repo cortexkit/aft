@@ -478,7 +478,7 @@ fn assign_entry_ids(candidates: Vec<Candidate>, previous: &BTreeMap<String, Stri
 /// name only (`mcp-claude-code`), matching the ids ENGRAM already has.
 /// Federated folders have no readable name, so the whole folder name is used
 /// with its `--` separators shortened.
-fn harness_label(dir_name: &str) -> Option<String> {
+pub(crate) fn harness_label(dir_name: &str) -> Option<String> {
     if FIXED_HARNESS_DIRS.contains(&dir_name) {
         return Some(dir_name.to_string());
     }
@@ -565,6 +565,38 @@ fn write_if_changed(target: &Path, bytes: &[u8]) -> io::Result<WriteOutcome> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relocated_caches_are_absent_from_storage_relative_catalog() {
+        let (_temp, storage) = storage_root();
+        let cache = storage.with_file_name("cache");
+        std::fs::create_dir(&cache).unwrap();
+        let mut config = crate::config::Config {
+            storage_dir: Some(storage.clone()),
+            cache_dir: Some(cache.clone()),
+            ..Default::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        let artifacts = crate::root_cache::cache_root(&config);
+        for domain in crate::root_cache::CACHE_DOMAINS {
+            mkdir(&artifacts, domain);
+        }
+        mkdir(&storage, "opencode/backups");
+        std::fs::write(storage.join("aft.db"), b"durable").unwrap();
+        let rendered = super::render_catalog(&storage).unwrap();
+        assert_engram_accepts(&storage, &rendered);
+        let value: serde_json::Value = serde_json::from_slice(&rendered).unwrap();
+        let paths: Vec<_> = value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["path"].as_str().unwrap())
+            .collect();
+        assert!(paths.contains(&"aft.db"));
+        assert!(paths.contains(&"opencode/backups"));
+        for domain in crate::root_cache::CACHE_DOMAINS {
+            assert!(!paths.contains(&domain));
+        }
+    }
     use super::*;
     use crate::harness::Harness;
     use serde_json::Value;

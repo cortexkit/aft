@@ -88,6 +88,111 @@ fn reply(value: Value) -> ReadReply {
         next_page: None,
     })
 }
+
+#[cfg(unix)]
+#[test]
+fn v20_worker_diff_reader_closing_after_first_line_is_quiet() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    struct FirstLineWriter {
+        stream: UnixStream,
+        closed: std::sync::mpsc::Receiver<()>,
+        writes: usize,
+    }
+    impl Write for FirstLineWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            if self.writes == 1 {
+                let end = bytes.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+                self.stream.write_all(&bytes[..end])?;
+                self.closed.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(end)
+            } else {
+                self.stream.write(bytes)
+            }
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.stream.flush()
+        }
+    }
+
+    let (writer, reader) = UnixStream::pair().unwrap();
+    let (closed, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        drop(reader);
+        closed.send(()).unwrap();
+        line
+    });
+    let mut output = FirstLineWriter {
+        stream: writer,
+        closed: receive,
+        writes: 0,
+    };
+    let result = render::run(
+        &planned(&["pr", "diff", "285"]),
+        &mut |_| {
+            Ok(reply(json!(
+                "diff --git a/file b/file\n--- a/file\n+++ b/file\n"
+            )))
+        },
+        &mut output,
+    );
+    assert_eq!(reader.join().unwrap(), "diff --git a/file b/file\n");
+    assert_eq!(output.writes, 2, "stop at the first failed write");
+    assert!(
+        matches!(result, Ok(0)),
+        "closed reader must be quiet: {result:?}"
+    );
+}
+
+#[test]
+fn v20_worker_diff_real_output_errors_are_reported() {
+    struct FullDisk;
+    impl Write for FullDisk {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("disk full"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let error = render::run(
+        &planned(&["pr", "diff", "285"]),
+        &mut |_| Ok(reply(json!("diff\n"))),
+        &mut FullDisk,
+    )
+    .unwrap_err();
+    assert_eq!(error.status(), 1);
+    assert_eq!(error.message("bot"), "disk full");
+}
+
+#[test]
+fn v20_worker_read_oversize_names_size_and_cap() {
+    let wire = executor::wire_request(
+        "cortexkit/aft",
+        &ReadRequest::Get {
+            path: "/repos/cortexkit/aft/pulls/434".into(),
+            accept: Some("diff".into()),
+        },
+    )
+    .unwrap();
+    let error = executor::decode_reply(
+        &wire,
+        &json!({"isError":false,"result":{
+            "status":200,"body":"x".repeat(1_048_577),"next_page":null
+        }}),
+    )
+    .unwrap_err();
+    assert_eq!(error.status(), 86);
+    assert_eq!(
+        error.message("bot"),
+        "governed read response is 1048577 bytes; cap is 1048576 bytes (1 MiB); narrow the request"
+    );
+}
 fn log_reply(body: &[u8], offset: u64, total_bytes: u64) -> ReadReply {
     ReadReply::JobLog(LogReply {
         body: String::from_utf8(body.to_vec()).unwrap(),
@@ -122,9 +227,39 @@ fn run_json(raw: &[&str], responses: Vec<Value>) -> (Value, Vec<ReadRequest>, i3
 
 #[test]
 fn v20_worker_reads_admit_the_reviewed_verbs() {
-    for command in TUPLES {
+    let reviewed = [
+        "api",
+        "run list",
+        "run view",
+        "pr list",
+        "pr view",
+        "pr diff",
+        "pr files",
+        "pr checks",
+        "issue list",
+        "issue view",
+        "issue comments",
+        "workflow list",
+        "workflow view",
+        "release list",
+        "release view",
+        "repo view",
+        "search code",
+        "search issues",
+    ];
+    assert_eq!(TUPLES.len(), reviewed.len());
+    assert_eq!(
+        TUPLES
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        reviewed
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+    );
+    for command in reviewed {
         let mut raw: Vec<_> = command.split_whitespace().collect();
-        match *command {
+        match command {
             "api" => raw.push("repos/cortexkit/aft/issues"),
             "run view" | "pr view" | "pr diff" | "pr files" | "pr checks" | "issue view"
             | "issue comments" => raw.push("42"),
@@ -300,6 +435,7 @@ fn v20_three_megabyte_job_log_pages_into_one_byte_exact_stream() {
     for index in 0..3 * REPLY_BYTES {
         log.push(b'a' + (index % 26) as u8);
     }
+    let window = render::LOG_WINDOW_BYTES;
     let plan = planned(&["api", "repos/cortexkit/aft/actions/jobs/42/logs"]);
     let mut ranges = Vec::new();
     let mut output = Vec::new();
@@ -314,28 +450,156 @@ fn v20_three_megabyte_job_log_pages_into_one_byte_exact_stream() {
                 panic!("full logs must not request Plexus's no-range tail");
             };
             assert_eq!(*job_id, 42);
-            assert_eq!(range.length, REPLY_BYTES as u64);
+            assert_eq!(range.length, window);
             ranges.push(range.clone());
             let offset = range.offset as usize;
-            Ok(log_reply(
-                &log[offset..offset + REPLY_BYTES],
-                range.offset,
-                log.len() as u64,
-            ))
+            let end = (offset + window as usize).min(log.len());
+            Ok(log_reply(&log[offset..end], range.offset, log.len() as u64))
         },
         &mut output,
     )
     .unwrap();
     assert_eq!(status, 0);
+    // 3 MiB does not divide into windows evenly, so a short fourth page follows.
     assert_eq!(
         ranges.iter().map(|range| range.offset).collect::<Vec<_>>(),
-        vec![0, 1_048_576, 2_097_152]
+        vec![0, window, 2 * window, 3 * window]
     );
     assert_eq!(output, log);
 }
 
+/// Decode a job-log reply through the real wire contract, so these paging tests
+/// exercise the same range checks that a Plexus reply goes through.
+fn decoded_log_reply(
+    request: &ReadRequest,
+    body: &str,
+    offset: u64,
+    length: u64,
+    total_bytes: u64,
+) -> Result<ReadReply, ReadError> {
+    let wire = executor::wire_request("cortexkit/aft", request).unwrap();
+    executor::decode_reply(
+        &wire,
+        &json!({"isError":false,"result":{"body":body,"offset":offset,"length":length,"total_bytes":total_bytes}}),
+    )
+}
+
+// The cursor is raw log bytes; bodies are display text (ANSI stripped, split
+// characters as U+FFFD). The second page must start at the first reply's
+// offset + length, not at the first body's length.
 #[test]
-fn v20_log_failed_selects_failed_jobs_and_steps_across_page_boundaries() {
+fn v20_job_log_pages_resume_at_raw_offset_plus_length_not_body_length() {
+    // Page one raw bytes: ESC[32m ok ESC[0m \n plus the first byte of "é".
+    let first_raw: &[u8] = b"\x1b[32mok\x1b[0m\n\xc3";
+    // Page two raw bytes: the last byte of "é", then ESC[31m bad ESC[0m \n.
+    let second_raw: &[u8] = b"\xa9\x1b[31mbad\x1b[0m\n";
+    let pages = [
+        (first_raw.len() as u64, "ok\n\u{FFFD}"),
+        (second_raw.len() as u64, "\u{FFFD}bad\n"),
+    ];
+    let total = (first_raw.len() + second_raw.len()) as u64;
+    let plan = planned(&["api", "repos/cortexkit/aft/actions/jobs/42/logs"]);
+    let mut offsets = Vec::new();
+    let mut output = Vec::new();
+    render::run(
+        &plan,
+        &mut |request| {
+            let ReadRequest::JobLog {
+                range: Some(range), ..
+            } = request
+            else {
+                panic!("full logs must request a byte range");
+            };
+            offsets.push(range.offset);
+            let (length, body) = pages[offsets.len() - 1];
+            decoded_log_reply(request, body, range.offset, length, total)
+        },
+        &mut output,
+    )
+    .unwrap();
+    assert_eq!(offsets, vec![0, first_raw.len() as u64]);
+    assert_eq!(
+        String::from_utf8(output).unwrap(),
+        "ok\n\u{FFFD}\u{FFFD}bad\n"
+    );
+}
+
+// A page made only of colour codes has an empty display body but still
+// consumes raw bytes, so paging continues instead of reporting a stall.
+#[test]
+fn v20_job_log_page_of_only_colour_codes_still_advances() {
+    let colour_only: &[u8] = b"\x1b[32m\x1b[0m";
+    let pages = [(colour_only.len() as u64, ""), (3, "ok\n")];
+    let total = colour_only.len() as u64 + 3;
+    let plan = planned(&["api", "repos/cortexkit/aft/actions/jobs/42/logs"]);
+    let mut offsets = Vec::new();
+    let mut output = Vec::new();
+    render::run(
+        &plan,
+        &mut |request| {
+            let ReadRequest::JobLog {
+                range: Some(range), ..
+            } = request
+            else {
+                panic!("full logs must request a byte range");
+            };
+            offsets.push(range.offset);
+            let (length, body) = pages[offsets.len() - 1];
+            decoded_log_reply(request, body, range.offset, length, total)
+        },
+        &mut output,
+    )
+    .unwrap();
+    assert_eq!(offsets, vec![0, colour_only.len() as u64]);
+    assert_eq!(output, b"ok\n");
+}
+
+// A full window whose edges both split a 4-byte character grows by U+FFFD
+// replacements (+6 at the start, +2 at the end). The window headroom keeps that
+// page under the 1 MiB decoded-reply bound.
+#[test]
+fn v20_full_log_window_with_split_characters_at_both_edges_is_accepted() {
+    let window = render::LOG_WINDOW_BYTES;
+    // Three ASCII bytes misalign the 4-byte emoji, so every window boundary
+    // falls one byte into a character.
+    let mut log = b"abc".to_vec();
+    while log.len() < 2 * window as usize + 64 {
+        log.extend_from_slice("\u{1F600}".as_bytes());
+    }
+    let total = log.len() as u64;
+    let plan = planned(&["api", "repos/cortexkit/aft/actions/jobs/42/logs"]);
+    let mut offsets = Vec::new();
+    let mut bodies = Vec::new();
+    let mut output = Vec::new();
+    render::run(
+        &plan,
+        &mut |request| {
+            let ReadRequest::JobLog {
+                range: Some(range), ..
+            } = request
+            else {
+                panic!("full logs must request a byte range");
+            };
+            offsets.push(range.offset);
+            let start = range.offset as usize;
+            let end = (start + range.length as usize).min(log.len());
+            let body = String::from_utf8_lossy(&log[start..end]).into_owned();
+            bodies.push(body.clone());
+            decoded_log_reply(request, &body, range.offset, (end - start) as u64, total)
+        },
+        &mut output,
+    )
+    .unwrap();
+    assert_eq!(offsets, vec![0, window, 2 * window]);
+    // The middle page is split at both edges: three lone continuation bytes at
+    // the start and one lead byte at the end.
+    assert_eq!(bodies[1].len() as u64, window + 8);
+    assert!(bodies[1].len() <= REPLY_BYTES);
+    assert_eq!(output, bodies.concat().into_bytes());
+}
+
+#[test]
+fn v20_log_failed_whole_job_fallback_is_complete_across_page_boundaries() {
     let plan = planned(&["run", "view", "8", "--log-failed"]);
     let log = b"2026-10-19T10:00:01Z ok\n2026-10-19T10:00:03Z bad\n";
     let mut requests = Vec::new();
@@ -355,9 +619,158 @@ fn v20_log_failed_selects_failed_jobs_and_steps_across_page_boundaries() {
     }, &mut output).unwrap();
     assert_eq!(
         String::from_utf8(output).unwrap(),
-        "build\ttest\t2026-10-19T10:00:03Z bad\n"
+        "build\tUNKNOWN STEP\t2026-10-19T10:00:01Z ok\nbuild\tUNKNOWN STEP\t2026-10-19T10:00:03Z bad\n"
     );
     assert_eq!(requests.len(), 5);
+}
+
+fn landing_policy_job() -> Value {
+    json!({"id":120842790454_u64,"name":"Landing policy","conclusion":"failure","steps":[
+        {"name":"Run actions/checkout@v4","number":2,"started_at":"2026-10-24T09:57:11Z","completed_at":"2026-10-24T09:57:22Z","conclusion":"success"},
+        {"name":"Original PR commit identity and agent attribution","number":3,"started_at":"2026-10-24T09:57:22Z","completed_at":"2026-10-24T09:57:22Z","conclusion":"failure"},
+        {"name":"No ignored files tracked under .cortexkit","number":4,"started_at":"2026-10-24T09:57:22Z","completed_at":"2026-10-24T09:57:22Z","conclusion":"skipped"},
+        {"name":"Post Run actions/checkout@v4","number":22,"started_at":"2026-10-24T09:57:22Z","completed_at":"2026-10-24T09:57:22Z","conclusion":"success"},
+        {"name":"Complete job","number":23,"started_at":"2026-10-24T09:57:22Z","completed_at":"2026-10-24T09:57:22Z","conclusion":"success"}
+    ]})
+}
+
+fn render_failed_log(body: &str, job: Value) -> (Result<i32, ReadError>, Vec<u8>) {
+    let plan = planned(&["run", "view", "40083893167", "--log-failed"]);
+    let mut output = Vec::new();
+    let result = render::run(
+        &plan,
+        &mut |request| match request {
+            ReadRequest::Get { .. } => Ok(reply(json!({"jobs":[job.clone()]}))),
+            ReadRequest::JobLog {
+                range: Some(range), ..
+            } => {
+                assert_eq!(range.offset, 0);
+                // Like the Plexus display-text vector, raw storage contains colour
+                // escapes that are absent from the decoded display body.
+                let raw_length = body.len() as u64 + 9;
+                decoded_log_reply(request, body, 0, raw_length, raw_length)
+            }
+            _ => panic!("unexpected request"),
+        },
+        &mut output,
+    );
+    (result, output)
+}
+
+#[test]
+fn v20_log_failed_real_same_second_steps_print_whole_job_as_unknown_step() {
+    // The companion native fixture preserves the operator's per-step archive;
+    // this excerpt is from the worker's whole-job display-text response.
+    let body = include_str!("../../tests/fixtures/gh_shim/run-40083893167-job-display.txt");
+    let (result, output) = render_failed_log(body, landing_policy_job());
+    assert_eq!(result.unwrap(), 0);
+    let expected = concat!(
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:21.4042950Z ##[group]Checking out the ref\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:21.4043428Z [command]/usr/bin/git checkout --progress --force 4bfc477d907853824afb483e0f2e95f99d9b5cd8\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.0036415Z HEAD is now at 4bfc477d9 mason: defer glob edit write checks until content matches\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.0073427Z ##[endgroup]\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.0128480Z [command]/usr/bin/git log -1 --format=%H\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.0158498Z 4bfc477d907853824afb483e0f2e95f99d9b5cd8\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.0377683Z ##[group]Run python3 scripts/landing-policy.py --event \"$GITHUB_EVENT_NAME\" --event-path \"$GITHUB_EVENT_PATH\"\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.0378545Z python3 scripts/landing-policy.py --event \"$GITHUB_EVENT_NAME\" --event-path \"$GITHUB_EVENT_PATH\"\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.0617811Z shell: /usr/bin/bash -e {0}\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.0618129Z env:\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.0618375Z   SCCACHE_IDLE_TIMEOUT: 0\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.0618678Z   SCCACHE_GHA_RW_MODE: READ_ONLY\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.0621822Z   GH_TOKEN: ***\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.0622087Z ##[endgroup]\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.1681605Z Landing policy: REFUSED: 7e98a53e8e8d856b919fe52ad0ea8d6662fafc8f: land/storage-floor agent commit missing alfonso-aft co-author trailer\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.1783209Z ##[error]Process completed with exit code 1.\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.1960957Z Post job cleanup.\n",
+        "Landing policy\tUNKNOWN STEP\t2026-10-24T09:57:22.2803101Z [command]/usr/bin/git version\n",
+    );
+    assert_eq!(String::from_utf8(output).unwrap(), expected);
+}
+
+#[test]
+fn v20_log_failed_empty_and_unattributed_logs_follow_whole_job_fallback() {
+    for body in [
+        "",
+        "not a timestamp or a step boundary\n",
+        "2026-10-24T09:57:23.1Z outside all steps\n",
+        "2026-10-24T09:57:22.1Z could be checkout, failed step, or cleanup\n",
+        "\u{feff}last line without newline",
+    ] {
+        let (result, output) = render_failed_log(body, landing_policy_job());
+        assert_eq!(result.unwrap(), 0);
+        let expected = if body.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Landing policy\tUNKNOWN STEP\t{}\n",
+                body.trim_end_matches('\n')
+            )
+        };
+        assert_eq!(String::from_utf8(output).unwrap(), expected);
+    }
+}
+
+#[test]
+fn v20_log_failed_accepts_native_gh_failure_states_in_job_order() {
+    let plan = planned(&["run", "view", "8", "--log-failed"]);
+    let mut output = Vec::new();
+    render::run(
+        &plan,
+        &mut |request| match request {
+            ReadRequest::Get { .. } => Ok(reply(json!({"jobs":[
+                {"id":4,"name":"required / review","conclusion":"action_required"},
+                {"id":3,"name":"startup","conclusion":"startup_failure"},
+                {"id":2,"name":"timeout","conclusion":"timed_out"},
+                {"id":1,"name":"failed","conclusion":"failure"}
+            ]}))),
+            ReadRequest::JobLog { .. } => Ok(log_reply(b"line\r\n", 0, 6)),
+            _ => panic!("unexpected request"),
+        },
+        &mut output,
+    )
+    .unwrap();
+    assert_eq!(
+        String::from_utf8(output).unwrap(),
+        concat!(
+            "required / review\tUNKNOWN STEP\tline\n",
+            "startup\tUNKNOWN STEP\tline\n",
+            "timeout\tUNKNOWN STEP\tline\n",
+            "failed\tUNKNOWN STEP\tline\n"
+        )
+    );
+}
+
+#[test]
+fn v20_log_failed_skips_successful_jobs() {
+    let plan = planned(&["run", "view", "40083893167", "--log-failed"]);
+    let mut output = Vec::new();
+    let mut log_ids = Vec::new();
+    let result = render::run(
+        &plan,
+        &mut |request| match request {
+            ReadRequest::Get { .. } => Ok(reply(json!({"jobs":[
+                {"id":1,"name":"successful job","conclusion":"success"},
+                landing_policy_job(),
+                {"id":2,"name":"skipped job","conclusion":"skipped"}
+            ]}))),
+            ReadRequest::JobLog {
+                job_id,
+                range: Some(range),
+            } => {
+                log_ids.push(*job_id);
+                assert_eq!(range.offset, 0);
+                decoded_log_reply(request, "failed job log\n", 0, 15, 15)
+            }
+            _ => panic!("unexpected request"),
+        },
+        &mut output,
+    );
+    assert_eq!(result.unwrap(), 0);
+    assert_eq!(
+        String::from_utf8(output).unwrap(),
+        "Landing policy\tUNKNOWN STEP\tfailed job log\n"
+    );
+    assert_eq!(log_ids, vec![120842790454]);
 }
 
 #[test]
@@ -835,7 +1248,7 @@ fn review_checks_include_failure_or_pending_status_from_later_page() {
 }
 
 #[test]
-fn review_failed_log_steps_use_precise_half_open_intervals() {
+fn review_failed_log_whole_job_fallback_does_not_infer_from_precise_timestamps() {
     let plan = planned(&["run", "view", "8", "--log-failed"]);
     let log = b"2026-10-19T10:00:02.1000000Z passing\n2026-10-19T10:00:02.2000000Z boundary failure\n2026-10-19T10:00:02.3000000Z failure\n2026-10-19T10:00:02.4000000Z after failure\n";
     let mut output = Vec::new();
@@ -852,7 +1265,7 @@ fn review_failed_log_steps_use_precise_half_open_intervals() {
         }
         _ => panic!("unexpected request"),
     }, &mut output).unwrap();
-    assert_eq!(String::from_utf8(output).unwrap(), "build\ttest\t2026-10-19T10:00:02.2000000Z boundary failure\nbuild\ttest\t2026-10-19T10:00:02.3000000Z failure\n");
+    assert_eq!(String::from_utf8(output).unwrap(), "build\tUNKNOWN STEP\t2026-10-19T10:00:02.1000000Z passing\nbuild\tUNKNOWN STEP\t2026-10-19T10:00:02.2000000Z boundary failure\nbuild\tUNKNOWN STEP\t2026-10-19T10:00:02.3000000Z failure\nbuild\tUNKNOWN STEP\t2026-10-19T10:00:02.4000000Z after failure\n");
 }
 
 #[test]

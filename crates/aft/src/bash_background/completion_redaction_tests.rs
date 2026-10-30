@@ -454,6 +454,7 @@ fn bash_background_completion_masks_per_call_env_values() {
             fixture.path().into(),
             HashMap::from([("DEPLOY_tOkEn".into(), value.into())]),
             super::super::HardKill::After(Duration::from_secs(30)),
+            None,
             fixture.path().into(),
             super::super::TaskSlot::Background { max: 10 },
             true,
@@ -582,7 +583,7 @@ fn bash_background_completion_replay_withholds_output_and_keeps_pointers() {
 }
 
 #[test]
-fn bash_background_watch_matches_raw_token_but_masks_pushed_and_persisted_text() {
+fn bash_background_watch_matches_raw_token_shows_pattern_and_masks_context() {
     let token = format!("ghp_{}", "a".repeat(36));
     for (needle, prefix) in [(token.as_str(), 0), ("ghp_", 64 * 1024 - 7), ("READY", 0)] {
         let fixture = tempfile::tempdir().unwrap();
@@ -605,7 +606,9 @@ fn bash_background_watch_matches_raw_token_but_masks_pushed_and_persisted_text()
         assert_eq!(pushed.len(), 1, "raw watch did not fire for {needle}");
         assert_eq!(pushed[0].reason, "pattern_match");
         assert_eq!(pushed[0].match_offset, text.find(needle).unwrap() as u64);
-        assert!(!pushed[0].match_text.contains("ghp_"));
+        // A substring watch's match is the agent's own pattern, so it is shown
+        // as given; the surrounding output is still masked.
+        assert_eq!(pushed[0].match_text, needle);
         assert!(!pushed[0].context.contains("ghp_"));
         assert!(!pushed[0].context.contains("aaaa"));
         assert!(pushed[0].context.contains(SECRET_PLACEHOLDER));
@@ -690,6 +693,7 @@ fn bash_background_completion_redaction_preserves_pipeline_failure_warning() {
                 fixture.path().into(),
                 HashMap::new(),
                 super::super::HardKill::After(Duration::from_secs(30)),
+                None,
                 fixture.path().into(),
                 super::super::TaskSlot::Background { max: 10 },
                 true,
@@ -750,6 +754,7 @@ fn bash_background_completion_redaction_preserves_short_recovery_trailers() {
             stderr_path: cache.stderr_path.clone(),
             include_stderr_path: false,
             artifact_access: cache.artifact_access.clone(),
+            failed_exit: false,
         });
         recovery.byte_truncated = true;
         recovery.had_inner_drop = true;
@@ -990,4 +995,150 @@ fn bash_background_completion_repeated_hex_edged_lines_keep_preview() {
         .unwrap()
         .output_preview;
     assert_eq!(preview, "done\ndone\n");
+}
+
+/// A queue-watcher output line: ordinary output, no secret.
+const RESTART_WATCH_LINE: &str = "09:37:38Z #1039 head 03b92ca085 failed: checks\n";
+
+/// A finished piped task whose secret flags are recorded at launch from the
+/// child `environment` (the values themselves are never saved), written to
+/// disk, then reloaded by a fresh registry as after a daemon restart. A watch
+/// with `pattern` is registered on the reloaded task; returns the pushed watch
+/// match and the reloaded registry's status snapshot.
+fn restarted_watch_match(
+    environment: &[(&str, &str)],
+    pattern: WatchPattern,
+) -> (BashPatternMatchFrame, BgTaskSnapshot, TaskPaths) {
+    let fixture = tempfile::tempdir().unwrap();
+    let original = BgTaskRegistry::default();
+    let (id, task) = tests::insert_terminal_piped_task(
+        &original,
+        &fixture,
+        "queue-watch",
+        RESTART_WATCH_LINE,
+        "",
+        false,
+    );
+    let plan = SpawnPlan::Host {
+        shell_path: PathBuf::from("bash"),
+        environment: environment
+            .iter()
+            .map(|(key, value)| ((*key).into(), (*value).into()))
+            .collect(),
+    };
+    let secrets = crate::sandbox_spawn::completion_secrets(&plan, &HashMap::new());
+    let mut metadata = task.lock_state().unwrap().metadata.clone();
+    metadata.completion_has_env_secrets = Some(!secrets.values.is_empty());
+    metadata.completion_has_non_ticket_env_secrets = Some(secrets.has_non_ticket_secrets);
+    metadata.completion_ticket_digest = secrets.ticket_digest;
+    metadata.notify_on_completion = false;
+    metadata.completion_delivered = true;
+    crate::bash_background::persistence::write_task(&task.paths.json, &metadata).unwrap();
+    drop(original);
+
+    let (restarted, _db, frames) = tests::registry_with_db_and_frames(fixture.path());
+    // Only whether the environment held secrets is saved, never a value.
+    assert!(!std::fs::read_to_string(&task.paths.json)
+        .unwrap()
+        .contains("opaque-deploy-credential"));
+    let metadata = crate::bash_background::persistence::read_task(&task.paths.json).unwrap();
+    restarted
+        .insert_rehydrated_task(metadata, task.paths.clone(), true)
+        .unwrap();
+    let reloaded = restarted.task(&id).unwrap();
+    restarted.ensure_task_row(&reloaded);
+    restarted.register_watch(id.clone(), pattern, true).unwrap();
+    let pushed = tests::pattern_match_frames(&frames);
+    assert_eq!(pushed.len(), 1, "watch did not fire after the restart");
+    assert_eq!(
+        pushed[0].match_offset,
+        RESTART_WATCH_LINE.find("failed").unwrap() as u64
+    );
+    let status = restarted
+        .status(&id, "session", None, None, RUNNING_OUTPUT_PREVIEW_BYTES)
+        .unwrap();
+    (pushed[0].clone(), status, task.paths.clone())
+}
+
+#[test]
+fn bash_background_restart_watch_previews_a_task_launched_without_secrets() {
+    let (matched, status, _) =
+        restarted_watch_match(&[], WatchPattern::regex("failed: .*").unwrap());
+    assert_eq!(matched.match_text, "failed: checks");
+    assert!(
+        matched
+            .context
+            .contains("#1039 head 03b92ca085 failed: checks"),
+        "{:?}",
+        matched.context
+    );
+    assert!(
+        !matched.context.contains("withheld"),
+        "{:?}",
+        matched.context
+    );
+    // bash_status on the finished task reads the same output.
+    assert!(status
+        .output_preview
+        .contains(RESTART_WATCH_LINE.trim_end()));
+    assert!(status.output_path.is_some());
+}
+
+#[test]
+fn bash_background_restart_watch_withholds_output_of_a_task_launched_with_secrets() {
+    const SECRET: &str = "opaque-deploy-credential";
+    let environment = [("DEPLOY_TOKEN", SECRET)];
+    let (matched, status, paths) =
+        restarted_watch_match(&environment, WatchPattern::regex("failed: .*").unwrap());
+    // The secret values are gone after the restart, so output-derived text
+    // stays withheld.
+    assert_eq!(matched.match_text, SECRET_PLACEHOLDER);
+    // bash_status shows no output for a running task, so the notice names
+    // the file the match was found in instead of pointing at bash_status.
+    assert_eq!(
+        matched.context,
+        format!(
+            "{}\nOutput file: {}",
+            completion_preview::RESTART_WATCH_PREVIEW_WITHHELD,
+            paths.stdout.display()
+        )
+    );
+    assert!(!matched.context.contains("03b92ca085"));
+    // bash_status on the finished task still reads the output.
+    assert!(status
+        .output_preview
+        .contains(RESTART_WATCH_LINE.trim_end()));
+    assert!(status.output_path.is_some());
+
+    // A substring watch's match is the agent's own pattern, shown as given
+    // even when the output around it is withheld.
+    let (matched, _, _) =
+        restarted_watch_match(&environment, WatchPattern::Substring("failed".into()));
+    assert_eq!(matched.match_text, "failed");
+    assert!(matched
+        .context
+        .starts_with(completion_preview::RESTART_WATCH_PREVIEW_WITHHELD));
+}
+
+#[test]
+fn bash_background_restart_watch_previews_a_task_launched_with_aft_co_author() {
+    // AFT gives governed children its co-author trailer. It names a person,
+    // not a credential, so it must not make the task's output withheld.
+    let environment = [(
+        "AFT_GIT_CO_AUTHOR",
+        "Co-Authored-By: Agent <agent@example.com>",
+    )];
+    let (matched, status, _) =
+        restarted_watch_match(&environment, WatchPattern::regex("failed: .*").unwrap());
+    assert_eq!(matched.match_text, "failed: checks");
+    assert!(
+        matched
+            .context
+            .contains("#1039 head 03b92ca085 failed: checks"),
+        "{:?}",
+        matched.context
+    );
+    assert!(status
+        .output_preview
+        .contains(RESTART_WATCH_LINE.trim_end()));
 }

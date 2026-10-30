@@ -29,7 +29,7 @@ use crate::blob_store::v2::FamilyPlane;
 
 use super::readiness::PlaneReadiness;
 use super::registry::{ReaderRegistration, ViewRegistration};
-use super::snapshot::{OpenGeneration, Snapshot};
+use super::snapshot::{ComposedGeneration, Snapshot};
 use super::RelPath;
 
 /// Durability boundaries of view construction. V3-only boundaries are appended
@@ -59,11 +59,36 @@ pub enum DurabilityStep {
     V3FloorRaised,
     /// All plane writes in a v3 publication are durable before its ledger commit.
     ClosureFlushed,
+    /// A `base_builds` claim row names this process as the base's builder.
+    BaseClaimed,
+    /// The base's member row (`kind = base`, no pointer yet) is committed.
+    BaseRegistered,
+    /// The base pointer moved to a readiness successor with the same membership.
+    BaseSuccessorPublished,
+    /// A worker's per-acquisition marker and `intent` referrer row exist.
+    BaseRefMarked,
+    /// The worker's referrer row is `published` with its worker generation.
+    ReferrerPublished,
+    /// A sweep found the base unreferenced and set its counter to 1.
+    BaseUnreferencedCounted,
+    /// A sweep committed `evicting` for an unreferenced base before removing it.
+    BaseReclaimBegun,
 }
 
 impl DurabilityStep {
     pub const V3_ONLY: [Self; 2] = [Self::V3FloorRaised, Self::ClosureFlushed];
-    pub const ALL: [Self; 10] = [
+    /// Boundaries of the base-reference protocol, in the order one base build,
+    /// worker bind and reclaim reaches them.
+    pub const BASE_PATH: [Self; 7] = [
+        Self::BaseClaimed,
+        Self::BaseRegistered,
+        Self::BaseSuccessorPublished,
+        Self::BaseRefMarked,
+        Self::ReferrerPublished,
+        Self::BaseUnreferencedCounted,
+        Self::BaseReclaimBegun,
+    ];
+    pub const ALL: [Self; 17] = [
         Self::BlobCommitted,
         Self::SegmentRowRecorded,
         Self::SegmentFileSynced,
@@ -74,6 +99,13 @@ impl DurabilityStep {
         Self::PointerSynced,
         Self::V3FloorRaised,
         Self::ClosureFlushed,
+        Self::BaseClaimed,
+        Self::BaseRegistered,
+        Self::BaseSuccessorPublished,
+        Self::BaseRefMarked,
+        Self::ReferrerPublished,
+        Self::BaseUnreferencedCounted,
+        Self::BaseReclaimBegun,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -88,6 +120,13 @@ impl DurabilityStep {
             Self::PointerSynced => "pointer-synced",
             Self::V3FloorRaised => "v3-floor-raised",
             Self::ClosureFlushed => "closure-flushed",
+            Self::BaseClaimed => "base-claimed",
+            Self::BaseRegistered => "base-registered",
+            Self::BaseSuccessorPublished => "base-successor-published",
+            Self::BaseRefMarked => "base-ref-marked",
+            Self::ReferrerPublished => "referrer-published",
+            Self::BaseUnreferencedCounted => "base-unreferenced-counted",
+            Self::BaseReclaimBegun => "base-reclaim-begun",
         }
     }
 
@@ -105,6 +144,60 @@ pub(crate) fn observe(observer: Option<&dyn DurabilityObserver>, step: Durabilit
     if let Some(observer) = observer {
         observer.reached(step);
     }
+}
+
+/// A failure a test injects at one durability boundary. The boundary's
+/// durable action has already happened; the caller sees the error a failed
+/// `fsync`, a failed `rename` or a full disk would give it right after.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InjectedFault {
+    Fsync,
+    Rename,
+    NoSpace,
+}
+
+#[cfg(test)]
+impl InjectedFault {
+    pub(crate) const ALL: [Self; 3] = [Self::Fsync, Self::Rename, Self::NoSpace];
+    fn error(self) -> std::io::Error {
+        match self {
+            // EIO, EXDEV and ENOSPC on unix. Windows maps these codes to other
+            // errors; callers handle every boundary failure the same way.
+            Self::Fsync => std::io::Error::from_raw_os_error(5),
+            Self::Rename => std::io::Error::from_raw_os_error(18),
+            Self::NoSpace => std::io::Error::from_raw_os_error(28),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static INJECTED: std::cell::Cell<Option<(DurabilityStep, InjectedFault)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Makes the next [`boundary`] at `step` on this thread fail with `fault`.
+#[cfg(test)]
+pub(crate) fn inject_fault_at(step: DurabilityStep, fault: InjectedFault) {
+    INJECTED.with(|slot| slot.set(Some((step, fault))));
+}
+
+/// [`observe`], for boundaries whose callers handle a failure there. Tests can
+/// make one boundary fail with [`inject_fault_at`]; production never fails here.
+pub(crate) fn boundary(
+    observer: Option<&dyn DurabilityObserver>,
+    step: DurabilityStep,
+) -> std::io::Result<()> {
+    observe(observer, step);
+    #[cfg(test)]
+    if let Some((at, fault)) = INJECTED.with(|slot| slot.get()) {
+        if at == step {
+            INJECTED.with(|slot| slot.set(None));
+            return Err(fault.error());
+        }
+    }
+    Ok(())
 }
 
 /// Who is using a view.
@@ -137,6 +230,26 @@ impl ViewAccess {
             Self::Owner(registration) => registration.scope(),
             Self::Reader { scope, .. } => scope,
         }
+    }
+}
+
+/// Where a generation's plane artifacts are read and written.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StorageRoute {
+    /// The v2 family store and the registration's v2 view directory.
+    V2,
+    /// The v3 plane stores and the v3 member directory of the route's scope.
+    V3(super::snapshot::V3Route),
+}
+
+impl ViewAccess {
+    /// The storage of `generation`: a generation opened or published in the
+    /// v3 namespace carries its route; every other generation is v2.
+    pub fn route(&self, generation: &ComposedGeneration) -> StorageRoute {
+        generation
+            .v3_route()
+            .cloned()
+            .map_or(StorageRoute::V2, StorageRoute::V3)
     }
 }
 
@@ -208,11 +321,48 @@ pub trait PlaneAdapter: Send + Sync {
     fn open_generation(
         &self,
         access: &ViewAccess,
-        generation: &Arc<OpenGeneration>,
+        generation: &Arc<ComposedGeneration>,
     ) -> Result<(), PlaneError>;
+
+    /// Open the resident state and optionally retain its actual read handle.
+    /// Adapters whose scope caches may be cleared while queries outlive them
+    /// return an owned handle; simpler adapters use the release-generation lease.
+    fn open_reader(
+        &self,
+        access: &ViewAccess,
+        generation: &Arc<ComposedGeneration>,
+    ) -> Result<Option<super::snapshot::PlaneAttachment>, PlaneError> {
+        self.open_generation(access, generation)?;
+        Ok(None)
+    }
+
+    /// Bind a shared immutable reader to this bundle's query state. This runs
+    /// for every bundle, including cache hits, so a new binding cannot inherit
+    /// mutable fill state from a retired binding of the same generation.
+    fn bind_reader(
+        &self,
+        _access: &ViewAccess,
+        _generation: &Arc<ComposedGeneration>,
+        reader: Option<super::snapshot::PlaneAttachment>,
+    ) -> Result<Option<super::snapshot::PlaneAttachment>, PlaneError> {
+        Ok(reader)
+    }
 
     /// Drops resident state for a generation that no snapshot holds.
     fn release_generation(&self, access: &ViewAccess, generation: &str);
+
+    /// Called only after durable pointer publication for this generation succeeded.
+    /// Opening draft readers must not drop live protection for unpublished fills.
+    /// `current` returns installed disk facts without I/O or building; sample it
+    /// after capturing a fill-state version so a concurrent completion is not lost.
+    fn generation_published(
+        &self,
+        _access: &ViewAccess,
+        _generation: &Arc<ComposedGeneration>,
+        _current: &dyn Fn() -> Snapshot,
+    ) -> Result<(), PlaneError> {
+        Ok(())
+    }
 
     /// This plane's readiness for the view `access` names, as of `snapshot`.
     ///

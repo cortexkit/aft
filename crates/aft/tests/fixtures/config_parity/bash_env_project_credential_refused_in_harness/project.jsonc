@@ -1,0 +1,11 @@
+{
+  "harnesses": {
+    "pi": {
+      "bash": {
+        "env": {
+          "PARITY_GITHUB_TOKEN": "x"
+        }
+      }
+    }
+  }
+}

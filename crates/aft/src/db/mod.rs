@@ -21,9 +21,11 @@ pub mod call_ledger;
 pub mod compression_events;
 #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
 pub(crate) mod contention_probe;
+pub(crate) mod gh_speech;
 pub mod github_read_cache;
 pub mod remote_exec;
 pub mod removal;
+pub mod rich_ui;
 pub mod standing_roots;
 pub mod state;
 
@@ -33,10 +35,33 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod wal_credit_probe;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 18;
+pub const CURRENT_SCHEMA_VERSION: u32 = 24;
 
 const MIGRATION_VERSIONS: &[u32] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    rich_ui::SCHEMA_VERSION,
+    21,
+    22,
+    23,
+    24,
 ];
 
 // Performance-only indexes do not change the table format or reader floor.
@@ -645,6 +670,7 @@ pub(crate) fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConne
         apply_pragmas_with_timeout(&conn, TOOL_RETRY_BUSY_WAIT)?;
         run_migrations(&mut conn)?;
         ensure_additive_indexes(&conn)?;
+        clear_stored_compression_commands(&mut conn)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         return Ok(conn);
     }
@@ -676,6 +702,7 @@ pub(crate) fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConne
             )?;
             run_migrations(&mut conn)?;
             ensure_additive_indexes(&conn)?;
+            clear_stored_compression_commands(&mut conn)?;
             Ok::<(), OpenError>(())
         })();
         match result {
@@ -770,12 +797,16 @@ fn apply_pragmas_with_timeout(
 /// Returns the post-migration schema version. Refuses to open databases created
 /// by newer AFT versions.
 pub fn run_migrations(conn: &mut Connection) -> Result<u32, OpenError> {
+    run_migrations_supported(conn, CURRENT_SCHEMA_VERSION)
+}
+
+fn run_migrations_supported(conn: &mut Connection, supported: u32) -> Result<u32, OpenError> {
     // Also fence callers that supply their own connection. Read the version
     // on that connection, never a second descriptor while it is live.
     if let Some(path) = conn.path().filter(|path| !path.is_empty()) {
         if crate::production_storage::protected(Path::new(path)) {
-            if current_schema_version(conn).ok() == Some(CURRENT_SCHEMA_VERSION) {
-                return Ok(CURRENT_SCHEMA_VERSION);
+            if current_schema_version(conn).ok() == Some(supported) {
+                return Ok(supported);
             }
             crate::production_storage::refuse_write(Path::new(path))?;
         }
@@ -785,28 +816,67 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, OpenError> {
     )?;
 
     let db_version = current_schema_version(conn)?;
-    if db_version == CURRENT_SCHEMA_VERSION {
+    if db_version == supported {
         return Ok(db_version);
     }
-    if db_version > CURRENT_SCHEMA_VERSION {
+    if db_version > supported {
         return Err(OpenError::DowngradeRefused {
             db_version,
-            supported: CURRENT_SCHEMA_VERSION,
+            supported,
         });
     }
 
     // The bare read above keeps current-schema opens read-only. A lagging opener
     // may still have observed a stale version, so every planned step re-reads it
     // after acquiring SQLite's write lock and skips work another opener committed.
-    for &version in MIGRATION_VERSIONS.iter().filter(|&&v| v > db_version) {
+    for &version in MIGRATION_VERSIONS
+        .iter()
+        .filter(|&&v| v > db_version && v <= supported)
+    {
         apply_migration(conn, version)?;
     }
 
-    Ok(CURRENT_SCHEMA_VERSION)
+    Ok(supported)
 }
 
 fn ensure_additive_indexes(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(ADDITIVE_INDEXES)
+}
+
+/// `host_state` key recording that shell command text written to
+/// `compression_events.command` by earlier builds has been cleared.
+const COMPRESSION_COMMANDS_CLEARED_KEY: &str = "aft.compression_event_commands_cleared";
+
+/// Clear command text that earlier builds stored with each compression event.
+/// Nothing reads that column, and a command can carry an inline credential.
+/// This is a data change, not a format change: the column stays (older builds
+/// still insert into it), so the schema version and reader floor are unchanged.
+/// Runs once per database on a writable open; the marker in `host_state` makes
+/// later opens a single indexed read.
+fn clear_stored_compression_commands(conn: &mut Connection) -> rusqlite::Result<()> {
+    let marker_exists = |conn: &Connection| {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM host_state WHERE key = ?1)",
+            [COMPRESSION_COMMANDS_CLEARED_KEY],
+            |row| row.get::<_, bool>(0),
+        )
+    };
+    if marker_exists(conn)? {
+        return Ok(());
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Another opener may have finished the cleanup while this one waited.
+    if !marker_exists(&tx)? {
+        tx.execute(
+            "UPDATE compression_events SET command = NULL WHERE command IS NOT NULL",
+            [],
+        )?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as i64);
+        state::set_host_state(&tx, COMPRESSION_COMMANDS_CLEARED_KEY, "1", now_ms)?;
+    }
+    tx.commit()
 }
 
 fn current_schema_version(conn: &Connection) -> Result<u32, rusqlite::Error> {
@@ -926,6 +996,7 @@ fn migration_already_applied(conn: &Connection, version: u32) -> rusqlite::Resul
             )
             .map(|object_count| object_count == 1),
         14 => conn.query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('remote_exec_policies','idx_remote_exec_policies_used')", [], |r| r.get::<_,u32>(0)).map(|n| n == 2),
+        24 => conn.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('bash_watch_delivery_acks','bash_watch_delivery_gaps')", [], |row| row.get::<_, u32>(0)).map(|count| count == 2),
         _ => Ok(false),
     }
 }
@@ -950,6 +1021,21 @@ fn apply_migration_statements(conn: &Connection, version: u32) -> rusqlite::Resu
         16 => conn.execute_batch(access_grants::MIGRATION),
         17 => conn.execute_batch(access_asks::MIGRATION),
         18 => conn.execute_batch(access_grants::MODES_MIGRATION),
+        19 => call_ledger::migrate_result_source(conn),
+        rich_ui::SCHEMA_VERSION => conn.execute_batch(rich_ui::MIGRATION),
+        21 => apply_migration_v21(conn),
+        22 => conn.execute_batch(gh_speech::MIGRATION),
+        23 => conn.execute_batch(gh_speech::LEGACY_DISPATCH_MIGRATION),
+        24 => conn.execute_batch("CREATE TABLE IF NOT EXISTS bash_watch_delivery_acks (
+            harness TEXT NOT NULL, session_id TEXT NOT NULL, task_id TEXT NOT NULL, watch_id TEXT NOT NULL,
+            version INTEGER NOT NULL, acknowledged_at INTEGER NOT NULL,
+            eviction_epoch TEXT NOT NULL, evicted_through INTEGER NOT NULL,
+            PRIMARY KEY (harness, session_id, task_id, watch_id)
+        );
+        CREATE TABLE IF NOT EXISTS bash_watch_delivery_gaps (
+            harness TEXT NOT NULL, session_id TEXT NOT NULL, task_id TEXT NOT NULL, watch_id TEXT NOT NULL,
+            batch TEXT NOT NULL, PRIMARY KEY (harness, session_id, task_id, watch_id)
+        )"),
         _ => Ok(()),
     }
 }
@@ -967,9 +1053,135 @@ fn apply_migration_v4(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn apply_migration_v21(conn: &Connection) -> rusqlite::Result<()> {
+    let columns = conn
+        .prepare("PRAGMA table_info(bash_pattern_watches)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|column| column == "each_line") {
+        conn.execute_batch(
+            "ALTER TABLE bash_pattern_watches ADD COLUMN each_line INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
+    if !columns.iter().any(|column| column == "match_batch") {
+        conn.execute_batch("ALTER TABLE bash_pattern_watches ADD COLUMN match_batch TEXT")?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_twenty_one_upgrade_adds_speech_authority_without_a_gap() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)")
+            .unwrap();
+        for version in 1..=21 {
+            apply_migration(&mut conn, version).unwrap();
+        }
+        assert_eq!(current_schema_version(&conn).unwrap(), 21);
+        assert_eq!(run_migrations(&mut conn).unwrap(), CURRENT_SCHEMA_VERSION);
+        for table in [
+            "gh_speech_authorities",
+            "gh_speech_task_revocations",
+            "gh_speech_scope_ends",
+            "gh_speech_policy_versions",
+            "gh_speech_policy_watermarks",
+            "gh_speech_requests",
+            "gh_speech_legacy_dispatch",
+        ] {
+            let present: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "missing {table}");
+        }
+        assert_eq!(MIGRATION_VERSIONS, (1..=24).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn schema_twenty_two_upgrade_preserves_revocations_and_adds_dispatch_outcomes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)")
+            .unwrap();
+        for version in 1..=22 {
+            apply_migration(&mut conn, version).unwrap();
+        }
+        conn.execute("INSERT INTO gh_speech_task_revocations(incarnation,reason,recorded_at_ms) VALUES('old-task','cancelled',1)", []).unwrap();
+        let absent: bool = conn.query_row("SELECT NOT EXISTS(SELECT 1 FROM sqlite_master WHERE name='gh_speech_legacy_dispatch')", [], |row| row.get(0)).unwrap();
+        assert!(
+            absent,
+            "schema 22 must not silently acquire schema 23 tables"
+        );
+        assert_eq!(run_migrations(&mut conn).unwrap(), CURRENT_SCHEMA_VERSION);
+        let reason: String = conn
+            .query_row(
+                "SELECT reason FROM gh_speech_task_revocations WHERE incarnation='old-task'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, "cancelled");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM gh_speech_legacy_dispatch",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+    #[test]
+    fn schema_twenty_three_upgrade_adds_watch_gap_state_after_speech_authority() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)")
+            .unwrap();
+        for version in 1..=23 {
+            apply_migration(&mut conn, version).unwrap();
+        }
+        conn.execute("INSERT INTO gh_speech_task_revocations(incarnation,reason,recorded_at_ms) VALUES('old-task','cancelled',1)", []).unwrap();
+        assert!(!migration_already_applied(&conn, 24).unwrap());
+        let count: u32 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('bash_watch_delivery_acks','bash_watch_delivery_gaps')", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(run_migrations(&mut conn).unwrap(), 24);
+        assert!(migration_already_applied(&conn, 24).unwrap());
+        bash_watches::acknowledge_delivery(&conn, "opencode", "session", "task", "watch", 7, None)
+            .unwrap();
+        assert_eq!(
+            bash_watches::delivery_ack_version(&conn, "opencode", "session", "task", "watch")
+                .unwrap()
+                .unwrap()
+                .0,
+            7
+        );
+        assert!(
+            bash_watches::list_delivery_gaps(&conn, "opencode", Some("session"))
+                .unwrap()
+                .is_empty()
+        );
+        let reason: String = conn
+            .query_row(
+                "SELECT reason FROM gh_speech_task_revocations WHERE incarnation='old-task'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, "cancelled");
+        let dispatch_count: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM gh_speech_legacy_dispatch",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dispatch_count, 0);
+    }
+
     use rusqlite::params;
     use tempfile::tempdir;
 
@@ -977,6 +1189,8 @@ mod tests {
         "schema_version",
         "bash_tasks",
         "bash_pattern_watches",
+        "bash_watch_delivery_acks",
+        "bash_watch_delivery_gaps",
         "compression_events",
         "backups",
         "harness_state",
@@ -987,6 +1201,10 @@ mod tests {
         "write_ledger_process_minutes",
         "write_ledger_meta",
         "write_ledger_unmeasurable_minutes",
+        "bash_view_records",
+        "rich_ui_templates",
+        "rich_ui_cursor_key",
+        "rich_ui_session_presets",
     ];
 
     const EXPECTED_INDEXES: &[&str] = &[
@@ -1012,6 +1230,7 @@ mod tests {
         "idx_standing_root_freshness_needs_verify",
         "idx_write_ledger_minutes_window",
         "idx_write_ledger_unmeasurable_window",
+        "idx_rich_ui_session_presets_recorded",
     ];
 
     /// Opens `aft.db` twice: the first connection plays this process's shared
@@ -1365,6 +1584,57 @@ mod tests {
     }
 
     #[test]
+    fn migration_v21_opens_v20_with_default_first_match_and_new_reader_floor() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+        let conn = Connection::open(&path).unwrap();
+        for version in 1..=20 {
+            apply_migration_statements(&conn, version).unwrap();
+        }
+        conn.execute("INSERT INTO schema_version(version) VALUES (20)", [])
+            .unwrap();
+        drop(conn);
+        crate::reader_floor::raise(
+            dir.path(),
+            &[(crate::persisted_format::PersistedStore::AftDb, 20)],
+        )
+        .unwrap();
+        assert!(crate::reader_floor::prepare(dir.path()).is_empty());
+        let conn = open(&path).unwrap();
+        // Opening migrates through every later version too, so the result is
+        // the current schema; the v21 columns below must still be present.
+        assert_eq!(schema_version(&conn), CURRENT_SCHEMA_VERSION);
+        let columns = conn
+            .prepare("PRAGMA table_info(bash_pattern_watches)")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(columns.contains(&("each_line".into(), "INTEGER".into(), true, Some("0".into()))));
+        assert!(columns.contains(&("match_batch".into(), "TEXT".into(), false, None)));
+        let result_source_type: String = conn.query_row(
+            "SELECT type FROM pragma_table_info('call_ledger') WHERE name = 'tool_result_source'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(result_source_type, "BLOB");
+        assert_eq!(
+            crate::reader_floor::read(dir.path())
+                .unwrap()
+                .unwrap()
+                .get(crate::persisted_format::PersistedStore::AftDb),
+            Some(u64::from(CURRENT_SCHEMA_VERSION))
+        );
+    }
+
+    #[test]
     fn migration_v2_deduplicates_compression_events_and_adds_unique_index() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("aft.db");
@@ -1467,9 +1737,18 @@ mod tests {
         assert!(!sqlite_names(&conn, "index").contains(&"idx_bash_tasks_task_owner".to_string()));
         drop(conn);
 
-        assert!(crate::reader_floor::prepare(dir.path()).is_empty());
+        // Today's startup baseline includes newer table formats; this fixture
+        // intentionally models only the optional index on the historical schema.
+        std::fs::write(
+            crate::reader_floor::floor_path(dir.path()),
+            br#"{"floor_schema":1,"stores":{"aft.db":18}}"#,
+        )
+        .unwrap();
         let floor_before = std::fs::read(crate::reader_floor::floor_path(dir.path())).unwrap();
-        let conn = open(&path).unwrap();
+        // Isolate the optional index at its historical table version; writable
+        // opens now also perform later table-format migrations.
+        let conn = Connection::open(&path).unwrap();
+        ensure_additive_indexes(&conn).unwrap();
         assert_eq!(schema_version(&conn), 18);
         assert_eq!(
             crate::reader_floor::read(dir.path())
@@ -1506,6 +1785,42 @@ mod tests {
                 .unwrap();
             assert!(statement.query([]).unwrap().next().unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn result_source_migration_preserves_legacy_frames_and_sets_reader_floor() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+        let conn = Connection::open(&path).unwrap();
+        for version in 1..=18 {
+            apply_migration_statements(&conn, version).unwrap();
+        }
+        conn.execute("INSERT INTO schema_version(version) VALUES (18)", [])
+            .unwrap();
+        let legacy = br#"{"content":[{"type":"text","text":"legacy"}],"isError":true}"#;
+        conn.execute("INSERT INTO call_ledger(carrier,call_key,digest,state,event_id,frame_type,frame_body) VALUES ('carrier','key','digest','Settled','event','Response',?1)", [legacy.as_slice()]).unwrap();
+        drop(conn);
+        assert!(crate::reader_floor::prepare(dir.path()).is_empty());
+        let conn = open(&path).unwrap();
+        assert_eq!(schema_version(&conn), CURRENT_SCHEMA_VERSION);
+        let row = call_ledger::get_for_replay(
+            &conn,
+            &call_ledger::Key {
+                carrier: "carrier".into(),
+                call_key: "key".into(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(row.frame.unwrap().body, legacy);
+        assert!(row.tool_result_source.is_none());
+        assert_eq!(
+            crate::reader_floor::read(dir.path())
+                .unwrap()
+                .unwrap()
+                .get(crate::persisted_format::PersistedStore::AftDb),
+            Some(u64::from(CURRENT_SCHEMA_VERSION))
+        );
     }
 
     #[test]
@@ -1778,6 +2093,62 @@ mod tests {
         let conn = open(&path).unwrap();
         assert_eq!(schema_version(&conn), CURRENT_SCHEMA_VERSION);
         assert_eq!(schema_version_row_count(&conn), 1);
+    }
+
+    #[test]
+    fn writable_open_clears_stored_compression_commands_once() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+        let commands = |conn: &Connection| -> Vec<Option<String>> {
+            let mut stmt = conn
+                .prepare("SELECT command FROM compression_events ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        // A database last written by a build that still stored command text.
+        let conn = open(&path).unwrap();
+        insert_compression_event(&conn, 1, "opencode", Some("s"), "p", "bash", Some("t1")).unwrap();
+        conn.execute(
+            "DELETE FROM host_state WHERE key = ?1",
+            [COMPRESSION_COMMANDS_CLEARED_KEY],
+        )
+        .unwrap();
+        drop(conn);
+
+        let reader = open_readonly(&path).unwrap();
+        assert_eq!(commands(&reader), [Some("echo ok".to_string())]);
+        drop(reader);
+
+        let conn = open(&path).unwrap();
+        assert_eq!(commands(&conn), [None]);
+        let row = compression_events::CompressionEventRow {
+            harness: "opencode",
+            session_id: Some("s"),
+            project_key: "p",
+            tool: "bash",
+            task_id: Some("t2"),
+            compressor: "generic",
+            original_bytes: 10,
+            compressed_bytes: 5,
+            original_tokens: 3,
+            compressed_tokens: 2,
+            created_at: 2,
+        };
+        compression_events::insert_compression_event(&conn, &row).unwrap();
+        assert_eq!(commands(&conn), [None, None]);
+
+        // Later opens only read the marker.
+        conn.execute(
+            "UPDATE compression_events SET command = 'kept' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let conn = open(&path).unwrap();
+        assert_eq!(commands(&conn), [Some("kept".to_string()), None]);
     }
 
     #[test]

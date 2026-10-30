@@ -15,6 +15,9 @@
 
 pub mod per_checkout;
 pub mod prune_legacy;
+pub mod v3_import;
+pub mod v3_ledger;
+pub mod v3_symbols;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -918,12 +921,21 @@ fn parse_legacy_snapshot(
 }
 
 fn fingerprint_is_compatible(legacy: &str, configured: &str) -> bool {
-    let Ok(legacy) = serde_json::from_str::<serde_json::Value>(legacy) else {
+    let Ok(mut legacy) = serde_json::from_str::<serde_json::Value>(legacy) else {
         return false;
     };
     let Ok(configured) = serde_json::from_str::<serde_json::Value>(configured) else {
         return false;
     };
+    let Some(fields) = legacy.as_object_mut() else {
+        return false;
+    };
+    // Repair state is not model identity. Every other fingerprint field stays exact.
+    if let Some(marker) = fields.remove("file_summary_budget_limited") {
+        if !marker.is_boolean() {
+            return false;
+        }
+    }
     legacy == configured
         && legacy
             .get("chunking_version")
@@ -1060,6 +1072,7 @@ mod tests {
         let view = ViewStore::open(&request.storage, &request.view).unwrap();
         let sweep = || {
             crate::gc::sweep(crate::gc::SweepRequest {
+                durable_storage: &request.storage,
                 storage: &request.storage,
                 family: &request.family,
                 view_dir: view.view_dir(),

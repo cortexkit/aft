@@ -1,0 +1,12 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/lib.rs"
+  ],
+  "note": "Bash can now list the project files that changed while a command ran, optionally with a short diff: set `bash.changed_files` to `list` or `diff` in your user config (off by default). Thanks @iceteaSA for the request (#752). Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}

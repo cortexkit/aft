@@ -96,7 +96,8 @@ fn assert_matches_disk(snapshot: &Snapshot, disk: &Disk, context: &str) {
     paths.extend(
         snapshot
             .generation()
-            .manifest()
+            .flatten()
+            .unwrap()
             .entries()
             .map(|(rel_path, _)| rel_path.clone()),
     );
@@ -365,7 +366,13 @@ fn pending_work_survives_a_fold_that_publishes_before_its_fill() {
     write(&mut disk, &mut delta, "a.txt", b"edited");
     let fill = FillMap::default();
     assert_eq!(
-        plane_readiness(FamilyPlane::Semantic, Some(&ready), &delta, &fill, &applies),
+        plane_readiness(
+            FamilyPlane::Semantic,
+            Some(delta.base()),
+            &delta,
+            &fill,
+            &applies
+        ),
         PlaneReadiness::Ready {
             pending: 1,
             failed: 0
@@ -373,7 +380,7 @@ fn pending_work_survives_a_fold_that_publishes_before_its_fill() {
     );
 
     let folded = fold(
-        &ready,
+        delta.base(),
         &producers(),
         [(
             path("a.txt"),
@@ -391,7 +398,7 @@ fn pending_work_survives_a_fold_that_publishes_before_its_fill() {
     assert_eq!(
         plane_readiness(
             FamilyPlane::Semantic,
-            Some(&folded),
+            Some(delta.base()),
             &delta,
             &fill,
             &applies
@@ -406,7 +413,7 @@ fn pending_work_survives_a_fold_that_publishes_before_its_fill() {
     let queue = work_queue(
         FamilyPlane::Semantic,
         "model-a",
-        Some(&folded),
+        Some(delta.base()),
         &delta,
         &fill,
         &applies,
@@ -426,13 +433,13 @@ fn pending_work_survives_a_fold_that_publishes_before_its_fill() {
         key: semantic_key("a.txt", b"edited", "model-a"),
     };
     assert_eq!(
-        fill.admit(&completion, "model-a", None, Some(&folded)),
+        fill.admit(&completion, "model-a", None, Some(delta.base())),
         Admission::Installed
     );
     assert_eq!(
         plane_readiness(
             FamilyPlane::Semantic,
-            Some(&folded),
+            Some(delta.base()),
             &delta,
             &fill,
             &applies
@@ -442,7 +449,7 @@ fn pending_work_survives_a_fold_that_publishes_before_its_fill() {
             failed: 0
         }
     );
-    let filled = fold(&folded, &producers(), [], &fill).unwrap();
+    let filled = fold(delta.base(), &producers(), [], &fill).unwrap();
     assert_eq!(
         filled
             .get(&path("a.txt"))
@@ -450,7 +457,7 @@ fn pending_work_survives_a_fold_that_publishes_before_its_fill() {
             .plane_state(FamilyPlane::Semantic),
         Some(&PlaneState::ready(&completion.key))
     );
-    fill.trim_folded(&filled);
+    fill.trim_folded(&OpenGeneration::new("filled", filled, None));
     assert!(fill.is_empty());
 }
 
@@ -461,7 +468,7 @@ fn pending_and_failed_states_survive_publication_and_reopen() {
     let storage = tempfile::tempdir().unwrap();
     let registry = super::registry::FamilyRegistry::open(storage.path(), "family").unwrap();
     let registration = registry
-        .register_view("scope", &storage.path().join("root"))
+        .register_view_with_storage(registry.storage(), "scope", &storage.path().join("root"))
         .unwrap();
     let mut manifest = ManifestV2::new(header());
     manifest
@@ -495,7 +502,7 @@ fn pending_and_failed_states_survive_publication_and_reopen() {
     assert_eq!(
         plane_readiness(
             FamilyPlane::Semantic,
-            Some(&loaded),
+            Some(delta.base()),
             &delta,
             &FillMap::default(),
             &applies
@@ -511,7 +518,7 @@ fn pending_and_failed_states_survive_publication_and_reopen() {
 fn stale_completions_are_dropped() {
     let mut disk = base_disk();
     let generation = generation_of(&disk, "g");
-    let manifest = generation.manifest().clone();
+    let manifest = generation.clone();
     let mut delta = LiveDelta::new(generation);
     let item = WorkItem {
         plane: FamilyPlane::Semantic,

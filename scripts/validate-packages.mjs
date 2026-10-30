@@ -3,8 +3,8 @@
 /**
  * validate-packages.mjs
  *
- * Validates all 9 AFT npm package.json files:
- * - 5 platform packages under npm/{platform}/
+ * Validates AFT npm package.json files:
+ * - Platform packages under npm/{platform}/
  * - @cortexkit/aft-bridge (aft-bridge — shared transport)
  * - @cortexkit/aft-opencode (opencode-plugin)
  * - @cortexkit/aft-pi (pi-plugin)

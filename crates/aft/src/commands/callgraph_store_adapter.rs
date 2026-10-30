@@ -8,7 +8,7 @@ use tree_sitter::{Node, Parser};
 use crate::callgraph::{self, TraceToSymbolCandidate};
 use crate::callgraph_store::{
     CallGraphRead, CallGraphStoreError, StoreCallSite, StoreNode, StoreUnresolvedCall,
-    MACRO_BODY_CALL_REF_KIND, MACRO_MENTION_REF_KIND,
+    MACRO_BODY_CALL_REF_KIND, MACRO_MENTION_REF_KIND, UNRESOLVED_CALL_SITE_COUNT_LIMIT,
 };
 use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::edit::line_col_to_byte;
@@ -54,6 +54,10 @@ fn is_zero(value: &usize) -> bool {
     *value == 0
 }
 
+pub(crate) const CALLBACK_REFERENCE_LABEL: &str = " (callback reference)";
+pub(crate) const UNRESOLVED_CALLERS_NOTE: &str = "Incomplete: {count} call site{plural} in the analyzed {language} code could not be resolved, so a dynamic or indirect call may still reach `{symbol}`.";
+const TEST_FILTER_NOTE: &str = "Test filtering incomplete: AFT could not tell whether {count} caller site{plural} {verb} test code, so {subject} still shown.";
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreHubSummary {
     pub message: String,
@@ -74,6 +78,12 @@ struct EdgeMarker {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreCallersResult {
+    #[serde(skip_serializing_if = "is_zero")]
+    pub callback_dependencies: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callback_reference_label: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_filter_note: Option<String>,
     pub symbol: String,
     pub file: String,
     pub callers: Vec<StoreCallerGroup>,
@@ -98,7 +108,7 @@ pub struct StoreCallersResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreIncompleteNote {
     pub complete: bool,
-    pub unresolved_method_calls: usize,
+    pub unresolved_call_sites: usize,
     pub incomplete_reason: String,
 }
 
@@ -111,12 +121,24 @@ fn empty_receiver_note(
     if count != 0 {
         return Ok(None);
     }
-    let sites = store.unresolved_method_sites_named(&target.name, target.lang)?;
-    let unresolved_method_calls = sites
-        .iter()
-        .filter(|s| include_tests || !is_test_file(&s.file))
-        .count();
-    Ok((unresolved_method_calls > 0).then(|| StoreIncompleteNote { complete: false, unresolved_method_calls, incomplete_reason: format!("Incomplete: {unresolved_method_calls} unresolved method call sites named `{}` could not be linked; use grep for `{}` before concluding there are no callers", target.name, target.name) }))
+    let unresolved_call_sites = store.unresolved_call_site_count(target.lang, include_tests)?;
+    let count_text = if unresolved_call_sites == UNRESOLVED_CALL_SITE_COUNT_LIMIT {
+        format!("at least {unresolved_call_sites}")
+    } else {
+        unresolved_call_sites.to_string()
+    };
+    Ok((unresolved_call_sites > 0).then(|| StoreIncompleteNote {
+        complete: false,
+        unresolved_call_sites,
+        incomplete_reason: UNRESOLVED_CALLERS_NOTE
+            .replace("{count}", &count_text)
+            .replace(
+                "{plural}",
+                if unresolved_call_sites == 1 { "" } else { "s" },
+            )
+            .replace("{language}", &format!("{:?}", target.lang))
+            .replace("{symbol}", &target.name),
+    }))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -139,6 +161,10 @@ pub struct StoreCallerGroup {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreCallerEntry {
+    #[serde(skip_serializing_if = "is_false")]
+    pub test_status_unknown: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relation: Option<&'static str>,
     pub symbol: String,
     pub line: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -176,6 +202,12 @@ pub struct StoreCallTreeNode {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreImpactResult {
+    #[serde(skip_serializing_if = "is_zero")]
+    pub callback_dependencies: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callback_reference_label: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_filter_note: Option<String>,
     pub symbol: String,
     pub file: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -198,6 +230,8 @@ pub struct StoreImpactResult {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreImpactCaller {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relation: Option<&'static str>,
     pub caller_symbol: String,
     pub caller_file: String,
     pub line: u32,
@@ -435,7 +469,32 @@ fn lower_bound_trace_summary(
 }
 
 fn callsite_is_from_test(site: &StoreCallSite) -> bool {
-    is_test_file(&site.caller.file)
+    is_test_file(&site.caller.file) || site.caller_is_test == Some(true)
+}
+
+fn unknown_test_note(sites: &[StoreCallSite], include_tests: bool) -> Option<String> {
+    test_filter_note_for_count(unknown_test_caller_count(sites), include_tests)
+}
+
+fn unknown_test_caller_count(sites: &[StoreCallSite]) -> usize {
+    sites
+        .iter()
+        .filter(|site| {
+            site.caller.lang == crate::parser::LangId::Rust
+                && !is_test_file(&site.caller.file)
+                && site.caller_is_test.is_none()
+        })
+        .count()
+}
+
+fn test_filter_note_for_count(count: usize, include_tests: bool) -> Option<String> {
+    (!include_tests && count > 0).then(|| {
+        TEST_FILTER_NOTE
+            .replace("{count}", &count.to_string())
+            .replace("{plural}", if count == 1 { "" } else { "s" })
+            .replace("{verb}", if count == 1 { "is" } else { "are" })
+            .replace("{subject}", if count == 1 { "it is" } else { "they are" })
+    })
 }
 
 fn trace_path_starts_in_test(path: &StoreTracePath) -> bool {
@@ -565,6 +624,7 @@ pub fn callers_result(
             .then(left.caller.symbol.cmp(&right.caller.symbol))
     });
     let pre_filter_count = sites.len();
+    let unknown_test_callers = unknown_test_caller_count(&sites);
     let hidden_tests = sites
         .iter()
         .filter(|site| callsite_is_from_test(site))
@@ -574,6 +634,10 @@ pub fn callers_result(
         .filter(|site| include_tests || !callsite_is_from_test(site))
         .collect::<Vec<_>>();
     let post_filter_count = visible_sites.len();
+    let callback_dependencies = visible_sites
+        .iter()
+        .filter(|site| site.kind == "callback_ref")
+        .count();
 
     let summarize = hub_selector_activated(post_filter_count);
     let visible_sites = if summarize {
@@ -615,6 +679,10 @@ pub fn callers_result(
             .entry(site.caller.file.clone())
             .or_default()
             .push(StoreCallerEntry {
+                test_status_unknown: site.caller.lang == crate::parser::LangId::Rust
+                    && site.caller_is_test.is_none()
+                    && !is_test_file(&site.caller.file),
+                relation: (site.kind == "callback_ref").then_some("callback_reference"),
                 symbol: site.caller.symbol.clone(),
                 line: site.line,
                 approximate: edge_approximate(&site),
@@ -630,6 +698,12 @@ pub fn callers_result(
         Vec::new()
     };
     let via_count = via_entries.len();
+    let unknown_macro_callers = via_entries
+        .iter()
+        .filter(|(_, entry)| entry.test_status_unknown)
+        .count();
+    let test_filter_note =
+        test_filter_note_for_count(unknown_test_callers + unknown_macro_callers, include_tests);
     for (file, entry) in via_entries {
         groups.entry(file).or_default().push(entry);
     }
@@ -647,10 +721,13 @@ pub fn callers_result(
     );
 
     Ok(StoreCallersResult {
+        callback_dependencies,
+        callback_reference_label: (callback_dependencies > 0).then_some(CALLBACK_REFERENCE_LABEL),
+        test_filter_note,
         incomplete: empty_receiver_note(
             store,
             &target.representative,
-            total_callers + via_count,
+            post_filter_count + via_count,
             include_tests,
         )?,
         symbol: target.representative.symbol,
@@ -701,12 +778,16 @@ fn macro_via_entries(
         return Ok(Vec::new());
     }
 
-    let name_match = |symbol: String, line: u32, via: Option<String>| StoreCallerEntry {
-        symbol,
-        line,
-        approximate: Some(true),
-        resolved_by: Some("name_match".to_string()),
-        via,
+    let name_match = |symbol: String, line: u32, via: Option<String>, test_status_unknown: bool| {
+        StoreCallerEntry {
+            test_status_unknown,
+            relation: None,
+            symbol,
+            line,
+            approximate: Some(true),
+            resolved_by: Some("name_match".to_string()),
+            via,
+        }
     };
     let mut entries = Vec::new();
     let mut macros = BTreeSet::new();
@@ -714,8 +795,12 @@ fn macro_via_entries(
         let Some(macro_name) = site.local_name else {
             continue;
         };
-        if include_tests || !is_test_file(&site.file) {
-            entries.push((site.file, name_match(macro_name.clone(), site.line, None)));
+        if include_tests || !(is_test_file(&site.file) || site.is_test == Some(true)) {
+            let unknown = site.is_test.is_none() && !is_test_file(&site.file);
+            entries.push((
+                site.file,
+                name_match(macro_name.clone(), site.line, None, unknown),
+            ));
         }
         macros.insert(macro_name);
     }
@@ -725,7 +810,7 @@ fn macro_via_entries(
             break;
         }
         for site in store.ref_sites_named("call", &macro_name, remaining)? {
-            if (!include_tests && is_test_file(&site.file))
+            if (!include_tests && (is_test_file(&site.file) || site.is_test == Some(true)))
                 || listed.contains(&(site.file.clone(), site.line))
             {
                 continue;
@@ -733,9 +818,10 @@ fn macro_via_entries(
             let symbol = site
                 .caller_symbol
                 .unwrap_or_else(|| "<top-level>".to_string());
+            let unknown = site.is_test.is_none() && !is_test_file(&site.file);
             entries.push((
                 site.file,
-                name_match(symbol, site.line, Some(macro_name.clone())),
+                name_match(symbol, site.line, Some(macro_name.clone()), unknown),
             ));
         }
     }
@@ -888,6 +974,7 @@ pub fn impact_result(
             .then(left.caller.symbol.cmp(&right.caller.symbol))
     });
     let pre_filter_count = sites.len();
+    let test_filter_note = unknown_test_note(&sites, include_tests);
     let hidden_tests = sites
         .iter()
         .filter(|site| callsite_is_from_test(site))
@@ -897,6 +984,10 @@ pub fn impact_result(
         .filter(|site| include_tests || !callsite_is_from_test(site))
         .collect::<Vec<_>>();
     let post_filter_count = visible_sites.len();
+    let callback_dependencies = visible_sites
+        .iter()
+        .filter(|site| site.kind == "callback_ref")
+        .count();
 
     let summarize = hub_selector_activated(post_filter_count);
     let affected_files = visible_sites
@@ -970,6 +1061,7 @@ pub fn impact_result(
         let lines = source_lines.get(&site.caller.file).and_then(Option::as_ref);
         let stale = stale_files.contains(&site.caller.file);
         callers.push(StoreImpactCaller {
+            relation: (site.kind == "callback_ref").then_some("callback_reference"),
             caller_symbol: site.caller.symbol.clone(),
             caller_file: site.caller.file.clone(),
             line: site.line,
@@ -999,10 +1091,13 @@ pub fn impact_result(
     });
 
     Ok(StoreImpactResult {
+        callback_dependencies,
+        callback_reference_label: (callback_dependencies > 0).then_some(CALLBACK_REFERENCE_LABEL),
+        test_filter_note,
         incomplete: empty_receiver_note(
             store,
             &target.representative,
-            total_affected,
+            post_filter_count,
             include_tests,
         )?,
         symbol: target.representative.symbol,
@@ -1108,7 +1203,14 @@ fn trace_to_result_with_budget(
             let wanted = wanted.into_iter().collect::<Vec<_>>();
             let mut fetched = store.direct_callers_for_symbols(&wanted)?;
             for key in wanted {
-                let callers = dedup_call_sites(fetched.remove(&key).unwrap_or_default());
+                let callers = dedup_call_sites(
+                    fetched
+                        .remove(&key)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|site| site.kind == "call")
+                        .collect(),
+                );
                 callers_by_symbol.insert(key, callers);
             }
         }
@@ -2537,6 +2639,14 @@ pub fn home_root_disabled_response(req_id: &str, operation: &str) -> Response {
 }
 
 pub fn unavailable_for(req_id: &str, operation: &str, ctx: &AppContext) -> Response {
+    if let Some(reason) = ctx.cache_unavailable_reason() {
+        return callgraph_index_refusal(
+            req_id,
+            crate::root_cache::CACHE_DIR_UNAVAILABLE,
+            format!("{operation}: cache_dir_unavailable: {reason}"),
+            IndexObservation::unavailable(crate::root_cache::CACHE_DIR_UNAVAILABLE),
+        );
+    }
     if ctx.is_home_root() {
         return home_root_disabled_response(req_id, operation);
     }
@@ -2996,12 +3106,13 @@ fn dedup_call_site_count(sites: Vec<StoreCallSite>) -> usize {
         .len()
 }
 
-fn call_site_key(site: &StoreCallSite) -> (String, u32, String, String) {
+fn call_site_key(site: &StoreCallSite) -> (String, u32, String, String, String) {
     (
         site.caller.file.clone(),
         site.line,
         site.target_file.clone(),
         site.target_symbol.clone(),
+        site.kind.clone(),
     )
 }
 
@@ -3050,8 +3161,28 @@ fn content_matches_store(
     };
     Ok(
         stored == crate::cache_freshness::zero_hash().to_hex().as_str()
-            || stored == current.to_hex().as_str(),
+            || stored == current.to_hex().as_str()
+            || stored == view_blob_key(file, current).unwrap_or_default(),
     )
+}
+
+/// A view-materialized graph records each file's call-graph blob key rather
+/// than its raw content hash. The key is derived from the content hash, the
+/// file's language and the extractor version, so the current bytes match
+/// exactly when they derive the stored key.
+fn view_blob_key(file: &str, current: blake3::Hash) -> Option<String> {
+    let language = if crate::views::assembly::is_resolution_input(file.as_bytes()) {
+        "config".to_owned()
+    } else {
+        format!("{:?}", crate::parser::detect_language(Path::new(file))?).to_lowercase()
+    };
+    let key = crate::blob_store::CallgraphKey::from_source_digest(
+        *current.as_bytes(),
+        language,
+        crate::views::callgraph::PRODUCER,
+    )
+    .full_key();
+    Some(crate::blob_store::v2::FamilyKey::from(&key).to_hex())
 }
 
 fn file_matches_store(
@@ -3140,6 +3271,7 @@ mod trace_to_tests {
         frontier_query_count: RefCell<usize>,
         caller_count_queries: RefCell<usize>,
         caller_count_targets: RefCell<usize>,
+        caller_count_identities: RefCell<Vec<(String, String)>>,
         node_lookups: RefCell<usize>,
         stored_hashes: HashMap<String, String>,
     }
@@ -3159,6 +3291,7 @@ mod trace_to_tests {
                 frontier_query_count: RefCell::new(0),
                 caller_count_queries: RefCell::new(0),
                 caller_count_targets: RefCell::new(0),
+                caller_count_identities: RefCell::new(Vec::new()),
                 node_lookups: RefCell::new(0),
                 stored_hashes: HashMap::new(),
             }
@@ -3178,6 +3311,8 @@ mod trace_to_tests {
                 .entry((target.file.clone(), target.symbol.clone()))
                 .or_default()
                 .push(StoreCallSite {
+                    kind: "call".to_string(),
+                    caller_is_test: Some(false),
                     caller: caller.clone(),
                     target_file: target.file.clone(),
                     target_symbol: target.symbol.clone(),
@@ -3195,6 +3330,8 @@ mod trace_to_tests {
                 .entry((caller.file.clone(), caller.symbol.clone()))
                 .or_default()
                 .push(StoreCallSite {
+                    kind: "call".to_string(),
+                    caller_is_test: Some(false),
                     caller: caller.clone(),
                     target_file: target.file.clone(),
                     target_symbol: target.symbol.clone(),
@@ -3245,6 +3382,7 @@ mod trace_to_tests {
             *self.caller_frontier_target_count.borrow_mut() = 0;
             *self.caller_count_queries.borrow_mut() = 0;
             *self.caller_count_targets.borrow_mut() = 0;
+            self.caller_count_identities.borrow_mut().clear();
         }
     }
 
@@ -3342,6 +3480,9 @@ mod trace_to_tests {
         ) -> CallGraphResult<HashMap<(String, String), usize>> {
             *self.caller_count_queries.borrow_mut() += 1;
             *self.caller_count_targets.borrow_mut() = targets.len();
+            self.caller_count_identities
+                .borrow_mut()
+                .extend_from_slice(targets);
             Ok(targets
                 .iter()
                 .cloned()
@@ -3798,6 +3939,125 @@ mod trace_to_tests {
     }
 
     #[test]
+    fn reverse_replies_batch_all_boundary_symbols_once() {
+        for width in [2, 20] {
+            for depth in [1, 5, 100] {
+                let temp = tempfile::tempdir().unwrap();
+                let (mut store, target) = layered_store(width, depth + 1);
+                store.root = temp.path().to_path_buf();
+                let first = store.nodes[&("layer_1_0.ts".into(), "layer_1_0".into())].clone();
+                // The layered fanout supplies diamond joins; this back edge
+                // makes revisiting an already expanded symbol unavoidable.
+                store.add_caller(&first, &target);
+                for include_tests in [false, true] {
+                    for op in ["callers", "impact"] {
+                        store.reset_query_counts();
+                        let (depth_limited, truncated) = if op == "callers" {
+                            let reply = callers_result(
+                                &store,
+                                Path::new(&target.file),
+                                &target.symbol,
+                                depth,
+                                include_tests,
+                            )
+                            .unwrap();
+                            (reply.depth_limited, reply.truncated)
+                        } else {
+                            let reply = impact_result(
+                                &store,
+                                Path::new(&target.file),
+                                &target.symbol,
+                                depth,
+                                include_tests,
+                            )
+                            .unwrap();
+                            (reply.depth_limited, reply.truncated)
+                        };
+                        assert!(depth_limited);
+                        // At depth one this back edge lies beyond the boundary,
+                        // so it adds one to the omitted count.
+                        assert_eq!(truncated, width * width + usize::from(depth == 1));
+                        assert_eq!(store.total_caller_queries(), 0);
+                        assert_eq!(store.total_caller_frontier_queries(), depth);
+                        assert_eq!(
+                            store.caller_frontier_target_count(),
+                            1 + width * (depth - 1)
+                        );
+                        assert_eq!(
+                            store.total_caller_count_queries(),
+                            1,
+                            "{op}: width={width}, depth={depth}, include_tests={include_tests}"
+                        );
+                        assert_eq!(store.caller_count_target_count(), width);
+                        let identities = store.caller_count_identities.borrow();
+                        let actual: BTreeSet<_> = identities.iter().cloned().collect();
+                        let expected: BTreeSet<_> = (0..width)
+                            .map(|index| {
+                                (
+                                    format!("layer_{depth}_{index}.ts"),
+                                    format!("layer_{depth}_{index}"),
+                                )
+                            })
+                            .collect();
+                        assert_eq!(
+                            actual, expected,
+                            "{op}: boundary identities at depth {depth}"
+                        );
+                        assert_eq!(
+                            identities.len(),
+                            actual.len(),
+                            "{op}: duplicate boundary identity"
+                        );
+                        println!(
+                            "{op}: width={width}, depth={depth}, include_tests={include_tests}: boundary_calls=1 boundary_targets={width} frontier_calls={depth} omitted={truncated}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reverse_replies_preserve_diamond_cycle_and_hidden_test_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = CountingStore::new();
+        store.root = temp.path().to_path_buf();
+        let target = node("target", false);
+        let alpha = node("alpha", false);
+        let beta = node("beta", false);
+        let shared = node("shared", false);
+        let test = StoreNode::for_test("shared.test.ts", "test", true);
+        let entry = node("entry", true);
+        for item in [&target, &alpha, &beta, &shared, &test, &entry] {
+            store.add_node(item.clone());
+        }
+        // Reverse insertion order and a duplicate exercise output sorting and
+        // site deduplication independently of traversal order.
+        store.add_caller_at(&target, &beta, 3);
+        store.add_caller_at(&target, &alpha, 2);
+        store.add_caller_at(&target, &alpha, 2);
+        store.add_caller_at(&alpha, &shared, 4);
+        store.add_caller_at(&beta, &shared, 4);
+        store.add_caller_at(&shared, &target, 1);
+        store.add_caller_at(&shared, &entry, 5);
+        store.add_caller_at(&alpha, &test, 6);
+        store.add_caller_at(&test, &entry, 5);
+
+        let callers = callers_result(&store, Path::new(&target.file), &target.symbol, 2, false)
+            .expect("callers result");
+        assert_eq!(
+            serde_json::to_string(&callers).unwrap(),
+            r#"{"symbol":"target","file":"target.ts","callers":[{"file":"alpha.ts","callers":[{"symbol":"alpha","line":2}]},{"file":"beta.ts","callers":[{"symbol":"beta","line":3}]},{"file":"shared.ts","callers":[{"symbol":"shared","line":4},{"symbol":"shared","line":4}]}],"total_callers":5,"hidden_test_callers":1,"scanned_files":6,"depth_limited":true,"truncated":3,"callers_list_envelope":{"shown":4,"total":{"kind":"at_least","value":4},"unit":"items","reason":"depth","causes":["depth"],"narrow":["depth","includeTests"]}}"#
+        );
+        let impact = impact_result(&store, Path::new(&target.file), &target.symbol, 2, false)
+            .expect("impact result");
+        assert_eq!(
+            serde_json::to_string(&impact).unwrap(),
+            r#"{"symbol":"target","file":"target.ts","parameters":[],"total_affected":5,"hidden_test_callers":1,"affected_files":3,"callers":[{"caller_symbol":"alpha","caller_file":"alpha.ts","line":2,"is_entry_point":false,"parameters":[]},{"caller_symbol":"beta","caller_file":"beta.ts","line":3,"is_entry_point":false,"parameters":[]},{"caller_symbol":"shared","caller_file":"shared.ts","line":4,"is_entry_point":false,"parameters":[]},{"caller_symbol":"shared","caller_file":"shared.ts","line":4,"is_entry_point":false,"parameters":[]}],"depth_limited":true,"truncated":3,"sites_list_envelope":{"shown":4,"total":{"kind":"at_least","value":4},"unit":"sites","reason":"depth","causes":["depth"],"narrow":["depth","includeTests"]}}"#
+        );
+    }
+
+    #[test]
     fn callers_reexpand_a_symbol_reached_later_at_a_shallower_depth() {
         let mut store = CountingStore::new();
         let target = node("target", false);
@@ -3822,7 +4082,9 @@ mod trace_to_tests {
 
     #[test]
     fn callers_and_impact_count_callers_omitted_at_the_depth_limit() {
+        let temp = tempfile::tempdir().unwrap();
         let mut store = CountingStore::new();
+        store.root = temp.path().to_path_buf();
         let target = node("target", false);
         let boundary = node("boundary", false);
         let upstream_a = node("upstreamA", true);
@@ -3872,7 +4134,9 @@ mod trace_to_tests {
     #[test]
     // At depth one hubCaller is listed, but upstreamA and upstreamB are not.
     fn batched_boundary_counts_preserve_serialized_callers_and_impact_contract() {
+        let temp = tempfile::tempdir().unwrap();
         let mut store = CountingStore::new();
+        store.root = temp.path().to_path_buf();
         let target = node("target", false);
         let boundary = node("hubCaller", false);
         let upstream_a = node("upstreamA", true);
@@ -4079,3 +4343,7 @@ mod trace_to_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "callgraph_regression_tests.rs"]
+mod callgraph_regression_tests;

@@ -24,6 +24,7 @@ fn identity(root: &Path, name: &str, kind: &str, parent: Option<&str>) -> RouteI
             principal_id: Some("reserved:broca".into()),
         },
         consumer_elicitation_capable: false,
+        tool_result_body: false,
         disabled_tools: Arc::new(vec![]),
         scope: Some(stamp),
         call_mode: subc_protocol::call_mode::CallMode::Classic,
@@ -71,6 +72,227 @@ fn fixture() -> (tempfile::TempDir, AppContext, RouteIdentity, RouteIdentity) {
 }
 fn catalog_request(raw: Value) -> Value {
     json!({"preset":"worker","params":{"allow_paths":raw}})
+}
+
+fn with_carrier(route: &RouteIdentity, principal: &str) -> RouteIdentity {
+    let mut data = copied_identity(route);
+    if let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut data.spawn_principal {
+        *principal_id = Some(principal.into());
+    }
+    RouteIdentity(Arc::new(data))
+}
+
+fn assert_saved_scope_grants(
+    ctx: &AppContext,
+    route: &RouteIdentity,
+    outside: &Path,
+    denial: Option<crate::access_policy::ScopeGrantsDenial>,
+) {
+    let _storage = crate::test_env::without_storage_override();
+    let raw_outside = outside.to_owned();
+    let outside = policy_path(outside);
+    ctx.update_config(|config| {
+        config.project_root = Some(route.project_root.clone());
+        config.restrict_to_project_root = true;
+    });
+    for operation in [AccessOperation::Read, AccessOperation::Write] {
+        store::insert(
+            &ctx.db().unwrap().lock().unwrap(),
+            &policy_scope_key(route),
+            &AccessGrant {
+                path: outside.clone(),
+                kind: GrantKind::File,
+                operation,
+            },
+        )
+        .unwrap();
+    }
+    assert_eq!(scope_grants_denial(route), denial);
+    let _io = crate::bounded_io::enter(Some(crate::bounded_io::Budget::after(
+        Duration::from_secs(5),
+    )));
+    call_policy::with_tool_call_policy(
+        ctx,
+        route,
+        "saved-grant-carrier",
+        ask_route(route),
+        BindTrust::Untrusted,
+        "read",
+        json!({}),
+        |_| {
+            assert_eq!(
+                ctx.validate_read_path("saved-grant-carrier", &route.session, &raw_outside)
+                    .is_ok(),
+                denial.is_none(),
+                "production validation must resolve the caller's path spelling"
+            );
+            ctx.with_read_policy_snapshot("saved-grant-carrier", || {
+                let policy = ctx.access_policy("saved-grant-carrier").unwrap();
+                assert_eq!(policy.scope_grants_denial, denial);
+                {
+                    let _nested = crate::access_policy::scope_grants_guard(Some(
+                        crate::access_policy::ScopeGrantsDenial::NotSessionHost,
+                    ));
+                    let captured = ctx.access_policy("saved-grant-carrier").unwrap();
+                    assert!(
+                        captured.grants.is_empty(),
+                        "must not reuse a host's cached grants"
+                    );
+                }
+                if denial.is_some() {
+                    assert!(policy.grants.is_empty());
+                }
+                let expected = denial.map_or(AccessDecision::Allow, |reason| {
+                    AccessDecision::Deny(AccessDenial::ScopeGrants(reason))
+                });
+                for operation in [AccessOperation::Read, AccessOperation::Write] {
+                    assert_eq!(policy.decide(operation, &outside, false), expected);
+                    assert_eq!(
+                        policy.decide(operation, &route.project_root.join("local.txt"), false),
+                        AccessDecision::Allow
+                    );
+                }
+                let outside = outside.to_owned();
+                assert_eq!(
+                    std::thread::spawn(move || policy.decide(
+                        AccessOperation::Read,
+                        &outside,
+                        false
+                    ))
+                    .join()
+                    .unwrap(),
+                    expected
+                );
+            });
+        },
+        |result| result.unwrap(),
+    );
+}
+
+#[test]
+fn saved_scope_grants_direct_broca_and_runner_hosts_keep_grants() {
+    let (dir, ctx, head, worker) = fixture();
+    let outside = dir.path().join("outside.txt");
+    std::fs::write(&outside, "saved authority").unwrap();
+    for principal in ["direct", "reserved:broca", "reserved:thalamus-harness"] {
+        for route in [&head, &worker] {
+            assert_saved_scope_grants(&ctx, &with_carrier(route, principal), &outside, None);
+        }
+    }
+}
+
+fn basal_session_run(parent: &RouteIdentity, worker: bool) -> RouteIdentity {
+    let mut run = copied_identity(parent);
+    let stamp = run.scope.as_mut().unwrap();
+    stamp.kind = subc_protocol::scope::ScopeKind::Ephemeral;
+    stamp.parent = Some(
+        serde_json::from_value(json!({
+            "owner": stamp.owner, "ref": stamp.scope_ref, "scope_epoch": stamp.scope_epoch,
+        }))
+        .unwrap(),
+    );
+    let run_id = if worker { "worker-run" } else { "head-run" };
+    stamp.scope_ref = format!("codemode/{run_id}");
+    stamp.attributes.run_id = Some(run_id.into());
+    stamp.attributes.agent_id = (!worker).then(|| "head".into());
+    stamp.attributes.on_behalf_of_agent = worker.then(|| "head".into());
+    run.run_owner = Some(Arc::new(codemode::RunOwner {
+        kind: if worker {
+            codemode::RunKind::Worker {
+                on_behalf_of_agent: "head".into(),
+            }
+        } else {
+            codemode::RunKind::Agent {
+                agent_id: "head".into(),
+            }
+        },
+        run_id: run_id.into(),
+        owner_route: parent.clone(),
+        owner_route_channel: route_key(41, 1),
+        run_route: route_key(42, 1),
+        run_principal: with_carrier(parent, "reserved:basal")
+            .spawn_principal
+            .clone(),
+    }));
+    RouteIdentity(Arc::new(run))
+}
+
+#[test]
+fn saved_scope_grants_basal_codemode_keeps_grants_but_flow_id_loses_them() {
+    let (dir, ctx, head, worker) = fixture();
+    let outside = dir.path().join("outside.txt");
+    std::fs::write(&outside, "saved authority").unwrap();
+    let run = basal_session_run(&head, false);
+    assert_saved_scope_grants(&ctx, &run, &outside, None);
+    let worker_run = basal_session_run(&worker, true);
+    assert_eq!(policy_scope_key(&worker_run), scope_key(&worker));
+    assert_ne!(policy_scope_key(&worker_run), scope_key(&head));
+    assert_saved_scope_grants(&ctx, &worker_run, &outside, None);
+    let mut flow = copied_identity(&run);
+    flow.run_owner = run.run_owner.clone();
+    flow.scope.as_mut().unwrap().attributes.flow_id = Some("flow-target-lease".into());
+    assert_saved_scope_grants(
+        &ctx,
+        &RouteIdentity(Arc::new(flow)),
+        &outside,
+        Some(crate::access_policy::ScopeGrantsDenial::Flow),
+    );
+}
+
+#[test]
+fn saved_scope_grants_rich_ui_and_unknown_carriers_lose_grants() {
+    let (dir, ctx, head, worker) = fixture();
+    let outside = dir.path().join("outside.txt");
+    std::fs::write(&outside, "saved authority").unwrap();
+    for principal in [
+        "reserved:occipital",
+        "reserved:unknown-runner",
+        "reserved:plexus",
+        "reserved:basal",
+    ] {
+        for route in [&head, &worker] {
+            assert_saved_scope_grants(
+                &ctx,
+                &with_carrier(route, principal),
+                &outside,
+                Some(crate::access_policy::ScopeGrantsDenial::NotSessionHost),
+            );
+        }
+    }
+}
+
+#[test]
+fn saved_scope_grants_unknown_scope_kind_fails_closed_with_typed_reason() {
+    let (dir, ctx, _, worker) = fixture();
+    let outside = dir.path().join("outside.txt");
+    std::fs::write(&outside, "saved authority").unwrap();
+    let mut unknown = copied_identity(&worker);
+    unknown.scope.as_mut().unwrap().kind = subc_protocol::scope::ScopeKind::Ephemeral;
+    let unknown = with_carrier(&RouteIdentity(Arc::new(unknown)), "reserved:basal");
+    assert_saved_scope_grants(
+        &ctx,
+        &unknown,
+        &outside,
+        Some(crate::access_policy::ScopeGrantsDenial::UnknownScopeKind),
+    );
+    let mut parentless = copied_identity(&unknown);
+    parentless.scope.as_mut().unwrap().parent = None;
+    assert_saved_scope_grants(
+        &ctx,
+        &RouteIdentity(Arc::new(parentless)),
+        &outside,
+        Some(crate::access_policy::ScopeGrantsDenial::UnknownScopeKind),
+    );
+    let mut missing = copied_identity(&worker);
+    missing.scope = None;
+    let missing = RouteIdentity(Arc::new(missing));
+    register(&missing, &ctx).unwrap();
+    assert_saved_scope_grants(
+        &ctx,
+        &missing,
+        &outside,
+        Some(crate::access_policy::ScopeGrantsDenial::UnknownScopeKind),
+    );
 }
 
 fn worker_at_parent_epoch(worker: &RouteIdentity, parent: &str, epoch: u64) -> RouteIdentity {
@@ -311,6 +533,7 @@ fn copied_identity(identity: &RouteIdentity) -> RouteIdentityData {
         trust: identity.trust,
         spawn_principal: identity.spawn_principal.clone(),
         consumer_elicitation_capable: identity.consumer_elicitation_capable,
+        tool_result_body: identity.tool_result_body,
         disabled_tools: identity.disabled_tools.clone(),
         scope: identity.scope.clone(),
         call_mode: identity.call_mode.clone(),
@@ -404,6 +627,7 @@ async fn first_read_path_response(
         parsed_body: Default::default(),
         confinement: None,
         launch_restore: None,
+        codemode_policies: None,
         frame,
         phase_trace: PhaseTrace::new(Instant::now()),
     };
@@ -1102,6 +1326,264 @@ fn grants_policy_reads_revocation_on_the_next_check() {
             AccessDecision::Deny(AccessDenial::OutsideRoots)
         );
         assert!(ctx.validate_read_path("check", "worker", &path).is_err());
+    });
+}
+
+#[test]
+fn scoped_read_lists_load_policy_and_grants_once_per_call() {
+    let _storage_override = crate::test_env::without_storage_override();
+    let (_dir, ctx, head, worker) = fixture();
+    let shared = head.project_root.join("shared");
+    std::fs::write(&shared, "shared").unwrap();
+    remote_policy::catalog(
+        catalog_request(json!([{"path":shared,"mode":"read"}])),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    ctx.update_config(|config| config.project_root = Some(worker.project_root.clone()));
+    let src = worker.project_root.join("src");
+    std::fs::create_dir(&src).unwrap();
+    for index in 0..160 {
+        std::fs::write(src.join(format!("item{index:03}.rs")), "pub fn item() {}\n").unwrap();
+    }
+    *ctx.search_index().write().unwrap() = Some(crate::search_index::SearchIndex::build(
+        &worker.project_root,
+    ));
+    crate::access_policy::with_scope(Some(scope_key(&worker)), || {
+        assert_eq!(
+            ctx.access_policy("scope-sanity").unwrap().decide(
+                AccessOperation::Read,
+                &policy_path(&shared),
+                false
+            ),
+            AccessDecision::Allow
+        );
+        for (tool, params) in [
+            ("glob", json!({"path":"src", "pattern":"**/*.rs"})),
+            ("outline", json!({"directory":src})),
+            ("outline", json!({"target":src,"files":true})),
+        ] {
+            let req = crate::protocol::RawRequest {
+                id: format!("scoped-policy-once-{tool}"),
+                command: tool.into(),
+                session_id: Some(worker.session.clone()),
+                lsp_hints: None,
+                params,
+            };
+            for _ in 0..2 {
+                let probe = crate::context::policy_load_probe::Probe::new(&req.id);
+                let response = if tool == "glob" {
+                    crate::commands::glob::handle_glob(&req, &ctx)
+                } else {
+                    crate::commands::outline::handle_outline(&req, &ctx)
+                };
+                assert!(response.success, "{response:?}");
+                let loads = probe.counts();
+                assert_eq!((loads.policies, loads.grants), (1, 1), "{loads:?}");
+            }
+        }
+    });
+}
+
+fn read_policy_boundary_fixture() -> (
+    tempfile::TempDir,
+    AppContext,
+    RouteIdentity,
+    RouteIdentity,
+    PathBuf,
+    PathBuf,
+) {
+    let (dir, ctx, head, scope_a) = fixture();
+    let root_b = dir.path().join("worker-b");
+    std::fs::create_dir(&root_b).unwrap();
+    let scope_b = identity(&policy_path(&root_b), "worker-b", "worker", Some("head"));
+    register(&scope_b, &ctx).unwrap();
+    let path_a = head.project_root.join("grant-a.txt");
+    let path_b = head.project_root.join("grant-b.txt");
+    std::fs::write(&path_a, "scope A").unwrap();
+    std::fs::write(&path_b, "scope B").unwrap();
+    for (route, path) in [(&scope_a, &path_a), (&scope_b, &path_b)] {
+        remote_policy::catalog(
+            catalog_request(json!([{"path":path,"mode":"read"}])),
+            route,
+            &ctx,
+        )
+        .unwrap();
+    }
+    ctx.update_config(|config| {
+        config.project_root = Some(scope_a.project_root.clone());
+        config.restrict_to_project_root = true;
+    });
+    (dir, ctx, scope_a, scope_b, path_a, path_b)
+}
+
+fn assert_boundary_grants(
+    policy: &crate::access_policy::AccessPolicy,
+    allowed: &Path,
+    denied: &Path,
+    label: &str,
+) {
+    assert_eq!(
+        policy.decide(AccessOperation::Read, &policy_path(allowed), false),
+        AccessDecision::Allow,
+        "{label}: wrong grants for allowed path {allowed:?}: {:?}",
+        policy.grants
+    );
+    assert_ne!(
+        policy.decide(AccessOperation::Read, &policy_path(denied), false),
+        AccessDecision::Allow,
+        "{label}: inherited another scope's grant for {denied:?}: {:?}",
+        policy.grants
+    );
+}
+
+#[test]
+fn read_policy_snapshot_scope_boundary_uses_current_scope_grants() {
+    let _storage_override = crate::test_env::without_storage_override();
+    let (_dir, ctx, scope_a, scope_b, path_a, path_b) = read_policy_boundary_fixture();
+    let id = "same-request-scope-boundary";
+    let probe = crate::context::policy_load_probe::Probe::new(id);
+    crate::access_policy::with_scope(Some(scope_key(&scope_a)), || {
+        ctx.with_read_policy_snapshot(id, || {
+            let policy_a = ctx.access_policy(id).unwrap();
+            assert_boundary_grants(&policy_a, &path_a, &path_b, "scope A");
+            let initial = probe.counts();
+            crate::access_policy::with_scope(Some(scope_key(&scope_b)), || {
+                let policy_b = ctx.access_policy(id).unwrap();
+                assert_boundary_grants(
+                    &policy_b,
+                    &path_b,
+                    &path_a,
+                    "scope B in A's live request cache",
+                );
+                assert!(probe.counts().policies > initial.policies);
+                ctx.with_read_policy_snapshot(id, || {
+                    let nested_b = ctx.access_policy(id).unwrap();
+                    assert_boundary_grants(&nested_b, &path_b, &path_a, "nested scope B");
+                });
+                // Dropping the inner cache restores A's entry, not B's authority.
+                let after_nested = ctx.access_policy(id).unwrap();
+                assert_boundary_grants(
+                    &after_nested,
+                    &path_b,
+                    &path_a,
+                    "scope B after nested cache drop",
+                );
+            });
+        });
+    });
+    // Reusing both identifiers on this thread after the call must start fresh.
+    crate::access_policy::with_scope(Some(scope_key(&scope_b)), || {
+        let after_call = ctx.access_policy(id).unwrap();
+        assert_boundary_grants(&after_call, &path_b, &path_a, "scope B after call return");
+    });
+}
+
+#[test]
+fn read_policy_snapshot_route_generation_rebuilds_changed_grants() {
+    let _storage_override = crate::test_env::without_storage_override();
+    let (_dir, ctx, scope_a, _scope_b, path_a, path_b) = read_policy_boundary_fixture();
+    let id = "same-request-route-boundary";
+    crate::access_policy::with_scope(Some(scope_key(&scope_a)), || {
+        ctx.with_read_policy_snapshot(id, || {
+            assert_boundary_grants(
+                &ctx.access_policy(id).unwrap(),
+                &path_a,
+                &path_b,
+                "initial route",
+            );
+            let generation = crate::access_policy::ask_route_generation();
+            {
+                let db = ctx.db().unwrap();
+                let conn = db.lock().unwrap();
+                assert_eq!(
+                    crate::db::access_grants::revoke(
+                        &conn,
+                        &scope_key(&scope_a),
+                        &policy_path(&path_a)
+                    )
+                    .unwrap(),
+                    1
+                );
+                crate::db::access_grants::insert(
+                    &conn,
+                    &scope_key(&scope_a),
+                    &crate::access_policy::AccessGrant {
+                        path: policy_path(&path_b),
+                        kind: crate::access_policy::GrantKind::File,
+                        operation: AccessOperation::Read,
+                    },
+                )
+                .unwrap();
+            }
+            assert_eq!(crate::access_policy::ask_route_generation(), generation);
+            assert_boundary_grants(
+                &ctx.access_policy(id).unwrap(),
+                &path_a,
+                &path_b,
+                "same-route snapshot",
+            );
+            let _route = crate::access_policy::ask_route_guard(Some(
+                crate::access_policy::AskRoute::Lowered,
+            ));
+            assert_ne!(crate::access_policy::ask_route_generation(), generation);
+            assert_boundary_grants(
+                &ctx.access_policy(id).unwrap(),
+                &path_b,
+                &path_a,
+                "changed route generation",
+            );
+        });
+    });
+}
+
+#[test]
+fn read_policy_snapshot_nested_scope_does_not_resurrect_revoked_grants() {
+    let _storage_override = crate::test_env::without_storage_override();
+    let (_dir, ctx, scope_a, scope_b, path_a, path_b) = read_policy_boundary_fixture();
+    let id = "same-request-nested-scope-boundary";
+    crate::access_policy::with_scope(Some(scope_key(&scope_a)), || {
+        ctx.with_read_policy_snapshot(id, || {
+            assert_boundary_grants(
+                &ctx.access_policy(id).unwrap(),
+                &path_a,
+                &path_b,
+                "outer scope A",
+            );
+            crate::access_policy::with_scope(Some(scope_key(&scope_b)), || {
+                ctx.with_read_policy_snapshot(id, || {
+                    assert_boundary_grants(
+                        &ctx.access_policy(id).unwrap(),
+                        &path_b,
+                        &path_a,
+                        "inner scope B",
+                    );
+                    let db = ctx.db().unwrap();
+                    let conn = db.lock().unwrap();
+                    assert_eq!(
+                        crate::db::access_grants::revoke(
+                            &conn,
+                            &scope_key(&scope_a),
+                            &policy_path(&path_a)
+                        )
+                        .unwrap(),
+                        1
+                    );
+                });
+            });
+            let after_nested = ctx.access_policy(id).unwrap();
+            assert_ne!(
+                after_nested.decide(AccessOperation::Read, &policy_path(&path_a), false),
+                AccessDecision::Allow,
+                "scope A resurrected revoked grants after scope B: {:?}",
+                after_nested.grants
+            );
+            assert_ne!(
+                after_nested.decide(AccessOperation::Read, &policy_path(&path_b), false),
+                AccessDecision::Allow
+            );
+        });
     });
 }
 

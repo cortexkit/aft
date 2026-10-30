@@ -219,16 +219,19 @@ fn fixture_i_phrase_lane_unreachable_log_line() {
 
     let split = split_query(&fixture.query);
     let without_tests =
-        discover_anchored_candidate_files(&index, &corpus, &split.retained_runs, false);
+        discover_anchored_candidate_files(&index, &corpus, &split.retained_runs, false).unwrap();
     assert!(without_tests.contains(&server_path));
     assert!(without_tests.contains(&decoy_path));
     assert!(!without_tests.contains(&test_path));
     assert!(!without_tests.contains(&outside_path));
 
-    let with_tests = discover_anchored_candidate_files(&index, &corpus, &split.retained_runs, true);
+    let with_tests =
+        discover_anchored_candidate_files(&index, &corpus, &split.retained_runs, true).unwrap();
     assert!(with_tests.contains(&test_path));
 
-    let results = AnchoredLane::new().execute_ready_mode(&index, &corpus, &fixture.query, false);
+    let results = AnchoredLane::new()
+        .execute_ready_mode(&index, &corpus, &fixture.query, false)
+        .unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(
         results[0].path, server_path,
@@ -249,13 +252,15 @@ fn fixture_ii_decoy_is_discovered_then_rejected_on_evidence() {
 
     let split = split_query(&fixture.query);
     let discovered =
-        discover_anchored_candidate_files(&index, temp.path(), &split.retained_runs, true);
+        discover_anchored_candidate_files(&index, temp.path(), &split.retained_runs, true).unwrap();
     assert!(
         discovered.contains(&decoy_path),
         "the union must discover a file containing only one retained run"
     );
 
-    let results = AnchoredLane::new().execute_ready_mode(&index, temp.path(), &fixture.query, true);
+    let results = AnchoredLane::new()
+        .execute_ready_mode(&index, temp.path(), &fixture.query, true)
+        .unwrap();
     assert!(
         results.is_empty(),
         "7/21 evidence must be rejected after discovery"
@@ -476,7 +481,9 @@ fn every_emitted_anchored_result_is_exact_tier_and_score_free() {
         index_file(&mut index, &temp.path().join(name), &fixture.source_text);
     }
 
-    let results = AnchoredLane::new().execute_ready_mode(&index, temp.path(), &fixture.query, true);
+    let results = AnchoredLane::new()
+        .execute_ready_mode(&index, temp.path(), &fixture.query, true)
+        .unwrap();
     assert_eq!(results.len(), 2);
     for (r3_order_index, candidate) in results.iter().enumerate() {
         assert_eq!(candidate.evidence.tier, EvidenceTier::Exact);
@@ -544,6 +551,7 @@ fn anchored_search_benchmark_rankings_remain_byte_identical() {
         // admission does not change rankings on these small benchmark files.
         for path in
             discover_anchored_candidate_files(&index, temp.path(), &split.retained_runs, true)
+                .unwrap()
         {
             let content = fs::read_to_string(&path).unwrap();
             let Some(alignment) = find_canonical_alignment(&content, &split.retained_runs) else {
@@ -567,8 +575,9 @@ fn anchored_search_benchmark_rankings_remain_byte_identical() {
             }
         }
         sort_anchored_canonical(&mut reference);
-        let actual =
-            AnchoredLane::new().execute_ready_mode(&index, temp.path(), &fixture.query, true);
+        let actual = AnchoredLane::new()
+            .execute_ready_mode(&index, temp.path(), &fixture.query, true)
+            .unwrap();
         assert_eq!(
             serde_json::to_vec(&actual).unwrap(),
             serde_json::to_vec(&reference).unwrap(),

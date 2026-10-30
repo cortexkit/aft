@@ -158,9 +158,14 @@ fn etc_hosts_still_requires_external_directory() {
     let response = bash(&mut aft, "cat-etc-hosts", "cat /etc/hosts");
     assert_eq!(response["success"], false, "response: {response:?}");
     assert_eq!(response["code"], "permission_required");
+    let expected = json!([std::fs::canonicalize("/etc/hosts").unwrap()]);
     assert!(
-        has_external_directory_pattern_containing(&response, "/etc"),
-        "non-temp external paths must still ask: {response:?}"
+        response["asks"].as_array().unwrap().iter().any(|ask| {
+            ask["kind"] == "external_directory"
+                && ask["patterns"] == expected
+                && ask["always"] == expected
+        }),
+        "system-file access must ask for the canonical file only: {response:?}"
     );
 
     assert!(aft.shutdown().success());

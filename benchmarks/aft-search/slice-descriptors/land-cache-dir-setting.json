@@ -1,0 +1,20 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/commands/semantic_search/external_pattern.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/commands/semantic_search/rerank/mod.rs",
+    "crates/aft/src/commands/semantic_search/rerank/onnx.rs",
+    "crates/aft/src/commands/semantic_search/rerank/slot.rs",
+    "crates/aft/src/commands/semantic_search/rerank/synapse.rs",
+    "crates/aft/src/commands/semantic_search/rerank/tests.rs",
+    "crates/aft/src/search_index.rs",
+    "crates/aft/src/semantic_index.rs"
+  ],
+  "note": "The fenced changes only choose where search, semantic and reranker-model files are stored (the cache volume) and refuse when that volume is unavailable. Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}

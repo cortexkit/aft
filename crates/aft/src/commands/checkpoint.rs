@@ -25,6 +25,74 @@ pub fn handle_checkpoint(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backup_checkpoint_command_reports_discovery_errors_without_replacing_history() {
+        for released in [false, true] {
+            for expired in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let path = root.path().join("tracked.txt");
+                let second = root.path().join("second.txt");
+                std::fs::write(&path, b"restore me").unwrap();
+                std::fs::write(&second, b"second").unwrap();
+                let ctx = AppContext::new(
+                    Box::new(crate::parser::TreeSitterProvider::new()),
+                    crate::config::Config {
+                        project_root: Some(root.path().to_path_buf()),
+                        ..Default::default()
+                    },
+                );
+                ctx.backup()
+                    .lock()
+                    .set_storage_dir(root.path().join("backup"), 72);
+                ctx.checkpoint().lock().set_storage_dir_for_harness(
+                    root.path().join("checkpoints"),
+                    crate::harness::Harness::Opencode,
+                );
+                let original: RawRequest = serde_json::from_value(serde_json::json!({
+                    "id": "original", "command": "checkpoint", "name": "useful", "files": [path],
+                }))
+                .unwrap();
+                assert!(handle_checkpoint(&original, &ctx).success);
+                {
+                    let mut backup = ctx.backup().lock();
+                    backup
+                        .snapshot(original.session(), &path, "tracked")
+                        .unwrap();
+                    backup
+                        .snapshot(original.session(), &second, "tracked")
+                        .unwrap();
+                    if released {
+                        backup.release_memory();
+                    }
+                    if expired {
+                        backup.expire_discovery_for_tests();
+                    } else {
+                        backup.set_discovery_entry_limit_for_tests(0);
+                    }
+                }
+                std::fs::write(&path, b"changed").unwrap();
+                let replacement = serde_json::from_value(serde_json::json!({
+                    "id": "replace", "command": "checkpoint", "name": "useful",
+                }))
+                .unwrap();
+                let response = handle_checkpoint(&replacement, &ctx);
+                assert!(!response.success, "{response:?}");
+                assert_eq!(response.data["code"], "io_error", "{response:?}");
+                assert!(response.data.get("file_count").is_none(), "{response:?}");
+                ctx.checkpoint()
+                    .lock()
+                    .restore(original.session(), "useful")
+                    .unwrap();
+                assert_eq!(std::fs::read(&path).unwrap(), b"restore me");
+            }
+        }
+    }
+}
+
 fn handle_checkpoint_impl(req: &RawRequest, ctx: &AppContext) -> Result<Response, Response> {
     let name = match req.params.get("name").and_then(|v| v.as_str()) {
         Some(n) => n,
@@ -51,7 +119,9 @@ fn handle_checkpoint_impl(req: &RawRequest, ctx: &AppContext) -> Result<Response
     let explicit_request = !files.is_empty();
     let file_list = if files.is_empty() {
         let backup = ctx.backup().lock();
-        backup.tracked_files(req.session())
+        backup
+            .try_tracked_files(req.session())
+            .map_err(|error| Response::error(&req.id, error.code(), error.to_string()))?
     } else {
         files
     };

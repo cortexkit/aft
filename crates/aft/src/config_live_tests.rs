@@ -98,6 +98,55 @@ fn staged_sources_are_cleared_at_entry_and_on_unwind() {
 }
 
 #[test]
+fn prepared_bind_watches_keep_the_captured_source() {
+    const NAME: &str = "config_live::tests::prepared_bind_watches_keep_the_captured_source";
+    const CHILD: &str = "AFT_TEST_PREPARED_WATCH_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--color=never"])
+            .env(CHILD, "1")
+            .env_remove("AFT_TEST_DISABLE_FILE_WATCHER")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+            "watch child failed: {:?} {:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let _git_env = crate::test_env::hermetic_git_env_guard();
+    let fixture = Fixture::new(
+        r#"{"indexes":{"trigram":false,"semantic":false,"callgraph":false},"views":{"enabled":false}}"#,
+        None,
+    );
+    let legacy = fixture.root.join(".pi/aft.jsonc");
+    write(&legacy, r#"{"callgraph_chunk_size":7}"#);
+    let prepared = crate::subc_config::PreparedBindConfig::read(
+        Some(&fixture.user_path),
+        &fixture.root,
+        &crate::harness::Harness::Pi,
+    )
+    .unwrap();
+    write(&fixture.project_path, r#"{"callgraph_chunk_size":9}"#);
+    std::fs::remove_file(&legacy).unwrap();
+    enable_config_watches_for_test();
+    let request: RawRequest = serde_json::from_value(json!({"id":"prepared-watch","command":"configure","project_root":fixture.root,"harness":"pi","cortexkit_user_config_path":fixture.user_path})).unwrap();
+    let response = crate::subc_config::with_prepared_bind_config(prepared, || {
+        crate::commands::configure::handle_configure(&request, &fixture.ctx)
+    });
+    assert!(response.success, "{}", response.data);
+    fixture.ctx.config_live().wait_for_watch_attachment();
+    let watches = fixture.ctx.config_live().watches.lock();
+    assert_eq!(
+        watches.project_fallback.as_ref().unwrap().file(),
+        legacy.as_path()
+    );
+}
+
+#[test]
 fn inspect_categories_and_lsp_idle_reload_without_restart() {
     let fixture = Fixture::new(r#"{"lsp":{"idle_minutes":60}}"#, None);
     write(
@@ -198,6 +247,87 @@ fn bash_env_updates_live_for_future_commands() {
             .map(String::as_str),
         Some("C.UTF-8")
     );
+}
+
+#[test]
+fn project_bash_env_and_runon_env_update_live() {
+    // A project's `bash.env` lives in `project_env` and a user's
+    // `bash.runon_env` in `runon_env`; editing either must take effect on the
+    // next command, and deleting it must clear the old value.
+    let fixture = Fixture::new(
+        r#"{ "bash": { "env": { "TZ": "UTC" }, "runon_env": ["TZ"] } }"#,
+        Some(r#"{ "bash": { "env": { "IBToolNeverDeque": "1" } } }"#),
+    );
+    assert_eq!(
+        fixture
+            .ctx
+            .config()
+            .bash
+            .project_env
+            .get("IBToolNeverDeque")
+            .map(String::as_str),
+        Some("1")
+    );
+
+    write(
+        &fixture.project_path,
+        r#"{ "bash": { "env": { "IBToolNeverDeque": "0", "SECOND": "2" } } }"#,
+    );
+    write(
+        &fixture.user_path,
+        r#"{ "bash": { "env": { "TZ": "UTC" } } }"#,
+    );
+    let outcome = fixture.reload();
+    assert!(
+        applied(&outcome).contains(&"bash.project_env"),
+        "{:?}",
+        applied(&outcome)
+    );
+    assert_eq!(
+        fixture
+            .ctx
+            .config()
+            .bash
+            .project_env
+            .get("IBToolNeverDeque")
+            .map(String::as_str),
+        Some("0"),
+        "an edited project value must apply live"
+    );
+    assert!(fixture.ctx.config().bash.runon_env.is_empty());
+    assert!(
+        applied(&outcome).contains(&"bash.runon_env"),
+        "{:?}",
+        applied(&outcome)
+    );
+
+    write(&fixture.project_path, "{}");
+    let outcome = fixture.reload();
+    assert!(
+        fixture.ctx.config().bash.project_env.is_empty(),
+        "a deleted project map must not keep its old values: {:?}",
+        fixture.ctx.config().bash.project_env
+    );
+    assert!(
+        applied(&outcome)
+            .iter()
+            .any(|key| *key == "bash.project_env"),
+        "{:?}",
+        applied(&outcome)
+    );
+}
+
+#[test]
+fn bash_env_updates_live_while_cache_dir_waits_for_reconfigure() {
+    let published = Config::default();
+    let mut candidate = published.clone();
+    candidate.bash.env.insert("TZ".into(), "UTC".into());
+    candidate.cache_dir = Some("/cache/next".into());
+    let result = super::apply_live_config(&published, &candidate, &published);
+    assert_eq!(result.applied, vec!["bash.env"]);
+    assert_eq!(result.deferred, vec!["storage.cache_dir"]);
+    assert_eq!(result.next.bash.env["TZ"], "UTC");
+    assert_eq!(result.next.cache_dir, published.cache_dir);
 }
 
 #[test]
@@ -324,6 +454,114 @@ fn deleted_config_file_keeps_the_last_good_config() {
         other => panic!("expected the last good config to stay, got {other:?}"),
     }
     assert!(fixture.ctx.config().restrict_to_project_root);
+    assert!(fixture
+        .ctx
+        .cache_unavailable_reason()
+        .is_some_and(|reason| reason.contains("cache_dir_config_unknown")));
+}
+
+#[test]
+fn invalid_user_config_live_disables_caches_without_changing_security_floor() {
+    for unreadable in [false, true] {
+        let fixture = Fixture::new(r#"{"restrict_to_project_root":true}"#, None);
+        assert!(fixture.ctx.cache_unavailable_reason().is_none());
+        if unreadable {
+            std::fs::remove_file(&fixture.user_path).unwrap();
+            std::fs::create_dir(&fixture.user_path).unwrap();
+        } else {
+            write(&fixture.user_path, "{");
+        }
+        assert!(matches!(fixture.reload(), ReloadOutcome::Kept { .. }));
+        assert!(fixture.ctx.config().restrict_to_project_root);
+        assert!(fixture
+            .ctx
+            .cache_unavailable_reason()
+            .is_some_and(|reason| reason.contains("cache_dir_config_unknown")));
+        if unreadable {
+            std::fs::remove_dir(&fixture.user_path).unwrap();
+        }
+        write(&fixture.user_path, r#"{"restrict_to_project_root":true}"#);
+        assert_eq!(fixture.reload(), ReloadOutcome::Unchanged);
+        assert!(fixture.ctx.config().cache_config_unknown.is_none());
+        assert!(fixture.ctx.cache_unavailable_reason().is_none());
+    }
+}
+
+#[test]
+fn repaired_user_config_with_new_text_turns_caches_back_on_and_keeps_deferred_keys_deferred() {
+    let fixture = Fixture::new(r#"{"restrict_to_project_root":true}"#, None);
+    assert!(fixture.ctx.cache_unavailable_reason().is_none());
+    write(&fixture.user_path, "{");
+    assert!(matches!(fixture.reload(), ReloadOutcome::Kept { .. }));
+    assert!(fixture
+        .ctx
+        .cache_unavailable_reason()
+        .is_some_and(|reason| reason.contains("cache_dir_config_unknown")));
+
+    // A valid file whose text differs from the last good text: one deferred
+    // key changed, nothing live.
+    write(
+        &fixture.user_path,
+        r#"{"restrict_to_project_root":true,"indexes":{"trigram":false}}"#,
+    );
+    let outcome = fixture.reload();
+    assert_eq!(deferred(&outcome), vec!["indexes.trigram"]);
+    assert!(applied(&outcome).is_empty());
+    let config = fixture.ctx.config();
+    assert!(config.cache_config_unknown.is_none());
+    assert!(
+        fixture.ctx.cache_unavailable_reason().is_none(),
+        "{:?}",
+        fixture.ctx.cache_unavailable_reason()
+    );
+    assert!(
+        config.indexes.trigram,
+        "a deferred key must not change live"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unchanged_symlinked_cache_dir_is_not_reported_deferred_on_reload() {
+    // The running config holds the directory a symlinked `storage.cache_dir`
+    // resolved to; the file still names the link. A reload that leaves the
+    // setting alone must not list it as waiting for the next connect.
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("cache-target");
+    std::fs::create_dir(&target).unwrap();
+    let link = temp.path().join("cache-link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let user = |extra: &str| {
+        json!({"storage": {"cache_dir": link}, "format_on_edit": extra == "on"}).to_string()
+    };
+    let fixture = Fixture::new(&user("off"), None);
+    assert_eq!(
+        fixture.ctx.config().cache_dir,
+        Some(std::fs::canonicalize(&target).unwrap()),
+        "the running config holds the resolved directory, not the link"
+    );
+    write(&fixture.user_path, &user("on"));
+    let outcome = fixture.reload();
+    assert_eq!(applied(&outcome), vec!["format_on_edit"]);
+    assert!(deferred(&outcome).is_empty(), "{outcome:?}");
+}
+
+#[test]
+fn invalid_unrelated_user_edit_live_keeps_caches_on() {
+    let fixture = Fixture::new(r#"{"restrict_to_project_root":true}"#, None);
+    write(
+        &fixture.user_path,
+        r#"{"restrict_to_project_root":true,"semantic":{"backend":"openai-compatible"}}"#,
+    );
+    // The invalid edit is still rejected as a whole, but it does not hide
+    // where caches belong, so caches stay on.
+    assert!(matches!(fixture.reload(), ReloadOutcome::Kept { .. }));
+    assert!(fixture.ctx.config().restrict_to_project_root);
+    assert!(
+        fixture.ctx.cache_unavailable_reason().is_none(),
+        "{:?}",
+        fixture.ctx.cache_unavailable_reason()
+    );
 }
 
 #[test]

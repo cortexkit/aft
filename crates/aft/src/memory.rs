@@ -375,6 +375,11 @@ pub struct ProcessMemorySnapshot {
     /// Resident views-on semantic arena bytes, every family counted once
     /// (see [`SemanticArenaCensus`]). Included in `total_attributed_bytes`.
     pub semantic_arena_bytes: u64,
+    /// Live local ONNX embedding sessions, shared across roots and query/build workers.
+    pub embedding_sessions: u64,
+    /// Serialized weight bytes for those sessions, counted once per session.
+    /// This estimates model storage, not ORT's transient tensors or allocator slack.
+    pub embedding_model_bytes: u64,
     /// Embedded chunks resident in those arenas. Each holds one embedding
     /// vector, so it can be checked against an allocator's block counts.
     pub semantic_resident_chunks: u64,
@@ -590,6 +595,7 @@ impl ProcessMemorySnapshot {
                 not_estimated_subsystems.saturating_add(root.not_estimated_subsystems);
         }
         let sqlite = SqliteMemorySnapshot::measure();
+        let embedding = crate::local_embed::session_memory();
         let AllocatorObservation {
             snapshot: allocator,
             age_ms: allocator_observation_age_ms,
@@ -597,6 +603,7 @@ impl ProcessMemorySnapshot {
         let total_attributed_bytes = root_attributed_bytes
             .saturating_add(shared_semantic_bases.estimated_bytes.unwrap_or(0))
             .saturating_add(semantic_arenas.bytes)
+            .saturating_add(embedding.model_bytes)
             .saturating_add(sqlite.memory_used_bytes);
         let rss_bytes = process_rss_bytes();
         let phys_footprint_bytes = process_phys_footprint_bytes();
@@ -623,6 +630,8 @@ impl ProcessMemorySnapshot {
             allocator_observation_age_ms,
             total_attributed_bytes,
             semantic_arena_bytes: semantic_arenas.bytes,
+            embedding_sessions: embedding.sessions,
+            embedding_model_bytes: embedding.model_bytes,
             semantic_resident_chunks: semantic_arenas.resident_chunks,
             unattributed_bytes,
             root_count,

@@ -19,6 +19,23 @@ import common
 
 
 class ViewsBranchDrillProbeTest(unittest.TestCase):
+    def test_hashed_index_roots_remain_scoped_in_semantic_and_contention_parsers(self) -> None:
+        suffix = "/typescript-eslint/worker"
+        root = Path("/" + "a" * (300 - 1 - len(suffix)) + suffix)
+        line = (
+            "index_event kind=build_progress plane=semantic build_id=b-1-1 "
+            "root=.../f2f0351c/typescript-eslint/worker key=workspace "
+            "completed=345 total=678 elapsed_ms=5678 stage=embed"
+        )
+        self.assertEqual(
+            common._semantic_log_work(line, root),
+            "semantic build b-1-1 stage=embed chunks=345/678",
+        )
+        self.assertEqual(MODULE.contention_metrics(line, root)["build_progress_lines"], 1)
+        other = Path(str(root).replace("a", "b"))
+        self.assertIsNone(common._semantic_log_work(line, other))
+        self.assertEqual(MODULE.contention_metrics(line, other)["build_progress_lines"], 0)
+
     def test_probe_requires_exact_token_and_reference_evidence(self) -> None:
         query = MODULE.search_query_for_token("activeInfo")
         self.assertIsNotNone(re.search(query, "activeInfo(value)"))

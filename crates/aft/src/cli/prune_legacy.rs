@@ -20,7 +20,10 @@ fn usage() -> String {
 
 Lists every legacy (pre-view) index set under the AFT storage root with its
 bytes, and with --yes deletes the sets whose import into per-checkout views
-completed at least {days} days ago. Without --yes it is a dry run.
+or into the v3 stores completed at least {days} days ago. A set that a running
+import or a v3 base build may still read is kept. Older v1 views and blob
+stores and v2 family stores are listed as retained and never deleted. Without
+--yes it is a dry run.
 
 {OPERATOR_CONTRACT}
 

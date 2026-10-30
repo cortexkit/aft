@@ -8,9 +8,13 @@
 pub(crate) mod disk_facts;
 pub(crate) mod facts;
 pub mod join;
+#[cfg(target_os = "macos")]
+mod readiness_watch_macos;
 pub(crate) mod resolution_config;
+mod source_stat;
 use disk_facts::DiskFacts;
 use facts::{byte_path, EntryKind, FactPaths, ProjectFacts};
+use source_stat::{SourceStat, StoredFile, ValidatedStat};
 
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::callgraph::{self, EdgeResolution, FileCallData, TraceToSymbolCandidate};
@@ -41,7 +45,7 @@ use tree_sitter::Node;
 #[cfg(not(test))]
 use tree_sitter::Parser;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 /// Highest callgraph generation schema this build reads (and writes).
 pub const STORE_FORMAT_VERSION: u32 = SCHEMA_VERSION as u32;
 const BACKEND_TREESITTER: &str = "treesitter";
@@ -95,6 +99,9 @@ const COLD_BUILD_EXTRACT_BATCH_BYTES: u64 = 32 * 1024 * 1024;
 // Source bytes alone do not bound retained extracts or cancellation latency for
 // empty/tiny files. Keep a finite ceiling while allowing bulk-load commits.
 const COLD_BUILD_EXTRACT_MAX_FILES: usize = 4096;
+// A bulk commit does not need every parsed graph resident at once. Bound
+// those graphs separately because call records can dwarf their source bytes.
+const COLD_BUILD_PARSE_MAX_FILES: usize = 16;
 // A 20k-reference resolver window kept peak RSS working-set shaped in the
 // committed 20k/40k corpus harness; 100k rows did not.
 const COLD_BUILD_RESOLVE_WINDOW: usize = 20_000;
@@ -680,7 +687,7 @@ mod write_amplification_tests {
             .unwrap();
         assert_eq!(
             busy_timeout, 0,
-            "request readers must never wait for a writer"
+            "readiness probes must never wait for a writer"
         );
         let error = database_ready(&reader).unwrap_err();
         assert!(error.is_transient_lock_contention(), "{error}");
@@ -827,8 +834,11 @@ mod write_amplification_tests {
         let source = root.join("src/lib.rs");
         let dir = root.join(".store");
         let project_key = crate::search_index::artifact_cache_key(&root);
-        let published_path =
-            |dir: &Path| resolve_ready_target(dir, &project_key).map(|(path, _generation)| path);
+        let published_path = |dir: &Path| {
+            resolve_ready_target(dir, &project_key)
+                .unwrap()
+                .map(|(path, _generation)| path)
+        };
 
         let store = CallGraphStore::open(dir.clone(), root.clone()).unwrap();
         store.cold_build(std::slice::from_ref(&source)).unwrap();
@@ -841,7 +851,7 @@ mod write_amplification_tests {
             "control: a store with the current fingerprint is served"
         );
 
-        let previous = schema_fingerprint_for("v10-rust-macro-templates");
+        let previous = schema_fingerprint_for("v19-position-independent-node-identities");
         assert_ne!(previous, schema_fingerprint());
         Connection::open(&path)
             .unwrap()
@@ -852,7 +862,7 @@ mod write_amplification_tests {
             .unwrap();
 
         assert!(
-            !db_path_ready(&path),
+            !db_path_ready(&path).unwrap(),
             "an old-fingerprint store is not ready"
         );
         assert!(
@@ -890,6 +900,7 @@ mod write_amplification_tests {
         fs::create_dir_all(&root).unwrap();
         let store_dir = temp.path().join("store");
         let store = CallGraphStore::open(store_dir.clone(), root.clone()).unwrap();
+        store.cold_build(&[]).unwrap();
         let path = store.sqlite_path.clone();
         drop(store);
         let writer = Connection::open(&path).unwrap();
@@ -897,14 +908,18 @@ mod write_amplification_tests {
             .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
             .unwrap();
         let started = std::time::Instant::now();
-        assert!(CallGraphStore::open_readonly(store_dir, root)
-            .unwrap()
-            .is_none());
-        // Request readers use an expired busy deadline, so they must not wait
+        assert!(
+            matches!(CallGraphStore::open_readonly(store_dir.clone(), root.clone()),
+            Err(error) if error.is_transient_lock_contention())
+        );
+        // Readiness opens use an expired busy deadline, so they must not wait
         // for the writer. A regression would wait for a 5 s busy timeout; 2 s
         // tells that apart from a slow open on a loaded CI runner.
         assert!(started.elapsed() < Duration::from_secs(2));
         writer.execute_batch("ROLLBACK").unwrap();
+        assert!(CallGraphStore::open_readonly(store_dir, root)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -943,6 +958,43 @@ mod write_amplification_tests {
             synchronous, 2,
             "readers retain SQLite's default durability setting"
         );
+    }
+
+    #[test]
+    fn callgraph_serving_reads_keep_outlasting_locks_busy() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("main.rs");
+        fs::write(&source, "fn leaf() {}\npub fn entry() { leaf(); }\n").unwrap();
+        let dir = temp.path().join("store");
+        let store = CallGraphStore::open(dir.clone(), root.clone()).unwrap();
+        store.cold_build(&[source]).unwrap();
+        let blocker = store.lock_readiness_for_test();
+        blocker.execute_batch("ROLLBACK").unwrap();
+        let reader = CallGraphStore::open_readonly(dir, root).unwrap().unwrap();
+        let snapshot = reader.read_snapshot().unwrap();
+        for conn in [&reader.inner.conn, &snapshot.conn] {
+            let timeout: u64 = conn
+                .lock()
+                .unwrap()
+                .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(timeout, 100, "serving reads need a short, bounded wait");
+        }
+
+        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        for reader in [&reader.inner, &snapshot] {
+            let error = reader
+                .call_tree(Path::new("main.rs"), "entry", 1)
+                .unwrap_err();
+            assert!(error.is_transient_lock_contention(), "{error}");
+        }
+        blocker.execute_batch("ROLLBACK").unwrap();
+        for reader in [&reader.inner, &snapshot] {
+            let tree = reader.call_tree(Path::new("main.rs"), "entry", 1).unwrap();
+            assert_eq!(tree.children[0].name, "leaf");
+        }
     }
 
     /// A store whose pointer is published and whose `meta` says ready must be
@@ -1583,6 +1635,8 @@ mod write_amplification_tests {
 
 #[cfg(test)]
 type ColdBuildBeforePublishObserver = dyn Fn() + Send + Sync + 'static;
+#[cfg(test)]
+type ColdBuildResidentExtractObserver = dyn Fn(usize) + Send + Sync + 'static;
 // THREAD-LOCAL, not a process-global: tests install and clear the observer on
 // their own thread. Context workers explicitly inherit the initiating thread's
 // hooks so simulated disk availability and build observations cover background
@@ -1601,6 +1655,9 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     #[cfg(test)]
     static COLD_BUILD_EXTRACT_OBSERVER: std::cell::RefCell<Option<Arc<ColdBuildExtractObserver>>> =
+        const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
+    static COLD_BUILD_RESIDENT_EXTRACT_OBSERVER: std::cell::RefCell<Option<Arc<ColdBuildResidentExtractObserver>>> =
         const { std::cell::RefCell::new(None) };
     static MIGRATION_AVAILABLE_DISK_OVERRIDE: std::cell::RefCell<Option<u64>> =
         const { std::cell::RefCell::new(None) };
@@ -1622,7 +1679,7 @@ mod dispatch_narrowing_tests;
 mod incremental_parity;
 
 #[cfg(test)]
-mod perf_tests;
+pub(crate) mod perf_tests;
 #[cfg(test)]
 pub(crate) mod position_identity_tests;
 mod refresh_wal;
@@ -1690,6 +1747,21 @@ fn notify_cold_build_extract_observer(paths: &[PathBuf]) {
 
 #[cfg(not(test))]
 fn notify_cold_build_extract_observer(_paths: &[PathBuf]) {}
+
+#[cfg(test)]
+fn set_cold_build_resident_extract_observer(
+    observer: Option<Arc<ColdBuildResidentExtractObserver>>,
+) {
+    COLD_BUILD_RESIDENT_EXTRACT_OBSERVER.with(|slot| *slot.borrow_mut() = observer);
+}
+
+#[cfg(test)]
+fn notify_cold_build_resident_extract_observer(count: usize) {
+    let observer = COLD_BUILD_RESIDENT_EXTRACT_OBSERVER.with(|slot| slot.borrow().clone());
+    if let Some(observer) = observer {
+        observer(count);
+    }
+}
 
 #[doc(hidden)]
 pub fn set_legacy_migration_available_disk_for_test(bytes: Option<u64>) {
@@ -2409,43 +2481,60 @@ fn refresh_writer_available(root: &RefreshRoot, fallback: bool) -> std::io::Resu
     }
 }
 
-fn refresh_lease_release_event(event: &notify::Event, lease: &Path) -> bool {
+pub(crate) fn refresh_lease_release_event(event: &notify::Event, lease: &Path) -> bool {
     use notify::{event::ModifyKind, EventKind};
+    let Some(directory) = lease.parent() else {
+        return false;
+    };
+    let same_directory = |path: &Path| {
+        path == directory
+            || match (fs_canonicalize(path), fs_canonicalize(directory)) {
+                (Ok(path), Ok(directory)) => path == directory,
+                _ => false,
+            }
+    };
     let named_release = matches!(
         event.kind,
         EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
-    ) && event.paths.iter().any(|path| path == lease);
-    // Native watchers can report SQLite sidecar writes without the adjacent
-    // lease deletion. Those writes are readiness hints only if the lease is
-    // gone; the worker still checks writer liveness before reopening the store.
+    ) && event.paths.iter().any(|path| {
+        path.file_name() == lease.file_name() && path.parent().is_some_and(&same_directory)
+    });
+    // Native watchers can coalesce a deletion into directory/sidecar activity,
+    // and spell the watched directory through an alias (/var vs /private/var).
+    // Activity is a hint only when the lease is gone; the worker still checks
+    // writer liveness before reopening the store.
     let sibling_change = matches!(
         event.kind,
-        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-    ) && event
-        .paths
-        .iter()
-        .any(|path| path.parent() == lease.parent())
-        && !lease.exists();
+        EventKind::Any | EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+    ) && !lease.exists()
+        && event
+            .paths
+            .iter()
+            .any(|path| same_directory(path) || path.parent().is_some_and(&same_directory));
     named_release || sibling_change
 }
 
-/// The watcher a readiness watch keeps on a callgraph directory. Windows uses
-/// AFT's own directory watcher: notify's Windows watcher can leave a read
-/// re-armed on a closed handle when a watch stops, and that read can then
-/// block another thread's file I/O forever (see the Windows
-/// `DirectoryWatcher`). macOS and Linux keep notify's watcher.
-#[cfg(not(windows))]
-type ReadinessWatcher = notify::RecommendedWatcher;
+/// Readiness notifications for one cache directory. macOS uses a vnode watch
+/// so unlinking a lease wakes the waiter even if FSEvents coalesces it away.
+/// Windows uses AFT's directory watcher to avoid re-arming notify reads on
+/// closed handles. Other platforms keep notify's watcher.
+#[cfg(not(any(windows, target_os = "macos")))]
+pub(crate) type ReadinessWatcher = notify::RecommendedWatcher;
 #[cfg(windows)]
-type ReadinessWatcher = ForwardingDirectoryWatcher;
+pub(crate) type ReadinessWatcher = ForwardingDirectoryWatcher;
+#[cfg(target_os = "macos")]
+pub(crate) type ReadinessWatcher = readiness_watch_macos::DirectoryWatch;
 
 /// Watches `dir`, without its subdirectories, and hands every event to
 /// `handler` until the returned watcher is dropped.
-fn watch_readiness_directory<F>(dir: &Path, handler: F) -> notify::Result<ReadinessWatcher>
+pub(crate) fn watch_readiness_directory<F>(
+    dir: &Path,
+    handler: F,
+) -> notify::Result<ReadinessWatcher>
 where
     F: FnMut(notify::Result<notify::Event>) + Send + 'static,
 {
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         use notify::{RecursiveMode, Watcher};
         let mut watcher = notify::recommended_watcher(handler)?;
@@ -2456,14 +2545,17 @@ where
     {
         ForwardingDirectoryWatcher::start(dir, handler)
     }
+    #[cfg(target_os = "macos")]
+    {
+        readiness_watch_macos::DirectoryWatch::start(dir, handler)
+    }
 }
 
-/// A Windows `DirectoryWatcher` whose events go to a callback rather than a
-/// channel. `DirectoryWatcher` only sends to a channel, so a thread of its
-/// own drains that channel into the callback, as notify's watcher thread
-/// called it directly.
+/// A native `DirectoryWatcher` whose events go to a callback rather than a
+/// channel. A forwarding thread drains its channel without running callback
+/// work on the native watcher thread.
 #[cfg(windows)]
-struct ForwardingDirectoryWatcher {
+pub(crate) struct ForwardingDirectoryWatcher {
     watcher: Option<crate::watcher_backend::DirectoryWatcher>,
     forwarder: Option<std::thread::JoinHandle<()>>,
 }
@@ -2511,11 +2603,41 @@ impl Drop for ForwardingDirectoryWatcher {
     }
 }
 
+fn refresh_pointer_publication_event(
+    event: &notify::Event,
+    pointer: &Path,
+    known: &mut Option<String>,
+) -> bool {
+    if !matches!(
+        event.kind,
+        notify::EventKind::Any
+            | notify::EventKind::Create(_)
+            | notify::EventKind::Modify(_)
+            | notify::EventKind::Remove(_)
+    ) {
+        return false;
+    }
+    let named = event.paths.iter().any(|path| path == pointer);
+    if !named
+        && !pointer
+            .parent()
+            .is_some_and(|directory| event.paths.iter().any(|path| path == directory))
+    {
+        return false;
+    }
+    // A directory-level vnode event has no child filename. Compare the small
+    // pointer so publication still wakes a liveness check while a writer holds
+    // its lease, without reopening the database for unrelated directory writes.
+    let current = std::fs::read_to_string(pointer).ok();
+    let changed = current != *known;
+    *known = current;
+    named || changed
+}
+
 fn refresh_readiness_watch(
     shared: &Arc<RefreshWorkerShared>,
     root: &RefreshRoot,
 ) -> notify::Result<ReadinessWatcher> {
-    use notify::EventKind;
     #[cfg(test)]
     if refresh_worker_test_seam(&root.project_root).fail_watch {
         return Err(notify::Error::generic(
@@ -2529,16 +2651,14 @@ fn refresh_readiness_watch(
     let project_key = project_key_for_store(&root.callgraph_dir, &root.project_root)
         .map_err(|error| notify::Error::generic(&error.to_string()))?;
     let pointer = pointer_path(&watch_dir, &project_key);
+    let mut known_pointer = std::fs::read_to_string(&pointer).ok();
     watch_readiness_directory(&watch_dir, move |event: notify::Result<notify::Event>| {
         let Ok(event) = event else { return };
         let lease_released = refresh_lease_release_event(&event, &lease);
         #[cfg(test)]
         let lease_released =
             lease_released && !refresh_worker_test_seam(&root.project_root).ignore_lease_release;
-        let published = matches!(
-            event.kind,
-            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-        ) && event.paths.contains(&pointer);
+        let published = refresh_pointer_publication_event(&event, &pointer, &mut known_pointer);
         if lease_released || published {
             if let Some(shared) = shared.upgrade() {
                 let mut queue = shared
@@ -3910,6 +4030,8 @@ struct RefreshWorkerTestSeam {
     /// parked paths back to the queue, until the test releases it.
     #[cfg(test)]
     open_failure_replay_hold: Option<TestHold>,
+    #[cfg(test)]
+    open_lock_hold: Option<RefreshOpenLockHold>,
     /// Makes the writer lease look held by another live process, so a
     /// waiting batch stays waiting without a second process.
     #[cfg(test)]
@@ -3939,6 +4061,122 @@ struct RetireSnapshotHold {
 struct TestHold {
     held: crossbeam_channel::Sender<()>,
     release: crossbeam_channel::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct RefreshOpenLockHold {
+    lock: TestHold,
+    unlocked: crossbeam_channel::Sender<()>,
+    read_done: crossbeam_channel::Receiver<()>,
+}
+
+#[cfg(test)]
+pub(crate) struct RefreshOpenLockTestGate {
+    pub held: crossbeam_channel::Receiver<()>,
+    pub release: crossbeam_channel::Sender<()>,
+    pub unlocked: crossbeam_channel::Receiver<()>,
+    pub read_done: crossbeam_channel::Sender<()>,
+}
+
+#[cfg(test)]
+pub(crate) fn hold_refresh_open_lock_for_test(project_root: PathBuf) -> RefreshOpenLockTestGate {
+    let (held, held_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release) = crossbeam_channel::bounded(1);
+    let (unlocked_tx, unlocked) = crossbeam_channel::bounded(1);
+    let (read_done, read_done_rx) = crossbeam_channel::bounded(1);
+    REFRESH_WORKER_TEST_SEAMS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry(project_root)
+        .or_default()
+        .open_lock_hold = Some(RefreshOpenLockHold {
+        lock: TestHold { held, release },
+        unlocked: unlocked_tx,
+        read_done: read_done_rx,
+    });
+    RefreshOpenLockTestGate {
+        held: held_rx,
+        release: release_tx,
+        unlocked,
+        read_done,
+    }
+}
+
+#[cfg(test)]
+fn hold_refresh_connection_lock_for_test(project_root: &Path, conn: &TrackedConnection) {
+    let hold = REFRESH_WORKER_TEST_SEAMS.get().and_then(|seams| {
+        seams
+            .lock()
+            .unwrap()
+            .get_mut(project_root)
+            .and_then(|seam| seam.open_lock_hold.take())
+    });
+    if let Some(hold) = hold {
+        // Lengthen the exclusive-lock window of a rollback-journal writer open
+        // on the actual refresh connection, before it switches the file to WAL.
+        conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        hold.lock.held.send(()).unwrap();
+        // If the test panics, dropping its sender unblocks this receive so the
+        // refresh connection still rolls back and releases its SQLite lock.
+        let _ = hold.lock.release.recv();
+        conn.execute_batch("ROLLBACK").unwrap();
+        // Let the busy callback retry call_tree before this connection enters
+        // configure_generation_connection's WAL switch. The test drops its
+        // read_done sender after the query; dropping the release or read_done
+        // sender on panic also disconnects the corresponding receive.
+        let _ = hold.unlocked.send(());
+        let _ = hold.read_done.recv();
+    }
+}
+
+#[cfg(test)]
+struct ServingBusyObserver {
+    on_busy: Option<Box<dyn FnOnce(Duration) -> bool>>,
+    timeout: Duration,
+    observed: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SERVING_BUSY_OBSERVER: std::cell::RefCell<Option<ServingBusyObserver>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn observe_serving_busy_retry_for_test(_attempt: i32) -> bool {
+    SERVING_BUSY_OBSERVER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(observer) = slot.as_mut() else {
+            return false;
+        };
+        observer.observed = true;
+        observer
+            .on_busy
+            .take()
+            .is_some_and(|on_busy| on_busy(observer.timeout))
+    })
+}
+
+#[cfg(test)]
+struct ServingBusyObserverGuard<'a> {
+    conn: &'a Mutex<TrackedConnection>,
+    timeout: Duration,
+}
+
+#[cfg(test)]
+impl Drop for ServingBusyObserverGuard<'_> {
+    fn drop(&mut self) {
+        let restored = self
+            .conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .busy_timeout(self.timeout);
+        SERVING_BUSY_OBSERVER.with(|slot| slot.borrow_mut().take());
+        if !std::thread::panicking() {
+            restored.unwrap();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4214,6 +4452,278 @@ pub struct ReadonlyCallGraphStore {
     inner: CallGraphStore,
     _view_pin: Option<Arc<crate::pins::QueryPin>>,
     _generation_pin: Option<Arc<crate::views::snapshot::OpenGeneration>>,
+    health_stale_census: Mutex<Option<CachedStalePathCensus>>,
+}
+
+#[derive(Debug)]
+struct CachedStalePathCensus {
+    data_version: i64,
+    total_changes: u64,
+    measured_at: Instant,
+    census: StalePathCensus,
+}
+
+pub(crate) struct StalePathHealthCensus {
+    pub census: StalePathCensus,
+    pub measured_age_ms: u64,
+}
+
+// Path existence and permissions can change without a SQLite commit. Recheck
+// them periodically even when the resident database has not changed.
+const HEALTH_STALE_PATH_MAX_AGE: Duration = Duration::from_secs(30);
+
+#[cfg(test)]
+mod health_stale_census_tests {
+    use super::*;
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        PathBuf,
+        CallGraphStore,
+        ReadonlyCallGraphStore,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let files = [root.join("a.ts"), root.join("b.ts")];
+        for file in &files {
+            std::fs::write(file, "export function fixture() {}\n").unwrap();
+        }
+        let store_dir = dir.path().join("store");
+        let writer = CallGraphStore::open(store_dir.clone(), root.clone()).unwrap();
+        writer.cold_build(&files).unwrap();
+        writer.mark_files_stale(&files[..1]).unwrap();
+        let reader = CallGraphStore::open_readonly(store_dir, root.clone())
+            .unwrap()
+            .unwrap();
+        (dir, root, writer, reader)
+    }
+
+    #[test]
+    fn health_stale_census_reuses_paths_with_honest_age_and_rechecks_filesystem() {
+        let (_dir, root, _writer, reader) = fixture();
+        let now = Instant::now();
+        let first = reader
+            .try_stale_path_census_for_health_at(now)
+            .unwrap()
+            .unwrap();
+        assert_eq!((first.census.stale, first.census.absent), (1, 0));
+        let builds = STALE_PATH_CENSUS_BUILDS.with(std::cell::Cell::get);
+        std::fs::remove_file(root.join("a.ts")).unwrap();
+        let reused = reader
+            .try_stale_path_census_for_health_at(now + Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert_eq!(reused.census, first.census);
+        assert_eq!(reused.measured_age_ms, 3_000);
+        assert_eq!(STALE_PATH_CENSUS_BUILDS.with(std::cell::Cell::get), builds);
+        let expired = reader
+            .try_stale_path_census_for_health_at(now + HEALTH_STALE_PATH_MAX_AGE)
+            .unwrap()
+            .unwrap();
+        assert_eq!((expired.census.stale, expired.census.absent), (1, 1));
+        assert_eq!(expired.measured_age_ms, 0);
+        assert_eq!(
+            STALE_PATH_CENSUS_BUILDS.with(std::cell::Cell::get),
+            builds + 1
+        );
+        let _guard = reader.inner.conn.lock().unwrap();
+        assert!(reader.try_stale_path_census_for_health().unwrap().is_none());
+    }
+
+    #[test]
+    fn health_stale_census_invalidates_on_other_connection_commits() {
+        let (_dir, root, writer, reader) = fixture();
+        let first = reader.try_stale_path_census_for_health().unwrap().unwrap();
+        assert_eq!(first.census.stale, 1);
+        let builds = STALE_PATH_CENSUS_BUILDS.with(std::cell::Cell::get);
+        writer.mark_files_stale(&[root.join("b.ts")]).unwrap();
+        let updated = reader.try_stale_path_census_for_health().unwrap().unwrap();
+        assert_eq!(updated.census.stale, 2);
+        assert_eq!(updated.measured_age_ms, 0);
+        assert_eq!(
+            STALE_PATH_CENSUS_BUILDS.with(std::cell::Cell::get),
+            builds + 1
+        );
+    }
+
+    #[test]
+    fn health_stale_census_invalidates_on_same_connection_writes() {
+        let (_dir, _root, writer, _reader) = fixture();
+        let reader = ReadonlyCallGraphStore::from_inner(writer);
+        assert_eq!(
+            reader
+                .try_stale_path_census_for_health()
+                .unwrap()
+                .unwrap()
+                .census
+                .stale,
+            1
+        );
+        reader
+            .inner
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE backend_file_state SET status = ?1 WHERE file_path = 'a.ts'",
+                [BACKEND_STATUS_UNDECODABLE],
+            )
+            .unwrap();
+        let updated = reader.try_stale_path_census_for_health().unwrap().unwrap();
+        assert_eq!((updated.census.stale, updated.census.undecodable), (0, 1));
+        assert_eq!(updated.measured_age_ms, 0);
+    }
+}
+
+/// Bound the work spent counting possible callers for an empty reverse graph.
+pub const UNRESOLVED_CALL_SITE_COUNT_LIMIT: usize = 1_000;
+
+const UNRESOLVED_CALL_SITE_COUNT_SQL: &str = "
+    SELECT COUNT(*) FROM (
+        SELECT DISTINCT r.caller_file, r.byte_start, r.byte_end
+        FROM refs r
+        JOIN files f ON f.path = r.caller_file
+        LEFT JOIN nodes n ON n.id = r.caller_node
+        WHERE r.status = 'unresolved'
+          AND r.kind IN ('call', 'construction')
+          AND f.lang = ?1
+          AND (?2 OR (COALESCE(n.is_test, 0) = 0 AND NOT aft_is_test_file(r.caller_file)))
+          AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.ref_id = r.ref_id AND e.kind = 'call')
+        LIMIT ?3
+    )";
+
+fn unresolved_call_site_count(
+    conn: &Connection,
+    language: LangId,
+    include_tests: bool,
+) -> Result<usize> {
+    Ok(conn
+        .prepare_cached(UNRESOLVED_CALL_SITE_COUNT_SQL)?
+        .query_row(
+            params![
+                lang_label(language),
+                include_tests,
+                UNRESOLVED_CALL_SITE_COUNT_LIMIT as i64
+            ],
+            |row| row.get(0),
+        )?)
+}
+
+#[cfg(test)]
+mod callgraph_unresolved_count_tests {
+    use super::*;
+
+    fn fixture() -> (Connection, Arc<std::sync::atomic::AtomicUsize>) {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE files(path TEXT PRIMARY KEY, lang TEXT);
+            CREATE TABLE nodes(id TEXT PRIMARY KEY, is_test INTEGER);
+            CREATE TABLE refs(ref_id TEXT, caller_file TEXT, caller_node TEXT, byte_start INTEGER, byte_end INTEGER, status TEXT, kind TEXT);
+            CREATE TABLE edges(ref_id TEXT, kind TEXT);
+            INSERT INTO files VALUES ('lib.rs', 'rust');").unwrap();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = reads.clone();
+        conn.create_scalar_function(
+            "aft_is_test_file",
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            move |ctx| {
+                counted.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(crate::inspect::job::is_test_file(&ctx.get::<String>(0)?))
+            },
+        )
+        .unwrap();
+        (conn, reads)
+    }
+
+    #[test]
+    fn callgraph_unresolved_count_stops_reading_at_cap_inside_sql() {
+        let (conn, reads) = fixture();
+        for i in 0..(UNRESOLVED_CALL_SITE_COUNT_LIMIT * 3) {
+            conn.execute(
+                "INSERT INTO refs VALUES (?1, 'lib.rs', NULL, ?2, ?2+1, 'unresolved', 'call')",
+                params![i.to_string(), i as i64],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            unresolved_call_site_count(&conn, LangId::Rust, false).unwrap(),
+            UNRESOLVED_CALL_SITE_COUNT_LIMIT
+        );
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            UNRESOLVED_CALL_SITE_COUNT_LIMIT,
+            "the SQL subquery must stop, not count or collect all rows before clamping"
+        );
+    }
+
+    #[test]
+    fn callgraph_unresolved_count_preserves_site_identity_and_exclusions() {
+        let (conn, _) = fixture();
+        conn.execute_batch(
+            "INSERT INTO files VALUES ('other.ts', 'typescript');
+            INSERT INTO nodes VALUES ('test_node', 1);
+            INSERT INTO refs VALUES
+                ('a', 'lib.rs', NULL, 1, 2, 'unresolved', 'call'),
+                ('duplicate', 'lib.rs', NULL, 1, 2, 'unresolved', 'construction'),
+                ('b', 'lib.rs', NULL, 2, 3, 'unresolved', 'construction'),
+                ('resolved', 'lib.rs', NULL, 3, 4, 'resolved', 'call'),
+                ('edge', 'lib.rs', NULL, 4, 5, 'unresolved', 'call'),
+                ('mention', 'lib.rs', NULL, 5, 6, 'unresolved', 'macro_mention'),
+                ('lang', 'other.ts', NULL, 6, 7, 'unresolved', 'call'),
+                ('inline_test', 'lib.rs', 'test_node', 7, 8, 'unresolved', 'call');
+            INSERT INTO edges VALUES ('edge', 'call'), ('a', 'reference');",
+        )
+        .unwrap();
+        assert_eq!(
+            unresolved_call_site_count(&conn, LangId::Rust, false).unwrap(),
+            2
+        );
+        assert_eq!(
+            unresolved_call_site_count(&conn, LangId::Rust, true).unwrap(),
+            3
+        );
+        // Paths without enclosing nodes still use the shared test-file classifier.
+        for (i, path) in [
+            "tests/helper.rs",
+            "src/__tests__/unit.rs",
+            "src/__test__/unit.rs",
+            "src\\tests\\unit.rs",
+            "src/unit.TEST.ts",
+            "src/unit.spec.ts",
+            "src/unit_test.rs",
+            "src/unit_test.go",
+            "src/unit_test.py",
+            "src/unit_test.rb",
+            "src/unit_test.exs",
+            "src/unit_spec.rb",
+            "src/test_unit.py",
+            "src/UnitTest.java",
+            "src/UnitTests.kt",
+            "src/UnitTest.cs",
+            "src/UnitTests.swift",
+            "src/UnitSpec.scala",
+        ]
+        .iter()
+        .enumerate()
+        {
+            conn.execute("INSERT INTO files VALUES (?1, 'rust')", [path])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO refs VALUES (?1, ?2, NULL, 0, 1, 'unresolved', 'call')",
+                params![format!("test_{i}"), path],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            unresolved_call_site_count(&conn, LangId::Rust, false).unwrap(),
+            2
+        );
+        assert_eq!(
+            unresolved_call_site_count(&conn, LangId::Rust, true).unwrap(),
+            21
+        );
+    }
 }
 
 pub trait CallGraphRead {
@@ -4288,6 +4798,12 @@ pub trait CallGraphRead {
     ) -> Result<Vec<StoreRefSite>> {
         let _ = (name, language);
         Ok(Vec::new())
+    }
+    /// Count unresolved invocation sites, stopping at `UNRESOLVED_CALL_SITE_COUNT_LIMIT`.
+    /// A count at the limit is a lower bound, not an exact total.
+    fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
+        let _ = (language, include_tests);
+        Ok(0)
     }
     fn call_tree(
         &self,
@@ -4416,8 +4932,11 @@ pub struct DiskReconcileReport {
     pub stored_files: usize,
     /// Files the walk visited, at most `max_examined`.
     pub examined_files: usize,
-    /// Visited files whose size matched and were hashed.
+    /// Visited files whose stat hint required a content hash.
     pub hashed_files: usize,
+    /// Modified paths that need verification, not confirmed content changes.
+    /// They must not turn a missing stat hint into a corpus-drift cold build.
+    pub unverified_files: usize,
     /// The bound the walk ran under.
     pub max_examined: usize,
     /// The walk stopped at the bound, so files past it were not compared and
@@ -4425,7 +4944,7 @@ pub struct DiskReconcileReport {
     pub truncated: bool,
     /// On disk but not in the store.
     pub created: Vec<PathBuf>,
-    /// In the store with a different size or content hash.
+    /// In the store with changed contents or no usable way to verify them.
     pub modified: Vec<PathBuf>,
     /// In the store but gone from disk.
     pub deleted: Vec<PathBuf>,
@@ -4591,6 +5110,8 @@ impl StoreNode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreCallSite {
+    pub kind: String,
+    pub caller_is_test: Option<bool>,
     pub caller: StoreNode,
     pub target_file: String,
     pub target_symbol: String,
@@ -4633,6 +5154,7 @@ pub struct StoreUnresolvedCall {
 /// One raw ref row located by name; see `CallGraphRead::ref_sites_named`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreRefSite {
+    pub is_test: Option<bool>,
     pub file: String,
     /// Scoped name of the symbol containing the ref, when it has a node.
     pub caller_symbol: Option<String>,
@@ -4733,6 +5255,7 @@ impl StoreForwardCall {
 struct FileExtract {
     rel_path: String,
     freshness: FileFreshness,
+    source_identity: Option<String>,
     lang: LangId,
     data: FileCallData,
     nodes: Vec<NodeRecord>,
@@ -4743,6 +5266,7 @@ struct FileExtract {
 
 #[derive(Debug, Clone)]
 struct NodeRecord {
+    is_test: Option<bool>,
     id: String,
     file_path: String,
     name: String,
@@ -4849,6 +5373,7 @@ struct NameMatchCandidate {
 struct FileRow {
     surface_fingerprint: String,
     freshness: FileFreshness,
+    source_identity: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -4894,7 +5419,146 @@ struct ProjectIndex<'a> {
     /// uses it. Such an index's file set is fixed when it is constructed: a
     /// changed file set means a new `ProjectIndex`, which starts empty.
     crate_scans: std::cell::OnceCell<CrateScanMemo>,
+    /// The lazy index overlays fresh caller extracts on stored rows. Its parent
+    /// map and caller paths belong to that immutable snapshot, not the worker.
+    lazy_module_parents: std::cell::OnceCell<HashMap<String, (String, String)>>,
+    rust_caller_paths: RefCell<HashMap<String, Vec<String>>>,
     go_packages: RefCell<GoPackageMemo>,
+    local_symbols: RefCell<CallerSymbolMemo>,
+}
+
+/// Symbol-query answers for the active caller. Resolution visits references in
+/// caller order, so retaining only one file avoids a corpus-sized name cache.
+/// The caller's symbol set is immutable for the lifetime of a resolver index.
+#[derive(Clone, Default)]
+struct CallerSymbolMemo {
+    file: Option<String>,
+    symbols: HashMap<String, Option<String>>,
+    #[cfg(test)]
+    builds: usize,
+}
+
+impl CallerSymbolMemo {
+    fn resolve(&mut self, file: &str, data: &FileCallData, query: &str) -> Option<String> {
+        if self.file.as_deref() != Some(file) {
+            self.symbols.clear();
+            for symbol in data
+                .symbol_metadata
+                .keys()
+                .chain(data.calls_by_symbol.keys())
+                .chain(data.exported_symbols.iter())
+            {
+                // Qualified queries require an exact match; bare queries must
+                // remain ambiguous even when one candidate is file-level.
+                if symbol.contains("::") {
+                    self.symbols.insert(symbol.clone(), Some(symbol.clone()));
+                }
+                let bare = symbol.rsplit("::").next().unwrap_or(symbol);
+                self.symbols
+                    .entry(bare.to_string())
+                    .and_modify(|existing| {
+                        if existing.as_ref() != Some(symbol) {
+                            *existing = None;
+                        }
+                    })
+                    .or_insert_with(|| Some(symbol.clone()));
+            }
+            self.file = Some(file.to_string());
+            #[cfg(test)]
+            {
+                self.builds += 1;
+            }
+        }
+        self.symbols.get(query).cloned().flatten()
+    }
+}
+
+#[cfg(test)]
+mod local_symbol_memo_tests {
+    use super::*;
+
+    #[test]
+    fn local_symbol_memo_preserves_scan_results_and_builds_once_per_caller() {
+        let file = "fixture.rs";
+        let mut source = String::from(
+            "fn local() {} fn ambiguous() {}\n\
+             mod nested { fn ambiguous() {} fn scoped_only() {} }\n\
+             struct Item; impl Item { fn method(&self) {} }\n",
+        );
+        for i in 0..512 {
+            source.push_str(&format!("fn function_{i}() {{ local(); }}\n"));
+        }
+        let mut data = callgraph::build_file_data_from_source(Path::new(file), &source).unwrap();
+        data.calls_by_symbol
+            .insert("caller_only".into(), Vec::new());
+        data.exported_symbols.push("nested::export_only".into());
+        let index = ProjectIndex::from_parts(
+            Path::new("/fixture"),
+            HashMap::new(),
+            HashMap::from([(file.to_string(), &data)]),
+            WorkspaceCratePrefixCache::default(),
+            Rc::new(DiskFacts::new(Path::new("/fixture"))),
+        );
+        assert_eq!(
+            rust_unique_file_level_function(&index, file, "local", "local", &data),
+            Some(("resolved_local".into(), file.into(), "local".into()))
+        );
+        assert!(
+            rust_unique_file_level_function(&index, file, "ambiguous", "ambiguous", &data)
+                .is_none()
+        );
+        assert_eq!(index.local_symbol(file, &data, "ambiguous"), None);
+        assert_eq!(
+            index.local_symbol(file, &data, "nested::ambiguous"),
+            Some("nested::ambiguous".into())
+        );
+        let queries = data
+            .symbol_metadata
+            .keys()
+            .chain(data.calls_by_symbol.keys())
+            .chain(data.exported_symbols.iter())
+            .flat_map(|name| [name.clone(), name.rsplit("::").next().unwrap().to_string()])
+            .chain(["missing".into(), "caller_only".into(), "export_only".into()])
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        let expected = queries
+            .iter()
+            .map(|query| {
+                callgraph::resolve_symbol_query_in_data(&data, Path::new(file), query).ok()
+            })
+            .collect::<Vec<_>>();
+        let scan_elapsed = started.elapsed();
+        let started = Instant::now();
+        for _ in 0..8 {
+            for (query, expected) in queries.iter().zip(&expected) {
+                assert_eq!(&index.local_symbol(file, &data, query), expected, "{query}");
+            }
+        }
+        let memo_elapsed = started.elapsed();
+        assert_eq!(index.local_symbols.borrow().builds, 1);
+        let other =
+            callgraph::build_file_data_from_source(Path::new("other.rs"), "fn other() {}").unwrap();
+        assert_eq!(index.local_symbol("other.rs", &other, "local"), None);
+        assert_eq!(
+            index.local_symbol("other.rs", &other, "other"),
+            Some("other".into())
+        );
+        assert_eq!(index.local_symbols.borrow().builds, 2);
+        // A later cold-build window can reparse the same caller path.
+        index.local_symbols.borrow_mut().file = None;
+        assert_eq!(index.local_symbol("other.rs", &data, "other"), None);
+        assert_eq!(
+            index.local_symbol("other.rs", &data, "local"),
+            Some("local".into())
+        );
+        assert_eq!(index.local_symbols.borrow().builds, 3);
+        eprintln!(
+            "local symbol queries={} scan_ns_per_query={} memo_ns_per_query={} builds=1",
+            queries.len(),
+            scan_elapsed.as_nanos() / queries.len() as u128,
+            memo_elapsed.as_nanos() / (queries.len() * 8) as u128,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4903,6 +5567,102 @@ thread_local! {
     /// real corpus, in the same process.
     pub(crate) static SCAN_WITHOUT_CRATE_MEMO: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+mod rust_module_work {
+    use super::*;
+
+    #[derive(Debug, Default)]
+    pub(super) struct Work {
+        pub parent_lookups: usize,
+        pub parent_scans: usize,
+        pub parent_file_visits: usize,
+        pub caller_requests: usize,
+        pub caller_walks: usize,
+        pub parent_time: Duration,
+        pub caller_time: Duration,
+    }
+
+    thread_local! {
+        static ACTIVE: RefCell<Option<Work>> = const { RefCell::new(None) };
+        static DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(super) fn disabled() -> bool {
+        DISABLED.with(std::cell::Cell::get)
+    }
+
+    pub(super) fn note(update: impl FnOnce(&mut Work)) {
+        ACTIVE.with(|active| {
+            if let Some(work) = active.borrow_mut().as_mut() {
+                update(work);
+            }
+        });
+    }
+
+    pub(super) struct Session;
+
+    impl Session {
+        pub fn start(disabled: bool) -> Self {
+            ACTIVE.with(|active| {
+                assert!(active.borrow().is_none(), "nested module profiling session");
+                *active.borrow_mut() = Some(Work::default());
+            });
+            DISABLED.with(|flag| flag.set(disabled));
+            Self
+        }
+
+        pub fn finish(self) -> Work {
+            ACTIVE.with(|active| active.borrow_mut().take().unwrap())
+        }
+    }
+
+    impl Drop for Session {
+        fn drop(&mut self) {
+            ACTIVE.with(|active| active.borrow_mut().take());
+            DISABLED.with(|flag| flag.set(false));
+        }
+    }
+
+    pub(super) struct Timing {
+        started: Option<Instant>,
+        parent: bool,
+    }
+
+    impl Timing {
+        pub fn parent() -> Self {
+            note(|work| work.parent_lookups += 1);
+            Self::start(true)
+        }
+
+        pub fn caller() -> Self {
+            note(|work| work.caller_requests += 1);
+            Self::start(false)
+        }
+
+        fn start(parent: bool) -> Self {
+            Self {
+                started: ACTIVE.with(|active| active.borrow().is_some().then(Instant::now)),
+                parent,
+            }
+        }
+    }
+
+    impl Drop for Timing {
+        fn drop(&mut self) {
+            if let Some(started) = self.started {
+                let elapsed = started.elapsed();
+                note(|work| {
+                    if self.parent {
+                        work.parent_time += elapsed;
+                    } else {
+                        work.caller_time += elapsed;
+                    }
+                });
+            }
+        }
+    }
 }
 
 /// Answers to the two Rust lookups that otherwise scan every indexed file on
@@ -4934,26 +5694,30 @@ impl CrateScanMemo {
         rust_files.sort();
         let mut module_parents = HashMap::<String, (String, String)>::new();
         for (file, index) in files {
-            for (module, target) in &index.declared_module_targets {
-                let Some(target) = target else {
-                    continue;
-                };
-                let candidate = (file.clone(), module.clone());
-                match module_parents.entry(target.clone()) {
-                    std::collections::hash_map::Entry::Occupied(mut best) => {
-                        if candidate < *best.get() {
-                            best.insert(candidate);
-                        }
-                    }
-                    std::collections::hash_map::Entry::Vacant(slot) => {
-                        slot.insert(candidate);
-                    }
-                }
-            }
+            Self::note_module_parents(&mut module_parents, file, index);
         }
         Self {
             rust_files,
             module_parents,
+        }
+    }
+
+    fn note_module_parents(
+        parents: &mut HashMap<String, (String, String)>,
+        file: &str,
+        index: &DbFileIndex,
+    ) {
+        for (module, target) in &index.declared_module_targets {
+            let Some(target) = target else {
+                continue;
+            };
+            let candidate = (file.to_string(), module.clone());
+            let best = parents
+                .entry(target.clone())
+                .or_insert_with(|| candidate.clone());
+            if candidate < *best {
+                *best = candidate;
+            }
         }
     }
 }
@@ -4979,9 +5743,13 @@ trait ResolverIndex {
         go_symbol_target_by_scan(self, caller_file, module, symbol)
     }
     fn caller_data(&self, file: &str) -> Option<&FileCallData>;
+    fn local_symbol(&self, file: &str, data: &FileCallData, query: &str) -> Option<String>;
     fn lang_for(&self, file: &str) -> Option<LangId>;
     fn module_target(&self, caller_file: &str, module_path: &str) -> Option<String>;
     fn module_parent(&self, target_file: &str) -> Option<(String, String)>;
+    fn rust_caller_module_segments(&self, caller_file: &str) -> Vec<String> {
+        rust_caller_module_segments_uncached(self, caller_file)
+    }
     fn reexports_for(&self, file: &str) -> Vec<ReexportIndex>;
     fn node_for_symbol(&self, file: &str, symbol: &str) -> Option<String>;
     fn node_is_callable(&self, file: &str, node_id: &str) -> bool;
@@ -5044,6 +5812,10 @@ impl ResolverIndex for ProjectIndex<'_> {
         self.caller_data.get(file).copied()
     }
 
+    fn local_symbol(&self, file: &str, data: &FileCallData, query: &str) -> Option<String> {
+        self.local_symbols.borrow_mut().resolve(file, data, query)
+    }
+
     fn lang_for(&self, file: &str) -> Option<LangId> {
         self.lang_for(file)
     }
@@ -5053,10 +5825,34 @@ impl ResolverIndex for ProjectIndex<'_> {
     }
 
     fn module_parent(&self, target_file: &str) -> Option<(String, String)> {
+        #[cfg(test)]
+        let _timing = rust_module_work::Timing::parent();
+        if self.lazy.is_some() {
+            #[cfg(test)]
+            if rust_module_work::disabled() {
+                return self.module_parent_by_scan(target_file);
+            }
+            return self.lazy_module_parents().get(target_file).cloned();
+        }
         match self.crate_scans() {
             Some(memo) => memo.module_parents.get(target_file).cloned(),
             None => self.module_parent_by_scan(target_file),
         }
+    }
+
+    fn rust_caller_module_segments(&self, caller_file: &str) -> Vec<String> {
+        #[cfg(test)]
+        if rust_module_work::disabled() {
+            return rust_caller_module_segments_uncached(self, caller_file);
+        }
+        if let Some(path) = self.rust_caller_paths.borrow().get(caller_file) {
+            return path.clone();
+        }
+        let path = rust_caller_module_segments_uncached(self, caller_file);
+        self.rust_caller_paths
+            .borrow_mut()
+            .insert(caller_file.to_string(), path.clone());
+        path
     }
 
     fn reexports_for(&self, file: &str) -> Vec<ReexportIndex> {
@@ -5146,6 +5942,24 @@ impl ResolverIndex for ProjectIndex<'_> {
 }
 
 impl ProjectIndex<'_> {
+    fn lazy_module_parents(&self) -> &HashMap<String, (String, String)> {
+        self.lazy_module_parents.get_or_init(|| {
+            #[cfg(test)]
+            rust_module_work::note(|work| work.parent_scans += 1);
+            let mut parents = HashMap::new();
+            // scan_paths excludes stored rows replaced by this refresh's
+            // extracts, including declarations that have just been removed.
+            for file in self.scan_paths(LazyDbFileIndexes::module_declaring_files) {
+                #[cfg(test)]
+                rust_module_work::note(|work| work.parent_file_visits += 1);
+                if let Some(index) = self.file_index(&file) {
+                    CrateScanMemo::note_module_parents(&mut parents, &file, &index);
+                }
+            }
+            parents
+        })
+    }
+
     fn go_package(
         &self,
         paths: &FactPaths<'_>,
@@ -5168,9 +5982,9 @@ impl ProjectIndex<'_> {
             |file| self.file_index(file),
         )
     }
-    /// The crate-wide lookup memo, or `None` for an index that loads stored
-    /// files on demand: its file set is not all in memory, so those lookups
-    /// keep scanning.
+    /// The eager crate-wide memo. Lazy indexes build their parent map
+    /// separately; resolving symbols inside inline Rust modules still scans
+    /// stored paths.
     fn crate_scans(&self) -> Option<&CrateScanMemo> {
         #[cfg(test)]
         if SCAN_WITHOUT_CRATE_MEMO.with(std::cell::Cell::get) {
@@ -5189,10 +6003,14 @@ impl ProjectIndex<'_> {
     /// `(declaring file, module name)` pair whose declared target is
     /// `target_file`.
     fn module_parent_by_scan(&self, target_file: &str) -> Option<(String, String)> {
+        #[cfg(test)]
+        rust_module_work::note(|work| work.parent_scans += 1);
         let mut parents = self
             .scan_paths(LazyDbFileIndexes::module_declaring_files)
             .into_iter()
             .filter_map(|file| {
+                #[cfg(test)]
+                rust_module_work::note(|work| work.parent_file_visits += 1);
                 let index = self.file_index(&file)?;
                 let modules = index
                     .declared_module_targets
@@ -5314,6 +6132,7 @@ struct DiskProjectIndex<'a> {
 #[derive(Default)]
 struct DiskIndexMemos {
     go_packages: RefCell<GoPackageMemo>,
+    local_symbols: RefCell<CallerSymbolMemo>,
     file_indexes: RefCell<HashMap<String, Option<Rc<DbFileIndex>>>>,
     file_index_order: RefCell<VecDeque<String>>,
     /// Target file -> first `(declaring file, module path)` naming it, in
@@ -5605,6 +6424,13 @@ impl ResolverIndex for DiskProjectIndex<'_> {
         (file == self.caller_file).then_some(self.caller_data)
     }
 
+    fn local_symbol(&self, file: &str, data: &FileCallData, query: &str) -> Option<String> {
+        self.memos
+            .local_symbols
+            .borrow_mut()
+            .resolve(file, data, query)
+    }
+
     fn lang_for(&self, file: &str) -> Option<LangId> {
         self.file_index(file).and_then(|index| index.lang)
     }
@@ -5615,6 +6441,8 @@ impl ResolverIndex for DiskProjectIndex<'_> {
     }
 
     fn module_parent(&self, target_file: &str) -> Option<(String, String)> {
+        #[cfg(test)]
+        let _timing = rust_module_work::Timing::parent();
         if self.memoize_resolver_indexes {
             return self.module_parents().get(target_file).cloned();
         }
@@ -5770,6 +6598,18 @@ fn project_key_for_store(callgraph_dir: &Path, project_root: &Path) -> Result<St
 }
 
 impl CallGraphStore {
+    #[cfg(test)]
+    pub(crate) fn lock_readiness_for_test(&self) -> Connection {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode=DELETE;")
+            .unwrap();
+        let blocker = Connection::open(self.sqlite_path()).unwrap();
+        blocker.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        blocker
+    }
+
     pub fn open_if_enabled(
         options: CallGraphStoreOptions,
         callgraph_dir: PathBuf,
@@ -5794,7 +6634,7 @@ impl CallGraphStore {
         // Resolve the current generation via the pointer (falling back to the
         // legacy single-file DB). If nothing is published yet, open the legacy
         // path so a brand-new store still gets a writable DB + schema.
-        let (sqlite_path, generation) = resolve_ready_target(&callgraph_dir, &project_key)
+        let (sqlite_path, generation) = resolve_ready_target(&callgraph_dir, &project_key)?
             .unwrap_or_else(|| (legacy_sqlite_path(&callgraph_dir, &project_key), None));
         let OpenedStore { store, root_repair } = Self::open_at_path(
             project_root.clone(),
@@ -5819,6 +6659,50 @@ impl CallGraphStore {
         }
     }
 
+    /// Explain a cold-build decision without filtering away stale metadata or
+    /// changing the published store. Only the cold path pays for this probe.
+    pub(crate) fn cold_build_reason(callgraph_dir: &Path, project_root: &Path) -> Result<String> {
+        let key = project_key_for_store(callgraph_dir, project_root)?;
+        let target = if let Some(generation) = read_pointer(callgraph_dir, &key) {
+            let path = callgraph_dir.join(&generation);
+            if !path.is_file() {
+                return Ok(format!(
+                    "published generation missing; generation={generation}"
+                ));
+            }
+            path
+        } else {
+            let path = legacy_sqlite_path(callgraph_dir, &key);
+            if !path.is_file() {
+                return Ok("pointer missing".into());
+            }
+            path
+        };
+        let conn = open_readonly_connection(&target)?;
+        let (schema, fingerprint, ready): (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+            "SELECT (SELECT v FROM meta WHERE k = 'schema_version'),
+                    (SELECT v FROM meta WHERE k = 'fingerprint'),
+                    (SELECT v FROM meta WHERE k = 'ready')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let current_schema = SCHEMA_VERSION.to_string();
+        let current_fingerprint = schema_fingerprint();
+        if schema.as_deref() != Some(current_schema.as_str())
+            || fingerprint.as_deref() != Some(current_fingerprint.as_str())
+        {
+            return Ok(format!(
+                "fingerprint or schema stale; stored_schema={}; current_schema={current_schema}; stored_fingerprint={}; current_fingerprint={current_fingerprint}; current_build_output={BUILD_OUTPUT_VERSION}",
+                schema.as_deref().unwrap_or("missing"), fingerprint.as_deref().unwrap_or("missing"),
+            ));
+        }
+        Ok(format!(
+            "generation not ready; ready={}",
+            ready.as_deref().unwrap_or("missing")
+        ))
+    }
+
     pub fn open_readonly(
         callgraph_dir: PathBuf,
         project_root: PathBuf,
@@ -5829,12 +6713,13 @@ impl CallGraphStore {
         // reported as not built (which would send callers to a cold build) or
         // served from an older legacy partition.
         refuse_newer_published_format(&callgraph_dir, &project_key)?;
-        if let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)
+        if let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)?
         {
             let conn = open_readonly_connection(&sqlite_path)?;
-            if !database_ready(&conn).unwrap_or(false) {
+            if !readonly_readiness(database_ready(&conn))? {
                 return Ok(None);
             }
+            configure_serving_reader(&conn)?;
             let marker_label = generation.as_deref().unwrap_or("legacy");
             let read_marker = crate::root_cache::ReadMarker::create(&callgraph_dir, marker_label)?;
             return Ok(Some(ReadonlyCallGraphStore::from_inner(
@@ -5861,9 +6746,10 @@ impl CallGraphStore {
             target.sqlite_path.display()
         );
         let conn = open_readonly_connection(&target.sqlite_path)?;
-        if !database_ready(&conn).unwrap_or(false) {
+        if !readonly_readiness(database_ready(&conn))? {
             return Ok(None);
         }
+        configure_serving_reader(&conn)?;
         let marker_label =
             legacy_read_marker_label(&target.sqlite_path, target.generation.as_deref());
         let read_marker = crate::root_cache::ReadMarker::create(&callgraph_dir, &marker_label)?;
@@ -5880,6 +6766,24 @@ impl CallGraphStore {
                 conn,
             ),
         )))
+    }
+
+    /// A drain makes at most three fail-fast probes before yielding. Continued
+    /// contention stays owned by the completion receiver for a later drain.
+    pub fn reopen_readonly(
+        callgraph_dir: PathBuf,
+        project_root: PathBuf,
+    ) -> Result<Option<ReadonlyCallGraphStore>> {
+        for attempt in 0..3 {
+            let result = Self::open_readonly(callgraph_dir.clone(), project_root.clone());
+            if attempt == 2
+                || !matches!(&result, Err(error) if error.is_transient_lock_contention())
+            {
+                return result;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        unreachable!("bounded reopen probes return on the final attempt")
     }
 
     /// Open the currently-published ready store with write access so moved-root
@@ -5952,7 +6856,7 @@ impl CallGraphStore {
             return Ok(None);
         };
         refuse_newer_published_format(&callgraph_dir, &project_key)?;
-        let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)
+        let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)?
         else {
             return Ok(None);
         };
@@ -6093,7 +6997,7 @@ impl CallGraphStore {
         // metadata in-place while still holding the build lease. If data rows
         // contain absolute paths, publish a fresh generation under this lease
         // rather than recursively reacquiring the same lock.
-        if let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)
+        if let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)?
         {
             let OpenedStore { store, root_repair } = Self::open_at_path(
                 project_root.clone(),
@@ -6178,7 +7082,7 @@ impl CallGraphStore {
         // Another writer may have completed the migration while this worker was
         // waiting for the lease. Adopt its root-keyed generation rather than
         // copying the legacy source a second time.
-        if let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)
+        if let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)?
         {
             let OpenedStore { store, root_repair } = Self::open_at_path(
                 project_root,
@@ -6475,7 +7379,7 @@ impl CallGraphStore {
         let project_key = project_key_for_store(callgraph_dir, project_root)?;
         // A cold build is needed unless a ready generation (or ready legacy DB)
         // is currently published.
-        Ok(resolve_ready_target(callgraph_dir, &project_key).is_none())
+        Ok(resolve_ready_target(callgraph_dir, &project_key)?.is_none())
     }
 
     /// Check the durable callgraph-domain breaker before a query starts a cold
@@ -6551,6 +7455,10 @@ impl CallGraphStore {
             store,
             project_root.display().to_string(),
         )?;
+        #[cfg(test)]
+        if role == WriterConnectionRole::Refresh {
+            hold_refresh_connection_lock_for_test(&project_root, &conn);
+        }
         match role {
             WriterConnectionRole::Generation => configure_connection(&conn)?,
             WriterConnectionRole::Refresh => configure_generation_connection(&conn, role)?,
@@ -7008,68 +7916,82 @@ impl CallGraphStore {
                     break;
                 };
                 after_path = batch.last_path;
-                let batch_files = batch.paths.len();
+                let admitted_files = batch.paths.len();
 
-                let mut needs_extract = Vec::with_capacity(batch_files);
+                let mut needs_extract = Vec::with_capacity(admitted_files);
                 for path in batch.paths {
                     if !staged_content_matches(&conn, &self.project_root, &path)? {
                         needs_extract.push(path);
                     }
                 }
                 if needs_extract.is_empty() {
-                    completed_files = completed_files.saturating_add(batch_files);
+                    completed_files = completed_files.saturating_add(admitted_files);
                     crate::cold_build_limiter::progress::completed(completed_files);
                     ensure_cold_build_current("extraction", completed_files, total_files)?;
                     continue;
                 }
 
                 notify_cold_build_extract_observer(&needs_extract);
-                let build =
-                    pool.build_extracts(&self.project_root, &needs_extract, &extraction_memo);
-                for extract in &build.extracts {
-                    retained_callers.retain(&extract.rel_path, &extract.data);
-                }
                 self.verify_writer_lease()?;
                 let total_changes_before = conn.total_changes();
                 let tx = conn.transaction()?;
                 let mut extracted_bytes = 0u64;
                 {
                     let mut inserts = ColdBuildInsertStatements::new(&tx)?;
-                    for extract in &build.extracts {
-                        delete_staged_file_rows(&tx, &extract.rel_path)?;
-                        insert_file_extract_prepared(&mut inserts, &workspace_root, extract)?;
-                        if resolution_config::resolution_config_kind(Path::new(&extract.rel_path))
-                            .is_some()
-                        {
-                            store_resolution_config_fields(
-                                &tx,
+                    // An outer batch can contain thousands of small sources, whose parsed
+                    // call records take far more memory than their source bytes. Insert and
+                    // drop each bounded parse chunk while keeping one transaction and
+                    // statement set for the whole outer batch.
+                    for paths in needs_extract.chunks(batch_files.min(COLD_BUILD_PARSE_MAX_FILES)) {
+                        let build =
+                            pool.build_extracts(&self.project_root, paths, &extraction_memo);
+                        for extract in &build.extracts {
+                            retained_callers.retain(&extract.rel_path, &extract.data);
+                        }
+                        #[cfg(test)]
+                        notify_cold_build_resident_extract_observer(
+                            build.extracts.len() + build.failures.len(),
+                        );
+                        self.verify_writer_lease()?;
+                        for extract in &build.extracts {
+                            delete_staged_file_rows(&tx, &extract.rel_path)?;
+                            insert_file_extract_prepared(&mut inserts, &workspace_root, extract)?;
+                            if resolution_config::resolution_config_kind(Path::new(
                                 &extract.rel_path,
-                                resolution_config::resolution_fields(
-                                    &self.project_root.join(&extract.rel_path),
-                                )
-                                .as_deref(),
+                            ))
+                            .is_some()
+                            {
+                                store_resolution_config_fields(
+                                    &tx,
+                                    &extract.rel_path,
+                                    resolution_config::resolution_fields(
+                                        &self.project_root.join(&extract.rel_path),
+                                    )
+                                    .as_deref(),
+                                )?;
+                            }
+                            for raw in &extract.raw_refs {
+                                insert_staged_ref_prepared(&mut inserts, raw)?;
+                            }
+                            extracted_bytes =
+                                extracted_bytes.saturating_add(extract.freshness.size);
+                        }
+                        for failure in &build.failures {
+                            insert_backend_state_prepared(
+                                &mut inserts.backend_state,
+                                &workspace_root,
+                                &failure.rel_path,
+                                failure
+                                    .freshness
+                                    .as_ref()
+                                    .map(|freshness| &freshness.content_hash),
+                                if failure.undecodable {
+                                    BACKEND_STATUS_UNDECODABLE
+                                } else {
+                                    "stale"
+                                },
                             )?;
                         }
-                        for raw in &extract.raw_refs {
-                            insert_staged_ref_prepared(&mut inserts, raw)?;
-                        }
-                        extracted_bytes = extracted_bytes.saturating_add(extract.freshness.size);
-                    }
-                    for failure in &build.failures {
-                        insert_backend_state_prepared(
-                            &mut inserts.backend_state,
-                            &workspace_root,
-                            &failure.rel_path,
-                            failure
-                                .freshness
-                                .as_ref()
-                                .map(|freshness| &freshness.content_hash),
-                            if failure.undecodable {
-                                BACKEND_STATUS_UNDECODABLE
-                            } else {
-                                "stale"
-                            },
-                        )?;
                     }
                 }
                 increment_staged_extracted_bytes(&tx, extracted_bytes)?;
@@ -7083,7 +8005,7 @@ impl CallGraphStore {
                 // unexplained. This is the connection's own db-status counter, so
                 // no second fd is ever opened on the live staging file set.
                 conn.sample_write_pages();
-                completed_files = completed_files.saturating_add(batch_files);
+                completed_files = completed_files.saturating_add(admitted_files);
                 crate::cold_build_limiter::progress::completed(completed_files);
                 ensure_cold_build_current("extraction", completed_files, total_files)?;
             }
@@ -7148,6 +8070,10 @@ impl CallGraphStore {
                 missing.into_iter().collect(),
                 &extraction_memo,
             );
+
+            // A caller split across windows may have been reparsed. Its local
+            // name table must use this window's data, not an earlier parse.
+            index_memos.local_symbols.borrow_mut().file = None;
 
             self.verify_writer_lease()?;
             let total_changes_before = conn.total_changes();
@@ -7409,7 +8335,8 @@ impl CallGraphStore {
             }
 
             if let Some(row) = &old_row {
-                match cache_freshness::verify_file(&abs_path, &row.freshness) {
+                let (verdict, source_identity) = source_stat::verify_file(&abs_path, row);
+                match verdict {
                     FreshnessVerdict::HotFresh => {
                         // Content still matches the stored graph. A prior failed
                         // refresh may have left backend_file_state='stale' without
@@ -7424,11 +8351,14 @@ impl CallGraphStore {
                     } => {
                         fresh_metadata.insert(
                             rel_path.clone(),
-                            FileFreshness {
-                                content_hash: row.freshness.content_hash,
-                                mtime: new_mtime,
-                                size: new_size,
-                            },
+                            (
+                                FileFreshness {
+                                    content_hash: row.freshness.content_hash,
+                                    mtime: new_mtime,
+                                    size: new_size,
+                                },
+                                source_identity,
+                            ),
                         );
                         continue;
                     }
@@ -7765,7 +8695,7 @@ impl CallGraphStore {
         for update in &resolution_updates {
             store_resolution_config_fields(&tx, &update.rel_path, update.fields.as_deref())?;
         }
-        for (rel_path, freshness) in fresh_metadata {
+        for (rel_path, (freshness, source_identity)) in fresh_metadata {
             update_file_fresh_metadata(
                 &tx,
                 &self.project_root,
@@ -7773,6 +8703,7 @@ impl CallGraphStore {
                 &freshness.content_hash,
                 freshness.mtime,
                 freshness.size,
+                source_identity.as_deref(),
             )?;
         }
         for rel_path in &confirmed_fresh {
@@ -7895,6 +8826,7 @@ impl CallGraphStore {
                         &extract.freshness.content_hash,
                         extract.freshness.mtime,
                         extract.freshness.size,
+                        extract.source_identity.as_deref(),
                     )?;
                     continue;
                 }
@@ -8151,23 +9083,27 @@ impl CallGraphStore {
             .collect())
     }
 
-    /// Compare the stored per-file size and content hash with the files on
-    /// disk, for when watcher events were lost. At most `max_examined` walked
+    /// Compare stored size, mtime and identity with disk, hashing changed or
+    /// unavailable stat hints, for when watcher events were lost. At most `max_examined` walked
     /// files are compared; the bound is applied to the walk itself, so a huge
     /// tree costs no more than the bound. The returned paths are what an
     /// incremental `refresh_files` needs to catch the store up.
     pub fn reconcile_with_disk(&self, max_examined: usize) -> Result<DiskReconcileReport> {
-        let stored = {
+        let (stored, revision) = {
             let conn = self.conn.lock().expect("callgraph store mutex poisoned");
             self.ensure_ready(&conn)?;
-            stored_file_identities(&conn)?
+            (stored_file_stats(&conn)?, projection_write_revision(&conn)?)
         };
-        Ok(reconcile_stored_files_with_disk(
+        let (report, updates) = reconcile_stored_files_with_disk(
             &self.project_root,
             stored,
             callgraph::walk_project_files(&self.project_root),
             max_examined,
-        ))
+        );
+        if let Err(error) = self.backfill_source_stats(revision, &updates) {
+            crate::slog_debug!("callgraph stat backfill deferred: {}", error);
+        }
+        Ok(report)
     }
     pub fn node_for(&self, file_rel: &Path, symbol: &str) -> Result<StoreNode> {
         self.refresh_read_marker()?;
@@ -8196,6 +9132,7 @@ impl CallGraphStore {
     /// this store for the snapshot's lifetime to keep its generation pinned.
     pub(crate) fn read_snapshot(&self) -> Result<CallGraphStore> {
         let conn = open_readonly_connection(&self.sqlite_path)?;
+        configure_serving_reader(&conn)?;
         conn.execute_batch("BEGIN DEFERRED")?;
         let mut snapshot = CallGraphStore::from_connection(
             self.project_root.clone(),
@@ -8431,9 +9368,10 @@ impl CallGraphStore {
         self.refresh_read_marker()?;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         self.ensure_ready(&conn)?;
-        let mut stmt = conn.prepare_cached("SELECT r.caller_file, n.scoped_name, r.line FROM refs r JOIN files f ON f.path=r.caller_file LEFT JOIN nodes n ON n.id=r.caller_node WHERE r.kind='call' AND r.short_name=?1 AND f.lang=?2 AND r.status='unresolved' AND r.full_ref LIKE '%.%' AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.ref_id=r.ref_id AND e.kind='call') ORDER BY r.caller_file, r.line, r.ref_id")?;
+        let mut stmt = conn.prepare_cached("SELECT r.caller_file, n.scoped_name, r.line, n.is_test FROM refs r JOIN files f ON f.path=r.caller_file LEFT JOIN nodes n ON n.id=r.caller_node WHERE r.kind IN ('call','construction') AND (?1='' OR (r.short_name=?1 AND r.full_ref LIKE '%.%')) AND f.lang=?2 AND r.status='unresolved' AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.ref_id=r.ref_id AND e.kind='call') GROUP BY r.caller_file, r.byte_start, r.byte_end ORDER BY r.caller_file, r.byte_start")?;
         let rows = stmt.query_map(params![name, lang_label(language)], |row| {
             Ok(StoreRefSite {
+                is_test: row.get(3)?,
                 file: row.get(0)?,
                 caller_symbol: row.get(1)?,
                 line: row.get::<_, i64>(2)?.max(0) as u32,
@@ -8442,6 +9380,22 @@ impl CallGraphStore {
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
+        self.refresh_read_marker()?;
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        self.ensure_ready(&conn)?;
+        // Reuse the path classifier so SQL filtering follows the same conventions
+        // as callers and impact, including test files with no enclosing node.
+        conn.create_scalar_function(
+            "aft_is_test_file",
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| Ok(crate::inspect::job::is_test_file(&ctx.get::<String>(0)?)),
+        )?;
+        unresolved_call_site_count(&conn, language, include_tests)
     }
 
     pub fn call_tree(
@@ -8532,7 +9486,10 @@ impl CallGraphStore {
                 continue;
             };
             let callers =
-                direct_callers_for_tuple(&conn, &current.node.file, &current.node.symbol)?;
+                direct_callers_for_tuple(&conn, &current.node.file, &current.node.symbol)?
+                    .into_iter()
+                    .filter(|site| site.kind == "call")
+                    .collect::<Vec<_>>();
             if callers.is_empty() {
                 if path.len() > 1 {
                     truncated_paths += 1;
@@ -8723,6 +9680,45 @@ impl CallGraphStore {
 }
 
 impl ReadonlyCallGraphStore {
+    #[cfg(test)]
+    pub(crate) fn with_busy_observer_for_test<R>(
+        &self,
+        on_busy: impl FnOnce(Duration) -> bool + 'static,
+        read: impl FnOnce() -> R,
+    ) -> (R, bool) {
+        let conn = self.inner.conn.lock().unwrap();
+        let timeout_ms: u64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        let timeout = Duration::from_millis(timeout_ms);
+        SERVING_BUSY_OBSERVER.with(|slot| {
+            assert!(slot.borrow().is_none(), "nested serving busy observer");
+            *slot.borrow_mut() = Some(ServingBusyObserver {
+                on_busy: Some(Box::new(on_busy)),
+                timeout,
+                observed: false,
+            });
+        });
+        // The callback runs synchronously on the querying thread. Only replace
+        // a policy that permits waiting: a zero-timeout reader must still fail
+        // under the held lock rather than gain a retry from the test hook.
+        let installed = if !timeout.is_zero() {
+            conn.busy_handler(Some(observe_serving_busy_retry_for_test))
+        } else {
+            Ok(())
+        };
+        drop(conn);
+        let guard = ServingBusyObserverGuard {
+            conn: &self.inner.conn,
+            timeout,
+        };
+        installed.unwrap();
+        let result = read();
+        let observed = SERVING_BUSY_OBSERVER.with(|slot| slot.borrow().as_ref().unwrap().observed);
+        drop(guard);
+        (result, observed)
+    }
+
     /// Read one answer snapshot while this reader retains the generation pins.
     pub(crate) fn read_snapshot(&self) -> Result<CallGraphStore> {
         self.inner.read_snapshot()
@@ -8738,8 +9734,14 @@ impl ReadonlyCallGraphStore {
     ) -> Result<Self> {
         let sqlite_path = crate::views::resolve_derived_path(&view_dir, generation)
             .map_err(|e| CallGraphStoreError::Unavailable(e.to_string()))?;
-        let conn = open_readonly_connection(&sqlite_path)?;
+        // A sealed donor never changes; open it without locks or a WAL.
+        let conn = if crate::views::donor::is_sealed(&sqlite_path) {
+            open_sealed_connection(&sqlite_path)?
+        } else {
+            open_readonly_connection(&sqlite_path)?
+        };
         ensure_database_ready(&conn)?;
+        configure_serving_reader(&conn)?;
         let mut inner = CallGraphStore::from_connection(
             project_root,
             family,
@@ -8757,6 +9759,7 @@ impl ReadonlyCallGraphStore {
             inner,
             _view_pin: None,
             _generation_pin: None,
+            health_stale_census: Mutex::new(None),
         })
     }
 
@@ -8770,6 +9773,7 @@ impl ReadonlyCallGraphStore {
         let sqlite_path = manifest_view_database_path(&view_dir, generation)?;
         let conn = open_readonly_connection(&sqlite_path)?;
         ensure_database_ready(&conn)?;
+        configure_serving_reader(&conn)?;
         let mut inner = CallGraphStore::from_connection(
             project_root,
             family,
@@ -8787,6 +9791,7 @@ impl ReadonlyCallGraphStore {
             inner,
             _view_pin: pin,
             _generation_pin: None,
+            health_stale_census: Mutex::new(None),
         })
     }
 
@@ -8832,6 +9837,7 @@ impl ReadonlyCallGraphStore {
             inner,
             _view_pin: None,
             _generation_pin: None,
+            health_stale_census: Mutex::new(None),
         }
     }
 
@@ -8864,6 +9870,60 @@ impl ReadonlyCallGraphStore {
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
         };
         stale_path_census(&conn, &self.inner.project_root).map(Some)
+    }
+
+    pub(crate) fn try_stale_path_census_for_health(&self) -> Result<Option<StalePathHealthCensus>> {
+        self.try_stale_path_census_for_health_at(Instant::now())
+    }
+
+    fn try_stale_path_census_for_health_at(
+        &self,
+        now: Instant,
+    ) -> Result<Option<StalePathHealthCensus>> {
+        let conn = match self.inner.conn.try_lock() {
+            Ok(conn) => conn,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        let mut cached = match self.health_stale_census.try_lock() {
+            Ok(cached) => cached,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        // data_version observes other connections' commits, while total_changes
+        // also covers writes made on this connection. The memo belongs to this
+        // opened store, so replacing a resident generation cannot reuse it.
+        let data_version: i64 = conn.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        let total_changes = conn.total_changes();
+        if let Some(sample) = cached.as_ref() {
+            let age = now.saturating_duration_since(sample.measured_at);
+            if sample.data_version == data_version
+                && sample.total_changes == total_changes
+                && age < HEALTH_STALE_PATH_MAX_AGE
+            {
+                return Ok(Some(StalePathHealthCensus {
+                    census: sample.census,
+                    measured_age_ms: age.as_millis().min(u128::from(u64::MAX)) as u64,
+                }));
+            }
+        }
+        *cached = None;
+        let census = stale_path_census(&conn, &self.inner.project_root)?;
+        let after_version: i64 = conn.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        // A writer can commit between the census's queries. Do not preserve a
+        // mixed observation as an unchanged-database sample for future ticks.
+        if after_version == data_version {
+            *cached = Some(CachedStalePathCensus {
+                data_version,
+                total_changes,
+                measured_at: now,
+                census,
+            });
+        }
+        Ok(Some(StalePathHealthCensus {
+            census,
+            measured_age_ms: 0,
+        }))
     }
 
     pub(crate) fn projection_generation(&self) -> Option<&str> {
@@ -9117,6 +10177,9 @@ impl CallGraphRead for CallGraphStore {
     ) -> Result<Vec<StoreRefSite>> {
         CallGraphStore::unresolved_method_sites_named(self, name, language)
     }
+    fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
+        CallGraphStore::unresolved_call_site_count(self, language, include_tests)
+    }
     fn call_tree(
         &self,
         file_rel: &Path,
@@ -9237,6 +10300,9 @@ impl<T: CallGraphRead + ?Sized> CallGraphRead for Arc<T> {
         language: LangId,
     ) -> Result<Vec<StoreRefSite>> {
         (**self).unresolved_method_sites_named(name, language)
+    }
+    fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
+        (**self).unresolved_call_site_count(language, include_tests)
     }
     fn call_tree(
         &self,
@@ -9359,6 +10425,10 @@ impl CallGraphRead for ReadonlyCallGraphStore {
     ) -> Result<Vec<StoreRefSite>> {
         self.inner.unresolved_method_sites_named(name, language)
     }
+    fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
+        self.inner
+            .unresolved_call_site_count(language, include_tests)
+    }
     fn call_tree(
         &self,
         file_rel: &Path,
@@ -9410,25 +10480,49 @@ fn stored_file_identities(conn: &Connection) -> Result<HashMap<String, (u64, Str
     Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
 }
 
-/// Classify each walked file against the stored identities. A file is compared
-/// by size first and hashed only when the size matches, the same content hash
-/// the store records (files over the hash size cap are stored with a zero hash,
-/// so for them only the size is compared). Stored files the walk did not reach
-/// are reported deleted only when the walk was complete and the file is really
-/// gone: a truncated walk cannot tell a deletion from an unvisited file.
+/// Stored content and optional machine-local stat hint, keyed by relative path.
+fn stored_file_stats(conn: &Connection) -> Result<HashMap<String, StoredFile>> {
+    let identity = if source_stat::has_identity_column(conn)? {
+        "source_identity"
+    } else {
+        "NULL"
+    };
+    let mut statement = conn.prepare(&format!(
+        "SELECT path, size, content_hash, mtime_ns, {identity} FROM files"
+    ))?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            StoredFile {
+                size: row.get::<_, i64>(1)?.max(0) as u64,
+                hash: row.get(2)?,
+                mtime_ns: row.get(3)?,
+                identity: row.get(4)?,
+            },
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
+}
+
+/// Skip source contents only when size, nanosecond mtime and an available
+/// machine-local identity all match. Unknown or changed stamps need a hash;
+/// hash-equal observations can be recorded without rewriting graph rows.
+/// Files over the hash cap whose stamp is unknown need a conservative refresh,
+/// since their stored zero hash is not evidence of equal contents.
 fn reconcile_stored_files_with_disk(
     project_root: &Path,
-    mut stored: HashMap<String, (u64, String)>,
+    mut stored: HashMap<String, StoredFile>,
     walk: impl Iterator<Item = PathBuf>,
     max_examined: usize,
-) -> DiskReconcileReport {
+) -> (DiskReconcileReport, Vec<ValidatedStat>) {
     let mut report = DiskReconcileReport {
         stored_files: stored.len(),
         max_examined,
         ..DiskReconcileReport::default()
     };
-    // One extra item tells a walk that ended exactly at the bound from one
-    // that was cut off by it.
+    let mut updates = Vec::new();
+    // One extra item distinguishes a complete walk ending at its bound from
+    // a truncated one; an unvisited file is never guessed to be deleted.
     for path in walk.take(max_examined.saturating_add(1)) {
         if report.examined_files == max_examined {
             report.truncated = true;
@@ -9436,28 +10530,49 @@ fn reconcile_stored_files_with_disk(
         }
         report.examined_files += 1;
         let rel_path = relative_path(project_root, &path);
-        let Some((stored_size, stored_hash)) = stored.remove(&rel_path) else {
+        let Some(previous) = stored.remove(&rel_path) else {
             report.created.push(path);
             continue;
         };
-        let Ok(metadata) = std::fs::metadata(&path) else {
+        let Ok(observed) = SourceStat::at(&path) else {
+            report.unverified_files += 1;
             report.modified.push(path);
             continue;
         };
-        if metadata.len() != stored_size {
+        if previous.matches(&observed) {
+            continue;
+        }
+        if observed.size != previous.size {
+            report.modified.push(path);
+            continue;
+        }
+        if observed.size > cache_freshness::CONTENT_HASH_SIZE_CAP
+            || previous.hash == hash_to_hex(cache_freshness::zero_hash())
+        {
+            report.unverified_files += 1;
             report.modified.push(path);
             continue;
         }
         report.hashed_files += 1;
-        let disk_hash = match cache_freshness::hash_file_if_small(&path, stored_size) {
-            Ok(hash) => hash.unwrap_or_else(cache_freshness::zero_hash),
-            Err(_) => {
+        let disk_hash = match cache_freshness::hash_file_if_small(&path, observed.size) {
+            Ok(Some(hash)) => hash,
+            _ => {
+                report.unverified_files += 1;
                 report.modified.push(path);
                 continue;
             }
         };
-        if hash_to_hex(disk_hash) != stored_hash {
+        if hash_to_hex(disk_hash) != previous.hash {
             report.modified.push(path);
+        } else if SourceStat::at(&path).ok().as_ref() != Some(&observed) {
+            report.unverified_files += 1;
+            report.modified.push(path);
+        } else {
+            updates.push(ValidatedStat {
+                rel_path,
+                previous,
+                observed,
+            });
         }
     }
     if !report.truncated {
@@ -9465,10 +10580,8 @@ fn reconcile_stored_files_with_disk(
             .into_keys()
             .map(|rel_path| project_root.join(rel_path))
             .filter(|path| {
-                matches!(
-                    std::fs::symlink_metadata(path),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
-                )
+                matches!(std::fs::symlink_metadata(path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound)
             })
             .collect::<Vec<_>>();
         deleted.sort();
@@ -9476,7 +10589,7 @@ fn reconcile_stored_files_with_disk(
     }
     report.created.sort();
     report.modified.sort();
-    report
+    (report, updates)
 }
 
 fn resolve_node_for_rel(conn: &Connection, rel_path: &str, symbol: &str) -> Result<StoreNode> {
@@ -9695,11 +10808,11 @@ fn direct_caller_counts_for_tuples(
                  JOIN edges e
                    ON e.target_file = requested.target_file
                   AND e.target_symbol = requested.target_symbol
-                  AND e.kind = 'call'
+                  AND e.kind IN ('call', 'callback_ref')
                  JOIN refs r ON r.ref_id = e.ref_id
                  JOIN nodes src ON src.id = e.source_node
                  JOIN files src_file ON src_file.path = src.file_path
-                 GROUP BY e.target_file, e.target_symbol, src.file_path, e.line
+                  GROUP BY e.target_file, e.target_symbol, src.file_path, e.line, e.kind
              )
              SELECT target_file, target_symbol, COUNT(*)
              FROM deduped
@@ -9738,7 +10851,7 @@ fn direct_caller_count_for_tuple(
          JOIN refs r ON r.ref_id = e.ref_id
          JOIN nodes src ON src.id = e.source_node
          JOIN files src_file ON src_file.path = src.file_path
-         WHERE e.kind = 'call' AND e.target_file = ?1 AND e.target_symbol = ?2",
+         WHERE e.kind IN ('call', 'callback_ref') AND e.target_file = ?1 AND e.target_symbol = ?2",
         params![target_file, target_symbol],
         |row| row.get(0),
     )?;
@@ -9758,14 +10871,14 @@ fn direct_callers_for_tuple(
                 src_file.lang,
                 tgt.id, tgt.file_path, tgt.scoped_name, tgt.name, tgt.kind, tgt.start_line,
                 tgt.end_line, tgt.signature, tgt.exported, tgt.is_callgraph_entry_point,
-                tgt_file.lang
+                tgt_file.lang, e.kind, src.is_test
          FROM edges e
          JOIN refs r ON r.ref_id = e.ref_id
          JOIN nodes src ON src.id = e.source_node
          JOIN files src_file ON src_file.path = src.file_path
          LEFT JOIN (nodes tgt JOIN files tgt_file ON tgt_file.path = tgt.file_path)
              ON tgt.id = e.target_node
-         WHERE e.kind = 'call' AND e.target_file = ?1 AND e.target_symbol = ?2
+         WHERE e.kind IN ('call', 'callback_ref') AND e.target_file = ?1 AND e.target_symbol = ?2
          ORDER BY e.source_node, r.byte_start, r.line, r.ref_id",
     )?;
     let rows = stmt.query_map(
@@ -9780,6 +10893,8 @@ fn direct_call_site_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreC
     let caller = store_node_from_row_at(row, 7)?;
     let target = optional_store_node_from_row_at(row, 18)?;
     Ok(StoreCallSite {
+        kind: row.get(29)?,
+        caller_is_test: row.get(30)?,
         caller,
         target_file: row.get(0)?,
         target_symbol: row.get(1)?,
@@ -9818,12 +10933,12 @@ fn direct_callers_for_tuples(
                     src_file.lang,
                     tgt.id, tgt.file_path, tgt.scoped_name, tgt.name, tgt.kind, tgt.start_line,
                     tgt.end_line, tgt.signature, tgt.exported, tgt.is_callgraph_entry_point,
-                    tgt_file.lang
+                    tgt_file.lang, e.kind, src.is_test
              FROM requested requested
              JOIN edges e
                ON e.target_file = requested.target_file
               AND e.target_symbol = requested.target_symbol
-              AND e.kind = 'call'
+              AND e.kind IN ('call', 'callback_ref')
              JOIN refs r ON r.ref_id = e.ref_id
              JOIN nodes src ON src.id = e.source_node
              JOIN files src_file ON src_file.path = src.file_path
@@ -9906,6 +11021,8 @@ fn outgoing_calls_for_symbol_tuples(
             Ok((
                 source_node_id,
                 StoreCallSite {
+                    kind: "call".to_string(),
+                    caller_is_test: None,
                     caller,
                     target_file: row.get(1)?,
                     target_symbol: row.get(2)?,
@@ -10042,6 +11159,8 @@ fn outgoing_calls_for_node_limited(
         |row| {
             let target = optional_store_node_from_row_at(row, 7)?;
             Ok(StoreCallSite {
+                kind: "call".to_string(),
+                caller_is_test: None,
                 caller: node.clone(),
                 target_file: row.get(0)?,
                 target_symbol: row.get(1)?,
@@ -10089,6 +11208,8 @@ fn resolved_self_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<V
         |row| {
             let target = optional_store_node_from_row_at(row, 7)?;
             Ok(StoreCallSite {
+                kind: "call".to_string(),
+                caller_is_test: None,
                 caller: node.clone(),
                 target_file: row.get(0)?,
                 target_symbol: row.get(1)?,
@@ -10114,7 +11235,7 @@ fn ref_sites_named(
     // LIMIT bounds returned rows, not rows examined: the short-name index does
     // not provide caller-file/line ordering, so SQLite may sort all matches.
     let mut stmt = conn.prepare_cached(
-        "SELECT r.caller_file, n.scoped_name, r.line, r.local_name
+        "SELECT r.caller_file, n.scoped_name, r.line, r.local_name, n.is_test
          FROM refs r
          LEFT JOIN nodes n ON n.id = r.caller_node
          WHERE r.short_name = ?1 AND r.kind = ?2
@@ -10129,6 +11250,7 @@ fn ref_sites_named(
                 caller_symbol: row.get(1)?,
                 line: row.get::<_, i64>(2)?.max(0) as u32,
                 local_name: row.get(3)?,
+                is_test: row.get(4)?,
             })
         },
     )?;
@@ -10378,7 +11500,11 @@ pub fn live_callgraph_edge_snapshot(
 
     let mut edges = BTreeSet::new();
     for (caller_file, data) in &file_data {
-        for (caller_symbol, call_sites) in &data.calls_by_symbol {
+        for (caller_symbol, call_sites) in data
+            .calls_by_symbol
+            .iter()
+            .chain(&data.value_refs_by_symbol)
+        {
             for call_site in call_sites {
                 let resolution = graph.resolve_cross_file_edge(
                     &call_site.full_callee,
@@ -10386,7 +11512,7 @@ pub fn live_callgraph_edge_snapshot(
                     caller_file,
                     &data.import_block,
                 );
-                let (target_file, target_symbol) = match resolution {
+                let (target_file, mut target_symbol) = match resolution {
                     EdgeResolution::Resolved { file, symbol } => (file, symbol),
                     EdgeResolution::Unresolved { callee_name } => {
                         if !callgraph::is_bare_callee(&call_site.full_callee, &callee_name) {
@@ -10402,6 +11528,43 @@ pub fn live_callgraph_edge_snapshot(
                         (caller_file.clone(), target_symbol)
                     }
                 };
+                let target_data = graph.build_file(&target_file)?;
+                let mut kind = if data.value_refs_by_symbol.contains_key(caller_symbol)
+                    && data.value_refs_by_symbol[caller_symbol].contains(call_site)
+                {
+                    "value_ref"
+                } else {
+                    "call"
+                };
+                match call_site.kind {
+                    callgraph::CallSiteKind::CallbackReference => kind = "callback_ref",
+                    callgraph::CallSiteKind::Construction => {
+                        if target_data
+                            .symbol_metadata_for(&target_symbol)
+                            .is_some_and(|meta| meta.kind == SymbolKind::Class)
+                        {
+                            let constructor = format!("{target_symbol}::constructor");
+                            if target_data.symbol_metadata.contains_key(&constructor) {
+                                target_symbol = constructor;
+                            } else {
+                                kind = "value_ref";
+                            }
+                        }
+                    }
+                    callgraph::CallSiteKind::Call => {}
+                }
+                if kind != "call"
+                    && data.lang != LangId::Go
+                    && !target_data
+                        .symbol_metadata_for(&target_symbol)
+                        .is_some_and(|meta| {
+                            matches!(meta.kind, SymbolKind::Function | SymbolKind::Method)
+                                || (call_site.kind == callgraph::CallSiteKind::Construction
+                                    && meta.kind == SymbolKind::Class)
+                        })
+                {
+                    continue;
+                }
                 if target_file == *caller_file && target_symbol == *caller_symbol {
                     continue;
                 }
@@ -10410,7 +11573,7 @@ pub fn live_callgraph_edge_snapshot(
                     source_symbol: caller_symbol.clone(),
                     target_file: relative_path(project_root, &target_file),
                     target_symbol,
-                    kind: "call".to_string(),
+                    kind: kind.to_string(),
                     line: call_site.line,
                 });
             }
@@ -10654,9 +11817,10 @@ fn open_legacy_fallback_store(
         target.sqlite_path.display()
     );
     let conn = open_readonly_connection(&target.sqlite_path)?;
-    if !database_ready(&conn).unwrap_or(false) {
+    if !readonly_readiness(database_ready(&conn))? {
         return Ok(None);
     }
+    configure_serving_reader(&conn)?;
     let marker_label = legacy_read_marker_label(&target.sqlite_path, target.generation.as_deref());
     let read_marker = crate::root_cache::ReadMarker::create(callgraph_dir, &marker_label)?;
     Ok(Some(CallGraphStore::from_connection(
@@ -10803,7 +11967,7 @@ fn newest_superseded_legacy_generation(
             continue;
         }
         let path = entry.path();
-        if !db_path_ready(&path) {
+        if !db_path_ready(&path)? {
             continue;
         }
         let modified = entry
@@ -10863,7 +12027,7 @@ fn ready_legacy_target(
 ) -> Result<Option<LegacyCallgraphTarget>> {
     if let Some(generation) = read_pointer(&partition.dir, &partition.key) {
         let sqlite_path = partition.dir.join(&generation);
-        if sqlite_path.is_file() && db_path_ready(&sqlite_path) {
+        if sqlite_path.is_file() && db_path_ready(&sqlite_path)? {
             let source_bytes = sqlite_file_set_size(&sqlite_path)?;
             return Ok(Some(LegacyCallgraphTarget {
                 partition: partition.clone(),
@@ -10876,7 +12040,7 @@ fn ready_legacy_target(
     }
 
     let sqlite_path = legacy_sqlite_path(&partition.dir, &partition.key);
-    if sqlite_path.is_file() && db_path_ready(&sqlite_path) {
+    if sqlite_path.is_file() && db_path_ready(&sqlite_path)? {
         let source_bytes = sqlite_file_set_size(&sqlite_path)?;
         return Ok(Some(LegacyCallgraphTarget {
             partition: partition.clone(),
@@ -11308,6 +12472,21 @@ fn open_readonly_connection(path: &Path) -> Result<TrackedConnection> {
     open_readonly_connection_before(path, Instant::now())
 }
 
+/// A sealed donor (see `views::donor`) is opened with `immutable=1`: SQLite
+/// then takes no locks and never looks for a WAL, which is what lets a
+/// worker clone the file with a plain descriptor.
+fn open_sealed_connection(path: &Path) -> Result<TrackedConnection> {
+    crate::private_storage::prepare_sqlite(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let uri = format!("{}&immutable=1", sqlite_readonly_uri(path));
+    let conn = TrackedConnection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        SqliteStore::CallgraphGeneration,
+    )?;
+    conn.execute_batch("PRAGMA query_only=ON;")?;
+    Ok(conn)
+}
+
 fn open_readonly_connection_before(path: &Path, deadline: Instant) -> Result<TrackedConnection> {
     crate::private_storage::prepare_sqlite(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let uri = sqlite_readonly_uri(path);
@@ -11318,11 +12497,19 @@ fn open_readonly_connection_before(path: &Path, deadline: Instant) -> Result<Tra
     )?;
     // Readers do not change durability or journal settings: even synchronous
     // reads the schema and can block behind an exclusive writer before setup.
-    // Request readers pass an expired deadline and fail fast; maintenance probes
+    // Readiness opens pass an expired deadline and fail fast; maintenance probes
     // may wait within their bounded budget without changing durability settings.
     conn.busy_timeout(deadline.saturating_duration_since(Instant::now()))?;
     conn.execute_batch("PRAGMA query_only=ON;")?;
     Ok(conn)
+}
+
+fn configure_serving_reader(conn: &TrackedConnection) -> Result<()> {
+    // Readiness was checked without waiting, but a ready store can still race a
+    // refresh opening its writer or checkpointing. Let normal queries outwait
+    // short exclusive locks without hiding contention that exceeds this bound.
+    conn.busy_timeout(Duration::from_millis(100))?;
+    Ok(())
 }
 
 fn sqlite_readonly_uri(path: &Path) -> String {
@@ -11394,9 +12581,9 @@ fn configure_build_connection(conn: &TrackedConnection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.set_wal_autocheckpoint(crate::db::lifecycle::DEFAULT_WAL_AUTOCHECKPOINT_PAGES)?;
-    // Only staged builds get this cache. The two production cold-build slots
-    // bound its aggregate page-cache budget to 512 MiB.
-    conn.pragma_update(None, "cache_size", -262_144)?;
+    // Bulk commits and statement reuse keep the build fast without retaining
+    // a whole-database page cache beside the parser and resolver working sets.
+    conn.pragma_update(None, "cache_size", CALLGRAPH_SQLITE_CACHE_KIB)?;
     Ok(())
 }
 
@@ -11409,9 +12596,9 @@ fn configure_build_connection(conn: &TrackedConnection) -> Result<()> {
 /// switch is a write transaction that needs an exclusive lock on the file. The
 /// writer waits for that lock (up to its busy timeout) for as long as any other
 /// connection, in this process or another, keeps a read open, and while it
-/// waits SQLite refuses every new reader with SQLITE_BUSY. Query readers do not
-/// wait on a busy store, so a store that was published and ready answered
-/// "building" for that whole time. Switching here, before the pointer names the
+/// waits SQLite refuses every new reader with SQLITE_BUSY. Readiness probes fail
+/// fast and serving readers wait only briefly, so a published, ready store can
+/// still answer busy during a delayed switch. Switching before the pointer names the
 /// file, means a published generation is already in WAL mode, where writers
 /// never need an exclusive lock and never block readers.
 ///
@@ -11489,7 +12676,8 @@ pub(crate) fn initialize_schema(conn: &Connection) -> Result<()> {
             is_dead_code_root   INTEGER NOT NULL DEFAULT 0,
             is_public_api       INTEGER NOT NULL DEFAULT 0,
             surface_fingerprint TEXT NOT NULL,
-            indexed_at          INTEGER NOT NULL
+            indexed_at          INTEGER NOT NULL,
+            source_identity     TEXT
         );
 
         CREATE TABLE IF NOT EXISTS nodes (
@@ -11509,6 +12697,7 @@ pub(crate) fn initialize_schema(conn: &Connection) -> Result<()> {
             is_type_like               INTEGER NOT NULL,
             is_callgraph_entry_point   INTEGER NOT NULL,
             provenance                 TEXT NOT NULL,
+            is_test                    INTEGER,
             UNIQUE(file_path, start_line, start_col, end_line, end_col, range_ordinal)
         );
 
@@ -11619,6 +12808,16 @@ pub(crate) fn initialize_schema(conn: &Connection) -> Result<()> {
     if !has_last_segment {
         conn.execute_batch("ALTER TABLE refs ADD COLUMN callee_last_segment TEXT;")?;
     }
+    let has_test_status = conn
+        .prepare("PRAGMA table_info(nodes)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "is_test");
+    if !has_test_status {
+        conn.execute_batch("ALTER TABLE nodes ADD COLUMN is_test INTEGER;")?;
+    }
+    source_stat::ensure_identity_column(conn)?;
     conn.execute_batch(&create_secondary_indexes_sql())?;
     // Shape initialization is not proof that graph rows were produced by this
     // build. Preserve an existing fingerprint so old identities remain unready.
@@ -11860,7 +13059,7 @@ fn ensure_database_ready(conn: &Connection) -> Result<()> {
 ///   completion does not duplicate documented methods.
 /// - v13: known interface contracts and their implementation fan-out retain
 ///   exact/dispatch provenance; a concrete trait call has only its actual target.
-const BUILD_OUTPUT_VERSION: &str = "v19-position-independent-node-identities";
+const BUILD_OUTPUT_VERSION: &str = "v21-rust-module-paths-and-function-references";
 
 fn staging_file_name(project_key: &str) -> String {
     format!("{project_key}.{BUILD_OUTPUT_VERSION}.staging.sqlite.tmp.resume")
@@ -11868,6 +13067,12 @@ fn staging_file_name(project_key: &str) -> String {
 
 fn schema_fingerprint() -> String {
     schema_fingerprint_for(BUILD_OUTPUT_VERSION)
+}
+
+/// The schema and build-output fingerprint a ready derived database carries,
+/// for keying derived outputs that are interchangeable across checkouts.
+pub(crate) fn derived_build_fingerprint() -> String {
+    schema_fingerprint()
 }
 
 fn schema_fingerprint_for(build_output_version: &str) -> String {
@@ -12252,7 +13457,7 @@ fn create_secondary_indexes_sql() -> String {
         .join("\n")
 }
 
-fn drop_cold_build_secondary_indexes(tx: &Transaction<'_>) -> Result<()> {
+pub(crate) fn drop_cold_build_secondary_indexes(tx: &Transaction<'_>) -> Result<()> {
     let sql = SECONDARY_INDEXES
         .iter()
         .map(|(name, _)| format!("DROP INDEX IF EXISTS {name};"))
@@ -12262,7 +13467,7 @@ fn drop_cold_build_secondary_indexes(tx: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
-fn create_cold_build_secondary_indexes(tx: &Transaction<'_>) -> Result<()> {
+pub(crate) fn create_cold_build_secondary_indexes(tx: &Transaction<'_>) -> Result<()> {
     tx.execute_batch(&create_secondary_indexes_sql())?;
     Ok(())
 }
@@ -12451,7 +13656,7 @@ fn log_root_repair_rebuild(repair: &OpenRootRepair) {
     } = repair
     {
         crate::slog_info!(
-            "callgraph cold-build decision: reason=re-rooting refused; from={}; to={}; detail={}",
+            "callgraph cold-build decision: reason=root mismatch; from={}; to={}; detail={}",
             previous_roots.join(", "),
             current_root,
             reason
@@ -12506,12 +13711,19 @@ fn read_pointer(callgraph_dir: &Path, project_key: &str) -> Option<String> {
 
 /// True if the DB at `path` opens and reports ready (schema + fingerprint + the
 /// `ready` flag). Uses a throwaway read-only connection.
-fn db_path_ready(path: &Path) -> bool {
-    (|| -> Result<bool> {
+fn db_path_ready(path: &Path) -> Result<bool> {
+    readonly_readiness((|| {
         let conn = open_readonly_connection(path)?;
         database_ready(&conn)
-    })()
-    .unwrap_or(false)
+    })())
+}
+
+fn readonly_readiness(result: Result<bool>) -> Result<bool> {
+    match result {
+        Err(error) if error.is_transient_lock_contention() => Err(error),
+        // Invalid databases remain not ready; contention cannot establish absence.
+        other => Ok(other.unwrap_or(false)),
+    }
 }
 
 /// Resolve the DB file a reader/opener should use, returning `(path, generation)`
@@ -12524,14 +13736,14 @@ fn db_path_ready(path: &Path) -> bool {
 fn resolve_ready_target(
     callgraph_dir: &Path,
     project_key: &str,
-) -> Option<(PathBuf, Option<String>)> {
+) -> Result<Option<(PathBuf, Option<String>)>> {
     for _ in 0..5 {
         if let Some(generation) = read_pointer(callgraph_dir, project_key) {
             let gen_path = callgraph_dir.join(&generation);
             if gen_path.is_file() {
-                return (migration_manifest_valid(callgraph_dir, &generation)
-                    && db_path_ready(&gen_path))
-                .then_some((gen_path, Some(generation)));
+                return Ok((migration_manifest_valid(callgraph_dir, &generation)
+                    && db_path_ready(&gen_path)?)
+                .then_some((gen_path, Some(generation))));
             }
             // Pointer names a missing generation (a GC/publish race): re-read the
             // pointer and retry rather than failing the reader.
@@ -12540,9 +13752,9 @@ fn resolve_ready_target(
         }
         // No pointer: fall back to the legacy single-file DB if it is ready.
         let legacy = legacy_sqlite_path(callgraph_dir, project_key);
-        return (legacy.is_file() && db_path_ready(&legacy)).then_some((legacy, None));
+        return Ok((legacy.is_file() && db_path_ready(&legacy)?).then_some((legacy, None)));
     }
-    None
+    Ok(None)
 }
 
 /// Schema version recorded in the published generation (or, with no pointer,
@@ -13439,7 +14651,7 @@ impl BuildPool {
             // constructed.
             match rayon::ThreadPoolBuilder::new()
                 .num_threads(build_pool_size())
-                .thread_name(|index| format!("aft-callgraph-build-{index}"))
+                .thread_name(|index| format!("aft-rayon-callgraph-build-{index}"))
                 .stack_size(8 * 1024 * 1024)
                 .build()
             {
@@ -13707,8 +14919,7 @@ fn build_file_extract_with_memo(
     let rel_path = relative_path(project_root, &abs_path);
     #[cfg(test)]
     work_counts::note_parse(&abs_path);
-    let source = crate::project_content::read_to_string(&abs_path)?;
-    let freshness = collect_source_freshness(&abs_path, &source)?;
+    let (source, freshness, source_identity) = source_stat::read_source(&abs_path)?;
     let mut data = callgraph::build_file_data_from_source(&abs_path, &source)?;
     let lang = data.lang;
     if lang == LangId::Rust {
@@ -13822,6 +15033,7 @@ fn build_file_extract_with_memo(
     Ok(FileExtract {
         rel_path,
         freshness,
+        source_identity,
         lang,
         data,
         nodes,
@@ -13871,6 +15083,7 @@ fn build_node_records(
             .map(|default| default == scoped_name || default == name)
             .unwrap_or(false);
         records.push(NodeRecord {
+            is_test: meta.is_test,
             id,
             file_path: rel_path.to_string(),
             name: name.clone(),
@@ -14027,7 +15240,12 @@ fn build_callable_refs(
                 caller_node: caller_node.clone(),
                 caller_symbol: Some(caller_symbol.clone()),
                 caller_file: rel_path.to_string(),
-                kind: kind.to_string(),
+                kind: match call_site.kind {
+                    callgraph::CallSiteKind::Construction => "construction",
+                    callgraph::CallSiteKind::CallbackReference => "callback_ref",
+                    callgraph::CallSiteKind::Call => kind,
+                }
+                .to_string(),
                 short_name: Some(call_site.callee_name.clone()),
                 full_ref: Some(call_site.full_callee.clone()),
                 module_path: None,
@@ -14732,8 +15950,12 @@ fn rust_pub_use_reexport_parts(
     }
 
     if let Some(brace_start) = body.find("::{") {
-        let module_path = body[..brace_start].trim().to_string();
-        let names = rust_reexport_names_from_specs(&body[brace_start + 3..body.rfind('}')?]);
+        rust_use_group_close(body)?;
+        let module_path = body.get(..brace_start)?.trim().to_string();
+        // Validate a real group, but retain the legacy range (including trailing
+        // comments) until a planned extraction output version change.
+        let specs = body.get(brace_start + 3..body.rfind('}')?)?;
+        let names = rust_reexport_names_from_specs(specs);
         if names.is_empty() {
             return None;
         }
@@ -14746,6 +15968,96 @@ fn rust_pub_use_reexport_parts(
         return None;
     }
     Some((module_path.trim().to_string(), names, false))
+}
+
+fn rust_use_group_close(body: &str) -> Option<usize> {
+    let bytes = body.as_bytes();
+    let mut pos = 0;
+    let mut depth: usize = 0;
+    while let Some(&byte) = bytes.get(pos) {
+        let rest = bytes.get(pos..)?;
+        if rest.starts_with(b"//") {
+            pos += rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len());
+            continue;
+        }
+        if rest.starts_with(b"/*") {
+            pos += 2;
+            let mut comments = 1;
+            while comments > 0 {
+                let rest = bytes.get(pos..)?;
+                if rest.starts_with(b"/*") {
+                    comments += 1;
+                    pos += 2;
+                } else if rest.starts_with(b"*/") {
+                    comments -= 1;
+                    pos += 2;
+                } else {
+                    bytes.get(pos)?;
+                    pos += 1;
+                }
+            }
+            continue;
+        }
+        // Raw strings may also have byte or C prefixes; scanning reaches their
+        // `r` after the prefix without interpreting their contents as code.
+        if byte == b'r' {
+            let hashes = rest[1..].iter().take_while(|&&b| b == b'#').count();
+            if rest.get(1 + hashes) == Some(&b'"') {
+                pos += 2 + hashes;
+                loop {
+                    let &next = bytes.get(pos)?;
+                    pos += 1;
+                    if next == b'"' && bytes.get(pos..pos + hashes)?.iter().all(|&b| b == b'#') {
+                        pos += hashes;
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+        if byte == b'"' || (byte == b'\'' && rust_use_char_literal(body.get(pos..)?)) {
+            pos += 1;
+            loop {
+                let &next = bytes.get(pos)?;
+                pos += 1;
+                if next == b'\\' {
+                    bytes.get(pos)?;
+                    pos += 1;
+                } else if next == byte {
+                    break;
+                }
+            }
+            continue;
+        }
+        if depth == 0 && rest.starts_with(b"::{") {
+            depth = 1;
+            pos += 3;
+            continue;
+        }
+        if depth > 0 {
+            if byte == b'{' {
+                depth += 1;
+            } else if byte == b'}' {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(pos);
+                }
+            }
+        }
+        pos += 1;
+    }
+    None
+}
+
+fn rust_use_char_literal(rest: &str) -> bool {
+    // Apostrophes also introduce lifetimes. A character has either an escape or
+    // one UTF-8 character followed by its closing quote.
+    if rest.as_bytes().get(1) == Some(&b'\\') {
+        return true;
+    }
+    rest.strip_prefix('\'')
+        .and_then(|text| text.chars().next())
+        .is_some_and(|ch| rest.as_bytes().get(1 + ch.len_utf8()) == Some(&b'\''))
 }
 
 fn rust_reexport_names_from_specs(specs: &str) -> HashMap<String, String> {
@@ -14995,7 +16307,7 @@ fn resolve_ref<I: ResolverIndex>(raw: RawRef, index: &I) -> Result<ResolvedRef> 
     }
     if !matches!(
         raw.kind.as_str(),
-        "call" | "value_ref" | MACRO_BODY_CALL_REF_KIND
+        "call" | "construction" | "callback_ref" | "value_ref" | MACRO_BODY_CALL_REF_KIND
     ) {
         return Ok(ResolvedRef {
             dependencies: raw.dependencies.clone(),
@@ -15032,7 +16344,7 @@ fn resolve_ref<I: ResolverIndex>(raw: RawRef, index: &I) -> Result<ResolvedRef> 
         _ => resolve_local_target(index, &caller_file, full_ref, short_name, caller_data),
     };
 
-    let Some((status, target_file, target_symbol)) = resolved else {
+    let Some((status, target_file, mut target_symbol)) = resolved else {
         return Ok(ResolvedRef {
             raw,
             status: "unresolved".to_string(),
@@ -15045,8 +16357,31 @@ fn resolve_ref<I: ResolverIndex>(raw: RawRef, index: &I) -> Result<ResolvedRef> 
     };
 
     dependencies.insert(target_file.clone());
+    let mut construction_without_constructor = false;
+    if raw.kind == "construction" {
+        let Some(node) = index.node_for_symbol(&target_file, &target_symbol) else {
+            return Ok(ResolvedRef {
+                raw,
+                status: "unresolved".to_string(),
+                target_node: None,
+                target_file: None,
+                target_symbol: None,
+                dependencies,
+                edge: None,
+            });
+        };
+        let constructor = format!("{target_symbol}::constructor");
+        if index.node_is_callable(&target_file, &node) {
+            // JavaScript functions can also be constructed; they remain callable targets.
+        } else if index.node_for_symbol(&target_file, &constructor).is_some() {
+            target_symbol = constructor;
+        } else {
+            // Keep the class reference for liveness without inventing an executable method call.
+            construction_without_constructor = true;
+        }
+    }
     let target_node = index.node_for_symbol(&target_file, &target_symbol);
-    if raw.kind == "value_ref"
+    if matches!(raw.kind.as_str(), "value_ref" | "callback_ref")
         && index.lang_for(&caller_file) != Some(LangId::Go)
         && !target_node
             .as_deref()
@@ -15075,7 +16410,16 @@ fn resolve_ref<I: ResolverIndex>(raw: RawRef, index: &I) -> Result<ResolvedRef> 
                 target_node: target_node.clone(),
                 target_file: target_file.clone(),
                 target_symbol: target_symbol.clone(),
-                kind: raw.kind.clone(),
+                kind: if raw.kind == "construction" {
+                    if construction_without_constructor {
+                        "value_ref"
+                    } else {
+                        "call"
+                    }
+                } else {
+                    raw.kind.as_str()
+                }
+                .to_string(),
                 line: raw.line,
             })
         }
@@ -15573,11 +16917,35 @@ fn resolve_rust_target<I: ResolverIndex>(
         }
     }
     if full_ref.contains("::") {
+        // Self names the enclosing impl or trait, not a module on disk. Keep
+        // private associated helpers in the same graph as their public callers.
+        if let Some(member) = full_ref.strip_prefix("Self::") {
+            if let Some(caller) = raw.caller_symbol.as_deref().filter(|caller| {
+                caller_data
+                    .symbol_metadata
+                    .get(*caller)
+                    .is_some_and(|meta| meta.kind == SymbolKind::Method)
+            }) {
+                if let Some((owner, _)) = caller.rsplit_once("::") {
+                    let symbol = format!("{owner}::{member}");
+                    if index.node_for_symbol(caller_file, &symbol).is_some() {
+                        return Some((
+                            "resolved_local".to_string(),
+                            caller_file.to_string(),
+                            symbol,
+                        ));
+                    }
+                }
+            }
+        }
         if let Some((target_file, target_symbol)) =
             rust_target_for_qualified(index, caller_file, full_ref, short_name, caller_data, raw)
         {
             return Some(("resolved".to_string(), target_file, target_symbol));
         }
+        // An unresolved qualifier must not bind an unrelated unqualified import
+        // that happens to share the final function name.
+        return None;
     }
 
     // A file-level function of the caller's own file wins over imports. Rust
@@ -15586,14 +16954,14 @@ fn resolve_rust_target<I: ResolverIndex>(
     // `mod tests { use super::{..}; }`); applying it to the whole file
     // resolved ordinary same-file calls through the wrong module.
     if let Some(local) =
-        rust_unique_file_level_function(caller_file, full_ref, short_name, caller_data)
+        rust_unique_file_level_function(index, caller_file, full_ref, short_name, caller_data)
     {
         return Some(local);
     }
 
     for import in &caller_data.import_block.imports {
         if let Some((target_file, target_symbol)) =
-            rust_target_for_use(index, caller_file, import, short_name, caller_data)
+            rust_target_for_use(index, caller_file, import, short_name, caller_data, raw)
         {
             return Some(("resolved".to_string(), target_file, target_symbol));
         }
@@ -15636,7 +17004,8 @@ fn rust_macro_use_target<I: ResolverIndex>(
     None
 }
 
-fn rust_unique_file_level_function(
+fn rust_unique_file_level_function<I: ResolverIndex>(
+    index: &I,
     caller_file: &str,
     full_ref: &str,
     short_name: &str,
@@ -15647,9 +17016,7 @@ fn rust_unique_file_level_function(
     }
     // The only symbol with this unqualified name must be the file-level one
     // itself; with a same-named nested item the call could mean either.
-    let symbol =
-        callgraph::resolve_symbol_query_in_data(caller_data, Path::new(caller_file), short_name)
-            .ok()?;
+    let symbol = index.local_symbol(caller_file, caller_data, short_name)?;
     let is_file_level_function = symbol == short_name
         && caller_data
             .symbol_metadata
@@ -15693,9 +17060,10 @@ fn rust_target_for_qualified<I: ResolverIndex>(
 
         // A path that does not resolve under one reading may under another, and
         // a later alias candidate may still match, so try them all in order.
-        for module_segments in
-            rust_resolve_segment_candidates_with_index(index, caller_file, &path_refs)
-        {
+        for module_segments in rust_resolve_segment_candidates_from(
+            rust_reference_module_segments(index, caller_file, caller_data, raw),
+            &path_refs,
+        ) {
             if let Some(target) =
                 rust_inline_scoped_target(index, caller_file, &module_segments, &requested_symbol)
             {
@@ -15867,6 +17235,7 @@ fn rust_target_for_use<I: ResolverIndex>(
     import: &ImportStatement,
     short_name: &str,
     caller_data: &FileCallData,
+    raw: &RawRef,
 ) -> Option<(String, String)> {
     let imports = &caller_data.import_block.imports;
     let path = rust_use_body(&import.raw_text)
@@ -15874,6 +17243,16 @@ fn rust_target_for_use<I: ResolverIndex>(
         .trim()
         .trim_end_matches(';');
     if let Some(module) = path.strip_suffix("::*") {
+        if let Some((file, symbol)) = rust_target_for_qualified(
+            index,
+            caller_file,
+            &format!("{module}::{short_name}"),
+            short_name,
+            caller_data,
+            raw,
+        ) {
+            return index.has_export(&file, &symbol).then_some((file, symbol));
+        }
         let segments = module.split("::").collect::<Vec<_>>();
         let file = rust_use_module_file(index, caller_file, &segments, imports)?;
         let (file, symbol) =
@@ -15888,6 +17267,16 @@ fn rust_target_for_use<I: ResolverIndex>(
                 .then(|| crate::imports::specifier_imported_name(name).to_string())
         });
         if let Some(imported) = imported {
+            if let Some(target) = rust_target_for_qualified(
+                index,
+                caller_file,
+                &format!("{prefix}::{imported}"),
+                &imported,
+                caller_data,
+                raw,
+            ) {
+                return Some(target);
+            }
             let prefix_segments: Vec<&str> = prefix.split("::").collect();
             let inline_segments = prefix_segments
                 .iter()
@@ -15919,6 +17308,16 @@ fn rust_target_for_use<I: ResolverIndex>(
     }
     if segments.len() < 2 {
         return None;
+    }
+    if let Some(target) = rust_target_for_qualified(
+        index,
+        caller_file,
+        path_without_alias,
+        segments.last().copied().unwrap_or(short_name),
+        caller_data,
+        raw,
+    ) {
+        return Some(target);
     }
     let module_segments = segments[..segments.len() - 1]
         .iter()
@@ -16152,6 +17551,17 @@ fn rust_resolve_segments_with_index<I: ResolverIndex>(
 }
 
 fn rust_caller_module_segments<I: ResolverIndex>(index: &I, caller_file: &str) -> Vec<String> {
+    #[cfg(test)]
+    let _timing = rust_module_work::Timing::caller();
+    index.rust_caller_module_segments(caller_file)
+}
+
+fn rust_caller_module_segments_uncached<I: ResolverIndex + ?Sized>(
+    index: &I,
+    caller_file: &str,
+) -> Vec<String> {
+    #[cfg(test)]
+    rust_module_work::note(|work| work.caller_walks += 1);
     if index.rust_crate_root_file(caller_file).as_deref() == Some(caller_file) {
         Vec::new()
     } else {
@@ -16160,16 +17570,45 @@ fn rust_caller_module_segments<I: ResolverIndex>(index: &I, caller_file: &str) -
     }
 }
 
-/// Module paths a path's leading segments can denote, most likely first. A
-/// bare first segment (`registry::f()` inside `bash_background/mod.rs`) is, in
-/// Rust 2018, relative to the current module, so a child module is tried
-/// before the crate-relative sibling reading `rust_resolve_segments_from` uses.
-fn rust_resolve_segment_candidates_with_index<I: ResolverIndex>(
+fn rust_reference_module_segments<I: ResolverIndex>(
     index: &I,
     caller_file: &str,
+    caller_data: &FileCallData,
+    raw: &RawRef,
+) -> Vec<String> {
+    let mut modules = rust_caller_module_segments(index, caller_file);
+    let Some(caller) = raw.caller_symbol.as_deref() else {
+        return modules;
+    };
+    let mut scope = caller.split("::").collect::<Vec<_>>();
+    scope.pop();
+    if caller_data
+        .symbol_metadata
+        .get(caller)
+        .is_some_and(|meta| meta.kind == SymbolKind::Method)
+    {
+        scope.pop();
+    }
+    // Scoped names include inline modules as well as enclosing functions and
+    // impl owners. Only the module prefix changes the meaning of self/super.
+    for (position, segment) in scope.iter().enumerate() {
+        if caller_data
+            .symbol_metadata
+            .contains_key(&scope[..=position].join("::"))
+        {
+            break;
+        }
+        modules.push((*segment).to_string());
+    }
+    modules
+}
+
+/// A bare path is relative to the current module; try its child modules before
+/// the sibling-module interpretation retained for imported paths.
+fn rust_resolve_segment_candidates_from(
+    caller_segments: Vec<String>,
     segments: &[&str],
 ) -> Vec<Vec<String>> {
-    let caller_segments = rust_caller_module_segments(index, caller_file);
     let mut candidates = Vec::new();
     if segments
         .first()
@@ -16205,8 +17644,14 @@ fn rust_resolve_segments_from(
         }
         "super" => {
             let mut resolved = caller_segments;
-            resolved.pop();
-            resolved.extend(segments[1..].iter().map(|item| item.to_string()));
+            let parents = segments
+                .iter()
+                .take_while(|segment| **segment == "super")
+                .count();
+            for _ in 0..parents {
+                resolved.pop()?;
+            }
+            resolved.extend(segments[parents..].iter().map(|item| item.to_string()));
             Some(resolved)
         }
         _ => {
@@ -16218,7 +17663,7 @@ fn rust_resolve_segments_from(
     }
 }
 
-fn rust_registered_module_segments<I: ResolverIndex>(
+fn rust_registered_module_segments<I: ResolverIndex + ?Sized>(
     index: &I,
     caller_file: &str,
 ) -> Option<Vec<String>> {
@@ -16324,7 +17769,7 @@ fn rust_module_segments_for_rel(rel_path: &str) -> Vec<String> {
 }
 
 fn resolve_local_target<I: ResolverIndex>(
-    _index: &I,
+    index: &I,
     caller_file: &str,
     full_ref: &str,
     short_name: &str,
@@ -16333,8 +17778,8 @@ fn resolve_local_target<I: ResolverIndex>(
     if !callgraph::is_bare_callee(full_ref, short_name) {
         return None;
     }
-    callgraph::resolve_symbol_query_in_data(caller_data, Path::new(caller_file), short_name)
-        .ok()
+    index
+        .local_symbol(caller_file, caller_data, short_name)
         .map(|symbol| {
             (
                 "resolved_local".to_string(),
@@ -16362,7 +17807,10 @@ impl<'a> ProjectIndex<'a> {
             workspace_crate_prefixes,
             rust_crate_roots: callgraph::RustCrateRootMemo::default(),
             crate_scans: std::cell::OnceCell::new(),
+            lazy_module_parents: std::cell::OnceCell::new(),
+            rust_caller_paths: RefCell::default(),
             go_packages: RefCell::default(),
+            local_symbols: RefCell::default(),
         }
     }
 
@@ -17079,8 +18527,8 @@ impl<'stmt> ColdBuildInsertStatements<'stmt> {
             file: tx.prepare(
                 "INSERT INTO files(
                     path, content_hash, mtime_ns, size, lang, is_dead_code_root,
-                    is_public_api, surface_fingerprint, indexed_at
-                ) VALUES(?1, ?2, ?3, ?4, ?5, 0, 0, ?6, ?7)
+                    is_public_api, surface_fingerprint, indexed_at, source_identity
+                ) VALUES(?1, ?2, ?3, ?4, ?5, 0, 0, ?6, ?7, ?8)
                 ON CONFLICT(path) DO UPDATE SET
                     content_hash=excluded.content_hash,
                     mtime_ns=excluded.mtime_ns,
@@ -17089,6 +18537,7 @@ impl<'stmt> ColdBuildInsertStatements<'stmt> {
                     is_dead_code_root=excluded.is_dead_code_root,
                     is_public_api=excluded.is_public_api,
                     surface_fingerprint=excluded.surface_fingerprint,
+                    source_identity=excluded.source_identity,
                     indexed_at=excluded.indexed_at
                 WHERE content_hash IS NOT excluded.content_hash
                    OR mtime_ns IS NOT excluded.mtime_ns
@@ -17096,14 +18545,15 @@ impl<'stmt> ColdBuildInsertStatements<'stmt> {
                    OR lang IS NOT excluded.lang
                    OR is_dead_code_root IS NOT excluded.is_dead_code_root
                    OR is_public_api IS NOT excluded.is_public_api
-                   OR surface_fingerprint IS NOT excluded.surface_fingerprint",
+                   OR surface_fingerprint IS NOT excluded.surface_fingerprint
+                   OR source_identity IS NOT excluded.source_identity",
             )?,
             node: tx.prepare(
                 "INSERT INTO nodes(
                     id, file_path, name, scoped_name, kind, start_line, start_col,
                     end_line, end_col, range_ordinal, signature, exported,
-                    is_default_export, is_type_like, is_callgraph_entry_point, provenance
-                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                    is_default_export, is_type_like, is_callgraph_entry_point, provenance, is_test
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
                 ON CONFLICT(id) DO UPDATE SET
                     file_path=excluded.file_path,
                     name=excluded.name,
@@ -17119,7 +18569,8 @@ impl<'stmt> ColdBuildInsertStatements<'stmt> {
                     is_default_export=excluded.is_default_export,
                     is_type_like=excluded.is_type_like,
                     is_callgraph_entry_point=excluded.is_callgraph_entry_point,
-                    provenance=excluded.provenance
+                    provenance=excluded.provenance,
+                    is_test=excluded.is_test
                 WHERE file_path IS NOT excluded.file_path
                    OR name IS NOT excluded.name
                    OR scoped_name IS NOT excluded.scoped_name
@@ -17134,6 +18585,7 @@ impl<'stmt> ColdBuildInsertStatements<'stmt> {
                    OR is_default_export IS NOT excluded.is_default_export
                    OR is_type_like IS NOT excluded.is_type_like
                    OR is_callgraph_entry_point IS NOT excluded.is_callgraph_entry_point
+                   OR is_test IS NOT excluded.is_test
                    OR provenance IS NOT excluded.provenance",
             )?,
             file_dependency: tx.prepare(
@@ -17259,6 +18711,7 @@ fn insert_file_graph_rows_prepared(
         lang_label(extract.lang),
         extract.surface_fingerprint,
         unix_seconds_now(),
+        extract.source_identity,
     ])?;
     for node in &extract.nodes {
         statements.node.execute(params![
@@ -17278,6 +18731,7 @@ fn insert_file_graph_rows_prepared(
             bool_int(node.is_type_like),
             bool_int(node.is_callgraph_entry_point),
             PROVENANCE_TREESITTER,
+            node.is_test.map(bool_int),
         ])?;
     }
 
@@ -17642,8 +19096,8 @@ fn insert_file_extract(
     tx.execute(
         "INSERT OR REPLACE INTO files(
             path, content_hash, mtime_ns, size, lang, is_dead_code_root,
-            is_public_api, surface_fingerprint, indexed_at
-        ) VALUES(?1, ?2, ?3, ?4, ?5, 0, 0, ?6, ?7)",
+            is_public_api, surface_fingerprint, indexed_at, source_identity
+        ) VALUES(?1, ?2, ?3, ?4, ?5, 0, 0, ?6, ?7, ?8)",
         params![
             extract.rel_path,
             hash_to_hex(extract.freshness.content_hash),
@@ -17652,6 +19106,7 @@ fn insert_file_extract(
             lang_label(extract.lang),
             extract.surface_fingerprint,
             unix_seconds_now(),
+            extract.source_identity,
         ],
     )?;
     for node in &extract.nodes {
@@ -17659,8 +19114,8 @@ fn insert_file_extract(
             "INSERT OR REPLACE INTO nodes(
                 id, file_path, name, scoped_name, kind, start_line, start_col,
                 end_line, end_col, range_ordinal, signature, exported,
-                is_default_export, is_type_like, is_callgraph_entry_point, provenance
-            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                is_default_export, is_type_like, is_callgraph_entry_point, provenance, is_test
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 node.id,
                 node.file_path,
@@ -17678,6 +19133,7 @@ fn insert_file_extract(
                 bool_int(node.is_type_like),
                 bool_int(node.is_callgraph_entry_point),
                 PROVENANCE_TREESITTER,
+                node.is_test.map(bool_int),
             ],
         )?;
     }
@@ -17730,7 +19186,7 @@ fn insert_file_dependencies(
 }
 
 fn ref_provenance(raw: &RawRef) -> &'static str {
-    if raw.kind == "value_ref" {
+    if matches!(raw.kind.as_str(), "value_ref" | "callback_ref") {
         PROVENANCE_VALUE_REF
     } else {
         PROVENANCE_TREESITTER
@@ -20106,7 +21562,14 @@ fn backend_file_paths_with_status(
         .map_err(Into::into)
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static STALE_PATH_CENSUS_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn stale_path_census(conn: &Connection, project_root: &Path) -> Result<StalePathCensus> {
+    #[cfg(test)]
+    STALE_PATH_CENSUS_BUILDS.with(|builds| builds.set(builds.get() + 1));
     let mut census = StalePathCensus {
         undecodable: backend_file_paths_with_status(
             conn,
@@ -20185,12 +21648,13 @@ fn clear_stale_backend_status_for_file(
 
 fn load_file_row(conn: &Connection, rel_path: &str) -> Result<Option<FileRow>> {
     conn.prepare_cached(
-        "SELECT surface_fingerprint, content_hash, mtime_ns, size FROM files WHERE path = ?1",
+        "SELECT surface_fingerprint, content_hash, mtime_ns, size, source_identity FROM files WHERE path = ?1",
     )?
     .query_row(params![rel_path], |row| {
         let hash_text: String = row.get(1)?;
         Ok(FileRow {
             surface_fingerprint: row.get(0)?,
+            source_identity: row.get(4)?,
             freshness: FileFreshness {
                 content_hash: hash_from_hex(&hash_text).unwrap_or_else(cache_freshness::zero_hash),
                 mtime: ns_to_system_time(row.get::<_, i64>(2)?),
@@ -20248,7 +21712,7 @@ fn stored_extract_matches(
     let mut stored_nodes_stmt = tx.prepare_cached(
         "SELECT id, file_path, name, scoped_name, kind, start_line, start_col,
                 end_line, end_col, range_ordinal, signature, exported,
-                is_default_export, is_type_like, is_callgraph_entry_point, provenance
+                is_default_export, is_type_like, is_callgraph_entry_point, provenance, is_test
          FROM nodes WHERE file_path = ?1",
     )?;
     let stored_nodes = stored_nodes_stmt
@@ -20270,6 +21734,7 @@ fn stored_extract_matches(
                 row.get::<_, i64>(13)?,
                 row.get::<_, i64>(14)?,
                 row.get::<_, String>(15)?,
+                row.get::<_, Option<i64>>(16)?,
             ])
             .to_string())
         })?
@@ -20295,6 +21760,7 @@ fn stored_extract_matches(
                 bool_int(node.is_type_like),
                 bool_int(node.is_callgraph_entry_point),
                 PROVENANCE_TREESITTER,
+                node.is_test.map(bool_int),
             ])
             .to_string()
         })
@@ -20497,9 +21963,10 @@ fn update_file_fresh_metadata(
     hash: &blake3::Hash,
     mtime: SystemTime,
     size: u64,
+    source_identity: Option<&str>,
 ) -> Result<()> {
     tx.prepare_cached(
-        "UPDATE files SET content_hash = ?2, mtime_ns = ?3, size = ?4, indexed_at = ?5
+        "UPDATE files SET content_hash = ?2, mtime_ns = ?3, size = ?4, indexed_at = ?5, source_identity = ?6
          WHERE path = ?1",
     )?
     .execute(params![
@@ -20508,6 +21975,7 @@ fn update_file_fresh_metadata(
         system_time_to_ns(mtime),
         size as i64,
         unix_seconds_now()
+        ,source_identity
     ])?;
     tx.prepare_cached(
         "UPDATE backend_file_state SET content_hash = ?3, status = 'fresh', updated_at = ?5
@@ -20585,7 +22053,10 @@ fn ref_ids_depending_on(
                 // Only calls and value references resolve to a target. The
                 // other refs of an importer (imports, re-exports, module
                 // declarations) resolve the same whatever the file defines.
-                if !matches!(row.kind.as_str(), "call" | "value_ref") {
+                if !matches!(
+                    row.kind.as_str(),
+                    "call" | "construction" | "callback_ref" | "value_ref"
+                ) {
                     continue;
                 }
                 let name = short_name.as_deref().map(callee_last_segment);
@@ -21043,14 +22514,14 @@ fn reexport_consumer_refs(
     )?;
     let mut calls_of = conn.prepare_cached(
         "SELECT ref_id, short_name FROM refs
-         WHERE caller_file = ?1 AND kind IN ('call', 'value_ref')",
+         WHERE caller_file = ?1 AND kind IN ('call', 'construction', 'callback_ref', 'value_ref')",
     )?;
     // Fully qualified Rust calls (`crate::git::clone()`) reach a barrel without
     // any import row; when the barrel cannot place the name they are stored
     // as resolved to the barrel itself.
     let mut resolved_to = conn.prepare_cached(
         "SELECT ref_id, caller_file, short_name FROM refs
-         WHERE target_file = ?1 AND kind IN ('call', 'value_ref')",
+         WHERE target_file = ?1 AND kind IN ('call', 'construction', 'callback_ref', 'value_ref')",
     )?;
     for (barrel, names) in &barrels {
         let resolved = resolved_to
@@ -22040,7 +23511,7 @@ fn ref_dependency_row_depends_on(
         // A call or value reference in a file that imports `rel_path` can bind
         // to it even when its stored state points elsewhere or nowhere (a value
         // reference only resolves once its target is callable).
-        "call" | "value_ref" => true,
+        "call" | "construction" | "callback_ref" | "value_ref" => true,
         "import" | "reexport" => row.module_path.as_deref().is_some_and(|module_path| {
             module_ref_can_name(project_root, &row.caller_file, module_path, rel_path, memo)
         }),
@@ -22815,14 +24286,18 @@ fn bool_int(value: bool) -> i64 {
 }
 
 fn system_time_to_ns(time: SystemTime) -> i64 {
-    time.duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .min(i64::MAX as u128) as i64
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_nanos().min(i64::MAX as u128) as i64,
+        Err(error) => -(error.duration().as_nanos().min(i64::MAX as u128) as i64),
+    }
 }
 
 fn ns_to_system_time(value: i64) -> SystemTime {
-    UNIX_EPOCH + Duration::from_nanos(value.max(0) as u64)
+    if value >= 0 {
+        UNIX_EPOCH + Duration::from_nanos(value as u64)
+    } else {
+        UNIX_EPOCH - Duration::from_nanos(value.unsigned_abs())
+    }
 }
 
 pub(crate) fn unix_millis_now() -> u64 {
@@ -22949,7 +24424,7 @@ mod refresh_worker_tests {
                 "INSERT INTO nodes SELECT 'positional-target', file_path, name, scoped_name, kind,
                  start_line + 100, start_col, end_line + 100, end_col, range_ordinal,
                  signature, exported, is_default_export, is_type_like, is_callgraph_entry_point,
-                 provenance FROM nodes WHERE name = 'old_leaf';",
+                  provenance, is_test FROM nodes WHERE name = 'old_leaf';",
             )
             .unwrap();
         }
@@ -23353,6 +24828,32 @@ mod refresh_worker_tests {
     }
 
     #[test]
+    fn directory_readiness_hint_detects_publication_while_writer_lease_is_live() {
+        let temp = tempfile::tempdir().unwrap();
+        let pointer = temp.path().join("key.current");
+        let lease = temp.path().join("writer.lease");
+        fs::write(&pointer, "old.sqlite\n").unwrap();
+        fs::write(&lease, "live writer").unwrap();
+        let mut known = fs::read_to_string(&pointer).ok();
+        let event = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Any))
+            .add_path(temp.path().to_path_buf());
+        assert!(!refresh_pointer_publication_event(
+            &event, &pointer, &mut known
+        ));
+        fs::write(&pointer, "new.sqlite\n").unwrap();
+        assert!(refresh_pointer_publication_event(
+            &event, &pointer, &mut known
+        ));
+        assert!(
+            !refresh_lease_release_event(&event, &lease),
+            "publication is not lease release"
+        );
+        assert!(!refresh_pointer_publication_event(
+            &event, &pointer, &mut known
+        ));
+    }
+
+    #[test]
     fn sibling_write_signals_released_lease_but_not_live_writer() {
         use notify::{
             event::{DataChange, ModifyKind},
@@ -23369,9 +24870,35 @@ mod refresh_worker_tests {
         let access = Event::new(EventKind::Access(notify::event::AccessKind::Any))
             .add_path(temp.path().join("generation.sqlite-shm"));
         assert!(!refresh_lease_release_event(&access, &lease));
+        let coarse = Event::new(EventKind::Any).add_path(temp.path().join("writer.lease"));
+        assert!(refresh_lease_release_event(&coarse, &lease));
+        fs::write(&lease, b"live writer").unwrap();
+        assert!(!refresh_lease_release_event(&coarse, &lease));
         let unrelated = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
             .add_path(temp.path().join("another-cache/generation.sqlite-shm"));
         assert!(!refresh_lease_release_event(&unrelated, &lease));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn aliased_directory_activity_signals_release_without_waking_a_live_holder() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("cache");
+        fs::create_dir(&directory).unwrap();
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&directory, &alias).unwrap();
+        let lease = directory.join("writer.lease");
+        fs::write(&lease, b"live").unwrap();
+        let directory_event =
+            notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Any))
+                .add_path(alias.clone());
+        assert!(!refresh_lease_release_event(&directory_event, &lease));
+        fs::remove_file(&lease).unwrap();
+        assert!(refresh_lease_release_event(&directory_event, &lease));
+        let removed =
+            notify::Event::new(notify::EventKind::Remove(notify::event::RemoveKind::File))
+                .add_path(alias.join("writer.lease"));
+        assert!(refresh_lease_release_event(&removed, &lease));
     }
 
     #[test]
@@ -23466,6 +24993,52 @@ mod refresh_worker_tests {
     struct ForeignRefreshWriter {
         child: std::process::Child,
         killed: bool,
+        output: crossbeam_channel::Receiver<std::result::Result<String, String>>,
+        tail: VecDeque<String>,
+    }
+
+    fn wait_for_foreign_writer_marker(
+        output: &crossbeam_channel::Receiver<std::result::Result<String, String>>,
+        tail: &mut VecDeque<String>,
+        marker: &str,
+        budget: Duration,
+    ) -> std::result::Result<(), String> {
+        let deadline = Instant::now() + budget;
+        loop {
+            match output.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(Ok(line)) => {
+                    let ready = line.trim() == marker;
+                    if tail.len() == 32 {
+                        tail.pop_front();
+                    }
+                    tail.push_back(line);
+                    if ready {
+                        return Ok(());
+                    }
+                }
+                Ok(Err(error)) => {
+                    return Err(format!("waiting for {marker}: {error}; stdout={tail:?}"))
+                }
+                Err(error) => {
+                    return Err(format!("waiting for {marker}: {error}; stdout={tail:?}"))
+                }
+            }
+        }
+    }
+
+    fn foreign_writer_exit_before(
+        child: &mut std::process::Child,
+        budget: Duration,
+    ) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + budget;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Err(error) => panic!("foreign writer {} exit status failed: {error}", child.id()),
+                Ok(None) if Instant::now() >= deadline => return None,
+                Ok(None) => std::thread::park_timeout(Duration::from_millis(5)),
+            }
+        }
     }
 
     impl ForeignRefreshWriter {
@@ -23484,53 +25057,107 @@ mod refresh_worker_tests {
                 .stdout(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
-            let mut output = std::io::BufReader::new(child.stdout.as_mut().unwrap());
-            let mut line = String::new();
-            loop {
-                assert!(
-                    output.read_line(&mut line).unwrap() > 0,
-                    "writer exited before acquiring lease"
-                );
-                if line.trim() == "writer-ready" {
-                    break;
+            let stdout = child.stdout.take().unwrap();
+            let (send, output) = crossbeam_channel::unbounded();
+            // A blocking pipe read belongs on a drain thread, not on the test
+            // thread whose marker deadline must still fire if the child stalls.
+            std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stdout).lines() {
+                    if send.send(line.map_err(|error| error.to_string())).is_err() {
+                        return;
+                    }
                 }
-                line.clear();
-            }
-            Self {
+                let _ = send.send(Err("child stdout closed".into()));
+            });
+            let mut writer = Self {
                 child,
                 killed: false,
+                output,
+                tail: VecDeque::new(),
+            };
+            writer.wait_for_marker("writer-ready");
+            writer
+        }
+
+        fn wait_for_marker(&mut self, marker: &str) {
+            if let Err(error) = wait_for_foreign_writer_marker(
+                &self.output,
+                &mut self.tail,
+                marker,
+                Duration::from_secs(30),
+            ) {
+                let status = self.child.try_wait();
+                let _ = self.child.kill();
+                self.killed = true;
+                let reaped = foreign_writer_exit_before(&mut self.child, Duration::from_secs(5));
+                panic!("foreign writer {} protocol failed: {error}; status={status:?}; reaped={reaped:?}", self.child.id());
             }
         }
 
         fn kill(&mut self) {
             self.child.kill().unwrap();
-            assert!(!self.child.wait().unwrap().success());
             self.killed = true;
+            let status = foreign_writer_exit_before(&mut self.child, Duration::from_secs(5))
+                .expect("killed foreign writer was not reaped before its deadline");
+            assert!(!status.success());
         }
 
         fn publish(&mut self) {
-            use std::io::{BufRead, Write};
+            use std::io::Write;
             self.child.stdin.as_mut().unwrap().write_all(b"p").unwrap();
-            let mut output = std::io::BufReader::new(self.child.stdout.as_mut().unwrap());
-            let mut line = String::new();
-            loop {
-                assert!(
-                    output.read_line(&mut line).unwrap() > 0,
-                    "writer exited before publishing"
-                );
-                if line.trim() == "published-ready" {
-                    break;
-                }
-                line.clear();
-            }
+            self.wait_for_marker("published-ready");
         }
     }
 
     impl Drop for ForeignRefreshWriter {
         fn drop(&mut self) {
             drop(self.child.stdin.take());
-            assert!(self.killed || self.child.wait().unwrap().success());
+            let status = foreign_writer_exit_before(&mut self.child, Duration::from_secs(30));
+            if status.is_none() {
+                let _ = self.child.kill();
+                let reaped = foreign_writer_exit_before(&mut self.child, Duration::from_secs(5));
+                if !std::thread::panicking() {
+                    panic!("foreign writer {} did not exit before deadline; reaped={reaped:?}; stdout={:?}", self.child.id(), self.tail);
+                }
+            } else if !self.killed && !std::thread::panicking() {
+                assert!(
+                    status.unwrap().success(),
+                    "foreign writer failed; stdout={:?}",
+                    self.tail
+                );
+            }
         }
+    }
+
+    #[test]
+    fn foreign_writer_marker_deadline_reports_captured_output() {
+        let (send, receive) = crossbeam_channel::unbounded();
+        send.send(Ok("child diagnostic".to_string())).unwrap();
+        let mut tail = VecDeque::new();
+        let error =
+            wait_for_foreign_writer_marker(&receive, &mut tail, "writer-ready", Duration::ZERO)
+                .unwrap_err();
+        assert!(
+            error.contains("writer-ready") && error.contains("child diagnostic"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn foreign_writer_marker_accepts_ready_and_reports_eof() {
+        let (send, receive) = crossbeam_channel::unbounded();
+        send.send(Ok("writer-ready".to_string())).unwrap();
+        let mut tail = VecDeque::new();
+        wait_for_foreign_writer_marker(&receive, &mut tail, "writer-ready", Duration::ZERO)
+            .unwrap();
+        send.send(Err("child stdout closed".into())).unwrap();
+        let error =
+            wait_for_foreign_writer_marker(&receive, &mut tail, "published-ready", Duration::ZERO)
+                .unwrap_err();
+        assert!(
+            error.contains("published-ready") && error.contains("child stdout closed"),
+            "{error}"
+        );
     }
 
     fn run_refresh_fallback_probe(worker: &CallgraphRefreshTestWorker) {
@@ -24261,9 +25888,10 @@ mod refresh_worker_tests {
         idle_writer_rx
             .recv_timeout(Duration::from_secs(12))
             .unwrap();
-        assert!(CallGraphStore::open_readonly(dir.clone(), root.clone())
-            .unwrap()
-            .is_none());
+        assert!(
+            matches!(CallGraphStore::open_readonly(dir.clone(), root.clone()),
+            Err(error) if error.is_transient_lock_contention())
+        );
         // Queue idle proves the replay committed, not that idle maintenance has
         // closed its writer. Request readers deliberately fail fast on a locked
         // generation, so join this fixture's worker before asserting a fresh open.
@@ -25508,6 +27136,97 @@ mod cold_build_insert_tests {
             sqlite_readonly_uri(Path::new(r"\\?\C:\Users\name with spaces\db#1.sqlite")),
             "file:///%5C%5C%3F%5CC:%5CUsers%5Cname%20with%20spaces%5Cdb%231.sqlite?mode=ro"
         );
+    }
+
+    /// Read-only stores are opened through a `file:` URI. That URI must not be
+    /// mistaken for a filesystem path by the cache-location checks: on Windows
+    /// such a "path" is an invalid name (os error 123), so every call-graph
+    /// read failed while builds kept succeeding. The temp folder is used as
+    /// given (Windows runners often hand out an 8.3 `RUNNER~1` spelling), and
+    /// also resolved, which on Windows is a verbatim `\\?\` path.
+    #[test]
+    fn readonly_store_opens_through_its_uri_under_plain_and_resolved_temp_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let resolved = std::fs::canonicalize(temp.path()).unwrap();
+        for (index, base) in [temp.path().to_path_buf(), resolved].iter().enumerate() {
+            let path = base
+                .join("callgraph")
+                .join(format!("readonly-probe-{index}.sqlite"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            Connection::open(&path)
+                .unwrap()
+                .execute_batch("CREATE TABLE probe(value INTEGER); INSERT INTO probe VALUES (7);")
+                .unwrap();
+            let conn = open_readonly_connection(&path).unwrap_or_else(|error| {
+                panic!("read-only open of {} failed: {error}", path.display())
+            });
+            let value: i64 = conn
+                .query_row("SELECT value FROM probe", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(value, 7, "read the store at {}", path.display());
+        }
+    }
+
+    /// A URI open is checked against the file it names, not waved through:
+    /// a writable open of a cache database on durable storage whose cache
+    /// location is unknown is refused whether the name is a path or a URI.
+    #[test]
+    fn uri_open_gets_the_same_durable_cache_refusal_as_its_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config {
+            storage_dir: Some(temp.path().join("storage")),
+            cache_config_unknown: Some("unreadable test configuration".into()),
+            ..crate::config::Config::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root(&mut config).is_some());
+        let storage = crate::bash_background::storage_dir(config.storage_dir.as_deref());
+        let path = storage.join("callgraph").join("uri-refusal-probe.sqlite");
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE;
+        let refusal = "cache_write_on_durable_storage";
+        let plain = crate::private_storage::prepare_sqlite(&path, flags)
+            .expect_err("a plain path to a durable cache database is refused");
+        assert!(plain.to_string().contains(refusal), "{plain}");
+        let uri = sqlite_readonly_uri(&path);
+        let through_uri = crate::private_storage::prepare_sqlite(
+            Path::new(&uri),
+            flags | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .expect_err("the same database named by a URI is refused too");
+        assert!(through_uri.to_string().contains(refusal), "{through_uri}");
+        assert!(!path.exists(), "no refused database was created");
+    }
+
+    /// A store under a `storage.cache_dir` root whose path is longer than the
+    /// classic Windows limit still opens read-only. On Windows its URI names
+    /// the long-path (`\\?\`) spelling SQLite needs, and the cache-location
+    /// checks must admit that spelling of a path inside the prepared cache
+    /// root. Elsewhere the path is used as it is.
+    #[test]
+    fn readonly_store_opens_past_the_windows_path_limit_under_a_cache_root() {
+        let storage = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config {
+            storage_dir: Some(storage.path().to_path_buf()),
+            cache_dir: Some(cache.path().to_path_buf()),
+            ..crate::config::Config::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        let mut dir = crate::root_cache::cache_root(&config).join("callgraph");
+        while dir.as_os_str().len() < 300 {
+            dir = dir.join("long-path-segment-0123456789");
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("readonly-probe.sqlite");
+        Connection::open(crate::db::lifecycle::sqlite_open_path(&path))
+            .unwrap()
+            .execute_batch("CREATE TABLE probe(value INTEGER); INSERT INTO probe VALUES (7);")
+            .unwrap();
+        let conn = open_readonly_connection(&path)
+            .unwrap_or_else(|error| panic!("read-only open of {} failed: {error}", path.display()));
+        let value: i64 = conn
+            .query_row("SELECT value FROM probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 7);
     }
 
     #[test]
@@ -27783,6 +29502,7 @@ export function leaf() {}
         let rel_path = "src/main.ts".to_string();
         let target_path = "src/helper.ts".to_string();
         let node = NodeRecord {
+            is_test: Some(false),
             id: "node-main".to_string(),
             file_path: rel_path.clone(),
             name: "main".to_string(),
@@ -27824,6 +29544,7 @@ export function leaf() {}
         };
         FileExtract {
             rel_path,
+            source_identity: None,
             freshness: FileFreshness {
                 mtime: UNIX_EPOCH + Duration::from_secs(123),
                 size: 40,
@@ -28247,6 +29968,263 @@ pub fn handle_{name}(ctx: &AppContext) -> usize {{
             });
         }
         Ok(values.join("\u{1f}"))
+    }
+}
+
+#[cfg(test)]
+mod rust_use_parser_tests {
+    use super::*;
+
+    fn import(raw_text: &str) -> ImportStatement {
+        ImportStatement {
+            module_path: String::new(),
+            names: Vec::new(),
+            default_import: Some("pub".to_string()),
+            namespace_import: None,
+            kind: ImportKind::Value,
+            group: ImportGroup::Internal,
+            byte_range: 0..raw_text.len(),
+            raw_text: raw_text.to_string(),
+            form: ImportForm::RustUse {
+                visibility: Some("pub".to_string()),
+                named: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn rust_reexport_rejects_close_before_unclosed_group() {
+        let raw_text = format!("pub use macro! {{}} {}::{{name;", "長".repeat(180));
+        assert!(raw_text.len() > 541);
+        assert_eq!(rust_pub_use_reexport_parts(&import(&raw_text)), None);
+    }
+
+    // Frozen pre-fix implementation: valid use declarations must retain their
+    // existing extraction output, even when the text parser is imperfect.
+    fn old_rust_pub_use_reexport_parts(
+        import: &ImportStatement,
+    ) -> Option<(String, HashMap<String, String>, bool)> {
+        let body = rust_use_body(&import.raw_text).unwrap_or(import.module_path.as_str());
+        let body = body.trim();
+        if let Some(module_path) = body.strip_suffix("::*") {
+            return Some((module_path.trim().to_string(), HashMap::new(), true));
+        }
+
+        if let Some(brace_start) = body.find("::{") {
+            let module_path = body[..brace_start].trim().to_string();
+            let names = rust_reexport_names_from_specs(&body[brace_start + 3..body.rfind('}')?]);
+            if names.is_empty() {
+                return None;
+            }
+            return Some((module_path, names, false));
+        }
+
+        let (module_path, spec) = body.rsplit_once("::")?;
+        let names = rust_reexport_names_from_specs(spec);
+        if names.is_empty() {
+            return None;
+        }
+        Some((module_path.trim().to_string(), names, false))
+    }
+
+    #[test]
+    fn rust_reexport_rejects_unclosed_groups() {
+        for raw_text in [
+            "pub use a::{",
+            "pub use a::{b, c;",
+            "pub use a::{b::{c, d};",
+            "pub use a::{b /* } */;",
+            "pub use a::{b // }\n;",
+            "pub use a::{b /* nested /* } */ } */;",
+        ] {
+            assert_eq!(
+                rust_pub_use_reexport_parts(&import(raw_text)),
+                None,
+                "{raw_text}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_reexport_preserves_nested_groups_and_unicode() {
+        let nested = rust_pub_use_reexport_parts(&import("pub use a::{b::{c, d}, e};"));
+        assert_eq!(
+            nested,
+            Some((
+                "a".into(),
+                [
+                    ("b::{c".into(), "b::{c".into()),
+                    ("d}".into(), "d}".into()),
+                    ("e".into(), "e".into())
+                ]
+                .into_iter()
+                .collect(),
+                false,
+            ))
+        );
+        let unicode = rust_pub_use_reexport_parts(&import("pub use 長::道::{名 as 別名, café};"));
+        assert_eq!(
+            unicode,
+            Some((
+                "長::道".into(),
+                [("別名".into(), "名".into()), ("café".into(), "café".into())]
+                    .into_iter()
+                    .collect(),
+                false
+            ))
+        );
+    }
+
+    #[test]
+    fn rust_use_group_matching_ignores_comments_and_literals() {
+        for specs in [
+            "b::{c, d}, e",
+            "b /* } { /* } */ } */",
+            "b // } {\n, c",
+            r#"m!("} {", "escaped \" }", b"}", c"{")"#,
+            r####"m!(r"}", r###"}"# {"###, br#"}"#, cr#"{"#)"####,
+            r#"m!('}', '{', '\'', '\\', '\u{7d}', '長', 'a)"#,
+        ] {
+            let body = format!("a::{{{specs}}} trailing {{}}");
+            assert_eq!(rust_use_group_close(&body), Some(4 + specs.len()), "{body}");
+            let unclosed = format!("pub use a::{{{specs};");
+            assert_eq!(
+                rust_pub_use_reexport_parts(&import(&unclosed)),
+                None,
+                "{unclosed}"
+            );
+        }
+        for raw_text in [
+            "pub use a::{m!(\"}\");",
+            "pub use a::{m!(\"unterminated }",
+            "pub use a::{m!(r###\"unterminated }\"##);",
+            "pub use a::{b /* unterminated }",
+            "pub use a /* ::{b} */ ::c;",
+            "pub use macro!(\"::{b}\");",
+        ] {
+            assert_eq!(
+                rust_pub_use_reexport_parts(&import(raw_text)),
+                None,
+                "{raw_text}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_reexport_preserves_legacy_comment_ranges() {
+        // These imperfect names are kept for output compatibility. Correct them
+        // at the next planned extraction output version bump, not in a panic fix.
+        for (raw_text, module, name) in [
+            ("pub use a::{b} /* } */;", "a", "b} /*"),
+            ("pub use a /* ::{ */ ::{b};", "a /*", "*/ ::{b"),
+        ] {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_rust::LANGUAGE.into())
+                .unwrap();
+            let tree = parser.parse(raw_text, None).unwrap();
+            assert!(!tree.root_node().has_error(), "{raw_text}");
+            let node = tree.root_node().named_child(0).unwrap();
+            let parsed = rust_import_from_use_node(raw_text, node).unwrap();
+            assert_eq!(parsed.raw_text, raw_text);
+            assert_eq!(
+                rust_pub_use_reexport_parts(&parsed),
+                Some((
+                    module.into(),
+                    [(name.into(), name.into())].into_iter().collect(),
+                    false
+                ))
+            );
+            assert_eq!(
+                rust_pub_use_reexport_parts(&parsed),
+                old_rust_pub_use_reexport_parts(&parsed)
+            );
+        }
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn pick<'a>(&mut self, choices: &'a [&'a str]) -> &'a str {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            choices[(self.0 % choices.len() as u64) as usize]
+        }
+    }
+
+    fn generated_use_spec(rng: &mut Rng, depth: usize) -> String {
+        let name = rng.pick(&["b", "名", "café", "r#type", "long_name"]);
+        match rng.pick(&["plain", "alias", "nested", "comment"]) {
+            "alias" => format!("{name} as {}", rng.pick(&["別名", "renamed", "r#match"])),
+            "nested" if depth > 0 => format!(
+                "{name}::{{{}, {}}}",
+                generated_use_spec(rng, depth - 1),
+                generated_use_spec(rng, depth - 1)
+            ),
+            "comment" => format!(
+                "{name} /* {} */",
+                rng.pick(&["}", "{", "/* } */", "\"::{\"", "長"])
+            ),
+            _ => name.to_string(),
+        }
+    }
+
+    #[test]
+    fn rust_use_generated_inputs_never_panic_and_preserve_well_formed_output() {
+        let mut rng = Rng(0x937a_b501_4cdf_628e);
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        for _ in 0..4096 {
+            let prefix = rng.pick(&["a", "長::道", "crate::r#type", "::外部"]);
+            let spec = generated_use_spec(&mut rng, 3);
+            let gap = rng.pick(&["", " /* ::{ */", " /* } */"]);
+            let suffix = rng.pick(&["", " /* } */", " /* { */", " // }\n"]);
+            let body = match rng.pick(&["group", "named", "wildcard"]) {
+                "named" => format!("{prefix}::{spec}"),
+                "wildcard" => format!("{prefix}::*"),
+                _ => format!("{prefix}{gap}::{{{spec}, self,}}{suffix}"),
+            };
+            let raw_text = format!(
+                "{}use {body};",
+                rng.pick(&["pub ", "pub(crate) ", "pub(super) ", ""])
+            );
+            let parsed = import(&raw_text);
+            assert!(
+                !parser
+                    .parse(&raw_text, None)
+                    .unwrap()
+                    .root_node()
+                    .has_error(),
+                "{raw_text}"
+            );
+            assert_eq!(
+                rust_pub_use_reexport_parts(&parsed),
+                old_rust_pub_use_reexport_parts(&parsed),
+                "{raw_text}"
+            );
+
+            let mut malformed = format!("pub use {body}");
+            for _ in 0..12 {
+                malformed.push_str(rng.pick(&[
+                    "::{", "}", "{", ";", "'", "\"", "\\", "/*", "*/", "//", "\n", "名", "🦀",
+                    " as ", "r###\"", "#", ",",
+                ]));
+            }
+            let result = std::panic::catch_unwind(|| {
+                let parsed = import(&malformed);
+                rust_use_body(&malformed);
+                rust_use_visibility(&malformed);
+                rust_use_list_names(&malformed);
+                rust_reexport_names_from_specs(&malformed);
+                quoted_module_path(&malformed);
+                parse_reexport_names(&malformed);
+                rust_pub_use_reexport_parts(&parsed);
+            });
+            assert!(result.is_ok(), "{malformed}");
+        }
     }
 }
 
@@ -28931,7 +30909,7 @@ edition = "2021"
             .lock()
             .unwrap()
             .query_row(
-                "SELECT status FROM refs WHERE kind='value_ref' AND full_ref='GoGetHandler'",
+                "SELECT status FROM refs WHERE kind='callback_ref' AND full_ref='GoGetHandler'",
                 [],
                 |row| row.get(0),
             )
@@ -30248,6 +32226,7 @@ mod crate_scan_memo_tests {
     //! order, and show that a changed file set (a new index) never reuses an
     //! earlier index's answers.
     use super::*;
+    use std::fs;
 
     fn rust_file(declared: &[(&str, &str)], scoped: &[&str]) -> DbFileIndex {
         let mut index = DbFileIndex::empty(Some(LangId::Rust));
@@ -30314,6 +32293,100 @@ mod crate_scan_memo_tests {
         path.iter().map(|segment| segment.to_string()).collect()
     }
 
+    fn copy_rust_corpus(from: &Path, to: &Path, files: &mut Vec<PathBuf>) {
+        fs::create_dir_all(to).unwrap();
+        let mut entries = fs::read_dir(from)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        entries.sort();
+        for source in entries {
+            let name = source.file_name().unwrap();
+            if source.is_dir() {
+                if name != "target" && name != ".git" {
+                    copy_rust_corpus(&source, &to.join(name), files);
+                }
+            } else if source.extension().is_some_and(|ext| ext == "rs") {
+                let destination = to.join(name);
+                fs::copy(&source, &destination).unwrap();
+                files.push(destination);
+            } else if name == "Cargo.toml" {
+                fs::copy(&source, to.join(name)).unwrap();
+            }
+        }
+    }
+
+    /// Compare identical source inventories and edits, including every stored
+    /// edge column, without changing the checkout being measured.
+    #[test]
+    #[ignore]
+    fn bench_rust_module_paths_whole_crate_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("corpus");
+        let mut files = Vec::new();
+        copy_rust_corpus(Path::new(env!("CARGO_MANIFEST_DIR")), &root, &mut files);
+        assert!(
+            files.len() > 500,
+            "benchmark must cover the whole Rust crate"
+        );
+        eprintln!("RUST_MODULE_PATHS inventory_files={}", files.len());
+        let changed = root.join("src/callgraph_store/mod.rs");
+        let original = fs::read_to_string(&changed).unwrap();
+        let mut baseline = None;
+        for disabled in [true, false] {
+            fs::write(&changed, &original).unwrap();
+            let store = CallGraphStore::open(
+                dir.path().join(if disabled { "baseline" } else { "memo" }),
+                root.clone(),
+            )
+            .unwrap();
+            eprintln!("RUST_MODULE_PATHS disabled={disabled} starting cold build");
+            set_cold_build_phase_observer(Some(Arc::new(move |phase| {
+                eprintln!("RUST_MODULE_PATHS disabled={disabled} cold_phase={phase}");
+            })));
+            let session = rust_module_work::Session::start(disabled);
+            let stats = store.cold_build(&files).unwrap();
+            let cold_work = session.finish();
+            set_cold_build_phase_observer(None);
+            eprintln!("RUST_MODULE_PATHS disabled={disabled} cold_ms={} files={} failed_files={} undecodable_files={}", stats.elapsed_ms, stats.files, stats.failed_files.len(), stats.undecodable_files.len());
+            let cold_edges = cold_build_insert_tests::graph_table_rows(&store, "edges");
+            fs::write(
+                &changed,
+                format!("{original}\npub fn aft_module_path_refresh_probe() {{}}\n"),
+            )
+            .unwrap();
+            eprintln!("RUST_MODULE_PATHS disabled={disabled} starting refresh");
+            let session = rust_module_work::Session::start(disabled);
+            let (refresh, profile) = store
+                .refresh_files_profiled(std::slice::from_ref(&changed))
+                .unwrap();
+            let refresh_work = session.finish();
+            assert!(
+                refresh.refreshed_own_files > 0,
+                "edit must re-resolve references"
+            );
+            let refreshed_edges = cold_build_insert_tests::graph_table_rows(&store, "edges");
+            println!(
+                "RUST_MODULE_PATHS disabled={disabled} files={} refs={} cold_edges={} refreshed_edges={} cold_ms={} cold_work={cold_work:?} refresh_profile={} refresh_work={refresh_work:?}",
+                stats.files, stats.refs, cold_edges.len(), refreshed_edges.len(),
+                stats.elapsed_ms, profile.report(),
+            );
+            if let Some((expected_cold, expected_refresh)) = &baseline {
+                assert!(
+                    &cold_edges == expected_cold,
+                    "whole-crate cold edge rows differ"
+                );
+                assert!(
+                    &refreshed_edges == expected_refresh,
+                    "whole-crate refreshed edge rows differ"
+                );
+                println!("RUST_MODULE_PATHS whole-crate edge rows identical before and after edit");
+            } else {
+                baseline = Some((cold_edges, refreshed_edges));
+            }
+        }
+    }
+
     /// Compares every memo answer with the scan over the same index and
     /// returns the memo answers for further checks.
     fn assert_memo_matches_scan(
@@ -30356,6 +32429,135 @@ mod crate_scan_memo_tests {
 
     fn pair(file: &str, item: &str) -> Option<(String, String)> {
         Some((file.to_string(), item.to_string()))
+    }
+
+    #[test]
+    fn lazy_rust_module_paths_scan_once_and_walk_once_per_caller() {
+        const DEPTH: usize = 48;
+        const CALL_SITES: usize = 200;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        fs::create_dir_all(root.join("src")).unwrap();
+        let mut files = Vec::new();
+        for level in 0..=DEPTH {
+            let file = root.join(if level == 0 {
+                "src/lib.rs".to_string()
+            } else {
+                format!("src/m{level}.rs")
+            });
+            let source = if level < DEPTH {
+                format!("#[path = \"m{}.rs\"] pub mod child;\n", level + 1)
+            } else {
+                "pub fn leaf() {}\n".to_string()
+            };
+            fs::write(&file, source).unwrap();
+            files.push(file);
+        }
+        let store = CallGraphStore::open(dir.path().join("store"), root.clone()).unwrap();
+        store.cold_build(&files).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let callers = HashMap::new();
+        let index = ProjectIndex::from_db_and_callers(
+            &conn,
+            &root,
+            &callers,
+            WorkspaceCratePrefixCache::default(),
+        );
+        let caller = format!("src/m{DEPTH}.rs");
+        let session = rust_module_work::Session::start(false);
+        for _ in 0..CALL_SITES {
+            assert_eq!(
+                rust_caller_module_segments(&index, &caller),
+                vec!["child".to_string(); DEPTH],
+            );
+        }
+        let work = session.finish();
+        assert_eq!(work.caller_requests, CALL_SITES);
+        assert_eq!(work.caller_walks, 1, "one path walk, not one per call site");
+        assert_eq!(work.parent_lookups, DEPTH + 1);
+        assert_eq!(
+            work.parent_scans, 1,
+            "one inventory pass, not one per parent"
+        );
+        assert_eq!(work.parent_file_visits, DEPTH);
+        assert!(index.take_lazy_load_error().is_none());
+    }
+
+    #[test]
+    fn lazy_rust_module_paths_overlay_replaced_declarations_and_reset_per_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        fs::create_dir_all(root.join("src")).unwrap();
+        let lib = root.join("src/lib.rs");
+        let child = root.join("src/physical.rs");
+        let zed = root.join("src/zed.rs");
+        fs::write(&lib, "#[path = \"physical.rs\"] mod old;\n").unwrap();
+        fs::write(&child, "pub fn target() {}\n").unwrap();
+        fs::write(&zed, "#[path = \"physical.rs\"] mod fallback;\n").unwrap();
+        let store = CallGraphStore::open(dir.path().join("store"), root.clone()).unwrap();
+        store.cold_build(&[lib.clone(), child, zed]).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let empty = HashMap::new();
+        let before = ProjectIndex::from_db_and_callers(
+            &conn,
+            &root,
+            &empty,
+            WorkspaceCratePrefixCache::default(),
+        );
+        assert_eq!(
+            rust_caller_module_segments(&before, "src/physical.rs"),
+            segments(&["old"])
+        );
+        for (source, expected) in [
+            ("#[path = \"physical.rs\"] mod new;\n", "new"),
+            ("// declaration removed\n", "fallback"),
+        ] {
+            fs::write(&lib, source).unwrap();
+            let callers = HashMap::from([(
+                "src/lib.rs".to_string(),
+                build_file_extract(&root, &lib).unwrap(),
+            )]);
+            let next = ProjectIndex::from_db_and_callers(
+                &conn,
+                &root,
+                &callers,
+                WorkspaceCratePrefixCache::default(),
+            );
+            assert_eq!(
+                ResolverIndex::module_parent(&next, "src/physical.rs"),
+                next.module_parent_by_scan("src/physical.rs")
+            );
+            assert_eq!(
+                rust_caller_module_segments(&next, "src/physical.rs"),
+                segments(&[expected])
+            );
+            assert_eq!(
+                rust_caller_module_segments(&before, "src/physical.rs"),
+                segments(&["old"])
+            );
+            assert!(next.take_lazy_load_error().is_none());
+        }
+    }
+
+    #[test]
+    fn rust_module_path_memo_preserves_cycles_missing_parents_and_path_fallbacks() {
+        let index = index(vec![
+            ("src/a.rs", rust_file(&[("b", "src/b.rs")], &[])),
+            ("src/b.rs", rust_file(&[("a", "src/a.rs")], &[])),
+            ("src/loose.rs", rust_file(&[], &[])),
+            ("src/lib.rs", rust_file(&[], &[])),
+        ]);
+        for caller in [
+            "src/a.rs",
+            "src/b.rs",
+            "src/loose.rs",
+            "src/lib.rs",
+            "src/missing.rs",
+        ] {
+            let expected = rust_caller_module_segments_uncached(&index, caller);
+            assert_eq!(rust_caller_module_segments(&index, caller), expected);
+            assert_eq!(rust_caller_module_segments(&index, caller), expected);
+        }
     }
 
     #[test]
@@ -30459,7 +32661,10 @@ mod reexport_resolution_tests {
             workspace_crate_prefixes: WorkspaceCratePrefixCache::default(),
             rust_crate_roots: callgraph::RustCrateRootMemo::default(),
             crate_scans: std::cell::OnceCell::new(),
+            lazy_module_parents: std::cell::OnceCell::new(),
+            rust_caller_paths: RefCell::default(),
             go_packages: RefCell::default(),
+            local_symbols: RefCell::default(),
         }
     }
 
@@ -31327,7 +33532,10 @@ mod bounded_build_breaker_tests {
     const SPECIMEN_CHILD_SIGNAL: &str = "AFT_SPECIMEN_CHILD_SIGNAL";
 
     fn wait_for_child_barrier(path: &Path) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // The child is a fresh test-binary process that builds a call graph
+        // before it reaches the barrier; a loaded macOS runner needed more
+        // than 10 s for that.
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !path.exists() {
             assert!(
                 Instant::now() < deadline,

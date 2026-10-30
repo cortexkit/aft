@@ -70,8 +70,13 @@ fn retry_waited_ms(remote: &RemoteTask) -> Option<u64> {
 /// The refusal text for a remote job. When the runner refused it for waiting
 /// behind this session's own earlier job in the same workspace, say so and
 /// name that job and its task instead of quoting the runner's queue report.
+/// When no runner that would take the job can copy files back, say that
+/// instead of suggesting a retry, which ck-motor refuses the same way.
 fn remote_refusal_message(reason: &str, detail: Option<&str>, remote: &RemoteTask) -> String {
     let message = match &remote.workspace_holder {
+        _ if return_paths_unsupported(reason, detail) => {
+            RETURN_PATHS_UNSUPPORTED_MESSAGE.to_string()
+        }
         Some(holder) if reason == "queue_wait_exceeded" => format!(
             "runon refused: your earlier job {} in this workspace is still running (task {}); this command waited behind it until the runner's queue wait limit passed and was not run; wait for task {} to end (bash_status shows it), then retry",
             holder.job_id, holder.task_id, holder.task_id
@@ -85,6 +90,19 @@ fn remote_refusal_message(reason: &str, detail: Option<&str>, remote: &RemoteTas
         Some(job_id) => format!("{message}; remote job {job_id}"),
         None => message,
     }
+}
+
+/// ck-motor's final refusal of a job with `return_paths` whose runner (any
+/// Windows runner, or an older Linux one) does not copy files back: refused
+/// before start as `request_rejected` with exactly this detail. It decides
+/// this from the runner's Hello before sending the run, and an unchanged
+/// retry gets the same answer.
+const RETURN_PATHS_UNSUPPORTED_DETAIL: &str = "return_paths_unsupported";
+
+const RETURN_PATHS_UNSUPPORTED_MESSAGE: &str = "runon refused: return_paths is not supported on the runner that would take this job; the command was not run; an unchanged retry is refused the same way";
+
+fn return_paths_unsupported(reason: &str, detail: Option<&str>) -> bool {
+    reason == "request_rejected" && detail == Some(RETURN_PATHS_UNSUPPORTED_DETAIL)
 }
 
 /// The job IDs a `queue_wait_exceeded` refusal detail names as running, when
@@ -152,12 +170,23 @@ pub(super) fn remote_refusal(metadata: &super::PersistedTask) -> Option<super::R
 #[cfg(unix)]
 const REMOTE_REATTACH_GRACE: Duration = Duration::from_secs(5 * 60);
 
-/// ck-motor's default queue wait limit, used for a request that sets no
-/// `queue_wait_limit_s` (AFT never sets one).
-/// Time a job waits only behind its own workspace's earlier job is not counted
-/// against it, so this bounds the ordinary case, not every wait.
+/// ck-motor's queue wait for jobs eligible for Boat (at most eight vCPUs,
+/// without outbound networking). Hosted-only jobs may wait longer. AFT leaves
+/// `queue_wait_limit_s` unset so the runner chooses its capacity-aware default.
+/// This baseline also caps retries after a proven terminal refusal.
 #[cfg(unix)]
 const RUNNER_QUEUE_WAIT_LIMIT: Duration = Duration::from_secs(300);
+
+/// Bound queue time without duplicating ck-motor's routing decisions. Its
+/// default admission policy allows 300 seconds for Boat-eligible jobs, or
+/// min(1800 seconds, the run timeout) for hosted-only jobs. The larger of 300
+/// seconds and the run timeout therefore covers either queue before execution
+/// consumes its separate runtime budget. Both re-attach and submission-key
+/// recovery must allow that time before declaring a job's outcome unknown.
+#[cfg(unix)]
+fn recovery_queue_wait_allowance(run_timeout: Duration) -> Duration {
+    RUNNER_QUEUE_WAIT_LIMIT.max(run_timeout)
+}
 
 /// The first pause before re-attaching after a lost stream; each failed attempt
 /// without progress doubles it, up to [`REATTACH_BACKOFF_MAX`].
@@ -288,12 +317,47 @@ enum HintedRetryStep {
 }
 
 #[cfg(unix)]
-fn draining_delay_ms(attempt: u32, retry_after_ms: Option<u64>) -> u64 {
-    retry_after_ms.unwrap_or_else(|| {
-        5000_u64
-            .saturating_mul(1_u64 << attempt.saturating_sub(1).min(4))
-            .min(60000)
-    })
+fn draining_delay_ms(
+    attempt: u32,
+    retry_after_ms: Option<u64>,
+    jitter: impl FnOnce(u64) -> u64,
+) -> u64 {
+    let delay = retry_after_ms
+        .map(|hint| hint.max(5000))
+        .unwrap_or_else(|| {
+            5000_u64
+                .saturating_mul(1_u64 << attempt.saturating_sub(1).min(4))
+                .min(60000)
+        });
+    delay.saturating_add(jitter(delay / 5))
+}
+
+#[cfg(unix)]
+fn retry_jitter_for_task(_task: &BgTask) -> impl FnOnce(u64) -> u64 {
+    #[cfg(test)]
+    let clock = tests::task_draining_clock(_task);
+    move |max| {
+        #[cfg(test)]
+        if let Some(clock) = clock {
+            return clock.retry_jitter_ms(max);
+        }
+        // Reject the incomplete remainder of the u64 range so every millisecond
+        // in the inclusive jitter range has the same probability.
+        let range = max + 1;
+        let reject_below = range.wrapping_neg() % range;
+        loop {
+            let mut bytes = [0; 8];
+            if let Err(error) = getrandom::fill(&mut bytes) {
+                crate::slog_warn!("runon: retry jitter entropy unavailable: {error}");
+                // An entropy failure must not turn backoff into an immediate retry.
+                return max;
+            }
+            let sample = u64::from_ne_bytes(bytes);
+            if sample >= reject_below {
+                return sample % range;
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -381,8 +445,8 @@ fn remote_execution_note(remote: &RemoteTask) -> String {
 /// Local fallback has its own warnings and never uses this advice.
 ///
 /// The runner has no operation an agent can call to fetch a job AFT stopped
-/// following, so the advice names the job and what to do instead: wait for it
-/// to end by its own run timeout, then rerun.
+/// following, so the advice names the job and how to stop it or wait for its
+/// run timeout before rerunning.
 #[cfg(unix)]
 fn remote_unknown_outcome(
     job_id: Option<Uuid>,
@@ -406,7 +470,7 @@ fn remote_unknown_outcome(
             |ms| format!("for up to its run timeout of {}", retry_duration(ms)),
         );
         text.push_str(&format!(
-            "; job {job_id} may still be running on {RUNNER_ID} and holding this workspace {limit}, and AFT can no longer fetch its result: a rerun in this workspace waits behind it and can be refused with queue_wait_exceeded, so wait for it to end, then rerun"
+            "; job {job_id} may still be running on {RUNNER_ID} and holding this workspace {limit}, and AFT can no longer fetch its result: a rerun in this workspace waits behind it and can be refused with queue_wait_exceeded, so wait for it to end or cancel it with bash_kill, then rerun"
         ));
     }
     text
@@ -427,9 +491,9 @@ fn local_os_name() -> &'static str {
 /// Bounds how long AFT keeps re-attaching to an accepted job whose stream it
 /// lost. Silence on an open stream is never bounded; only recovery attempts
 /// that bring no record are. While the job may still be queued or running on
-/// the runner, AFT keeps trying: it stops only once the job's own limits (the
-/// runner's queue wait limit plus the command's run timeout, counted from AFT's
-/// latest submission of it) have passed, and never sooner than [`REMOTE_REATTACH_GRACE`]
+/// the runner, AFT keeps trying: it stops only once a conservative queue
+/// allowance plus the command's run timeout (counted from AFT's latest
+/// submission of it) have passed, and never sooner than [`REMOTE_REATTACH_GRACE`]
 /// after recovery began. Accepted jobs can disappear with a wiped runner state;
 /// AFT must not resubmit them.
 #[cfg(unix)]
@@ -456,8 +520,8 @@ struct ReattachBudget {
 #[cfg(unix)]
 impl ReattachBudget {
     fn new(_root: &Path, metadata: &PersistedTask) -> Self {
-        let queue_wait = RUNNER_QUEUE_WAIT_LIMIT;
         let (until_job_end, recorded_timeout, run_timeout) = Self::until_job_end(metadata);
+        let queue_wait = recovery_queue_wait_allowance(run_timeout);
         let grace = REMOTE_REATTACH_GRACE;
         // A shortened test budget stands for the whole allowance: the job's
         // limits are treated as already passed.
@@ -469,7 +533,7 @@ impl ReattachBudget {
             None => (grace, until_job_end),
         };
         let limit_note = format!(
-            "ck-motor's queue wait limit of {} and its {}run timeout of {} have passed since AFT submitted it, plus {} of grace",
+            "a queue wait allowance of {} and its {}run timeout of {} have passed since AFT submitted it, plus {} of grace",
             retry_duration(duration_ms(queue_wait)),
             if recorded_timeout.is_some() { "" } else { "assumed " },
             retry_duration(duration_ms(run_timeout)),
@@ -516,7 +580,7 @@ impl ReattachBudget {
             .and_then(|retry| retry.resubmitted_at_ms)
             .unwrap_or(metadata.started_at);
         let job_end_ms = submitted_at
-            .saturating_add(duration_ms(RUNNER_QUEUE_WAIT_LIMIT))
+            .saturating_add(duration_ms(recovery_queue_wait_allowance(run_timeout)))
             .saturating_add(duration_ms(run_timeout));
         (
             Duration::from_millis(job_end_ms.saturating_sub(unix_millis())),
@@ -545,7 +609,13 @@ impl ReattachBudget {
         }
     }
 
-    /// A record arrived: the job is alive, so recovery starts over.
+    fn observe(&mut self, progress: &StreamProgress) {
+        if matches!(progress, StreamProgress::Record) {
+            self.reset();
+        }
+    }
+
+    /// An execution record arrived: the job is alive, so recovery starts over.
     fn reset(&mut self) {
         self.deadline = None;
         self.attempts = 0;
@@ -740,6 +810,8 @@ impl RemotePreStartRefusal {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct RemoteTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission: Option<KeyedSubmission>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_platform: Option<Platform>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted_platform: Option<Platform>,
@@ -804,7 +876,85 @@ pub(crate) struct RemoteTask {
     /// waited behind an earlier job of this same session in the same workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_holder: Option<WorkspaceHolder>,
+    /// Files the caller asked the runner to copy back, relative to the
+    /// task's workdir (`return_paths`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub return_paths: Vec<String>,
+    /// The outcome for each of `return_paths`, saved once the runner's
+    /// manifest was handled or the job ended without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub returned_files: Option<Vec<super::return_files::ReturnedPath>>,
+    /// The seq of the job's first returned-file chunk. A restart before the
+    /// manifest attaches again from here, because the staged bytes did not
+    /// survive the restart but the runner still replays them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_first_seq: Option<u64>,
+    /// Staging files and directories created for the returned files and
+    /// not yet placed or removed. A restart removes them from here.
+    #[serde(
+        default,
+        skip_serializing_if = "super::return_files::StagingRecord::is_empty"
+    )]
+    pub return_staging: super::return_files::StagingRecord,
+    /// Seq ranges missing before an expired replay's manifest that carried
+    /// no chunk counts, where the derived count did not match and recovery
+    /// could not fill them: lost output or differently sized chunks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expired_gap_unverified: Vec<(u64, u64)>,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct KeyedSubmission {
+    key: String,
+    created_at_ms: u64,
+    request_digest: String,
+    attempts: u8,
+    fresh_key_used: bool,
+    resuming: bool,
+    reattached: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refusal: Option<TerminalRecord>,
+}
+
+#[cfg(unix)]
+impl KeyedSubmission {
+    fn expires_at(&self, metadata: &PersistedTask) -> u64 {
+        let run_timeout = metadata
+            .timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_BG_TIMEOUT);
+        let submitted_at = metadata
+            .remote
+            .as_ref()
+            .and_then(|r| r.retry.as_ref())
+            .and_then(|r| r.resubmitted_at_ms)
+            .unwrap_or(metadata.started_at);
+        // Admission can wait before execution starts; that wait does not
+        // consume the runner's execution timeout.
+        let job_end_ms = submitted_at
+            .saturating_add(duration_ms(recovery_queue_wait_allowance(run_timeout)))
+            .saturating_add(duration_ms(run_timeout));
+        self.created_at_ms
+            .saturating_add(SUBMISSION_RETENTION_MS)
+            .min(job_end_ms)
+    }
+}
+
+#[cfg(unix)]
+const SUBMISSION_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+#[cfg(unix)]
+const SUBMISSION_RECOVERY_ATTEMPTS: u8 = 3;
+
+#[cfg(unix)]
+fn new_submission_key(task_id: &str) -> Result<String, String> {
+    let mut nonce = [0; 16];
+    getrandom::fill(&mut nonce).map_err(|e| e.to_string())?;
+    Ok(format!("aft:{task_id}:{}", Uuid::from_bytes(nonce)))
+}
+
+// Reattachment is recorded in metadata without adding agent-visible wording.
+#[cfg(all(test, unix))]
+const REATTACHED_RESULT_SENTENCE: Option<&str> = None;
 
 /// This session's earlier remote job that still held the workspace when the
 /// runner refused a later job in it.
@@ -878,6 +1028,51 @@ pub(crate) struct RemoteProgress {
     pub phase: RemotePhase,
 }
 
+#[cfg(unix)]
+fn admission_progress_detail(detail: &str) -> String {
+    const MAX_DETAIL_CHARS: usize = 120;
+    let single_line: String = detail
+        .chars()
+        .map(|character| {
+            if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let normalized = single_line.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Mask complete credentials before a display cut could split their shape.
+    let redacted = crate::log_redact::aft_redactor(&normalized);
+    if redacted.chars().count() <= MAX_DETAIL_CHARS {
+        return redacted.into_owned();
+    }
+    let (boundary, _) = redacted.char_indices().nth(MAX_DETAIL_CHARS - 1).unwrap();
+    format!("{}…", &redacted[..boundary])
+}
+
+#[cfg(unix)]
+fn admission_progress_line(progress: &exec::types::Progress) -> Option<String> {
+    use exec::types::ProgressPhase;
+    let step = match progress.phase() {
+        ProgressPhase::Upload => "uploading its files".to_owned(),
+        ProgressPhase::PlacementWait => "waiting for a free build host".to_owned(),
+        ProgressPhase::Connect => "connecting to its build host".to_owned(),
+        _ => return None,
+    };
+    let elapsed =
+        crate::lsp::manager::format_retry_delay(Duration::from_millis(progress.phase_elapsed_ms()));
+    let detail = progress
+        .detail()
+        .map(admission_progress_detail)
+        .filter(|detail| !detail.is_empty())
+        .map(|detail| format!(": {detail}"))
+        .unwrap_or_default();
+    Some(format!(
+        "The remote job is {step} ({elapsed} so far){detail}."
+    ))
+}
+
 impl RemoteProgress {
     pub(crate) fn of(remote: &RemoteTask) -> Self {
         Self {
@@ -931,12 +1126,42 @@ pub(crate) fn remote_phase_note(metadata: &super::PersistedTask, now_ms: u64) ->
 
 #[cfg(unix)]
 impl RemoteTask {
+    fn resubmit_for_recovery(&self) -> bool {
+        // A confirmed terminal needs only output recovery. Attach preserves the
+        // saved terminal and buffered records if executor history has expired.
+        self.submission.is_some() && self.gap_recovery.is_none()
+    }
+
     fn point(&self) -> Option<ResumePoint> {
+        // Returned files are staged only in memory and private files that a
+        // restart discards, so resume before their first chunk until the
+        // manifest has been handled. This holds during gap recovery too: the
+        // saved terminal proof stays with the resume point, and the records
+        // buffered above the gap stay pending, while the chunks before the
+        // gap are fetched again.
+        let last_seq = match (self.return_first_seq, &self.returned_files) {
+            (Some(first), None) => self.last_seq.min(first.checked_sub(1)),
+            _ => self.last_seq,
+        };
         Some(ResumePoint {
             job_id: self.job_id?,
-            last_seq: self.last_seq,
+            last_seq,
             gap_recovery: self.gap_recovery.clone(),
+            last_output_seq: self.last_output_seq(),
         })
+    }
+
+    /// The seq of the last output record received, which an expired
+    /// replay's missing chunks are counted from. It is not saved apart from
+    /// the stream cursor: chunks follow every output record, so while the
+    /// file returns are unfinished it is the record just before the first
+    /// chunk, and otherwise the cursor itself. Once the manifest has been
+    /// handled no expired-replay gap is checked again, so the cursor serves.
+    fn last_output_seq(&self) -> Option<u64> {
+        match (self.return_first_seq, &self.returned_files) {
+            (Some(first), None) => self.last_seq.min(first.checked_sub(1)),
+            _ => self.last_seq,
+        }
     }
 }
 
@@ -1012,12 +1237,19 @@ struct TaskSink {
     // metadata until the files are synced. Cancellation also saves that metadata.
     output_progress: OutputProgress,
     last_progress_persist: Instant,
+    sent_at: Option<Instant>,
     #[cfg(test)]
     progress_clock: Option<Arc<dyn Fn() -> Instant + Send + Sync>>,
     /// Runs between the checkpoint snapshot and its file write, so a test can
     /// land another metadata write in that window.
     #[cfg(test)]
     before_checkpoint_write: Option<Box<dyn FnMut() + Send>>,
+    /// Stages the job's returned-file chunks until the runner's manifest
+    /// arrives, then places the files that verify.
+    returns: Option<super::return_files::ReturnReceiver>,
+    /// A handled manifest's report whose save failed, saved when the
+    /// consumer delivers the manifest again.
+    unsaved_return_report: Option<Vec<super::return_files::ReturnedPath>>,
 }
 
 /// Longest time the saved output cursor of a running remote task may lag the
@@ -1040,14 +1272,46 @@ const PROGRESS_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 impl TaskSink {
     fn new(registry: &BgTaskRegistry, task: Arc<BgTask>) -> io::Result<Self> {
-        let remote = task
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("task lock poisoned"))?
-            .metadata
-            .remote
-            .clone()
-            .ok_or_else(|| io::Error::other("remote record absent"))?;
+        let (remote, workdir, project_root) = {
+            let state = task
+                .state
+                .lock()
+                .map_err(|_| io::Error::other("task lock poisoned"))?;
+            (
+                state
+                    .metadata
+                    .remote
+                    .clone()
+                    .ok_or_else(|| io::Error::other("remote record absent"))?,
+                state.metadata.workdir.clone(),
+                state.metadata.project_root.clone(),
+            )
+        };
+        // Staged bytes do not survive a restart: remove the files an earlier
+        // AFT process staged, from the places it recorded. A restart before
+        // the manifest attaches again from the first chunk to stage afresh.
+        super::return_files::remove_recorded_staging(&remote.return_staging, &task.task_id);
+        let returns = if !remote.return_paths.is_empty() && remote.returned_files.is_none() {
+            Some(super::return_files::ReturnReceiver::new(
+                remote.return_paths.clone(),
+                exec::return_max_bytes(),
+                &workdir,
+                project_root.as_deref().unwrap_or(&workdir),
+                worktree_root_containing(&workdir, exec::DirectoryKind::WorkingDirectory)
+                    .ok()
+                    .flatten()
+                    .as_deref(),
+                // Staged bytes live in the task's private control folder,
+                // which sandboxed commands cannot write.
+                resolve_task_layout(&task.paths.session_dir, &task.task_id)?
+                    .dirs
+                    .control
+                    .clone(),
+                &task.task_id,
+            )?)
+        } else {
+            None
+        };
         let stdout = open_task_artifact_for_remote(&task, TaskArtifact::Stdout)?;
         let stderr = open_task_artifact_for_remote(&task, TaskArtifact::Stderr)?;
         // Discard bytes beyond the saved checkpoint, but never extend a short
@@ -1094,10 +1358,13 @@ impl TaskSink {
                 ..OutputProgress::of(&remote)
             },
             last_progress_persist: Instant::now(),
+            sent_at: None,
             #[cfg(test)]
             progress_clock: None,
             #[cfg(test)]
             before_checkpoint_write: None,
+            returns,
+            unsaved_return_report: None,
         };
         let losses: Vec<_> = [
             (RemoteOutputStream::Stdout, stdout_len, remote.stdout_len),
@@ -1149,8 +1416,14 @@ impl TaskSink {
             // no per-record byte offsets are saved to separate them from lost bytes.
             if let Err(error) = registry.persist_task_locked(&sink.task, &state.metadata, &mut db) {
                 state.metadata = previous;
+                sink.task
+                    .drain_reply
+                    .publish_metadata(&state.metadata, sink.task.hard_kill_renewable);
                 return Err(error);
             }
+        }
+        if !remote.return_staging.is_empty() {
+            sink.commit(|r| r.return_staging = Default::default())?;
         }
         Ok(sink)
     }
@@ -1201,6 +1474,9 @@ impl TaskSink {
             .persist_task_locked(&self.task, &state.metadata, &mut db);
         if result.is_err() {
             state.metadata.remote = previous;
+            self.task
+                .drain_reply
+                .publish_metadata(&state.metadata, self.task.hard_kill_renewable);
         } else {
             self.output_progress = OutputProgress::of(state.metadata.remote.as_ref().unwrap());
             self.last_progress_persist = self.progress_now();
@@ -1424,8 +1700,39 @@ pub(super) fn persist_terminal_artifacts(paths: &TaskPaths, metadata: &mut Persi
 
 #[cfg(unix)]
 impl OutputSink for TaskSink {
+    fn admission_progress(&mut self, progress: &exec::types::Progress) {
+        let Some(note) = admission_progress_line(progress) else {
+            return;
+        };
+        let Ok(mut state) = self.task.state.lock() else {
+            return;
+        };
+        if !state.metadata.is_terminal()
+            && state.metadata.remote.as_ref().is_some_and(|r| !r.accepted)
+        {
+            // Replace, never append: pre-acceptance status is ephemeral and is
+            // not output, a resume checkpoint, or execution evidence.
+            state.remote_admission_note = Some(note);
+            self.task.publish_runon_launch_state(&state);
+        }
+    }
     fn accepted(&mut self, accepted: &Accepted) -> io::Result<()> {
+        // Measure receipt before local persistence adds its own latency. An
+        // attach after restart has no in-process exec.run send timestamp.
+        let capture_ms = self
+            .sent_at
+            .map(|sent_at| sent_at.elapsed().as_millis().to_string())
+            .unwrap_or_else(|| "unknown".into());
+        // A resubmitted job returns its files afresh.
+        if let Some(returns) = self.returns.as_mut() {
+            returns.reset();
+        }
         self.commit(|r| {
+            if let Some(submission) = r.submission.as_mut() {
+                submission.reattached |= accepted.attached;
+            }
+            r.return_first_seq = None;
+            r.return_staging = Default::default();
             r.job_id = Some(accepted.job_id);
             r.queue_position = Some(accepted.queue_position);
             r.accepted = true;
@@ -1441,6 +1748,7 @@ impl OutputSink for TaskSink {
             .state
             .lock()
             .map_err(|_| io::Error::other("task lock poisoned"))?;
+        state.remote_admission_note = None;
         append_executor_environment_disclosure(&mut state.metadata);
         if let Some(remote) = &state.metadata.remote {
             let note = remote_execution_note(remote);
@@ -1456,10 +1764,11 @@ impl OutputSink for TaskSink {
             *existing = note + &suffix;
         }
         crate::slog_info!(
-            "runon: remote task accepted task_id={} session={} job_id={}",
+            "runon: remote task accepted task_id={} session={} job_id={} capture_ms={}",
             self.task.task_id,
             state.metadata.session_id,
             accepted.job_id,
+            capture_ms,
         );
         self.registry
             .persist_task_locked(&self.task, &state.metadata, &mut db)?;
@@ -1502,10 +1811,13 @@ impl OutputSink for TaskSink {
         Ok(())
     }
     fn truncated(&mut self, before_seq: u64) -> io::Result<()> {
-        self.truncate_output(before_seq, false)
+        self.truncate_output(before_seq, MissingRecords::NoLongerRetained)
     }
     fn undelivered(&mut self, before_seq: u64) -> io::Result<()> {
-        self.truncate_output(before_seq, true)
+        self.truncate_output(before_seq, MissingRecords::NeverDelivered)
+    }
+    fn expired_gap_unverified(&mut self, before_seq: u64) -> io::Result<()> {
+        self.truncate_output(before_seq, MissingRecords::ExpiredGapUnverified)
     }
     fn gap_recovery(&mut self, recovery: &exec::GapRecovery) -> io::Result<()> {
         self.commit(|r| r.gap_recovery = Some(recovery.clone()))
@@ -1533,14 +1845,86 @@ impl OutputSink for TaskSink {
         }
         self.progress(seq, None, offset + bytes.len() as u64)
     }
+    fn return_chunk(&mut self, chunk: &ReturnChunk) -> io::Result<()> {
+        let Some(mut returns) = self.returns.take() else {
+            return self.unknown_output(chunk.seq, &[]);
+        };
+        if !returns.received_chunk() {
+            // Saved before the cursor can pass the chunk, so a restart knows
+            // where to attach to receive the files again.
+            let seq = chunk.seq;
+            if let Err(error) = self.commit(|r| r.return_first_seq = Some(seq)) {
+                self.returns = Some(returns);
+                return Err(error);
+            }
+        }
+        returns.chunk(chunk, &mut |staging| self.record_staging(staging));
+        self.returns = Some(returns);
+        let unknown_len = self.output_progress.unknown_len;
+        self.progress(chunk.seq, None, unknown_len)
+    }
+    fn return_manifest(
+        &mut self,
+        manifest: &ReturnManifest,
+        expired_replay: Option<u64>,
+    ) -> io::Result<()> {
+        let report = match self.unsaved_return_report.take() {
+            Some(report) => report,
+            None => match self.returns.take() {
+                Some(mut returns) => returns.manifest(manifest, expired_replay, &mut |staging| {
+                    self.record_staging(staging)
+                }),
+                None => return self.unknown_output(manifest.seq, &[]),
+            },
+        };
+        let seq = manifest.seq;
+        let saved = report.clone();
+        let result = self.commit(|r| {
+            r.returned_files = Some(report);
+            // Every staging file was placed or removed with the report.
+            r.return_staging = Default::default();
+            r.last_seq = Some(seq);
+        });
+        if result.is_err() {
+            // The files are already placed. The consumer delivers this
+            // manifest again, and the same report is saved then.
+            self.unsaved_return_report = Some(saved);
+        }
+        result
+    }
     fn terminal(&mut self, record: &TerminalRecord, verdict: &Verdict) -> io::Result<()> {
         #[cfg(test)]
         let clock = tests::task_draining_clock(&self.task);
+        let jitter = retry_jitter_for_task(&self.task);
+        // A job that ran but sent no manifest returned nothing. A refusal
+        // before start may be retried, so it leaves the request open.
+        let unreported = (!matches!(verdict, Verdict::RunLocally { .. }))
+            .then(|| {
+                self.returns
+                    .take()
+                    .map(|mut returns| returns.without_manifest())
+            })
+            .flatten();
         self.commit(|r| {
+            let resubmit_refusal = r.submission.as_ref().is_some_and(|s| s.resuming)
+                && matches!(verdict, Verdict::RunLocally { .. });
+            // A keyed refusal belongs to this call, not to the existing job.
+            // Keep the existing ID available for cancellation and recovery.
+            if resubmit_refusal {
+                r.submission.as_mut().unwrap().refusal = Some(record.clone());
+                return;
+            }
+            if let Some(report) = unreported {
+                r.returned_files = Some(report);
+                r.return_staging = Default::default();
+            }
             r.job_id = Some(record.job_id);
             r.terminal = Some(record.clone());
-            // The runner has finished with the job: no cancellation is owed.
-            r.cancel_pending = false;
+            if r.submission.is_none()
+                || !matches!(verdict, Verdict::OutcomeUnknown | Verdict::HistoryExpired)
+            {
+                r.cancel_pending = false;
+            }
             r.gap_recovery = None;
             if retries_draining(r, verdict) {
                 if let Some(retry) = r.retry.as_mut() {
@@ -1548,23 +1932,80 @@ impl OutputSink for TaskSink {
                     #[cfg(test)]
                     let now = clock.as_ref().map_or(now, |clock| clock.now());
                     retry.first_refusal_at_ms.get_or_insert(now);
-                    retry.next_retry_at_ms =
-                        Some(now.saturating_add(draining_delay_ms(
-                            retry.attempts,
-                            record.retry_after_ms,
-                        )));
+                    retry.next_retry_at_ms = Some(now.saturating_add(draining_delay_ms(
+                        retry.attempts,
+                        record.retry_after_ms,
+                        jitter,
+                    )));
                 }
             }
         })?;
-        // The saved record no longer owes a cancel; drop its index entry.
-        remove_owed_cancel_marker(&self.task.paths);
+        if self.task.state.lock().is_ok_and(|state| {
+            state
+                .metadata
+                .remote
+                .as_ref()
+                .is_some_and(|r| !r.cancel_pending)
+        }) {
+            remove_owed_cancel_marker(&self.task.paths);
+        }
         Ok(())
     }
 }
 
 #[cfg(unix)]
 impl TaskSink {
-    fn truncate_output(&mut self, before_seq: u64, undelivered: bool) -> io::Result<()> {
+    fn settle_never_accepted(&mut self) -> io::Result<()> {
+        let mut proven_never_accepted = false;
+        self.commit(|r| {
+            // Dispatch clears terminal and submission.refusal for the next key.
+            // Only a refusal still belonging to the current key permits fallback.
+            let current_refusal = r
+                .submission
+                .as_ref()
+                .and_then(|s| s.refusal.as_ref())
+                .or(r.terminal.as_ref());
+            let current_proof = current_refusal.is_some_and(|record| {
+                matches!(
+                    exec::grade(record),
+                    Verdict::RunLocally {
+                        reason: RefusalReason::SubmissionNeverAccepted,
+                        ..
+                    }
+                )
+            });
+            if !current_proof {
+                return;
+            }
+            proven_never_accepted = true;
+            if let Some(submission) = r.submission.as_mut() {
+                submission.resuming = false;
+                if let Some(refusal) = submission.refusal.take() {
+                    r.job_id = Some(refusal.job_id);
+                    r.terminal = Some(refusal);
+                }
+            }
+            r.cancel_pending = false;
+        })?;
+        if !proven_never_accepted {
+            return Err(io::Error::other(
+                "current keyed submission outcome unknown; local fallback withheld",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Save staging files and directories in the task record before the
+    /// receiver creates them.
+    fn record_staging(&mut self, staging: &super::return_files::StagingRecord) -> io::Result<()> {
+        let staging = staging.clone();
+        self.commit(|r| {
+            r.return_staging.files.extend(staging.files);
+            r.return_staging.dirs.extend(staging.dirs);
+        })
+    }
+
+    fn truncate_output(&mut self, before_seq: u64, kind: MissingRecords) -> io::Result<()> {
         self.dirty
             .sync(&self.stdout, &self.stderr, self.unknown.as_ref())?;
         let mut db = DeferredDbWrites::new(&self.registry, &self.task);
@@ -1583,13 +2024,16 @@ impl TaskSink {
         let first = remote.last_seq.map_or(0, |seq| seq.saturating_add(1));
         remote.last_seq = before_seq.checked_sub(1);
         if first < before_seq {
-            if undelivered {
-                remote.undelivered_output.push((first, before_seq - 1));
+            let range = (first, before_seq - 1);
+            match kind {
+                MissingRecords::NoLongerRetained => state.metadata.incomplete_output.push(range),
+                MissingRecords::NeverDelivered => {
+                    remote.undelivered_output.push(range);
+                    state.metadata.incomplete_output.push(range);
+                }
+                // Not known to be lost output, so not listed as such.
+                MissingRecords::ExpiredGapUnverified => remote.expired_gap_unverified.push(range),
             }
-            state
-                .metadata
-                .incomplete_output
-                .push((first, before_seq - 1));
         }
         append_output_loss(&mut state.metadata);
         let result = self
@@ -1597,6 +2041,9 @@ impl TaskSink {
             .persist_task_locked(&self.task, &state.metadata, &mut db);
         if result.is_err() {
             state.metadata = previous;
+            self.task
+                .drain_reply
+                .publish_metadata(&state.metadata, self.task.hard_kill_renewable);
         } else {
             self.output_progress = OutputProgress::of(state.metadata.remote.as_ref().unwrap());
             self.last_progress_persist = self.progress_now();
@@ -1652,6 +2099,8 @@ struct LocalFallback {
     shell_path: PathBuf,
     env: HashMap<String, String>,
     capture_pipeline: bool,
+    // Keep the submitting request's local ceiling even if configuration reloads.
+    memory_limit_mib: Option<u64>,
     linux_scope: bool,
 }
 
@@ -1691,11 +2140,84 @@ const RUNON_CD_OUTSIDE_CHECKOUT_MESSAGE: &str = "runon refused: the command chan
 const RUNON_CD_WINDOWS_ABSOLUTE_MESSAGE: &str = "runon refused: the command changes into <path>, which is not valid on the Windows runner because absolute command paths are not translated (checkout <checkout root>); the command did not run. Set the bash tool's workdir to that folder instead of using cd.";
 
 #[cfg(unix)]
+fn runon_snapshot_directory_known(
+    checkout: &Path,
+    path: &Path,
+    git: &Path,
+    deadline: Instant,
+) -> bool {
+    let Ok(relative) = path.strip_prefix(checkout) else {
+        return false;
+    };
+    // The MOTOR build runner's snapshot contract (MOTOR repository,
+    // docs/snapshot-contents.md, sections 2–3) carries existing tracked files and
+    // non-ignored untracked files, but reserves each checkout's top-level target
+    // for runner-owned build output. Ask Git itself about standard excludes and
+    // tracked overrides; a directory needs a copied file beneath it as proof.
+    // Uncertain membership retains the failure cwd and its checkout-escape
+    // refusals, rather than assuming a directory change succeeds remotely.
+    if Instant::now() >= deadline || relative.starts_with("target") || !path.is_dir() {
+        return false;
+    }
+    let relative = if relative.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        relative
+    };
+    let mut command = std::process::Command::new(git);
+    command
+        .current_dir(checkout)
+        .arg("--literal-pathspecs")
+        .args([
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+        ])
+        .arg(relative)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // Source-file lists regularly exceed capture_probe_command's 4 KiB limit.
+    // Use the normal bounded capture; truncated output still stays unknown.
+    crate::format::isolate_in_process_group(&mut command);
+    let Ok(child) = command.spawn() else {
+        return false;
+    };
+    let Ok(files) = crate::format::wait_with_deadline(child, "git", deadline, || false) else {
+        return false;
+    };
+    // Capture decodes bytes lossily; a replacement path is not evidence that
+    // the listed file still exists in the working tree.
+    files.status.success()
+        && !files.truncated
+        && !files.stdout.contains('\u{fffd}')
+        && files.stdout.split_terminator('\0').any(|file| {
+            !Path::new(file).starts_with("target")
+                && std::fs::symlink_metadata(checkout.join(file))
+                    .is_ok_and(|metadata| !metadata.is_dir())
+        })
+}
+
+#[cfg(unix)]
 fn runon_cd_refusal(command: &str, request: &RunRequest) -> Result<Option<String>, exec::Error> {
+    runon_cd_refusal_with_git(command, request, Path::new("git"))
+}
+
+#[cfg(unix)]
+fn runon_cd_refusal_with_git(
+    command: &str,
+    request: &RunRequest,
+    git: &Path,
+) -> Result<Option<String>, exec::Error> {
+    // All directory probes share one budget so a long cd list cannot delay
+    // remote dispatch by spending a fresh timeout on every destination.
+    let deadline = Instant::now() + Duration::from_secs(2);
     let checkout = Path::new(&request.workspace_key);
-    let cwd = Path::new(&request.cwd)
-        .canonicalize()
-        .map_err(|error| exec::Error::Protocol(error.to_string()))?;
+    let cwd = exec::DirectoryKind::WorkingDirectory.canonicalize(Path::new(&request.cwd))?;
     // Sibling wire paths are absolute and are not rebased on Linux. A linked
     // worktree also gets a mount beside the workspace under each sibling name.
     let alias_parent = checkout
@@ -1727,16 +2249,35 @@ fn runon_cd_refusal(command: &str, request: &RunRequest) -> Result<Option<String
         );
     }
     let windows = request.platform == Some(Platform::Windows);
+    let copied = |path: &Path| {
+        path.starts_with(checkout) || siblings.iter().any(|sibling| path.starts_with(sibling))
+    };
+    let known_directories = std::cell::RefCell::new(BTreeMap::<PathBuf, bool>::new());
+    let known_directory = |path: &Path| {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        if let Some(known) = known_directories.borrow().get(path) {
+            return *known;
+        }
+        let known = std::iter::once(checkout)
+            .chain(siblings.iter().map(PathBuf::as_path))
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.components().count())
+            .is_some_and(|root| runon_snapshot_directory_known(root, path, git, deadline));
+        known_directories
+            .borrow_mut()
+            .insert(path.to_path_buf(), known);
+        known
+    };
     Ok(
-        crate::bash_permissions::scan::top_level_directory_targets(command, &cwd)
+        crate::bash_permissions::scan::top_level_directory_targets(command, &cwd, &known_directory)
             .into_iter()
             .find_map(|target| {
                 let template = if windows && target.literal_absolute {
                     RUNON_CD_WINDOWS_ABSOLUTE_MESSAGE
                 } else {
                     let invalid = |path: &Path| {
-                        let copied = path.starts_with(checkout)
-                            || siblings.iter().any(|sibling| path.starts_with(sibling));
                         // System and unknown paths may exist on the runner. Reject
                         // only local home content or another checkout.
                         let local_only = homes.iter().any(|home| path.starts_with(home))
@@ -1744,7 +2285,7 @@ fn runon_cd_refusal(command: &str, request: &RunRequest) -> Result<Option<String
                                 .ok()
                                 .flatten()
                                 .is_some();
-                        !copied && local_only
+                        !copied(path) && local_only
                     };
                     // An unknown shell mode gives mutually exclusive candidates,
                     // unlike separate reachable command branches: both must fail.
@@ -1781,6 +2322,7 @@ impl BgTaskRegistry {
         workdir: PathBuf,
         env: HashMap<String, String>,
         hard_kill: super::super::HardKill,
+        memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
         slot: super::super::TaskSlot,
         notify: bool,
@@ -1796,6 +2338,7 @@ impl BgTaskRegistry {
             workdir,
             env,
             hard_kill,
+            memory_limit_mib,
             storage_dir,
             slot,
             notify,
@@ -1816,12 +2359,16 @@ impl BgTaskRegistry {
         workdir: PathBuf,
         mut env: HashMap<String, String>,
         hard_kill: super::super::HardKill,
+        memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
         slot: super::super::TaskSlot,
         notify: bool,
         compressed: bool,
         root: Option<PathBuf>,
     ) -> Result<String, RegistryError> {
+        let mut timings = super::super::take_runon_timings();
+        timings.enter("task_setup");
+        let canonical_project_root = canonicalized_path(root.as_deref().unwrap_or(&workdir));
         let _admission = self.background_admission_guard(slot);
         self.check_background_slot_typed(slot, &session_id)?;
         let layout = match plan.prepared_task() {
@@ -1829,6 +2376,7 @@ impl BgTaskRegistry {
             None => allocate_task_layout(&storage_dir, &session_id).map_err(|e| e.to_string())?,
         };
         let layout_cleanup = UncommittedLayout::new(&layout);
+        timings.enter("sandbox_payload");
         if plan.prepared_task().is_none() {
             let environment =
                 crate::sandbox_spawn::approved_payload_environment(&env, &std::env::temp_dir());
@@ -1844,6 +2392,7 @@ impl BgTaskRegistry {
             plan = plan.with_prepared_task(prepared);
         }
         let task_id = layout.paths.task_id.clone();
+        timings.enter("task_metadata");
         let requested_vcpus = launch.requested_vcpus;
         let mut metadata = PersistedTask::starting(
             task_id.clone(),
@@ -1860,6 +2409,7 @@ impl BgTaskRegistry {
         metadata.status = BgTaskStatus::Running;
         metadata.execution_note = Some(format!("remote execution requested on {RUNNER_ID}"));
         metadata.remote = Some(RemoteTask {
+            submission: None,
             requested_platform: launch.requested_platform.clone(),
             accepted_platform: None,
             connection_file: launch.connection_file,
@@ -1890,6 +2440,11 @@ impl BgTaskRegistry {
             retry: None,
             output_incomplete: None,
             workspace_holder: None,
+            return_paths: launch.return_paths.clone(),
+            returned_files: None,
+            return_first_seq: None,
+            return_staging: Default::default(),
+            expired_gap_unverified: Vec::new(),
         });
         metadata.pipeline_segments = single_top_level_pipeline(command)
             .map(|p| p.segments.into_iter().map(|s| s.label).collect())
@@ -1900,6 +2455,7 @@ impl BgTaskRegistry {
             &shell_path,
         );
         attach_sandbox_metadata(&mut metadata, &plan);
+        timings.enter("fallback_snapshot");
         let digest = crate::sandbox_spawn::save_local_launch(
             &plan,
             root.as_deref().unwrap_or(&workdir),
@@ -1908,8 +2464,10 @@ impl BgTaskRegistry {
             &shell_path,
             env.get("AFT_INTERNAL_LINUX_SCOPE")
                 .is_some_and(|v| v == "1"),
+            memory_limit_mib,
         )?;
         metadata.remote.as_mut().unwrap().fallback_digest = Some(digest);
+        timings.enter("task_registration");
         let handles =
             TaskIoHandles::create(&layout, BgMode::Pipes, true).map_err(|e| e.to_string())?;
         write_task_at(&layout, &metadata).map_err(|e| e.to_string())?;
@@ -1923,7 +2481,13 @@ impl BgTaskRegistry {
         }
         layout_cleanup.disarm();
         self.dual_write_task(&layout.paths, &metadata);
-        self.insert_rehydrated_task(metadata, layout.paths, false)?;
+        self.insert_registered_task(
+            metadata,
+            layout.paths,
+            false,
+            crate::bash_changed_files::current(),
+            canonical_project_root,
+        )?;
         let task = self.task(&task_id).unwrap();
         task.holds_background_slot
             .store(slot.holds_slot(), Ordering::SeqCst);
@@ -1932,12 +2496,25 @@ impl BgTaskRegistry {
             .map_err(|_| "task lock poisoned")?
             .io_handles = Some(handles);
         let request_root = root.as_deref().unwrap_or(&workdir);
+        timings.enter("remote_environment");
         let linux_scope = env
             .remove("AFT_INTERNAL_LINUX_SCOPE")
             .is_some_and(|v| v == "1");
+        // Configured `bash.env` values apply to local commands only: the
+        // ambient environment must not carry one to a build server just
+        // because it happens to be exported here. The request's own map is a
+        // different thing -- it holds the per-call `env` values plus the user
+        // names `bash.runon_env` forwarded -- so it is layered on top and
+        // never filtered. `commands::bash_remote_env` owns the disclosure of
+        // what a job does not receive.
+        let configured_env_names = launch.configured_env_names.clone();
         let shell_environment: crate::sandbox_spawn::ChildEnvironment =
             if !plan.is_native_launcher() && plan.host_shell_path().is_none() {
                 std::env::vars_os()
+                    .filter(|(key, _)| {
+                        !key.to_str()
+                            .is_some_and(|name| configured_env_names.iter().any(|n| n == name))
+                    })
                     .chain(env.clone().into_iter().map(|(k, v)| (k.into(), v.into())))
                     .collect()
             } else {
@@ -1979,6 +2556,7 @@ impl BgTaskRegistry {
                 .map_err(|e| e.to_string())?;
         }
         let explicit_runon = launch.explicit_runon;
+        timings.enter("workdir_repository_git");
         let request = environment.and_then(|environment| {
             *task
                 .completion_secrets
@@ -2004,10 +2582,12 @@ impl BgTaskRegistry {
                     siblings: launch.params.siblings,
                     weight_hint: requested_vcpus,
                     network: launch.requested_network.then_some(Network::Outbound),
+                    return_paths: launch.return_paths,
                     ..Default::default()
                 },
             )
         });
+        timings.enter("cd_snapshot_git");
         let request = request
             .map_err(RemoteRequestError::Build)
             .and_then(|request| {
@@ -2024,22 +2604,210 @@ impl BgTaskRegistry {
             plan,
             shell_path,
             linux_scope,
+            memory_limit_mib,
             env,
             capture_pipeline,
         };
-        self.start_remote_worker(task, Some((request, fallback)))?;
+        timings.enter("worker_dispatch");
+        self.start_remote_worker(task, Some((request, fallback)), Some(timings))?;
         self.start_watchdog();
         Ok(task_id)
     }
 
     pub(super) fn resume_remote_task(&self, task_id: &str) -> Result<(), String> {
-        self.start_remote_worker(self.task(task_id).ok_or("remote task missing")?, None)
+        self.start_remote_worker(self.task(task_id).ok_or("remote task missing")?, None, None)
+    }
+
+    async fn key_fresh_request(
+        &self,
+        client: &ExecRemoteClient,
+        task: &Arc<BgTask>,
+        request: RunRequest,
+        timings: &mut exec::LaunchTimings,
+    ) -> Result<RunRequest, String> {
+        timings.enter("supports_submission_key");
+        let supported = client
+            .supports_submission_key()
+            .await
+            .map_err(|e| e.to_string())?;
+        timings.enter("submission_persistence");
+        let previous = task
+            .state
+            .lock()
+            .map_err(|_| "task lock poisoned")?
+            .metadata
+            .remote
+            .clone()
+            .unwrap();
+        let submission = if supported {
+            let digest = match previous
+                .retry
+                .as_ref()
+                .map(|r| &r.request_digest)
+                .or_else(|| previous.submission.as_ref().map(|s| &s.request_digest))
+            {
+                Some(digest) => digest.clone(),
+                None => save_retry_request(task, &request)?,
+            };
+            Some(KeyedSubmission {
+                key: if previous.submission.is_some() {
+                    new_submission_key(&task.task_id)?
+                } else {
+                    format!("aft:{}", task.task_id)
+                },
+                created_at_ms: unix_millis(),
+                request_digest: digest,
+                attempts: 0,
+                fresh_key_used: false,
+                resuming: false,
+                reattached: false,
+                refusal: None,
+            })
+        } else {
+            None
+        };
+        let request = match &submission {
+            Some(submission) => request.with_submission_key(&submission.key),
+            None => request,
+        };
+        let mut db = DeferredDbWrites::new(self, task);
+        let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
+        state.metadata.remote.as_mut().unwrap().submission = submission;
+        self.persist_task_locked(task, &state.metadata, &mut db)
+            .map_err(|e| e.to_string())?;
+        Ok(request)
+    }
+
+    /// Retry only a durable key, while both the caller's timeout and the
+    /// executor's key retention are open. Attempts survive AFT restarts too.
+    async fn recover_submission(
+        &self,
+        client: &mut ExecRemoteClient,
+        sink: &mut TaskSink,
+        root: &Path,
+        mut fresh: bool,
+    ) -> Result<Option<exec::RemoteStream>, String> {
+        sink.checkpoint_progress().map_err(|e| e.to_string())?;
+        loop {
+            let mut timings = exec::LaunchTimings::new(Instant::now(), "submission_recovery");
+            let metadata = sink
+                .task
+                .state
+                .lock()
+                .map_err(|_| "task lock poisoned")?
+                .metadata
+                .clone();
+            let remote = metadata.remote.as_ref().unwrap();
+            let Some(mut submission) = remote.submission.clone() else {
+                return Ok(None);
+            };
+            let now = unix_millis();
+            let expires = submission.expires_at(&metadata);
+            if remote.cancel_requested
+                || now >= expires
+                || now < submission.created_at_ms
+                || submission.attempts >= SUBMISSION_RECOVERY_ATTEMPTS
+            {
+                return Ok(None);
+            }
+            let delay = Duration::from_millis(100 << submission.attempts);
+            if delay.as_millis() as u64 >= expires - now {
+                return Ok(None);
+            }
+            tokio::time::sleep(delay).await;
+            if fresh {
+                if submission.fresh_key_used {
+                    return Ok(None);
+                }
+                submission.key = new_submission_key(&sink.task.task_id)?;
+                submission.created_at_ms = unix_millis();
+                submission.fresh_key_used = true;
+            }
+            let mut request = restore_retry_request(&sink.task, &submission.request_digest)?
+                .with_submission_key(&submission.key);
+            if !fresh {
+                if let Some(seq) = remote.last_seq {
+                    request = request.with_resume_from_seq(seq);
+                }
+            }
+            submission.attempts += 1;
+            submission.resuming = !fresh;
+            submission.refusal = None;
+            // Save the attempt and key before dispatch. A crash can then repeat
+            // only the same request, never invent an untracked second job.
+            let mut cancelled = false;
+            sink.commit(|r| {
+                cancelled = r.cancel_requested;
+                if cancelled {
+                    return;
+                }
+                r.submission = Some(submission);
+                r.terminal = None;
+                if fresh {
+                    r.job_id = None;
+                    r.last_seq = None;
+                    r.accepted = false;
+                    r.started = None;
+                }
+            })
+            .map_err(|e| e.to_string())?;
+            if cancelled {
+                return Ok(None);
+            }
+            fresh = false;
+            let remaining = expires.saturating_sub(unix_millis());
+            if remaining == 0 {
+                return Ok(None);
+            }
+            let submit = async {
+                timings.enter("supports_submission_key");
+                if !client.supports_submission_key().await? {
+                    return Ok(None);
+                }
+                let result = run_diagnosed(client, &sink.task, &request, timings).await;
+                #[cfg(test)]
+                let result = if result.is_ok() && tests::lose_submission_replies(root) {
+                    // A round trip confirms dispatch reached the fake executor
+                    // before losing the caller's dispatch result.
+                    let _ = client.status().await;
+                    Err(exec::Error::RecoveryRequired {
+                        resume: None,
+                        reason: "submission dispatch reply lost".into(),
+                    })
+                } else {
+                    result
+                };
+                result.map(Some)
+            };
+            match tokio::time::timeout(Duration::from_millis(remaining), submit).await {
+                Ok(Ok(Some(stream))) => return Ok(Some(stream)),
+                Ok(Ok(None)) => return Ok(None),
+                _ => {
+                    // The SDK reconnects the transport after a daemon restart,
+                    // but its old route is stale. Reopen that route with the
+                    // same caller identity instead of dialing a second client.
+                    if let Ok(Ok(reconnected)) = tokio::time::timeout(
+                        Duration::from_millis(expires.saturating_sub(unix_millis())),
+                        client.reopen_route(subc_protocol::BindIdentity::new(
+                            root.display().to_string(),
+                            remote.harness.clone(),
+                            remote.session.clone(),
+                        )),
+                    )
+                    .await
+                    {
+                        *client = reconnected;
+                    }
+                }
+            }
+        }
     }
 
     fn start_remote_worker(
         &self,
         task: Arc<BgTask>,
         initial: Option<(Result<RunRequest, RemoteRequestError>, LocalFallback)>,
+        timings: Option<exec::LaunchTimings>,
     ) -> Result<(), String> {
         {
             // A finished task whose owed runner cancel the startup pass
@@ -2101,11 +2869,19 @@ impl BgTaskRegistry {
         std::thread::Builder::new()
             .name(format!("aft-remote-{}", task.task_id))
             .spawn(move || {
-                let result = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| e.to_string())
-                    .and_then(|rt| rt.block_on(registry.run_remote_task(task.clone(), initial)));
+                let run = || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| e.to_string())
+                        .and_then(|rt| {
+                            rt.block_on(registry.run_remote_task(task.clone(), initial, timings))
+                        })
+                };
+                #[cfg(test)]
+                let result = tests::capture_remote_launch_logs(&task, run);
+                #[cfg(not(test))]
+                let result = run();
                 if let Err(error) = result {
                     if registry.finish_owner_pause_cancel(&task, Err(error.clone())) {
                         task.remote_launch_ready.store(true, Ordering::Release);
@@ -2160,7 +2936,10 @@ impl BgTaskRegistry {
         &self,
         task: Arc<BgTask>,
         mut initial: Option<(Result<RunRequest, RemoteRequestError>, LocalFallback)>,
+        timings: Option<exec::LaunchTimings>,
     ) -> Result<(), String> {
+        let mut timings =
+            timings.unwrap_or_else(|| exec::LaunchTimings::new(Instant::now(), "recovery_setup"));
         let remote = task
             .state
             .lock()
@@ -2177,6 +2956,7 @@ impl BgTaskRegistry {
             .project_root
             .clone()
             .unwrap_or_else(|| PathBuf::from("/"));
+        timings.enter("worker_setup");
         let mut sink = TaskSink::new(self, task.clone()).map_err(|e| e.to_string())?;
         let mut recovery = ReattachBudget::new(
             &root,
@@ -2187,7 +2967,18 @@ impl BgTaskRegistry {
                 .metadata,
         );
         let mut retry_request = None;
-        if let Some(record) = remote.terminal.as_ref() {
+        let resume_submission = initial.is_none()
+            && remote.resubmit_for_recovery()
+            && (remote.terminal.as_ref().is_some_and(|record| {
+                exec::grade(record) == Verdict::OutcomeUnknown
+                    || matches!(
+                        record.outcome,
+                        Outcome::RefusedBeforeStart {
+                            reason: RefusalReason::SubmissionNeverAccepted
+                        }
+                    )
+            }) || remote.terminal.is_none());
+        if let Some(record) = remote.terminal.as_ref().filter(|_| !resume_submission) {
             let verdict = exec::grade(record);
             if retries_draining(&remote, &verdict) && remote.retry.is_some() {
                 retry_request = self.wait_draining_retry(&task, &root).await?;
@@ -2230,10 +3021,40 @@ impl BgTaskRegistry {
             self.refuse_cd_before_start(&task, message);
             return Ok(());
         }
+        if let Some((
+            Err(RemoteRequestError::Build(exec::Error::ResolveDirectory { kind, path, source })),
+            _,
+        )) = initial.as_ref().filter(|_| remote.explicit_runon)
+        {
+            // A local path error must not be hidden by a failed connection to the runner.
+            let reason = if source.kind() == io::ErrorKind::NotFound {
+                "does not exist"
+            } else {
+                "cannot be resolved"
+            };
+            let os_error = source
+                .raw_os_error()
+                .map(|code| format!("os error {code}"))
+                .unwrap_or_else(|| source.to_string());
+            self.remote_terminal(
+                &task,
+                Verdict::RunLocally {
+                    reason: RefusalReason::Unreachable,
+                    refusal_detail: None,
+                },
+                Some(format!(
+                    "runon refused: {kind} {reason}: {}; command did not run ({os_error})",
+                    path.display()
+                )),
+            );
+            return Ok(());
+        }
+        timings.enter("connect_route");
         let connection = remote
             .connection_file
             .as_ref()
             .ok_or_else(|| "daemon connection file unavailable".to_string());
+        let mut keyed_connect_attempts = 0;
         let mut client = loop {
             let connect = async {
                 match &connection {
@@ -2250,7 +3071,24 @@ impl BgTaskRegistry {
                     Err(error) => Err(error.clone()),
                 }
             };
-            let result = if initial.is_none() && retry_request.is_none() {
+            let result = if resume_submission {
+                let metadata = task
+                    .state
+                    .lock()
+                    .map_err(|_| "task lock poisoned")?
+                    .metadata
+                    .clone();
+                let submission = remote.submission.as_ref().unwrap();
+                let now = unix_millis();
+                let expires = submission.expires_at(&metadata);
+                if now < submission.created_at_ms || now >= expires {
+                    return Err("remote outcome unknown; keyed recovery time limit passed".into());
+                }
+                keyed_connect_attempts += 1;
+                tokio::time::timeout(Duration::from_millis(expires - now), connect)
+                    .await
+                    .unwrap_or_else(|_| Err("remote connection timed out".into()))
+            } else if initial.is_none() && retry_request.is_none() {
                 if let Some(point) = remote.point() {
                     recovery.wait(point.job_id, connect).await?
                 } else {
@@ -2262,6 +3100,16 @@ impl BgTaskRegistry {
             match result {
                 Ok(c) => break c,
                 Err(error) => {
+                    if resume_submission {
+                        if keyed_connect_attempts < SUBMISSION_RECOVERY_ATTEMPTS {
+                            tokio::time::sleep(Duration::from_millis(
+                                100 << (keyed_connect_attempts - 1),
+                            ))
+                            .await;
+                            continue;
+                        }
+                        return Err(format!("remote outcome unknown; keyed recovery connection attempts exhausted: {error}"));
+                    }
                     if retry_request.is_some() {
                         self.refuse_remote_before_dispatch(&task, &error)?;
                         // A pause that landed while reconnecting already ended
@@ -2285,6 +3133,7 @@ impl BgTaskRegistry {
                 }
             }
         };
+        timings.enter("retry_preparation");
         let mut fallback = None;
         let mut hinted: Option<HintedRetry> = None;
         if remote.accepted && !platform_acknowledged(&remote) {
@@ -2293,7 +3142,65 @@ impl BgTaskRegistry {
             }
             return Err("remote outcome unknown: Windows platform was not acknowledged; cancel requested; result not trusted".into());
         }
-        let mut stream = if retry_request.is_some() {
+        let mut stream = if resume_submission {
+            let refusal = remote
+                .submission
+                .as_ref()
+                .and_then(|s| s.refusal.as_ref())
+                .or_else(|| {
+                    remote.terminal.as_ref().filter(|r| {
+                        matches!(
+                            r.outcome,
+                            Outcome::RefusedBeforeStart {
+                                reason: RefusalReason::SubmissionNeverAccepted
+                            }
+                        )
+                    })
+                });
+            if let Some(record) = refusal {
+                if let Verdict::RunLocally {
+                    reason,
+                    refusal_detail,
+                } = exec::grade(record)
+                {
+                    if reason != RefusalReason::SubmissionNeverAccepted {
+                        return Err(format!(
+                            "remote keyed resubmit refused: {}; {}; original job outcome unknown",
+                            String::from(reason),
+                            refusal_detail.unwrap_or_default()
+                        ));
+                    }
+                }
+            }
+            let fresh = refusal.is_some_and(|r| {
+                matches!(
+                    &r.outcome,
+                    Outcome::RefusedBeforeStart {
+                        reason: RefusalReason::SubmissionNeverAccepted
+                    }
+                )
+            });
+            match self
+                .recover_submission(&mut client, &mut sink, &root, fresh)
+                .await?
+            {
+                Some(stream) => stream,
+                None if fresh => {
+                    sink.settle_never_accepted().map_err(|e| e.to_string())?;
+                    return self.restored_remote_fallback(
+                        &task,
+                        &remote,
+                        "submission_never_accepted",
+                        None,
+                    );
+                }
+                None => {
+                    return Err(
+                        "remote outcome unknown; keyed recovery unavailable or exhausted".into(),
+                    )
+                }
+            }
+        } else if retry_request.is_some() {
             let Some((stream, retry)) = self.submit_draining_retry(&client, &task, &root).await?
             else {
                 return Ok(());
@@ -2334,6 +3241,9 @@ impl BgTaskRegistry {
                 .map_err(|e| e.to_string())?;
                 hinted = Some(HintedRetry::start(&root, request.clone()));
             }
+            let request = self
+                .key_fresh_request(&client, &task, request, &mut timings)
+                .await?;
             if task
                 .state
                 .lock()
@@ -2348,7 +3258,7 @@ impl BgTaskRegistry {
                 }
                 return Ok(());
             }
-            match client.run(&request).await {
+            match run_diagnosed(&client, &task, &request, timings).await {
                 Ok(stream) => stream,
                 Err(error) if proves_no_start(&error) => {
                     return if remote.explicit_runon {
@@ -2362,9 +3272,10 @@ impl BgTaskRegistry {
                         )
                     }
                 }
-                Err(error) => {
-                    return Err(format!("remote outcome unknown; not resubmitted: {error}"))
-                }
+                Err(error) => self
+                    .recover_submission(&mut client, &mut sink, &root, false)
+                    .await?
+                    .ok_or_else(|| format!("remote outcome unknown; not resubmitted: {error}"))?,
             }
         } else {
             let point = remote.point().ok_or("remote outcome unknown: acceptance job ID was not persisted; command was not resubmitted")?;
@@ -2427,6 +3338,7 @@ impl BgTaskRegistry {
                     return Err(PRE_ACCEPTANCE_CANCELLED.into());
                 }
             }
+            sink.sent_at = stream.sent_at();
             let result = tokio::select! {
                 result=stream.next(&mut sink)=>result,
                 _=tokio::time::sleep(Duration::from_millis(50))=>{
@@ -2455,12 +3367,43 @@ impl BgTaskRegistry {
             } else {
                 true
             };
+            if let Ok(progress) = &result {
+                recovery.observe(progress);
+            }
             match result {
-                Ok(StreamProgress::Record) => recovery.reset(),
+                Ok(StreamProgress::AdmissionProgress | StreamProgress::Record) => {}
                 Ok(StreamProgress::Complete(Verdict::RunLocally {
                     reason,
                     refusal_detail,
                 })) => {
+                    #[cfg(test)]
+                    if reason == RefusalReason::SubmissionNeverAccepted
+                        && tests::stop_draining_worker(&root)
+                    {
+                        return Ok(());
+                    }
+                    let submission = task
+                        .state
+                        .lock()
+                        .map_err(|_| "task lock poisoned")?
+                        .metadata
+                        .remote
+                        .as_ref()
+                        .and_then(|r| r.submission.clone());
+                    if let Some(submission) = submission {
+                        if reason == RefusalReason::SubmissionNeverAccepted {
+                            if let Some(next) = self
+                                .recover_submission(&mut client, &mut sink, &root, true)
+                                .await?
+                            {
+                                stream = next;
+                                continue;
+                            }
+                            sink.settle_never_accepted().map_err(|e| e.to_string())?;
+                        } else if submission.resuming {
+                            return Err(format!("remote keyed resubmit refused: {}; {}; original job outcome unknown", String::from(reason), refusal_detail.unwrap_or_default()));
+                        }
+                    }
                     let verdict = Verdict::RunLocally {
                         reason: reason.clone(),
                         refusal_detail: refusal_detail.clone(),
@@ -2537,13 +3480,52 @@ impl BgTaskRegistry {
                     return result;
                 }
                 Ok(StreamProgress::Complete(verdict)) => {
+                    #[cfg(test)]
+                    if verdict == Verdict::OutcomeUnknown && tests::stop_draining_worker(&root) {
+                        return Ok(());
+                    }
                     if !platform_ok {
                         return Err("remote outcome unknown: Windows platform was not acknowledged; result not trusted".into());
+                    }
+                    if verdict == Verdict::OutcomeUnknown {
+                        if let Some(next) = self
+                            .recover_submission(&mut client, &mut sink, &root, false)
+                            .await?
+                        {
+                            stream = next;
+                            continue;
+                        }
                     }
                     self.remote_terminal(&task, verdict, None);
                     return Ok(());
                 }
                 Err(error) => {
+                    #[cfg(test)]
+                    if stream
+                        .resume_point()
+                        .is_some_and(|point| point.gap_recovery.is_some())
+                        && tests::stop_draining_worker(&root)
+                    {
+                        return Ok(());
+                    }
+                    let keyed = task
+                        .state
+                        .lock()
+                        .map_err(|_| "task lock poisoned")?
+                        .metadata
+                        .remote
+                        .as_ref()
+                        .is_some_and(RemoteTask::resubmit_for_recovery);
+                    if keyed {
+                        if let Some(next) = self
+                            .recover_submission(&mut client, &mut sink, &root, false)
+                            .await?
+                        {
+                            stream = next;
+                            continue;
+                        }
+                        return Err(format!("remote outcome unknown; keyed recovery unavailable or exhausted: {error}"));
+                    }
                     let Some(point) = stream.resume_point() else {
                         return Err(format!("remote outcome unknown; not resubmitted: {error}"));
                     };
@@ -2552,8 +3534,8 @@ impl BgTaskRegistry {
                     if stream.received_frame() {
                         recovery.reset();
                     }
-                    // A known accepted job is recovered only by attach. Never
-                    // convert a lost stream into another run or local fallback.
+                    // Without a submission key, only attach can recover an
+                    // accepted job without risking a second execution.
                     recovery.pause(point.job_id).await?;
                     stream = match self
                         .attach_remote(&mut client, point, &remote, &root, &task, &mut recovery)
@@ -2650,12 +3632,16 @@ impl BgTaskRegistry {
         task: &Arc<BgTask>,
         root: &Path,
     ) -> Result<Option<(exec::RemoteStream, HintedRetry)>, String> {
+        let mut timings = exec::LaunchTimings::new(Instant::now(), "draining_retry");
         // Recheck after connecting: reconnect time also consumes the retry budget.
         let Some(request) = self.wait_draining_retry(task, root).await? else {
             return Ok(None);
         };
         #[cfg(test)]
         tests::draining_gate(root, tests::DrainingGate::BeforeResubmit).await;
+        let keyed_request = self
+            .key_fresh_request(client, task, request.clone(), &mut timings)
+            .await?;
         {
             let mut db = DeferredDbWrites::new(self, task);
             let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
@@ -2691,7 +3677,7 @@ impl BgTaskRegistry {
         }
         // A fresh submission gets its own signer-retry allowance, counted from now.
         let hinted = HintedRetry::start(root, request);
-        match resubmit(client, &hinted.request, root).await {
+        match resubmit(client, task, &keyed_request, root, timings).await {
             Ok(stream) => Ok(Some((stream, hinted))),
             Err(error) if proves_no_start(&error) => {
                 #[cfg(test)]
@@ -2707,9 +3693,10 @@ impl BgTaskRegistry {
     }
 
     /// Act on a refusal the runner marked transient with a retry hint: wait
-    /// for the hint, then send the same request again. The refusal is reported
-    /// unchanged when it carries no usable hint, the hint is longer than the
-    /// job's admission time left, that time has run out by the moment of
+    /// for the hint (at least five seconds) plus jitter, then send the same
+    /// request again. The refusal is reported unchanged when it carries no
+    /// usable hint, the jittered delay exceeds the job's admission time left,
+    /// that time has run out by the moment of
     /// resending, or the job was already resubmitted
     /// [`HINTED_RETRY_MAX_RESUBMITS`] times. A kill during the wait ends the
     /// task at once.
@@ -2720,6 +3707,7 @@ impl BgTaskRegistry {
         root: &Path,
         retry: &mut HintedRetry,
     ) -> Result<HintedRetryStep, String> {
+        let mut timings = exec::LaunchTimings::new(Instant::now(), "hinted_retry");
         let (terminal, started) = {
             let state = task.state.lock().map_err(|_| "task lock poisoned")?;
             let remote = state
@@ -2743,8 +3731,9 @@ impl BgTaskRegistry {
         if retry.resubmits >= HINTED_RETRY_MAX_RESUBMITS {
             return Ok(HintedRetryStep::Surface);
         }
+        let delay = draining_delay_ms(1, Some(hint), retry_jitter_for_task(task));
         let now = draining_now_ms(root);
-        if hint > retry.deadline_ms.saturating_sub(now) {
+        if delay > retry.deadline_ms.saturating_sub(now) {
             return Ok(HintedRetryStep::Surface);
         }
         let reason = match &terminal.outcome {
@@ -2752,12 +3741,12 @@ impl BgTaskRegistry {
             _ => String::new(),
         };
         crate::slog_info!(
-            "runon: resubmitting job {} after its refusal before start (reason={reason} detail={} retry_after_ms={hint}); resubmission {} of at most {HINTED_RETRY_MAX_RESUBMITS}",
+            "runon: resubmitting job {} after its refusal before start (reason={reason} detail={} retry_after_ms={hint} delay_ms={delay}); resubmission {} of at most {HINTED_RETRY_MAX_RESUBMITS}",
             terminal.job_id,
             terminal.refusal_detail().unwrap_or_default(),
             retry.resubmits + 1,
         );
-        let until = now.saturating_add(hint);
+        let until = now.saturating_add(delay);
         // Stands in for the daemon stopping while it waits: the worker ends
         // and leaves only the refusal it has already saved.
         #[cfg(test)]
@@ -2793,6 +3782,9 @@ impl BgTaskRegistry {
         }
         #[cfg(test)]
         tests::draining_gate(root, tests::DrainingGate::BeforeHintedResubmit).await;
+        let request = self
+            .key_fresh_request(client, task, retry.request.clone(), &mut timings)
+            .await?;
         {
             let mut db = DeferredDbWrites::new(self, task);
             let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
@@ -2807,9 +3799,8 @@ impl BgTaskRegistry {
                 self.cancel_draining_retry(task);
                 return Ok(HintedRetryStep::Ended);
             }
-            // The wait can end late, and a zero hint does not wait at all, so
-            // check the admission time again right before sending: once it has
-            // run out, report the saved refusal as it is.
+            // The wait can end late, so check the admission time again right
+            // before sending: once it has run out, report the saved refusal as it is.
             if draining_now_ms(root) >= retry.deadline_ms {
                 return Ok(HintedRetryStep::Surface);
             }
@@ -2827,7 +3818,7 @@ impl BgTaskRegistry {
                 .map_err(|e| e.to_string())?;
         }
         retry.resubmits += 1;
-        match resubmit(client, &retry.request, root).await {
+        match resubmit(client, task, &request, root, timings).await {
             Ok(stream) => Ok(HintedRetryStep::Resubmitted(stream)),
             Err(error) if proves_no_start(&error) => {
                 #[cfg(test)]
@@ -2919,8 +3910,12 @@ impl BgTaskRegistry {
         let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
         let metadata = state.metadata.clone();
         // Automatic prefix routing may fall back; an explicit remote demand
-        // must fail before any local launch state or process is created.
-        if metadata.remote.as_ref().is_some_and(|r| r.explicit_runon) {
+        // must fail before any local launch state or process is created. A
+        // refusal of return_paths is final too: running the command here
+        // would not copy back the files it was asked for.
+        if metadata.remote.as_ref().is_some_and(|r| r.explicit_runon)
+            || return_paths_unsupported(reason, refusal_detail)
+        {
             drop(state);
             drop(db);
             return self.refuse_remote_executor(task, reason, refusal_detail);
@@ -2968,6 +3963,15 @@ impl BgTaskRegistry {
             "ran locally on {}: remote refused: {reason}",
             local_os_name()
         ));
+        if metadata
+            .remote
+            .as_ref()
+            .is_some_and(|remote| !remote.return_paths.is_empty())
+        {
+            let note = state.metadata.execution_note.as_mut().unwrap();
+            note.push('\n');
+            note.push_str(super::return_files::LOCAL_RUN_NOTE);
+        }
         if let Some(changes) = metadata
             .remote
             .as_ref()
@@ -2990,7 +3994,8 @@ impl BgTaskRegistry {
             .map_err(|e| e.to_string())?;
         #[cfg(test)]
         tests::after_local_fallback_marker(&task.task_id);
-        let child = spawn_detached_child(
+        let mut memory_monitor = Self::prepare_memory_limit(local.memory_limit_mib, &task.task_id)?;
+        let mut child = spawn_detached_child(
             &local.plan,
             &metadata.command,
             super::super::BashShell::Bash,
@@ -3000,13 +4005,42 @@ impl BgTaskRegistry {
             &local.env,
             state.io_handles.as_mut().ok_or("task handles absent")?,
             local.capture_pipeline,
+            memory_monitor.is_some(),
             local.linux_scope,
-            // local_fallback_started was persisted above before process creation;
-            // a later failed PID write reports unknown, never "did not run" or a
-            // second execution. This caller has no ordinary-local "run" sender,
-            // so its wrapper must start without that identity-checkpoint gate.
-            LocalIdentityGate::CommittedFallback,
+            // The fallback's execution marker is already durable. Only capped
+            // commands need a second gate here, to attach the memory container.
+            if memory_monitor.is_some() {
+                LocalIdentityGate::Required
+            } else {
+                LocalIdentityGate::CommittedFallback
+            },
         )?;
+        if let Some(mut monitor) = memory_monitor.take() {
+            if let Err(error) = monitor.attach(child.id()) {
+                super::super::process::terminate_pgid(child.id() as i32, None);
+                let _ = child.wait();
+                return Err(error);
+            }
+            state.metadata.memory_policy = Some(monitor.policy.clone());
+            // Persist the chosen enforcer before the gated fallback command can run.
+            if let Err(error) = self.persist_task_locked(task, &state.metadata, &mut db) {
+                drop(child.stdin.take());
+                let _ = child.wait();
+                return Err(error.to_string());
+            }
+            self.inner
+                .memory_monitors
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(task.task_id.clone(), monitor);
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .ok_or("memory cap launch gate missing")?
+                .write_all(b"run\n")
+                .map_err(|error| error.to_string())?;
+        }
         #[cfg(test)]
         if tests::simulate_crash_before_local_pid(&task.task_id) {
             return Ok(());
@@ -3045,19 +4079,20 @@ impl BgTaskRegistry {
     ) -> Result<(), String> {
         // Decide before even restoring a local launch plan: this also covers
         // a refusal persisted just before the previous AFT process stopped.
-        if remote.explicit_runon {
+        if remote.explicit_runon || return_paths_unsupported(reason, refusal_detail) {
             return self.refuse_remote_executor(task, reason, refusal_detail);
         }
         let restore = (|| {
             let layout = resolve_task_layout(&task.paths.session_dir, &task.task_id)
                 .map_err(|e| e.to_string())?;
-            let (plan, shell_path, env, linux_scope) = crate::sandbox_spawn::restore_local_launch(
-                &layout,
-                remote
-                    .fallback_digest
-                    .as_deref()
-                    .ok_or("local snapshot digest absent")?,
-            )?;
+            let (plan, shell_path, env, linux_scope, memory_limit_mib) =
+                crate::sandbox_spawn::restore_local_launch(
+                    &layout,
+                    remote
+                        .fallback_digest
+                        .as_deref()
+                        .ok_or("local snapshot digest absent")?,
+                )?;
             let metadata = task
                 .state
                 .lock()
@@ -3083,6 +4118,7 @@ impl BgTaskRegistry {
                     env,
                     capture_pipeline,
                     linux_scope,
+                    memory_limit_mib,
                 },
                 reason,
                 refusal_detail,
@@ -3141,8 +4177,11 @@ impl BgTaskRegistry {
         if holders.is_empty() {
             return None;
         }
-        let workspace =
-            |metadata: &PersistedTask| worktree_root_containing(&metadata.workdir).ok().flatten();
+        let workspace = |metadata: &PersistedTask| {
+            worktree_root_containing(&metadata.workdir, exec::DirectoryKind::WorkingDirectory)
+                .ok()
+                .flatten()
+        };
         let own_workspace = workspace(&task.state.lock().ok()?.metadata)?;
         let tasks: Vec<_> = self.inner.tasks.lock().ok()?.values().cloned().collect();
         tasks.into_iter().find_map(|other| {
@@ -3212,8 +4251,8 @@ impl BgTaskRegistry {
     }
 
     fn remote_terminal(&self, task: &Arc<BgTask>, verdict: Verdict, error: Option<String>) {
-        // Known terminal outcomes keep their status. An unknown outcome is reported
-        // as uncertain, never automatically resubmitted.
+        // Known terminal outcomes keep their status. Unknown outcomes reach
+        // this point only after recovery was unavailable or exhausted.
         let refused = matches!(&verdict, Verdict::RunLocally { .. });
         let unknown = matches!(&verdict, Verdict::OutcomeUnknown);
         let (status, code, mut reason) = terminal_outcome(verdict, error);
@@ -3366,6 +4405,37 @@ impl BgTaskRegistry {
     }
 
     pub(super) fn kill_remote_task(&self, task: &Arc<BgTask>) -> Result<BgTaskSnapshot, String> {
+        let metadata = task
+            .lock_state()
+            .map_err(|_| "task lock poisoned")?
+            .metadata
+            .clone();
+        if let Some(job_id) = unknown_remote_cancel_job(&metadata) {
+            // The original follower has stopped. Probe cancellation separately,
+            // without replacing its saved unknown outcome with an acknowledgement.
+            let bound = remote_kill_settle_bound().min(ReattachBudget::until_job_end(&metadata).0);
+            let result = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|error| error.to_string())?;
+                        runtime.block_on(async {
+                            tokio::time::timeout(bound, cancel_unknown_remote(&metadata, job_id))
+                                .await
+                                .map_err(|_| "runner confirmation timed out".to_string())?
+                        })
+                    })
+                    .join()
+            })
+            .unwrap_or_else(|_| Err("runner cancellation probe stopped".into()));
+            let mut snapshot = self.snapshot_with_terminal_cache(task, 8 * 1024);
+            snapshot.remote_cancel = Some(result.unwrap_or_else(|error| {
+                format!("remote cancellation unconfirmed; outcome is still unknown: {error}")
+            }));
+            return Ok(snapshot);
+        }
         if !self.record_remote_cancel(task)? {
             return self.kill(&task.task_id, &task.session_id);
         }
@@ -3488,6 +4558,115 @@ impl BgTaskRegistry {
             self.remote_terminal(task, Verdict::Cancelled, None);
         }
         true
+    }
+}
+
+/// A locally terminal unknown outcome is not proof that the runner stopped.
+/// Use the latest submission's queue/run bounds only to limit cancellation
+/// attempts, never as evidence of a known outcome.
+#[cfg(unix)]
+pub(super) fn unknown_remote_cancel_job(metadata: &PersistedTask) -> Option<Uuid> {
+    if metadata.status != super::BgTaskStatus::FateUnknown
+        || ReattachBudget::until_job_end(metadata).0.is_zero()
+    {
+        return None;
+    }
+    let remote = metadata.remote.as_ref()?;
+    if remote
+        .terminal
+        .as_ref()
+        .is_some_and(|terminal| terminal.execution_ended())
+    {
+        return None;
+    }
+    remote
+        .job_id
+        .or_else(|| remote.terminal.as_ref().map(|terminal| terminal.job_id))
+}
+
+/// Collects a new runner terminal record without modifying the finished task's artifacts.
+#[cfg(unix)]
+#[derive(Default)]
+struct CancelProbe {
+    terminal: Option<TerminalRecord>,
+}
+
+#[cfg(unix)]
+impl OutputSink for CancelProbe {
+    fn accepted(&mut self, _: &Accepted) -> io::Result<()> {
+        Ok(())
+    }
+    fn output(&mut self, _: u64, _: OutputStream, _: &[u8]) -> io::Result<()> {
+        Ok(())
+    }
+    fn truncated(&mut self, _: u64) -> io::Result<()> {
+        Ok(())
+    }
+    fn unknown_output(&mut self, _: u64, _: &[u8]) -> io::Result<()> {
+        Ok(())
+    }
+    fn gap_recovery(&mut self, recovery: &exec::GapRecovery) -> io::Result<()> {
+        self.terminal = Some(recovery.terminal.clone());
+        Ok(())
+    }
+    fn terminal(&mut self, record: &TerminalRecord, _: &Verdict) -> io::Result<()> {
+        self.terminal = Some(record.clone());
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+async fn cancel_unknown_remote(metadata: &PersistedTask, job_id: Uuid) -> Result<String, String> {
+    let remote = metadata
+        .remote
+        .as_ref()
+        .ok_or("remote metadata unavailable")?;
+    let connection = remote
+        .connection_file
+        .as_ref()
+        .ok_or("no runner connection was saved")?;
+    let root = metadata.project_root.as_deref().unwrap_or(Path::new("/"));
+    let client = ExecRemoteClient::connect(
+        connection,
+        subc_protocol::BindIdentity::new(
+            root.display().to_string(),
+            remote.harness.clone(),
+            remote.session.clone(),
+        ),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    client
+        .cancel_job(job_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    // A cancel reply only acknowledges intent. Do not reuse a terminal record
+    // from gap recovery: the attach after cancellation must observe a new result.
+    let mut stream = client
+        .attach(ResumePoint {
+            job_id,
+            last_seq: remote.last_seq,
+            gap_recovery: None,
+            last_output_seq: remote.last_output_seq(),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut probe = CancelProbe::default();
+    loop {
+        let progress = stream.next(&mut probe).await;
+        if let Some(terminal) = probe.terminal.as_ref() {
+            return Ok(match exec::grade(terminal) {
+                Verdict::Cancelled | Verdict::CancelKilled => "runner confirmed cancellation",
+                Verdict::Exited { .. }
+                | Verdict::Signalled { .. }
+                | Verdict::DeadlineKilled
+                | Verdict::RunLocally { .. } => "runner reports job already ended",
+                _ if terminal.execution_ended() => "runner reports job already ended",
+                _ => "remote cancellation requested; outcome is still unknown",
+            }
+            .into());
+        }
+        progress.map_err(|error| error.to_string())?;
     }
 }
 
@@ -4076,11 +5255,12 @@ fn build_remote_request(
     timeout_seconds: u64,
     preset: &exec::PresetParams,
 ) -> Result<RunRequest, exec::Error> {
-    let session_root = session_root
-        .canonicalize()
-        .map_err(|error| exec::Error::Protocol(error.to_string()))?;
-    let session_worktree = worktree_root_containing(&session_root)?.unwrap_or(session_root);
-    let Some(worktree_root) = worktree_root_containing(cwd)? else {
+    let session_root = exec::DirectoryKind::ProjectFolder.canonicalize(session_root)?;
+    let session_worktree =
+        worktree_root_containing(&session_root, exec::DirectoryKind::ProjectFolder)?
+            .unwrap_or(session_root);
+    let Some(worktree_root) = worktree_root_containing(cwd, exec::DirectoryKind::WorkingDirectory)?
+    else {
         return Err(workdir_outside_session_repository(
             cwd,
             None,
@@ -4108,17 +5288,15 @@ fn build_remote_request(
 }
 
 #[cfg(unix)]
-fn worktree_root_containing(path: &Path) -> Result<Option<PathBuf>, exec::Error> {
-    let path = path
-        .canonicalize()
-        .map_err(|error| exec::Error::Protocol(error.to_string()))?;
+fn worktree_root_containing(
+    path: &Path,
+    kind: exec::DirectoryKind,
+) -> Result<Option<PathBuf>, exec::Error> {
+    let path = kind.canonicalize(path)?;
     for ancestor in path.ancestors() {
         let git_marker = ancestor.join(".git");
         if git_marker.is_file() || git_marker.is_dir() {
-            return ancestor
-                .canonicalize()
-                .map(Some)
-                .map_err(|error| exec::Error::Protocol(error.to_string()));
+            return kind.canonicalize(ancestor).map(Some);
         }
     }
     Ok(None)
@@ -4170,10 +5348,54 @@ fn repository_root(root: &Path) -> PathBuf {
         .unwrap_or_else(|| root.into())
 }
 
+/// Why records between the saved cursor and a later one are missing.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum MissingRecords {
+    /// The runner trimmed them from its retained history.
+    NoLongerRetained,
+    /// They never arrived, even after the re-attaches gap recovery makes.
+    NeverDelivered,
+    /// They never arrived and precede an expired replay's manifest without
+    /// chunk counts whose derived count did not match.
+    ExpiredGapUnverified,
+}
+
+/// The agent-facing line for a gap before an expired replay's manifest that
+/// AFT could not verify: the runner sent no per-file chunk counts, the count
+/// AFT derived from the file sizes did not match, and re-attaching did not
+/// fill the gap. It is kept apart from lost output in
+/// `RemoteTask::expired_gap_unverified`. `{first}` and `{last}` are the seqs;
+/// a single record reads "records N to N", like the lost-output line beside
+/// it.
+#[cfg(unix)]
+pub(crate) const EXPIRED_GAP_UNVERIFIED_TEXT: &str = "records {first} to {last} could not be verified: they may be expired returned-file data or lost output, and the runner did not report chunk counts";
+
+#[cfg(unix)]
+fn expired_gap_unverified_line(first: u64, last: u64) -> String {
+    EXPIRED_GAP_UNVERIFIED_TEXT
+        .replace("{first}", &first.to_string())
+        .replace("{last}", &last.to_string())
+}
+
 #[cfg(unix)]
 fn append_output_loss(metadata: &mut PersistedTask) {
     append_environment_disclosure(metadata);
     append_executor_environment_disclosure(metadata);
+    let unverified = metadata
+        .remote
+        .as_ref()
+        .map(|remote| remote.expired_gap_unverified.clone())
+        .unwrap_or_default();
+    for (first, last) in unverified {
+        let warning = expired_gap_unverified_line(first, last);
+        let note = metadata
+            .execution_note
+            .get_or_insert_with(|| format!("remote execution on {RUNNER_ID}"));
+        if !note.contains(&warning) {
+            note.push_str(&format!("\n{warning}"));
+        }
+    }
     for (first, last) in &metadata.incomplete_output {
         let reason = if metadata
             .remote
@@ -4204,18 +5426,46 @@ fn append_output_loss(metadata: &mut PersistedTask) {
 pub(crate) fn remote_report(
     metadata: &crate::bash_background::persistence::PersistedTask,
 ) -> Option<String> {
-    let terminal = metadata.remote.as_ref()?.terminal.as_ref()?;
+    let remote = metadata.remote.as_ref()?;
+    let terminal = remote.terminal.as_ref()?;
     if matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. })
         || terminal.ran == Some(Ran::None)
     {
         return None;
     }
-    render_terminal_report(terminal)
+    let returned_files = remote.returned_files.as_deref().unwrap_or_default();
+    // A file that was copied back is not also listed as left on the server.
+    // ck-motor reports `workspace_changes` relative to the checkout root with
+    // `/` separators on every platform. On Linux the list comes from `git
+    // status --porcelain -z --untracked-files=all` (renames as their
+    // destination, untracked files included); on Windows it lists every
+    // changed file inside the checkout, git-ignored ones too. Both name a
+    // returned file by its checkout-relative path, so the same filter applies.
+    let copied_back: Vec<&str> = returned_files
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.outcome,
+                super::return_files::ReturnOutcome::Returned { .. }
+            )
+        })
+        .filter_map(|entry| entry.checkout_path.as_deref())
+        .collect();
+    let returned =
+        (!returned_files.is_empty()).then(|| super::return_files::render_report(returned_files));
+    match (returned, render_terminal_report(terminal, &copied_back)) {
+        (Some(returned), Some(report)) => Some(format!("{returned}\n{report}")),
+        (returned, report) => returned.or(report),
+    }
 }
 
-/// [`remote_report`] for one terminal record.
+/// [`remote_report`] for one terminal record. `copied_back` names files,
+/// relative to the checkout as the runner reports them, that were copied back
+/// to this machine; they are left out of the changed-files list. The
+/// untracked-files list is printed as sent: ck-motor does not send it, and
+/// the contract does not state its path base.
 #[cfg(unix)]
-fn render_terminal_report(terminal: &TerminalRecord) -> Option<String> {
+fn render_terminal_report(terminal: &TerminalRecord, copied_back: &[&str]) -> Option<String> {
     // Paths come from another machine; escaping keeps one per line.
     fn path(path: &str) -> String {
         path.escape_default().to_string()
@@ -4226,12 +5476,19 @@ fn render_terminal_report(terminal: &TerminalRecord) -> Option<String> {
     let mut blocks: Vec<String> = Vec::new();
     let mut unreported: Vec<&str> = Vec::new();
 
-    match terminal.workspace_changes.as_deref() {
-        Some([]) => {}
+    let left_on_server = |paths: &'_ [String]| -> Vec<String> {
+        paths
+            .iter()
+            .filter(|path| !copied_back.contains(&path.as_str()))
+            .cloned()
+            .collect()
+    };
+    match terminal.workspace_changes.as_deref().map(left_on_server) {
+        Some(changes) if changes.is_empty() => {}
         Some(changes) => {
             let mut block =
                 String::from("These files changed on the server and were NOT copied back:");
-            for changed in changes {
+            for changed in &changes {
                 block.push_str(&format!("\n  {}", path(changed)));
             }
             blocks.push(block);
@@ -4271,7 +5528,12 @@ fn render_terminal_report(terminal: &TerminalRecord) -> Option<String> {
             blocks.push(block);
         }
         Some(_) => {}
-        None => unreported.push("git state"),
+        // The build-server runner never fills the Git, untracked-file, or
+        // ignored-write fields: its checkout is read-only and every file
+        // change arrives in `workspace_changes`. An absent field therefore
+        // carries no information, so it stays silent instead of printing a
+        // "not reported" line.
+        None => {}
     }
 
     match &terminal.untracked_files {
@@ -4288,7 +5550,9 @@ fn render_terminal_report(terminal: &TerminalRecord) -> Option<String> {
             blocks.push(block);
         }
         Some(_) => {}
-        None => unreported.push("untracked files"),
+        // Same as above: an absent untracked-file report carries no
+        // information from this runner, so it stays silent.
+        None => {}
     }
 
     match &terminal.ignored_writes {
@@ -4310,7 +5574,9 @@ fn render_terminal_report(terminal: &TerminalRecord) -> Option<String> {
             blocks.push(block);
         }
         Some(_) => {}
-        None => unreported.push("ignored writes"),
+        // Same as above: an absent ignored-write report carries no
+        // information from this runner, so it stays silent.
+        None => {}
     }
 
     for field in unreported {
@@ -4380,8 +5646,10 @@ fn append_executor_environment_disclosure(metadata: &mut PersistedTask) {
 #[cfg(unix)]
 async fn resubmit(
     client: &ExecRemoteClient,
+    task: &Arc<BgTask>,
     request: &RunRequest,
     _root: &Path,
+    timings: exec::LaunchTimings,
 ) -> Result<exec::RemoteStream, exec::Error> {
     #[cfg(test)]
     if tests::refuse_resubmission(_root) {
@@ -4389,7 +5657,26 @@ async fn resubmit(
             "test: resubmission failed before it was sent".into(),
         ));
     }
-    client.run(request).await
+    run_diagnosed(client, task, request, timings).await
+}
+
+#[cfg(unix)]
+async fn run_diagnosed(
+    client: &ExecRemoteClient,
+    task: &Arc<BgTask>,
+    request: &RunRequest,
+    timings: exec::LaunchTimings,
+) -> Result<exec::RemoteStream, exec::Error> {
+    client
+        .run_with_diagnostics(
+            request,
+            Some(exec::RunDiagnostics {
+                task_id: &task.task_id,
+                session: &task.session_id,
+                timings,
+            }),
+        )
+        .await
 }
 
 #[cfg(unix)]
@@ -4403,9 +5690,15 @@ fn proves_no_start(error: &exec::Error) -> bool {
                 | subc_client_rs::CallError::CapabilityAmbiguous { .. }
                 | subc_client_rs::CallError::InvalidCapabilityIdentifier { .. }
         ) | exec::Error::Protocol(_)
+            | exec::Error::MissingCapability { .. }
     )
 }
 
 #[cfg(all(test, unix))]
 #[path = "remote_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+pub(crate) use tests::{
+    captured_task_after_losing_replay_for_test, uncaptured_terminal_before_render_for_test,
+};

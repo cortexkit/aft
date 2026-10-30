@@ -120,6 +120,30 @@ fn worker_rust_sources_keep_stored_grants() {
 }
 
 #[test]
+fn worker_rust_sources_are_ordinary_policy_not_saved_scope_grants() {
+    let home = rust_home();
+    let shared = home.base.join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    let _guard = scope_grants_guard(Some(ScopeGrantsDenial::NotSessionHost));
+    let mut policy = home.policy(true);
+    policy.install_scope_grants_from(
+        vec![AccessGrant {
+            path: shared.clone(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        }],
+        true,
+        &home.sources,
+    );
+    assert!(policy.grants.is_empty());
+    assert_eq!(
+        read(&policy, &home.cargo.join(REGISTRY_FILE)),
+        AccessDecision::Allow
+    );
+    assert_eq!(read(&policy, &shared), AccessDecision::Ask);
+}
+
+#[test]
 fn worker_rust_sources_refuse_writes() {
     let home = rust_home();
     let worker = home.policy(true);

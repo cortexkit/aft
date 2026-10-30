@@ -13,9 +13,9 @@ use crate::callgraph::{resolve_module_path, resolve_reexported_symbol_target};
 use crate::calls::extract_type_references;
 use crate::imports::{parse_imports, specifier_imported_name, specifier_local_name};
 use crate::inspect::job::{
-    canonicalize_normalized, dead_code_skipped_language, is_test_tree_file, language_name,
-    ExcludedTestTally, CALLGRAPH_PROVENANCE_REEXPORT, CALLGRAPH_PROVENANCE_TREESITTER,
-    DISPATCHED_CALLEE_SEPARATOR,
+    canonicalize_normalized as canonicalize_uncached, dead_code_skipped_language,
+    is_test_tree_file, language_name, ExcludedTestTally, CALLGRAPH_PROVENANCE_REEXPORT,
+    CALLGRAPH_PROVENANCE_TREESITTER, DISPATCHED_CALLEE_SEPARATOR,
 };
 use crate::inspect::oxc_engine::{
     analyze_file_facts, AnalyzeOptions, DynamicImportFact, ExportFact, FileFacts, FileId,
@@ -41,6 +41,64 @@ const RUST_MACRO_REF_SHAPE_STRUCT: &str = "struct";
 const TOP_LEVEL_SYMBOL: &str = "<top-level>";
 
 type ExportNode = (String, String);
+
+// A scan and its rollup share physical path identities, including on Rayon
+// workers. Never retain them across jobs: a symlink or missing file can change
+// between requests, and the next job must resolve it again.
+#[derive(Default)]
+struct CanonicalPaths {
+    paths: parking_lot::RwLock<HashMap<PathBuf, PathBuf>>,
+    relative: parking_lot::RwLock<HashMap<PathBuf, HashMap<PathBuf, String>>>,
+}
+
+thread_local! {
+    static CANONICAL_PATHS: std::cell::RefCell<Option<Arc<CanonicalPaths>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn current_canonical_paths() -> Option<Arc<CanonicalPaths>> {
+    CANONICAL_PATHS.with(|slot| slot.borrow().clone())
+}
+
+struct CanonicalPathsScope(Option<Arc<CanonicalPaths>>);
+
+impl Drop for CanonicalPathsScope {
+    fn drop(&mut self) {
+        CANONICAL_PATHS.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
+fn canonical_paths_scope(paths: Option<Arc<CanonicalPaths>>) -> CanonicalPathsScope {
+    CanonicalPathsScope(CANONICAL_PATHS.with(|slot| slot.replace(paths)))
+}
+
+fn with_canonical_paths<T>(paths: Option<Arc<CanonicalPaths>>, run: impl FnOnce() -> T) -> T {
+    let _restore = canonical_paths_scope(paths);
+    run()
+}
+
+fn with_job_canonical_paths<T>(run: impl FnOnce() -> T) -> T {
+    // Rayon can execute an independent job while a parent job is waiting.
+    // Only explicitly dispatched file items inherit the canonical-path memo;
+    // other Rayon jobs do not.
+    with_canonical_paths(Some(Arc::default()), run)
+}
+
+fn canonicalize_normalized(path: &Path) -> PathBuf {
+    match current_canonical_paths() {
+        Some(paths) => {
+            if let Some(canonical) = paths.paths.read().get(path) {
+                return canonical.clone();
+            }
+            paths
+                .paths
+                .write()
+                .entry(path.to_path_buf())
+                .or_insert_with(|| canonicalize_uncached(path))
+                .clone()
+        }
+        None => canonicalize_uncached(path),
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct GraphTargets {
@@ -181,6 +239,7 @@ struct ImportedExportLiveness {
 
 #[derive(Debug, Default)]
 struct FileAnalysis {
+    freshness: Option<crate::cache_freshness::FileFreshness>,
     rust_api: Option<RustApiFacts>,
     go_dispatch: Option<GoDispatchFacts>,
     raw_imports: Vec<RawImportContribution>,
@@ -269,6 +328,13 @@ impl DeadCodeFileAnalyzer {
             return FileAnalysis::default();
         }
 
+        let metadata = fs::metadata(file).ok();
+        #[cfg(test)]
+        AFTER_SOURCE_METADATA.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
         let Ok(source) = crate::project_content::read_to_string(file) else {
             return FileAnalysis::default();
         };
@@ -377,7 +443,14 @@ impl DeadCodeFileAnalyzer {
             Vec::new()
         };
 
-        FileAnalysis {
+        let analysis = FileAnalysis {
+            freshness: Some(crate::cache_freshness::FileFreshness {
+                mtime: metadata
+                    .and_then(|metadata| metadata.modified().ok())
+                    .unwrap_or(std::time::UNIX_EPOCH),
+                size: source.len() as u64,
+                content_hash: cache_freshness::hash_bytes(source.as_bytes()),
+            }),
             rust_api,
             go_dispatch: (lang == LangId::Go).then(|| {
                 let mut facts = tree
@@ -411,7 +484,14 @@ impl DeadCodeFileAnalyzer {
             globs_parent_module,
             trait_impl_methods,
             type_ref_names,
-        }
+        };
+        #[cfg(test)]
+        AFTER_ANALYSIS.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        analysis
     }
 
     fn parse_source(&mut self, lang: LangId, source: &str) -> Option<tree_sitter::Tree> {
@@ -443,6 +523,14 @@ pub(crate) fn run_dead_code_scan_with_oxc(
 }
 
 fn run_dead_code_scan_with_oxc_started(
+    job: &InspectJob,
+    oxc_result: Option<&OxcEngineResult>,
+    started: Instant,
+) -> InspectResult {
+    with_job_canonical_paths(|| run_dead_code_scan_body(job, oxc_result, started))
+}
+
+fn run_dead_code_scan_body(
     job: &InspectJob,
     oxc_result: Option<&OxcEngineResult>,
     started: Instant,
@@ -486,6 +574,7 @@ fn run_dead_code_scan_with_oxc_started(
         .unwrap_or_default();
 
     let cancellation = crate::executor::current_job_cancellation();
+    let canonical_paths = current_canonical_paths();
     let contributions = job
         .scope_files
         .par_iter()
@@ -497,15 +586,17 @@ fn run_dead_code_scan_with_oxc_started(
                 return None;
             }
             let mut file_analyzer = DeadCodeFileAnalyzer::default();
-            Some(gather_file_contribution(
-                job,
-                file,
-                &fallback_exports_by_file,
-                &oxc_facts_by_file,
-                &oxc_parse_errors_by_file,
-                &oxc_skipped_files,
-                &mut file_analyzer,
-            ))
+            Some(with_canonical_paths(canonical_paths.clone(), || {
+                gather_file_contribution(
+                    job,
+                    file,
+                    &fallback_exports_by_file,
+                    &oxc_facts_by_file,
+                    &oxc_parse_errors_by_file,
+                    &oxc_skipped_files,
+                    &mut file_analyzer,
+                )
+            }))
         })
         .collect::<Vec<_>>();
     if crate::executor::current_job_cancelled() {
@@ -517,14 +608,18 @@ fn run_dead_code_scan_with_oxc_started(
         return InspectResult::failed(job, "dead-code scan cancelled", started.elapsed());
     }
     let roles = crate::inspect::entry_points::resolve_project_roles(&job.project_root);
-    let aggregate = aggregate_dead_code_contributions_with_snapshot(
+    let aggregate = aggregate_dead_code_contributions_incremental_body(
         &job.project_root,
         snapshot,
         &contributions,
         &public_api_files,
         &roles,
         None,
-    );
+        None,
+        None,
+        &BTreeSet::new(),
+    )
+    .0;
     let success = InspectScanSuccess {
         scanned_files: job.scope_files.clone(),
         contributions,
@@ -654,6 +749,7 @@ fn gather_file_contribution(
                 .unwrap_or_default()
         });
     let FileAnalysis {
+        freshness,
         rust_api,
         go_dispatch,
         raw_imports,
@@ -751,10 +847,25 @@ fn gather_file_contribution(
         payload["skipped_files"] = Value::Array(oxc_skipped_files.to_vec());
     }
 
+    // OXC facts may have been parsed before this scan. Without metadata tied
+    // to that buffer, force content verification rather than blessing the
+    // facts with metadata from a later save.
+    let freshness = oxc_facts
+        .and_then(|facts| blake3::Hash::from_hex(&facts.content_hash).ok())
+        .map(|hash| match freshness.as_ref() {
+            Some(freshness) if freshness.content_hash == hash => *freshness,
+            _ => crate::cache_freshness::FileFreshness {
+                mtime: std::time::UNIX_EPOCH,
+                size: 0,
+                content_hash: hash,
+            },
+        })
+        .or(freshness);
+
     FileContribution::new(
         InspectCategory::DeadCode,
         file.to_path_buf(),
-        collect_freshness(file),
+        freshness.unwrap_or_else(|| collect_freshness(file)),
         payload,
     )
     .with_type_ref_names(type_ref_names)
@@ -828,7 +939,7 @@ pub(crate) fn callgraph_unavailable_aggregate_for_job(job: &InspectJob) -> serde
         Some("call graph is disabled (indexes.callgraph=false)")
     } else if job.config.views.enabled
         && crate::views::read::current_generation_lacks_callgraph(
-            &crate::bash_background::storage_dir(job.config.storage_dir.as_deref()),
+            &crate::root_cache::cache_root(&job.config),
             &job.project_root,
         )
     {
@@ -923,6 +1034,43 @@ pub(crate) fn aggregate_dead_code_contributions_incremental(
     previous: Option<&DeadCodeRollupState>,
     changed_files: &BTreeSet<String>,
 ) -> (serde_json::Value, DeadCodeRollupState, RollupVerdict) {
+    with_job_canonical_paths(|| {
+        aggregate_dead_code_contributions_incremental_body(
+            project_root,
+            snapshot,
+            contributions,
+            public_api_files,
+            roles,
+            drill_down_limit,
+            cache_key,
+            previous,
+            changed_files,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn aggregate_dead_code_contributions_incremental_body(
+    project_root: &Path,
+    snapshot: &CallgraphSnapshot,
+    contributions: &[FileContribution],
+    public_api_files: &BTreeSet<String>,
+    roles: &crate::inspect::entry_points::ProjectRoles,
+    drill_down_limit: Option<usize>,
+    cache_key: Option<&str>,
+    previous: Option<&DeadCodeRollupState>,
+    changed_files: &BTreeSet<String>,
+) -> (serde_json::Value, DeadCodeRollupState, RollupVerdict) {
+    let parsed = parse_dead_code_contributions(project_root, contributions);
+    // Unchanged-state reuse must not hide a new gap or retain an error after
+    // repair. Rebuild from the current facts while either state has a gap.
+    let has_decode_gaps = parsed.iter().any(|contribution| contribution.decode_failed)
+        || previous.is_some_and(|state| {
+            state
+                .materialized
+                .iter()
+                .any(|contribution| contribution.decode_failed)
+        });
     let contribution_hashes = contribution_hashes(
         previous.map(|state| &state.contribution_hashes),
         contributions,
@@ -955,7 +1103,8 @@ pub(crate) fn aggregate_dead_code_contributions_incremental(
                 && fragment.production_reachable_exports
                     == reachable_symbols_for_file(&previous.production.reachable, file)
         });
-        if previous.contribution_hashes == contribution_hashes
+        if !has_decode_gaps
+            && previous.contribution_hashes == contribution_hashes
             && previous.public_api_files == *public_api_files
             && previous.roles_fingerprint == roles_fingerprint
             && previous.drill_down_limit == drill_down_limit
@@ -980,12 +1129,12 @@ pub(crate) fn aggregate_dead_code_contributions_incremental(
         }
     }
 
-    let parsed = parse_dead_code_contributions(contributions);
     let mut affected_files = changed_files
         .union(&changed_graph_files)
         .cloned()
         .collect::<BTreeSet<_>>();
-    if previous.is_none()
+    if has_decode_gaps
+        || previous.is_none()
         || previous.is_some_and(|state| {
             state.public_api_files != *public_api_files
                 || state.roles_fingerprint != roles_fingerprint
@@ -1231,6 +1380,7 @@ fn callgraph_hashes(
     changed_files: &BTreeSet<String>,
     previous_initializer_files: Option<&BTreeSet<String>>,
 ) -> BTreeMap<String, String> {
+    let grouped = group_outbound_calls_by_caller_file(project_root, &snapshot.outbound_calls);
     let mut hashes = previous.cloned().unwrap_or_default();
     let mut files = if previous.is_some() {
         for file in changed_files {
@@ -1238,11 +1388,7 @@ fn callgraph_hashes(
         }
         changed_files.clone()
     } else {
-        snapshot
-            .outbound_calls
-            .iter()
-            .map(|call| relative_path(project_root, &call.caller_file))
-            .collect()
+        grouped.by_file.keys().cloned().collect()
     };
     // A package's variables can change without changing the files that import
     // it. Rehash compact initializer groups even on an incremental scan.
@@ -1256,21 +1402,19 @@ fn callgraph_hashes(
     for file in &files {
         hashes.remove(file);
     }
-    let absolute_files = files
-        .iter()
-        .map(|file| (project_root.join(file), file))
-        .collect::<BTreeMap<_, _>>();
     let mut hashers = BTreeMap::<String, blake3::Hasher>::new();
-    for call in &snapshot.outbound_calls {
-        let Some(file) = absolute_files.get(&call.caller_file) else {
+    for (file, calls) in &grouped.by_file {
+        if !files.contains(file) {
             continue;
-        };
-        let hasher = hashers.entry((*file).clone()).or_default();
-        hasher.update(call.caller_symbol.as_bytes());
-        hasher.update(&[0]);
-        hasher.update(call.target.as_bytes());
-        hasher.update(&call.line.to_le_bytes());
-        hasher.update(call.provenance.as_bytes());
+        }
+        let hasher = hashers.entry(file.clone()).or_default();
+        for call in calls {
+            hasher.update(call.caller_symbol.as_bytes());
+            hasher.update(&[0]);
+            hasher.update(call.target.as_bytes());
+            hasher.update(&call.line.to_le_bytes());
+            hasher.update(call.provenance.as_bytes());
+        }
     }
     for group in &snapshot.go_initializers {
         let file = relative_path(project_root, &group.caller_file);
@@ -1310,8 +1454,12 @@ fn changed_map_keys(
 
 fn reachable_symbols_for_file(reachable: &BTreeSet<ExportNode>, file: &str) -> BTreeSet<String> {
     reachable
-        .iter()
-        .filter(|node| node.0 == file)
+        .range((file.to_string(), String::new())..)
+        .take_while(|node| {
+            #[cfg(test)]
+            REACHABLE_VISITS.with(|visits| visits.set(visits.get() + 1));
+            node.0 == file
+        })
         .map(|node| node.1.clone())
         .collect()
 }
@@ -1326,19 +1474,40 @@ fn fragments_from_aggregate(
     production_reachable: &BTreeSet<ExportNode>,
     aggregate: &Value,
 ) -> BTreeMap<String, DeadCodeFileFragment> {
-    let items_for_file = |key: &str, file: &str| {
-        aggregate[key]
-            .as_array()
+    let groups = [
+        "items",
+        "generated_items",
+        "test_only_items",
+        "uncertain_items",
+    ]
+    .map(|key| {
+        let mut grouped = BTreeMap::<&str, Vec<&Value>>::new();
+        for item in aggregate[key].as_array().into_iter().flatten() {
+            #[cfg(test)]
+            FRAGMENT_ITEM_VISITS.with(|visits| visits.set(visits.get() + 1));
+            if let Some(file) = item["file"].as_str() {
+                grouped.entry(file).or_default().push(item);
+            }
+        }
+        grouped
+    });
+    let items_for_file = |index: usize, file: &str| {
+        groups[index]
+            .get(file)
             .into_iter()
             .flatten()
-            .filter(|item| item["file"].as_str() == Some(file))
-            .cloned()
+            .map(|item| (*item).clone())
             .collect::<Vec<_>>()
     };
     materialized
         .iter()
         .map(|contribution| {
             let file = contribution.file.clone();
+            let headline_items = items_for_file(0, &file)
+                .into_iter()
+                .filter(|item| item.get("generated").is_none())
+                .collect::<Vec<_>>();
+            let headline_count = headline_items.len();
             (
                 file.clone(),
                 DeadCodeFileFragment {
@@ -1350,28 +1519,14 @@ fn fragments_from_aggregate(
                     ),
                     public_api: public_api_files.contains(&file),
                     roles_fingerprint: roles_fingerprint.to_string(),
-                    headline_items: items_for_file("items", &file)
+                    headline_items,
+                    generated_items: items_for_file(1, &file),
+                    test_only_items: items_for_file(2, &file),
+                    uncertain_items: items_for_file(3, &file),
+                    by_language: [(language_for_file(&file).to_string(), headline_count)]
                         .into_iter()
-                        .filter(|item| item.get("generated").is_none())
+                        .filter(|(_, count)| *count > 0)
                         .collect(),
-                    generated_items: items_for_file("generated_items", &file),
-                    test_only_items: items_for_file("test_only_items", &file),
-                    uncertain_items: items_for_file("uncertain_items", &file),
-                    by_language: [(
-                        language_for_file(&file).to_string(),
-                        aggregate["items"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .filter(|item| {
-                                item["file"].as_str() == Some(file.as_str())
-                                    && item.get("generated").is_none()
-                            })
-                            .count(),
-                    )]
-                    .into_iter()
-                    .filter(|(_, count)| *count > 0)
-                    .collect(),
                     excluded_test_findings: aggregate["excluded_test_by_file"][file.as_str()]
                         .as_u64()
                         .unwrap_or(0) as usize,
@@ -1387,16 +1542,15 @@ fn rank_dead_code_items(
     mut items: Vec<Value>,
     roles: &crate::inspect::entry_points::ProjectRoles,
 ) -> Vec<Value> {
-    items.sort_by(|a, b| {
-        let key = |item: &Value| {
-            (
-                roles.role_for(item["file"].as_str().unwrap_or("")),
-                item["file"].as_str().unwrap_or("").to_string(),
-                item["line"].as_u64().unwrap_or(0),
-                item["symbol"].as_str().unwrap_or("").to_string(),
-            )
-        };
-        key(a).cmp(&key(b))
+    items.sort_by_cached_key(|item| {
+        #[cfg(test)]
+        SORT_KEY_EVALUATIONS.with(|count| count.set(count.get() + 1));
+        (
+            roles.role_for(item["file"].as_str().unwrap_or("")),
+            item["file"].as_str().unwrap_or("").to_string(),
+            item["line"].as_u64().unwrap_or(0),
+            item["symbol"].as_str().unwrap_or("").to_string(),
+        )
     });
     items
 }
@@ -1508,11 +1662,30 @@ fn fold_dead_code_fragments(
     aggregate
 }
 
-fn parse_dead_code_contributions(contributions: &[FileContribution]) -> Vec<DeadCodeContribution> {
+fn parse_dead_code_contributions(
+    project_root: &Path,
+    contributions: &[FileContribution],
+) -> Vec<DeadCodeContribution> {
     contributions
         .iter()
-        .filter_map(|contribution| {
-            serde_json::from_value::<DeadCodeContribution>(contribution.contribution.clone()).ok()
+        .map(|contribution| {
+            serde_json::from_value::<DeadCodeContribution>(contribution.contribution.clone())
+                .unwrap_or_else(|_| {
+                    // An undecodable record is a coverage gap, not a file with
+                    // no findings. Its JSON file field may also be corrupt, so
+                    // retain the authoritative cache-row path instead.
+                    let file = relative_path(project_root, &contribution.file_path);
+                    DeadCodeContribution {
+                        file: file.clone(),
+                        generated: Some(false),
+                        decode_failed: true,
+                        parse_errors: vec![json!({
+                            "file": file,
+                            "message": "cached dead-code contribution could not be decoded",
+                        })],
+                        ..Default::default()
+                    }
+                })
         })
         .collect::<Vec<_>>()
 }
@@ -2521,12 +2694,65 @@ fn scanner_graph_payload_bytes(all: &GraphEdges, production: &GraphEdges) -> usi
     bytes
 }
 
+#[derive(Default)]
+struct TestOriginLabels {
+    ids: Vec<usize>,
+    queued: bool,
+}
+
+// Both inputs are sorted and unique. Bulk union avoids a B-tree insertion for
+// every label on every graph edge, including edges that add no new origins.
+fn merge_test_origin_ids(ids: &mut Vec<usize>, labels: &[usize]) -> bool {
+    if labels.is_empty() || ids.as_slice() == labels {
+        return false;
+    }
+    if ids
+        .last()
+        .zip(labels.first())
+        .is_none_or(|(last, first)| last < first)
+    {
+        ids.extend_from_slice(labels);
+        return true;
+    }
+    let mut merged = Vec::with_capacity(ids.len() + labels.len());
+    let (mut left, mut right) = (0, 0);
+    while left < ids.len() && right < labels.len() {
+        match ids[left].cmp(&labels[right]) {
+            std::cmp::Ordering::Less => {
+                merged.push(ids[left]);
+                left += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                merged.push(labels[right]);
+                right += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                merged.push(ids[left]);
+                left += 1;
+                right += 1;
+            }
+        }
+    }
+    merged.extend_from_slice(&ids[left..]);
+    merged.extend_from_slice(&labels[right..]);
+    if merged.len() == ids.len() {
+        return false;
+    }
+    *ids = merged;
+    true
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ORIGIN_NODE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn test_only_callers_by_target(
     contributions: &[DeadCodeContribution],
 ) -> BTreeMap<ExportNode, Vec<String>> {
     let test_files = cfg_test_module_files(contributions);
     let edges = edges_by_source(contributions, false);
-    let mut origins = BTreeMap::<ExportNode, BTreeSet<usize>>::new();
+    let mut origins = BTreeMap::<ExportNode, TestOriginLabels>::new();
     let mut origin_ids = BTreeMap::<String, usize>::new();
     let mut frontier = VecDeque::new();
     for contribution in contributions {
@@ -2542,19 +2768,29 @@ fn test_only_callers_by_target(
                 let next_id = origin_ids.len();
                 let origin = *origin_ids.entry(origin).or_insert(next_id);
                 let target = (call.file.clone(), call.symbol.clone());
-                if origins.entry(target.clone()).or_default().insert(origin) {
-                    frontier.push_back(target);
+                let entry = origins.entry(target.clone()).or_default();
+                if let Err(index) = entry.ids.binary_search(&origin) {
+                    entry.ids.insert(index, origin);
+                    if !entry.queued {
+                        entry.queued = true;
+                        frontier.push_back(target);
+                    }
                 }
             }
         }
     }
     while let Some(node) = frontier.pop_front() {
-        let labels = origins[&node].clone();
+        #[cfg(test)]
+        TEST_ORIGIN_NODE_VISITS.with(|visits| visits.set(visits.get() + 1));
+        let entry = origins.get_mut(&node).expect("queued origin node");
+        entry.queued = false;
+        let labels = entry.ids.clone();
         for target in edges.get(&node).into_iter().flatten() {
             let entry = origins.entry(target.clone()).or_default();
-            let before = entry.len();
-            entry.extend(labels.iter().cloned());
-            if entry.len() != before {
+            // A pending node will propagate all labels it has accumulated when
+            // popped; queueing it once per new label repeats the same union.
+            if merge_test_origin_ids(&mut entry.ids, &labels) && !entry.queued {
+                entry.queued = true;
                 frontier.push_back(target.clone());
             }
         }
@@ -2562,10 +2798,13 @@ fn test_only_callers_by_target(
     crate::slog_info!(
         "scanner origins: nodes={} labels={} label_payload_bytes={}",
         origins.len(),
-        origins.values().map(BTreeSet::len).sum::<usize>(),
         origins
             .values()
-            .map(|labels| labels.len() * std::mem::size_of::<usize>())
+            .map(|labels| labels.ids.len())
+            .sum::<usize>(),
+        origins
+            .values()
+            .map(|labels| labels.ids.len() * std::mem::size_of::<usize>())
             .sum::<usize>()
             + origin_ids.keys().map(String::capacity).sum::<usize>()
     );
@@ -2598,6 +2837,7 @@ fn test_only_callers_by_target(
         .filter(|(node, _)| !production.contains(node))
         .map(|(node, files)| {
             let mut names = files
+                .ids
                 .into_iter()
                 .map(|id| origin_names[id].clone())
                 .collect::<Vec<_>>();
@@ -4909,26 +5149,13 @@ fn rust_mod_scope_chain(node: &tree_sitter::Node<'_>, source: &str) -> Vec<Strin
 }
 
 fn rust_impl_scope_name(impl_node: &tree_sitter::Node<'_>, source: &str) -> String {
-    let mut type_names: Vec<String> = Vec::new();
-    let mut child_cursor = impl_node.walk();
-    if child_cursor.goto_first_child() {
-        loop {
-            let child = child_cursor.node();
-            if child.kind() == "type_identifier" || child.kind() == "generic_type" {
-                type_names.push(node_text(source, child).to_string());
-            }
-            if !child_cursor.goto_next_sibling() {
-                break;
-            }
-        }
-    }
-
-    if type_names.len() >= 2 {
-        format!("{} for {}", type_names[0], type_names[1])
-    } else if type_names.len() == 1 {
-        type_names[0].clone()
-    } else {
-        String::new()
+    let Some(self_type) = impl_node.child_by_field_name("type") else {
+        return String::new();
+    };
+    let self_name = node_text(source, self_type);
+    match impl_node.child_by_field_name("trait") {
+        Some(trait_type) => format!("{} for {self_name}", node_text(source, trait_type)),
+        None => self_name.to_string(),
     }
 }
 
@@ -7099,17 +7326,37 @@ fn collect_freshness(file: &Path) -> FileFreshness {
 
 fn relative_path(project_root: &Path, path: &Path) -> String {
     let absolute = if path.is_absolute() {
-        path.to_path_buf()
+        std::borrow::Cow::Borrowed(path)
     } else {
-        project_root.join(path)
+        std::borrow::Cow::Owned(project_root.join(path))
     };
+    let paths = current_canonical_paths();
+    if let Some(paths) = &paths {
+        if let Some(relative) = paths
+            .relative
+            .read()
+            .get(project_root)
+            .and_then(|files| files.get(absolute.as_ref()))
+        {
+            return relative.clone();
+        }
+    }
     let normalized_root = canonicalize_normalized(project_root);
     let normalized = canonicalize_normalized(&absolute);
-    normalized
+    let relative = normalized
         .strip_prefix(&normalized_root)
         .unwrap_or(normalized.as_path())
         .to_string_lossy()
-        .replace('\\', "/")
+        .replace('\\', "/");
+    if let Some(paths) = paths {
+        paths
+            .relative
+            .write()
+            .entry(project_root.to_path_buf())
+            .or_default()
+            .insert(absolute.into_owned(), relative.clone());
+    }
+    relative
 }
 
 fn canonical_or_normalized(project_root: &Path, path: &Path) -> PathBuf {
@@ -7137,8 +7384,11 @@ fn normalize_path(path: &Path) -> PathBuf {
     crate::inspect::job::normalize_path(path)
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct DeadCodeContribution {
+    // This marker belongs only to the in-memory rollup, never cached JSON.
+    #[serde(skip)]
+    decode_failed: bool,
     #[serde(skip)]
     go_initializers: Option<GoInitializerContribution>,
     file: String,
@@ -7359,11 +7609,765 @@ struct ParsedTarget {
     file: Option<String>,
     symbol: Option<String>,
 }
+#[cfg(test)]
+thread_local! {
+    static AFTER_SOURCE_METADATA: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static AFTER_ANALYSIS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static REACHABLE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SORT_KEY_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FRAGMENT_ITEM_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn legacy_test_only_callers_by_target(
+        contributions: &[DeadCodeContribution],
+    ) -> BTreeMap<ExportNode, Vec<String>> {
+        let test_files = cfg_test_module_files(contributions);
+        let edges = edges_by_source(contributions, false);
+        let mut origins = BTreeMap::<ExportNode, BTreeSet<usize>>::new();
+        let mut origin_ids = BTreeMap::<String, usize>::new();
+        let mut frontier = VecDeque::new();
+        for contribution in contributions {
+            for call in contribution.calls() {
+                if call.test_origin != Some(true) {
+                    continue;
+                }
+                let origin = if is_test_code_file(&contribution.file, &test_files) {
+                    contribution.file.clone()
+                } else if contribution.line_is_cfg_test(call.line) {
+                    format!("{}:{}", contribution.file, call.line)
+                } else {
+                    continue;
+                };
+                let next = origin_ids.len();
+                let origin = *origin_ids.entry(origin).or_insert(next);
+                let target = (call.file.clone(), call.symbol.clone());
+                if origins.entry(target.clone()).or_default().insert(origin) {
+                    frontier.push_back(target);
+                }
+            }
+        }
+        while let Some(node) = frontier.pop_front() {
+            let labels = origins[&node].clone();
+            for target in edges.get(&node).into_iter().flatten() {
+                let entry = origins.entry(target.clone()).or_default();
+                let before = entry.len();
+                entry.extend(labels.iter().copied());
+                if entry.len() != before {
+                    frontier.push_back(target.clone());
+                }
+            }
+        }
+        let mut production = BTreeSet::new();
+        for contribution in contributions {
+            for call in contribution.calls() {
+                if call.test_origin == Some(false)
+                    && !origins
+                        .contains_key(&(contribution.file.clone(), call.caller_symbol.clone()))
+                {
+                    production.insert((call.file.clone(), call.symbol.clone()));
+                }
+            }
+        }
+        let mut frontier = production.iter().cloned().collect::<Vec<_>>();
+        while let Some(node) = frontier.pop() {
+            for target in edges.get(&node).into_iter().flatten() {
+                if production.insert(target.clone()) {
+                    frontier.push(target.clone());
+                }
+            }
+        }
+        let mut names = vec![String::new(); origin_ids.len()];
+        for (name, id) in origin_ids {
+            names[id] = name;
+        }
+        origins
+            .into_iter()
+            .filter(|(node, _)| !production.contains(node))
+            .map(|(node, ids)| {
+                let mut files = ids
+                    .into_iter()
+                    .map(|id| names[id].clone())
+                    .collect::<Vec<_>>();
+                files.sort();
+                (node, files)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_origin_bulk_union_matches_set_union() {
+        // Exhaustive small subsets cover equality, subset, overlap, empty and
+        // append-only unions without computing expectations through the merger.
+        for left in 0..64 {
+            for right in 0..64 {
+                let mut ids = (0..6)
+                    .filter(|bit| left & (1 << bit) != 0)
+                    .collect::<Vec<_>>();
+                let labels = (0..6)
+                    .filter(|bit| right & (1 << bit) != 0)
+                    .collect::<Vec<_>>();
+                let expected = (0..6)
+                    .filter(|bit| (left | right) & (1 << bit) != 0)
+                    .collect::<Vec<_>>();
+                let changed = merge_test_origin_ids(&mut ids, &labels);
+                assert_eq!(ids, expected);
+                assert_eq!(changed, (right & !left) != 0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_origins_coalesce_high_fanin_and_keep_cycle_and_production_semantics() {
+        let mut contributions = (0..128).map(|n| serde_json::from_value::<DeadCodeContribution>(json!({
+            "file": format!("test{n}_test.go"), "exports": [], "internal_calls": [
+                {"caller_symbol": "Test", "file": "helper.go", "symbol": "entry", "line": 1, "test_origin": true},
+                {"caller_symbol": "Test", "file": "helper.go", "symbol": "entry", "line": 2, "test_origin": true},
+                {"caller_symbol": "Test", "file": "helper.go", "symbol": "cut", "line": 3, "test_origin": true}
+            ]
+        })).unwrap()).collect::<Vec<_>>();
+        let edges = [
+            ("entry", "left"),
+            ("entry", "right"),
+            ("left", "join"),
+            ("right", "join"),
+            ("join", "entry"),
+            ("cut", "sink"),
+            ("production", "cut"),
+        ];
+        contributions.push(serde_json::from_value(json!({"file": "helper.go", "exports": [], "internal_calls": edges.into_iter().map(|(source,target)| json!({
+            "caller_symbol": source, "file": "helper.go", "symbol": target, "line": 1, "test_origin": false
+        })).collect::<Vec<_>>()})).unwrap());
+        let expected = legacy_test_only_callers_by_target(&contributions);
+        TEST_ORIGIN_NODE_VISITS.with(|visits| visits.set(0));
+        let actual = test_only_callers_by_target(&contributions);
+        assert_eq!(
+            serde_json::to_vec(&actual.iter().collect::<Vec<_>>()).unwrap(),
+            serde_json::to_vec(&expected.iter().collect::<Vec<_>>()).unwrap()
+        );
+        assert_eq!(actual.len(), 4);
+        assert!(actual.values().all(|labels| labels.len() == 128));
+        assert!(!actual.contains_key(&("helper.go".into(), "cut".into())));
+        assert!(!actual.contains_key(&("helper.go".into(), "sink".into())));
+        assert_eq!(
+            TEST_ORIGIN_NODE_VISITS.with(|visits| visits.get()),
+            6,
+            "pending nodes propagate once, not once per origin"
+        );
+    }
+
+    #[test]
+    fn test_origins_requeue_previously_visited_nodes_for_late_labels() {
+        let edges = [
+            ("a_test.go", "TestA", "helper.go", "join", true),
+            ("b_test.go", "TestB", "helper.go", "relay", true),
+            ("helper.go", "join", "helper.go", "sink", false),
+            ("helper.go", "relay", "helper.go", "join", false),
+        ];
+        let contributions = edges.into_iter().map(|(file, caller, target, symbol, test_origin)| serde_json::from_value(json!({
+            "file": file, "exports": [], "internal_calls": [{"caller_symbol": caller, "file": target, "symbol": symbol, "line": 1, "test_origin": test_origin}]
+        })).unwrap()).collect::<Vec<_>>();
+        let expected = legacy_test_only_callers_by_target(&contributions);
+        let actual = test_only_callers_by_target(&contributions);
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual[&("helper.go".into(), "sink".into())],
+            vec!["a_test.go", "b_test.go"]
+        );
+    }
+
+    #[test]
+    #[ignore = "opt-in CPU measurement using a cold callgraph of this checkout"]
+    fn live_cpu_test_origins_checkout_cost() {
+        let root = fs::canonicalize(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/aft-bridge"),
+        )
+        .unwrap();
+        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        eprintln!(
+            "test-origin measurement setup: root={} files={}",
+            root.display(),
+            files.len()
+        );
+        let storage = tempfile::tempdir().unwrap();
+        let store = crate::callgraph_store::CallGraphStore::open(
+            storage.path().to_path_buf(),
+            root.clone(),
+        )
+        .unwrap();
+        store.cold_build(&files).unwrap();
+        eprintln!("test-origin measurement setup: callgraph built");
+        let graph =
+            crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path()).unwrap();
+        let job = job(&root, files, graph.clone());
+        let rows = with_job_canonical_paths(|| {
+            let fallback = fallback_export_contributions_by_file(&job, &graph);
+            job.scope_files
+                .iter()
+                .map(|file| {
+                    gather_file_contribution(
+                        &job,
+                        file,
+                        &fallback,
+                        &BTreeMap::new(),
+                        &BTreeMap::new(),
+                        &[],
+                        &mut DeadCodeFileAnalyzer::default(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        let parsed = parse_dead_code_contributions(&root, &rows);
+        let affected = parsed
+            .iter()
+            .map(|row| row.file.clone())
+            .collect::<BTreeSet<_>>();
+        let facts = with_job_canonical_paths(|| {
+            materialize_dead_code_contributions(
+                &root,
+                &graph,
+                parsed,
+                &collect_public_api_files(&root),
+                None,
+                &affected,
+            )
+        });
+        eprintln!("test-origin measurement setup: facts materialized; comparing propagation");
+        let before = Instant::now();
+        let expected = legacy_test_only_callers_by_target(&facts);
+        let before_time = before.elapsed();
+        TEST_ORIGIN_NODE_VISITS.with(|visits| visits.set(0));
+        let after = Instant::now();
+        let actual = test_only_callers_by_target(&facts);
+        let after_time = after.elapsed();
+        assert!(
+            !actual.is_empty(),
+            "checkout must exercise test-origin propagation"
+        );
+        assert_eq!(
+            serde_json::to_vec(&actual.iter().collect::<Vec<_>>()).unwrap(),
+            serde_json::to_vec(&expected.iter().collect::<Vec<_>>()).unwrap()
+        );
+        println!("test origins: files={} calls={} attributed_targets={} before={before_time:?} after={after_time:?} node_visits={}", facts.len(), facts.iter().map(|row| row.calls().count()).sum::<usize>(), actual.len(), TEST_ORIGIN_NODE_VISITS.with(|visits| visits.get()));
+    }
+
+    fn uncached_relative_path(root: &Path, path: &Path) -> String {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        let root = canonicalize_uncached(root);
+        let path = canonicalize_uncached(&absolute);
+        path.strip_prefix(&root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    #[test]
+    fn relative_paths_resolve_once_per_job_across_parallel_items() {
+        let (_temp, root, _) = canonical_fixture(&[("src/a.rs", "fn a() {}\n")]);
+        let files = [
+            root.join("src/a.rs"),
+            PathBuf::from("src/a.rs"),
+            root.join("src/missing.rs"),
+        ];
+        let requests = (0..64)
+            .flat_map(|_| files.iter().cloned())
+            .collect::<Vec<_>>();
+        let expected = requests
+            .iter()
+            .map(|path| uncached_relative_path(&root, path))
+            .collect::<Vec<_>>();
+        let paths = Arc::new(CanonicalPaths::default());
+        let actual = with_canonical_paths(Some(Arc::clone(&paths)), || {
+            requests
+                .par_iter()
+                .map(|path| {
+                    with_canonical_paths(Some(Arc::clone(&paths)), || relative_path(&root, path))
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            serde_json::to_vec(&actual).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+        let resolved = paths.paths.read();
+        assert_eq!(
+            resolved.len(),
+            3,
+            "one root and two distinct absolute paths"
+        );
+        assert!(resolved.contains_key(&root));
+        assert!(resolved.contains_key(&root.join("src/a.rs")));
+        assert!(resolved.contains_key(&root.join("src/missing.rs")));
+        assert!(current_canonical_paths().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_path_job_cache_preserves_aliases_and_rechecks_next_job() {
+        let (temp, root, _) =
+            canonical_fixture(&[("src/a.rs", "fn a() {}\n"), ("src/b.rs", "fn b() {}\n")]);
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let link = root.join("src/link.rs");
+        std::os::unix::fs::symlink("a.rs", &link).unwrap();
+        with_job_canonical_paths(|| {
+            for path in [
+                &link,
+                &alias.join("src/link.rs"),
+                &root.join("src/missing/../a.rs"),
+            ] {
+                assert_eq!(
+                    relative_path(&alias, path),
+                    uncached_relative_path(&alias, path)
+                );
+            }
+            assert_eq!(relative_path(&alias, &link), "src/a.rs");
+            fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink("b.rs", &link).unwrap();
+            assert_eq!(
+                with_job_canonical_paths(|| relative_path(&alias, &link)),
+                "src/b.rs"
+            );
+            assert_eq!(
+                relative_path(&alias, &link),
+                "src/a.rs",
+                "nested job restores its parent's memo"
+            );
+        });
+        assert_eq!(
+            with_job_canonical_paths(|| relative_path(&alias, &link)),
+            "src/b.rs"
+        );
+    }
+
+    #[test]
+    fn cached_scan_keeps_contribution_and_aggregate_bytes() {
+        let (_temp, root, files) = canonical_fixture(&[(
+            "main.rs",
+            "fn main() { helper(); }\nfn helper() {}\nfn unused() {}\n",
+        )]);
+        let graph = snapshot(
+            files.clone(),
+            vec![
+                export(&root, "main.rs", "helper", "function"),
+                export(&root, "main.rs", "unused", "function"),
+            ],
+            vec![outbound(&root, "main.rs", "main", "helper")],
+        );
+        let job = job(&root, files, graph);
+        let before = run_dead_code_scan_body(&job, None, Instant::now())
+            .outcome
+            .unwrap();
+        let after = run_dead_code_scan(&job).outcome.unwrap();
+        assert_eq!(
+            serde_json::to_vec(&before.aggregate).unwrap(),
+            serde_json::to_vec(&after.aggregate).unwrap()
+        );
+        let payloads = |success: &InspectScanSuccess| {
+            serde_json::to_vec(
+                &success
+                    .contributions
+                    .iter()
+                    .map(|row| &row.contribution)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        assert_eq!(payloads(&before), payloads(&after));
+    }
+
+    #[test]
+    #[ignore = "opt-in CPU measurement on the checkout containing the crate"]
+    fn live_cpu_relative_paths_checkout_cost() {
+        let root = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+        let mut parser = crate::parser::FileParser::new();
+        let mut requests: Vec<PathBuf> = Vec::new();
+        let mut files = 0;
+        for path in crate::callgraph::walk_project_files(&root) {
+            if let Ok(symbols) = parser.extract_symbols(&path) {
+                files += 1;
+                requests.extend(symbols.iter().map(|_| path.clone()));
+            }
+        }
+        let before = Instant::now();
+        let expected = requests
+            .par_iter()
+            .map(|path| uncached_relative_path(&root, path))
+            .collect::<Vec<_>>();
+        let before_time = before.elapsed();
+        let paths = Arc::new(CanonicalPaths::default());
+        let after = Instant::now();
+        let actual = requests
+            .par_iter()
+            .map(|path| {
+                with_canonical_paths(Some(Arc::clone(&paths)), || relative_path(&root, path))
+            })
+            .collect::<Vec<_>>();
+        let after_time = after.elapsed();
+        assert_eq!(
+            serde_json::to_vec(&expected).unwrap(),
+            serde_json::to_vec(&actual).unwrap()
+        );
+        println!("relative paths: files={files} items={} before={before_time:?} realpath_calls={} after={after_time:?} realpath_calls={}", requests.len(), requests.len() * 2, paths.paths.read().len());
+    }
+
     use std::fs;
+    #[test]
+    fn cached_dead_code_decode_gap_is_named_incomplete_and_repairable() {
+        let (_temp, root, files) = fixture_project(&[
+            ("src/good.rs", "pub fn good_unused() {}\n"),
+            ("src/bad.rs", "pub fn bad_unused() {}\n"),
+        ]);
+        let snapshot = snapshot(
+            files.clone(),
+            vec![
+                export(&root, "src/good.rs", "good_unused", "function"),
+                export(&root, "src/bad.rs", "bad_unused", "function"),
+            ],
+            vec![],
+        );
+        let contributions = run_dead_code_scan(&job(&root, files.clone(), snapshot.clone()))
+            .outcome
+            .expect("valid scan")
+            .contributions;
+        let public = BTreeSet::new();
+        let roles = crate::inspect::entry_points::ProjectRoles::default();
+        let rollup = |facts: &[FileContribution], previous: Option<&DeadCodeRollupState>| {
+            aggregate_dead_code_contributions_incremental(
+                &root,
+                &snapshot,
+                facts,
+                &public,
+                &roles,
+                None,
+                Some("decode-gap"),
+                previous,
+                &BTreeSet::new(),
+            )
+        };
+        let (valid, valid_state, _) = rollup(&contributions, None);
+        assert_eq!(valid["complete"], true);
+        assert_eq!(valid["count"], 2);
+        let inspect_dir = root.join(".aft-cache/inspect");
+        let writer =
+            crate::inspect::cache::InspectCache::open(inspect_dir.clone(), root.clone()).unwrap();
+        let key = JobKey::for_project_category(InspectCategory::DeadCode);
+
+        for case in [
+            "missing exports",
+            "wrong exports and forged file",
+            "wrong file",
+        ] {
+            let mut malformed = contributions.clone();
+            let bad = malformed
+                .iter_mut()
+                .find(|item| item.contribution["file"] == "src/bad.rs")
+                .unwrap();
+            match case {
+                "missing exports" => {
+                    bad.contribution.as_object_mut().unwrap().remove("exports");
+                }
+                "wrong exports and forged file" => {
+                    bad.contribution["exports"] = json!("invalid cached value");
+                    bad.contribution["file"] = json!("forged.rs");
+                }
+                _ => {
+                    bad.contribution["file"] = json!(42);
+                }
+            }
+            assert_eq!(
+                bad.contribution["facts_format_version"],
+                DEAD_CODE_FACTS_FORMAT_VERSION
+            );
+            writer
+                .store_tier2_result(key.clone(), &files, &malformed, valid.clone())
+                .unwrap();
+            let borrower = crate::inspect::cache::InspectCache::open_readonly(
+                inspect_dir.clone(),
+                root.clone(),
+            )
+            .unwrap()
+            .unwrap();
+            let rows = borrower
+                .load_tier2_contributions(InspectCategory::DeadCode)
+                .unwrap();
+            let raw = rows
+                .iter()
+                .map(|row| row.contribution.clone())
+                .collect::<Vec<_>>();
+            let loaded = rows
+                .into_iter()
+                .map(|row| {
+                    let path = if row.file_path.is_absolute() {
+                        row.file_path
+                    } else {
+                        root.join(row.file_path)
+                    };
+                    FileContribution::new(row.category, path, row.freshness, row.contribution)
+                        .with_type_ref_names(row.type_ref_names)
+                })
+                .collect::<Vec<_>>();
+            let (cold, state, _) = rollup(&loaded, None);
+            assert_eq!(cold["complete"], false, "{case}");
+            assert_eq!(cold["scanned_files"], 2);
+            assert_eq!(cold["count"], 1);
+            assert!(aggregate_has_item(&cold, "src/good.rs", "good_unused"));
+            assert!(!aggregate_has_item(&cold, "src/bad.rs", "bad_unused"));
+            assert_eq!(
+                cold["parse_errors"],
+                json!([{
+                    "file": "src/bad.rs",
+                    "message": "cached dead-code contribution could not be decoded",
+                }])
+            );
+            let (warm, gap_state, _) = rollup(&loaded, Some(&state));
+            assert_eq!(warm, cold, "unchanged gap: {case}");
+            let (corrupted, _, _) = rollup(&loaded, Some(&valid_state));
+            assert_eq!(
+                corrupted, cold,
+                "corruption without changed-file notice: {case}"
+            );
+            let (repaired, _, _) = rollup(&contributions, Some(&gap_state));
+            assert_eq!(repaired, valid, "repaired contribution: {case}");
+            assert_eq!(
+                borrower
+                    .load_tier2_contributions(InspectCategory::DeadCode)
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.contribution.clone())
+                    .collect::<Vec<_>>(),
+                raw,
+                "read-only rollup must not rewrite cached rows"
+            );
+        }
+    }
+
+    #[test]
+    fn audit05_freshness_survives_missing_pre_read_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.rs");
+        let source = "pub fn old() {}\n";
+        let create_path = path.clone();
+        AFTER_SOURCE_METADATA.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::write(create_path, source).unwrap();
+            }))
+        });
+        let save_path = path.clone();
+        AFTER_ANALYSIS.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::write(save_path, "pub fn new() {}\n").unwrap();
+            }))
+        });
+        let job = job(
+            dir.path(),
+            vec![path.clone()],
+            snapshot(vec![], vec![], vec![]),
+        );
+        let contribution = gather_file_contribution(
+            &job,
+            &path,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &[],
+            &mut DeadCodeFileAnalyzer::default(),
+        );
+        assert_eq!(
+            contribution.freshness.content_hash,
+            cache_freshness::hash_bytes(source.as_bytes())
+        );
+        assert_eq!(contribution.freshness.mtime, std::time::UNIX_EPOCH);
+        assert_eq!(
+            cache_freshness::verify_file(&path, &contribution.freshness),
+            crate::cache_freshness::FreshnessVerdict::Stale
+        );
+    }
+
+    #[test]
+    fn audit05_fragments_group_each_item_once() {
+        let files = ["a.rs", "b.rs", "c.rs"];
+        let contributions = files
+            .iter()
+            .map(|file| dispatch_contribution(file, &[]))
+            .collect::<Vec<_>>();
+        let items = files
+            .iter()
+            .map(|file| json!({"file": file, "symbol": "f", "line": 1}))
+            .collect::<Vec<_>>();
+        let aggregate = json!({"items": items, "generated_items": items, "test_only_items": items, "uncertain_items": items});
+        FRAGMENT_ITEM_VISITS.with(|visits| visits.set(0));
+        let fragments = fragments_from_aggregate(
+            &contributions,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            "roles",
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &aggregate,
+        );
+        for file in files {
+            let fragment = &fragments[file];
+            assert_eq!(fragment.headline_items.len(), 1);
+            assert_eq!(fragment.generated_items.len(), 1);
+            assert_eq!(fragment.test_only_items.len(), 1);
+            assert_eq!(fragment.uncertain_items.len(), 1);
+            assert_eq!(fragment.by_language["rust"], 1);
+        }
+        assert_eq!(FRAGMENT_ITEM_VISITS.with(|visits| visits.get()), 12);
+    }
+
+    #[test]
+    fn audit05_reachability_query_visits_only_the_requested_file() {
+        let mut reachable = BTreeSet::new();
+        for i in 0..100 {
+            reachable.insert(("a.ts".to_string(), format!("symbol{i}")));
+            reachable.insert(("z.ts".to_string(), format!("symbol{i}")));
+        }
+        reachable.insert(("middle.ts".to_string(), "one".to_string()));
+        reachable.insert(("middle.ts".to_string(), "two".to_string()));
+        REACHABLE_VISITS.with(|visits| visits.set(0));
+        assert_eq!(
+            reachable_symbols_for_file(&reachable, "middle.ts"),
+            ["one".to_string(), "two".to_string()].into_iter().collect()
+        );
+        assert_eq!(REACHABLE_VISITS.with(|visits| visits.get()), 3);
+    }
+
+    #[test]
+    fn audit05_ranking_computes_one_key_per_item() {
+        let items = (0..100)
+            .rev()
+            .map(|line| json!({"file": "src/file.rs", "line": line, "symbol": "function"}))
+            .collect();
+        SORT_KEY_EVALUATIONS.with(|count| count.set(0));
+        let ranked = rank_dead_code_items(
+            items,
+            &crate::inspect::entry_points::ProjectRoles::default(),
+        );
+        assert_eq!(ranked[0]["line"], 0);
+        assert_eq!(ranked[99]["line"], 99);
+        assert_eq!(SORT_KEY_EVALUATIONS.with(|count| count.get()), 100);
+    }
+
+    #[test]
+    fn audit05_freshness_hashes_the_analyzed_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.rs");
+        let source = "pub fn old() {}\n";
+        fs::write(&path, source).unwrap();
+        let save_path = path.clone();
+        AFTER_ANALYSIS.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::write(save_path, "pub fn new() {}\n").unwrap();
+            }))
+        });
+        let job = job(
+            dir.path(),
+            vec![path.clone()],
+            snapshot(vec![], vec![], vec![]),
+        );
+        let contribution = gather_file_contribution(
+            &job,
+            &path,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &[],
+            &mut DeadCodeFileAnalyzer::default(),
+        );
+        assert_eq!(
+            contribution.freshness.content_hash,
+            cache_freshness::hash_bytes(source.as_bytes())
+        );
+        assert_ne!(
+            contribution.freshness.content_hash,
+            cache_freshness::collect(&path).unwrap().content_hash
+        );
+    }
+
+    #[test]
+    fn audit05_oxc_contribution_freshness_uses_facts_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.ts");
+        let source = "export const old = 1;\n";
+        fs::write(&path, source).unwrap();
+        let result = crate::inspect::oxc_engine::analyze_files(
+            dir.path(),
+            std::slice::from_ref(&path),
+            Default::default(),
+        )
+        .unwrap();
+        fs::write(&path, "export const new = 1;\n").unwrap();
+        let job = job(
+            dir.path(),
+            vec![path.clone()],
+            snapshot(vec![], vec![], vec![]),
+        );
+        let facts = result
+            .facts
+            .into_iter()
+            .map(|facts| ("file.ts".to_string(), facts))
+            .collect();
+        let contribution = gather_file_contribution(
+            &job,
+            &path,
+            &BTreeMap::new(),
+            &facts,
+            &BTreeMap::new(),
+            &[],
+            &mut DeadCodeFileAnalyzer::default(),
+        );
+        assert_eq!(
+            contribution.freshness.content_hash,
+            cache_freshness::hash_bytes(source.as_bytes())
+        );
+        assert_eq!(
+            cache_freshness::verify_file(&path, &contribution.freshness),
+            crate::cache_freshness::FreshnessVerdict::Stale
+        );
+    }
+
+    #[test]
+    fn audit05_rust_impl_scope_includes_scoped_and_reference_types() {
+        let source = "impl crate::Trait for &crate::Widget { fn run(&self) {} }";
+        let tree = DeadCodeFileAnalyzer::default()
+            .parse_source(LangId::Rust, source)
+            .unwrap();
+        let node = tree.root_node().named_child(0).unwrap();
+        assert_eq!(
+            rust_impl_scope_name(&node, source),
+            "crate::Trait for &crate::Widget"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit05_callgraph_hashes_accept_symlink_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("real");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("lib.rs"), "fn caller() {}\n").unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let snapshot = snapshot(
+            vec![],
+            vec![],
+            vec![outbound(&root, "lib.rs", "caller", "target")],
+        );
+        let expected = callgraph_hashes(&root, &snapshot, None, &BTreeSet::new(), None);
+        let actual = callgraph_hashes(&alias, &snapshot, None, &BTreeSet::new(), None);
+        assert_eq!(expected.len(), 1);
+        assert_eq!(actual, expected);
+    }
 
     #[cfg(unix)]
     #[test]
@@ -8300,6 +9304,187 @@ mod tests {
         let snapshot =
             crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path()).unwrap();
         scan(job(&root, paths, snapshot))
+    }
+
+    #[test]
+    fn rust_module_paths_and_function_values_in_impl_bodies_are_live() {
+        let (temp, root, paths) = canonical_fixture(&[
+            (
+                "src/main.rs",
+                r#"
+mod checks;
+struct Handler { draw: fn() }
+impl Handler {
+    fn new() -> Self { Self::with_draw() }
+    fn with_draw() -> Self { Self { draw: checks::draw } }
+    fn register(&self) { Self::register_in(); }
+    fn register_in() {
+        checks::check();
+        let callback = checks::assigned;
+        let callbacks = [checks::arrayed];
+        consume(checks::argument);
+    }
+}
+fn consume(_: fn()) {}
+fn main() { let handler = Handler::new(); handler.register(); }
+"#,
+            ),
+            (
+                "src/checks.rs",
+                r#"
+pub(crate) fn check() {}
+pub(crate) fn draw() {}
+pub(crate) fn assigned() {}
+pub(crate) fn arrayed() {}
+pub(crate) fn argument() {}
+pub(crate) fn planted_dead() {}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn checks() { super::check(); }
+}
+"#,
+            ),
+        ]);
+        let store = crate::callgraph_store::CallGraphStore::open(
+            temp.path().join("callgraph-store"),
+            root.clone(),
+        )
+        .unwrap();
+        store.cold_build(&paths).unwrap();
+        let snapshot =
+            crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path()).unwrap();
+        let aggregate = scan(job(&root, paths, snapshot));
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/checks.rs::planted_dead"],
+            "{aggregate:#}"
+        );
+        assert_eq!(aggregate["test_only_count"], 0, "{aggregate:#}");
+        for (helper, caller) in [
+            ("Handler::with_draw", "Handler::new"),
+            ("Handler::register_in", "Handler::register"),
+        ] {
+            let sites = store
+                .direct_callers_of(Path::new("src/main.rs"), helper)
+                .unwrap();
+            assert_eq!(sites.len(), 1, "{helper}: {sites:#?}");
+            assert_eq!(sites[0].caller.symbol, caller);
+            assert_eq!(sites[0].kind, "call");
+        }
+        let tree = store
+            .call_tree(Path::new("src/main.rs"), "Handler::with_draw", 1)
+            .unwrap();
+        assert!(
+            tree.children.is_empty(),
+            "function values are not executed: {tree:#?}"
+        );
+        for symbol in ["check", "draw", "assigned", "arrayed", "argument"] {
+            let callers = store
+                .direct_callers_of(Path::new("src/checks.rs"), symbol)
+                .unwrap();
+            let caller = callers
+                .iter()
+                .find(|caller| caller.caller.file == "src/main.rs")
+                .unwrap_or_else(|| panic!("{symbol}: {callers:#?}"));
+            assert_eq!(
+                caller.kind,
+                if symbol == "check" {
+                    "call"
+                } else {
+                    "callback_ref"
+                }
+            );
+            let source = fs::read_to_string(root.join("src/main.rs")).unwrap();
+            let written = &source[caller.byte_start..caller.byte_end];
+            assert!(
+                written.contains(&format!("checks::{symbol}")),
+                "{symbol}: {written}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_qualified_paths_resolve_from_the_enclosing_module() {
+        let (temp, root, paths) = canonical_fixture(&[
+            (
+                "src/main.rs",
+                "mod driver; mod targets; fn main() { driver::run(); }",
+            ),
+            (
+                "src/driver.rs",
+                r#"
+use crate::targets::drop;
+pub fn run() { std::mem::drop(0); outer::run(); }
+pub(crate) fn via_super() {}
+mod outer {
+    use crate::targets as alias;
+    pub fn run() {
+        child::plain();
+        child::typed::<()>();
+        self::child::via_self();
+        super::via_super();
+        crate::targets::via_crate();
+        alias::via_alias();
+        child::deep::run();
+    }
+    pub(crate) mod child {
+        pub(crate) fn plain() {}
+        pub(crate) fn typed<T>() {}
+        pub(crate) fn via_self() {}
+        pub(crate) mod deep {
+            pub fn run() { super::super::super::via_super(); }
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::outer::child::typed;
+    #[test] fn checks() { super::outer::child::plain(); typed::<()>(); }
+}
+"#,
+            ),
+            (
+                "src/targets.rs",
+                r#"
+pub(crate) fn via_crate() {}
+pub(crate) fn via_alias() {}
+pub(crate) fn drop(_value: i32) {}
+"#,
+            ),
+        ]);
+        let store = crate::callgraph_store::CallGraphStore::open(
+            temp.path().join("callgraph-store"),
+            root.clone(),
+        )
+        .unwrap();
+        store.cold_build(&paths).unwrap();
+        let snapshot =
+            crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path()).unwrap();
+        let aggregate = scan(job(&root, paths, snapshot));
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/targets.rs::drop"],
+            "{aggregate:#}"
+        );
+        assert_eq!(aggregate["test_only_count"], 0, "{aggregate:#}");
+        for (file, symbol, expected_count) in [
+            ("src/driver.rs", "outer::child::plain", 2),
+            ("src/driver.rs", "outer::child::typed", 2),
+            ("src/driver.rs", "outer::child::via_self", 1),
+            ("src/driver.rs", "via_super", 2),
+            ("src/targets.rs", "via_crate", 1),
+            ("src/targets.rs", "via_alias", 1),
+        ] {
+            let callers = store.direct_callers_of(Path::new(file), symbol).unwrap();
+            assert_eq!(callers.len(), expected_count, "{symbol}: {callers:#?}");
+            assert!(
+                callers
+                    .iter()
+                    .all(|caller| caller.kind == "call" && caller.resolved),
+                "{symbol}: {callers:#?}"
+            );
+        }
     }
 
     #[test]

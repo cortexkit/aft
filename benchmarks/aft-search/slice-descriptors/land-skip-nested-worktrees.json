@@ -1,0 +1,15 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/search_index.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/lib.rs"
+  ],
+  "slices": [
+    "skip-nested-worktrees"
+  ],
+  "note": "The ranking fence hits are search_index.rs and semantic_search/mod.rs, whose project walks now prune linked worktrees of the same repository nested under the root, and lib.rs, which registers the new test module. No benchmark corpus contains such a worktree, so ranked rows must remain byte-identical to the committed reference; scoring, admission and routing are unchanged."
+}

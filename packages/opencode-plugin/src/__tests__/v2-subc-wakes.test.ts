@@ -6,6 +6,7 @@ import {
   type AftTransportFactoryOptions,
   type AftTransportPool,
   acquireBridge,
+  type BashPatternMatchAck,
   releaseBridge,
   SubcTransportPool,
 } from "@cortexkit/aft-bridge";
@@ -21,7 +22,7 @@ import {
 import { makeServerEffect } from "../entry/server-runtime.mjs";
 import * as logger from "../logger.js";
 import { __resetV2WakeRoutesForTests, type V2RuntimeConsumer } from "../wakes/runtime-consumer.js";
-import type { V2SessionSyntheticInput } from "../wakes/session-delivery.js";
+import { V2SessionDelivery, type V2SessionSyntheticInput } from "../wakes/session-delivery.js";
 import { recoverV2SubcSessions } from "../wakes/subc-recovery.js";
 
 const roots: string[] = [];
@@ -49,6 +50,7 @@ class ModuleDouble {
   events: string[] = [];
   clients: ReturnType<ModuleDouble["connect"]>[] = [];
   admissionGate: Promise<void> | undefined;
+  acks: BashPatternMatchAck[][] = [];
   key(root: string, session: string) {
     return `${root}\0${session}`;
   }
@@ -72,7 +74,10 @@ class ModuleDouble {
       request: async (route: RouteHandle, raw: unknown) => {
         if (closed) throw new Error("client closed");
         const identity = routes.get(route.channel)!;
-        const body = raw as { name: string; arguments: { task_ids?: string[] } };
+        const body = raw as {
+          name: string;
+          arguments: { task_ids?: string[]; matches?: BashPatternMatchAck[] };
+        };
         const key = this.key(identity.project_root, identity.session);
         this.events.push(`${body.name}:${identity.session}`);
         if (body.name === "bash_drain_completions") {
@@ -82,6 +87,16 @@ class ModuleDouble {
         if (body.name === "bash_ack_completions") {
           expect(this.events).toContain(`admitted:${identity.session}`);
           const taskIds = new Set(body.arguments.task_ids);
+          const exact = (left: BashPatternMatchAck, right: BashPatternMatchAck) =>
+            left.task_id === right.task_id &&
+            left.watch_id === right.watch_id &&
+            left.match_offset === right.match_offset;
+          const acked = (body.arguments.matches ?? []).filter((target) =>
+            this.pending
+              .get(key)
+              ?.pending_matches?.some((item) => exact(item as BashPatternMatchAck, target)),
+          );
+          this.acks.push(body.arguments.matches ?? []);
           const retained = {
             bg_completions: this.pending
               .get(key)
@@ -91,14 +106,21 @@ class ModuleDouble {
             pending_matches: this.pending
               .get(key)
               ?.pending_matches?.filter(
-                (item) => !taskIds.has((item as { task_id: string }).task_id),
+                (item) =>
+                  !taskIds.has((item as { task_id: string }).task_id) &&
+                  !acked.some((target) => exact(item as BashPatternMatchAck, target)),
               ),
           };
           if (retained.bg_completions?.length || retained.pending_matches?.length)
             this.pending.set(key, retained);
           else this.pending.delete(key);
           return {
-            structuredContent: { text: "", success: true, acked_task_ids: body.arguments.task_ids },
+            structuredContent: {
+              text: "",
+              success: true,
+              acked_task_ids: body.arguments.task_ids,
+              acked_matches: acked,
+            },
             content: [],
           };
         }
@@ -796,6 +818,100 @@ test("OC2 subc admission reservation fences a concurrent in-turn completion drai
     expect(runtime.synthetic).toHaveLength(1);
   } finally {
     admit?.();
+    await runtime.stop();
+  }
+});
+
+test("OC2 subc each_line stale ack at version one does not repeat admitted rows or counters", async () => {
+  const root = workspace();
+  const module = new ModuleDouble();
+  const runtime = await start(root, module);
+  let admit!: () => void;
+  let firstDrain: Promise<void> | undefined;
+  const deliveries = new Set<V2SessionDelivery>();
+  const original = V2SessionDelivery.prototype.completion;
+  V2SessionDelivery.prototype.completion = function (input) {
+    if (input.notificationID?.startsWith("match\0")) deliveries.add(this);
+    return original.call(this, input);
+  };
+  try {
+    runtime.consumer.registerSession?.("s");
+    await runtime.pool.getBridge(root).send("status", { session_id: "s" });
+    await tick();
+    module.events.length = 0;
+    const firstLine = {
+      stream: "stdout",
+      offset: 0,
+      end_offset: 12,
+      text: "READY first",
+      count: 1,
+    };
+    const first = {
+      ...match(),
+      once: false,
+      reason: "pattern_match",
+      match_offset: 0,
+      batch: {
+        pending_id: "subc-pending",
+        version: 0,
+        snapshot: true,
+        lines: [firstLine],
+        dropped_lines: 7,
+        skipped_long_lines: 0,
+        first_dropped_offset: 100,
+        first_dropped_stream: "stdout",
+      },
+    };
+    module.pending.set(module.key(root, "s"), { pending_matches: [first] });
+    module.admissionGate = new Promise<void>((resolve) => {
+      admit = resolve;
+    });
+    const receiver = runtime.consumer.subcWakes(() => runtime.pool, root);
+    firstDrain = receiver.drainSession("s");
+    await until(() => module.events.includes("bash_drain_completions:s"));
+    module.pending.set(module.key(root, "s"), {
+      pending_matches: [
+        {
+          ...first,
+          match_offset: 1,
+          batch: {
+            ...first.batch,
+            version: 1,
+            dropped_lines: 10,
+            lines: [
+              { ...firstLine },
+              { stream: "stderr", offset: 0, end_offset: 13, text: "READY second", count: 1 },
+            ],
+          },
+        },
+      ],
+    });
+    admit();
+    module.admissionGate = undefined;
+    await firstDrain;
+    await receiver.drainSession("s");
+    expect(runtime.synthetic).toHaveLength(2);
+    expect(runtime.synthetic[0]?.text).toContain("stdout byte 0: READY first");
+    expect(runtime.synthetic[0]?.text).toContain("7 matching lines dropped.");
+    expect(runtime.synthetic[1]?.text).toContain("stderr byte 0: READY second");
+    expect(runtime.synthetic[1]?.text).not.toContain("stdout byte 0: READY first");
+    expect(runtime.synthetic[1]?.text).toContain("3 matching lines dropped.");
+    expect(runtime.synthetic[1]?.text).not.toContain("10 matching lines dropped.");
+    expect(module.acks).toEqual([
+      [{ task_id: "watched", watch_id: "watch", match_offset: 0 }],
+      [{ task_id: "watched", watch_id: "watch", match_offset: 1 }],
+    ]);
+    expect(module.pending.has(module.key(root, "s"))).toBe(false);
+    expect(deliveries.size).toBe(1);
+    for (const delivery of deliveries) {
+      expect((delivery as unknown as { admittedWakes: Set<string> }).admittedWakes.size).toBe(0);
+    }
+    await receiver.drainSession("s");
+    expect(runtime.synthetic).toHaveLength(2);
+  } finally {
+    V2SessionDelivery.prototype.completion = original;
+    admit?.();
+    await firstDrain;
     await runtime.stop();
   }
 });

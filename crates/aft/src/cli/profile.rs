@@ -971,6 +971,8 @@ fn version_for_loaded_image(loaded_id: &str, disk_id: Option<&str>, image: &Path
     version_for_loaded_image_with(loaded_id, disk_id, || binary_version(image))
 }
 
+// Used by the macOS loaded-image reader and by its tests on every platform.
+#[cfg(any(target_os = "macos", test))]
 fn version_for_loaded_image_with(
     loaded_id: &str,
     disk_id: Option<&str>,
@@ -3531,8 +3533,42 @@ mod tests {
 
     #[test]
     fn linux_perf_stacks_fold_into_one_tree_before_ranking() {
-        let raw = include_str!("../../tests/fixtures/linux-perf-script.txt");
-        let threads = parse_perf_script(raw);
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/linux-perf-script.json"))
+                .unwrap();
+        let mut raw = String::new();
+        let mut sample = 0;
+        let mut append = |frame: &str| {
+            sample += 1;
+            raw.push_str(&frame.replace("@TIME@", &format!("12345.{:06}", sample * 4000)));
+        };
+        // The original trace alternates five actor samples and three scan
+        // samples. Thirty distinct scan leaves recur twice to exercise fanout.
+        for cycle in 0..20 {
+            for _ in 0..5 {
+                append(fixture["actorSample"].as_str().unwrap());
+            }
+            for leaf in (cycle * 3)..(cycle * 3 + 3) {
+                let leaf = leaf % 30;
+                append(
+                    &fixture["scanSample"]
+                        .as_str()
+                        .unwrap()
+                        .replace("@ADDR@", &format!("{:x}", 0x55d1c0b00000u64 + leaf))
+                        .replace("@OFFSET@", &format!("{:x}", leaf * 4)),
+                );
+            }
+        }
+        for _ in 0..8 {
+            append(fixture["executorSample"].as_str().unwrap());
+        }
+        // Pin the full original bytes, not just the parsed stack counts.
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            format!("{:x}", Sha256::digest(raw.as_bytes())),
+            fixture["sha256"].as_str().unwrap()
+        );
+        let threads = parse_perf_script(&raw);
         let ids = threads
             .iter()
             .map(|thread| (thread.id.as_str(), thread.declared_samples))

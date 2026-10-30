@@ -1,0 +1,15 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/commands/semantic_search/external_disk_check.rs",
+    "crates/aft/src/search_index.rs"
+  ],
+  "slices": [
+    "flake-batch-1027"
+  ],
+  "note": "Batch of seven merge-queue fixes landed together so their groups stop failing on each other's flakes: #1028 (views-on readiness samples the installed snapshot's index; views-off unchanged), #1029, #1030, #1031, #1032, #1033, #1037. Fence hits are #1028's views-only readiness sample and test-only code in semantic_search and search_index; views-off ranked rows stay byte-identical to the committed reference."
+}

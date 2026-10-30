@@ -563,6 +563,7 @@ describe("scenario isolation and liveness", () => {
     const legacy = await createScenarioIsolation({
       parent: join(parent, "legacy-runs"),
       scenarioId: "read/T7/legacy",
+      userConfig: { bash: { changed_files: "diff" } },
       fixture,
       pluginTarball: tarball,
       pluginDirectory,
@@ -579,6 +580,10 @@ describe("scenario isolation and liveness", () => {
       providerConfigKey: "provider",
     });
     const legacyConfig = JSON.parse(await readFile(legacy.host_config, "utf8"));
+    expect(JSON.parse(await readFile(join(legacy.config, "cortexkit", "aft.jsonc"), "utf8")))
+      .toEqual({ disabled_tools: [], bash: { changed_files: "diff" } });
+    expect(JSON.parse(await readFile(join(legacy.project, ".cortexkit", "aft.jsonc"), "utf8")))
+      .toEqual({});
     // The V1 host reads `provider`; it logs `providers` as an unsupported key
     // and then has no provider to resolve the run's model against.
     expect(legacyConfig.provider.mock.options.baseURL).toBe("http://127.0.0.1:1234/v1");
@@ -1472,10 +1477,76 @@ describe("source-of-truth derivation", () => {
     expect(parity?.comparison).toEqual(t1.comparison);
   });
 
-  test("all twelve list surfaces and supported reasons come from the Rust registry", async () => {
+  test("T6 ownership and fixtures follow negotiated route requirements", () => {
+    const surface = {
+      id: "future_tool.matches.payload.matches",
+      command: "future_tool",
+      mode: "matches",
+      list_id: "payload.matches",
+      owner: "future_tool",
+      unit: "results",
+      narrow: ["pattern"],
+      reasons: ["budget"],
+      requires: "future-results/v2",
+    };
+    const matrix: Parameters<typeof validateT6>[0] = {
+      schema_version: 1,
+      platform: "linux",
+      rows: [{
+        tool: surface.owner,
+        trajectories: {
+          T1: "applicable", T2: "applicable", T3: "applicable", T4: "applicable",
+          T5: "applicable", T6: "n/a:no-list-surface", T7: "applicable",
+        },
+      }],
+    };
+    expect(() => validateT6(matrix, [], [surface])).not.toThrow();
+    expect(() => validateT6(matrix, [], [surface], ["unrelated/v1"])).not.toThrow();
+    expect(() => validateT6(matrix, [], [surface], [surface.requires]))
+      .toThrow("owns registered list surfaces");
+    matrix.rows[0].trajectories.T6 = "applicable";
+    const fixtures: ScenarioDefinition[] = ["complete", "incomplete"].map((kind) => ({
+      ...scenario(call({ id: "future-call", name: surface.owner })),
+      id: `${surface.owner}/T6/${kind}`,
+      tool: surface.owner,
+      trajectory: "T6",
+      metadata: {
+        t6: {
+          surface_id: surface.id,
+          call_id: "future-call",
+          fixture: kind,
+          ...(kind === "incomplete" ? {
+            triggered_reason: "budget",
+            expected_trailer: "shown 1 of 2 results (budget) · narrow: pattern",
+          } : {}),
+        },
+      },
+    }));
+    expect(() => validateT6(matrix, fixtures, [surface], [surface.requires])).not.toThrow();
+    expect(() => validateT6(matrix, fixtures.slice(0, 1), [surface], [surface.requires]))
+      .toThrow("requires complete and incomplete fixtures");
+    expect(() => validateT6(matrix, fixtures, [surface])).toThrow("must derive n/a:no-list-surface");
+    matrix.rows[0].trajectories.T6 = "n/a:no-list-surface";
+    expect(() => validateT6(matrix, fixtures, [surface])).toThrow("unknown T6 surface");
+  });
+
+  test("all fifteen list surfaces and route requirements come from the Rust registry", async () => {
     const repo = join(import.meta.dir, "../../../..");
     const surfaces = await deriveListSurfaces(repo);
-    expect(surfaces).toHaveLength(12);
+    expect(surfaces).toHaveLength(15);
+    expect(surfaces.find((surface) => surface.id === "ast_search.matches.payload.matches"))
+      .toMatchObject({
+        owner: "ast_search",
+        requires: "tool-result/v1",
+        unit: "results",
+        reasons: ["budget"],
+        narrow: ["paths", "globs", "pattern"],
+      });
+    expect(surfaces.filter((surface) => surface.requires == null)).toHaveLength(14);
+    expect(surfaces.find((surface) => surface.id === "bash.changed_files.bash.changed_files"))
+      .toMatchObject({ owner: "bash", unit: "files" });
+    expect(surfaces.find((surface) => surface.id === "bash.diff_lines.bash.diff_lines"))
+      .toMatchObject({ owner: "bash", unit: "lines" });
     expect(surfaces.find((surface) => surface.id === "read.directory.payload.entries")).toMatchObject({
       owner: "read",
       unit: "items",

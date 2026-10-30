@@ -604,6 +604,9 @@ fn collect_warm_working_set(
                 .contains_key(&(file.to_path_buf(), server.clone()))
         })
     };
+    // Watcher changes still queued for the manager lock have not reached the
+    // servers; deliver them first so the state read below accounts for them.
+    ctx.lsp_forward_queued_watcher_changes();
     {
         let mut lsp = ctx.lsp();
         // Live language-server diagnostics come from queued events and the

@@ -306,7 +306,7 @@ recommended tool surface; experimental flags gate advanced behavior, not the too
 | `compressed` | boolean | Opt in/out of output compression for this call (default true; requires compression flag) |
 | `pty` | boolean | Run in a real PTY for interactive programs. Implies `background: true`. |
 | `ptyRows` / `ptyCols` | number | PTY dimensions (max 60 rows / 140 cols). Soft-ignored on non-PTY calls. |
-| `runon` | string | Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add ",net" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options). |
+| `runon` | string | Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add ",net" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options). `macos` sends the command to a macOS machine for builds and tests that need macOS (no vCPU or network options). |
 
 Calls admitted under the `worker` catalog preset set `NEXTEST_TEST_THREADS` and `RUST_TEST_THREADS` for local bash children from `../.cargo/alfonso-test-threads` (one decimal integer plus newline), defaulting to 4 when the file is missing, invalid, or above 256; valid values through 256 are preserved. Existing inherited or per-call values take precedence, and shell command prefixes still override them; head sessions and unscoped plugin worker flags receive no defaults, and exec-remote requests never carry these variables.
 
@@ -321,14 +321,19 @@ Calls admitted under the `worker` catalog preset set `NEXTEST_TEST_THREADS` and 
 process spawn (setup time does not count). Expiry sends SIGTERM to the Unix process group, then
 SIGKILL after up to 2 seconds (Windows uses `taskkill /T /F`) and reports exit 124. Unix processes
 that leave the group (`setsid`, `setpgid`, Python `start_new_session=True`) survive; macOS has no
-tree kill. A bare foreground
+tree kill. AFT cannot signal a process owned by another user, such as one started with `sudo`; on
+Linux and macOS the task's `live_descendants` and text name any such survivor by pid, owner and executable
+name (never its arguments, which can hold credentials; a null list comes with
+`live_descendants_unavailable`, the reason AFT could not check), so bound `sudo` commands yourself:
+`sudo -n timeout -k 1 <secs> <cmd>` shorter than AFT's limit, or
+`sudo -n bash -c "trap 'kill -KILL 0' TERM; <cmd> & wait"`. A bare foreground
 `bash({ command })` is polled for a short internal wait window (~5s); if the command hasn't
 finished it auto-promotes to a background task and returns a `taskId` while the command keeps
 running under the 30-minute (or explicit `timeout`) kill cap. `bash({ timeout: 2000 })` polls
 briefly then hard-kills at 2s. `background: true` skips polling entirely.
 
 Completion previews in notices and wakes have common credential formats and secret-named child environment values masked; stdout/stderr files and `bash_status` tool results remain unchanged.
-After a daemon restart, a masked preview saved before the restart is replayed unchanged. A preview not yet saved is built from the output files only when the task was recorded as having no secret-named environment values; otherwise its preview is withheld because the secret values are no longer in memory to mask it, and `bash_status` reads the output.
+After a daemon restart, a masked preview saved before the restart is replayed unchanged. A preview not yet saved is built from the output files only when the task was recorded as having no secret-named environment values; otherwise its preview is withheld because the secret values are no longer in memory to mask it, and `bash_status` reads the output. A watch match or `each_line` row withheld this way names the output file it was found in, since `bash_status` shows no output while the task runs. A substring watch always reports its own pattern as the matched text, and its `each_line` rows show the pattern even where it is part of a masked credential (the rest of the credential stays masked).
 
 **Foreground example:**
 
@@ -346,7 +351,10 @@ build server (ck-motor, reached through the Subconscious daemon's `exec-remote/v
 command starts. Without a count, the job gets 2 vCPUs. Add `,net` for outbound internet:
 `linux,net`, `linux,4c,net` and `linux,net,4c` are accepted; remote jobs are offline by default. A plan's
 `default_demand` may include these options too. `runon: "windows"` sends the command to a Windows
-build machine and runs it in Git Bash; it does not accept vCPU or network options. Duplicate
+build machine and runs it in Git Bash; it does not accept vCPU or network options. `runon: "macos"`
+sends the command to a macOS machine; it takes no vCPU or network options. Use it for builds and
+tests that need macOS (its sandbox, code signing or file watching) instead of running them on this
+machine; anything needing a service manager agent (such as a launchd agent) or a GUI session stays local. Duplicate
 options, unknown tokens and unsupported platforms are refused by name before dispatch. It runs
 there under `bash -c` in the same working directory, with the same timeout and the same
 environment, minus the secret-shaped and AFT/CortexKit control variables AFT strips before any
@@ -357,7 +365,7 @@ Explicit whole-line `runon` also requires the user-only live safety switch
 `bash.runon_enabled: true` (default false); projects cannot enable it. Turning that switch off
 hides and refuses `runon` without disabling legacy prefix routing.
 
-When remote runs are available, put `runon: "linux"` on build and test lines (cargo, bun test), including chains and pipes. Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs this machine's own operating system or hardware (its sandbox, code signing, service manager, permission prompts or GUI frameworks) or runs a binary that already exists on this machine; building and testing still go remote, and a remote build leaves no binaries or target/ output here.
+When remote runs are available, put `runon: "linux"` on build and test lines (cargo, bun test), including chains and pipes. Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs this machine's own operating system or hardware (its sandbox, code signing, service manager, permission prompts or GUI frameworks) or runs a binary that already exists on this machine; a build or test that needs only macOS (its sandbox, code signing or file watching) can use runon: "macos" instead; building and testing still go remote, and a remote build leaves no binaries or target/ output here.
 The job sees exactly the CPUs it gets, so ask for what the command uses: 2c (the default) for a single test binary or script, 4c for `cargo check`/clippy on one crate, 8c for a workspace test suite, and 16c for a large release build.
 
 Who is offered `runon`:
@@ -379,7 +387,7 @@ setting says.
 A call that sets `runon` is refused by name, and runs nowhere, when it cannot run remotely:
 the project turned remote runs off (`remote runs are off for this project`), the session has no
 remote runner (`this session has no remote runner`), the demand is not one AFT knows
-(`unknown runner demand`; the server only runs Linux), an option is malformed (for example,
+(`unknown runner demand`; AFT only runs Linux, macOS, and Windows jobs), an option is malformed (for example,
 `runon "linux,4" is not valid: options are net and a vCPU count as Nc, for example "linux,4c,net"`),
 or the call also sets `pty: true`, a
 PowerShell shell, or `sandbox: "host"`. On Windows `runon` is refused by name: remote dispatch
@@ -422,9 +430,11 @@ is copied back: the files the run changed (`These files changed on the server an
 copied back:`), a changed Git state (HEAD before -> after, the symbolic ref or `detached`,
 whether the index tree changed, and the stash count change), new untracked files (marked when
 the runner listed only some of them), and the number of writes under ignored paths with sample
-paths. A kind of change the runner reported as empty is not mentioned. A kind it did not report
-(an older runner) gets one line, such as `git state: not reported by the runner`, and is never
-shown as "nothing changed".
+paths. A kind of change the runner reported as empty is not mentioned. When the runner sends no
+changed-file list at all, the reply says `changed files: not reported by the runner` rather than
+implying nothing changed. The Git state, untracked-file and ignored-write reports stay silent when
+absent: the build server never fills them (its Git folder is read-only, and every changed file is
+already in the changed-file list).
 
 **Rewriter** — when `experimental.bash.rewrite: true`, common shell command shapes route to AFT
 tools instead of spawning bash:
@@ -534,6 +544,7 @@ briefly exceed the limit.
 **`bash_status`** — read-only snapshot of a background or PTY task's current state and output.
 Never waits. For PTY tasks, `outputMode` selects `screen` (vt100-rendered), `raw` (byte stream),
 or `both`.
+Optional `outputOffset` / `stderrOffset` (`output_offset` / `stderr_offset` in Pi) read masked stdout/PTY or stderr pages from a byte offset and return the next offset.
 
 **`bash_watch`** — block on or register for a background task's output. In a main session sync
 waits are for a short remaining wait on a task (default 30s, max `bash.watch_sync_max_ms`, 120s
@@ -547,6 +558,9 @@ but never extends it beyond the configured worker limit. Every session's blockin
 call (`wait: true`, or any foreground call when
 `bash.subagent_background` is false) is bounded the same way: at the limit the command moves to the
 background, not killed, and the reply gives its task id, including on the tool-provider/v1 route.
+With `background: true`, `deliver: "each_line"` batches matching lines with byte offsets and combines consecutive identical lines with a count.
+Notices are capped at 50 lines and 12 a minute per watch (the final drop summary is exempt from the rate cap).
+Drops name a `bash_status` offset to read.
 The head preset declares a reply deadline for `bash`; the worker preset declares it for `bash`
 and `bash_watch`. Both use the resolved `bash.worker_wait_max_ms` plus 240 seconds for spawn,
 terminal handoff and reply delivery. A watch does not spawn a command, but retains the same
@@ -585,6 +599,12 @@ and asks for permission per sub-command via `ctx.ask({ permission: "bash", patte
 File-touching commands (`rm`, `cp`, `mv`, etc.) also fire
 `ctx.ask({ permission: "external_directory" })` for paths outside the project root. Pi has no
 permission system; bash runs without prompts.
+
+For a file outside the project, OpenCode's "always" rule and Cingulate's folder option stay
+file-only for your home folder and the folders above it, drive and volume roots, root-level
+folders, and system folders such as `/usr`, `/etc`, `/System`, `C:\Windows` and
+`C:\Program Files` (macOS per-user temp folders under `/var/folders` are not system folders).
+Other folders keep the folder-wide rule.
 
 ---
 

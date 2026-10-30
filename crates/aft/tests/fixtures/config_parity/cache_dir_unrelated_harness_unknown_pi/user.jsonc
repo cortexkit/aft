@@ -1,0 +1,7 @@
+{
+  "harnesses": {
+    "pi": {
+      "future_option": true
+    }
+  }
+}

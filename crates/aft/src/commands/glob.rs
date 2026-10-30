@@ -38,7 +38,13 @@ const MAX_DIRECTORY_SECTIONS: usize = 8;
 const MAX_DISPLAY_DIRECTORIES: usize = 6;
 
 pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
-    crate::bounded_io::command(req, ctx, handle_glob_inner)
+    let config = ctx.config();
+    let _pin = config.views.enabled.then(|| ctx.pin_config_to(config));
+    ctx.with_read_policy_snapshot(&req.id, || {
+        crate::context::confinement::with_floor_disclosure(|| {
+            crate::bounded_io::command(req, ctx, handle_glob_inner)
+        })
+    })
 }
 
 fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -53,13 +59,16 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    if let Err(error) = build_path_filters(&[pattern.to_string()], &[]) {
-        return Response::error(
-            &req.id,
-            "invalid_request",
-            format!("glob: invalid pattern: {}", error),
-        );
-    }
+    let filters = match build_path_filters(&[pattern.to_string()], &[]) {
+        Ok(filters) => filters,
+        Err(error) => {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                format!("glob: invalid pattern: {}", error),
+            )
+        }
+    };
 
     let project_root = ctx
         .config()
@@ -67,6 +76,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or_default());
     let project_root = crate::bounded_io::canonicalize(&project_root).unwrap_or(project_root);
+    crate::context::confinement::set_floor_filter(&project_root, &filters);
     let search_roots = match req.params.get("path").and_then(|value| value.as_str()) {
         Some(path) => match resolve_path_or_multi(
             path,
@@ -166,7 +176,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             0,
         )
     } else if search_roots.len() == 1 {
-        let discovery = discover_glob_root(
+        let discovery = match discover_glob_root(
             named_ignored_roots[0].as_deref(),
             ctx,
             &project_root,
@@ -178,7 +188,13 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 .get("path")
                 .and_then(|value| value.as_str())
                 .map(|_| req.session()),
-        );
+        ) {
+            Ok(discovery) => discovery,
+            // A failed view load fails the call, like grep: no fallback
+            // walk may answer for a checkout view. The error text is the
+            // view's own, naming the cause.
+            Err(error) => return Response::error(&req.id, "internal_error", error),
+        };
         indexed_mtimes = discovery.indexed_mtimes;
         (
             discovery.files,
@@ -192,26 +208,31 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             discovery.skipped_foreign_mounts,
         )
     } else {
-        let discoveries: Vec<GlobDiscovery> = search_roots
+        let mut discoveries = Vec::with_capacity(search_roots.len());
+        for ((root, ignored), named) in search_roots
             .iter()
             .zip(&ignored_targets)
             .zip(&named_ignored_roots)
-            .map(|((root, ignored), named)| {
-                discover_glob_root(
-                    named.as_deref(),
-                    ctx,
-                    &project_root,
-                    root,
-                    pattern,
-                    DEFAULT_MAX_RESULTS + 1,
-                    *ignored,
-                    req.params
-                        .get("path")
-                        .and_then(|value| value.as_str())
-                        .map(|_| req.session()),
-                )
-            })
-            .collect();
+        {
+            match discover_glob_root(
+                named.as_deref(),
+                ctx,
+                &project_root,
+                root,
+                pattern,
+                DEFAULT_MAX_RESULTS + 1,
+                *ignored,
+                req.params
+                    .get("path")
+                    .and_then(|value| value.as_str())
+                    .map(|_| req.session()),
+            ) {
+                Ok(discovery) => discoveries.push(discovery),
+                // A failed view load fails the call, like grep: no fallback
+                // walk may answer for a checkout view.
+                Err(error) => return Response::error(&req.id, "internal_error", error),
+            }
+        }
         let walk_truncated = discoveries.iter().any(|d| d.walk_truncated);
         let walk_time_limit_reached = discoveries.iter().any(|d| d.walk_time_limit_reached);
         let entries_visited = discoveries.iter().map(|d| d.entries_visited).sum();
@@ -263,27 +284,49 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // still lists another checkout's files): only paths present on disk in this
     // checkout are returned. Only the page is checked, and the page is refilled
     // from the following matches, so present files keep their order.
-    let presence = crate::search_index::take_present_on_disk(
+    let candidate_count = files.len();
+    let (presence, _) = match crate::search_index::take_present_on_disk_with_admission(
         files,
         DEFAULT_MAX_RESULTS,
         |path| path.as_path(),
         "glob",
-    );
+        |path| match ctx.validate_read_path(&req.id, req.session(), path) {
+            Ok(_) => Ok(true),
+            Err(response) if response.data["code"] == "denied_floor" => {
+                crate::context::confinement::capture().record_matched_floor(path);
+                Ok(false)
+            }
+            Err(response) => Err(response),
+        },
+    ) {
+        Ok(presence) => presence,
+        Err(response) => return response,
+    };
     let missing_on_disk = presence.dropped;
     let presence_budget_exhausted = presence.budget_exhausted;
     let files = presence.present;
-    let total = files.len() + presence.unexamined;
-    let result_truncated = total > DEFAULT_MAX_RESULTS || presence_budget_exhausted;
+    let admitted_count = files.len();
+    // The public count includes discovered candidates beyond the returned page.
+    // Missing or denied candidates checked in this window are already excluded.
+    let total = admitted_count.saturating_add(presence.unexamined);
+    let all_candidates_checked = presence.unexamined == 0;
+    let result_truncated = presence.unexamined > 0 || presence_budget_exhausted;
 
     let mut body = serde_json::json!({
         "text": format_glob_text(&files, pattern, &project_root, result_truncated),
-        "complete": !walk_truncated && skipped_foreign_mounts == 0 && !presence_budget_exhausted,
+        "complete": all_candidates_checked && !walk_truncated && skipped_foreign_mounts == 0 && !presence_budget_exhausted,
         "no_files_matched_scope": !scope_has_files,
         "skipped_foreign_mounts": skipped_foreign_mounts,
         "files": files.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
-        "total": total,
+        "total": all_candidates_checked.then_some(total),
         "truncated": result_truncated,
     });
+    if !all_candidates_checked {
+        body["total_lower_bound"] = serde_json::json!(total);
+        body["admitted_count"] = serde_json::json!(admitted_count);
+        body["candidate_count"] = serde_json::json!(candidate_count);
+        body["unexamined_files"] = serde_json::json!(presence.unexamined);
+    }
     if walk_truncated {
         body["walk_truncated"] = serde_json::Value::Bool(true);
     }
@@ -471,7 +514,7 @@ fn discover_glob_root(
     max_results: usize,
     ignored_target: bool,
     explicit_session: Option<&str>,
-) -> GlobDiscovery {
+) -> Result<GlobDiscovery, String> {
     if let Some(named_root) = named_ignored_root {
         let filters = build_path_filters(&[pattern.to_owned()], &[]).unwrap_or_default();
         let started = Instant::now();
@@ -480,7 +523,7 @@ fn discover_glob_root(
             named_root,
             &filters,
         );
-        return GlobDiscovery {
+        return Ok(GlobDiscovery {
             scope_has_files: !outcome.files.is_empty()
                 || outcome.walk_truncated
                 || outcome.skipped_foreign_mounts > 0,
@@ -493,7 +536,7 @@ fn discover_glob_root(
             walk_time: started.elapsed(),
             scope_probe: Duration::ZERO,
             skipped_foreign_mounts: outcome.skipped_foreign_mounts,
-        };
+        });
     }
     glob_root(
         ctx,
@@ -526,9 +569,14 @@ fn glob_root(
     max_results: usize,
     ignored_target: bool,
     explicit_session: Option<&str>,
-) -> GlobDiscovery {
+) -> Result<GlobDiscovery, String> {
     if crate::context::confinement::active() {
-        return fallback_glob(project_root, search_root, pattern, ignored_target);
+        return Ok(fallback_glob(
+            project_root,
+            search_root,
+            pattern,
+            ignored_target,
+        ));
     }
     if let Some(outputs) = explicit_session.and_then(|session| {
         ctx.bash_background()
@@ -545,7 +593,7 @@ fn glob_root(
             .into_iter()
             .filter(|path| filters.matches(filter_root, path))
             .collect();
-        return GlobDiscovery {
+        return Ok(GlobDiscovery {
             scope_has_files: !files.is_empty(),
             files,
             indexed_mtimes: HashMap::new(),
@@ -556,11 +604,19 @@ fn glob_root(
             walk_time: Duration::ZERO,
             scope_probe: Duration::ZERO,
             skipped_foreign_mounts: 0,
-        };
+        });
     }
     let search_root_text = search_root.to_string_lossy();
     let search_scope = resolve_search_scope(project_root, Some(search_root_text.as_ref()));
-    let indexed_snapshot = {
+    let view_snapshot = (search_scope.use_index && !ignored_target)
+        .then(|| ctx.lexical_view_snapshot("glob"))
+        .flatten();
+    let indexed_snapshot = if let Some(snapshot) = view_snapshot {
+        // A failed view load fails the call, like grep: answering from a
+        // fallback walk would hide the outage, and the legacy snapshot may
+        // describe another checkout.
+        Some(snapshot.map_err(crate::context::view_load_failure_message)?)
+    } else {
         let search_index = ctx
             .search_index()
             .read()
@@ -599,8 +655,7 @@ fn glob_root(
             skipped_foreign_mounts: 0,
         }
     });
-
-    match indexed {
+    Ok(match indexed {
         Some(discovery)
             if index_covers_root
                 || crate::grep_executor::is_same_directory(&search_scope.root, project_root) =>
@@ -626,7 +681,7 @@ fn glob_root(
                     let walk_time = walk_started.elapsed();
                     let scope_started = Instant::now();
                     let scope_has_files = !outcome.files.is_empty() || outcome.walk_truncated;
-                    return GlobDiscovery {
+                    return Ok(GlobDiscovery {
                         files: outcome.files,
                         indexed_mtimes: HashMap::new(),
                         walk_truncated: outcome.walk_truncated,
@@ -637,12 +692,12 @@ fn glob_root(
                         scope_has_files,
                         scope_probe: scope_started.elapsed(),
                         skipped_foreign_mounts: 0,
-                    };
+                    });
                 }
             }
             fallback_glob(project_root, &search_scope.root, pattern, ignored_target)
         }
-    }
+    })
 }
 
 /// Runs one `glob_root` discovery and returns the files it found, the source
@@ -665,7 +720,8 @@ pub(crate) fn glob_root_files_for_test(
         max_results,
         false,
         explicit_session,
-    );
+    )
+    .expect("test glob discovery without a view failure");
     (discovery.files, discovery.source, discovery.entries_visited)
 }
 
@@ -845,6 +901,65 @@ fn format_directory_label(directory: Option<&Path>) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn glob_bulk_fixture_preserves_examined_lower_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(dir.path()).unwrap();
+        let bulk = project.join("bulk");
+        std::fs::create_dir(&bulk).unwrap();
+        for index in 0..140 {
+            std::fs::write(bulk.join(format!("fixture-{index:03}.txt")), "fixture\n").unwrap();
+        }
+        let mut observed = Vec::new();
+        for indexed in [false, true] {
+            let ctx = AppContext::new(
+                crate::context::default_language_provider_factory(),
+                crate::config::Config {
+                    project_root: Some(project.clone()),
+                    ..Default::default()
+                },
+            );
+            if indexed {
+                *ctx.search_index().write().unwrap() =
+                    Some(crate::search_index::SearchIndex::build(&project));
+            }
+            let request = serde_json::from_value(serde_json::json!({
+                "id": "glob-bulk-lower-bound", "command": "glob", "pattern": "bulk/*.txt"
+            }))
+            .unwrap();
+            // This test checks the reported lower bound, not deadline handling.
+            // A slow CI runner (Windows) can spend the default 5 s request
+            // budget on 140 per-path checks, so give the request a generous
+            // budget of its own.
+            let response = crate::bounded_io::with_budget(
+                Some(crate::bounded_io::Budget::after(Duration::from_secs(60))),
+                || handle_glob(&request, &ctx),
+            );
+            assert!(response.success, "{response:?}");
+            let body = &response.data;
+            let lower_bound = body["total_lower_bound"]
+                .as_u64()
+                .or_else(|| body["total"].as_u64())
+                .unwrap();
+            let rendered = crate::subc_format::format_response("glob", &response, false);
+            let trailer = rendered.lines().last().unwrap().to_owned();
+            println!(
+                "GLOB_BULK_FIXTURE indexed={indexed} lower_bound={lower_bound} returned={} trailer={trailer}",
+                body["files"].as_array().unwrap().len()
+            );
+            assert_eq!(body["files"].as_array().unwrap().len(), 100);
+            observed.push((indexed, lower_bound, trailer));
+        }
+        let trailer = "shown 5 of ≥140 files (cap) · narrow: path";
+        assert_eq!(
+            observed,
+            vec![
+                (false, 140, trailer.to_owned()),
+                (true, 140, trailer.to_owned())
+            ]
+        );
+    }
+
     fn exact_file_glob_fixture() -> (tempfile::TempDir, AppContext, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let project = std::fs::canonicalize(dir.path()).unwrap();
@@ -870,16 +985,20 @@ mod tests {
         assert!(index.snapshot().has_file_in_scope(&file));
         *ctx.search_index().write().unwrap() = Some(index);
 
-        let discovery = glob_root(&ctx, &project, &file, "main.ts", 100, false, None);
+        let discovery = glob_root(&ctx, &project, &file, "main.ts", 100, false, None)
+            .expect("ready index answers without a view");
         assert_eq!(discovery.source, "index");
         assert!(!discovery.walk_truncated);
         assert_eq!(discovery.files, vec![file.clone()]);
         assert_eq!(
-            glob_root(&ctx, &project, &file, "*.ts", 100, false, None).files,
+            glob_root(&ctx, &project, &file, "*.ts", 100, false, None)
+                .expect("glob answers without a view")
+                .files,
             vec![file.clone()]
         );
         assert!(
             glob_root(&ctx, &project, &file, "other.ts", 100, false, None)
+                .expect("glob answers without a view")
                 .files
                 .is_empty()
         );
@@ -890,16 +1009,20 @@ mod tests {
         let (_dir, ctx, project, file) = exact_file_glob_fixture();
         assert!(ctx.search_index().read().unwrap().is_none());
 
-        let discovery = glob_root(&ctx, &project, &file, "main.ts", 100, false, None);
+        let discovery = glob_root(&ctx, &project, &file, "main.ts", 100, false, None)
+            .expect("fallback answers without a view");
         assert_eq!(discovery.source, "fallback");
         assert!(!discovery.walk_truncated);
         assert_eq!(discovery.files, vec![file.clone()]);
         assert_eq!(
-            glob_root(&ctx, &project, &file, "*.ts", 100, false, None).files,
+            glob_root(&ctx, &project, &file, "*.ts", 100, false, None)
+                .expect("glob answers without a view")
+                .files,
             vec![file.clone()]
         );
         assert!(
             glob_root(&ctx, &project, &file, "other.ts", 100, false, None)
+                .expect("glob answers without a view")
                 .files
                 .is_empty()
         );
@@ -1184,14 +1307,20 @@ mod tests {
         *ctx.search_index().write().unwrap() =
             Some(crate::search_index::SearchIndex::build(&project));
         let request = serde_json::from_value(serde_json::json!({
-            "id": "audit", "command": "glob", "pattern": "*.rs"
+            "id": "glob-page-cost-audit", "command": "glob", "pattern": "*.rs"
         }))
         .unwrap();
         crate::search_index::audit_work_reset();
+        let policy_work = crate::context::policy_load_probe::Probe::new("glob-page-cost-audit");
         let response = handle_glob(&request, &ctx);
         let body = serde_json::to_value(response).unwrap();
         assert_eq!(body["files"].as_array().unwrap().len(), 100);
-        assert_eq!(body["total"], 1000);
+        assert!(body["total"].is_null());
+        assert_eq!(body["candidate_count"], 1000);
+        assert_eq!(body["total_lower_bound"], 1000);
+        assert_eq!(body["admitted_count"], 100);
+        assert_eq!(body["unexamined_files"], 900);
+        assert_eq!(body["complete"], false);
         let expected = (900..1000)
             .rev()
             .map(|i| project.join(format!("file_{i:04}.rs")))
@@ -1214,6 +1343,7 @@ mod tests {
         assert_eq!(work.sort_stats, 0, "{work:?}");
         assert_eq!(work.sort_canonicalizes, 0, "{work:?}");
         assert_eq!(work.presence_checks, 100, "{work:?}");
+        assert_eq!(policy_work.counts().read_paths, 100);
     }
 
     fn files(paths: &[&str]) -> Vec<PathBuf> {

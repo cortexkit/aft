@@ -1,6 +1,6 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { beforeEach, describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, spyOn, test } from "bun:test";
 import {
   __resetRpcNotificationsForTest,
   drainNotifications,
@@ -17,6 +17,20 @@ beforeEach(() => {
 });
 
 describe("rpc notifications", () => {
+  test("notification overflow preserves session fairness without sorting monotonic ids", () => {
+    const sort = spyOn(Array.prototype, "sort");
+    try {
+      pushNotification("quiet", {}, "quiet");
+      for (let i = 0; i < 100; i++) pushNotification("noisy", {}, "noisy");
+      expect(sort).not.toHaveBeenCalled();
+      expect(drainNotifications().map((message) => message.id)).toEqual([
+        1,
+        ...Array.from({ length: 50 }, (_, i) => i + 52),
+      ]);
+    } finally {
+      sort.mockRestore();
+    }
+  });
   test("keeps messages queued until the client acks their id", () => {
     pushNotification("one", { ok: true }, "ses_1");
     const firstPoll = drainNotifications();

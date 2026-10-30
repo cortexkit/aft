@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "flake-batch-9"
+  ],
+  "note": "Test-only fix plus one INFO log line: the Windows PTY console round-trip test waits separately for PowerShell startup and for the round trip; bash_write logs the byte count it sent. No changed path matches RANKING_FENCE_PREFIXES."
+}

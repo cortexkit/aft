@@ -1,8 +1,10 @@
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -10,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   clearMigrationNotices,
   npmInvocation,
@@ -23,6 +25,7 @@ import {
   terminateNpmProcessTree,
 } from "@cortexkit/aft-bridge";
 
+import { getAllAdapters } from "../adapters/index.js";
 import { OpenCodeAdapter } from "../adapters/opencode.js";
 import type { HarnessAdapter } from "../adapters/types.js";
 import {
@@ -86,7 +89,7 @@ import { getAftBinaryCacheDir } from "../lib/paths.js";
 import { confirm, intro, log, note, outro, selectMany, selectOne, text } from "../lib/prompts.js";
 import { sanitizeContent } from "../lib/sanitize.js";
 import { getSelfVersion } from "../lib/self-version.js";
-import { readSessionLog } from "../lib/session-log.js";
+import { readLogHistory, readSessionLog } from "../lib/session-log.js";
 import { listRecentSessions, type RecentSession, truncateTitle } from "../lib/sessions.js";
 import {
   checkGhStatus,
@@ -774,10 +777,15 @@ export interface BinaryCacheClearResult {
   keptVersion: string | null;
 }
 
-export function clearOldBinaries(): BinaryCacheClearResult {
-  // Keep the version that matches the running CLI. Different release
-  // tags share a `v` prefix; binaries on disk follow the same shape.
-  const cliVersion = getSelfVersion();
+export function clearOldBinaries(
+  cliVersion = getSelfVersion(),
+  plugins: Pick<
+    HarnessAdapter,
+    "getPluginCacheInfo" | "pluginPackageName" | "getConfiguredPluginEntry"
+  >[] = getAllAdapters(),
+): BinaryCacheClearResult {
+  // Retain both the CLI binary and versions installed or pinned by a harness.
+  const knownVersion = /^(?:v)?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
   const keepTag = `v${cliVersion.replace(/^v/, "")}`;
   const info = getBinaryCacheInfo(cliVersion);
   const result: BinaryCacheClearResult = {
@@ -792,7 +800,31 @@ export function clearOldBinaries(): BinaryCacheClearResult {
     return result;
   }
 
-  const stale = info.versions.filter((v) => v !== keepTag);
+  if (!knownVersion.test(cliVersion)) {
+    result.keptVersion = null;
+    return result;
+  }
+  const retained = new Set([keepTag]);
+  for (const plugin of plugins) {
+    try {
+      const info = plugin.getPluginCacheInfo();
+      // Failed metadata reads cannot establish that a plugin's binary is unused.
+      if (info.readError !== undefined) return result;
+      const entry = (info.configuredEntry ?? plugin.getConfiguredPluginEntry?.())?.replace(
+        /^npm:/,
+        "",
+      );
+      const prefix = `${plugin.pluginPackageName}@`;
+      const pinned = entry?.startsWith(prefix) ? entry.slice(prefix.length) : undefined;
+      for (const version of [info.cached, pinned]) {
+        if (version && knownVersion.test(version)) retained.add(`v${version.replace(/^v/, "")}`);
+      }
+    } catch {
+      // Unreadable registration is not evidence that its binary is unused.
+      return result;
+    }
+  }
+  const stale = info.versions.filter((v) => !retained.has(v));
 
   if (stale.length === 0) {
     log.info(
@@ -1665,6 +1697,23 @@ function applyConfigMigration(
     }
     for (const line of file.notes) log.warn(`  ${line}`);
   }
+  for (const path of result.cacheCleanup?.removed ?? []) {
+    changed += 1;
+    log.success(`Removed inactive rebuildable cache ${path}`);
+  }
+  for (const skipped of result.cacheCleanup?.skipped ?? [])
+    log.warn(`Inactive cache retained: ${skipped}`);
+  for (const partial of result.cacheCleanup?.partial ?? []) {
+    changed += 1;
+    log.warn(
+      `Partially cleared ${partial.path}: removed ${partial.removed_entries} file/directory entries before repair stopped`,
+    );
+  }
+  for (const warning of result.cacheCleanup?.warnings ?? []) log.warn(warning);
+  if (result.cacheCleanup?.error) {
+    errors += 1;
+    log.error(`Inactive cache cleanup refused: ${result.cacheCleanup.error}`);
+  }
   return { changed, errors };
 }
 
@@ -1692,7 +1741,31 @@ export function formatDoctorStorageStatus(h: DiagnosticReport["harnesses"][numbe
     ? h.storageDir.path
     : `${h.storageDir.path} (${h.pluginRegistered ? "not yet created (lazy — created on first tool call)" : "not created"})`;
   const legacyDuplication = formatLegacyDuplication(h.storageDir.legacyDuplication);
-  return `${state} (${[formatStorageSizes(h.storageDir.sizesByKey), legacyDuplication]
+  let cacheWarning = "";
+  if (h.storageDir.cacheRoot) {
+    try {
+      const parent = realpathSync(dirname(h.storageDir.cacheRoot));
+      let durable = h.storageDir.path;
+      while (!existsSync(durable) && dirname(durable) !== durable) durable = dirname(durable);
+      let registered = false;
+      const history = join(h.storageDir.path, "retention/cache-parents.json");
+      if (existsSync(history)) {
+        const saved = JSON.parse(readFileSync(history, "utf8")) as {
+          parents?: { path?: string }[];
+        };
+        registered = saved.parents?.some((entry) => entry.path === parent) === true;
+      }
+      if (!registered && statSync(parent).dev === statSync(durable).dev) {
+        cacheWarning = "; cache_dir_on_storage_device: first enrollment requires another volume";
+      }
+    } catch {
+      // Native configure owns admission and reports unreadable or absent roots.
+    }
+  }
+  return `${state}${h.storageDir.cacheRoot ? `; cache root: ${h.storageDir.cacheRoot} (configured; unavailable roots disable caches)${cacheWarning}` : ""} (${[
+    formatStorageSizes(h.storageDir.sizesByKey),
+    legacyDuplication,
+  ]
     .filter((part): part is string => Boolean(part))
     .join("; ")})`;
 }
@@ -2028,6 +2101,36 @@ export function collectIssueLog(
   };
 }
 
+/** Collect engine history separately because plugin logs no longer duplicate it. */
+export function collectIssueEngineLog(path: string, selectedSession: RecentSession | null) {
+  const directory = dirname(path);
+  const files: { path: string; modified: number }[] = [];
+  try {
+    for (const name of readdirSync(directory)) {
+      if (!/^aft-\d+\.log(?:\.1)?$/.test(name)) continue;
+      try {
+        const candidate = join(directory, name);
+        const stat = lstatSync(candidate);
+        if (stat.isFile()) files.push({ path: candidate, modified: stat.mtimeMs });
+      } catch {
+        // Rotation or cleanup can remove a file during discovery.
+      }
+    }
+  } catch {
+    // Storage and its log directory are created lazily.
+  }
+  files.sort((a, b) => b.modified - a.modified || a.path.localeCompare(b.path));
+  const result = readLogHistory(
+    files.map((file) => file.path),
+    selectedSession,
+  );
+  return {
+    logText: result.lines.join("\n"),
+    errors: result.errors.join("\n"),
+    notice: result.boundHit ? "[scan limit reached; older engine lines may be missing]" : "",
+  };
+}
+
 /**
  * `aft doctor --issue` flow — collect diagnostics, sanitize user paths,
  * prompt for an issue description, optionally file via `gh`.
@@ -2060,13 +2163,20 @@ async function runIssueFlow(argv: string[]): Promise<number> {
 
   const report = await collectDiagnostics(adapters);
 
-  const logResults = adapters.map((adapter) => {
+  const logResults = adapters.flatMap((adapter) => {
     const path = adapter.getLogFile();
     const { logText, errors, notice } = collectIssueLog(path, selectedSession);
-    return {
-      section: `#### ${adapter.displayName} log (${path})\n\n${notice}\n\`\`\`\n${logText || "<no log output>"}\n\`\`\`\n`,
-      errors,
-    };
+    const engine = collectIssueEngineLog(path, selectedSession);
+    return [
+      {
+        section: `#### ${adapter.displayName} log (${path})\n\n${notice}\n\`\`\`\n${logText || "<no log output>"}\n\`\`\`\n`,
+        errors,
+      },
+      {
+        section: `#### Engine logs (${dirname(path)})\n\n${engine.notice}\n\`\`\`\n${engine.logText || "<no log output>"}\n\`\`\`\n`,
+        errors: engine.errors,
+      },
+    ];
   });
   const logSections = logResults.map((result) => result.section).join("\n");
   const recentErrorLines = extractRecentErrors(
@@ -2102,8 +2212,8 @@ async function runIssueFlow(argv: string[]): Promise<number> {
     toolFailuresSection,
     "",
     selectedSession
-      ? `## Logs (last 200 lines for session ${selectedSession.id}; project ${selectedSession.projectRoot ?? "unknown"}, ${selectedSession.startedAt !== undefined ? new Date(selectedSession.startedAt).toISOString() : "unknown start"}–${new Date(selectedSession.lastActivity).toISOString()})`
-      : "## Logs (last 200 lines per harness)",
+      ? `## Logs (last 200 lines per source for session ${selectedSession.id}; project ${selectedSession.projectRoot ?? "unknown"}, ${selectedSession.startedAt !== undefined ? new Date(selectedSession.startedAt).toISOString() : "unknown start"}–${new Date(selectedSession.lastActivity).toISOString()})`
+      : "## Logs (last 200 lines per source)",
     logSections,
     "_Usernames and home paths have been stripped from this report._",
   ].join("\n");

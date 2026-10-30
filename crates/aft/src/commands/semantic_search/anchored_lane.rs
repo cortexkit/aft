@@ -111,27 +111,8 @@ pub fn cmp_alignment(a: &Alignment, b: &Alignment) -> Ordering {
         .then_with(|| b.occurrence_list().cmp(&a.occurrence_list()))
 }
 
-/// Whether a relative path indicates a test file according to AFT conventions.
 pub fn is_test_path(relative_path: &str) -> bool {
-    let normalized = relative_path.replace('\\', "/");
-    if normalized
-        .split('/')
-        .any(|segment| matches!(segment, "__tests__" | "__test__" | "tests"))
-    {
-        return true;
-    }
-    let file = normalized.rsplit('/').next().unwrap_or(&normalized);
-    let lower = file.to_ascii_lowercase();
-    if lower.contains(".test.") || lower.contains(".spec.") {
-        return true;
-    }
-    lower.ends_with("_test.rs")
-        || lower.ends_with("_test.go")
-        || lower.ends_with("_test.py")
-        || lower.ends_with("_test.rb")
-        || lower.ends_with("_test.exs")
-        || lower.ends_with("_spec.rb")
-        || (lower.starts_with("test_") && lower.ends_with(".py"))
+    super::path_is_hidden_test_file(Path::new(relative_path), Path::new(""))
 }
 
 /// Check if string contains at least one alphabetic word of 3+ letters.
@@ -549,20 +530,20 @@ pub fn discover_anchored_candidate_files(
     search_root: &Path,
     retained_runs: &[String],
     include_tests: bool,
-) -> Vec<PathBuf> {
+) -> std::io::Result<Vec<PathBuf>> {
     if retained_runs.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut candidate_file_ids = BTreeSet::new();
     for run in retained_runs {
         let run_query = decompose_regex(&format!("(?i:{})", regex::escape(run)));
-        candidate_file_ids.extend(index.candidates(&run_query));
+        candidate_file_ids.extend(index.candidates(&run_query)?);
     }
 
     let canonical_root =
         fs::canonicalize(search_root).unwrap_or_else(|_| search_root.to_path_buf());
-    candidate_file_ids
+    Ok(candidate_file_ids
         .into_iter()
         .filter_map(|file_id| index.files.get(file_id as usize))
         .filter(|file| !file.path.as_os_str().is_empty())
@@ -571,9 +552,9 @@ pub fn discover_anchored_candidate_files(
                 fs::canonicalize(&file.path).unwrap_or_else(|_| file.path.to_path_buf());
             canonical_path.starts_with(&canonical_root)
         })
-        .filter(|file| include_tests || !is_test_path(&file.path.to_string_lossy()))
+        .filter(|file| super::path_allowed_by_include_tests(&file.path, search_root, include_tests))
         .map(|file| file.path.clone())
-        .collect()
+        .collect())
 }
 
 pub fn verify_file_for_anchored(
@@ -649,9 +630,9 @@ impl AnchoredLane {
         search_root: &Path,
         query: &str,
         include_tests: bool,
-    ) -> Vec<CandidateResult> {
+    ) -> std::io::Result<Vec<CandidateResult>> {
         self.execute_with_admission_report(index, search_root, query, include_tests)
-            .0
+            .map(|result| result.0)
     }
 
     pub(crate) fn execute_with_admission_report(
@@ -660,10 +641,10 @@ impl AnchoredLane {
         search_root: &Path,
         query: &str,
         include_tests: bool,
-    ) -> (Vec<CandidateResult>, usize, usize) {
+    ) -> std::io::Result<(Vec<CandidateResult>, usize, usize)> {
         let split = split_query(query);
         if split.retained_runs.is_empty() {
-            return (Vec::new(), 0, 0);
+            return Ok((Vec::new(), 0, 0));
         }
 
         let candidate_files = discover_anchored_candidate_files(
@@ -671,10 +652,10 @@ impl AnchoredLane {
             search_root,
             &split.retained_runs,
             include_tests,
-        );
+        )?;
         let examined = candidate_files.len();
         if candidate_files.is_empty() {
-            return (Vec::new(), 0, 0);
+            return Ok((Vec::new(), 0, 0));
         }
         let compiled = CompiledRuns::new(&split.retained_runs);
         let mut excluded = 0;
@@ -694,7 +675,7 @@ impl AnchoredLane {
             .collect::<Vec<_>>();
 
         sort_anchored_canonical(&mut results);
-        (results, examined, excluded)
+        Ok((results, examined, excluded))
     }
 }
 
@@ -703,16 +684,16 @@ impl SearchLane for AnchoredLane {
         SearchLaneKind::Anchored
     }
 
-    fn execute(&self, input: &LaneInput<'_>) -> LaneExecution {
-        LaneExecution {
+    fn execute(&self, input: &LaneInput<'_>) -> std::io::Result<LaneExecution> {
+        Ok(LaneExecution {
             kind: self.kind(),
             candidates: self.execute_ready_mode(
                 input.index,
                 input.root,
                 input.query,
                 input.include_tests,
-            ),
-        }
+            )?,
+        })
     }
 }
 
@@ -772,8 +753,9 @@ mod hot_path_tests {
             paths.push(path);
             if ordinal == 0 || ordinal == 19 {
                 crate::search_hot_path_measurements::reset();
-                let actual =
-                    AnchoredLane::new().execute_ready_mode(&index, temp.path(), query, true);
+                let actual = AnchoredLane::new()
+                    .execute_ready_mode(&index, temp.path(), query, true)
+                    .unwrap();
                 assert_eq!(
                     crate::search_hot_path_measurements::counts().regex_compilations,
                     split.retained_runs.len()

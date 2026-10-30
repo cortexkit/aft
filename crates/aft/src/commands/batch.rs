@@ -87,7 +87,14 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let line_offsets = edit::LineOffsets::new(&source);
     for (i, edit_val) in edits.iter().enumerate() {
-        match resolve_edit_with_offsets(&source, &line_offsets, edit_val, i, &req.id) {
+        match resolve_edit_with_offsets(
+            &source,
+            &line_offsets,
+            edit_val,
+            i,
+            &req.id,
+            Some(path.as_path()),
+        ) {
             Ok(item_edits) => resolved.extend(item_edits),
             Err(resp) => return resp,
         }
@@ -162,7 +169,9 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Phase 6: Write, format, and validate via shared pipeline
     let _mutation = crate::runtime_drain::record_file_mutation(ctx, [path.as_path()]);
+    let tool_policy = &crate::sandbox_spawn::ToolLaunchPolicy::for_request(ctx);
     let mut write_result = match edit::write_format_validate_observed(
+        tool_policy,
         &path,
         &content,
         &ctx.config(),
@@ -376,7 +385,7 @@ fn resolve_edit(
     req_id: &str,
 ) -> Result<Vec<ResolvedEdit>, Response> {
     let line_offsets = edit::LineOffsets::new(source);
-    resolve_edit_with_offsets(source, &line_offsets, edit_val, index, req_id)
+    resolve_edit_with_offsets(source, &line_offsets, edit_val, index, req_id, None)
 }
 
 /// Resolve one edit, reusing line starts computed once for the whole batch.
@@ -386,6 +395,7 @@ fn resolve_edit_with_offsets(
     edit_val: &serde_json::Value,
     index: usize,
     req_id: &str,
+    path: Option<&Path>,
 ) -> Result<Vec<ResolvedEdit>, Response> {
     // Detect edit type: match-replace or line-range
     // Accept both "match"/"replacement" and "oldString"/"newString" (backward compat)
@@ -467,17 +477,27 @@ fn resolve_edit_with_offsets(
 
         let fuzzy_matches = crate::fuzzy_match::find_all_fuzzy(source, match_str);
 
-        let effective_replacement = |m: &crate::fuzzy_match::FuzzyMatch| -> String {
+        // A plan covers every match one replacement applies to, so finding
+        // string lines parses the file at most once for all of them.
+        let effective_replacement = |plan: &crate::fuzzy_match::ReindentPlan<'_>,
+                                     at: usize|
+         -> Result<String, Response> {
             let mut output = String::new();
-            super::edit_match::push_fuzzy_replacement(&mut output, source, m, replacement);
-            output
+            super::edit_match::push_fuzzy_replacement(&mut output, plan, at).map_err(|error| {
+                Response::error(
+                    req_id,
+                    error.code(),
+                    format!("batch: edit[{}] {}", index, error),
+                )
+            })?;
+            Ok(output)
         };
 
         if fuzzy_matches.is_empty() {
             let message = format!(
-                "batch: edit[{}] match '{}' not found in file{}",
+                "batch: edit[{}] match {} not found in file{}",
                 index,
-                match_str,
+                crate::fuzzy_match::describe_searched_text(match_str),
                 crate::fuzzy_match::render_edit_not_found_detail(source, match_str, replacement),
             );
             return Err(Response::error(req_id, "batch_edit_failed", message));
@@ -493,21 +513,31 @@ fn resolve_edit_with_offsets(
         }
 
         if replace_all {
-            return Ok(fuzzy_matches
+            let plan = crate::fuzzy_match::ReindentPlan::new(
+                source,
+                match_str,
+                replacement,
+                path,
+                &fuzzy_matches,
+            );
+            return fuzzy_matches
                 .iter()
-                .map(|m| ResolvedEdit {
-                    byte_start: m.byte_start,
-                    byte_end: m.byte_start + m.byte_len,
-                    replacement: effective_replacement(m),
-                    fuzzy_match: (m.pass > 1).then(|| {
-                        crate::fuzzy_match::replacement_detail(
-                            source,
-                            match_str,
-                            std::slice::from_ref(m),
-                        )
-                    }),
+                .enumerate()
+                .map(|(at, m)| {
+                    Ok(ResolvedEdit {
+                        byte_start: m.byte_start,
+                        byte_end: m.byte_start + m.byte_len,
+                        replacement: effective_replacement(&plan, at)?,
+                        fuzzy_match: (m.pass > 1).then(|| {
+                            crate::fuzzy_match::replacement_detail(
+                                source,
+                                match_str,
+                                std::slice::from_ref(m),
+                            )
+                        }),
+                    })
                 })
-                .collect());
+                .collect();
         }
 
         if let Some(occ) = occurrence {
@@ -527,7 +557,16 @@ fn resolve_edit_with_offsets(
             return Ok(vec![ResolvedEdit {
                 byte_start: m.byte_start,
                 byte_end: m.byte_start + m.byte_len,
-                replacement: effective_replacement(m),
+                replacement: effective_replacement(
+                    &crate::fuzzy_match::ReindentPlan::new(
+                        source,
+                        match_str,
+                        replacement,
+                        path,
+                        std::slice::from_ref(m),
+                    ),
+                    0,
+                )?,
                 fuzzy_match: (m.pass > 1).then(|| {
                     crate::fuzzy_match::replacement_detail(
                         source,
@@ -575,7 +614,16 @@ fn resolve_edit_with_offsets(
         Ok(vec![ResolvedEdit {
             byte_start: m.byte_start,
             byte_end: m.byte_start + m.byte_len,
-            replacement: effective_replacement(m),
+            replacement: effective_replacement(
+                &crate::fuzzy_match::ReindentPlan::new(
+                    source,
+                    match_str,
+                    replacement,
+                    path,
+                    std::slice::from_ref(m),
+                ),
+                0,
+            )?,
             fuzzy_match: (m.pass > 1).then(|| {
                 crate::fuzzy_match::replacement_detail(source, match_str, std::slice::from_ref(m))
             }),
@@ -771,6 +819,42 @@ mod a03_tests {
             "edits": edits, "preview": preview, "include_diff_content": true
         }))
         .unwrap()
+    }
+
+    /// The host `edit` tool sends a single-file `oldString` miss through this
+    /// batch path. Its error should name the miss without pasting the whole
+    /// match back; the nearest-miss excerpt that follows is already bounded.
+    #[test]
+    fn not_found_error_does_not_repeat_a_large_match() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("small.rs");
+        std::fs::write(&path, "fn main() {\n    println!(\"hello\");\n}\n").unwrap();
+        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        let needle: String = (0..400)
+            .map(|index| format!("    let absent_{index} = 0;\n"))
+            .collect();
+        let response = handle_batch(
+            &request(
+                &path,
+                serde_json::json!([{"match": needle, "replacement": "x"}]),
+                false,
+            ),
+            &ctx,
+        );
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "batch_edit_failed");
+        let message = response.data["message"].as_str().unwrap();
+        assert!(
+            !message.contains(&needle),
+            "{} byte match repeated in a {} byte error",
+            needle.len(),
+            message.len()
+        );
+        assert!(message.len() < 4 * 1024, "{} byte error", message.len());
+        assert!(
+            message.starts_with("batch: edit[0] match '    let absent_0 = 0;…' (400 lines, 9490 bytes) not found in "),
+            "{message}"
+        );
     }
 
     #[test]
@@ -1026,7 +1110,10 @@ mod a03_tests {
         assert_eq!(hashes, 2);
         let history = store.history(req.session(), &path);
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].content_bytes.as_ref(), "é before\r\n".as_bytes());
+        assert_eq!(
+            history[0].content_bytes().unwrap().as_ref(),
+            "é before\r\n".as_bytes()
+        );
         assert_eq!(
             history[0].post_state,
             Some(crate::backup::PathFingerprint::Content(
@@ -1163,7 +1250,8 @@ mod audit11_regressions {
         let offsets = edit::LineOffsets::new(source);
         let edit = serde_json::json!({"line_start": 2, "line_end": 2, "content": "new"});
         for _ in 0..100 {
-            let resolved = resolve_edit_with_offsets(source, &offsets, &edit, 0, "test").unwrap();
+            let resolved =
+                resolve_edit_with_offsets(source, &offsets, &edit, 0, "test", None).unwrap();
             assert_eq!((resolved[0].byte_start, resolved[0].byte_end), (10, 14));
             let content =
                 edit::replace_byte_range(source, 10, 14, &resolved[0].replacement).unwrap();
@@ -1173,7 +1261,14 @@ mod audit11_regressions {
                 format_on_edit: false,
                 ..Default::default()
             };
-            edit::write_format_validate(&path, &content, &config, &serde_json::json!({})).unwrap();
+            edit::write_format_validate(
+                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                &path,
+                &content,
+                &config,
+                &serde_json::json!({}),
+            )
+            .unwrap();
             assert_eq!(
                 std::fs::read(path).unwrap(),
                 "\u{feff}first\r\nnew\nthree\rfour\r\ntail".as_bytes()
@@ -1183,5 +1278,28 @@ mod audit11_regressions {
             edit::LINE_OFFSET_BYTES_SCANNED.with(|count| count.get()),
             source.len()
         );
+    }
+
+    /// A batch replace-all item shares one parse for string lines across
+    /// all of its 1,000 loose matches.
+    #[test]
+    fn batch_replace_all_parses_for_string_lines_at_most_once() {
+        use crate::fuzzy_match::STRING_LINE_PARSES;
+        let source = format!("def f():\n{}", "    v = 'a'\n".repeat(1_000));
+        let offsets = edit::LineOffsets::new(&source);
+        let edit = serde_json::json!({
+            "match": "v = 'a' ",
+            "replacement": "v = 'b'\nw = 'c'",
+            "replaceAll": true,
+        });
+        STRING_LINE_PARSES.with(|count| count.set(0));
+        let resolved =
+            resolve_edit_with_offsets(&source, &offsets, &edit, 0, "t", Some(Path::new("t.py")))
+                .unwrap_or_else(|_| panic!("batch replace-all should resolve"));
+        assert_eq!(resolved.len(), 1_000);
+        assert!(resolved
+            .iter()
+            .all(|edit| edit.replacement == "v = 'b'\n    w = 'c'"));
+        assert_eq!(STRING_LINE_PARSES.with(|count| count.get()), 1);
     }
 }

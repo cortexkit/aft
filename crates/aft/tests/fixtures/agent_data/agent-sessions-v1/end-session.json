@@ -1,0 +1,6 @@
+[
+  {"request":{"method":"agent.end_session","params":{"harness":"broca","runner":"broca","session":"broca-ended"}},"principal":{"kind":"reserved","moduleId":"prefrontal-core"},"reply":{"result":{"ended_at_ms":700,"found":true}}},
+  {"request":{"method":"agent.end_session","params":{"harness":"broca","runner":"broca","session":"broca-ended"}},"principal":{"kind":"reserved","moduleId":"prefrontal-core"},"reply":{"result":{"ended_at_ms":700,"found":true}}},
+  {"request":{"method":"agent.end_session","params":{"harness":"broca","session":"never-registered"}},"principal":{"kind":"reserved","moduleId":"prefrontal-core"},"reply":{"result":{"found":false}}},
+  {"request":{"method":"agent.end_session","params":{"harness":"broca","runner":"thalamus-harness","session":"broca-live"}},"principal":{"kind":"reserved","moduleId":"prefrontal-core"},"reply":{"code":"runner_mismatch","detail":{"runner":"broca"},"message":"this session is hosted by runner broca, not thalamus-harness"}}
+]

@@ -1,0 +1,8 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "slices": ["callgraph-callback-constructor-inline-tests"],
+  "note": "Callgraph dependencies, constructor ownership, unresolved-site disclosure and Rust inline-test visibility change navigation and inspect's shared dead-code store, not search ranking. No changed path is in RANKING_FENCE_PREFIXES. Previous graph versions rebuild rather than reuse stale derived views."
+}

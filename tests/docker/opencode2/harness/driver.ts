@@ -789,6 +789,7 @@ async function runOneScenario(options: {
       binaryPath: config.nativeExecutable,
       mockBaseUrl: mock.url,
       projectConfig: scenario.project_config,
+      userConfig: scenario.user_config,
       scenarioEnv: scenario.env,
       providerConfig: options.providerConfig,
       providerConfigKey: options.providerConfigKey,

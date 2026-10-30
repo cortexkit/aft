@@ -3,7 +3,11 @@
  * Shared by scripts/build-tool-schemas.ts and subc-tool-schemas-fresh.test.ts.
  */
 
-import { BASH_RUNON_DESCRIPTION, type BridgePool } from "@cortexkit/aft-bridge";
+import {
+  BASH_RETURN_PATHS_DESCRIPTION,
+  BASH_RUNON_DESCRIPTION,
+  type BridgePool,
+} from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { resolveBashConfig } from "./config.js";
@@ -258,6 +262,12 @@ export function buildSubcToolSchemas(
       type: "string",
       description: BASH_RUNON_DESCRIPTION,
     };
+    bashProperties.return_paths = {
+      type: "array",
+      items: { type: "string" },
+      maxItems: 64,
+      description: BASH_RETURN_PATHS_DESCRIPTION,
+    };
   }
 
   return {
@@ -374,7 +384,7 @@ export function buildSubcToolPresets(
  * The worker preset's `bash_watch`: the OpenCode tool's arguments with the
  * worker description. The module serves this tool itself and always waits
  * synchronously, because a catalog consumer has no channel that would deliver
- * an async watch's notification; the two async-only arguments say so.
+ * an async watch's notification; the async-only arguments say so.
  */
 function workerBashWatchSchema(
   schema: Record<string, unknown>,
@@ -390,6 +400,11 @@ function workerBashWatchSchema(
   properties.once = {
     ...properties.once,
     description: "Accepted for compatibility; only an async watch reads it.",
+  };
+  properties.deliver = {
+    ...properties.deliver,
+    description:
+      "Rejected: this watch always waits synchronously; deliver requires background:true with an async notification channel.",
   };
   return { ...clone, description };
 }

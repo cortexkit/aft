@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "tag-fetch-retry"
+  ],
+  "note": "CI only: the v0.48.1 tag fetch before the publication input gate retries three times, so a runner that briefly cannot reach github.com does not fail a merge-queue group. No engine or ranking files change."
+}

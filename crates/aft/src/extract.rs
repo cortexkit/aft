@@ -2467,8 +2467,14 @@ mod audit11_regressions {
             format_on_edit: false,
             ..Default::default()
         };
-        crate::edit::write_format_validate(&path, &generated, &config, &serde_json::json!({}))
-            .unwrap();
+        crate::edit::write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            &generated,
+            &config,
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read(path).unwrap(),
             b"def helper(a, b, args, c, kwargs):\n    consume(a, b, args, c, kwargs)"
@@ -2512,8 +2518,14 @@ mod audit11_regressions {
             format_on_edit: false,
             ..Default::default()
         };
-        crate::edit::write_format_validate(&path, &generated, &config, &serde_json::json!({}))
-            .unwrap();
+        crate::edit::write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            &generated,
+            &config,
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read(path).unwrap(),
             b"function helper(renamed, other, rest) {\n    consume(renamed, other, rest);\n}"
@@ -2530,7 +2542,7 @@ mod audit11_regressions {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("out.txt");
             let config = crate::config::Config { format_on_edit: false, ..Default::default() };
-            crate::edit::write_format_validate(&path, &generated, &config, &serde_json::json!({})).unwrap();
+            crate::edit::write_format_validate(&crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(), &path, &generated, &config, &serde_json::json!({})).unwrap();
             assert_eq!(std::fs::read(path).unwrap(), expected.as_bytes());
         }
     }

@@ -233,7 +233,13 @@ pub(super) fn engine_audit(input: EngineAuditInput<'_>) -> Value {
 
     match targets() {
         Ok(targets) if !targets.is_empty() => {
-            let unpooled = unpooled_lexical_ranks(&input);
+            let unpooled = match unpooled_lexical_ranks(&input) {
+                Ok(ranks) => ranks,
+                Err(error) => {
+                    audit.insert("targets_error".into(), json!(error.to_string()));
+                    return Value::Object(audit);
+                }
+            };
             let coverage = targets
                 .iter()
                 .map(|target| {
@@ -270,21 +276,23 @@ pub(super) fn engine_audit(input: EngineAuditInput<'_>) -> Value {
 /// the lexical lane scores but without the lane's discovery pool (files holding
 /// one of the three rarest query trigrams). A target with a rank here and no
 /// place in the lane's own order was cut by that pool, not by its score.
-fn unpooled_lexical_ranks(input: &EngineAuditInput<'_>) -> HashMap<PathBuf, usize> {
+fn unpooled_lexical_ranks(
+    input: &EngineAuditInput<'_>,
+) -> std::io::Result<HashMap<PathBuf, usize>> {
     let mut unique = Vec::with_capacity(input.query_trigrams.len());
     for trigram in input.query_trigrams {
         if !unique.contains(trigram) {
             unique.push(*trigram);
         }
     }
-    input
+    Ok(input
         .snapshot
-        .lexical_rank_at_depth(&unique, Some(input.candidate_filter), usize::MAX)
+        .lexical_rank_at_depth(&unique, Some(input.candidate_filter), usize::MAX)?
         .files
         .into_iter()
         .enumerate()
         .map(|(position, (path, _))| (path, position + 1))
-        .collect()
+        .collect())
 }
 
 /// Adds each target file's semantic chunks, ranked against the whole semantic

@@ -1,0 +1,3 @@
+[
+  {"request":{"method":"agent.register_session","params":{"agent_id":"agent_0000000000000101","harness":"broca","project_root":"/workspace/session-vectors","ref":"11111111111111111111111111111111","ref_kind":"broca-session","runner":"broca","session_id":"broca-live"}},"principal":{"kind":"reserved","moduleId":"prefrontal-core"},"reply":{"result":{"agent_id":"agent_0000000000000101","harness":"broca","project_root":"/workspace/session-vectors","ref":"11111111111111111111111111111111","ref_kind":"broca-session","registered_at_ms":700,"registered_by":"orchestrator","session_id":"broca-live"}}}
+]

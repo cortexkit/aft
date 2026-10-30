@@ -20,6 +20,125 @@ thread_local! {
     /// The cause of the watchdog pass running on this thread, if any.
     static CURRENT_PASS: std::cell::Cell<Option<WatchdogPassCause>> =
         const { std::cell::Cell::new(None) };
+    static MARKER_READS: std::cell::Cell<Option<MarkerReadCounts>> = const { std::cell::Cell::new(None) };
+    static MARKER_SUMMARY: std::cell::RefCell<MarkerReadSummary> =
+        std::cell::RefCell::new(MarkerReadSummary::default());
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum MarkerReadReason {
+    FirstPoll,
+    NonemptyMarker,
+    ChangedProbe,
+    PoisonedProbe,
+    Unprobed,
+}
+
+/// Counts attempts to read and validate the marker, including failures before it opens.
+/// Terminal candidates are counted separately: they need cleanup, not a read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct MarkerReadCounts {
+    pub first_poll: u64,
+    pub nonempty_marker: u64,
+    pub changed_probe: u64,
+    pub poisoned_probe: u64,
+    pub unprobed: u64,
+    pub terminal_retained_skipped: u64,
+}
+
+impl MarkerReadCounts {
+    fn add(&mut self, other: Self) {
+        self.first_poll += other.first_poll;
+        self.nonempty_marker += other.nonempty_marker;
+        self.changed_probe += other.changed_probe;
+        self.poisoned_probe += other.poisoned_probe;
+        self.unprobed += other.unprobed;
+        self.terminal_retained_skipped += other.terminal_retained_skipped;
+    }
+}
+
+pub(super) fn record_marker_read(reason: MarkerReadReason) {
+    update_marker_counts(|counts| match reason {
+        MarkerReadReason::FirstPoll => counts.first_poll += 1,
+        MarkerReadReason::NonemptyMarker => counts.nonempty_marker += 1,
+        MarkerReadReason::ChangedProbe => counts.changed_probe += 1,
+        MarkerReadReason::PoisonedProbe => counts.poisoned_probe += 1,
+        MarkerReadReason::Unprobed => counts.unprobed += 1,
+    });
+}
+
+pub(super) fn record_terminal_marker_skip() {
+    update_marker_counts(|counts| counts.terminal_retained_skipped += 1);
+}
+
+fn update_marker_counts(update: impl FnOnce(&mut MarkerReadCounts)) {
+    MARKER_READS.with(|cell| {
+        if let Some(mut counts) = cell.get() {
+            update(&mut counts);
+            cell.set(Some(counts));
+        }
+    });
+}
+
+#[derive(Default)]
+struct MarkerReadSummary {
+    since: Option<Instant>,
+    passes: u64,
+    counts: MarkerReadCounts,
+}
+
+impl MarkerReadSummary {
+    fn add_pass(
+        &mut self,
+        counts: MarkerReadCounts,
+        now: Instant,
+    ) -> Option<(u64, MarkerReadCounts)> {
+        self.passes += 1;
+        self.counts.add(counts);
+        let since = self.since.get_or_insert(now);
+        if now.duration_since(*since) < CLEANUP_INTERVAL {
+            return None;
+        }
+        let summary = (self.passes, self.counts);
+        self.since = Some(now);
+        self.passes = 0;
+        self.counts = MarkerReadCounts::default();
+        Some(summary)
+    }
+}
+
+struct MarkerReadPass {
+    previous_cause: Option<WatchdogPassCause>,
+    previous_counts: Option<MarkerReadCounts>,
+}
+
+impl MarkerReadPass {
+    fn begin(cause: WatchdogPassCause) -> Self {
+        Self {
+            previous_cause: CURRENT_PASS.with(|cell| cell.replace(Some(cause))),
+            previous_counts: MARKER_READS
+                .with(|cell| cell.replace(Some(MarkerReadCounts::default()))),
+        }
+    }
+}
+
+impl Drop for MarkerReadPass {
+    fn drop(&mut self) {
+        let counts = MARKER_READS
+            .with(|cell| cell.replace(self.previous_counts))
+            .unwrap_or_default();
+        let cause = CURRENT_PASS.with(|cell| cell.replace(self.previous_cause));
+        log::debug!("bash watchdog marker reads pass={cause:?} full_marker_reads={counts:?}");
+        // All projects share the scheduler thread, so this is one process-wide
+        // summary per minute, not one log line per project per minute.
+        MARKER_SUMMARY.with(|summary| {
+            if let Some((passes, counts)) = summary.borrow_mut().add_pass(counts, Instant::now()) {
+                log::info!(
+                    "bash watchdog marker reads passes={passes} full_marker_reads={counts:?}"
+                );
+            }
+        });
+    }
 }
 
 /// The watchdog pass running on the calling thread, so a terminal transition
@@ -66,7 +185,7 @@ struct Subscription {
     awaiting_reader: HashMap<String, Instant>,
 }
 
-type TimeoutKill = (BgTaskRegistry, std::sync::Arc<BgTask>);
+type TimeoutKill = (BgTaskRegistry, std::sync::Arc<BgTask>, Option<String>);
 
 fn timeout_kills() -> Option<crossbeam_channel::Sender<TimeoutKill>> {
     static KILLS: std::sync::OnceLock<
@@ -87,7 +206,7 @@ fn timeout_kills() -> Option<crossbeam_channel::Sender<TimeoutKill>> {
             match thread::Builder::new()
                 .name(format!("aft-bash-timeout-{index}"))
                 .spawn(move || {
-                    for (registry, task) in rx {
+                    for (registry, task, memory_reason) in rx {
                         struct Reset(std::sync::Arc<BgTask>);
                         impl Drop for Reset {
                             fn drop(&mut self) {
@@ -97,7 +216,12 @@ fn timeout_kills() -> Option<crossbeam_channel::Sender<TimeoutKill>> {
                         let _reset = Reset(task.clone());
                         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             if !task.is_terminal() {
-                                let _ = registry.kill_for_timeout(&task.task_id, &task.session_id);
+                                if let Some(reason) = memory_reason {
+                                    registry.kill_for_memory(&task, reason);
+                                } else {
+                                    let _ =
+                                        registry.kill_for_timeout(&task.task_id, &task.session_id);
+                                }
                             }
                         }));
                     }
@@ -113,12 +237,30 @@ fn timeout_kills() -> Option<crossbeam_channel::Sender<TimeoutKill>> {
 }
 
 fn schedule_timeout_kill(registry: &BgTaskRegistry, task: &std::sync::Arc<BgTask>) {
+    schedule_limit_kill(registry, task, None);
+}
+
+pub(super) fn schedule_memory_kill(
+    registry: &BgTaskRegistry,
+    task: &std::sync::Arc<BgTask>,
+    reason: String,
+) {
+    schedule_limit_kill(registry, task, Some(reason));
+}
+
+fn schedule_limit_kill(
+    registry: &BgTaskRegistry,
+    task: &std::sync::Arc<BgTask>,
+    memory_reason: Option<String>,
+) {
     if task.timeout_kill_queued.swap(true, Ordering::SeqCst) {
         return;
     }
-    if !timeout_kills()
-        .is_some_and(|queue| queue.try_send((registry.clone(), task.clone())).is_ok())
-    {
+    if !timeout_kills().is_some_and(|queue| {
+        queue
+            .try_send((registry.clone(), task.clone(), memory_reason))
+            .is_ok()
+    }) {
         task.timeout_kill_queued.store(false, Ordering::SeqCst);
     }
 }
@@ -256,11 +398,15 @@ pub(super) fn run_pass(
     pass_cause: WatchdogPassCause,
     awaiting_reader: &mut HashMap<String, Instant>,
 ) {
-    CURRENT_PASS.with(|pass| pass.set(Some(pass_cause)));
+    let _marker_reads = MarkerReadPass::begin(pass_cause);
     registry.evaluate_erased_watch_targets();
     let tasks = registry.running_tasks();
     awaiting_reader.retain(|task_id, _| tasks.iter().any(|task| &task.task_id == task_id));
     for task in tasks {
+        if let Some(reason) = registry.memory_limit_exceeded(&task) {
+            schedule_memory_kill(registry, &task, reason);
+            continue;
+        }
         if leave_to_reader_wake(registry, &task, pass_cause, awaiting_reader) {
             continue;
         }
@@ -371,6 +517,91 @@ mod tests {
             prefer_pending_wake(WatchdogPassCause::Tick, &wake_rx),
             WatchdogPassCause::Tick,
             "without a pending wake a tick pass stays a tick pass"
+        );
+    }
+
+    #[test]
+    fn marker_read_counters_attribute_real_probe_branches() {
+        use super::super::persistence::{self, ExitMarker, ExitMarkerProbe, PersistedTask};
+        let storage = tempfile::tempdir().unwrap();
+        let task = persistence::allocate_task_layout(storage.path(), "session").unwrap();
+        let metadata = PersistedTask::starting(
+            task.paths.task_id.clone(),
+            "session".into(),
+            "probe".into(),
+            storage.path().into(),
+            None,
+            None,
+            true,
+            false,
+        );
+        persistence::write_task_at(&task, &metadata).unwrap();
+        std::fs::write(&task.paths.exit, b"").unwrap();
+        let mut probe = ExitMarkerProbe::default();
+        let pass = MarkerReadPass::begin(WatchdogPassCause::Tick);
+        let mut poll = || persistence::poll_exit_marker(&task.paths, &mut probe).unwrap();
+        assert_eq!(poll(), None);
+        assert_eq!(poll(), None);
+        let replacement = task.paths.io_dir.join("replacement");
+        std::fs::write(&replacement, b"").unwrap();
+        std::fs::rename(replacement, &task.paths.exit).unwrap();
+        assert_eq!(poll(), None);
+        std::fs::write(&task.paths.exit, b"kil").unwrap();
+        assert_eq!(poll(), None);
+        assert_eq!(poll(), None);
+        std::fs::write(&task.paths.exit, b"killed\n").unwrap();
+        assert_eq!(poll(), Some(ExitMarker::Killed));
+        std::fs::remove_file(&task.paths.exit).unwrap();
+        std::fs::create_dir(&task.paths.exit).unwrap();
+        assert!(persistence::read_exit_marker(&task.paths).is_err());
+        let counts = MARKER_READS.with(|cell| cell.get().unwrap());
+        assert_eq!(counts.first_poll, 1);
+        assert_eq!(counts.nonempty_marker, 3);
+        // Unix distinguishes a new empty inode. Windows may preserve the old
+        // creation time on replacement, so the probe can legitimately skip it.
+        #[cfg(unix)]
+        assert_eq!(counts.changed_probe, 1);
+        assert_eq!(counts.poisoned_probe, 0);
+        assert_eq!(
+            counts.unprobed, 1,
+            "failed direct reads must be attributed too"
+        );
+        assert_eq!(counts.terminal_retained_skipped, 0);
+        drop(pass);
+        assert_eq!(current_pass(), None);
+        assert_eq!(MARKER_READS.with(std::cell::Cell::get), None);
+    }
+
+    #[test]
+    fn marker_read_summary_is_shared_across_passes_and_limited_to_one_per_minute() {
+        let now = Instant::now();
+        let counts = MarkerReadCounts {
+            first_poll: 2,
+            nonempty_marker: 3,
+            ..Default::default()
+        };
+        let mut summary = MarkerReadSummary::default();
+        assert_eq!(summary.add_pass(counts, now), None);
+        assert_eq!(
+            summary.add_pass(counts, now + Duration::from_secs(59)),
+            None
+        );
+        let (passes, total) = summary
+            .add_pass(counts, now + Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(passes, 3);
+        assert_eq!(total.first_poll, 6);
+        assert_eq!(total.nonempty_marker, 9);
+        assert_eq!(
+            summary.add_pass(counts, now + Duration::from_secs(119)),
+            None
+        );
+        assert_eq!(
+            summary
+                .add_pass(counts, now + Duration::from_secs(120))
+                .unwrap()
+                .0,
+            2
         );
     }
 }

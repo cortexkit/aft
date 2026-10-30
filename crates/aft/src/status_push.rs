@@ -200,12 +200,13 @@ fn summary(source: &Value, string_limit: usize) -> Value {
                 "refreshing_count",
                 "entries",
                 "dimension",
-                "skipped_rows",
-                "refused_rows_summary",
-                "skipped_row_reason",
+                "skipped_chunks",
+                "skipped_chunks_summary",
+                "skipped_chunk_reason",
                 "error",
                 "reason",
                 "backend_url",
+                "pending_reason",
             ],
         ),
         ("semantic", &["backend", "model"]),
@@ -279,6 +280,35 @@ fn summary(source: &Value, string_limit: usize) -> Value {
                 }
             }
             out.insert((*container).into(), Value::Object(selected));
+        }
+    }
+    if let Some(semantic) = out.get_mut("semantic_index").and_then(Value::as_object_mut) {
+        for (field, keys) in [
+            (
+                "coordination_error",
+                &[
+                    "state",
+                    "kind",
+                    "reason",
+                    "detail",
+                    "retryable",
+                    "retry_scheduled",
+                    "retry_in_ms",
+                ][..],
+            ),
+            ("pending_owner", &["kind", "pid", "attempt"][..]),
+        ] {
+            if let Some(value) = source.pointer(&format!("/semantic_index/{field}")) {
+                let selected = keys
+                    .iter()
+                    .filter_map(|key| {
+                        value
+                            .get(*key)
+                            .map(|value| ((*key).to_owned(), scalar(value, string_limit)))
+                    })
+                    .collect();
+                semantic.insert(field.to_owned(), Value::Object(selected));
+            }
         }
     }
     let mut compression = serde_json::Map::new();
@@ -490,6 +520,37 @@ pub(crate) fn project(ctx: &AppContext, mut snapshot: Value) -> Value {
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[test]
+    fn semantic_batch_lease_operator_line_survives_compact_status_push() {
+        for semantic in [
+            serde_json::json!({
+                "status": "ready",
+                "pending_reason": "Waiting for another AFT process that is embedding the same new code; results will follow.",
+                "pending_owner": {"kind":"base_claim", "pid":42, "attempt":3},
+            }),
+            serde_json::json!({
+                "status": "ready",
+                "pending_reason": "Can't coordinate embedding with other AFT processes: permission denied. Retrying in 4s.",
+                "coordination_error": {
+                    "state":"error", "kind":"storage", "reason":"Can't coordinate embedding with other AFT processes",
+                    "detail":"permission denied", "retryable":true, "retry_scheduled":true, "retry_in_ms":4000,
+                },
+            }),
+        ] {
+            let frame = StatusChangedFrame::new(
+                None,
+                serde_json::json!({
+                    "semantic_index": semantic.clone(),
+                    "oversized_detail": "x".repeat(BODY_MAX_BYTES + 1),
+                }),
+            );
+            let body = bounded_body(&frame);
+            assert!(body.compacted);
+            let captured: Value = serde_json::from_slice(&body.bytes).unwrap();
+            assert_eq!(captured["snapshot"]["semantic_index"], semantic);
+        }
+    }
+
     use super::*;
     use crate::bash_background::push_projection_fixture::busy_root;
     use crate::persisted_format::{self, PersistedStore, UnsupportedPersistedFormat};
@@ -619,6 +680,14 @@ mod tests {
                 .len(),
             192
         );
+    }
+
+    #[test]
+    fn status_push_narrow_builder_matches_full_snapshot_projection() {
+        let fixture = busy_root();
+        let expected = project(&fixture.ctx, fixture.ctx.build_status_snapshot());
+        let pushed = fixture.ctx.try_build_status_push_snapshot().unwrap();
+        assert_eq!(pushed, expected);
     }
 
     struct Refusals(Vec<(PersistedStore, PathBuf)>);

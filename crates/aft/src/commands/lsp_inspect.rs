@@ -214,12 +214,34 @@ fn classify_binary_source(
 
 fn spawn_status(result: &ServerAttemptResult) -> String {
     match result {
+        ServerAttemptResult::InProgress { .. } => {
+            crate::lsp::manager::START_IN_PROGRESS_STATUS.into()
+        }
         ServerAttemptResult::ProjectClosed => "project closed; reopen the project and retry".into(),
         ServerAttemptResult::Ok { .. } => "ok".to_string(),
         ServerAttemptResult::NoRootMarker { .. } => "no_root_marker".to_string(),
         ServerAttemptResult::BinaryNotInstalled { .. } => "binary_not_installed".to_string(),
         ServerAttemptResult::SpawnFailed { reason, .. } => format!("spawn_failed: {reason}"),
     }
+}
+
+#[cfg(test)]
+#[test]
+fn startup_status_preserves_pending_and_existing_failure_text() {
+    use crate::lsp::{registry::ServerKind, roots::ServerKey};
+    let pending = ServerAttemptResult::InProgress {
+        server_key: ServerKey {
+            kind: ServerKind::Rust,
+            root: PathBuf::from("workspace"),
+        },
+    };
+    assert_eq!(spawn_status(&pending), "start_in_progress");
+    assert_eq!(
+        spawn_status(&ServerAttemptResult::NoRootMarker {
+            looked_for: Vec::new()
+        }),
+        "no_root_marker"
+    );
 }
 
 fn pull_status(outcome: &PullFileOutcome) -> String {

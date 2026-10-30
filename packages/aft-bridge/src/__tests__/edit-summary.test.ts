@@ -42,6 +42,21 @@ describe("formatEditSummary", () => {
     expect(summary).toContain("Replaced text 1: old punctuation");
   });
 
+  test("renders the producer's loose-match notice once per distinct notice", () => {
+    const notice =
+      "oldString matched only after ignoring indentation and trailing whitespace; newString was re-indented to match the file.";
+    expect(
+      formatEditSummary({
+        edits_applied: 1,
+        diff: { additions: 2, deletions: 2 },
+        fuzzy_matches: [
+          { pass: 3, replaced_text: [], notice },
+          { pass: 3, replaced_text: [], notice },
+        ],
+      }),
+    ).toBe(`Edited (+2/-2).\n${notice}`);
+  });
+
   test("surfaces edits_applied for batch mode when > 1", () => {
     expect(formatEditSummary({ edits_applied: 2, diff: { additions: 4, deletions: 1 } })).toBe(
       "Edited (+4/-1, 2 edits).",

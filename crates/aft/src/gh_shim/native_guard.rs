@@ -61,7 +61,12 @@ pub(super) fn permission_with(
             .as_deref()
             .is_none_or(|ticket| ticket.is_empty())
         {
-            return Err("no gh-shim ticket inside a sandboxed agent shell; operator gh is not available here".into());
+            // A worker shell gets the read broker, never a ticket, so a
+            // command that is not a repository read always lands here.
+            return Err(
+                "in a worker shell, gh runs only reads of a repository; this command is not one"
+                    .into(),
+            );
         }
         return Err(
             "operator gh is not available inside the worker jail; use governed reads or bot speech"

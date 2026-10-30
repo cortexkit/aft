@@ -11,6 +11,8 @@ const FILE_COMMANDS: &[&str] = &[
     "rm", "cp", "mv", "mkdir", "touch", "chmod", "chown", "cat", "cd", "source", ".",
 ];
 const CWD_COMMANDS: &[&str] = &["cd", "pushd", "popd"];
+pub const UNKNOWN_CWD_PERMISSION_REASON: &str =
+    "Working directory is unknown; approve this exact command.";
 /// File commands whose path arguments are only read. Only these (and `<`
 /// input redirects) may use a read exemption; a command that can modify,
 /// move or delete its arguments always gets the normal external-directory ask.
@@ -131,10 +133,12 @@ fn scan_with_read_exemption(
 
     let mut asks = Vec::new();
     let mut seen = HashSet::new();
-    let mut scan_cwd = cwd.clone();
+    // Unknown directory changes must not resolve later paths against a stale base.
+    let mut scan_cwd = Some(cwd.clone());
+    let mut unknown_cwd = false;
     // Directories pushed by `pushd` earlier in this command line. The shell's
     // own stack from before the command is unknown, so a `popd` past these
-    // entries leaves the tracked directory unchanged.
+    // entries leaves the directory unknown.
     let mut directory_stack = Vec::new();
     for node in command_nodes {
         let parts = command_parts(command, node);
@@ -146,13 +150,21 @@ fn scan_with_read_exemption(
         let head = tokens[0].as_str();
 
         if CWD_COMMANDS.contains(&head) {
-            collect_redirection_targets(command, node, &scan_cwd, |target| match target {
-                RedirectTarget::Path { path, input_only } => {
-                    let exemption = if input_only { read_exemption } else { None };
-                    push_external_path(&mut asks, &mut seen, &project_root, &path, exemption);
-                }
-                RedirectTarget::Dynamic => {}
-            });
+            collect_redirection_targets(
+                command,
+                node,
+                scan_cwd.as_deref(),
+                |target| match target {
+                    RedirectTarget::Path { path, input_only } => {
+                        let exemption = if input_only { read_exemption } else { None };
+                        push_external_path(&mut asks, &mut seen, &project_root, &path, exemption);
+                    }
+                    RedirectTarget::RelativeToUnknown => {
+                        unknown_cwd = true;
+                    }
+                    RedirectTarget::Dynamic => {}
+                },
+            );
             let home = std::env::var_os("HOME").map(PathBuf::from);
             track_cwd_change(
                 head,
@@ -164,6 +176,7 @@ fn scan_with_read_exemption(
             continue;
         }
 
+        unknown_cwd |= scan_cwd.is_none();
         if FILE_COMMANDS.contains(&head) {
             let exemption = if READ_ONLY_FILE_COMMANDS.contains(&head) {
                 read_exemption
@@ -171,9 +184,12 @@ fn scan_with_read_exemption(
                 None
             };
             for arg in path_args(&parts) {
-                match path_arg_target(arg, &scan_cwd) {
+                match path_arg_target(arg, scan_cwd.as_deref()) {
                     PathArgTarget::Path(path) => {
                         push_external_path(&mut asks, &mut seen, &project_root, &path, exemption);
+                    }
+                    PathArgTarget::RelativeToUnknown => {
+                        unknown_cwd = true;
                     }
                     // A dynamic target (e.g. `rm "$DEST/file"`) can't be
                     // resolved to a concrete directory. Matching native
@@ -188,12 +204,15 @@ fn scan_with_read_exemption(
             }
         }
 
-        collect_redirection_targets(command, node, &scan_cwd, |target| match target {
+        collect_redirection_targets(command, node, scan_cwd.as_deref(), |target| match target {
             RedirectTarget::Path { path, input_only } => {
                 // Only a plain `<` input redirect reads its target; `>`, `>>`,
                 // `&>`, `<>` and friends can create or truncate it.
                 let exemption = if input_only { read_exemption } else { None };
                 push_external_path(&mut asks, &mut seen, &project_root, &path, exemption);
+            }
+            RedirectTarget::RelativeToUnknown => {
+                unknown_cwd = true;
             }
             // Dynamic redirect target (e.g. `echo hi > "$FOO/bar"`): no
             // external_directory ask, same rationale as dynamic path args
@@ -217,6 +236,18 @@ fn scan_with_read_exemption(
         }
     }
 
+    if unknown_cwd {
+        // A relative folder approval has no stable identity after a dynamic cd.
+        // Add exact-command approval without replacing the individual command
+        // resources that the host checks against its allow and deny rules.
+        asks.push(PermissionAsk {
+            kind: PermissionKind::Bash,
+            patterns: vec![command.to_string()],
+            always: Vec::new(),
+            reason: Some(UNKNOWN_CWD_PERMISSION_REASON.into()),
+            targets: Vec::new(),
+        });
+    }
     asks
 }
 
@@ -225,6 +256,8 @@ fn parse_failed_ask() -> PermissionAsk {
         kind: PermissionKind::Bash,
         patterns: vec!["*".to_string()],
         always: Vec::new(),
+        reason: None,
+        targets: Vec::new(),
     }
 }
 
@@ -263,14 +296,22 @@ pub(crate) struct DirectoryTarget {
 /// invalid. Shell behavior the check cannot follow continues to run as before.
 /// Follow reachable outer-shell folder and physical-mode alternatives, keeping
 /// successful and failed commands separate so `&&` and `||` stay correlated.
+/// `known_directory` identifies existing directories copied to the runner. Treat
+/// valid initial `cd` changes as successful, but stop trusting the snapshot after
+/// any non-`cd` command. Keep tracking cwd independently of snapshot trust.
 #[cfg(any(unix, test))]
-pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<DirectoryTarget> {
+pub(crate) fn top_level_directory_targets(
+    command: &str,
+    cwd: &Path,
+    known_directory: &dyn Fn(&Path) -> bool,
+) -> Vec<DirectoryTarget> {
     const MAX_CWD_PATHS: usize = 8;
 
     #[derive(Clone, PartialEq, Eq)]
     struct ShellState {
         cwd: PathBuf,
         physical: Option<bool>,
+        snapshot_unchanged: bool,
     }
     #[derive(Clone)]
     enum Paths {
@@ -286,6 +327,7 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
             Self::Known(vec![ShellState {
                 cwd,
                 physical: Some(physical),
+                snapshot_unchanged: true,
             }])
         }
         fn is_empty(&self) -> bool {
@@ -355,6 +397,20 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
                 }
             }
         }
+        fn snapshot_unchanged(&self) -> bool {
+            match self {
+                Self::Known(states) => states.iter().all(|state| state.snapshot_unchanged),
+                Self::Unknown(_) => false,
+            }
+        }
+        fn invalidate_snapshot(mut self) -> Self {
+            if let Self::Known(states) = &mut self {
+                for state in states {
+                    state.snapshot_unchanged = false;
+                }
+            }
+            self
+        }
     }
     struct Flow {
         success: Paths,
@@ -398,6 +454,37 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
         let mut parsed = crate::bash_rewrite::parser::parse(raw)?;
         (parsed.args.len() == 1 && parsed.appends_to.is_none() && parsed.heredoc.is_none())
             .then(|| parsed.args.remove(0))
+    }
+    fn followable_pushd(parts: &[Part]) -> bool {
+        let mut args = parts.iter().skip(1);
+        let Some(first) = args.next() else {
+            return false;
+        };
+        let options_ended = literal_word(&first.text).as_deref() == Some("--");
+        let operand = if options_ended {
+            args.next()
+        } else {
+            Some(first)
+        };
+        let Some(operand) = operand.filter(|_| args.next().is_none()) else {
+            return false;
+        };
+        let raw = &operand.text;
+        let word = if raw == "~" || raw.starts_with("~/") {
+            literal_word(&format!("\\{raw}"))
+        } else {
+            literal_word(raw)
+        };
+        let Some(word) = word else {
+            return false;
+        };
+        let negative_index = word.strip_prefix('-').is_some_and(|index| {
+            !index.is_empty() && index.chars().all(|character| character.is_ascii_digit())
+        });
+        word != "-"
+            && !word.starts_with('+')
+            && !negative_index
+            && (options_ended || !word.starts_with('-'))
     }
     /// Non-literal arguments while parsing `set` options may change physical mode.
     fn set_mode_change(parts: &[Part]) -> SetModeChange {
@@ -494,15 +581,18 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
                             match flag {
                                 'L' => physical = false,
                                 'P' => physical = true,
-                                _ => {}
+                                'e' | '@' => {}
+                                _ => return None,
                             }
                         }
                     }
                     continue;
                 }
             }
-            operand = Some(part.text.as_str());
-            break;
+            if operand.replace(part.text.as_str()).is_some() {
+                return None;
+            }
+            options = false;
         }
         let raw = operand?;
         let expand_home = raw == "~" || raw.starts_with("~/");
@@ -546,10 +636,20 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
         parts: &[Part],
         incoming: Paths,
         targets: &mut Vec<DirectoryTarget>,
+        known_directory: &dyn Fn(&Path) -> bool,
     ) -> Flow {
+        if head == "pushd" && !followable_pushd(parts) {
+            // Stack rotation or an unmodeled stack edit cannot establish a
+            // successful cwd. Failure still leaves the incoming folder intact.
+            return Flow {
+                success: Paths::Unknown(incoming.mode()),
+                failure: incoming,
+            };
+        }
         let mut success = Paths::empty();
+        let mut failure = Paths::empty();
         let mut emitted: Vec<DirectoryTarget> = Vec::new();
-        let mut resolve = |cwd, mode| {
+        let mut resolve = |cwd, mode, snapshot_unchanged| {
             let resolved = match mode {
                 Some(physical) => resolve_target(head, parts, cwd, physical)
                     .map(|(target, next_cwd)| (target, Some(next_cwd))),
@@ -566,10 +666,17 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
                     }),
             };
             if let Some((target, next_cwd)) = resolved {
+                let known_success = snapshot_unchanged
+                    && known_directory(&target.path)
+                    && target
+                        .alternate_path
+                        .as_ref()
+                        .is_none_or(|path| known_directory(path));
                 if let Some(next_cwd) = next_cwd {
                     success.insert(ShellState {
                         cwd: next_cwd,
                         physical: mode,
+                        snapshot_unchanged,
                     });
                 } else {
                     success = Paths::Unknown(None);
@@ -577,48 +684,75 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
                 if !emitted.contains(&target) {
                     emitted.push(target);
                 }
+                known_success
             } else {
                 success = success.clone().union(Paths::Unknown(mode));
+                false
             }
         };
         match &incoming {
             Paths::Known(paths) => {
                 for state in paths {
-                    resolve(Some(state.cwd.as_path()), state.physical);
+                    if !resolve(
+                        Some(state.cwd.as_path()),
+                        state.physical,
+                        state.snapshot_unchanged,
+                    ) {
+                        failure.insert(state.clone());
+                    }
                 }
             }
-            Paths::Unknown(mode) => resolve(None, *mode),
+            Paths::Unknown(mode) => {
+                if !resolve(None, *mode, false) {
+                    failure = incoming.clone();
+                }
+            }
         }
         targets.extend(emitted);
-        // A failed cd/pushd leaves its incoming directory unchanged.
-        Flow {
-            success,
-            failure: incoming,
-        }
+        // Missing or unresolved destinations may still fail and leave the cwd unchanged.
+        Flow { success, failure }
     }
     fn inspect_independent_children(
         node: Node<'_>,
         source: &str,
         targets: &mut Vec<DirectoryTarget>,
+        known_directory: &dyn Fn(&Path) -> bool,
     ) {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            let _ = evaluate(child, source, Paths::Unknown(None), targets);
+            let _ = evaluate(
+                child,
+                source,
+                Paths::Unknown(None),
+                targets,
+                known_directory,
+            );
         }
+    }
+    fn has_substitution(node: Node<'_>) -> bool {
+        if matches!(node.kind(), "command_substitution" | "process_substitution") {
+            return true;
+        }
+        let mut cursor = node.walk();
+        let found = node.named_children(&mut cursor).any(has_substitution);
+        found
     }
     fn evaluate(
         node: Node<'_>,
         source: &str,
         incoming: Paths,
         targets: &mut Vec<DirectoryTarget>,
+        known_directory: &dyn Fn(&Path) -> bool,
     ) -> Flow {
         if incoming.is_empty() {
             return Flow::success(incoming);
         }
         match node.kind() {
             "subshell" => return Flow::either(Paths::Unknown(incoming.mode())),
-            "command_substitution" | "process_substitution" => return Flow::either(incoming),
-            "function_definition" => return Flow::success(incoming),
+            "command_substitution" | "process_substitution" => {
+                return Flow::either(incoming.invalidate_snapshot());
+            }
+            "function_definition" => return Flow::success(incoming.invalidate_snapshot()),
             "if_statement"
             | "for_statement"
             | "c_style_for_statement"
@@ -627,12 +761,12 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
             | "pipeline" => {
                 // Unsupported control flow loses cwd precision; independently
                 // resolvable targets remain inspectable without choosing a branch.
-                inspect_independent_children(node, source, targets);
+                inspect_independent_children(node, source, targets, known_directory);
                 return Flow::either(Paths::Unknown(None));
             }
             "negated_command" => {
                 if let Some(body) = node.named_child(0) {
-                    let inner = evaluate(body, source, incoming, targets);
+                    let inner = evaluate(body, source, incoming, targets, known_directory);
                     return Flow {
                         success: inner.failure,
                         failure: inner.success,
@@ -641,13 +775,14 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
                 return Flow::either(incoming);
             }
             "redirected_statement" => {
+                let incoming = incoming.invalidate_snapshot();
                 let mut cursor = node.walk();
                 let body = node.child_by_field_name("body").or_else(|| {
                     node.named_children(&mut cursor)
                         .find(|child| !child.kind().contains("redirect"))
                 });
                 let inner = body
-                    .map(|body| evaluate(body, source, incoming.clone(), targets))
+                    .map(|body| evaluate(body, source, incoming.clone(), targets, known_directory))
                     .unwrap_or_else(|| Flow::either(incoming.clone()));
                 // Redirection can fail before the body changes directory.
                 return Flow {
@@ -658,9 +793,14 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
             "command" => {
                 let parts = command_parts(source, node);
                 let head = parts.first().and_then(|part| literal_word(&part.text));
+                let incoming = if head.as_deref() == Some("cd") && !has_substitution(node) {
+                    incoming
+                } else {
+                    incoming.invalidate_snapshot()
+                };
                 return match head.as_deref() {
                     Some(head @ ("cd" | "pushd")) => {
-                        directory_change(head, &parts, incoming, targets)
+                        directory_change(head, &parts, incoming, targets, known_directory)
                     }
                     Some("popd") => Flow {
                         success: Paths::Unknown(incoming.mode()),
@@ -724,7 +864,18 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
                 "&" => {
                     // The asynchronous list ran in a child shell. Its final cwd
                     // and options must not replace the foreground entry state.
-                    flow = flow.map(|_| Flow::success(asynchronous_entry.clone()));
+                    flow = flow.map(|left| {
+                        // Background jobs share files with the foreground shell,
+                        // even though their directory changes do not carry over.
+                        let entry = if left.success.snapshot_unchanged()
+                            && left.failure.snapshot_unchanged()
+                        {
+                            asynchronous_entry.clone()
+                        } else {
+                            asynchronous_entry.clone().invalidate_snapshot()
+                        };
+                        Flow::success(entry)
+                    });
                     operator = Operator::Sequence;
                     continue;
                 }
@@ -733,21 +884,27 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
                 _ => {}
             }
             flow = Some(match flow.take() {
-                None => evaluate(child, source, incoming.clone(), targets),
+                None => evaluate(child, source, incoming.clone(), targets, known_directory),
                 Some(left) => match operator {
                     Operator::Sequence => {
                         asynchronous_entry = left.all();
-                        evaluate(child, source, asynchronous_entry.clone(), targets)
+                        evaluate(
+                            child,
+                            source,
+                            asynchronous_entry.clone(),
+                            targets,
+                            known_directory,
+                        )
                     }
                     Operator::And => {
-                        let right = evaluate(child, source, left.success, targets);
+                        let right = evaluate(child, source, left.success, targets, known_directory);
                         Flow {
                             success: right.success,
                             failure: left.failure.union(right.failure),
                         }
                     }
                     Operator::Or => {
-                        let right = evaluate(child, source, left.failure, targets);
+                        let right = evaluate(child, source, left.failure, targets, known_directory);
                         Flow {
                             success: left.success.union(right.success),
                             failure: right.failure,
@@ -767,6 +924,7 @@ pub(crate) fn top_level_directory_targets(command: &str, cwd: &Path) -> Vec<Dire
             command,
             Paths::one(cwd.to_path_buf(), false),
             &mut targets,
+            known_directory,
         );
     }
     targets
@@ -798,6 +956,7 @@ fn command_parts(source: &str, node: Node<'_>) -> Vec<Part> {
                 | "string"
                 | "raw_string"
                 | "concatenation"
+                | "number"
         ) {
             out.push(Part {
                 text: node_text(source, child).to_string(),
@@ -827,11 +986,13 @@ enum RedirectTarget {
         path: PathBuf,
         input_only: bool,
     },
+    RelativeToUnknown,
     Dynamic,
 }
 
 enum PathArgTarget {
     Path(PathBuf),
+    RelativeToUnknown,
     Dynamic,
     None,
 }
@@ -839,34 +1000,48 @@ enum PathArgTarget {
 fn collect_redirection_targets(
     source: &str,
     command: Node<'_>,
-    cwd: &Path,
+    cwd: Option<&Path>,
     mut on_target: impl FnMut(RedirectTarget),
 ) {
     // In tree-sitter-bash, redirects on `echo hi > /tmp/out` are siblings of
     // the `command` node, wrapped inside `redirected_statement`. Walking
-    // `command.children` would miss them. Walk from the parent
-    // (`redirected_statement`) when present, otherwise fall back to walking
-    // `command` itself in case a future grammar version inlines redirections
-    // under `command`.
-    let walk_root = match command.parent() {
-        Some(parent) if parent.kind() == "redirected_statement" => parent,
-        _ => command,
-    };
-    let mut cursor = walk_root.walk();
-    for child in walk_root.children(&mut cursor) {
-        // Skip the inner `command` node itself — its children are arguments,
-        // not redirections, and re-walking them is just wasted work.
-        if child.id() == command.id() {
-            continue;
+    // `command.children` would miss them. Lists and pipelines can also carry
+    // this wrapper: only their last command owns the trailing redirect, in
+    // the directory in effect for that command.
+    let mut body = command;
+    while let Some(parent) = body.parent() {
+        match parent.kind() {
+            "redirected_statement" => {
+                let mut cursor = parent.walk();
+                for child in parent.children(&mut cursor) {
+                    if child.id() != body.id() {
+                        collect_redirection_targets_from_node(source, child, cwd, &mut on_target);
+                    }
+                }
+                return;
+            }
+            "list" | "pipeline" if is_last_named_child(parent, body) => body = parent,
+            _ => break,
         }
+    }
+    let mut cursor = command.walk();
+    for child in command.children(&mut cursor) {
         collect_redirection_targets_from_node(source, child, cwd, &mut on_target);
     }
+}
+
+fn is_last_named_child(parent: Node<'_>, child: Node<'_>) -> bool {
+    parent
+        .named_child_count()
+        .checked_sub(1)
+        .and_then(|last| parent.named_child(last as u32))
+        .is_some_and(|last| last.id() == child.id())
 }
 
 fn collect_redirection_targets_from_node(
     source: &str,
     node: Node<'_>,
-    cwd: &Path,
+    cwd: Option<&Path>,
     on_target: &mut impl FnMut(RedirectTarget),
 ) {
     // tree-sitter-bash 0.25.x emits `file_redirect` and `heredoc_redirect`
@@ -899,6 +1074,9 @@ fn collect_redirection_targets_from_node(
                     PathArgTarget::Path(path) => {
                         on_target(RedirectTarget::Path { path, input_only })
                     }
+                    PathArgTarget::RelativeToUnknown => {
+                        on_target(RedirectTarget::RelativeToUnknown);
+                    }
                     PathArgTarget::Dynamic => on_target(RedirectTarget::Dynamic),
                     PathArgTarget::None => {}
                 }
@@ -920,55 +1098,59 @@ fn is_dynamic_node(node: Node<'_>) -> bool {
     )
 }
 
-/// Follow the literal forms of `cd`, `pushd` and `popd` so later relative
-/// paths resolve where the shell will actually be. Forms whose target is not
-/// known here (`cd -`, a dynamic directory, stack rotation with `+N`/`-N`)
-/// leave the tracked directory unchanged.
+/// Follow directory changes, marking an unknowable destination as unknown
+/// until an absolute literal change (or bare `cd` to HOME) restores the base.
 fn track_cwd_change(
     head: &str,
     parts: &[Part],
     home: Option<&Path>,
-    scan_cwd: &mut PathBuf,
-    directory_stack: &mut Vec<PathBuf>,
+    scan_cwd: &mut Option<PathBuf>,
+    directory_stack: &mut Vec<Option<PathBuf>>,
 ) {
     let args = parts.iter().skip(1).map(|part| part.text.as_str());
     let options_only = args.clone().all(|arg| arg.starts_with('-') && arg != "-");
+    let target = |cwd: &Option<PathBuf>| {
+        path_args(parts)
+            .next()
+            .and_then(|arg| arg_path(arg, cwd.as_deref()))
+    };
     match head {
         "cd" => {
-            if options_only {
+            *scan_cwd = if options_only {
                 // A bare `cd` goes to the home directory.
-                if let Some(home) = home {
-                    *scan_cwd = resolve_existing(home);
-                }
-            } else if !args.clone().any(|arg| arg == "-") {
-                if let Some(path) = path_args(parts)
-                    .next()
-                    .and_then(|arg| arg_path(arg, scan_cwd))
-                {
-                    *scan_cwd = path;
-                }
-            }
+                home.map(resolve_existing)
+            } else if args.clone().any(|arg| arg == "-") {
+                None
+            } else {
+                target(scan_cwd)
+            };
         }
         "pushd" => {
-            if args
-                .clone()
-                .any(|arg| arg.starts_with('+') || arg.starts_with('-'))
-            {
-                return;
-            }
-            if let Some(path) = path_args(parts)
-                .next()
-                .and_then(|arg| arg_path(arg, scan_cwd))
-            {
-                directory_stack.push(std::mem::replace(scan_cwd, path));
+            let rotates = options_only
+                || args.clone().any(|arg| unquote(arg).starts_with(['+', '-']))
+                || path_args(parts).count() != 1;
+            let next = if rotates {
+                None
+            } else {
+                target(scan_cwd).filter(|path| path.is_dir())
+            };
+            if next.is_none() {
+                // Rotation reorders the stack rather than pushing the old cwd.
+                // Unmodeled forms cannot leave saved entries that a later popd
+                // might mistake for a known directory.
+                directory_stack.clear();
+                *scan_cwd = None;
+            } else {
+                directory_stack.push(std::mem::replace(scan_cwd, next));
             }
         }
         "popd" => {
-            if options_only {
-                if let Some(previous) = directory_stack.pop() {
-                    *scan_cwd = previous;
-                }
-            }
+            *scan_cwd = if parts.len() == 1 {
+                directory_stack.pop().flatten()
+            } else {
+                directory_stack.clear();
+                None
+            };
         }
         _ => {}
     }
@@ -985,17 +1167,25 @@ fn path_args(parts: &[Part]) -> impl Iterator<Item = &str> {
     })
 }
 
-fn arg_path(arg: &str, cwd: &Path) -> Option<PathBuf> {
+fn arg_path(arg: &str, cwd: Option<&Path>) -> Option<PathBuf> {
     match path_arg_target(arg, cwd) {
         PathArgTarget::Path(path) => Some(path),
-        PathArgTarget::Dynamic | PathArgTarget::None => None,
+        PathArgTarget::RelativeToUnknown | PathArgTarget::Dynamic | PathArgTarget::None => None,
     }
 }
 
-fn path_arg_target(arg: &str, cwd: &Path) -> PathArgTarget {
+fn path_arg_target(arg: &str, cwd: Option<&Path>) -> PathArgTarget {
     let text = home(&unquote(arg), cwd);
     if dynamic(&text) {
         return PathArgTarget::Dynamic;
+    }
+
+    if cwd.is_none()
+        && !text.is_empty()
+        && !Path::new(&text).is_absolute()
+        && !is_device_file(&text)
+    {
+        return PathArgTarget::RelativeToUnknown;
     }
 
     let Some(text) = glob_prefix(&text) else {
@@ -1017,7 +1207,10 @@ fn path_arg_target(arg: &str, cwd: &Path) -> PathArgTarget {
     let resolved = if path.is_absolute() {
         path
     } else {
-        cwd.join(path)
+        match cwd {
+            Some(cwd) => cwd.join(path),
+            None => return PathArgTarget::None,
+        }
     };
     PathArgTarget::Path(resolve_existing(&resolved))
 }
@@ -1039,7 +1232,7 @@ fn unquote(text: &str) -> String {
     out
 }
 
-fn home(text: &str, cwd: &Path) -> String {
+fn home(text: &str, cwd: Option<&Path>) -> String {
     if text == "~" {
         return std::env::var("HOME").unwrap_or_else(|_| text.to_string());
     }
@@ -1049,11 +1242,15 @@ fn home(text: &str, cwd: &Path) -> String {
         }
     }
     let home = std::env::var("HOME").unwrap_or_default();
-    let pwd = cwd.to_string_lossy();
-    text.replace("$HOME", &home)
-        .replace("${HOME}", &home)
-        .replace("$PWD", pwd.as_ref())
-        .replace("${PWD}", pwd.as_ref())
+    let text = text.replace("$HOME", &home).replace("${HOME}", &home);
+    match cwd {
+        Some(cwd) => {
+            let pwd = cwd.to_string_lossy();
+            text.replace("$PWD", pwd.as_ref())
+                .replace("${PWD}", pwd.as_ref())
+        }
+        None => text,
+    }
 }
 
 fn glob_prefix(text: &str) -> Option<&str> {
@@ -1074,14 +1271,6 @@ fn dynamic(text: &str) -> bool {
 
 fn resolve_existing(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| super::normalize_path(path))
-}
-
-fn permission_dir(path: &Path) -> PathBuf {
-    if path.is_dir() {
-        path.to_path_buf()
-    } else {
-        path.parent().unwrap_or(path).to_path_buf()
-    }
 }
 
 fn display_path(path: &Path) -> String {
@@ -1105,6 +1294,8 @@ fn push_bash_ask(
             kind: PermissionKind::Bash,
             patterns: vec![pattern],
             always: vec![format!("{stable} *")],
+            reason: None,
+            targets: Vec::new(),
         },
     );
 }
@@ -1153,8 +1344,22 @@ fn push_external_path(
     if read_exemption.is_some_and(|is_exempt| is_exempt(path)) {
         return;
     }
-    let dir = permission_dir(path);
-    let pattern = format!("{}/*", display_path(&dir));
+    use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+    let grant = AccessGrant {
+        path: path.to_path_buf(),
+        kind: if path.is_dir() {
+            GrantKind::Subtree
+        } else {
+            GrantKind::File
+        },
+        // Folder eligibility is identical for read and write approvals.
+        operation: AccessOperation::Read,
+    };
+    let scope = crate::subc::directory_scope(&grant);
+    let pattern = match scope.kind {
+        GrantKind::File => display_path(&scope.path),
+        GrantKind::Subtree => format!("{}/*", display_path(&scope.path)),
+    };
     push_ask(
         asks,
         seen,
@@ -1162,6 +1367,8 @@ fn push_external_path(
             kind: PermissionKind::ExternalDirectory,
             patterns: vec![pattern.clone()],
             always: vec![pattern],
+            reason: None,
+            targets: vec![grant],
         },
     );
 }
@@ -1170,7 +1377,35 @@ fn push_ask(asks: &mut Vec<PermissionAsk>, seen: &mut HashSet<String>, ask: Perm
     let key = format!("{:?}:{:?}:{:?}", ask.kind, ask.patterns, ask.always);
     if seen.insert(key) {
         asks.push(ask);
+    } else if let Some(existing) = asks.iter_mut().find(|existing| {
+        existing.kind == ask.kind
+            && existing.patterns == ask.patterns
+            && existing.always == ask.always
+    }) {
+        // A single displayed folder ask may represent several files. Keep all
+        // of them so approving one file cannot authorize its unapproved sibling.
+        for target in ask.targets {
+            if !existing
+                .targets
+                .iter()
+                .any(|prior| same_external_target(prior, &target))
+            {
+                existing.targets.push(target);
+            }
+        }
     }
+}
+
+fn same_external_target(
+    left: &crate::access_policy::AccessGrant,
+    right: &crate::access_policy::AccessGrant,
+) -> bool {
+    #[cfg(windows)]
+    let same_path = crate::windows_path::normalize_windows_path(&left.path)
+        == crate::windows_path::normalize_windows_path(&right.path);
+    #[cfg(not(windows))]
+    let same_path = left.path == right.path;
+    same_path && left.kind == right.kind && left.operation == right.operation
 }
 
 #[cfg(test)]
@@ -1178,9 +1413,17 @@ mod tests {
     use super::*;
 
     fn directory_paths(command: &str, cwd: &Path) -> Vec<PathBuf> {
-        top_level_directory_targets(command, cwd)
+        top_level_directory_targets(command, cwd, &|_| false)
             .into_iter()
             .map(|target| target.path)
+            .collect()
+    }
+
+    fn external_ask_shapes(command: &str, project: &Path) -> Vec<(Vec<String>, Vec<String>)> {
+        scan_with_project_root(command, project, project)
+            .into_iter()
+            .filter(|ask| matches!(ask.kind, PermissionKind::ExternalDirectory))
+            .map(|ask| (ask.patterns, ask.always))
             .collect()
     }
 
@@ -1189,7 +1432,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let absolute = dir.path().canonicalize().unwrap();
         let command = format!("cd '{}' && cd nested && cd '~/literal'", absolute.display());
-        let targets = top_level_directory_targets(&command, &absolute);
+        let targets = top_level_directory_targets(&command, &absolute, &|_| false);
         assert_eq!(
             targets
                 .iter()
@@ -1278,6 +1521,75 @@ mod tests {
     }
 
     #[test]
+    fn directory_targets_only_drop_failures_for_known_destinations() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(cwd.join("a")).unwrap();
+        std::fs::create_dir(cwd.join("b")).unwrap();
+        let known_directory = |path: &Path| path.starts_with(&cwd) && path.is_dir();
+        for (command, expected) in [
+            ("cd a; cd ../b", vec![cwd.join("a"), cwd.join("b")]),
+            (
+                "maybe && cd a; cd ../b",
+                vec![
+                    cwd.join("a"),
+                    cwd.join("b"),
+                    cwd.parent().unwrap().join("b"),
+                ],
+            ),
+            (
+                "cd missing; cd ../b",
+                vec![
+                    cwd.join("missing"),
+                    cwd.join("b"),
+                    cwd.parent().unwrap().join("b"),
+                ],
+            ),
+            ("cd a || cd ..", vec![cwd.join("a")]),
+            (
+                "cd a >/not-writable || cd ..",
+                vec![cwd.join("a"), cwd.parent().unwrap().to_path_buf()],
+            ),
+        ] {
+            let paths: Vec<_> = top_level_directory_targets(command, &cwd, &known_directory)
+                .into_iter()
+                .map(|target| target.path)
+                .collect();
+            assert_eq!(paths, expected, "{command}");
+        }
+    }
+
+    #[test]
+    fn directory_targets_only_prove_supported_cd_invocations() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        for name in ["a", "-Z"] {
+            std::fs::create_dir(cwd.join(name)).unwrap();
+        }
+        for (command, destination) in [
+            ("cd a || cd ..", "a"),
+            ("cd -e a || cd ..", "a"),
+            ("cd -@ a || cd ..", "a"),
+            ("cd '-LP' -e@ -- a || cd ..", "a"),
+            ("cd -- -Z || cd ..", "-Z"),
+        ] {
+            let targets = top_level_directory_targets(command, &cwd, &|path| path.is_dir());
+            assert_eq!(targets.len(), 1, "{command}");
+            assert_eq!(targets[0].path, cwd.join(destination), "{command}");
+        }
+        for command in [
+            "cd a extra || cd ..",
+            "cd -Z a || cd ..",
+            "cd -PZ a || cd ..",
+            "cd -- a extra || cd ..",
+        ] {
+            let targets = top_level_directory_targets(command, &cwd, &|path| path.is_dir());
+            assert_eq!(targets.len(), 1, "{command}");
+            assert_eq!(targets[0].path, cwd.parent().unwrap(), "{command}");
+        }
+    }
+
+    #[test]
     fn directory_targets_bound_reachable_cwd_alternatives() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().canonicalize().unwrap();
@@ -1302,6 +1614,10 @@ mod tests {
             directory_paths("pushd nested && cd ../..", &cwd),
             vec![cwd.join("nested"), cwd.parent().unwrap().to_path_buf()]
         );
+        assert_eq!(
+            directory_paths("pushd -- nested && cd ../..", &cwd),
+            vec![cwd.join("nested"), cwd.parent().unwrap().to_path_buf()]
+        );
     }
 
     #[test]
@@ -1323,6 +1639,187 @@ mod tests {
                 "{prefix}"
             );
         }
+    }
+
+    #[test]
+    fn directory_targets_unfollowable_pushd_forgets_successful_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        for change in [
+            "pushd +1",
+            "pushd -1",
+            "pushd -- -1",
+            "pushd",
+            "pushd -n /usr",
+            "pushd -1 ignored",
+            "pushd /usr extra",
+            "pushd \"$UNKNOWN\"",
+        ] {
+            for separator in [";", "&&"] {
+                let command = format!("{change} {separator} cd child");
+                assert!(directory_paths(&command, &cwd).is_empty(), "{command}");
+            }
+            // A failed pushd leaves the cwd unchanged; a background pushd must
+            // not change the foreground shell's cwd.
+            for command in [
+                format!("{change} || cd child"),
+                format!("{change} & cd child"),
+            ] {
+                assert_eq!(
+                    directory_paths(&command, &cwd),
+                    vec![cwd.join("child")],
+                    "{command}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_targets_stack_unknown_preserves_physical_mode_and_absolute_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let deep = root.join("deep");
+        std::fs::create_dir(&deep).unwrap();
+        std::os::unix::fs::symlink("..", deep.join("link")).unwrap();
+        for (option, last) in [
+            ("-P", root.parent().unwrap().to_path_buf()),
+            ("-o physical", root.parent().unwrap().to_path_buf()),
+            ("+P", deep.clone()),
+            ("+o physical", deep.clone()),
+        ] {
+            let command = format!(
+                "set {option}; pushd -1 ignored; cd '{}' && cd link && cd ..",
+                deep.display()
+            );
+            assert_eq!(
+                directory_paths(&command, &deep),
+                vec![deep.clone(), root.clone(), last],
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_heredoc_body_is_not_scanned_as_commands_or_paths() {
+        let scratch = std::env::current_dir().unwrap().join("target/bash-heredoc");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let fixture = tempfile::tempdir_in(scratch).unwrap();
+        let project = fixture.path().join("project");
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(project.join("gate.sh"), "").unwrap();
+        let command = format!(
+            "cat > '{}/gate.sh' <<'EOF'\ncp '{}/body-only.txt' /tmp/copy\nsed -n '1p' '{}/body-only.txt'\npython3 - <<'PY'\nprint('$(body_only_command /tmp/data)')\nPY\necho \"$HOME $(body_only_command '{}/body-only.txt')\"\nEOF\n",
+            project.display(), outside.display(), outside.display(), outside.display(),
+        );
+        let asks = scan_with_project_root(&command, &project, &outside);
+        assert_eq!(
+            asks.len(),
+            1,
+            "only the outer cat command may ask: {asks:?}"
+        );
+        assert_eq!(asks[0].kind, PermissionKind::Bash);
+        assert_eq!(asks[0].always, ["cat *"]);
+        assert!(asks[0].patterns[0].starts_with("cat > "));
+    }
+
+    #[test]
+    fn unknown_cwd_preserves_individual_command_permissions() {
+        let project = tempfile::tempdir().unwrap();
+        let command = "cd \"$DEST\" && rm -rf build";
+        let asks = scan_with_project_root(command, project.path(), project.path());
+        let rm = asks
+            .iter()
+            .find(|ask| ask.patterns == ["rm -rf build"])
+            .expect("the host must still evaluate rm command rules");
+        assert_eq!(rm.kind, PermissionKind::Bash);
+        assert_eq!(rm.always, ["rm *"]);
+        assert!(rm.reason.is_none());
+        let exact = asks
+            .iter()
+            .find(|ask| ask.reason.as_deref() == Some(UNKNOWN_CWD_PERMISSION_REASON))
+            .expect("the unknown directory still needs exact-command approval");
+        assert_eq!(exact.kind, PermissionKind::Bash);
+        assert_eq!(exact.patterns, [command]);
+        assert!(exact.always.is_empty());
+        assert!(asks
+            .iter()
+            .all(|ask| ask.kind != PermissionKind::ExternalDirectory));
+    }
+
+    #[test]
+    fn relative_paths_after_an_unknown_directory_change_ask() {
+        let project = tempfile::tempdir().unwrap();
+        for command in [
+            "cd \"$TARGET\" && rm -rf build",
+            "cd - && rm notes.txt",
+            "popd && rm notes.txt",
+            "pushd +1 && rm notes.txt",
+            "pushd && rm notes.txt",
+            "cd \"$TARGET\" && cd sub && rm notes.txt",
+            "cd \"$TARGET\" && echo hi > out.txt",
+            "cd \"$TARGET\"; cat 'quoted name'/file",
+        ] {
+            assert_unknown_cwd_ask(command, project.path());
+        }
+    }
+
+    fn assert_unknown_cwd_ask(command: &str, project: &Path) {
+        let asks = scan_with_project_root(command, project, project);
+        let exact = asks
+            .iter()
+            .find(|ask| ask.reason.as_deref() == Some(UNKNOWN_CWD_PERMISSION_REASON))
+            .unwrap();
+        assert_eq!(exact.patterns, [command], "{command}");
+        assert!(exact.always.is_empty(), "{command}");
+        assert_eq!(exact.reason.as_deref(), Some(UNKNOWN_CWD_PERMISSION_REASON));
+        assert!(asks.iter().all(|ask| ask.kind != PermissionKind::ExternalDirectory || !ask.targets.is_empty()), "{asks:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotated_directory_stack_cannot_restore_a_stale_project_directory() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("+1")).unwrap();
+        std::fs::create_dir(project.path().join("-1")).unwrap();
+        let project_path = project.path().display();
+        for change in [
+            "pushd +1",
+            "pushd -1",
+            "pushd '+1'",
+            "pushd '-1'",
+            "pushd",
+            "pushd /usr extra",
+            "pushd missing-directory",
+            "pushd \"$UNKNOWN\"",
+            "popd +1",
+            "popd -1",
+            "popd -n",
+        ] {
+            let command = format!(
+                "pushd /usr; pushd /etc; pushd '{project_path}'; {change}; popd; rm notes.txt"
+            );
+            assert_unknown_cwd_ask(&command, project.path());
+        }
+    }
+
+    #[test]
+    fn numeric_directory_stack_options_are_preserved() {
+        let command = "popd -1";
+        let tree = parse_tree(command).unwrap();
+        let mut commands = Vec::new();
+        collect_commands(tree.root_node(), &mut commands);
+        assert_eq!(commands.len(), 1);
+        let parts = command_parts(command, commands[0]);
+        assert_eq!(
+            parts
+                .iter()
+                .map(|part| part.text.as_str())
+                .collect::<Vec<_>>(),
+            ["popd", "-1"]
+        );
     }
 
     #[test]
@@ -1566,17 +2063,28 @@ mod tests {
             directory_paths("set \"$OPTS\"; cd .. && cd ..", &deep),
             vec![root.clone(), root.parent().unwrap().to_path_buf()]
         );
-        let paired = top_level_directory_targets("set \"$OPTS\"; cd link/.. && cd ../..", &deep);
+        let paired =
+            top_level_directory_targets("set \"$OPTS\"; cd link/.. && cd ../..", &deep, &|_| false);
         assert_eq!(paired.len(), 1);
         assert_eq!(paired[0].path, deep);
         assert_eq!(
             paired[0].alternate_path,
             Some(root.parent().unwrap().to_path_buf())
         );
-        let explicit = top_level_directory_targets("set \"$OPTS\"; cd -P link/..", &deep);
+        let explicit =
+            top_level_directory_targets("set \"$OPTS\"; cd -P link/..", &deep, &|_| false);
         assert_eq!(explicit.len(), 1);
         assert_eq!(explicit[0].path, root.parent().unwrap());
         assert_eq!(explicit[0].alternate_path, None);
+        for both_known in [false, true] {
+            let targets = top_level_directory_targets(
+                "set \"$OPTS\"; cd link/.. || cd fallback",
+                &deep,
+                &|path| both_known || path.starts_with(&root),
+            );
+            assert_eq!(targets.len(), 2);
+            assert_eq!(targets[1].path, deep.join("fallback"));
+        }
         for command in ["set -- \"$X\"; cd ..", "set value \"$X\"; cd .."] {
             assert_eq!(
                 directory_paths(command, &deep),
@@ -1647,7 +2155,141 @@ mod tests {
             vec![sibling.canonicalize().unwrap().join("missing")]
         );
     }
+
+    #[test]
+    fn unknown_directory_never_produces_a_blanket_ask() {
+        let project = tempfile::tempdir().unwrap();
+        assert!(external_ask_shapes("cd \"$TARGET\" && rm \"$NAME\"", project.path()).is_empty());
+        assert!(
+            external_ask_shapes("cd \"$TARGET\" && make 2>&1 > /dev/null", project.path())
+                .is_empty()
+        );
+        assert_unknown_cwd_ask("cd \"$TARGET\" && rm -rf build '*/*.txt'", project.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn literal_absolute_directory_change_ends_the_unknown_state() {
+        let project = tempfile::tempdir().unwrap();
+        let usr = vec![(
+            vec!["/usr/aft-scan-probe".to_string()],
+            vec!["/usr/aft-scan-probe".to_string()],
+        )];
+        assert_eq!(
+            external_ask_shapes(
+                "cd \"$TARGET\" && cd /usr && rm aft-scan-probe",
+                project.path()
+            ),
+            usr
+        );
+        assert_eq!(
+            external_ask_shapes("cd \"$TARGET\" && rm /usr/aft-scan-probe", project.path()),
+            usr
+        );
+        let inside = project.path().display().to_string();
+        assert!(external_ask_shapes(
+            &format!("cd \"$TARGET\" && cd '{inside}' && rm notes.txt"),
+            project.path()
+        )
+        .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trailing_redirect_after_a_list_belongs_to_the_last_command() {
+        let project = tempfile::tempdir().unwrap();
+        for (command, target) in [
+            ("cd /usr && echo hi > out.txt", "/usr/out.txt"),
+            (
+                "true && echo hi > /usr/aft-scan-probe",
+                "/usr/aft-scan-probe",
+            ),
+            ("echo hi | cat > /usr/aft-scan-probe", "/usr/aft-scan-probe"),
+        ] {
+            assert_eq!(
+                external_ask_shapes(command, project.path()),
+                vec![(vec![target.to_string()], vec![target.to_string()])],
+                "{command}"
+            );
+        }
+        assert!(external_ask_shapes("echo hi > out.txt && cd /usr", project.path()).is_empty());
+    }
     use crate::bash_permissions::normalize_path;
+
+    #[cfg(windows)]
+    #[test]
+    fn external_target_dedup_normalizes_windows_path_spellings() {
+        use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+        for (plain, verbatim) in [
+            (r"D:/a/aft/file.txt", r"\\?\d:\a\aft\file.txt"),
+            (
+                r"\\server\share\folder\file.txt",
+                r"\\?\UNC\server\share\folder\file.txt",
+            ),
+        ] {
+            let original = AccessGrant {
+                path: PathBuf::from(verbatim),
+                kind: GrantKind::File,
+                operation: AccessOperation::Read,
+            };
+            let pattern = "unchanged-host-pattern/*";
+            let ask = |target| PermissionAsk {
+                kind: PermissionKind::ExternalDirectory,
+                patterns: vec![pattern.into()],
+                always: vec![pattern.into()],
+                reason: None,
+                targets: vec![target],
+            };
+            let mut asks = Vec::new();
+            let mut seen = HashSet::new();
+            push_ask(&mut asks, &mut seen, ask(original.clone()));
+            push_ask(
+                &mut asks,
+                &mut seen,
+                ask(AccessGrant {
+                    path: PathBuf::from(plain),
+                    ..original.clone()
+                }),
+            );
+            assert_eq!(asks.len(), 1);
+            assert_eq!(
+                asks[0].targets,
+                [original.clone()],
+                "equivalent targets should merge without rewriting the first spelling"
+            );
+            push_ask(
+                &mut asks,
+                &mut seen,
+                ask(AccessGrant {
+                    kind: GrantKind::Subtree,
+                    ..original.clone()
+                }),
+            );
+            push_ask(
+                &mut asks,
+                &mut seen,
+                ask(AccessGrant {
+                    operation: AccessOperation::Write,
+                    ..original.clone()
+                }),
+            );
+            push_ask(
+                &mut asks,
+                &mut seen,
+                ask(AccessGrant {
+                    path: original.path.with_file_name("other.txt"),
+                    ..original
+                }),
+            );
+            assert_eq!(
+                asks[0].targets.len(),
+                4,
+                "different kind, mode or path must remain distinct"
+            );
+            assert_eq!(asks[0].patterns, [pattern]);
+            assert_eq!(asks[0].always, [pattern]);
+        }
+    }
 
     #[test]
     fn pwd_expands_against_scan_cwd() {
@@ -1655,14 +2297,14 @@ mod tests {
         let scan_cwd = temp.path().join("project").join("subdir");
         std::fs::create_dir_all(&scan_cwd).unwrap();
 
-        let path = arg_path("$PWD/output.log", &scan_cwd).unwrap();
+        let path = arg_path("$PWD/output.log", Some(&scan_cwd)).unwrap();
 
         assert_eq!(path, normalize_path(&scan_cwd.join("output.log")));
     }
 
     #[test]
     fn dynamic_file_arg_is_reported_as_dynamic_target() {
-        let target = path_arg_target(r#""$DEST/file""#, Path::new("/tmp"));
+        let target = path_arg_target(r#""$DEST/file""#, Some(Path::new("/tmp")));
 
         assert!(matches!(target, PathArgTarget::Dynamic));
     }
@@ -1673,7 +2315,7 @@ mod tests {
         let scan_cwd = temp.path().join("outside");
         std::fs::create_dir_all(&scan_cwd).unwrap();
 
-        let path = arg_path("./file.log", &scan_cwd).unwrap();
+        let path = arg_path("./file.log", Some(&scan_cwd)).unwrap();
 
         assert_eq!(path, normalize_path(&scan_cwd.join("file.log")));
     }
@@ -1684,14 +2326,17 @@ mod tests {
         // to a real block device. The scanner fails closed on the latter.
         for arg in ["/dev/fd/0", "/dev/fd/2", "/dev/fd/255"] {
             assert!(
-                matches!(path_arg_target(arg, Path::new("/tmp")), PathArgTarget::None),
+                matches!(
+                    path_arg_target(arg, Some(Path::new("/tmp"))),
+                    PathArgTarget::None
+                ),
                 "expected {arg} to be skipped as a device path"
             );
         }
         for arg in ["/dev/fd/../sda", "/dev/fd/", "/dev/fd/2x", "/dev/fd/2/x"] {
             assert!(
                 matches!(
-                    path_arg_target(arg, Path::new("/tmp")),
+                    path_arg_target(arg, Some(Path::new("/tmp"))),
                     PathArgTarget::Path(_)
                 ),
                 "expected {arg} to be treated as a regular path (fail closed)"
@@ -1705,7 +2350,7 @@ mod tests {
         // pipe inode under CI), so the device check must run on the raw
         // path — after canonicalize it no longer matches the allowlist.
         for arg in ["/dev/stderr", "/dev/stdin", "/dev/stdout", "/dev/fd/2"] {
-            let target = path_arg_target(arg, Path::new("/tmp"));
+            let target = path_arg_target(arg, Some(Path::new("/tmp")));
             assert!(
                 matches!(target, PathArgTarget::None),
                 "expected {arg} to be skipped as a device path"
@@ -1814,7 +2459,7 @@ mod tests {
     fn partly_quoted_absolute_path_is_not_treated_as_relative() {
         let project = tempfile::tempdir().unwrap();
         let asks = external_asks(r#"rm "/usr"/aft-scan-probe"#, project.path());
-        assert_eq!(asks, vec!["/usr/*".to_string()]);
+        assert_eq!(asks, vec!["/usr/aft-scan-probe".to_string()]);
         assert_eq!(unquote(r#""/etc"/'pass'wd"#), "/etc/passwd");
         assert_eq!(unquote(r#"'a"b'"c'd""#), "a\"bc'd");
     }
@@ -1824,7 +2469,7 @@ mod tests {
     fn pushd_and_popd_move_the_scan_directory() {
         let project = tempfile::tempdir().unwrap();
         let asks = external_asks("pushd /usr && rm aft-scan-probe", project.path());
-        assert_eq!(asks, vec!["/usr/*".to_string()]);
+        assert_eq!(asks, vec!["/usr/aft-scan-probe".to_string()]);
         let asks = external_asks("pushd /usr && popd && rm aft-scan-probe", project.path());
         assert!(asks.is_empty(), "{asks:?}");
     }
@@ -1834,7 +2479,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
-        let mut scan_cwd = temp.path().to_path_buf();
+        let mut scan_cwd = Some(temp.path().to_path_buf());
         let mut stack = Vec::new();
         let parts = |words: &[&str]| {
             words
@@ -1851,8 +2496,7 @@ mod tests {
             &mut scan_cwd,
             &mut stack,
         );
-        assert_eq!(scan_cwd, resolve_existing(&home));
-        let before = scan_cwd.clone();
+        assert_eq!(scan_cwd, Some(resolve_existing(&home)));
         track_cwd_change(
             "cd",
             &parts(&["cd", "-"]),
@@ -1860,7 +2504,7 @@ mod tests {
             &mut scan_cwd,
             &mut stack,
         );
-        assert_eq!(scan_cwd, before, "cd - goes to an unknown directory");
+        assert_eq!(scan_cwd, None, "cd - goes to an unknown directory");
     }
 
     #[test]

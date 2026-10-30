@@ -1,0 +1,47 @@
+{
+  "chunks": {
+    "requests": {
+      "rich_ui.manifest_chunk": {"manifestDigest": "sha256:<64 lowercase hex>", "index": 0},
+      "rich_ui.template_chunk": {"templateDigest": "sha256:<64 lowercase hex>", "index": 0}
+    },
+    "replyFields": ["digest", "index", "chunks", "bytes", "data"],
+    "reply": {"digest": "sha256:<asset digest>", "index": 0, "chunks": 3, "bytes": 300000, "data": "<standard padded RFC4648 base64>"},
+    "decodedBytesMax": 131072,
+    "indexBase": 0,
+    "bytesMeaning": "whole asset bytes, not chunk length",
+    "refusalFrame": "Error",
+    "refusalCodes": ["principal_not_allowed", "digest_unknown", "chunk_index_out_of_range", "database_unavailable", "database_busy"],
+    "refusal": {"code": "digest_unknown", "message": "The requested asset digest is not available."},
+    "refusalRule": "Typed protocol Error, never a tool-result body; message contains no request data."
+  },
+  "carrier": {
+    "bodyFields": ["content", "isError", "structuredContent"],
+    "success": {"content": [{"type": "text", "text": ""}], "isError": false, "structuredContent": {"running": false, "exitCode": 0}},
+    "failure": {"content": [{"type": "text", "text": "args_invalid"}], "isError": true, "structuredContent": {"success": false, "code": "args_invalid", "message": "The operation arguments are invalid."}},
+    "successRule": "structuredContent is exactly the projected and validated result (or items/next page); no id, success, text, view or session sidecars are added.",
+    "failureRule": "Keep code; replace handler message with operations.rs fixed table or generic fallback; drop data and sidecars.",
+    "sessionRefusals": "session_not_bound and session_route_ambiguous are typed protocol Error frames, not carrier bodies. Gate refusals keep the gate frame."
+  },
+  "frameKey": {
+    "freshPerReadOrAbsent": true,
+    "frameField": "ToolCallRequest.call_key",
+    "viewedCallField": "arguments.task",
+    "retry": "Identical key/request replays the identical provider-frame body under the retry correlation header; not a fresh poll.",
+    "scopedCarrier": "reserved:occipital# + compact JSON [owner principal_id, scope_ref, scope_epoch as canonical decimal string]",
+    "unscopedCarrier": "reserved:occipital",
+    "ledgerScope": null,
+    "isolation": "Never use policy-route principal or S scope for the ledger; never read or write the viewed call ledger entry or advance S custodian ack/late results."
+  },
+  "binding": {
+    "principal": "reserved:occipital",
+    "role": "ToolProviderV1",
+    "sessionIdentity": ["owner", "ref", "epoch"],
+    "equalStamp": ["owner", "ref", "epoch"],
+    "noPolicyRouteCode": "session_not_bound",
+    "rule": "A carrier route serves S only when its daemon-stamped owner/ref/epoch equals S policy route stamp. Unscoped and self-owned scoped Occipital routes admit provider reads only.",
+    "carrierLabels": "Occipital sends neutral labels of its own. All route labels (project_root, harness, session) are opener claims, not daemon attestations. AFT ignores carrier labels and project_root; there is no label comparison.",
+    "policySource": "Use S own live policy route: core relay for a head, Broca tool route for a worker. Take S project, read rules, harness and session only from that policy route. Bash task lookup uses that harness and session.",
+    "projectCheck": "Check the policy-route project against the stamp workdir/project_id under scope-workdir/v1.",
+    "labelSource": "Resolved by stamp equality, agreed in Rich UI room SUBC seq 109, CKIOS seq 107 and AFT seq 110; supersedes the seq 104/105 label-equality handoff."
+  }
+}

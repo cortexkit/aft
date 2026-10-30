@@ -38,6 +38,9 @@ pub fn try_acquire() -> Option<ColdBuildPermit> {
 /// while CPU sat idle; waiting serializes that pressure at the source. Only
 /// call from dedicated background threads, never the dispatch thread or an
 /// executor worker.
+/// A permit bounds local build CPU and memory pressure, not backend latency.
+/// A build that yields it during model I/O must separately bound its retained
+/// batches and avoid blocking on a shared gate while holding a cold slot.
 pub fn acquire_blocking(kind: &str) -> ColdBuildPermit {
     acquire_blocking_while(kind, || true).expect("unconditional cold-build admission")
 }
@@ -330,6 +333,10 @@ fn acquire_blocking_while_inner(
             return Some(permit);
         }
         if !logged {
+            #[cfg(test)]
+            if let Some(observer) = limiter.refusal_observer.lock().unwrap().as_ref() {
+                let _ = observer.send(kind.to_owned());
+            }
             match request {
                 Some(request) => crate::slog_info!(
                     "{} cold-build request queued behind concurrency cap ({}): request={} kind={}",
@@ -376,6 +383,8 @@ pub(crate) struct ColdBuildLimiter {
     /// second hot-path lock. Rotation still uses `admission_state` below.
     waiting_by_class: [AtomicUsize; ADMISSION_CLASS_COUNT],
     admission_state: Mutex<AdmissionState>,
+    #[cfg(test)]
+    refusal_observer: Mutex<Option<crossbeam_channel::Sender<String>>>,
 }
 
 #[derive(Debug)]
@@ -507,7 +516,16 @@ impl ColdBuildLimiter {
                 holders_by_root: BTreeMap::new(),
                 queued: BTreeMap::new(),
             }),
+            #[cfg(test)]
+            refusal_observer: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_refusals_for_test(&self) -> crossbeam_channel::Receiver<String> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        *self.refusal_observer.lock().unwrap() = Some(tx);
+        rx
     }
 
     pub(crate) fn limit(&self) -> usize {
@@ -753,6 +771,31 @@ impl ColdBuildLimiter {
             holders: state.holders.values().map(render).collect(),
             queued: state.queued.values().map(render).collect(),
         }
+    }
+
+    /// Count standing overdue slot waits without waiting on admission or copying labels.
+    pub(crate) fn try_overdue_waits(
+        &self,
+        now_ms: u64,
+        bound_ms: u64,
+    ) -> Result<(u64, u64), &'static str> {
+        let state = self
+            .admission_state
+            .try_lock()
+            .map_err(|_| "limiter_busy_or_poisoned")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+        let mut count = 0u64;
+        let mut first = now_ms;
+        for entry in state.queued.values() {
+            if std::time::Instant::now() >= deadline {
+                return Err("limiter_scan_deadline");
+            }
+            if now_ms.saturating_sub(entry.started_at_ms) > bound_ms {
+                count += 1;
+                first = first.min(entry.started_at_ms);
+            }
+        }
+        Ok((count, first))
     }
 
     pub(crate) fn has_non_standing_waiters(&self) -> bool {
@@ -1617,6 +1660,31 @@ mod tests {
 #[cfg(test)]
 mod census_tests {
     use super::*;
+
+    #[test]
+    fn diagnostics_findings_cold_wait_snapshot_counts_overdue_and_never_waits() {
+        let limiter = isolated_limiter(1);
+        {
+            let mut guard = limiter.admission_state.lock().unwrap();
+            for (id, started_at_ms) in [(1, 1), (2, 39_999), (3, 40_000)] {
+                guard.queued.insert(
+                    id,
+                    CensusRecord {
+                        domain: "maintenance",
+                        root: "private-root".to_owned(),
+                        kind: "private-label".to_owned(),
+                        permit: None,
+                        started_at_ms,
+                    },
+                );
+            }
+            assert_eq!(
+                limiter.try_overdue_waits(100_000, 60_000),
+                Err("limiter_busy_or_poisoned")
+            );
+        }
+        assert_eq!(limiter.try_overdue_waits(100_000, 60_000), Ok((2, 1)));
+    }
 
     #[test]
     fn census_names_holders_and_queued_requests_without_holding_work_locks() {

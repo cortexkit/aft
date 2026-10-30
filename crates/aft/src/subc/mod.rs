@@ -197,8 +197,20 @@ impl fmt::Display for RouteChannel {
 type PushEnvelope = (ProjectRootId, PushFrame);
 type LossyPushEnvelope = (u64, ProjectRootId, PushFrame);
 type RetryBuffer = HashMap<RouteChannel, VecDeque<(push::ReplayKey, PushFrame)>>;
+mod a0_egress;
 mod access_grants;
+#[cfg(test)]
+mod bind_ack_fixup_tests;
+#[cfg(test)]
+mod bind_capacity_tests;
+use a0_egress::{A0Egress, ControlCompletion};
 mod bash;
+mod bind_candidates;
+mod bind_log;
+mod call_policy;
+mod carrier_read_only;
+#[cfg(test)]
+mod tool_result_tests;
 // The grant tests run real shell commands, which need a POSIX shell.
 #[cfg(all(test, unix))]
 mod bash_grant_tests;
@@ -206,26 +218,64 @@ mod bash_grant_tests;
 mod bash_selector_tests;
 mod codemode;
 mod consent;
+pub(crate) use consent::directory_scope;
+#[cfg(all(test, unix))]
+mod deleted_root_reclaim_tests;
+mod diagnostics_findings;
+// The secret vault seam and its consent adapter. They read ragged route
+// fields, so they live under `subc` rather than the public `secret` types.
 mod drain;
 mod flow_read;
 mod health;
 #[cfg(test)]
+mod idle_reap_frame_loop_tests;
+#[cfg(test)]
 mod idle_root_retention_tests;
 mod perf_sweep;
+mod route_census;
+mod secret_consent;
+#[cfg(all(test, unix))]
+pub(crate) use secret_consent::with_secret_bound_identity_for_test;
+#[cfg(test)]
+pub(crate) use secret_consent::with_secret_identity_for_test;
+pub(crate) use secret_consent::{
+    current_call_scopes, current_secret_audit_scope, resolve_current_secret_label, LaunchDecision,
+};
 mod standalone;
 #[doc(hidden)]
 pub use self::health::SubcTestHealthRollupProbe;
 mod manifest;
+mod page_collect;
 mod persistence;
+#[cfg(test)]
+mod prepared_bind_tests;
 mod push;
+mod queued_call;
 mod readiness;
 mod remote_policy;
+pub(crate) mod result_body;
+mod retained_result;
+mod rich_ui;
+pub(crate) mod watch_delivery;
+// Drives the chunk queries and Occipital's route shapes through the real
+// frame loop, so it lives beside the chunk module but runs as a child of this
+// module to reach the loop and its test fixtures.
+#[cfg(test)]
+#[path = "rich_ui/chunks/route_tests.rs"]
+mod rich_ui_chunk_route_tests;
 mod run_scope;
 mod scope_describe;
+#[cfg(test)]
+mod stack_budget_tests;
+#[cfg(all(test, unix))]
+pub(crate) use scope_describe::confirm_secret_rebind_for_test;
+#[cfg(test)]
+mod scope_workdir_tests;
 mod stall_watchdog;
 mod standing;
 mod tool_provider;
 mod wire;
+mod work_step;
 
 pub(crate) use self::tool_provider::WORKER_REPLY_MARGIN_MS;
 
@@ -286,6 +336,16 @@ pub enum SubcLifecycleEvent {
         counts: Vec<(String, usize)>,
         line: String,
     },
+    /// A foreground bash call reached its wait loop and published the detach
+    /// target the drain uses to answer it, so its census kind is no longer
+    /// `bash:spawning`. `phase` is the census label (`bash:wait`,
+    /// `bash:block` or `bash:foreground`).
+    BashForegroundWait {
+        route_channel: u16,
+        route_epoch: u32,
+        corr: u64,
+        phase: String,
+    },
 }
 
 /// Test-only observer and rendezvous for the frame-loop lifecycle.
@@ -294,6 +354,7 @@ pub enum SubcLifecycleEvent {
 pub struct SubcTestLifecycleProbe {
     events_tx: mpsc::UnboundedSender<SubcLifecycleEvent>,
     bind_priority: Arc<StdMutex<Option<RouteBindPriorityProbe>>>,
+    ack_queue_corr: Option<u64>,
     health_rollup: Option<SubcTestHealthRollupProbe>,
 }
 
@@ -310,8 +371,16 @@ impl SubcTestLifecycleProbe {
         Self {
             events_tx,
             bind_priority: Arc::new(StdMutex::new(None)),
+            ack_queue_corr: None,
             health_rollup: None,
         }
+    }
+
+    /// Observe one bind's queued ACK without changing other lifecycle observers.
+    #[doc(hidden)]
+    pub fn with_bind_ack_queue_for_test(mut self, corr: u64) -> Self {
+        self.ack_queue_corr = Some(corr);
+        self
     }
 
     /// Hold the next turn that drains reliable pushes at its end. Releasing the
@@ -370,15 +439,21 @@ impl SubcTestLifecycleProbe {
 
     fn route_bind_ack_queued(&self, corr: u64) {
         let guard = self.bind_priority.lock().expect("bind priority probe lock");
-        if let Some(priority) = guard.as_ref().filter(|priority| priority.corr == corr) {
-            let batches_at_arrival = priority
-                .batches_at_arrival
-                .expect("bind completion arrival observed");
-            let _ = self.events_tx.send(SubcLifecycleEvent::RouteBindAckQueued {
-                corr,
-                reliable_push_batches: priority.reliable_push_batches - batches_at_arrival,
-            });
-        }
+        let reliable_push_batches =
+            if let Some(priority) = guard.as_ref().filter(|priority| priority.corr == corr) {
+                let batches_at_arrival = priority
+                    .batches_at_arrival
+                    .expect("bind completion arrival observed");
+                priority.reliable_push_batches - batches_at_arrival
+            } else if self.ack_queue_corr == Some(corr) {
+                0
+            } else {
+                return;
+            };
+        let _ = self.events_tx.send(SubcLifecycleEvent::RouteBindAckQueued {
+            corr,
+            reliable_push_batches,
+        });
     }
 
     fn attach_decision(&self, attempt: u32, will_retry: bool) {
@@ -402,6 +477,15 @@ impl SubcTestLifecycleProbe {
             held: census.held(phase),
             counts: census.counts(),
             line: line.to_string(),
+        });
+    }
+
+    fn bash_foreground_wait(&self, route: RouteChannel, corr: u64, phase: &str) {
+        let _ = self.events_tx.send(SubcLifecycleEvent::BashForegroundWait {
+            route_channel: route.channel,
+            route_epoch: route.epoch,
+            corr,
+            phase: phase.to_string(),
         });
     }
 
@@ -447,6 +531,8 @@ struct DecodedFrame {
     /// The route's confinement answer from memory or an off-loop database read
     /// by `persistence::DatabaseWaits::read_confinement`. `None` until checked.
     confinement: Option<remote_policy::CarriedConfinement>,
+    /// Candidate head policies read off-loop before codemode chooses an owner.
+    codemode_policies: Option<Result<codemode::SavedPolicies, subc_protocol::ErrorBody>>,
     /// Result of restoring launch grants for this frame; retain it so later
     /// admission waits do not repeat restoration.
     launch_restore: Option<Result<(), subc_protocol::ErrorBody>>,
@@ -479,6 +565,7 @@ enum RouteDetachPolicy {
 struct RequestFrameMeta {
     ver: u8,
     flags: Flags,
+    deadline: Option<queued_call::Deadline>,
 }
 
 #[derive(Clone)]
@@ -498,6 +585,7 @@ impl AdmissionWait {
             meta: RequestFrameMeta {
                 ver: decoded.frame.header.ver,
                 flags: decoded.frame.header.flags,
+                deadline: None,
             },
             bare_name: bare_name.to_owned(),
             held_since: decoded.phase_trace.received_at(),
@@ -770,12 +858,23 @@ impl PendingSubcResponses {
             if let Some(cancellation) = &entry.pending.cancellation {
                 cancellation.request_cancel();
             }
-            if let Some(ctx) = executor.actor_context(&entry.root) {
-                if let Some(on_shutdown) = entry.pending.on_shutdown.as_mut() {
-                    let response = on_shutdown(&ctx);
-                    resolved.push(ResolvedSubcResponse { entry, response });
-                }
-            }
+            let shutdown_terminal = executor.actor_context(&entry.root).and_then(|ctx| {
+                entry
+                    .pending
+                    .on_shutdown
+                    .as_mut()
+                    .map(|on_shutdown| on_shutdown(&ctx))
+            });
+            // Removing a deferred entry must settle its credit even when the
+            // producer has no shutdown callback or its actor is already gone.
+            let response = shutdown_terminal.unwrap_or_else(|| {
+                Response::error(
+                    &entry.pending.request_id,
+                    "request_cancelled",
+                    "request cancelled because the connection is shutting down",
+                )
+            });
+            resolved.push(ResolvedSubcResponse { entry, response });
         }
         self.entries = waiting;
         self.refresh_poll_interval();
@@ -888,25 +987,32 @@ fn submit_active_tool_call(
     request: RequestFrameMeta,
     job: crate::executor::ExecutorJob,
 ) -> oneshot::Receiver<Response> {
+    let job = queued_call::guard(request.deadline, tool, request_id.clone(), job);
     let job = push::routed_progress_job(route, corr, &request_id, job);
-    let (rx, cancellation) =
-        executor.submit_tool_call_cancellable_async(root_id.clone(), lane, request_id, tool, job);
-    active
+    let cancellation = JobCancellation::new();
+    let mut calls = active
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            (route, corr),
-            ActiveToolCall {
-                root_id,
-                cancellation,
-                detach_policy,
-                tool: tool.to_string(),
-                started_at: Instant::now(),
-                request,
-                answering: false,
-            },
-        );
-    rx
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    calls.insert(
+        (route, corr),
+        ActiveToolCall {
+            root_id: root_id.clone(),
+            cancellation: cancellation.clone(),
+            detach_policy,
+            tool: tool.to_string(),
+            started_at: Instant::now(),
+            request,
+            answering: false,
+        },
+    );
+    executor.submit_tool_call_with_cancellation_async(
+        root_id,
+        lane,
+        request_id,
+        tool,
+        job,
+        cancellation,
+    )
 }
 
 /// Run a tracked call's job again (after a consent answer) as that call's
@@ -925,25 +1031,24 @@ fn resubmit_active_tool_call(
     tool: &str,
     job: crate::executor::ExecutorJob,
 ) -> oneshot::Receiver<Response> {
+    let mut calls = active
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(call) = calls.get_mut(&(route, corr)).filter(|call| !call.answering) else {
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(Response::error(
+            request_id,
+            "route_released",
+            "call ended before resubmission",
+        ));
+        return rx;
+    };
+    let job = queued_call::guard(call.request.deadline, tool, request_id.clone(), job);
     let job = push::routed_progress_job(route, corr, &request_id, job);
     let (rx, cancellation) =
         executor.submit_tool_call_cancellable_async(root_id.clone(), lane, request_id, tool, job);
-    let registered = {
-        let mut calls = active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match calls.get_mut(&(route, corr)) {
-            Some(call) if !call.answering => {
-                call.cancellation = cancellation.clone();
-                call.root_id = root_id.clone();
-                true
-            }
-            _ => false,
-        }
-    };
-    if !registered {
-        executor.cancel_job(&root_id, &cancellation);
-    }
+    call.cancellation = cancellation;
+    call.root_id = root_id;
     rx
 }
 
@@ -1277,11 +1382,16 @@ pub(crate) fn recovered_bash_frame(
     snapshot: crate::bash_background::registry::BgTaskSnapshot,
     key: &crate::db::call_ledger::Key,
     project_root: &Path,
-) -> Option<(crate::db::call_ledger::RecordedFrame, String)> {
+) -> Option<(
+    crate::db::call_ledger::RecordedFrame,
+    String,
+    Option<Vec<u8>>,
+)> {
     if snapshot.info.status == crate::bash_background::BgTaskStatus::FateUnknown {
         return Some((
             crate::db::call_ledger::not_retained(key, "unknown"),
             "unknown".into(),
+            None,
         ));
     }
     let now = Instant::now();
@@ -1318,12 +1428,39 @@ pub(crate) fn recovered_bash_frame(
         BindTrust::Untrusted,
     )
     .ok()?;
+    // Recovery no longer has the vanished consumer's format declaration. Keep
+    // its legacy bytes, plus a bounded complete result for a future opt-in replay.
+    let mut projected = build_tool_response_frame(
+        PROTOCOL_VERSION,
+        route_key(1, 1),
+        1,
+        control_flags(),
+        &result,
+        wire::ToolResponsePolicy {
+            trust: BindTrust::FirstParty,
+            tool_result_body: true,
+        },
+    )
+    .ok()?;
+    projected.frame = Frame::build_with_version(
+        frame.header.ver,
+        frame.header.ty,
+        frame.header.flags,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+        frame.frame.body.clone(),
+    )
+    .ok()?;
+    let tool_result_body = projected.tool_result_source_for_retention().ok()?;
+    drop(projected);
     Some((
         crate::db::call_ledger::RecordedFrame {
             ty: frame.header.ty,
-            body: frame.body,
+            body: frame.frame.body,
         },
         outcome,
+        tool_result_body,
     ))
 }
 
@@ -1340,6 +1477,9 @@ struct RootMeta {
     maintenance_last_submitted: Option<Instant>,
     maintenance_poisoned: bool,
     last_touched: Instant,
+    /// Diagnostic demand clocks; unlike last_touched, polling and teardown do not reset them.
+    last_tool_call: Option<Instant>,
+    route_activity: HashMap<RouteChannel, route_census::RouteActivity>,
     diagnostics_on_edit: bool,
     active_bash_waits: usize,
     idle_artifacts_evicted: bool,
@@ -1353,6 +1493,10 @@ struct RootMeta {
     /// tasks. The kill waits out signal grace periods, so it never runs on
     /// the frame loop; the reaper retains the root until it finishes.
     reclaim_kill_in_flight: Option<Arc<AtomicBool>>,
+    /// Minimum spacing between kill submissions, including failed spawns and
+    /// kills that leave surviving processes. Sweeps must not create a thread
+    /// on every tick while a process cannot be terminated.
+    reclaim_kill_submitted_at: Option<Instant>,
     /// When the idle reaper last submitted the unbound-teardown persist for
     /// this root. Sweeps run every few hundred milliseconds, so a persist that
     /// could not clear its blocker (cache lock contention, a failed write) is
@@ -1373,6 +1517,7 @@ struct RootMeta {
 
 #[derive(Debug)]
 struct PendingBind {
+    ack_publication: Option<a0_egress::AckPublication>,
     bind_root_id: ProjectRootId,
     inserted_new_actor: bool,
     cancelled: bool,
@@ -1388,9 +1533,15 @@ struct PendingBind {
     /// removed, running configures return at their next checkpoint) instead of
     /// only marking bookkeeping.
     cancellation: crate::executor::JobCancellation,
+    /// Session that requested this bind. Periodic warnings about the bind run
+    /// on the frame loop, which serves every session, so they log inside this
+    /// session's scope to carry the right session tag.
+    session: Option<String>,
 }
 
 struct RouteBindCompletion {
+    expected_snapshot_id: Option<u64>,
+    applied_snapshot_id: Option<u64>,
     route: RouteChannel,
     identity: RouteIdentity,
     bind_root_id: ProjectRootId,
@@ -1405,9 +1556,32 @@ struct RouteBindCompletion {
 #[derive(Debug, Clone)]
 struct RouteIdentity(Arc<RouteIdentityData>);
 
+#[derive(Default)]
+struct ManagementIdentity {
+    principal: Option<Principal>,
+    scope: Option<subc_protocol::scope::ScopeStamp>,
+    admission: ManagementAdmission,
+}
+
+#[derive(Default, PartialEq, Eq)]
+enum ManagementAdmission {
+    #[default]
+    FirstParty,
+    FlowOnly,
+}
+
+impl RouteIdentity {
+    fn reply_policy(&self) -> wire::ToolResponsePolicy {
+        self.into()
+    }
+}
+
 #[derive(Debug)]
 struct RouteIdentityData {
     root: ProjectRootId,
+    /// Resolved scope workdir, or the legacy bind root when no workdir is stamped.
+    /// The daemon's project id is retained alongside it in `scope.project_id`;
+    /// persisted state continues to use the root path, not that id.
     project_root: PathBuf,
     harness: String,
     session: String,
@@ -1415,6 +1589,7 @@ struct RouteIdentityData {
     trust: BindTrust,
     spawn_principal: AuthenticatedPrincipal,
     consumer_elicitation_capable: bool,
+    tool_result_body: bool,
     /// `disabled_tools` resolved from the config files when this route bound.
     /// Every tool call on the route is checked against this snapshot, so a
     /// config edit applies to the next bind, not mid-session.
@@ -1423,8 +1598,10 @@ struct RouteIdentityData {
     /// `owner` publishes work under a stable `ref`; `scope_epoch` distinguishes
     /// a new generation of that work from obsolete routes. Optional
     /// `attributes.agent_id` and `attributes.run_id` identify the agent and its
-    /// codemode run. The GitHub CLI relay uses this identity for delegated bot
-    /// writes; lifetime controls confirm the run ended before terminating processes.
+    /// codemode run; a worker run carries `attributes.on_behalf_of_agent`
+    /// instead of `agent_id`, as attribution only. The GitHub CLI relay uses
+    /// this identity for delegated bot writes; lifetime controls confirm the
+    /// run ended before terminating processes.
     /// Absent on routes opened without a scope or by a daemon predating scopes.
     scope: Option<subc_protocol::scope::ScopeStamp>,
     call_mode: subc_protocol::call_mode::CallMode,
@@ -1433,10 +1610,66 @@ struct RouteIdentityData {
     /// Set by the route's first tool call, so the health counter of scoped
     /// routes that make tool calls counts each route once.
     made_tool_call: AtomicBool,
-    /// Present only on the identity a codemode tool call runs under: the head
-    /// agent the call acts for (see `codemode`). Routes in the route table
-    /// never carry it.
+    /// Present only on the identity a codemode tool call runs under: the owner
+    /// route the call takes its access from, the head agent's for an agent run
+    /// or the worker's own for a worker run (see `codemode`). Routes in the
+    /// route table never carry it.
     run_owner: Option<Arc<codemode::RunOwner>>,
+}
+
+fn speech_launch_seed(
+    identity: &RouteIdentity,
+    route: RouteChannel,
+    control: Option<&Arc<readiness::DaemonControl>>,
+) -> Option<crate::gh_shim_speech::service::LaunchSeed> {
+    use crate::gh_shim_speech::model::{LaunchAuthority, RouteOrigin};
+    let lifecycle = identity.scope.clone()?;
+    let origin = |channel: RouteChannel| {
+        control.and_then(|control| {
+            Some(RouteOrigin {
+                run_nonce: crate::gh_shim_speech::service::run_nonce()?.into(),
+                connection_generation: format!("{:p}", Arc::as_ptr(control)),
+                channel: u32::from(channel.channel),
+                epoch: u64::from(channel.epoch),
+            })
+        })
+    };
+    let launch = if let Some(owner) = &identity.run_owner {
+        if matches!(owner.kind, codemode::RunKind::Worker { .. }) {
+            Err(crate::gh_shim_speech::Refusal::new(
+                crate::gh_shim_speech::Code::AuthorityUnavailable,
+                "owner_unresolved",
+            ))
+        } else {
+            owner
+                .owner_route
+                .scope
+                .clone()
+                .ok_or_else(|| {
+                    crate::gh_shim_speech::Refusal::new(
+                        crate::gh_shim_speech::Code::AuthorityUnavailable,
+                        "owner_unresolved",
+                    )
+                })
+                .and_then(|head| {
+                    LaunchAuthority::codemode(
+                        head,
+                        lifecycle.clone(),
+                        origin(route),
+                        origin(owner.owner_route_channel),
+                    )
+                })
+        }
+    } else {
+        LaunchAuthority::classic(lifecycle.clone(), origin(route))
+    };
+    Some(crate::gh_shim_speech::service::LaunchSeed {
+        launch,
+        lifecycle: Some(lifecycle),
+        session: identity.session.clone(),
+        harness: identity.harness.clone(),
+        project_root: identity.project_root.display().to_string(),
+    })
 }
 
 impl Deref for RouteIdentity {
@@ -1538,6 +1771,7 @@ struct ReverseCorrKey {
 }
 
 struct PendingBashAsk {
+    handles_progress: bool,
     route: RouteChannel,
     tool_corr: u64,
     tool_flags: Flags,
@@ -1576,6 +1810,8 @@ impl RootMeta {
             maintenance_last_submitted: None,
             maintenance_poisoned: false,
             last_touched: now,
+            last_tool_call: None,
+            route_activity: HashMap::new(),
             diagnostics_on_edit: false,
             active_bash_waits: 0,
             idle_artifacts_evicted: false,
@@ -1583,6 +1819,7 @@ impl RootMeta {
             consecutive_missing_sweeps: 0,
             presence_generation_seen: 0,
             reclaim_kill_in_flight: None,
+            reclaim_kill_submitted_at: None,
             teardown_persist_submitted_at: None,
             ttl_retention_logged: None,
             configure_tail_in_flight: false,
@@ -2022,7 +2259,7 @@ fn quiesce_connection_roots(
             quiesce_unbound_root_with(&root_id, live_roots, executor, lsp);
         } else if let Some(ctx) = executor.actor_context(&root_id) {
             ctx.mark_subc_unbound();
-            executor.cancel_queued_maintenance(&root_id);
+            executor.cancel_queued_root_maintenance(&root_id);
             crate::commands::configure::cancel_deferred_configure_maintenance(&ctx);
         }
     }
@@ -2066,6 +2303,8 @@ struct IdleReapOutcome {
 
 /// Minimum gap between unbound-teardown persist attempts for one root.
 const UNBOUND_TEARDOWN_PERSIST_RETRY: Duration = Duration::from_secs(60);
+
+const RECLAIM_KILL_RETRY: Duration = Duration::from_secs(30);
 
 /// Count an unbound root retained past its idle TTL and log the reason once
 /// per distinct blocker.
@@ -2438,14 +2677,32 @@ fn reap_idle_roots_with_presence(
                     meta.reclaim_kill_in_flight
                         .get_or_insert_with(|| Arc::new(AtomicBool::new(false))),
                 );
-                let tasks_settled = !kill_in_flight.load(Ordering::Acquire)
-                    && ctx.bash_background().try_has_running_tasks() == Some(false);
-                if !tasks_settled {
-                    if !kill_in_flight.swap(true, Ordering::AcqRel) {
-                        spawn_reclaimed_root_task_kill(&ctx, &root_id, kill_in_flight);
+                let retention = if kill_in_flight.load(Ordering::Acquire) {
+                    Some(health::DeletedTaskRetention::KillInFlight)
+                } else {
+                    match ctx
+                        .bash_background()
+                        .try_has_reclaimable_tasks_for_root(&root_id)
+                    {
+                        Some(false) => None,
+                        None => Some(health::DeletedTaskRetention::RegistryBusy),
+                        Some(true) => {
+                            let retry_due =
+                                meta.reclaim_kill_submitted_at.is_none_or(|submitted| {
+                                    now.saturating_duration_since(submitted) >= RECLAIM_KILL_RETRY
+                                });
+                            if retry_due && !kill_in_flight.swap(true, Ordering::AcqRel) {
+                                meta.reclaim_kill_submitted_at = Some(now);
+                                spawn_reclaimed_root_task_kill(&ctx, &root_id, kill_in_flight);
+                                Some(health::DeletedTaskRetention::KillInFlight)
+                            } else {
+                                Some(health::DeletedTaskRetention::KillBackoff)
+                            }
+                        }
                     }
-                    census.deleted_retained += 1;
-                    census.artifact_eviction_blocked += 1;
+                };
+                if let Some(retention) = retention {
+                    census.note_deleted_task_retained(retention);
                     continue;
                 }
             }
@@ -2459,7 +2716,12 @@ fn reap_idle_roots_with_presence(
             continue;
         };
         let taken_pending = Some(taken_pending);
-        if let Some(blocker) = ctx.try_artifact_eviction_blocker(false) {
+        let blocker = if deleted {
+            ctx.try_artifact_eviction_blocker_for_deleted_root(false, &root_id)
+        } else {
+            ctx.try_artifact_eviction_blocker(false)
+        };
+        if let Some(blocker) = blocker {
             if let Some(pending) = taken_pending {
                 ctx.restore_pending_reconciliation_state_without_waiting(pending);
             }
@@ -2490,7 +2752,12 @@ fn reap_idle_roots_with_presence(
             continue;
         }
         let memory_before = ctx.memory_root_snapshot();
-        if !ctx.try_evict_idle_artifacts() {
+        let evicted = if deleted {
+            ctx.try_evict_idle_artifacts_for_deleted_root(&root_id)
+        } else {
+            ctx.try_evict_idle_artifacts()
+        };
+        if !evicted {
             if let Some(pending) = taken_pending {
                 ctx.restore_pending_reconciliation_state_without_waiting(pending);
             }
@@ -2637,13 +2904,12 @@ fn note_reap_lock_contended(
     }
 }
 
-/// Shut down language servers for roots that have had no request for the
-/// configured LSP idle window. This is independent of artifact eviction and
-/// runs even while the root is still bound.
+/// Shut down individually idle language servers, independently of artifact
+/// eviction and even while their root is bound and serving other packages.
 ///
 /// `meta.last_touched` moves on every inbound tool call for a bound root
 /// (`reactivate_bound` in the route-request handler) and on response delivery,
-/// so an active harness does not look idle.
+/// so whole-root idle shutdown does not mistake an active harness for idle.
 fn reap_idle_lsp_servers(
     now: Instant,
     live_roots: &HashMap<ProjectRootId, RootMeta>,
@@ -2712,6 +2978,7 @@ fn purge_deleted_root_residents(
     );
 
     for route in stale_routes.iter().copied() {
+        metrics.held_bash_calls.clear_progress_for_route(route);
         reclaimed_routes.insert(route);
         remove_installed_route(installed_route_epochs, route);
         remove_route_channel(routes, root_channels, route);
@@ -2960,11 +3227,16 @@ fn bash_elicitation_message(
         .into_iter()
         .collect::<Vec<_>>()
         .join(", ");
-    if ask_kinds.is_empty() {
+    let mut message = if ask_kinds.is_empty() {
         format!("Allow bash command `{command}`? Matched patterns: {pattern_text}")
     } else {
         format!("Allow bash command `{command}`? Matched {ask_kinds} patterns: {pattern_text}")
+    };
+    for reason in asks.iter().filter_map(|ask| ask.reason.as_deref()) {
+        message.push('\n');
+        message.push_str(reason);
     }
+    message
 }
 
 fn bash_elicitation_request_body(
@@ -3311,13 +3583,22 @@ async fn handle_bash_elicitation_reply(
 
     if frame.header.ty == FrameType::Response && bash_elicitation_reply_is_allow(&frame.body) {
         if routes.contains_key(&key.route) {
+            let _secret_identity = secret_consent::SecretIdentityGuard::install_optional(
+                routes.get(&key.route).cloned(),
+            );
             let _grant_scope = crate::access_policy::scope_guard(
                 routes.get(&key.route).map(access_grants::policy_scope_key),
+            );
+            let _grants = crate::access_policy::scope_grants_guard(
+                routes
+                    .get(&key.route)
+                    .and_then(access_grants::scope_grants_denial),
             );
             let _ask_route = crate::access_policy::ask_route_guard(
                 routes.get(&key.route).map(access_grants::ask_route),
             );
             bash::submit_deferred_bash(
+                pending.handles_progress,
                 executor,
                 bash_deferred_tx,
                 bash_poll_touch_tx,
@@ -3338,6 +3619,9 @@ async fn handle_bash_elicitation_reply(
                 pending.spawn_principal,
                 pending.edit_slot_survives,
                 pending.call_key,
+                // A permission-prompt resume carries no pin through the
+                // pending ask; only the direct production caller passes one.
+                None,
                 Some(pending.grants),
                 pending.repeat,
                 pending.worker_session,
@@ -3679,7 +3963,7 @@ async fn teardown_installed_route(
     replacement_root: Option<&ProjectRootId>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
-    management_routes: &mut HashMap<RouteChannel, Option<Principal>>,
+    management_routes: &mut HashMap<RouteChannel, ManagementIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
@@ -3696,9 +3980,29 @@ async fn teardown_installed_route(
     tool_response_body_limit: usize,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
+    // A replacement project route keeps replayable calls, even those still
+    // waiting in the executor. Release queued calls only when no project route
+    // replaces the old handle; already-running mutations keep their result.
+    if replacement_root.is_none() {
+        let queued =
+            queued_call::release_route(active_tool_calls, executor, channel, pending_responses);
+        for (corr, request) in queued {
+            let terminal = build_error_frame(
+                request.ver,
+                channel.channel,
+                channel.epoch,
+                corr,
+                request.flags,
+                "route_released",
+                "route released before execution; the tool did not run",
+            )?;
+            send_reliable_writer_frame(tx, metrics, terminal, "released queued call").await?;
+        }
+    }
     // Only the consumer's own close withdraws held permission asks. A
-    // higher-epoch rebind keeps the logical route, and a transport drop never
-    // reaches here, so their asks stay open for the retried call.
+    // higher-epoch allocation is a new daemon route/client handle. AFT retains
+    // scoped permission work by its call identity, not by that old route handle.
+    // A transport drop never reaches here.
     if cancellation_reason == "Goodbye" {
         consent::note_route_closed(channel);
     }
@@ -3742,6 +4046,7 @@ async fn teardown_installed_route(
     if let Some(cancel) = route_bash_cancels.remove(&channel) {
         cancel.token.cancel();
     }
+    metrics.held_bash_calls.clear_progress_for_route(channel);
     for resolved in pending_responses.drain_route(channel, executor) {
         deliver_resolved_subc_response(
             tx,
@@ -3756,8 +4061,9 @@ async fn teardown_installed_route(
         )
         .await?;
     }
-    // A higher-epoch replacement keeps replayable work because the logical
-    // route remains live. A route that actually closes keeps only calls that
+    // AFT keeps registered native work across higher-epoch replacement using
+    // its retained call/job records; the daemon does not preserve the old handle.
+    // An explicit close keeps only calls that
     // already started; pre-execution work has no response to replay and must
     // not retain scheduler capacity or an epoch-reader admission.
     let work_disposition = if replacement_root.is_some() {
@@ -3780,7 +4086,8 @@ async fn teardown_installed_route(
             channel.channel
         );
     }
-    let migrated = push::migrate_retry_buffer_to_push_buffer(retry_buffer, channel, push_buffer);
+    let migrated =
+        push::migrate_retry_buffer_to_push_buffer(metrics, retry_buffer, channel, push_buffer);
     if let Some(identity) = routes.get(&channel) {
         let has_pending_bind = pending_binds
             .values()
@@ -3814,6 +4121,7 @@ async fn teardown_installed_route(
             if let Some(ctx) = executor.actor_context(&identity.root) {
                 ctx.hashline_bindings()
                     .teardown(identity.root.as_path(), &identity.session);
+                let _ = ctx.release_backup_session_in_background(identity.session.clone());
             }
         }
         if migrated > 0 {
@@ -3823,6 +4131,7 @@ async fn teardown_installed_route(
             );
         }
         if let Some(meta) = live_roots.get_mut(&identity.root) {
+            meta.route_activity.remove(&channel);
             let idle_for = meta.last_touched.elapsed();
             meta.note_activity();
             log::debug!(
@@ -3939,7 +4248,8 @@ enum ModuleLoopExit {
 }
 
 /// Entry point for `aft --subc <connection-file>`. Synchronous on the outside;
-/// owns an isolated current-thread tokio runtime for the async transport.
+/// owns an isolated current-thread tokio runtime on a dedicated, explicitly
+/// sized stack for the async transport. The caller joins that thread.
 /// Returns `Err` (fail-loud) on any connect/auth/protocol failure — we never
 /// fall back to the standalone loop, to avoid split-brain index state.
 pub fn run_subc_mode(
@@ -4017,6 +4327,26 @@ fn run_subc_mode_with_probe(
     )
 }
 
+// A current-thread runtime polls its root future on the thread calling
+// block_on. Windows gives the process main thread only a 1 MiB stack; the
+// module loop and its callees need headroom even with their futures boxed.
+const MODULE_RUNTIME_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+fn with_module_runtime_stack<T: Send>(run: impl FnOnce() -> T + Send) -> io::Result<T> {
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name("aft-subc-runtime".to_string())
+            .stack_size(MODULE_RUNTIME_STACK_BYTES)
+            .spawn_scoped(scope, run)?;
+        match worker.join() {
+            Ok(result) => Ok(result),
+            // Keep the original panic payload and unwind the caller, rather
+            // than turning a module panic into a clean stop or a new panic.
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+}
+
 fn run_subc_mode_inner(
     connection_file_path: &Path,
     ctx: Arc<AppContext>,
@@ -4027,6 +4357,36 @@ fn run_subc_mode_inner(
     tool_response_body_limit: usize,
     lifecycle_probe: Option<SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
+    with_module_runtime_stack(move || {
+        run_subc_mode_on_runtime_thread(
+            connection_file_path,
+            ctx,
+            executor,
+            dispatch,
+            user_config_path,
+            allow_native_passthrough,
+            tool_response_body_limit,
+            lifecycle_probe,
+        )
+    })
+    .map_err(SubcError::RuntimeThread)?
+}
+
+fn run_subc_mode_on_runtime_thread(
+    connection_file_path: &Path,
+    ctx: Arc<AppContext>,
+    executor: Arc<Executor>,
+    dispatch: DispatchFn,
+    user_config_path: Option<PathBuf>,
+    allow_native_passthrough: bool,
+    tool_response_body_limit: usize,
+    lifecycle_probe: Option<SubcTestLifecycleProbe>,
+) -> Result<(), SubcError> {
+    // Before any database opens: this process admits keyed calls, so it is
+    // the one that recovers the call ledger after a restart.
+    crate::db::call_ledger::mark_provider_process();
+    let _daemon_storage_lease = crate::root_cache::acquire_daemon_storage_lease(&ctx.storage_dir())
+        .map_err(SubcError::StorageLease)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -4041,6 +4401,9 @@ fn run_subc_mode_inner(
         // Saved paused tasks may still owe their runner a cancel; send those
         // now rather than when (if ever) their projects bind again.
         crate::bash_background::note_storage_root(&storage_dir);
+        // Initialize the page snapshot store. The shared storage-use lease
+        // excludes cache cleanup, not other AFT daemons.
+        crate::page_collect::snapshot::SnapshotStore::for_storage(&storage_dir);
         let stream =
             connect_and_authenticate(connection_file_path, lifecycle_probe.as_ref()).await?;
         log::info!(
@@ -4048,25 +4411,27 @@ fn run_subc_mode_inner(
             connection_file_path.display()
         );
         let (read_half, write_half) = tokio::io::split(stream);
-        run_module_loop(
-            read_half,
-            write_half,
-            connection_file_path,
-            shared_app,
-            executor_for_loop,
-            dispatch,
-            user_config_path,
-            allow_native_passthrough,
-            tool_response_body_limit,
-            lifecycle_probe,
-            &storage_dir,
-            // The exit phase below takes and shuts down every root's servers.
-            QuiescedLsp::LeaveForExitSweep,
-            #[cfg(test)]
-            None,
-            #[cfg(test)]
-            None,
-        )
+        heap_module_future(|| {
+            run_module_loop(
+                read_half,
+                write_half,
+                connection_file_path,
+                shared_app,
+                executor_for_loop,
+                dispatch,
+                user_config_path,
+                allow_native_passthrough,
+                tool_response_body_limit,
+                lifecycle_probe,
+                &storage_dir,
+                // The exit phase below takes and shuts down every root's servers.
+                QuiescedLsp::LeaveForExitSweep,
+                #[cfg(test)]
+                None,
+                #[cfg(test)]
+                None,
+            )
+        })
         .await
     });
 
@@ -4652,7 +5017,9 @@ async fn connect_and_authenticate_once(
 #[allow(clippy::too_many_arguments)]
 async fn process_route_bind_completion(
     writer_tx: &WriterSender,
-    completion: RouteBindCompletion,
+    completion: ControlCompletion,
+    a0: &A0Egress,
+    management_routes: &mut HashMap<RouteChannel, ManagementIdentity>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
@@ -4666,9 +5033,44 @@ async fn process_route_bind_completion(
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
     decrement_counted_channel(&metrics.control_completion_queued);
+    let (completion, ack_written) = match completion {
+        ControlCompletion::ConfigureReady(completion) => (completion, false),
+        ControlCompletion::AckWritten(completion) => (completion, true),
+        ControlCompletion::AckCancelled(completion) => match *completion {
+            ControlCompletion::AckWritten(completion) => (completion, false),
+            ControlCompletion::ManagementAckWritten { route, .. } => {
+                a0.retire(route);
+                remove_installed_route(installed_route_epochs, route);
+                return Ok(());
+            }
+            ControlCompletion::BindRetracted { route, .. } => {
+                a0.retire(route);
+                remove_installed_route(installed_route_epochs, route);
+                return Ok(());
+            }
+            _ => return Err(SubcError::WriterClosed),
+        },
+        ControlCompletion::ManagementAckWritten {
+            route, identity, ..
+        } => {
+            a0.retire(route);
+            if installed_route_epochs.get(&route.channel) == Some(&route.epoch) {
+                management_routes.insert(route, identity);
+            }
+            return Ok(());
+        }
+        ControlCompletion::WriteFailed => return Err(SubcError::WriterClosed),
+        ControlCompletion::BindRetracted { route, .. } => {
+            a0.retire(route);
+            remove_installed_route(installed_route_epochs, route);
+            return Ok(());
+        }
+    };
     handle_route_bind_completion(
         writer_tx,
         completion,
+        ack_written,
+        a0,
         routes,
         root_channels,
         session_identity,
@@ -4686,7 +5088,10 @@ async fn process_route_bind_completion(
 
 #[allow(clippy::too_many_arguments)]
 async fn drain_pending_route_bind_completions(
-    control_completion_rx: &mut mpsc::Receiver<RouteBindCompletion>,
+    control_completion_rx: &mut mpsc::Receiver<ControlCompletion>,
+    configure_completion_rx: &mut mpsc::Receiver<ControlCompletion>,
+    a0: &A0Egress,
+    management_routes: &mut HashMap<RouteChannel, ManagementIdentity>,
     writer_tx: &WriterSender,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
@@ -4701,10 +5106,15 @@ async fn drain_pending_route_bind_completions(
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Result<usize, SubcError> {
     let mut drained = 0;
-    while let Ok(completion) = control_completion_rx.try_recv() {
+    while let Ok(completion) = control_completion_rx
+        .try_recv()
+        .or_else(|_| configure_completion_rx.try_recv())
+    {
         process_route_bind_completion(
             writer_tx,
             completion,
+            a0,
+            management_routes,
             routes,
             root_channels,
             session_identity,
@@ -4721,6 +5131,14 @@ async fn drain_pending_route_bind_completions(
         drained += 1;
     }
     Ok(drained)
+}
+
+// Construct the large protocol future in a separate stack frame, then keep its
+// state on the heap while polling. Native Windows main threads have a smaller
+// default stack than Rust worker threads, and must still handle ordinary calls.
+#[inline(never)]
+fn heap_module_future<F: std::future::Future>(build: impl FnOnce() -> F) -> std::pin::Pin<Box<F>> {
+    Box::pin(build())
 }
 
 /// ModuleHello → HelloAck → control/route loop. Runs until the daemon closes
@@ -4759,8 +5177,12 @@ where
     // startup, see `crate::launch_nonce`) so a reserved module_id's HELLO is
     // accepted; absent for non-reserved/self-connect.
     let launch_nonce = crate::launch_nonce::current();
+    // Compile immutable call validators before HELLO makes this module available.
+    // Discovery only needs catalog entries and must not pay this first-use cost.
+    tool_provider::prepare_admission();
     let mut manifest = build_manifest_without(&catalog_disabled);
     manifest::declare_provenance(&mut manifest, crate::launch_nonce::provenance());
+    let rich_ui_proofs = rich_ui::session::ProofCapabilities::from_manifest(&manifest);
     let manifest_provides = manifest.provides.clone();
     let hello_at = tokio::time::Instant::now();
     let hello = ModuleHelloBody {
@@ -4801,12 +5223,20 @@ where
     };
 
     let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
+    dispatch_path_metrics.watch_delivery.install(&executor);
+    if let Some(probe) = lifecycle_probe.clone() {
+        *dispatch_path_metrics
+            .lifecycle_probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(probe);
+    }
     shared_app.set_subc_connection_file(connection_file_path.to_path_buf());
     #[cfg(test)]
     let dispatch_path_metrics = watchdog_test
         .as_ref()
         .map(|hooks| Arc::clone(&hooks.metrics))
         .unwrap_or(dispatch_path_metrics);
+    let _progress_lifetime = drain::ProgressLifetimeGuard::new(Arc::clone(&dispatch_path_metrics));
     // Lives until this function returns, i.e. for the whole attached session,
     // including teardown. Dropping it stops the thread.
     #[cfg(test)]
@@ -4828,6 +5258,7 @@ where
         Arc::clone(&dispatch_path_metrics),
     );
     let (ledger_edge, mut ledger_ready_rx) = tool_provider::LedgerEdge::new();
+    let raw_writer_tx = writer_tx.clone();
     let (writer_tx, mut ledger_writer_task) = ledger_edge.proxy(
         writer_tx,
         Arc::clone(&executor),
@@ -4854,8 +5285,31 @@ where
         HELLO_CORR + 1,
     ));
     let run_scopes = Arc::new(run_scope::RunScopes::new(control.clone()));
-    let (scope_describes, mut scopes_ended_rx, scope_describe_task) =
-        scope_describe::start(control.clone(), executor.clone(), run_scopes.clone());
+    let gh_relay = crate::gh_shim_relay::GhRelay::new(connection_file_path.to_path_buf());
+    let speech_control = Arc::clone(&control);
+    let speech = crate::gh_shim_speech::service::start(
+        storage_dir,
+        &gh_relay,
+        Arc::new(move |scope| {
+            let control = Arc::clone(&speech_control);
+            Box::pin(async move {
+                control
+                    .describe(&scope)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+        }),
+        format!("{:p}", Arc::as_ptr(&control)),
+        control.advertises(subc_protocol::scope::SCOPE_DESCRIBE_OP),
+    );
+    let speech_runtime = speech.runtime_guard();
+    let (scope_describes, mut scopes_ended_rx, mut scope_describe_task) =
+        scope_describe::start_for_speech(
+            control.clone(),
+            executor.clone(),
+            run_scopes.clone(),
+            Arc::clone(&speech),
+        );
     let (run_ready_tx, mut run_ready_rx) = mpsc::unbounded_channel::<DecodedFrame>();
     let readiness_task = spawn_readiness(control.clone(), spawn_role, hello_at);
     // `read_frame` is NOT cancellation-safe, so it must never sit directly inside
@@ -4912,7 +5366,15 @@ where
     };
     let (bash_poll_touch_tx, mut bash_poll_touch_rx) = mpsc::channel::<ProjectRootId>(256);
     let (control_completion_tx, mut control_completion_rx) =
-        mpsc::channel::<RouteBindCompletion>(256);
+        mpsc::channel::<ControlCompletion>(256);
+    // ACK receipts have admission-reserved slots. Configure-ready messages use
+    // their own bounded channel so those reservations cannot block the very
+    // work that must consume them.
+    let (configure_completion_tx, mut configure_completion_rx) =
+        mpsc::channel::<ControlCompletion>(WRITER_QUEUE_CAPACITY);
+    let a0 = A0Egress::new(raw_writer_tx, control_completion_tx.clone())
+        .with_probe(lifecycle_probe.clone());
+    let mut candidate_requests = bind_candidates::CandidateRequests::default();
     let (lossy_tx, mut lossy_rx) = mpsc::channel::<LossyPushEnvelope>(1024);
     let lossy_overflow = Arc::new(push::LossyOverflow::default());
     let lossy_seq = Arc::new(AtomicU64::new(0));
@@ -4921,7 +5383,6 @@ where
         spawn_fleet_status_dial(connection_file_path, 64);
     // Serves the gh shim's bot-write relay on management routes; it dials
     // prefrontal and plexus over its own connection, off the frame loop.
-    let gh_relay = crate::gh_shim_relay::GhRelay::new(connection_file_path.to_path_buf());
     let (_worker_read_service, mut worker_read_scopes) =
         crate::gh_shim_worker_broker::install(Arc::clone(&gh_relay));
     // Stamped workers' permission asks go to Cingulate over this daemon.
@@ -4936,7 +5397,7 @@ where
     let connection_cancel = PersistentCancelSignal::new();
     let mut installed_route_epochs: HashMap<u16, u32> = HashMap::new();
     let mut routes: HashMap<RouteChannel, RouteIdentity> = HashMap::new();
-    let mut management_routes: HashMap<RouteChannel, Option<Principal>> = HashMap::new();
+    let mut management_routes: HashMap<RouteChannel, ManagementIdentity> = HashMap::new();
     let mut bg_subs: HashMap<RouteChannel, BgSub> = HashMap::new();
     let mut bg_sub_by_session: BgSubsBySession = HashMap::new();
     let mut bg_wake_pending = BgWakePending::new();
@@ -4986,14 +5447,29 @@ where
     // taken before the first select must be just as recoverable as a later one.
     dispatch_path_metrics.publish_frame_loop_wake_deadline(DRAIN_TICK_PERIOD);
     let loop_result: Result<ModuleLoopExit, SubcError> = 'module_loop: loop {
+        dispatch_path_metrics.mark_frame_loop_step("LedgerEdge::detach_shells", "", 0);
         for route in ledger_edge.unrouted_shells(&routes) {
             ledger_edge.detach_shells(&executor, Some(route)).await;
         }
         dispatch_path_metrics.mark_frame_loop_tick();
+        dispatch_path_metrics.mark_frame_loop_step("logging::perf_tick", "", 0);
+        #[cfg(test)]
+        if let Some(hook) = watchdog_test
+            .as_ref()
+            .and_then(|hooks| hooks.before_turn_work.as_ref())
+        {
+            hook();
+        }
         shared_app.set_open_route_count(routes.len() + management_routes.len());
         crate::logging::perf_tick(Some(&executor));
+        dispatch_path_metrics.mark_frame_loop_step("PendingSubcResponses::poll_if_woken", "", 0);
         let ready_inspects = pending_responses.poll_if_woken(executor.as_ref(), &deferred_wake);
         for resolved in ready_inspects {
+            dispatch_path_metrics.mark_frame_loop_step(
+                "deliver_resolved_subc_response",
+                &resolved.entry.bare_name,
+                resolved.entry.corr,
+            );
             if let Err(error) = deliver_resolved_subc_response(
                 &writer_tx,
                 resolved,
@@ -5010,6 +5486,7 @@ where
                 break 'module_loop Err(error);
             }
         }
+        dispatch_path_metrics.mark_frame_loop_step("expire_pending_bash_asks", "", 0);
         if let Err(error) = expire_pending_bash_asks(
             &writer_tx,
             &mut pending_bash_asks,
@@ -5027,8 +5504,16 @@ where
         // RouteBind completions are control-plane unblockers. Drain any completed
         // binds before entering other branch work so Push and maintenance bursts
         // can only add one loop-turn of latency.
+        dispatch_path_metrics.mark_frame_loop_step(
+            "drain_pending_route_bind_completions",
+            "route_bind",
+            0,
+        );
         match drain_pending_route_bind_completions(
             &mut control_completion_rx,
+            &mut configure_completion_rx,
+            &a0,
+            &mut management_routes,
             &writer_tx,
             &mut routes,
             &mut root_channels,
@@ -5053,18 +5538,40 @@ where
             Err(error) => break Err(error),
         }
 
+        if let Err(error) = candidate_requests
+            .release(&a0, &routes, &management_routes, &dispatch_path_metrics)
+            .await
+        {
+            break Err(error);
+        }
+        status_pushes.awaiting_binds(
+            pending_binds
+                .values()
+                .filter(|pending| !pending.cancelled && !pending.deadline_reported)
+                .map(|pending| pending.bind_root_id.clone()),
+        );
         if tokio::time::Instant::now() >= next_drain_at {
+            dispatch_path_metrics.mark_frame_loop_step("push::emit_bg_event_wakes", "", 0);
             push::emit_bg_event_wakes(
                 &writer_tx,
                 &dispatch_path_metrics,
                 &bg_subs,
                 &mut bg_wake_pending,
             );
+            dispatch_path_metrics.mark_frame_loop_step("warn_stuck_pending_watches", "", 0);
             dispatch_path_metrics.warn_stuck_pending_watches(&executor, &bg_sub_by_session);
+            dispatch_path_metrics.mark_frame_loop_step("warn_slow_pending_binds", "", 0);
             warn_slow_pending_binds(&mut pending_binds, &executor);
+            dispatch_path_metrics.mark_frame_loop_step("warn_slow_running_interactive_jobs", "", 0);
             warn_slow_running_interactive_jobs(&executor);
+            dispatch_path_metrics.mark_frame_loop_step(
+                "expire_overdue_route_binds",
+                "route_bind",
+                0,
+            );
             if let Err(error) = expire_overdue_route_binds(
-                &writer_tx,
+                &a0.writer,
+                &a0,
                 &executor,
                 &mut pending_binds,
                 &mut installed_route_epochs,
@@ -5075,12 +5582,18 @@ where
                 break Err(error);
             }
 
+            dispatch_path_metrics.mark_frame_loop_step(
+                "push::drain_retry_buffers_for_bound_routes",
+                "",
+                0,
+            );
             let retried = push::drain_retry_buffers_for_bound_routes(
                 &writer_tx,
                 &dispatch_path_metrics,
                 &routes,
                 &mut retry_buffer,
             );
+            dispatch_path_metrics.watch_delivery.kick();
             if retried > 0 {
                 log::debug!(
                     "subc attach: retried {retried} reliable Push frame(s) after writer backpressure"
@@ -5095,6 +5608,11 @@ where
             let bash_drain_due = drain_progress
                 .as_ref()
                 .is_some_and(|progress| Instant::now() >= progress.bash_backstop_at);
+            dispatch_path_metrics.mark_frame_loop_step(
+                "bash::answer_held_bash_calls_from_module_loop",
+                "",
+                0,
+            );
             if let Err(error) = bash::answer_held_bash_calls_from_module_loop(
                 &writer_tx,
                 &routes,
@@ -5107,6 +5625,7 @@ where
             }
 
             if let Some(progress) = drain_progress.as_mut() {
+                dispatch_path_metrics.mark_frame_loop_step("drain::held_request_census", "", 0);
                 if !progress.quiesced_reported || !progress.deadline_reported {
                     let census = drain::held_request_census(
                         &active_tool_calls,
@@ -5142,13 +5661,10 @@ where
         // Merge queued and overflow updates before retrying pending status.
         // A slow writer must get the newest state, not an older pending copy
         // followed by the update that was already waiting in the channel.
-        let overflow_batch = lossy_overflow.drain();
-        let mut batch = Vec::new();
-        while let Ok(item) = lossy_rx.try_recv() {
-            batch.push(item);
-        }
-        batch.extend(overflow_batch);
+        dispatch_path_metrics.mark_frame_loop_step("push::drain_lossy_push_batch", "", 0);
+        let batch = push::drain_lossy_push_batch(&mut lossy_rx, &lossy_overflow);
         if !batch.is_empty() {
+            dispatch_path_metrics.mark_frame_loop_step("push::drain_reliable_push_turn", "", 0);
             let (processed, deferred) = push::drain_reliable_push_turn(
                 &writer_tx,
                 &dispatch_path_metrics,
@@ -5172,6 +5688,11 @@ where
                 tokio::task::yield_now().await;
             }
 
+            dispatch_path_metrics.mark_frame_loop_step(
+                "push::process_lossy_push_envelope_batch",
+                "",
+                0,
+            );
             push::process_lossy_push_envelope_batch(
                 &writer_tx,
                 &dispatch_path_metrics,
@@ -5183,18 +5704,21 @@ where
             );
         }
 
+        dispatch_path_metrics.mark_frame_loop_step("StatusPushes::drain_turn", "", 0);
         status_pushes.drain_turn(&writer_tx, &dispatch_path_metrics, &routes, &root_channels);
 
         // The drain-tick arm below guarantees this select returns by
         // `next_drain_at`; publishing that promise lets the stall watchdog tell
         // an idle-but-ticking loop from one that stopped taking turns.
+        dispatch_path_metrics.mark_frame_loop_step("ScopeDescribes::routes", "", 0);
+        scope_describes.routes(&routes);
         dispatch_path_metrics.publish_frame_loop_wake_deadline(
             next_drain_at.saturating_duration_since(tokio::time::Instant::now()),
         );
-        scope_describes.routes(&routes);
         tokio::select! {
             biased;
             Some(ended) = scopes_ended_rx.recv() => {
+                dispatch_path_metrics.mark_frame_loop_step("run_scopes::revoke", "", 0);
                 run_scopes.revoke(&ended.stamp);
                 ledger_edge.scope_ended(&ended.keys);
                 let keys: Vec<_> = pending_bash_asks.iter().filter(|(_, pending)| {
@@ -5210,10 +5734,18 @@ where
                     }
                 }
             }
-            Some(completion) = control_completion_rx.recv() => {
+            Some(completion) = async {
+                tokio::select! { biased;
+                    completion = control_completion_rx.recv() => completion,
+                    completion = configure_completion_rx.recv() => completion,
+                }
+            } => {
+                dispatch_path_metrics.mark_frame_loop_step("process_route_bind_completion", "route_bind", completion.corr());
                 if let Err(error) = process_route_bind_completion(
                     &writer_tx,
                     completion,
+                    &a0,
+                    &mut management_routes,
                     &mut routes,
                     &mut root_channels,
                     &mut session_identity,
@@ -5230,18 +5762,26 @@ where
                 {
                     break Err(error);
                 }
+                if let Err(error) = candidate_requests.release(&a0, &routes, &management_routes, &dispatch_path_metrics).await {
+                    break Err(error);
+                }
                 next_maintenance_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
                 health_rollup_worker.request_refresh();
             }
             Some(query) = worker_read_scopes.recv() => {
-                let scopes = gh_relay_route_scopes(&routes);
+                dispatch_path_metrics.mark_frame_loop_step("gh_relay_route_scopes", "", 0);
+                let scopes = gh_relay_route_scopes(&routes,&speech);
                 let _ = query.reply.send(scopes.for_session(&query.session).cloned());
             }
             _ = shutdown.notified() => {
+                dispatch_path_metrics.mark_frame_loop_step("run_module_loop/shutdown", "", 0);
                 log::warn!("subc attach: fatal executor response requested teardown");
                 break Ok(ModuleLoopExit::SkipSearchFlush);
             }
             (maybe_frame, database_waited, ledger_waited) = async {
+                if let Some(frame) = candidate_requests.next_ready() {
+                    return (Some(Ok(frame)), false, false);
+                }
                 tokio::select! {
                     frame = reader_rx.recv() => (frame, false, false),
                     frame = run_ready_rx.recv() => (frame.map(Ok), false, false),
@@ -5265,6 +5805,12 @@ where
                     (hooks.before_frame)();
                 }
 
+                let frame = match candidate_requests.intercept(frame, &a0, &mut pending_binds, &executor, &dispatch_path_metrics).await {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => continue,
+                    Err(error) => break Err(error),
+                };
+
                 if !(ledger_waited && ledger_edge.is_withdrawn(&frame.frame)) && !ingress_route_should_be_processed(
                     &installed_route_epochs,
                     &reclaimed_routes,
@@ -5282,7 +5828,7 @@ where
                 if !database_waited && !ledger_waited && frame.frame.header.ty == FrameType::Request && frame.frame.header.channel != 0 {
                     dispatch_path_metrics.tool_received_decoded(&frame);
                 }
-                let DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore } = frame;
+                let DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore, codemode_policies } = frame;
 
                 match frame.header.ty {
                     FrameType::Ping if frame.header.channel == 0 => {
@@ -5308,6 +5854,7 @@ where
                         break Ok(ModuleLoopExit::Graceful);
                     }
                     FrameType::Goodbye => {
+                        a0.cancel(route_key(frame.header.channel, frame.header.epoch));
                         let channel = route_key(frame.header.channel, frame.header.epoch);
                         if let Some(stamp) = routes.get(&channel).and_then(|identity| identity.scope.clone()) {
                             scope_describes.goodbye(stamp);
@@ -5347,7 +5894,7 @@ where
                         if standalone::reply(&writer_tx, &frame) {
                             continue;
                         }
-                        let decoded = DecodedFrame {frame, phase_trace, parsed_body, confinement, launch_restore};
+                        let decoded = DecodedFrame {frame, phase_trace, parsed_body, confinement, launch_restore, codemode_policies};
                         let decoded = if !ledger_waited {
                             match ledger_edge.authorize(decoded, &pending_bash_asks, &executor) {
                                 Ok(()) => continue,
@@ -5386,8 +5933,12 @@ where
                         }
                     }
                     FrameType::Request if frame.header.channel == 0 => {
-                        if let Err(error) = handle_control_request(
+                        // Keep the control future on the heap so it does not enlarge
+                        // the loop's poll stack frame, including for tool requests.
+                        if let Err(error) = heap_module_future(|| handle_control_request(
+                            &a0.writer,
                             &writer_tx,
+                            &a0,
                             &frame,
                             &shared_app,
                             &executor,
@@ -5408,7 +5959,7 @@ where
                             &mut retry_buffer,
                             &mut push_buffer,
                             &shutdown,
-                            &control_completion_tx,
+                            &configure_completion_tx,
                             &dispatch_path_metrics,
                             lifecycle_probe.as_ref(),
                             &health_rollup_cache,
@@ -5417,7 +5968,8 @@ where
                             user_config_path.as_deref(),
                             tool_response_body_limit,
                             Some(&run_scopes),
-                        )
+                            storage_dir,
+                        ))
                         .await
                         {
                             break Err(error);
@@ -5425,15 +5977,94 @@ where
                     }
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
-                        let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore };
-                        // A codemode program's tool call runs with its head agent's
-                        // access: every step below sees the head-derived identity.
+                        let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore, codemode_policies };
+                        // Bind admission, not request-supplied scope data, limits
+                        // flow management routes to the manifest's flow operations
+                        // before any store, provider, or general tool dispatch.
+                        // Tool routes retain their separate call-mode contract.
+                        if let Some(identity) = management_routes.get(&route) {
+                            if let Err(error) = admit_management_flow_request(identity, decoded.body().ok()) {
+                                if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await {
+                                    break Err(error);
+                                }
+                                continue;
+                            }
+                        }
+                        if let (Some(identity), Ok(body)) = (routes.get(&route), decoded.body()) {
+                            // Rich-UI chunk queries are provider reads that name no
+                            // session or tool, so they are answered here, before the
+                            // carrier gate and every tool-call admission step.
+                            if let Some((operation, query)) = chunk_query(body) {
+                                let db = shared_app.db();
+                                if let Err(error) = answer_chunk_query(&writer_tx, &dispatch_path_metrics, &decoded.frame, identity, operation, &query, db.as_deref()).await {
+                                    break Err(error);
+                                }
+                                continue;
+                            }
+                            if diagnostics_findings::is_request(body) {
+                                if let Err(error) = diagnostics_findings::dispatch(
+                                    &writer_tx, &dispatch_path_metrics, &decoded.frame,
+                                    identity.scope.as_ref(), body, &health_rollup_cache, &executor,
+                                ).await {
+                                    break Err(error);
+                                }
+                                continue;
+                            }
+                            if let Some(error) = occipital_session_refusal(identity, body) {
+                                if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await {
+                                    break Err(error);
+                                }
+                                continue;
+                            }
+                            if let Err(error) = carrier_read_only::admit(identity, body) {
+                                if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await {
+                                    break Err(error);
+                                }
+                                continue;
+                            }
+                        }
+                        if let (Some(identity), Ok(body)) = (management_routes.get(&route), decoded.body()) {
+                            if diagnostics_findings::is_request(body) {
+                                if let Err(error) = diagnostics_findings::dispatch(
+                                    &writer_tx, &dispatch_path_metrics, &decoded.frame,
+                                    identity.scope.as_ref(), body, &health_rollup_cache, &executor,
+                                ).await {
+                                    break Err(error);
+                                }
+                                continue;
+                            }
+                        }
+                        // A codemode program's tool call runs with its owner route's
+                        // access (the head agent's, or a worker run's own worker's):
+                        // every step below sees the owner-derived identity.
                         let codemode_routes;
-                        let (routes_for_call, codemode_call) = match codemode::admit(&routes, route, decoded.body().ok()) {
+                        let (routes_for_call, codemode_call) = match codemode::admit(&routes, route, decoded.body().ok(), |identity| {
+                            let Some(ctx) = executor.actor_context(&identity.root) else {
+                                return Some(Err(remote_policy::policy_unavailable()));
+                            };
+                            if remote_policy::key(identity, Some("worker")).is_none() || ctx.database_runtime_unconfigured() {
+                                return Some(Ok(codemode::EffectiveSavedPolicy::default()));
+                            }
+                            match decoded.codemode_policies.as_ref()? {
+                                Ok(policies) => policies.get(&ctx, identity),
+                                Err(error) => Some(Err(error.clone())),
+                            }
+                        }) {
                             codemode::Admission::Unchanged => (&routes, false),
                             codemode::Admission::Owner(effective) => {
                                 codemode_routes = codemode::overlay(&routes, route, effective);
                                 (&codemode_routes, true)
+                            }
+                            codemode::Admission::AwaitPolicies(heads) => {
+                                match database_waits.read_codemode_policies(decoded, heads, &executor) {
+                                    Ok(()) => continue,
+                                    Err(decoded) => {
+                                        if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, remote_policy::policy_unavailable()).await {
+                                            break Err(error);
+                                        }
+                                        continue;
+                                    }
+                                }
                             }
                             codemode::Admission::Refused(error) => {
                                 if let Some(run) = routes.get(&route) {
@@ -5531,39 +6162,42 @@ where
                         let result = if management_routes.contains_key(&route)
                             && gh_relay_operation(&frame).is_some()
                         {
-                            // Management routes are bound only for first-party
-                            // principals (see the RouteBind arm), so the route
-                            // being here is the admission fact passed on.
+                            // Flow-only management routes were refused above;
+                            // reaching the relay requires first-party admission.
                             spawn_gh_relay(
                                 &writer_tx,
                                 &frame,
                                 &gh_relay,
                                 &dispatch_path_metrics,
                                 true,
-                                gh_relay_route_scopes(&routes),
+                                gh_relay_route_scopes(&routes,&speech),
                             );
                             Ok(())
                         } else if management_routes.contains_key(&route) {
                             handle_management_request(
-                                &writer_tx,
+                                &a0.writer,
                                 &frame,
                                 &shared_app,
                                 &executor,
                                 &live_roots,
                                 &root_channels,
+                                &routes,
+                                &active_tool_calls,
                                 &health_rollup_cache,
                                 &dispatch_path_metrics,
-                                management_routes.get(&route).and_then(Option::as_ref),
+                                management_routes.get(&route).and_then(|identity| identity.principal.as_ref()),
                                 storage_dir,
                             )
                             .await
                         } else {
-                             handle_tool_call(
-                                 &writer_tx,
-                                 &frame,
-                                 parsed_body,
-                                 confinement,
-                                 phase_trace,
+                            // Keep construction of the large tool-call future out
+                            // of the loop's poll stack as well as its stored state.
+                            heap_module_future(|| handle_tool_call_with_capabilities(
+                                &writer_tx,
+                                &frame,
+                                parsed_body,
+                                confinement,
+                                phase_trace,
                                 routes_for_call,
                                 &pending_binds,
                                 &reclaimed_routes,
@@ -5589,7 +6223,8 @@ where
                                 tool_response_body_limit,
                                 &module_drain,
                                 Some(&control),
-                            )
+                                rich_ui_proofs,
+                            ))
                             .await
                         };
                         if let Err(error) = result {
@@ -5646,6 +6281,7 @@ where
                         let cancelled_deferred = pending_responses.cancel_request(channel, corr);
                         if cancelled_call.is_some() || cancelled_deferred {
                             let request = cancelled_call.unwrap_or(RequestFrameMeta {
+                                deadline: None,
                                 ver: frame.header.ver,
                                 flags: frame.header.flags,
                             });
@@ -5848,6 +6484,7 @@ where
                 }
             }
             Some(pending) = deferred_response_rx.recv() => {
+                dispatch_path_metrics.mark_frame_loop_step("PendingSubcResponses::register", "", pending.corr);
                 if routes.contains_key(&pending.route)
                     && active_tool_call_is_registered(
                         &active_tool_calls,
@@ -5883,6 +6520,7 @@ where
                 }
             }
             Some((root_id, frame)) = reliable_rx.recv() => {
+                dispatch_path_metrics.mark_frame_loop_step("push::drain_reliable_push_turn", "", 0);
                 // Reliable Push frames are FIFO and must-deliver, but draining an
                 // unbounded burst in one current-thread turn can starve RouteBind
                 // completions. The budget defers excess frames, never drops them.
@@ -5910,6 +6548,7 @@ where
                 }
             }
             Some((order, root_id, frame)) = lossy_rx.recv() => {
+                dispatch_path_metrics.mark_frame_loop_step("push::process_lossy_push_envelope_batch", "", 0);
                 // When both push lanes have work, handle a small reliable slice before lossy work.
                 // That ordering lets completed task ids suppress stale BashLongRunning frames.
                 // The slice stays bounded so reliable bursts cannot monopolize this loop turn.
@@ -5943,10 +6582,7 @@ where
                 // combined batch is sorted back into producer order before
                 // coalescing drops stale updates for the same key.
                 let mut batch = vec![(order, root_id, frame)];
-                while let Ok(item) = lossy_rx.try_recv() {
-                    batch.push(item);
-                }
-                batch.extend(lossy_overflow.drain());
+                batch.extend(push::drain_lossy_push_batch(&mut lossy_rx, &lossy_overflow));
                 push::process_lossy_push_envelope_batch(
                     &writer_tx,
                     &dispatch_path_metrics,
@@ -5958,6 +6594,7 @@ where
                 );
             }
             Some(done) = bash_deferred_rx.recv() => {
+                dispatch_path_metrics.mark_frame_loop_step("bash::handle_bash_deferred_completion", "", 0);
                 decrement_counted_channel(&dispatch_path_metrics.bash_deferred_queued);
                 if let Err(error) = bash::handle_bash_deferred_completion(
                     &writer_tx,
@@ -5974,15 +6611,18 @@ where
                 }
             }
             Some(root_id) = bash_poll_touch_rx.recv() => {
+                dispatch_path_metrics.mark_frame_loop_step("RootMeta::note_activity", "", 0);
                 decrement_counted_channel(&dispatch_path_metrics.bash_poll_touch_queued);
                 if let Some(meta) = live_roots.get_mut(&root_id) {
                     meta.note_activity();
                 }
             }
             Some(done) = identity_replay_done_rx.recv() => {
+                dispatch_path_metrics.mark_frame_loop_step("finish_identity_replay", "route_bind", 0);
                 finish_identity_replay(&done, &mut live_roots, &routes, &executor);
             }
             Some(completion) = maintenance_rx.recv() => {
+                dispatch_path_metrics.mark_frame_loop_step("note_maintenance_completion", "", 0);
                 decrement_counted_channel(&dispatch_path_metrics.maintenance_queued);
                 let root_id = completion.root_id.clone();
                 let response = completion.response;
@@ -6082,7 +6722,9 @@ where
                 // inbound route/control messages and push completions have run,
                 // so maintenance does not block the actor from handling the
                 // first request that arrives after a route bind is acknowledged.
+                dispatch_path_metrics.mark_frame_loop_step("logging::maybe_sweep_logs", "", 0);
                 crate::logging::maybe_sweep_logs();
+                dispatch_path_metrics.mark_frame_loop_step("compression_events::maybe_spawn_retention", "", 0);
                 let retention_registries = shared_app.try_memory_contexts().map(|contexts| {
                     contexts
                         .into_iter()
@@ -6098,9 +6740,12 @@ where
                         retention_registries,
                     );
                 }
+                dispatch_path_metrics.mark_frame_loop_step("spawn_orphaned_lsp_child_reap", "", 0);
                 spawn_orphaned_lsp_child_reap(shared_app.lsp_child_registry());
+                dispatch_path_metrics.mark_frame_loop_step("reap_idle_lsp_servers", "", 0);
                 let now = Instant::now();
                 reap_idle_lsp_servers(now, &live_roots, &executor);
+                dispatch_path_metrics.mark_frame_loop_step("reap_idle_roots_with_presence", "", 0);
                 let presence = root_presence.latest();
                 let reap = reap_idle_roots_with_presence(
                     now,
@@ -6113,6 +6758,7 @@ where
                 );
                 root_presence.request(live_roots.keys().cloned().collect());
                 for root_id in &reap.forgotten_deleted_roots {
+                    dispatch_path_metrics.mark_frame_loop_step("purge_deleted_root_residents", "", 0);
                     bg_unacked_keys_by_root.remove(root_id);
                     let reclaim_frames = purge_deleted_root_residents(
                         root_id,
@@ -6149,12 +6795,14 @@ where
                 if reap.evicted > 0 {
                     log::debug!("subc attach: reaped {} idle root(s)", reap.evicted);
                 }
+                dispatch_path_metrics.mark_frame_loop_step("record_bg_runtime_from_snapshots", "", 0);
                 record_bg_runtime_from_snapshots(
                     &dispatch_path_metrics,
                     bg_subs.len(),
                     bg_wake_pending.len(),
                     &bg_unacked_keys_by_root,
                 );
+                dispatch_path_metrics.mark_frame_loop_step("submit_due_maintenance_jobs", "", 0);
                 submit_due_maintenance_jobs(
                     &executor,
                     &mut live_roots,
@@ -6166,6 +6814,7 @@ where
                     &dispatch_path_metrics,
                 );
                 if tokio::time::Instant::now() >= next_standing_pass_at {
+                    dispatch_path_metrics.mark_frame_loop_step("StandingWorker::request", "", 0);
                     standing_worker.request();
                     next_standing_pass_at = tokio::time::Instant::now()
                         + standing::STANDING_MAINTENANCE_INTERVAL;
@@ -6185,10 +6834,25 @@ where
             }
         }
         if let Some(probe) = lifecycle_probe.as_ref() {
+            dispatch_path_metrics.mark_frame_loop_step(
+                "SubcTestLifecycleProbe::hold_reliable_push_turn",
+                "",
+                0,
+            );
             probe.hold_reliable_push_turn().await;
         }
     };
 
+    dispatch_path_metrics.held_bash_calls.clear_all_progress();
+    a0.stop();
+    let loop_result = if matches!(loop_result, Ok(ModuleLoopExit::Graceful)) {
+        candidate_requests
+            .stop(&a0, &dispatch_path_metrics)
+            .await
+            .and(loop_result)
+    } else {
+        loop_result
+    };
     // The exit budget runs from the drain, so the teardown between the loop
     // ending and the index flush is timed and logged as its own exit phase.
     let teardown_started = Instant::now();
@@ -6217,6 +6881,14 @@ where
     health_rollup_worker.shutdown();
     // The flip retries until accepted; the connection ending is what stops it.
     scope_describe_task.abort();
+    // Cancellation is not a join guarantee. If the monitor does not stop in
+    // 100 ms, keep the locks: it may still publish scope-end revocations.
+    if tokio::time::timeout(Duration::from_millis(100), &mut scope_describe_task)
+        .await
+        .is_err()
+    {
+        speech_runtime.retain_until_process_exit();
+    }
     ledger_edge.detach_shells(&executor, None).await;
     if let Some(task) = readiness_task {
         task.abort();
@@ -6298,6 +6970,11 @@ where
         }
     }
 
+    // No new relay can enter after the frame loop. Retire the speech owner
+    // before joining the writer: its runtime also owns a control sender.
+    // Relays may still enqueue bot writes or finish durable state. Their work
+    // guards retain the serving/storage locks until both operations finish.
+    speech_runtime.retire();
     // The run-scope coordinator owns a writer sender even when no run is live.
     // Release it before joining the writer so an idle connection can drain.
     drop(run_scopes);
@@ -6305,6 +6982,8 @@ where
     // so flow reads can ask the daemon whether their parent scope is still
     // live; the writer tasks cannot drain while the handle is alive.
     drop(control);
+    a0.stop();
+    drop(a0);
     drop(writer_tx);
     drop(pong_tx);
     if tokio::time::timeout(Duration::from_secs(5), &mut ledger_writer_task)
@@ -6433,10 +7112,19 @@ where
                 continue;
             };
             prefer_pong = !control;
+            decrement_counted_channel(&metrics.writer_queued);
+            if !queued.begin_ack_write() {
+                continue;
+            }
+            queued.project_tool_result().map_err(|error| {
+                subc_transport::FrameIoError::Io(io::Error::other(error.to_string()))
+            })?;
             let measure = queued.tool_response_trace.is_some();
             let dequeued = measure.then(Instant::now);
+            let dequeued_cpu = measure
+                .then(crate::run_tool_call::ThreadCpuSample::now)
+                .flatten();
             metrics.writer_active.store(true, Ordering::Relaxed);
-            decrement_counted_channel(&metrics.writer_queued);
             let write_timing = write_frame_contiguous(
                 &mut write,
                 queued.frame(),
@@ -6449,12 +7137,14 @@ where
             let write_timing = match write_timing {
                 Ok(write_timing) => write_timing,
                 Err(error) => {
+                    queued.finish_ack_write(false);
                     if let Some(trace) = queued.tool_response_trace.as_ref() {
                         trace.note_write_failure(&error.to_string());
                     }
                     return Err(error);
                 }
             };
+            queued.finish_ack_write(true);
             metrics.tool_replied(queued.frame());
 
             if let (Some(trace), Some(dequeued), Some(write_timing)) =
@@ -6465,6 +7155,10 @@ where
                     write_timing.write_started,
                     write_timing.write_finished,
                     write_timing.frame_bytes,
+                    crate::run_tool_call::ThreadCpuSample::elapsed(
+                        dequeued_cpu,
+                        write_timing.write_started_cpu,
+                    ),
                 ) {
                     let session = completed.session.clone();
                     log_ctx::with_session(Some(session.clone()), || {
@@ -6495,6 +7189,7 @@ where
 
 struct FrameWriteTiming {
     write_started: Instant,
+    write_started_cpu: Option<crate::run_tool_call::ThreadCpuSample>,
     write_finished: Instant,
     frame_bytes: usize,
 }
@@ -6525,6 +7220,9 @@ where
     buffer.extend_from_slice(&header);
     buffer.extend_from_slice(body);
     let write_started = measure.then(Instant::now);
+    let write_started_cpu = measure
+        .then(crate::run_tool_call::ThreadCpuSample::now)
+        .flatten();
     writer
         .write_all(buffer)
         .await
@@ -6537,6 +7235,7 @@ where
     }
     Ok(write_started.map(|write_started| FrameWriteTiming {
         write_started,
+        write_started_cpu,
         write_finished: write_finished.expect("measured write has a finish timestamp"),
         frame_bytes,
     }))
@@ -6561,6 +7260,7 @@ where
                         parsed_body: Default::default(),
                         confinement: None,
                         launch_restore: None,
+                        codemode_policies: None,
                         frame,
                         phase_trace: PhaseTrace::new(received_at),
                     };
@@ -6697,6 +7397,12 @@ async fn close_daemon_connection(
     }
 }
 
+/// `storage_dir` is the storage root the module selected at startup, the one
+/// its daemon storage lease covers. A new actor starts from it so that the
+/// bind's configure opens aft.db and the actor's other durable state in that
+/// same root. Starting from an empty `storage_dir` would let the actor fall
+/// back to the default data home and split the module's data in two whenever
+/// the module was started with an explicit storage path.
 fn register_actor_for_bind(
     shared_app: &Arc<App>,
     executor: &Arc<Executor>,
@@ -6704,6 +7410,7 @@ fn register_actor_for_bind(
     bind_root_id: &ProjectRootId,
     route_channel: u16,
     root_was_live: bool,
+    storage_dir: &Path,
 ) -> bool {
     if executor.actor_registered(bind_root_id) {
         log::debug!(
@@ -6724,7 +7431,10 @@ fn register_actor_for_bind(
 
     let actor_ctx = Arc::new(AppContext::from_app(
         Arc::clone(shared_app),
-        Config::default(),
+        Config {
+            storage_dir: Some(storage_dir.to_path_buf()),
+            ..Config::default()
+        },
     ));
     install_bash_compressor(&actor_ctx);
     actor_ctx.install_fleet_status_client(Some(push_senders.fleet_status_client.clone()));
@@ -6791,10 +7501,11 @@ fn route_bind_error_code_for_configure_response(response: &Response) -> &'static
         // contention); the client retries the bind rather than treating the
         // root as permanently divergent.
         Some("cache_key_probe_failed") => "cache_key_probe_failed",
+        Some("config_unknown") => "config_unknown",
         // Actor lifecycle gaps are transient from the daemon/client viewpoint:
         // a fresh bind can create or join a healthy actor, so do not classify
         // them as permanent config divergence.
-        Some("actor_not_registered" | "actor_fatal") => "actor_not_ready",
+        Some("actor_not_registered" | "actor_fatal" | "actor_not_ready") => "actor_not_ready",
         // The retention binding record sits behind a storage-wide file lock
         // that background sweeps also take. A bind that times out waiting for
         // it is contention, not divergent configuration, so the client retries
@@ -6861,7 +7572,9 @@ fn queue_post_bind_configure_and_completion_maintenance(
 #[allow(clippy::too_many_arguments)]
 async fn handle_route_bind_completion(
     tx: &WriterSender,
-    completion: RouteBindCompletion,
+    mut completion: RouteBindCompletion,
+    ack_written: bool,
+    a0: &A0Egress,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
@@ -6875,6 +7588,61 @@ async fn handle_route_bind_completion(
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
     let route_id = completion.route;
+    if completion.configure_response.success
+        && completion.expected_snapshot_id.is_some()
+        && completion.expected_snapshot_id != completion.applied_snapshot_id
+    {
+        completion.configure_response = Response::error(
+            "bind-config-witness",
+            "config_unknown",
+            "configure did not apply this bind's prepared configuration snapshot",
+        );
+    }
+    if !ack_written
+        && completion.configure_response.success
+        && pending_binds
+            .get(&route_id)
+            .is_some_and(|pending| !pending.cancelled && !pending.deadline_reported)
+    {
+        if pending_binds[&route_id]
+            .ack_publication
+            .as_ref()
+            .is_some_and(|ack| ack.is_queued() || ack.is_committed() || ack.is_retracted())
+        {
+            return Ok(());
+        }
+        let restore_watcher = live_roots
+            .get(&completion.bind_root_id)
+            .is_some_and(|meta| meta.idle_artifacts_evicted || meta.unbound_quiesced);
+        if let Some(ctx) = executor.actor_context(&completion.bind_root_id) {
+            ctx.mark_subc_bound();
+            if restore_watcher {
+                crate::commands::configure::ensure_project_watcher(&ctx);
+            }
+        }
+        let ack = route_bind_ack_frame(completion.ver, completion.corr, completion.flags)?;
+        match a0.enqueue_ack(
+            route_id,
+            ack,
+            ControlCompletion::AckWritten(completion),
+            metrics,
+        ) {
+            Ok(publication) => {
+                pending_binds.get_mut(&route_id).unwrap().ack_publication = Some(publication);
+                return Ok(());
+            }
+            Err(ControlCompletion::AckWritten(mut rejected)) => {
+                rejected.configure_response = Response::error(
+                    "bind-ack",
+                    "actor_not_ready",
+                    "route bind ACK publication is busy; retry shortly",
+                );
+                completion = rejected;
+            }
+            Err(_) => return Err(SubcError::WriterClosed),
+        }
+    }
+    a0.retire(route_id);
     let Some(pending) = pending_binds.remove(&route_id) else {
         log::warn!(
             "subc attach: dropping RouteBind completion for non-pending route {}",
@@ -6912,8 +7680,8 @@ async fn handle_route_bind_completion(
     }
 
     let inserted_new_actor = pending.inserted_new_actor || completion.inserted_new_actor;
-    // The deadline path already answered (and recorded) an overdue bind, and a
-    // torn-down bind is never answered.
+    // Cancelled or overdue binds already own their control error through A0.
+    // A late configure completion only cleans up; it must not reply again.
     if !pending.cancelled && !pending.deadline_reported {
         metrics.record_bind_ack(pending.started_at.elapsed());
     }
@@ -6976,16 +7744,20 @@ async fn handle_route_bind_completion(
         let message = response_message(response, fallback);
         let fatal = response_is_fatal_panic(response);
         let error_code = route_bind_error_code_for_configure_response(response);
-        send_route_bind_error_parts(
-            tx,
-            completion.ver,
-            completion.corr,
-            completion.flags,
-            error_code,
-            &message,
-            metrics,
-        )
-        .await?;
+        if a0.publication(route_id).is_some() {
+            a0.reject(route_id, ErrorBody::new(error_code, &message));
+        } else {
+            send_route_bind_error_parts(
+                &a0.writer,
+                completion.ver,
+                completion.corr,
+                completion.flags,
+                error_code,
+                &message,
+                metrics,
+            )
+            .await?;
+        }
         remove_installed_route(installed_route_epochs, route_id);
         if fatal {
             signal_fatal_teardown(
@@ -7011,9 +7783,6 @@ async fn handle_route_bind_completion(
         Some(&completion.bind_root_id),
         Some(metrics),
     );
-    let restore_watcher = live_roots
-        .get(&completion.bind_root_id)
-        .is_some_and(|meta| meta.idle_artifacts_evicted || meta.unbound_quiesced);
     live_roots
         .entry(completion.bind_root_id.clone())
         .and_modify(|meta| {
@@ -7023,35 +7792,19 @@ async fn handle_route_bind_completion(
         })
         .or_insert_with(|| RootMeta::new(Instant::now()));
     if let Some(meta) = live_roots.get_mut(&completion.bind_root_id) {
+        meta.route_activity
+            .insert(route_id, route_census::RouteActivity::new(Instant::now()));
         meta.diagnostics_on_edit = completion.diagnostics_on_edit;
         meta.maintenance_poisoned = false;
     }
     if let Some(ctx) = executor.actor_context(&completion.bind_root_id) {
-        ctx.mark_subc_bound();
-        if restore_watcher {
-            crate::commands::configure::ensure_project_watcher(&ctx);
-        }
+        debug_assert!(ack_written);
         if crate::commands::configure::ignore_rules_load_pending(&ctx) {
             submit_ignore_rule_load(executor, &completion.bind_root_id);
         }
     }
 
-    let ack =
-        serde_json::to_vec(&ModuleControlResponse::RouteBindAck {}).map_err(SubcError::Json)?;
-    let response = Frame::build_with_version(
-        completion.ver,
-        FrameType::Response,
-        control_flags(),
-        0,
-        0,
-        completion.corr,
-        ack,
-    )
-    .map_err(SubcError::FrameBuild)?;
-    send_reliable_writer_frame(tx, metrics, response, "RouteBindAck").await?;
-    if let Some(probe) = lifecycle_probe {
-        probe.route_bind_ack_queued(completion.corr);
-    }
+    debug_assert!(ack_written);
     start_post_ack_database_open(executor, &completion.bind_root_id);
     if let Some(identity) = routes
         .get(&route_id)
@@ -7113,6 +7866,7 @@ async fn handle_route_bind_completion(
 
 async fn expire_overdue_route_binds(
     tx: &WriterSender,
+    a0: &A0Egress,
     executor: &Arc<Executor>,
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
@@ -7123,7 +7877,16 @@ async fn expire_overdue_route_binds(
         .iter()
         .filter_map(|(route, pending)| {
             let age = now.saturating_duration_since(pending.started_at);
-            (!pending.deadline_reported && age >= ROUTE_BIND_DEADLINE).then(|| {
+            (!pending.deadline_reported
+                && age >= ROUTE_BIND_DEADLINE
+                && pending
+                    .ack_publication
+                    .as_ref()
+                    // Write-start wins the bind: completing that frame and
+                    // publishing it after the deadline is intentional. Only an
+                    // ACK still waiting in the queue can become a refusal.
+                    .is_none_or(|ack| !ack.is_committed() && !ack.is_retracted()))
+            .then(|| {
                 (
                     *route,
                     pending.corr,
@@ -7132,15 +7895,33 @@ async fn expire_overdue_route_binds(
                     pending.bind_root_id.clone(),
                     pending.configure_request_id.clone(),
                     age,
+                    pending
+                        .ack_publication
+                        .as_ref()
+                        .is_some_and(|ack| ack.is_queued()),
                 )
             })
         })
         .collect();
 
-    for (route, corr, ver, flags, root_id, configure_request_id, age) in expired {
+    for (route, corr, ver, flags, root_id, configure_request_id, age, ack_queued) in expired {
         // Read the blockers before cancelling: once cancelled, the bind is no
         // longer queued and the snapshot can no longer say what held it.
         let blockers = executor.bind_blocker_snapshot(&root_id, &configure_request_id);
+        let (code, message) = if ack_queued {
+            ("actor_not_ready", format!("route bind deadline exceeded after {}ms (deadline {}ms): the bind waited in the ACK writer queue", age.as_millis(), ROUTE_BIND_DEADLINE.as_millis()))
+        } else {
+            route_bind_deadline_refusal(
+                age,
+                ROUTE_BIND_DEADLINE,
+                DAEMON_BIND_RELAY_TIMEOUT,
+                &blockers,
+            )
+        };
+        let reserved = a0.publication(route).is_some();
+        if reserved && !a0.reject(route, ErrorBody::new(code, &message)) {
+            continue;
+        }
         if let Some(pending) = pending_binds.get_mut(&route) {
             pending.cancelled = true;
             pending.deadline_reported = true;
@@ -7152,13 +7933,9 @@ async fn expire_overdue_route_binds(
         remove_installed_route(installed_route_epochs, route);
         metrics.record_bind_ack(age);
         let deadline_ms = ROUTE_BIND_DEADLINE.as_millis();
-        let (code, message) = route_bind_deadline_refusal(
-            age,
-            ROUTE_BIND_DEADLINE,
-            DAEMON_BIND_RELAY_TIMEOUT,
-            &blockers,
-        );
-        send_route_bind_error_parts(tx, ver, corr, flags, code, &message, metrics).await?;
+        if !reserved {
+            send_route_bind_error_parts(tx, ver, corr, flags, code, &message, metrics).await?;
+        }
         log::warn!(
             "subc attach: route {} bind for root {} exceeded {}ms deadline (configure_request_id={}, code={})",
             route,
@@ -7194,14 +7971,16 @@ async fn send_cached_health_response(
     pending_binds: &HashMap<RouteChannel, PendingBind>,
     metrics: &DispatchPathMetrics,
     health_rollup_cache: &HealthRollupCache,
+    ownership_summary: Value,
 ) -> Result<(), SubcError> {
-    let report = build_health_report(
+    let mut report = build_health_report(
         health_rollup_cache,
         executor,
         pending_binds,
         metrics,
         shared_app,
     );
+    health::with_route_ownership_summary(&mut report, ownership_summary);
     let body = serde_json::to_vec(&ModuleControlResponse::from(report)).map_err(SubcError::Json)?;
     let response = Frame::build_with_version(
         frame.header.ver,
@@ -7216,12 +7995,237 @@ async fn send_cached_health_response(
     send_frame(tx, metrics, response).await
 }
 
+fn normalized_scope_workdir(workdir: &Path) -> Option<PathBuf> {
+    let mut ancestor = workdir;
+    let mut missing = Vec::new();
+    loop {
+        match ProjectRootId::from_path(ancestor) {
+            Ok(root) => {
+                let mut normalized = root.into_path_buf();
+                for component in missing.iter().rev() {
+                    normalized.push(component);
+                }
+                return Some(normalized);
+            }
+            Err(crate::path_identity::IdentityError::NonExistentPath { .. }) => {
+                missing.push(ancestor.file_name()?.to_os_string());
+                ancestor = ancestor.parent()?;
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+fn resolve_route_project_root(
+    identity: &subc_protocol::BindIdentity,
+    scope: Option<&subc_protocol::scope::ScopeStamp>,
+) -> PathBuf {
+    match scope.and_then(|stamp| stamp.workdir.as_deref()) {
+        Some(workdir) => {
+            let workdir = Path::new(workdir);
+            // Invalid stamped paths still go through bind validation; they must
+            // never select a different project through the compatibility fallback.
+            normalized_scope_workdir(workdir).unwrap_or_else(|| workdir.to_path_buf())
+        }
+        None => legacy_unstamped_bind_project_root(identity),
+    }
+}
+
+// Older daemons and session hosts do not always stamp a workdir. Remove this
+// compatibility fallback when BindIdentity no longer carries project_root.
+fn legacy_unstamped_bind_project_root(identity: &subc_protocol::BindIdentity) -> PathBuf {
+    identity.project_root.clone()
+}
+
+fn log_route_project_key_change(
+    identity: &subc_protocol::BindIdentity,
+    project_root: &Path,
+    route: RouteChannel,
+) {
+    // Catalog and consent keys use literal display strings. Compare those strings
+    // so aliases that canonicalize to one folder still produce a key-change log.
+    let bind_key = identity.project_root.display().to_string();
+    let resolved_key = project_root.display().to_string();
+    if bind_key != resolved_key {
+        crate::slog_info!(
+            "subc route project key changed: bind_project_root={} resolved_project_root={} session={} route={}",
+            bind_key,
+            resolved_key,
+            identity.session,
+            route,
+        );
+    }
+}
+
+const MAX_SCOPE_WORKDIR_DIAGNOSTICS: usize = 2;
+
+#[derive(Default)]
+struct ScopeWorkdirDiagnostics {
+    in_flight: StdMutex<HashSet<String>>,
+    pool: OnceLock<crate::bounded_io::IsolatedPool>,
+    #[cfg(test)]
+    idle: std::sync::Condvar,
+}
+
+static SCOPE_WORKDIR_DIAGNOSTICS: LazyLock<Arc<ScopeWorkdirDiagnostics>> =
+    LazyLock::new(|| Arc::new(ScopeWorkdirDiagnostics::default()));
+
+struct ScopeWorkdirPermit {
+    diagnostics: Arc<ScopeWorkdirDiagnostics>,
+    workdir: String,
+}
+
+impl ScopeWorkdirDiagnostics {
+    fn try_admit(self: &Arc<Self>, workdir: &str) -> Result<ScopeWorkdirPermit, &'static str> {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if in_flight.contains(workdir) {
+            return Err("workdir_already_in_flight");
+        }
+        if in_flight.len() >= MAX_SCOPE_WORKDIR_DIAGNOSTICS {
+            return Err("diagnostic_capacity_exhausted");
+        }
+        // The daemon supplies the canonical spelling, including missing tails.
+        // Admission must not touch the filesystem to derive a different key.
+        in_flight.insert(workdir.to_owned());
+        Ok(ScopeWorkdirPermit {
+            diagnostics: Arc::clone(self),
+            workdir: workdir.to_owned(),
+        })
+    }
+}
+
+impl Drop for ScopeWorkdirPermit {
+    fn drop(&mut self) {
+        self.diagnostics
+            .in_flight
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.workdir);
+        #[cfg(test)]
+        self.diagnostics.idle.notify_all();
+    }
+}
+
+fn schedule_scope_workdir_comparison(
+    identity: &subc_protocol::BindIdentity,
+    scope: Option<&subc_protocol::scope::ScopeStamp>,
+) {
+    let Some(stamp) = scope else { return };
+    let Some(workdir) = stamp.workdir.as_deref() else {
+        return;
+    };
+    #[cfg(test)]
+    let observed = scope_workdir_tests::take_comparison_observer();
+    let permit = match SCOPE_WORKDIR_DIAGNOSTICS.try_admit(workdir) {
+        Ok(permit) => permit,
+        Err(reason) => {
+            log_scope_workdir_comparison(identity, stamp, Err(io::Error::other(reason)));
+            #[cfg(test)]
+            if let Some(observed) = observed {
+                let _ = observed.send(());
+            }
+            return;
+        }
+    };
+    let budget = crate::bounded_io::Budget::after(crate::bounded_io::IO_BUDGET);
+    let deadline = tokio::time::Instant::from_std(budget.deadline);
+    let project_root = identity.project_root.clone();
+    let workdir = workdir.to_owned();
+    // A diagnostic must not delay frame processing or serialize project work. The
+    // bounded helper owns all filesystem work; the blocking task only waits for it.
+    let worker = tokio::task::spawn_blocking(move || {
+        compare_scope_workdir(project_root, workdir, budget, permit)
+    });
+    let identity = identity.clone();
+    let stamp = stamp.clone();
+    tokio::spawn(async move {
+        // Include time queued in Tokio's blocking pool in the same budget. Late
+        // filesystem results are discarded and cannot produce a mismatch record.
+        let result = match tokio::time::timeout_at(deadline, worker).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(io::Error::other(format!(
+                "comparison worker failed: {error}"
+            ))),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "filesystem comparison budget expired",
+            )),
+        };
+        log_scope_workdir_comparison(&identity, &stamp, result);
+        #[cfg(test)]
+        if let Some(observed) = observed {
+            let _ = observed.send(());
+        }
+    });
+}
+
+fn compare_scope_workdir(
+    project_root: PathBuf,
+    workdir: String,
+    budget: crate::bounded_io::Budget,
+    permit: ScopeWorkdirPermit,
+) -> io::Result<Option<(PathBuf, PathBuf)>> {
+    // A stamped folder can have a missing tail. Normalize its existing prefix
+    // like a routing root, including Windows path spelling, then append that tail.
+    // Bound the whole walk, including direct canonicalization of the project root.
+    let pool = permit
+        .diagnostics
+        .pool
+        .get_or_init(|| crate::bounded_io::IsolatedPool::new(MAX_SCOPE_WORKDIR_DIAGNOSTICS))
+        .clone();
+    crate::bounded_io::with_budget(Some(budget), || {
+        pool.run(Path::new(&workdir), None, move |workdir| {
+            // Keep both the capacity slot and this folder's deduplication key
+            // until the actual filesystem job exits, not merely until timeout.
+            let _permit = permit;
+            let (Ok(project_root), Some(workdir)) = (
+                ProjectRootId::from_path(project_root),
+                normalized_scope_workdir(&workdir),
+            ) else {
+                return Ok(None);
+            };
+            Ok((workdir.as_path() != project_root.as_path())
+                .then(|| (project_root.into_path_buf(), workdir)))
+        })
+    })
+}
+
+fn log_scope_workdir_comparison(
+    identity: &subc_protocol::BindIdentity,
+    stamp: &subc_protocol::scope::ScopeStamp,
+    result: io::Result<Option<(PathBuf, PathBuf)>>,
+) {
+    match result {
+        Ok(Some((project_root, workdir))) => crate::slog_info!(
+            "subc scope workdir differs: project_root={} workdir={} session={} project_id={}",
+            project_root.display(),
+            workdir.display(),
+            identity.session,
+            stamp.project_id.as_deref().unwrap_or("none"),
+        ),
+        Ok(None) => {}
+        Err(error) => crate::slog_info!(
+            "subc scope workdir comparison skipped: project_root={} workdir={} session={} project_id={} reason={}",
+            identity.project_root.display(),
+            stamp.workdir.as_deref().unwrap_or("none"),
+            identity.session,
+            stamp.project_id.as_deref().unwrap_or("none"),
+            error,
+        ),
+    }
+}
+
 /// Channel-0 control requests: RouteBind plus the cached health probe.
 /// Tool-provider binds reconcile RootConfig through the executor's Mutating lane;
 /// management binds install immediately without creating project state.
 #[allow(clippy::too_many_arguments)]
 async fn handle_control_request(
     tx: &WriterSender,
+    legacy_tx: &WriterSender,
+    a0: &A0Egress,
     frame: &Frame,
     shared_app: &Arc<App>,
     executor: &Arc<Executor>,
@@ -7230,7 +8234,7 @@ async fn handle_control_request(
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
-    management_routes: &mut HashMap<RouteChannel, Option<Principal>>,
+    management_routes: &mut HashMap<RouteChannel, ManagementIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
@@ -7242,7 +8246,7 @@ async fn handle_control_request(
     retry_buffer: &mut RetryBuffer,
     push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
     shutdown: &Arc<Notify>,
-    control_completion_tx: &mpsc::Sender<RouteBindCompletion>,
+    control_completion_tx: &mpsc::Sender<ControlCompletion>,
     metrics: &Arc<DispatchPathMetrics>,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
     health_rollup_cache: &HealthRollupCache,
@@ -7251,11 +8255,14 @@ async fn handle_control_request(
     user_config_path: Option<&Path>,
     tool_response_body_limit: usize,
     run_scopes: Option<&run_scope::RunScopes>,
+    storage_dir: &Path,
 ) -> Result<(), SubcError> {
+    metrics.mark_frame_loop_entry("handle_control_request", frame);
     let request = match serde_json::from_slice::<ModuleControlRequest>(&frame.body) {
         Ok(request) => request,
         Err(error) => return refuse_undecodable_control_request(tx, frame, &error, metrics).await,
     };
+    metrics.mark_frame_loop_control(&request, frame);
     match request {
         ModuleControlRequest::RouteBind {
             route_channel,
@@ -7270,6 +8277,11 @@ async fn handle_control_request(
             call_mode,
         } => {
             let route_id = route_key(route_channel, epoch);
+            bind_log::consumer_capabilities(
+                &principal,
+                &identity.harness,
+                consumer_capabilities.as_deref().unwrap_or_default(),
+            );
             // Whether the daemon stamped this bind with a scope decides what a
             // tool call without a preset gets (refused when scoped, the
             // unscoped default otherwise), so every bind says which it was.
@@ -7283,6 +8295,7 @@ async fn handle_control_request(
                 ),
                 if role_versions.is_some() { "declared" } else { "none" }
             );
+            schedule_scope_workdir_comparison(&identity, scope.as_ref());
             if epoch == 0 {
                 return send_route_bind_error(
                     tx,
@@ -7305,6 +8318,31 @@ async fn handle_control_request(
             };
 
             let bind_trust = trust_for_bind(&identity.harness, &principal);
+            if installed_route_epochs
+                .get(&route_channel)
+                .is_some_and(|installed| *installed >= epoch)
+            {
+                return send_route_bind_error(
+                    tx,
+                    frame,
+                    "config_divergence",
+                    "route bind generation is not newer than the installed generation",
+                    metrics,
+                )
+                .await;
+            }
+            let reservation = match a0.reserve(
+                route_id,
+                frame.header.ver,
+                frame.header.corr,
+                frame.header.flags,
+                metrics,
+            ) {
+                Ok(reservation) => reservation,
+                Err(refusal) => {
+                    return send_route_bind_error_body(tx, frame, &refusal, metrics).await
+                }
+            };
             if let RouteTarget::ManagementSurface { module_id } = &target {
                 if let Err(refusal) = flow_read::admit_management(scope.as_ref()) {
                     return send_route_bind_error_body(tx, frame, &refusal, metrics).await;
@@ -7319,7 +8357,9 @@ async fn handle_control_request(
                     )
                     .await;
                 }
-                if !matches!(bind_trust, BindTrust::FirstParty) {
+                if !matches!(bind_trust, BindTrust::FirstParty)
+                    && diagnostics_findings::admit_flow(scope.as_ref()).is_err()
+                {
                     return send_route_bind_error(
                         tx,
                         frame,
@@ -7329,6 +8369,14 @@ async fn handle_control_request(
                     )
                     .await;
                 }
+                let admission = if scope
+                    .as_ref()
+                    .is_some_and(diagnostics_findings::is_flow_scope)
+                {
+                    ManagementAdmission::FlowOnly
+                } else {
+                    ManagementAdmission::FirstParty
+                };
                 if let Some(installed_epoch) = installed_route_epochs.get(&route_channel).copied() {
                     if installed_epoch >= epoch {
                         return send_route_bind_error(
@@ -7340,8 +8388,9 @@ async fn handle_control_request(
                         )
                         .await;
                     }
+                    a0.supersede(route_key(route_channel, installed_epoch));
                     teardown_installed_route(
-                        tx,
+                        legacy_tx,
                         metrics,
                         executor,
                         route_key(route_channel, installed_epoch),
@@ -7380,15 +8429,37 @@ async fn handle_control_request(
                 }
 
                 installed_route_epochs.insert(route_channel, epoch);
-                management_routes.insert(route_id, principal);
-                return send_route_bind_ack(
-                    tx,
-                    frame.header.ver,
-                    frame.header.corr,
-                    frame.header.flags,
-                    metrics,
-                )
-                .await;
+                let _publication = reservation.commit();
+                let ack =
+                    route_bind_ack_frame(frame.header.ver, frame.header.corr, frame.header.flags)?;
+                if a0
+                    .enqueue_ack(
+                        route_id,
+                        ack,
+                        ControlCompletion::ManagementAckWritten {
+                            route: route_id,
+                            identity: ManagementIdentity {
+                                principal,
+                                scope,
+                                admission,
+                            },
+                            corr: frame.header.corr,
+                        },
+                        metrics,
+                    )
+                    .is_err()
+                {
+                    remove_installed_route(installed_route_epochs, route_id);
+                    return send_route_bind_error(
+                        tx,
+                        frame,
+                        "actor_not_ready",
+                        "route bind ACK publication is busy; retry shortly",
+                        metrics,
+                    )
+                    .await;
+                }
+                return Ok(());
             }
             if matches!(&target, RouteTarget::InternalService { .. }) {
                 return send_route_bind_error(
@@ -7400,7 +8471,23 @@ async fn handle_control_request(
                 )
                 .await;
             }
+            // Occipital reaches AFT only through tool-provider v1 routes: their
+            // provider reads and admitted carrier calls. The legacy grammar has
+            // neither the chunk queries nor carrier admission, so refuse it.
+            if route_role == tool_provider::RouteRole::Legacy
+                && principal_id(&principal).as_deref() == Some(rich_ui::chunks::OCCIPITAL_PRINCIPAL)
+            {
+                return send_route_bind_error(
+                    tx,
+                    frame,
+                    "route_refused",
+                    "reserved:occipital binds only tool-provider v1 routes",
+                    metrics,
+                )
+                .await;
+            }
 
+            let bind_project_root = resolve_route_project_root(&identity, scope.as_ref());
             let mut bind_root_id = None;
             if let Some(installed_epoch) = installed_route_epochs.get(&route_channel).copied() {
                 if installed_epoch >= epoch {
@@ -7414,7 +8501,7 @@ async fn handle_control_request(
                     .await;
                 }
 
-                let replacement_root = match ProjectRootId::from_path(&identity.project_root) {
+                let replacement_root = match ProjectRootId::from_path(&bind_project_root) {
                     Ok(root_id) => root_id,
                     Err(error) => {
                         return send_route_bind_error(
@@ -7427,8 +8514,9 @@ async fn handle_control_request(
                         .await;
                     }
                 };
+                a0.supersede(route_key(route_channel, installed_epoch));
                 teardown_installed_route(
-                    tx,
+                    legacy_tx,
                     metrics,
                     executor,
                     route_key(route_channel, installed_epoch),
@@ -7470,7 +8558,7 @@ async fn handle_control_request(
                 Some(root_id) => root_id,
                 None => match {
                     metrics.mark_frame_loop_wait("disk/canonicalize_root", None);
-                    ProjectRootId::from_path(&identity.project_root)
+                    ProjectRootId::from_path(&bind_project_root)
                 } {
                     Ok(root_id) => root_id,
                     Err(error) => {
@@ -7485,11 +8573,11 @@ async fn handle_control_request(
                     }
                 },
             };
+            log_route_project_key_change(&identity, &bind_project_root, route_id);
 
-            // Reconcile RootConfig: build a configure request from the bind
-            // identity + forwarded config tiers and run it through the executor.
+            // Reconcile RootConfig using the resolved project and the local
+            // config tiers, then run it through the executor.
             let request_id = format!("subc-bind-{route_channel}");
-            let bind_project_root = identity.project_root.clone();
             let bind_harness = identity.harness.clone();
             let bind_session = identity.session.clone();
             let bind_principal_id = principal_id(&principal);
@@ -7500,6 +8588,7 @@ async fn handle_control_request(
             let consumer_elicitation_capable = consumer_capabilities
                 .as_ref()
                 .is_some_and(|capabilities| capabilities.iter().any(|c| c == "elicitation"));
+            let tool_result_body = result_body::accepts(consumer_capabilities.as_deref());
             log::info!(
                 "subc attach: route {} harness={} principal={} trust={} elicitation={}",
                 route_channel,
@@ -7514,22 +8603,40 @@ async fn handle_control_request(
             // The resolver selects only this bind's harness override before it
             // applies the unchanged user/project trust boundary.
             metrics.mark_frame_loop_wait("disk/local_config", None);
-            let local_tiers = crate::subc_config::read_local_cortexkit_config_tiers(
-                user_config_path,
-                Path::new(&bind_project_root),
-            );
+            // Invalid harnesses still reach configure's existing typed refusal.
+            let active_harness = bind_harness.parse::<crate::harness::Harness>().ok();
+            let prepared_config = match active_harness.as_ref() {
+                Some(harness) => match crate::subc_config::PreparedBindConfig::read(
+                    user_config_path,
+                    Path::new(&bind_project_root),
+                    harness,
+                ) {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(error) => {
+                        let code = if error.code == "config_rejected" {
+                            "config_divergence"
+                        } else {
+                            error.code
+                        };
+                        return send_route_bind_error(tx, frame, code, &error.to_string(), metrics)
+                            .await;
+                    }
+                },
+                None => None,
+            };
+            let local_tiers = prepared_config
+                .as_ref()
+                .map_or(&[][..], |snapshot| snapshot.tiers());
             let config_tiers: Vec<Value> = local_tiers
                 .iter()
                 .map(|t| json!({ "tier": t.tier, "source": t.source, "doc": t.doc }))
                 .collect();
             // Let configure return its structured invalid-harness error rather
             // than panicking while computing this optional registration setting.
-            let active_harness = bind_harness.parse::<crate::harness::Harness>().ok();
-            let bind_config = crate::config_resolve::resolve_config_for_harness(
-                &local_tiers,
-                active_harness.as_ref(),
-            )
-            .config;
+            let bind_config = prepared_config
+                .as_ref()
+                .map(|snapshot| snapshot.resolved().clone())
+                .unwrap_or_default();
             let diagnostics_on_edit = bind_config.diagnostics_on_edit;
             let bind_disabled_tools = Arc::new(bind_config.disabled_tools);
             let configure_json = json!({
@@ -7571,6 +8678,7 @@ async fn handle_control_request(
                     principal_id: bind_principal_id,
                 },
                 consumer_elicitation_capable,
+                tool_result_body,
                 disabled_tools: bind_disabled_tools,
                 run_scope: OnceLock::new(),
                 call_mode: call_mode.unwrap_or(subc_protocol::call_mode::CallMode::Classic),
@@ -7582,6 +8690,7 @@ async fn handle_control_request(
                 scopes.bind(&route_identity);
             }
             let configure_session = route_identity.session.clone();
+            let bind_session = configure_session.clone();
             let root_was_live = live_roots.contains_key(&bind_root_id);
             metrics.mark_frame_loop_wait(
                 "executor.scheduler/register_actor",
@@ -7594,10 +8703,14 @@ async fn handle_control_request(
                 &bind_root_id,
                 route_channel,
                 root_was_live,
+                storage_dir,
             );
 
             sync_bg_live_delivery_sessions(executor, routes, Some(&bind_root_id), Some(metrics));
             let configure_request_id = configure_req.id.clone();
+            let expected_snapshot_id = prepared_config.as_ref().map(|snapshot| snapshot.id());
+            let applied_snapshot = Arc::new(AtomicU64::new(0));
+            let job_snapshot = Arc::clone(&applied_snapshot);
             installed_route_epochs.insert(route_channel, epoch);
             if let Some(meta) = live_roots.get_mut(&bind_root_id) {
                 meta.maintenance_queued_kinds.clear();
@@ -7610,6 +8723,7 @@ async fn handle_control_request(
                 "executor.scheduler/submit_bind",
                 Some(executor.scheduler_lock_diagnostics()),
             );
+            let publication = reservation.commit();
             let (configure_rx, configure_cancellation) = executor.submit_bind_cancellable_async(
                 bind_root_id.clone(),
                 configure_request_id.clone(),
@@ -7618,7 +8732,20 @@ async fn handle_control_request(
                     Arc::new(move |ctx| {
                         log_ctx::with_session(Some(configure_session.clone()), || {
                             let bind_started = Instant::now();
-                            let response = dispatch(configure_req.clone(), ctx);
+                            job_snapshot.store(0, Ordering::Release);
+                            let response = match prepared_config.as_ref() {
+                                Some(snapshot) => crate::subc_config::with_prepared_bind_config(
+                                    Arc::clone(snapshot),
+                                    || dispatch(configure_req.clone(), ctx),
+                                ),
+                                None => dispatch(configure_req.clone(), ctx),
+                            };
+                            if response.success {
+                                job_snapshot.store(
+                                    ctx.config_live().applied_bind_snapshot().unwrap_or(0),
+                                    Ordering::Release,
+                                );
+                            }
                             if response.success {
                                 // Revoke matching standing publication before the
                                 // session is installed, but never on the frame loop.
@@ -7641,6 +8768,7 @@ async fn handle_control_request(
             pending_binds.insert(
                 route_id,
                 PendingBind {
+                    ack_publication: Some(publication),
                     bind_root_id: bind_root_id.clone(),
                     inserted_new_actor,
                     cancelled: false,
@@ -7652,6 +8780,7 @@ async fn handle_control_request(
                     ver: frame.header.ver,
                     flags: frame.header.flags,
                     cancellation: configure_cancellation,
+                    session: Some(bind_session),
                 },
             );
 
@@ -7673,6 +8802,11 @@ async fn handle_control_request(
                 // read data, so a later maintenance pass can do it without delaying the
                 // daemon's confirmation that the route is usable.
                 let completion = RouteBindCompletion {
+                    expected_snapshot_id,
+                    applied_snapshot_id: match applied_snapshot.load(Ordering::Acquire) {
+                        0 => None,
+                        id => Some(id),
+                    },
                     route: route_key(completion_route_channel, epoch),
                     identity: completion_identity,
                     bind_root_id: completion_root,
@@ -7686,7 +8820,7 @@ async fn handle_control_request(
                 if send_counted_channel(
                     &completion_tx,
                     &completion_metrics.control_completion_queued,
-                    completion,
+                    ControlCompletion::ConfigureReady(completion),
                 )
                 .await
                 .is_err()
@@ -7714,6 +8848,16 @@ async fn handle_control_request(
                 pending_binds,
                 metrics,
                 health_rollup_cache,
+                route_census::snapshot(
+                    live_roots,
+                    root_channels,
+                    routes,
+                    active_tool_calls,
+                    executor,
+                    metrics,
+                    Instant::now(),
+                )
+                .summary(),
             )
             .await
         }
@@ -7728,11 +8872,14 @@ async fn handle_management_request(
     executor: &Arc<Executor>,
     live_roots: &HashMap<ProjectRootId, RootMeta>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    active_tool_calls: &ActiveToolCalls,
     health_rollup_cache: &Arc<HealthRollupCache>,
     metrics: &Arc<DispatchPathMetrics>,
     principal: Option<&Principal>,
     storage_dir: &Path,
 ) -> Result<(), SubcError> {
+    metrics.mark_frame_loop_entry("handle_management_request", frame);
     let decoded = serde_json::from_slice::<Value>(&frame.body).ok();
     let operation = decoded
         .as_ref()
@@ -7751,6 +8898,7 @@ async fn handle_management_request(
         return send_reliable_writer_frame(tx, metrics, error, "management refusal").await;
     };
 
+    metrics.mark_frame_loop_command("handle_management_request", operation, frame.header.corr);
     let result = match operation {
         crate::commands::bash_kill_scope::BASH_KILL_SCOPE_OPERATION => {
             let params = decoded
@@ -7786,6 +8934,15 @@ async fn handle_management_request(
                 shared_app,
                 executor,
                 census_route_rows(live_roots, root_channels),
+                route_census::snapshot(
+                    live_roots,
+                    root_channels,
+                    routes,
+                    active_tool_calls,
+                    executor,
+                    metrics,
+                    Instant::now(),
+                ),
                 health_rollup_cache,
                 metrics,
             );
@@ -7909,6 +9066,25 @@ async fn handle_management_request(
                 None => crate::commands::health_digest::root_not_bound_response(&request, root),
             }
         }
+        operation if page_collect::is_page_operation(operation) => {
+            let params = decoded
+                .as_ref()
+                .and_then(|value| value.get("params"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            spawn_page_operation(
+                tx,
+                frame,
+                operation,
+                params,
+                principal.cloned(),
+                routes,
+                executor,
+                metrics,
+                storage_dir,
+            );
+            return Ok(());
+        }
         _ => {
             let error = build_error_frame(
                 frame.header.ver,
@@ -7960,6 +9136,7 @@ fn spawn_memory_census(
     shared_app: &Arc<App>,
     executor: &Arc<Executor>,
     route_rows: Vec<CensusRouteRow>,
+    ownership: route_census::Snapshot,
     health_rollup_cache: &Arc<HealthRollupCache>,
     metrics: &Arc<DispatchPathMetrics>,
 ) {
@@ -7973,7 +9150,8 @@ fn spawn_memory_census(
     tokio::spawn(async move {
         let _response_task = ResponseTaskGuard::new(&metrics);
         let census = health::fresh_memory_census(&cache, deadline).await;
-        let census = with_census_route_rows(census, &shared_app, &executor, &route_rows);
+        let mut census = with_census_route_rows(census, &shared_app, &executor, &route_rows);
+        census["route_ownership"] = ownership.render(&executor);
         if let Err(error) = send_management_response(
             &tx,
             &frame,
@@ -8069,10 +9247,23 @@ fn gh_relay_operation(frame: &Frame) -> Option<String> {
 /// command; the relay finds that route by the session its ticket names.
 fn gh_relay_route_scopes(
     routes: &HashMap<RouteChannel, RouteIdentity>,
+    speech: &Arc<crate::gh_shim_speech::service::Service>,
 ) -> crate::gh_shim_relay::RouteScopes {
     let mut scopes = crate::gh_shim_relay::RouteScopes::default();
-    for identity in routes.values() {
+    scopes.speech = Some(Arc::clone(speech));
+    for (channel, identity) in routes {
         scopes.push(&identity.session, identity.scope.clone());
+        scopes.push_origin(
+            crate::gh_shim_speech::model::RouteOrigin {
+                run_nonce: crate::gh_shim_speech::service::run_nonce()
+                    .unwrap_or_default()
+                    .into(),
+                connection_generation: speech.generation(),
+                channel: u32::from(channel.channel),
+                epoch: u64::from(channel.epoch),
+            },
+            identity.scope.clone(),
+        );
     }
     scopes
 }
@@ -8092,7 +9283,12 @@ fn spawn_gh_relay(
     let frame = frame.clone();
     let relay = Arc::clone(relay);
     let metrics = Arc::clone(metrics);
+    let speech_work = route_scopes
+        .speech
+        .as_ref()
+        .map(|speech| speech.track_finalization());
     tokio::spawn(async move {
+        let _speech_work = speech_work;
         let decoded = serde_json::from_slice::<Value>(&frame.body).unwrap_or(Value::Null);
         let operation = decoded
             .get("op")
@@ -8134,6 +9330,125 @@ fn spawn_gh_relay(
             send_reliable_writer_frame(&tx, &metrics, response, "gh shim relay response").await
         {
             log::warn!("gh_shim relay: could not queue the reply: {error}");
+        }
+    });
+}
+
+/// Bit 0 of a frame's flags byte: the body is raw bytes, not JSON
+/// (`Flags::is_binary`). subc-protocol does not export the constant.
+const FRAME_FLAG_BINARY: u8 = 0b0000_0001;
+
+/// Run a page-bundle operation off the frame loop: a collection reads files
+/// and checks policy, and every operation touches the snapshot folder.
+#[allow(clippy::too_many_arguments)]
+fn spawn_page_operation(
+    tx: &WriterSender,
+    frame: &Frame,
+    operation: &str,
+    params: Value,
+    principal: Option<Principal>,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    executor: &Arc<Executor>,
+    metrics: &Arc<DispatchPathMetrics>,
+    storage_dir: &Path,
+) {
+    use crate::page_collect as page;
+    let store = page::snapshot::SnapshotStore::for_storage(storage_dir);
+    // Only the named session's routes leave the frame loop.
+    let routes = match (
+        params.get("harness").and_then(Value::as_str),
+        params.get("session").and_then(Value::as_str),
+    ) {
+        (Some(harness), Some(session)) if operation == page::COLLECT_OPERATION => {
+            page_collect::session_routes(routes, harness, session)
+                .into_iter()
+                .collect()
+        }
+        _ => HashMap::new(),
+    };
+    let tx = tx.clone();
+    let frame = frame.clone();
+    let executor = Arc::clone(executor);
+    let metrics = Arc::clone(metrics);
+    let operation = operation.to_string();
+    tokio::spawn(async move {
+        let _response_task = ResponseTaskGuard::new(&metrics);
+        let id = format!("management-{}", operation.replace('.', "-"));
+        let internal = |error: tokio::task::JoinError| {
+            Response::error(id.as_str(), "internal_error", error.to_string())
+        };
+        let sent = match operation.as_str() {
+            page::COLLECT_OPERATION => {
+                let call = page_collect::CollectCall {
+                    params,
+                    principal,
+                    routes,
+                    executor,
+                    store: Arc::clone(&store),
+                };
+                let result = tokio::task::spawn_blocking(move || page_collect::collect(call))
+                    .await
+                    .unwrap_or_else(internal);
+                if result.success {
+                    // Delete the snapshot when it expires even if nobody
+                    // calls again.
+                    tokio::spawn(async move {
+                        tokio::time::sleep(page::snapshot::TTL + Duration::from_millis(50)).await;
+                        let _ = tokio::task::spawn_blocking(move || store.expire_due()).await;
+                    });
+                }
+                send_management_response(&tx, &frame, &operation, result, &metrics).await
+            }
+            page::READ_OPERATION => {
+                let reply = tokio::task::spawn_blocking(move || {
+                    page_collect::read(params, principal.as_ref(), &store)
+                })
+                .await;
+                match reply {
+                    Ok(page_collect::ReadReply::Bytes(bytes)) => {
+                        // The bytes are the whole body, flagged binary, as
+                        // subc-protocol's bulk lane carries raw bytes.
+                        match Frame::build_with_version(
+                            frame.header.ver,
+                            FrameType::Response,
+                            Flags(frame.header.flags.0 | FRAME_FLAG_BINARY),
+                            frame.header.channel,
+                            frame.header.epoch,
+                            frame.header.corr,
+                            bytes,
+                        ) {
+                            Ok(response) => {
+                                send_reliable_writer_frame(
+                                    &tx,
+                                    &metrics,
+                                    response,
+                                    "page.read bytes",
+                                )
+                                .await
+                            }
+                            Err(error) => Err(SubcError::FrameBuild(error)),
+                        }
+                    }
+                    Ok(page_collect::ReadReply::Refused(response)) => {
+                        send_management_response(&tx, &frame, &operation, response, &metrics).await
+                    }
+                    Err(error) => {
+                        send_management_response(&tx, &frame, &operation, internal(error), &metrics)
+                            .await
+                    }
+                }
+            }
+            _ => {
+                let result = tokio::task::spawn_blocking(move || {
+                    page_collect::release(params, principal.as_ref(), &store)
+                })
+                .await
+                .unwrap_or_else(internal);
+                send_management_response(&tx, &frame, &operation, result, &metrics).await
+            }
+        };
+        if let Err(error) = sent {
+            log::warn!("{operation}: could not queue the reply: {error}");
         }
     });
 }
@@ -8294,18 +9609,11 @@ fn install_bash_compressor(ctx: &AppContext) {
     );
 }
 
-async fn send_route_bind_ack(
-    tx: &WriterSender,
-    ver: u8,
-    corr: u64,
-    flags: Flags,
-    metrics: &DispatchPathMetrics,
-) -> Result<(), SubcError> {
+fn route_bind_ack_frame(ver: u8, corr: u64, flags: Flags) -> Result<Frame, SubcError> {
     let body =
         serde_json::to_vec(&ModuleControlResponse::RouteBindAck {}).map_err(SubcError::Json)?;
-    let response = Frame::build_with_version(ver, FrameType::Response, flags, 0, 0, corr, body)
-        .map_err(SubcError::FrameBuild)?;
-    send_reliable_writer_frame(tx, metrics, response, "RouteBindAck").await
+    Frame::build_with_version(ver, FrameType::Response, flags, 0, 0, corr, body)
+        .map_err(SubcError::FrameBuild)
 }
 
 /// Longest decode-error text a refusal carries back to the sender; serde can
@@ -8483,6 +9791,141 @@ async fn send_provider_error(
     send_reliable_writer_frame(tx, metrics, response, "v1 refusal").await
 }
 
+/// Whether the route was bound by the authenticated principal
+/// `reserved:occipital`. This reads the route's own bind principal, not a
+/// codemode run principal: routes in the route table never carry a run owner.
+fn occipital_route(identity: &RouteIdentity) -> bool {
+    matches!(&identity.spawn_principal, AuthenticatedPrincipal::RouteBind { principal_id: Some(id), .. }
+        if id == rich_ui::chunks::OCCIPITAL_PRINCIPAL)
+}
+
+/// Whether an Occipital route carries another principal's session: it is
+/// scoped, and its stamp's owner is not Occipital itself. Only such a route
+/// may take session calls.
+fn occipital_carrier_route(identity: &RouteIdentity) -> bool {
+    occipital_route(identity)
+        && identity.scope.as_ref().is_some_and(|scope| {
+            principal_id(&Some(scope.owner.clone())).as_deref()
+                != Some(rich_ui::chunks::OCCIPITAL_PRINCIPAL)
+        })
+}
+
+fn admit_management_flow_request(
+    identity: &ManagementIdentity,
+    body: Option<&Value>,
+) -> Result<(), ErrorBody> {
+    if identity.admission != ManagementAdmission::FlowOnly {
+        return Ok(());
+    }
+    let operation = body
+        .and_then(|body| body.get("method").or_else(|| body.get("op")))
+        .and_then(Value::as_str);
+    if !operation.is_some_and(|operation| manifest::FLOW_OPERATIONS.contains(&operation)) {
+        return Err(ErrorBody::new(
+            "flow_scope_not_supported",
+            "a flow may call only diagnostics.findings on an AFT management route",
+        ));
+    }
+    diagnostics_findings::admit_flow(identity.scope.as_ref())
+}
+
+/// Whether a route request is a tool call: either `op: "tool.call"`, or the
+/// bare form with no `op` whose `name` is not a provider operation.
+fn route_request_is_tool_call(envelope: &Value) -> bool {
+    match envelope.get("op").and_then(Value::as_str) {
+        Some(operation) => operation == "tool.call",
+        None => !envelope
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| {
+                tool_provider::recognized_operation(name)
+                    || rich_ui::chunks::is_chunk_operation(name)
+            }),
+    }
+}
+
+/// An Occipital route that carries no other session (unscoped, or scoped by a
+/// stamp Occipital owns) admits provider reads only. A tool call there has no
+/// session to run in, so it refuses `session_not_bound` before the carrier
+/// gate or any other tool-call admission step runs.
+fn occipital_session_refusal(
+    identity: &RouteIdentity,
+    envelope: &Value,
+) -> Option<subc_protocol::ErrorBody> {
+    (occipital_route(identity)
+        && !occipital_carrier_route(identity)
+        && route_request_is_tool_call(envelope))
+    .then(|| rich_ui::chunks::refusal("session_not_bound"))
+}
+
+/// The chunk query a route request names, either as `op` or, in the bare
+/// form, as `name`, with the request body that carries its digest and index.
+fn chunk_query(envelope: &Value) -> Option<(&str, Value)> {
+    match envelope.get("op").and_then(Value::as_str) {
+        Some(operation) if rich_ui::chunks::is_chunk_operation(operation) => {
+            let mut body = envelope.clone();
+            if let Some(body) = body.as_object_mut() {
+                body.remove("op");
+            }
+            Some((operation, body))
+        }
+        Some(_) => None,
+        None => {
+            let name = envelope.get("name").and_then(Value::as_str)?;
+            rich_ui::chunks::is_chunk_operation(name).then(|| {
+                (
+                    name,
+                    envelope
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or_else(|| json!({})),
+                )
+            })
+        }
+    }
+}
+
+/// Answer a rich-UI chunk query on the route it arrived on. Admission is by
+/// the route's authenticated principal alone, scoped or unscoped; the query
+/// names no session. A reply is a Response frame holding the chunk; every
+/// refusal is a typed Error frame through [`send_provider_error`].
+async fn answer_chunk_query(
+    tx: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    frame: &Frame,
+    identity: &RouteIdentity,
+    operation: &str,
+    body: &Value,
+    db: Option<&StdMutex<crate::db::TrackedConnection>>,
+) -> Result<(), SubcError> {
+    let principal = match &identity.spawn_principal {
+        AuthenticatedPrincipal::RouteBind { principal_id, .. } => principal_id.as_deref(),
+        AuthenticatedPrincipal::FirstParty => None,
+    };
+    let answer = rich_ui::chunks::admit_principal(principal).and_then(|()| {
+        if operation == rich_ui::chunks::MANIFEST_CHUNK {
+            rich_ui::chunks::manifest_chunk(body)
+        } else {
+            rich_ui::chunks::template_chunk(body, db)
+        }
+    });
+    let answer = match answer {
+        Ok(answer) => answer,
+        Err(error) => return send_provider_error(tx, metrics, frame, error).await,
+    };
+    let response = Frame::build_with_version(
+        frame.header.ver,
+        FrameType::Response,
+        frame.header.flags,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+        serde_json::to_vec(&answer).map_err(SubcError::Json)?,
+    )
+    .map_err(SubcError::FrameBuild)?;
+    send_reliable_writer_frame(tx, metrics, response, "rich-ui chunk").await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn submit_provider_read(
     tx: &WriterSender,
@@ -8494,6 +9937,7 @@ async fn submit_provider_read(
     operation: &str,
     body: Value,
     mut phase_trace: PhaseTrace,
+    request: RequestFrameMeta,
 ) -> Result<(), SubcError> {
     let route = route_key(frame.header.channel, frame.header.epoch);
     let corr = frame.header.corr;
@@ -8506,50 +9950,38 @@ async fn submit_provider_read(
     let project_root = identity.project_root.clone();
     let request_id = format!("subc-{}-{}", route.channel, corr);
     let job_id = request_id.clone();
-    // Worker catalogs can materialize persisted launch params even on a
-    // parameterless refetch. Serialize them with grant revocation before replying.
-    let freeze_policy = operation.starts_with("grants.")
-        || remote_policy::key(&identity, body.get("preset").and_then(Value::as_str)).is_some()
-        || body
-            .get("params")
-            .and_then(Value::as_object)
-            .is_some_and(|p| p.contains_key("allow_paths"));
+    let provider_root = identity.root.clone();
+    let received_at = phase_trace.received_at();
+    let admission_deadline = request
+        .deadline
+        .map_or(received_at + Duration::from_secs(2), |deadline| {
+            deadline.at().min(received_at + Duration::from_secs(2))
+        });
     phase_trace.mark_executor_submitted();
     let (trace_tx, trace_rx) = oneshot::channel();
-    let rx = submit_active_tool_call(
+    let mut rx = submit_active_tool_call(
         executor,
         active,
         route,
         corr,
         identity.root.clone(),
-        if freeze_policy {
-            Lane::Mutating
-        } else {
-            Lane::PureRead
-        },
+        Lane::ProviderMetadata,
         request_id.clone(),
-        RouteDetachPolicy::CancelOnDetach,
+        RouteDetachPolicy::RetainForReplay,
         &operation,
-        RequestFrameMeta { ver, flags },
+        request,
         Box::new(move |ctx| {
             phase_trace.mark_job_admitted();
             let result = if job_operation == "role.describe" {
                 Ok(tool_provider::describe())
+            } else if job_operation.starts_with("grants.") && ctx.database_runtime_initializing() {
+                Err(subc_protocol::ErrorBody::new(
+                    "grants_unavailable",
+                    "scope persistence unavailable",
+                ))
             } else if job_operation.starts_with("grants.") {
-                crate::database_open::run_staged_open(
-                    ctx,
-                    crate::database_open::DatabaseOpenRunner::ConfigureTail,
-                    true,
-                );
                 access_grants::operation(body, &job_operation, &identity, ctx)
             } else {
-                if freeze_policy {
-                    crate::database_open::run_staged_open(
-                        ctx,
-                        crate::database_open::DatabaseOpenRunner::ConfigureTail,
-                        true,
-                    );
-                }
                 remote_policy::catalog(body, &identity, ctx)
             };
             if job_operation == "tool.catalog" {
@@ -8586,9 +10018,61 @@ async fn submit_provider_read(
     let tx = tx.clone();
     let metrics = metrics.clone();
     let active = active.clone();
+    let provider_executor = executor.clone();
+    let cancellation = active
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(route, corr))
+        .expect("provider call registered before submission")
+        .cancellation
+        .clone();
     tokio::spawn(async move {
-        let response = await_executor_response(rx, request_id).await;
-        let phase_trace = trace_rx.await.ok();
+        let (response, phase_trace) = match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(admission_deadline),
+            &mut rx,
+        )
+        .await
+        {
+            Ok(response) => (
+                response.unwrap_or_else(|_| {
+                    Response::error(request_id, "internal_error", "executor dropped")
+                }),
+                trace_rx.await.ok(),
+            ),
+            Err(_) => {
+                match provider_executor.cancel_job_before_execution(&provider_root, &cancellation) {
+                    PreExecutionCancelOutcome::AlreadyStarted => (
+                        await_executor_response(rx, request_id).await,
+                        trace_rx.await.ok(),
+                    ),
+                    PreExecutionCancelOutcome::QueuedRemoved
+                    | PreExecutionCancelOutcome::DispatchedCancelled => {
+                        if let Some(deadline) = request.deadline {
+                            deadline.log_drop(&operation, "provider_admission_timeout");
+                        } else {
+                            log::warn!("queued tool_call dropped name={operation:?} reason=provider_admission_timeout queue_ms={} deadline_ms=none admission_budget_ms=2000",
+                            received_at.elapsed().as_millis());
+                        }
+                        let code = if request
+                            .deadline
+                            .is_some_and(|deadline| deadline.at() <= Instant::now())
+                        {
+                            "deadline_exceeded"
+                        } else {
+                            "provider_busy"
+                        };
+                        (
+                            Response::error(
+                                request_id,
+                                code,
+                                "provider admission deadline exceeded; no operation ran",
+                            ),
+                            None,
+                        )
+                    }
+                }
+            }
+        };
         if !claim_active_tool_call(&active, route, corr) {
             if operation == "tool.catalog" {
                 log::warn!(
@@ -8605,6 +10089,8 @@ async fn submit_provider_read(
             (FrameType::Error, error.clone())
         } else if let Some(answer) = response.data.get("answer") {
             (FrameType::Response, answer.clone())
+        } else if !response.success {
+            (FrameType::Error, response.data.clone())
         } else {
             (
                 FrameType::Error,
@@ -8711,6 +10197,7 @@ pub(super) static PLAIN_RUN_IO_BUDGET_FOR_TEST: std::sync::LazyLock<
 /// held for a consent answer can run again with the approved capabilities.
 #[derive(Clone)]
 struct PlainToolRun {
+    speech_seed: Option<crate::gh_shim_speech::service::LaunchSeed>,
     bare_name: String,
     arguments: Value,
     format_context: crate::subc_format::FormatContext,
@@ -8743,6 +10230,7 @@ impl PlainToolRun {
         let runtime = tokio::runtime::Handle::current();
         Box::new(move |ctx| {
             let PlainToolRun {
+                speech_seed,
                 bare_name,
                 mut arguments,
                 format_context,
@@ -8756,9 +10244,6 @@ impl PlainToolRun {
                 approved_io_window,
                 reply_deadline,
             } = run_spec;
-            if matches!(ask_route, crate::access_policy::AskRoute::Plugin { .. }) {
-                ctx.mark_standalone_plugin_host();
-            }
             if matches!(ask_route, crate::access_policy::AskRoute::Plugin { .. }) {
                 if let Some(args) = arguments.as_object_mut() {
                     args.remove("permissions_granted");
@@ -8779,40 +10264,73 @@ impl PlainToolRun {
                 io_budget
             };
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
+            let _result_body = result_body::enter(identity_for_run.tool_result_body);
+            let observation_only = carrier_read_only::restricted(&identity_for_run);
             phase_trace.mark_job_admitted();
             log_ctx::with_session(Some(identity_for_run.session.clone()), || {
-                let run = || {
-                    let finalizer = |response: &mut Response, text: &mut String| {
-                        crate::response_finalize::finalize_tool_response(
-                            response,
-                            text,
-                            ctx,
-                            &identity_for_run.session,
-                            &bare_name,
-                            bind_trust.allows_bash_observation()
-                                && !crate::context::confinement::active(),
-                        );
-                    };
-                    let outcome = remote_policy::with_call_policy(
+                // Both the tool's run and the reply's finishing use the trace.
+                let phase_trace = std::cell::RefCell::new(Some(phase_trace));
+                // Classify before translation changes an agent's taskId to native task_id.
+                let agent_visible = !tool_call_context.preview
+                    && !manifest::is_native_plumbing_call(&bare_name, &arguments);
+                let finalizer = |response: &mut Response, text: &mut String| {
+                    // A UI copy must leave completions and cancellation notices
+                    // available to the session that actually owns the command.
+                    if observation_only {
+                        return;
+                    }
+                    crate::response_finalize::finalize_tool_response_with_visibility(
+                        response,
+                        text,
                         ctx,
-                        &identity_for_run,
-                        &request_id_for_force,
+                        &identity_for_run.session,
                         &bare_name,
-                        arguments,
-                        |arguments| {
-                            run_tool_call(
-                                &bare_name,
-                                arguments,
-                                &format_context,
-                                &tool_call_context,
-                                ctx,
-                                &dispatch,
-                                Some(&finalizer),
-                                Some(&mut phase_trace),
+                        bind_trust.allows_bash_observation()
+                            && !crate::context::confinement::active(),
+                        agent_visible,
+                    );
+                };
+                let work = |arguments: Value| {
+                    let tool_policy = (!tool_call_context.preview
+                        && manifest::tool_call_is_mutating(&bare_name, &arguments))
+                    .then(|| {
+                        crate::sandbox_spawn::ToolLaunchPolicy::for_session(
+                            identity_for_run.spawn_principal.clone(),
+                            access_grants::alfonso_worker(&identity_for_run),
+                        )
+                    });
+                    crate::gh_shim_speech::service::with_launch(
+                        speech_seed.clone(),
+                        &ctx.storage_dir(),
+                        || {
+                            crate::sandbox_spawn::ToolLaunchPolicy::with_current(
+                                tool_policy,
+                                || {
+                                    let mut trace = phase_trace.borrow_mut();
+                                    let dispatch = |request: RawRequest, ctx: &AppContext| {
+                                        if observation_only && bare_name == "bash_status" {
+                                            crate::commands::bash_status::handle_with_observation_only(&request,ctx,observation_only)
+                                        } else {
+                                            dispatch(request, ctx)
+                                        }
+                                    };
+                                    run_tool_call(
+                                        &bare_name,
+                                        arguments,
+                                        &format_context,
+                                        &tool_call_context,
+                                        ctx,
+                                        &dispatch,
+                                        Some(&finalizer),
+                                        trace.as_mut(),
+                                    )
+                                },
                             )
                         },
                     )
-                    .unwrap_or_else(|response| {
+                };
+                let finish = |outcome: Result<ToolCallOutcome, Response>| {
+                    let outcome = outcome.unwrap_or_else(|response| {
                         ToolCallOutcome::Unary(ToolCallResult {
                             text: crate::subc_format::format_response_with_context(
                                 &bare_name,
@@ -8867,7 +10385,10 @@ impl PlainToolRun {
                             let response = result.response;
                             let _ = done.send(ToolCallCompletion {
                                 text: result.text,
-                                phase_trace,
+                                phase_trace: phase_trace
+                                    .borrow_mut()
+                                    .take()
+                                    .expect("the phase trace is taken once"),
                             });
                             response
                         }
@@ -8881,21 +10402,21 @@ impl PlainToolRun {
                     .run_owner
                     .as_ref()
                     .map(|owner| owner.run_id.clone());
-                let _ask_route = crate::access_policy::ask_route_guard(Some(ask_route));
-                crate::access_policy::with_scope(
-                    Some(access_grants::policy_scope_key(&identity_for_run)),
-                    || {
-                        crate::backup::with_request_harness(&harness, || {
-                            crate::backup::with_request_run(run_id.as_deref(), || {
-                                if matches!(bind_trust, BindTrust::Untrusted) {
-                                    ctx.with_force_restrict(&request_id_for_force, run)
-                                } else {
-                                    run()
-                                }
-                            })
-                        })
-                    },
-                )
+                crate::backup::with_request_harness(&harness, || {
+                    crate::backup::with_request_run(run_id.as_deref(), || {
+                        call_policy::with_tool_call_policy(
+                            ctx,
+                            &identity_for_run,
+                            &request_id_for_force,
+                            ask_route,
+                            bind_trust,
+                            &bare_name,
+                            arguments,
+                            work,
+                            finish,
+                        )
+                    })
+                })
             })
         })
     }
@@ -9048,11 +10569,83 @@ fn bash_watch_warning_wait_ms(
     })
 }
 
+// Direct decoder fixtures use the build's default HELLO capabilities. The live
+// loop passes the snapshot of the actual HELLO sent on that connection instead.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn handle_tool_call(
+    tx: &WriterSender,
+    frame: &Frame,
+    parsed_body: Option<Result<Value, serde_json::Error>>,
+    confinement: Option<remote_policy::CarriedConfinement>,
+    phase_trace: PhaseTrace,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    pending_binds: &HashMap<RouteChannel, PendingBind>,
+    reclaimed_routes: &ReclaimedRoutes,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    executor: &Arc<Executor>,
+    active_tool_calls: &ActiveToolCalls,
+    pending_deferred_setups: &Arc<PendingDeferredSetups>,
+    shutdown: &Arc<Notify>,
+    connection_cancel: &PersistentCancelSignal,
+    bash_deferred_tx: &mpsc::Sender<bash::BashDeferredCompletion>,
+    bash_poll_touch_tx: &mpsc::Sender<ProjectRootId>,
+    metrics: &Arc<DispatchPathMetrics>,
+    route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
+    pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
+    next_bash_ask_corr: &mut u64,
+    bg_subs: &mut HashMap<RouteChannel, BgSub>,
+    bg_sub_by_session: &mut BgSubsBySession,
+    bg_wake_pending: &mut BgWakePending,
+    bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
+    dispatch: DispatchFn,
+    deferred_response_tx: &DeferredResponseSender,
+    allow_native_passthrough: bool,
+    tool_response_body_limit: usize,
+    module_drain: &drain::ModuleDrainWindow,
+    daemon_control: Option<&Arc<readiness::DaemonControl>>,
+) -> Result<(), SubcError> {
+    handle_tool_call_with_capabilities(
+        tx,
+        frame,
+        parsed_body,
+        confinement,
+        phase_trace,
+        routes,
+        pending_binds,
+        reclaimed_routes,
+        live_roots,
+        executor,
+        active_tool_calls,
+        pending_deferred_setups,
+        shutdown,
+        connection_cancel,
+        bash_deferred_tx,
+        bash_poll_touch_tx,
+        metrics,
+        route_bash_cancels,
+        pending_bash_asks,
+        next_bash_ask_corr,
+        bg_subs,
+        bg_sub_by_session,
+        bg_wake_pending,
+        bg_wake_epoch,
+        dispatch,
+        deferred_response_tx,
+        allow_native_passthrough,
+        tool_response_body_limit,
+        module_drain,
+        daemon_control,
+        rich_ui::session::ProofCapabilities::from_manifest(&manifest::build_manifest()),
+    )
+    .await
+}
+
 /// Route-channel tool call: `{name, arguments}` → executor lane → dispatch to
 /// the sync command core → wrap the structured Response in a CallToolResult
 /// `{content, isError}`. Tool-result mapping: the whole `{success, ...}` Response
 /// serialized into ONE text block; `isError` carries `success == false`.
-async fn handle_tool_call(
+async fn handle_tool_call_with_capabilities(
     tx: &WriterSender,
     frame: &Frame,
     parsed_body: Option<Result<Value, serde_json::Error>>,
@@ -9083,7 +10676,9 @@ async fn handle_tool_call(
     tool_response_body_limit: usize,
     module_drain: &drain::ModuleDrainWindow,
     daemon_control: Option<&Arc<readiness::DaemonControl>>,
+    rich_ui_proofs: rich_ui::session::ProofCapabilities,
 ) -> Result<(), SubcError> {
+    metrics.mark_frame_loop_entry("handle_tool_call", frame);
     let module_draining = module_drain.is_active();
     let route_id = route_key(frame.header.channel, frame.header.epoch);
     if pending_binds.contains_key(&route_id) {
@@ -9129,6 +10724,17 @@ async fn handle_tool_call(
         phase_trace.received_at(),
         &envelope,
     );
+    let request_meta = RequestFrameMeta {
+        ver: frame.header.ver,
+        flags: frame.header.flags,
+        deadline: queued_call::Deadline::from_envelope(phase_trace.received_at(), &envelope),
+    };
+    if let Some(error) = occipital_session_refusal(&identity, &envelope) {
+        return send_provider_error(tx, metrics, frame, error).await;
+    }
+    if let Err(error) = carrier_read_only::admit(&identity, &envelope) {
+        return send_provider_error(tx, metrics, frame, error).await;
+    }
     if envelope
         .get("name")
         .and_then(Value::as_str)
@@ -9215,6 +10821,7 @@ async fn handle_tool_call(
                 operation,
                 body,
                 phase_trace,
+                request_meta,
             )
             .await;
         }
@@ -9228,6 +10835,12 @@ async fn handle_tool_call(
     }
     let mut route_request = if identity.role == tool_provider::RouteRole::ToolProviderV1 {
         note_route_tool_call(&identity, metrics);
+        let mut envelope = envelope;
+        let handles_progress = envelope
+            .as_object_mut()
+            .and_then(|body| body.remove("handles_progress"))
+            .and_then(|value| value.as_bool())
+            == Some(true);
         let mut call = match serde_json::from_value::<
             cortexkit_role_tool_provider::call::ToolCallRequest,
         >(envelope)
@@ -9246,11 +10859,48 @@ async fn handle_tool_call(
                 .await
             }
         };
+        match carrier_read_only::admit_operation(&identity, &call.name, &call.arguments) {
+            Err(error) => {
+                let response = wire::build_carrier_response_frame(
+                    frame,
+                    None,
+                    rich_ui::carrier::error_body(&error.code),
+                )?;
+                return send_reliable_writer_frame(
+                    tx,
+                    metrics,
+                    response,
+                    "carrier admission refusal",
+                )
+                .await;
+            }
+            Ok(Some(operation)) => {
+                return rich_ui::session::submit(
+                    tx,
+                    frame,
+                    identity,
+                    routes,
+                    executor,
+                    active_tool_calls,
+                    metrics,
+                    operation,
+                    dispatch,
+                    rich_ui_proofs,
+                    request_meta,
+                    reply_budget,
+                )
+                .await;
+            }
+            Ok(None) => {}
+        }
         if let Some(error) = tool_provider::shell_capability_refusal(
             &call.name,
             tool_provider::admission_trusted(&identity, &call),
         ) {
             return send_provider_error(tx, metrics, frame, error).await;
+        }
+        if carrier_read_only::restricted(&identity) {
+            call.name = carrier_read_only::internal_name(&call.name).to_owned();
         }
         if let Err(error) =
             admit_confined_call_name(executor, &identity, &mut call.name, confinement.as_ref())
@@ -9258,6 +10908,9 @@ async fn handle_tool_call(
             return send_provider_error(tx, metrics, frame, error).await;
         }
         if let Err(error) = tool_provider::admit_call_mode(&call.name, &identity.call_mode) {
+            return send_provider_error(tx, metrics, frame, error).await;
+        }
+        if let Err(error) = rich_ui::admission::reject_non_carrier(&call.arguments) {
             return send_provider_error(tx, metrics, frame, error).await;
         }
         // Plugin approvals are host transport metadata, not model-facing tool
@@ -9303,6 +10956,7 @@ async fn handle_tool_call(
         }
         RouteRequest::ToolCall(ToolCallRequest {
             name: call.name,
+            handles_progress,
             arguments,
             edit_slot_survives: None,
             preview: false,
@@ -9324,6 +10978,9 @@ async fn handle_tool_call(
     };
     if identity.role == tool_provider::RouteRole::Legacy {
         if let RouteRequest::ToolCall(call) = &mut route_request {
+            if carrier_read_only::restricted(&identity) {
+                call.name = carrier_read_only::internal_name(&call.name).to_owned();
+            }
             if let Err(error) =
                 admit_confined_call_name(executor, &identity, &mut call.name, confinement.as_ref())
             {
@@ -9462,11 +11119,15 @@ async fn handle_tool_call(
         log::debug!("subc tool call {}: schema_pin={pin}", call.name);
     }
     let call_key = call.call_key;
+    // The pin travels with the deferred bash path so the spawned task can
+    // record it; every other tool drops it after this log line.
+    let schema_pin = call.schema_pin.clone();
     let ledger_key = call_key
         .as_deref()
         .filter(|_| identity.role == tool_provider::RouteRole::ToolProviderV1)
         .map(|key| tool_provider::LedgerEdge::key(&identity, key));
     let bare_name = call.name;
+    metrics.mark_frame_loop_tool(&bare_name, frame.header.corr);
     codemode::audit_call(&identity, &bare_name, frame.header.corr);
     let arguments = strip_agent_preview_arg_owned(call.arguments);
     if bare_name == "bash_watch" {
@@ -9506,6 +11167,26 @@ async fn handle_tool_call(
     );
 
     let request_id = format!("subc-{}-{}", frame.header.channel, frame.header.corr);
+    // Pin the response ID only for the fixture's exact probe inputs. Other
+    // calls and frame correlation keep their ordinary identities; all native
+    // handlers, formatters and wire rendering still run unchanged.
+    #[cfg(feature = "test-conformance-result-inputs")]
+    let request_id = if std::env::var("AFT_TEST_CONFORMANCE_RESPONSE_ID")
+        .ok()
+        .and_then(|input| serde_json::from_str::<Value>(&input).ok())
+        .and_then(|probes| {
+            probes.as_array().map(|items| {
+                items.iter().any(|probe| {
+                    probe[0].as_str() == Some(bare_name.as_ref()) && probe[1] == arguments
+                })
+            })
+        })
+        .unwrap_or(false)
+    {
+        "conformance-result-probe".to_owned()
+    } else {
+        request_id
+    };
     let bind_trust = identity.trust;
     let diagnostics_on_edit = live_roots
         .get(&identity.root)
@@ -9539,7 +11220,7 @@ async fn handle_tool_call(
             frame.header.corr,
             frame.header.flags,
             &result,
-            bind_trust,
+            identity.reply_policy(),
             tool_response_body_limit,
         )?;
         return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
@@ -9573,7 +11254,7 @@ async fn handle_tool_call(
             frame.header.corr,
             frame.header.flags,
             &result,
-            bind_trust,
+            identity.reply_policy(),
             tool_response_body_limit,
         )?;
         return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
@@ -9581,6 +11262,7 @@ async fn handle_tool_call(
 
     if matches!(bind_trust, BindTrust::Untrusted)
         && is_bash_family_tool(&bare_name)
+        && !carrier_read_only::observes_tasks(&identity, &bare_name)
         && (!matches!(bare_name.as_str(), "bash" | "powershell")
             || !identity.consumer_elicitation_capable)
     {
@@ -9597,7 +11279,7 @@ async fn handle_tool_call(
             frame.header.corr,
             frame.header.flags,
             &result,
-            bind_trust,
+            identity.reply_policy(),
             tool_response_body_limit,
         )?;
         return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
@@ -9636,10 +11318,16 @@ async fn handle_tool_call(
             frame.header.corr,
             frame.header.flags,
             &result,
-            bind_trust,
+            identity.reply_policy(),
             tool_response_body_limit,
         )?;
         return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
+    }
+
+    if is_subc_agent_core_tool(&bare_name) || is_subc_native_plumbing_tool(&bare_name) {
+        if let Some(meta) = live_roots.get_mut(&identity.root) {
+            route_census::note_tool_call(meta, route_id, Instant::now());
+        }
     }
 
     if matches!(bare_name.as_str(), "bash" | "powershell") {
@@ -9672,7 +11360,7 @@ async fn handle_tool_call(
                 frame.header.corr,
                 frame.header.flags,
                 &result,
-                bind_trust,
+                identity.reply_policy(),
                 tool_response_body_limit,
             )?;
             return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
@@ -9707,7 +11395,7 @@ async fn handle_tool_call(
                         frame.header.corr,
                         frame.header.flags,
                         &result,
-                        bind_trust,
+                        identity.reply_policy(),
                         tool_response_body_limit,
                     )?;
                     return send_reliable_writer_frame(
@@ -9746,6 +11434,7 @@ async fn handle_tool_call(
                     });
             route_cancel.active_waits = route_cancel.active_waits.saturating_add(1);
             let cancel = bash::BashWaitCancel {
+                speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
                 run_scope: identity.run_scope.get().cloned(),
                 scope: identity.scope.clone(),
                 late_results: identity.role == tool_provider::RouteRole::ToolProviderV1
@@ -9765,6 +11454,7 @@ async fn handle_tool_call(
                     corr: reverse_corr,
                 },
                 PendingBashAsk {
+                    handles_progress: call.handles_progress,
                     route: route_id,
                     tool_corr: frame.header.corr,
                     tool_flags: frame.header.flags,
@@ -9807,6 +11497,7 @@ async fn handle_tool_call(
                 });
         route_cancel.active_waits = route_cancel.active_waits.saturating_add(1);
         let cancel = bash::BashWaitCancel {
+            speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
             run_scope: identity.run_scope.get().cloned(),
             scope: identity.scope.clone(),
             late_results: identity.role == tool_provider::RouteRole::ToolProviderV1
@@ -9823,10 +11514,14 @@ async fn handle_tool_call(
 
         let _grant_scope =
             crate::access_policy::scope_guard(Some(access_grants::policy_scope_key(&identity)));
+        let _grants =
+            crate::access_policy::scope_grants_guard(access_grants::scope_grants_denial(&identity));
+        let _secret_identity = secret_consent::SecretIdentityGuard::install(identity.clone());
         let _ask_route = crate::access_policy::ask_route_guard(Some(
             access_grants::ask_route_for_call(&identity, &bare_name, &arguments),
         ));
         bash::submit_deferred_bash(
+            call.handles_progress,
             executor,
             bash_deferred_tx,
             bash_poll_touch_tx,
@@ -9847,6 +11542,7 @@ async fn handle_tool_call(
             identity.spawn_principal.clone(),
             call.edit_slot_survives,
             call_key,
+            schema_pin,
             None,
             repeat,
             role.is_worker(),
@@ -9863,7 +11559,7 @@ async fn handle_tool_call(
     // enable Cargo indirectly by selecting a head catalog on its route.
     if access_grants::alfonso_worker(&identity) {
         if let Some(ctx) = executor.actor_context(&identity.root) {
-            ctx.lsp().disable_rust_cargo_for_worker();
+            ctx.disable_rust_cargo_for_worker();
         }
     }
     let lane = command_lane(&bare_name);
@@ -9904,7 +11600,7 @@ async fn handle_tool_call(
                 frame.header.corr,
                 frame.header.flags,
                 &result,
-                bind_trust,
+                identity.reply_policy(),
                 tool_response_body_limit,
             )?;
             return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
@@ -9922,6 +11618,7 @@ async fn handle_tool_call(
                 | crate::access_policy::AskRoute::Elicitation { .. }
         )
         .then(|| PlainToolRun {
+            speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
             bare_name: bare_name.clone(),
             arguments: arguments.clone(),
             format_context: format_context.clone(),
@@ -9943,12 +11640,23 @@ async fn handle_tool_call(
             .map(|run| run.io_budget.clone())
             .unwrap_or_else(|| crate::bounded_io::Budget::after(Duration::from_secs(25)));
         phase_trace.mark_executor_submitted();
+        // The vault scopes are read once per submitted call, outside the job,
+        // from the same identity the job runs with. A launch inside the job
+        // reads them through `SecretScopeGuard`, so a background command keeps
+        // them for its whole life.
+        let secret_scopes = Some(secret_consent::call_scopes(&identity_for_run));
         let job: crate::executor::ExecutorJob = Box::new(move |ctx| {
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
             let _deferred_wake_scope = completion_wake.install();
+            let _secret_scope = secret_consent::SecretScopeGuard::install(secret_scopes.clone());
+            let _secret_identity =
+                secret_consent::SecretIdentityGuard::install(identity_for_run.clone());
             let _grant_scope = crate::access_policy::scope_guard(Some(
                 access_grants::policy_scope_key(&identity_for_run),
             ));
+            let _grants = crate::access_policy::scope_grants_guard(
+                access_grants::scope_grants_denial(&identity_for_run),
+            );
             let _ask_route =
                 crate::access_policy::ask_route_guard(Some(access_grants::ask_route_for_call(
                     &identity_for_run,
@@ -10012,10 +11720,11 @@ async fn handle_tool_call(
                                 matches!(bind_trust, BindTrust::Untrusted),
                             )
                         } else if bare_name_for_run == "bash_watch" {
-                            crate::commands::bash_watch::handle_deferred_with_budget(
+                            crate::commands::bash_watch::handle_deferred_with_observation_only(
                                 &prepared.request,
                                 Arc::clone(&deferred_ctx),
                                 reply_budget,
+                                carrier_read_only::restricted(&identity_for_run),
                             )
                         } else {
                             crate::commands::lsp_navigation::handle_lsp_navigation_deferred_with_reply_deadline(
@@ -10050,6 +11759,9 @@ async fn handle_tool_call(
                                 let response = crate::bounded_io::finish_response(response);
                                 phase_trace.mark_execute_done();
                                 let finalizer = |response: &mut Response, text: &mut String| {
+                                    if carrier_read_only::restricted(&identity_for_run) {
+                                        return;
+                                    }
                                     crate::response_finalize::finalize_tool_response(
                                         response,
                                         text,
@@ -10132,10 +11844,7 @@ async fn handle_tool_call(
             request_id.clone(),
             RouteDetachPolicy::CancelOnDetach,
             &bare_name,
-            RequestFrameMeta {
-                ver: frame.header.ver,
-                flags: frame.header.flags,
-            },
+            request_meta,
             job,
         );
 
@@ -10227,7 +11936,7 @@ async fn handle_tool_call(
                         corr,
                         flags,
                         &result,
-                        bind_trust,
+                        identity.reply_policy(),
                         tool_response_body_limit,
                     ) {
                         Ok(response_frame) => {
@@ -10288,7 +11997,7 @@ async fn handle_tool_call(
                         corr,
                         flags,
                         &result,
-                        bind_trust,
+                        identity.reply_policy(),
                         tool_response_body_limit,
                     ) {
                         let _ = send_reliable_writer_frame(
@@ -10313,6 +12022,7 @@ async fn handle_tool_call(
     let (tool_call_tx, tool_call_rx) = oneshot::channel::<ToolCallCompletion>();
     phase_trace.mark_executor_submitted();
     let plain_run = PlainToolRun {
+        speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
         bare_name,
         arguments,
         format_context,
@@ -10341,10 +12051,7 @@ async fn handle_tool_call(
         request_id.clone(),
         RouteDetachPolicy::RetainForReplay,
         &bare_name_for_frame,
-        RequestFrameMeta {
-            ver: frame.header.ver,
-            flags: frame.header.flags,
-        },
+        request_meta,
         job,
     );
     let completion_tx = tx.clone();
@@ -10412,7 +12119,7 @@ async fn handle_tool_call(
             corr,
             flags,
             &result,
-            bind_trust,
+            identity.reply_policy(),
             tool_response_body_limit,
         ) {
             Ok(response_frame) => {
@@ -10763,13 +12470,13 @@ async fn deliver_resolved_subc_response(
         );
         return Ok(());
     };
-    let Some(ctx) = executor.actor_context(&entry.root) else {
-        return Ok(());
-    };
+    // A missing actor only prevents context-dependent finalization. The route
+    // still needs its terminal, including the actor_not_registered poll result.
+    let ctx = executor.actor_context(&entry.root);
     resolved.response = crate::bounded_io::with_budget(entry.io_budget.clone(), || {
         crate::bounded_io::finish_response(resolved.response)
     });
-    if let (Some(db), Some(budget)) = (ctx.db(), &entry.io_budget) {
+    if let (Some(db), Some(budget)) = (ctx.as_ref().and_then(|ctx| ctx.db()), &entry.io_budget) {
         let mut observations = budget.permissions();
         if resolved.response.data["code"] != "macos_permission_denied" {
             observations.retain(|observation| observation.readable);
@@ -10783,16 +12490,23 @@ async fn deliver_resolved_subc_response(
             });
         }
     }
-    entry.phase_trace.mark_execute_done();
+    entry.phase_trace.mark_execute_done_after_await();
     let finalizer = |response: &mut Response, text: &mut String| {
-        crate::response_finalize::finalize_tool_response(
-            response,
-            text,
-            &ctx,
-            &entry.session_id,
-            &entry.bare_name,
-            entry.bind_trust.allows_bash_observation(),
-        );
+        // A rich-UI result is a copy, not delivery to the worker: finalization
+        // must not acknowledge completions or consume cancellation notices.
+        if carrier_read_only::restricted(identity) {
+            return;
+        }
+        if let Some(ctx) = &ctx {
+            crate::response_finalize::finalize_tool_response(
+                response,
+                text,
+                ctx,
+                &entry.session_id,
+                &entry.bare_name,
+                entry.bind_trust.allows_bash_observation(),
+            );
+        }
     };
     let result = finish_tool_call_response(
         &entry.bare_name,
@@ -10802,7 +12516,7 @@ async fn deliver_resolved_subc_response(
         Some(&finalizer),
         Some(&mut entry.phase_trace),
     );
-    if let Some(key) = entry.ledger_key.clone() {
+    if let (Some(_), Some(key)) = (&ctx, entry.ledger_key.clone()) {
         let outcome = if result.response.success {
             "ok".to_string()
         } else {
@@ -10835,7 +12549,7 @@ async fn deliver_resolved_subc_response(
         entry.corr,
         entry.flags,
         &result,
-        identity.trust,
+        identity.reply_policy(),
         tool_response_body_limit,
     )?;
     let trace = ToolResponseWriteTrace::new(
@@ -10849,6 +12563,8 @@ async fn deliver_resolved_subc_response(
         entry.route.channel,
         entry.corr,
     );
+    // A closed writer means the transport is gone and no terminal can be sent;
+    // propagate that failure rather than treating an unanswered call as success.
     send_traced_tool_response_frame(tx, metrics, response_frame, trace).await?;
     if fatal {
         signal_fatal_teardown(
@@ -10934,6 +12650,7 @@ fn decode_legacy_route_request(envelope: Value) -> Result<RouteRequest, SubcErro
             };
             Ok(RouteRequest::ToolCall(ToolCallRequest {
                 name,
+                handles_progress: false,
                 arguments,
                 edit_slot_survives: None,
                 preview: false,
@@ -10985,6 +12702,9 @@ fn provider_shell_selector(name: &str, args: &mut serde_json::Map<String, Value>
 /// `schema_pin`) keep the shared type's wire names.
 #[derive(Debug, Deserialize)]
 struct ToolCallRequest {
+    /// The transport has a receiver for request-scoped progress pushes.
+    #[serde(default)]
+    handles_progress: bool,
     name: String,
     #[serde(default)]
     arguments: Value,
@@ -11127,6 +12847,13 @@ fn opaque_field_refusal_frame(
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    /// Write user configuration with indexes and views disabled for transport tests.
+    /// Default configure can start index builds that these tests do not exercise.
+    pub(super) fn bind_config_without_indexes(root: &std::path::Path) -> std::path::PathBuf {
+        let path = root.join("protocol-user-config.json");
+        std::fs::write(&path, r#"{"indexes":{"trigram":false,"semantic":false,"callgraph":false},"views":{"enabled":false}}"#).unwrap();
+        path
+    }
     use super::*;
     use crate::bash_background::BgTaskStatus;
     use crate::protocol::{
@@ -11145,6 +12872,7 @@ pub(crate) mod test_support {
         RequestFrameMeta {
             ver: PROTOCOL_VERSION,
             flags: Flags::new(false, Priority::Interactive, false),
+            deadline: None,
         }
     }
 
@@ -11783,6 +13511,7 @@ pub(crate) mod test_support {
                 principal_id: Some("reserved:broca".into()),
             },
             consumer_elicitation_capable: false,
+            tool_result_body: false,
             disabled_tools: Arc::new(vec![]),
             run_scope: OnceLock::new(),
             call_mode: subc_protocol::call_mode::CallMode::Classic,
@@ -11916,10 +13645,17 @@ pub(crate) mod test_support {
         if short_deadline {
             assert_eq!(response.data["status"], "running", "{response:?}");
             assert_eq!(response.data["waited"]["reason"], "timeout", "{response:?}");
+            // Check which deadline the watch applied rather than how fast a
+            // loaded runner delivered it. The client's 1 s deadline (received
+            // 400 ms late) leaves a wait limit under a second or two, while
+            // the default worker window with timeoutMs=1_800_000 is tens of
+            // minutes, so 10 s separates the two with room for scheduling lag.
+            let limit_ms = response.data["waited"]["limit_ms"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("watch reply names its wait limit: {response:?}"));
             assert!(
-                started.elapsed() < Duration::from_millis(650),
-                "queued watch missed shortened reply cutoff: {:?}",
-                started.elapsed()
+                limit_ms < 10_000,
+                "queued watch ignored the client deadline: wait limit {limit_ms} ms"
             );
             return;
         }
@@ -12102,6 +13838,7 @@ pub(crate) mod test_support {
                 crate::bash_background::HardKill::After(Duration::from_secs(
                     if case == "hard-timeout" { 2 } else { 60 },
                 )),
+                None,
                 crate::bash_background::task_storage_dir(&ctx),
                 1,
                 false,
@@ -12951,6 +14688,7 @@ pub(crate) mod test_support {
 
     pub(super) fn completion_frame_with_session(task_id: &str, session_id: &str) -> PushFrame {
         PushFrame::BashCompleted(BashCompletedFrame {
+            changed_files: None,
             frame_type: "bash_completed",
             task_id: task_id.to_string(),
             session_id: session_id.to_string(),
@@ -12967,6 +14705,7 @@ pub(crate) mod test_support {
             output_incomplete: false,
             live_descendants: Some(Vec::new()),
             live_descendants_omitted: 0,
+            live_descendants_unavailable: None,
             live_descendants_summary: None,
         })
     }
@@ -12991,6 +14730,7 @@ pub(crate) mod test_support {
 
     pub(super) fn pattern_match_frame(session_id: &str) -> PushFrame {
         PushFrame::BashPatternMatch(BashPatternMatchFrame {
+            batch: None,
             frame_type: "bash_pattern_match",
             task_id: "task-pattern".to_string(),
             session_id: session_id.to_string(),
@@ -13050,6 +14790,7 @@ pub(crate) mod test_support {
                 }),
             },
             consumer_elicitation_capable: false,
+            tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),
             call_mode: subc_protocol::call_mode::CallMode::Classic,
@@ -13096,6 +14837,46 @@ mod tests {
         test_root, wait_for_actor_root_count, wait_for_watcher_count,
     };
     use super::*;
+
+    #[test]
+    fn subc_startup_takes_storage_lease_before_connecting() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        crate::private_storage::create_dir_all(&storage).unwrap();
+        let ctx = Arc::new(AppContext::from_app(
+            App::default_shared(),
+            Config {
+                storage_dir: Some(storage.clone()),
+                ..Default::default()
+            },
+        ));
+        let cleanup = crate::root_cache::acquire_cache_cleanup_lease(&storage).unwrap();
+        let result = run_subc_mode(
+            &temp.path().join("missing-connection.json"),
+            Arc::clone(&ctx),
+            Arc::new(Executor::new()),
+            |_, _| unreachable!("no routes have bound"),
+            None,
+        );
+        assert!(
+            matches!(result, Err(SubcError::StorageLease(_))),
+            "{result:?}"
+        );
+        drop(cleanup);
+        let result = run_subc_mode(
+            &temp.path().join("missing-connection.json"),
+            ctx,
+            Arc::new(Executor::new()),
+            |_, _| unreachable!("no routes have bound"),
+            None,
+        );
+        assert!(
+            matches!(result, Err(SubcError::ConnectionFile { .. })),
+            "{result:?}"
+        );
+        // Failed attachment must release the daemon lease too.
+        crate::root_cache::acquire_cache_cleanup_lease(&storage).unwrap();
+    }
 
     #[test]
     fn subc_bridge_routebind_ack_is_prioritized_over_reliable_flood_probe() {
@@ -13194,8 +14975,14 @@ mod tests {
                 &fixture_path.join("absent-connection.json"),
                 app,
                 loop_executor,
-                |request, _| Response::success(request.id, json!({})),
-                Some(fixture_path.join("absent-user-config.json")),
+                |request, ctx| {
+                    if request.command == "configure" {
+                        crate::commands::configure::handle_configure(&request, ctx)
+                    } else {
+                        Response::success(request.id, json!({}))
+                    }
+                },
+                Some(test_support::bind_config_without_indexes(&fixture_path)),
                 false,
                 usize::MAX,
                 None,
@@ -13358,8 +15145,14 @@ mod tests {
                 &fixture_path.join("absent-connection.json"),
                 app,
                 loop_executor,
-                |request, _| Response::success(request.id, json!({})),
-                Some(fixture_path.join("absent-user-config.json")),
+                |request, ctx| {
+                    if request.command == "configure" {
+                        crate::commands::configure::handle_configure(&request, ctx)
+                    } else {
+                        Response::success(request.id, json!({}))
+                    }
+                },
+                Some(test_support::bind_config_without_indexes(&fixture_path)),
                 false,
                 usize::MAX,
                 None,
@@ -13831,6 +15624,8 @@ mod tests {
             let cpu = cpu_hunt_process_cpu_us();
             handle_control_request(
                 &writer_tx,
+                &writer_tx,
+                &A0Egress::new(writer_tx.clone(), completion_tx.clone()),
                 &frame,
                 &app,
                 &executor,
@@ -13859,10 +15654,17 @@ mod tests {
                 None,
                 &cache,
                 &senders,
-                |request, _| Response::success(request.id, json!({})),
-                Some(&dir.path().join("absent-user-config.json")),
+                |request, ctx| {
+                    if request.command == "configure" {
+                        crate::commands::configure::handle_configure(&request, ctx)
+                    } else {
+                        Response::success(request.id, json!({}))
+                    }
+                },
+                Some(&test_support::bind_config_without_indexes(dir.path())),
                 usize::MAX,
                 None,
+                &ctx.storage_dir(),
             )
             .await
             .expect("admit route bind");
@@ -13876,6 +15678,9 @@ mod tests {
                 .await
                 .expect("configure completes")
                 .expect("completion delivered");
+            let ControlCompletion::ConfigureReady(completion) = completion else {
+                panic!("configure completion expected");
+            };
             assert!(completion.configure_response.success);
             assert_eq!(pending_binds.len(), 1, "the bind must reach admission");
             assert_eq!(
@@ -13927,6 +15732,7 @@ mod tests {
                 &HashMap::new(),
                 &metrics,
                 &health_rollup_cache,
+                json!({}),
             ));
             done_tx.send(result).expect("report health result");
         });
@@ -14192,26 +15998,34 @@ mod tests {
 
     #[test]
     fn a_held_callgraph_flush_is_abandoned_within_the_exit_budget() {
-        // The flush is held for 3 s, like a refresh worker still inside a
-        // long refresh or store checkpoint when exit begins.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let drained_at = Instant::now();
-        let line = flush_actor_indexes_on_graceful_shutdown_with(&[], drained_at, || {
-            std::thread::sleep(Duration::from_secs(3));
+        let line = flush_actor_indexes_on_graceful_shutdown_with(&[], drained_at, move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+            finished_tx.send(()).unwrap();
             true
         });
+        entered_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        // An unfinished flush must be abandoned because its deadline expired,
+        // not because the flush completed. Runner scheduling can delay observation.
+        assert!(matches!(
+            finished_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(Instant::now() >= crate::callgraph_store::exit_index_flush_deadline(drained_at));
         let flush_window = crate::callgraph_store::exit_index_flush_deadline(drained_at)
             .saturating_duration_since(drained_at);
-        let elapsed = drained_at.elapsed();
-        assert!(
-            elapsed < flush_window + Duration::from_millis(200),
-            "exit waited {elapsed:?} on a held call-graph flush (window {flush_window:?})"
-        );
         // The rest of the exit, LSP shutdown, still fits in the exit budget.
         assert!(
             flush_window + crate::lsp::manager::LSP_SHUTDOWN_ALL_BUDGET
                 <= crate::callgraph_store::EXIT_BUDGET_AFTER_DRAIN
         );
         assert!(line.contains("callgraph=abandoned"), "{line}");
+        release_tx.send(()).unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(30)).unwrap();
     }
 
     #[test]
@@ -14334,6 +16148,7 @@ mod tests {
         assert_eq!(
             restored1
                 .grep("new actor one token", true, &[], &[], &canonical_root1, 10)
+                .unwrap()
                 .matches
                 .len(),
             1,
@@ -14347,6 +16162,7 @@ mod tests {
         assert_eq!(
             restored2
                 .grep("new actor two token", true, &[], &[], &canonical_root2, 10)
+                .unwrap()
                 .matches
                 .len(),
             1,
@@ -14748,6 +16564,7 @@ mod tests {
                     &fixture.canonical,
                     10
                 )
+                .unwrap()
                 .matches
                 .len(),
             1,
@@ -15151,6 +16968,7 @@ mod tests {
             asks.insert(
                 ReverseCorrKey { route, corr: 100 },
                 PendingBashAsk {
+                    handles_progress: false,
                     route,
                     tool_corr: 78,
                     tool_flags: control_flags(),
@@ -15165,6 +16983,7 @@ mod tests {
                     arguments: json!({"command": "printf must-not-run"}),
                     format_context: crate::subc_format::FormatContext::default(),
                     cancel: bash::BashWaitCancel {
+                        speech_seed: None,
                         run_scope: None,
                         scope: None,
                         late_results: false,
@@ -15194,6 +17013,7 @@ mod tests {
                     request: RequestFrameMeta {
                         ver: PROTOCOL_VERSION,
                         flags: control_flags(),
+                        deadline: None,
                     },
                     answering: false,
                 },
@@ -15433,6 +17253,7 @@ mod tests {
                 storage.path().to_path_buf(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(60)),
+                None,
                 storage.path().to_path_buf(),
                 8,
                 true,
@@ -15944,6 +17765,23 @@ mod tests {
     }
 
     #[test]
+    fn idle_lsp_sweep_reaps_one_package_while_bound_root_is_busy() {
+        let fixture = crate::lsp::manager::regression_tests::IdleLspFixture::new();
+        let root = ProjectRootId::from_path(fixture.config.project_root.as_ref().unwrap()).unwrap();
+        fixture.ctx.mark_subc_bound();
+        let executor = Executor::new();
+        assert!(executor.register_actor(root.clone(), Arc::clone(&fixture.ctx)));
+        let mut roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+        for _ in 0..3 {
+            fixture.hover(&fixture.busy);
+            let now = Instant::now();
+            roots.get_mut(&root).unwrap().last_touched = now;
+            reap_idle_lsp_servers(now, &roots, &executor);
+        }
+        fixture.assert_only_busy();
+    }
+
+    #[test]
     fn quiesced_root_refuses_preserved_inspect_spawn_and_rebind_is_safe() {
         use crate::lsp::manager::ServerAttemptResult;
         use crate::lsp::registry::ServerKind;
@@ -15971,7 +17809,12 @@ mod tests {
         );
         ctx.lsp()
             .set_extra_env("AFT_FAKE_LSP_IGNORE_SHUTDOWN".into(), "1".into());
-        assert_eq!(ctx.lsp().ensure_server_for_file(&file, &config).len(), 1);
+        assert_eq!(
+            crate::lsp::manager::settled_lsp(&mut ctx.lsp(), |startup_manager| startup_manager
+                .ensure_server_for_file(&file, &config))
+            .len(),
+            1
+        );
         assert_eq!(ctx.lsp().active_client_count(), 1);
         let executor = Arc::new(Executor::new());
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
@@ -15998,7 +17841,9 @@ mod tests {
             .any(|failure| matches!(failure.result, ServerAttemptResult::ProjectClosed)));
         assert_eq!(ctx.lsp().active_client_count(), 0);
 
-        let file_denied = ctx.lsp().ensure_server_for_file_detailed(&file, &config);
+        let file_denied = crate::lsp::manager::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+            startup_manager.ensure_server_for_file_detailed(&file, &config)
+        });
         assert!(file_denied
             .attempts
             .iter()
@@ -16028,7 +17873,12 @@ mod tests {
         ctx.mark_subc_bound();
         ctx.lsp()
             .set_extra_env("AFT_FAKE_LSP_IGNORE_SHUTDOWN".into(), "0".into());
-        assert_eq!(ctx.lsp().ensure_server_for_file(&file, &config).len(), 1);
+        assert_eq!(
+            crate::lsp::manager::settled_lsp(&mut ctx.lsp(), |startup_manager| startup_manager
+                .ensure_server_for_file(&file, &config))
+            .len(),
+            1
+        );
         let deadline = Instant::now() + Duration::from_secs(10);
         while ctx.lsp_child_registry().health_snapshot().children_total > 1 {
             assert!(Instant::now() < deadline, "old client must be reaped");
@@ -16078,7 +17928,12 @@ mod tests {
             "AFT_FAKE_LSP_CWD",
             &root.as_path().parent().unwrap().to_string_lossy(),
         );
-        assert_eq!(ctx.lsp().ensure_server_for_file(&file, &config).len(), 1);
+        assert_eq!(
+            crate::lsp::manager::settled_lsp(&mut ctx.lsp(), |startup_manager| startup_manager
+                .ensure_server_for_file(&file, &config))
+            .len(),
+            1
+        );
         assert_eq!(ctx.lsp().active_client_count(), 1);
         let pids = ctx.lsp_child_registry().pids();
         assert_eq!(pids.len(), 1, "one tracked server child: {pids:?}");
@@ -16175,14 +18030,17 @@ mod tests {
             ctx.lsp_child_registry(),
         );
         assert_eq!(outcome.graceful + outcome.forced, 1, "{outcome:?}");
-        assert_eq!(outcome.unreaped, 0, "{outcome:?}");
-        // The forced kill does not wait; its worker thread reaps the child
-        // right after. Hang guard only.
+        // The shared budget bounds the caller, not its detached reapers. A slow
+        // Windows force-kill can leave the completion report pending at that
+        // deadline. Require eventual process exit and registry cleanup instead;
+        // neither a live leaked server nor a stale registry entry may remain.
         let deadline = Instant::now() + Duration::from_secs(30);
-        while crate::bash_background::process::is_process_alive(pid) {
+        while crate::bash_background::process::is_process_alive(pid)
+            || ctx.lsp_child_registry().pids().contains(&pid)
+        {
             assert!(
                 Instant::now() < deadline,
-                "exit sweep left server {pid} running"
+                "exit sweep did not reap server {pid}: {outcome:?}"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -16791,213 +18649,6 @@ mod tests {
         assert!(!deferred);
     }
 
-    async fn assert_quiet_view_publication_wake(edit_count: usize) {
-        use crate::context::ViewRuntimeSnapshot;
-        use crate::watcher_filter::WatcherDispatchEvent;
-        use std::collections::BTreeSet;
-
-        let (_dir, root) = test_root("maintenance-view-deadline");
-        let root_path = std::fs::canonicalize(root.as_path()).unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        for args in [
-            vec!["init", "--quiet"],
-            vec!["config", "user.name", "Publication test"],
-            vec!["config", "user.email", "publication@example.invalid"],
-        ] {
-            assert!(std::process::Command::new("git")
-                .args(args)
-                .current_dir(&root_path)
-                .status()
-                .unwrap()
-                .success());
-        }
-        for name in ["first.rs", "second.rs"] {
-            std::fs::write(root_path.join(name), "pub fn original() {}\n").unwrap();
-        }
-        for args in [
-            vec!["add", "."],
-            vec![
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "--quiet",
-                "-m",
-                "fixture",
-            ],
-        ] {
-            assert!(std::process::Command::new("git")
-                .args(args)
-                .current_dir(&root_path)
-                .status()
-                .unwrap()
-                .success());
-        }
-        let ctx = test_ctx();
-        ctx.update_config(|config| {
-            config.project_root = Some(root_path.clone());
-            config.storage_dir = Some(storage.path().to_owned());
-            config.views.enabled = true;
-            config.indexes.trigram = false;
-            config.indexes.semantic = false;
-            config.indexes.callgraph = true;
-        });
-        ctx.set_canonical_cache_root(root_path.clone());
-        let scope = crate::path_identity::project_scope_key(&root_path);
-        let view = crate::views::ViewStore::open(storage.path(), &scope).unwrap();
-        ctx.install_view_runtime(
-            ViewRuntimeSnapshot {
-                query_pin: None,
-                storage: storage.path().to_owned(),
-                family: "maintenance-view-fixture".to_owned(),
-                scope,
-                view_dir: view.view_dir().to_owned(),
-                generation: None,
-                manifest: None,
-                head_fingerprint: String::new(),
-                head_metadata: crate::alias::capture_git_head_metadata(&root_path, None).unwrap(),
-                pending_paths: BTreeSet::new(),
-                pending_inputs: Default::default(),
-            },
-            None,
-        );
-        let initial = ctx
-            .publish_view_paths(BTreeSet::new(), true)
-            .unwrap()
-            .generation;
-        runtime_drain::drain_build_completions(&ctx);
-        runtime_drain::drain_inspect_events(&ctx);
-        let (tx, rx) = crossbeam_channel::unbounded();
-        *ctx.watcher_rx().lock() = Some(rx);
-        let executor = Arc::new(Executor::new());
-        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-        let metrics = Arc::new(DispatchPathMetrics::new());
-        let (completion_tx, mut completion_rx) = mpsc::channel(8);
-        let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
-        let mut jobs = async || {
-            let (jobs, deferred) = due_maintenance_jobs(
-                &mut live_roots,
-                Some(&executor),
-                &BgSubsBySession::new(),
-                &BgWakePending::new(),
-                MAINTENANCE_SUBMIT_BUDGET,
-                &HashSet::new(),
-            );
-            assert!(!deferred);
-            for (job_root, kind) in &jobs {
-                assert_eq!((job_root, *kind), (&root, MaintenanceDrainKind::Watcher));
-                submit_maintenance_job(
-                    &executor,
-                    job_root.clone(),
-                    *kind,
-                    Vec::new(),
-                    &completion_tx,
-                    &metrics,
-                );
-                let completion = tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
-                    .await
-                    .expect("watcher maintenance must finish")
-                    .unwrap();
-                assert!(completion.response.success);
-                note_maintenance_completion(
-                    live_roots.get_mut(job_root).unwrap(),
-                    completion.requeue_kind,
-                    false,
-                    false,
-                );
-            }
-            jobs
-        };
-        assert!(jobs().await.is_empty());
-        let baseline = ctx.view_publication_attempts_for_test();
-        let mut changed = BTreeSet::new();
-        let mut previous_due = None;
-        let mut last_edit = Instant::now();
-        for edit in 0..edit_count {
-            let path = root_path.join(if edit % 2 == 0 {
-                "first.rs"
-            } else {
-                "second.rs"
-            });
-            last_edit = Instant::now();
-            std::fs::write(&path, format!("pub fn changed_{edit}() {{}}\n")).unwrap();
-            changed.insert(path.clone());
-            tx.send(WatcherDispatchEvent::Paths(vec![path])).unwrap();
-            assert_eq!(jobs().await.len(), 1);
-            let slice = ctx.watcher_drain_slice().lock();
-            let state = slice.as_ref().unwrap();
-            assert_eq!(state.view_publication_paths, changed);
-            let due = state.view_publication_due.unwrap();
-            assert!(due > last_edit);
-            if let Some(previous) = previous_due {
-                assert!(due > previous, "each batch extends the quiet window");
-            }
-            previous_due = Some(due);
-            drop(slice);
-            assert!(
-                ctx.view_publication_attempts_for_test() == baseline,
-                "the debounce must not publish early"
-            );
-            assert!(
-                jobs().await.is_empty(),
-                "a future deadline must not spin the dispatcher"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        let due = previous_due.unwrap();
-        let deadline = last_edit + Duration::from_secs(2);
-        while ctx.view_publication_attempts_for_test() == baseline && Instant::now() < deadline {
-            assert!(
-                !ctx.tier2_refresh_dispatch_due(),
-                "no Tier-2 rescue wake is due"
-            );
-            jobs().await;
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(
-            ctx.view_publication_attempts_for_test() - baseline,
-            1,
-            "view publication did not start within 2s of the edit without other maintenance due"
-        );
-        let started = Instant::now();
-        assert!(started >= due, "publication must respect the quiet window");
-        assert!(started <= due + Duration::from_secs(1));
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while ctx.view_runtime_snapshot().unwrap().generation == initial {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the started publication must install its generation");
-        runtime_drain::drain_build_completions(&ctx);
-        runtime_drain::drain_inspect_events(&ctx);
-        let slice = ctx.watcher_drain_slice().lock();
-        assert!(slice.as_ref().unwrap().view_publication_due.is_none());
-        assert!(slice.as_ref().unwrap().view_publication_paths.is_empty());
-        drop(slice);
-        for _ in 0..10 {
-            assert!(
-                jobs().await.is_empty(),
-                "an unchanged root must return to idle"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(
-            ctx.view_publication_attempts_for_test() - baseline,
-            1,
-            "a burst publishes exactly once"
-        );
-    }
-
-    #[tokio::test]
-    async fn view_publication_quiet_root_wakes_without_other_maintenance() {
-        assert_quiet_view_publication_wake(1).await;
-    }
-
-    #[tokio::test]
-    async fn view_publication_burst_coalesces_and_returns_idle() {
-        assert_quiet_view_publication_wake(3).await;
-    }
-
     /// The maintenance probes run on the frame loop, which also answers
     /// health checks and routes requests. A probe that waits for its source's
     /// lock parks the whole module for as long as another thread holds it,
@@ -17265,6 +18916,7 @@ mod tests {
         ctx.mark_subc_bound();
         let storage_root = ctx.storage_dir();
         ctx.enqueue_configure_maintenance(crate::context::ConfigureMaintenanceJob {
+            artifact_root: ctx.cache_dir(),
             generation: ctx.configure_generation(),
             root_path: root_path.clone(),
             canonical_cache_root: root_path.clone(),
@@ -18059,6 +19711,7 @@ mod tests {
                 trust,
             )
             .expect("tool response frame")
+            .frame
             .body
         };
         let harness_body = frame_for(harness_module);
@@ -18252,6 +19905,7 @@ mod tests {
             trust: BindTrust::FirstParty,
             spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,
+            tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),
             call_mode: subc_protocol::call_mode::CallMode::Classic,
@@ -18265,6 +19919,8 @@ mod tests {
             identity,
             bind_root_id: root.clone(),
             inserted_new_actor: false,
+            expected_snapshot_id: None,
+            applied_snapshot_id: None,
             configure_response: Response::success("subc-bind-7", json!({})),
             diagnostics_on_edit: false,
             ver: PROTOCOL_VERSION,
@@ -18274,6 +19930,7 @@ mod tests {
         let mut pending_binds = HashMap::from([(
             route,
             PendingBind {
+                ack_publication: None,
                 bind_root_id: root,
                 inserted_new_actor: false,
                 cancelled: false,
@@ -18285,6 +19942,7 @@ mod tests {
                 ver: PROTOCOL_VERSION,
                 flags: control_flags(),
                 cancellation: crate::executor::JobCancellation::new(),
+                session: None,
             },
         )]);
         let mut installed_route_epochs = HashMap::from([(route.channel, route.epoch)]);
@@ -18293,11 +19951,19 @@ mod tests {
         let (writer_tx, mut writer_rx) = mpsc::channel(8);
         let metrics = Arc::new(DispatchPathMetrics::new());
         let executor = Arc::new(Executor::new());
+        let mut published_routes = HashMap::new();
+        let (ack_tx, mut ack_rx) = mpsc::channel(8);
+        let a0 = A0Egress::new(writer_tx.clone(), ack_tx);
+        a0.reserve(route, PROTOCOL_VERSION, 91, control_flags(), &metrics)
+            .unwrap()
+            .commit();
 
         handle_route_bind_completion(
             &writer_tx,
             completion,
-            &mut HashMap::new(),
+            false,
+            &a0,
+            &mut published_routes,
             &mut HashMap::new(),
             &mut HashMap::new(),
             &mut push_buffer,
@@ -18312,7 +19978,41 @@ mod tests {
         .await
         .unwrap();
 
-        let ack = writer_rx.try_recv().expect("RouteBindAck");
+        assert!(
+            !published_routes.contains_key(&route),
+            "route published before actual ACK write"
+        );
+
+        let mut ack = writer_rx.recv().await.expect("RouteBindAck");
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "route egress must remain buffered"
+        );
+        assert!(ack.begin_ack_write());
+        ack.finish_ack_write(true);
+        let ControlCompletion::AckWritten(completion) = ack_rx.recv().await.unwrap() else {
+            panic!("ACK write completion expected");
+        };
+        handle_route_bind_completion(
+            &writer_tx,
+            completion,
+            true,
+            &a0,
+            &mut published_routes,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut push_buffer,
+            &mut HashMap::new(),
+            &mut pending_binds,
+            &mut installed_route_epochs,
+            &executor,
+            &Arc::new(Notify::new()),
+            &metrics,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(published_routes.contains_key(&route));
         assert_eq!(ack.header.ty, FrameType::Response);
         assert_eq!((ack.header.channel, ack.header.epoch), (0, 0));
         let route_frame = writer_rx.try_recv().expect("post-ack route frame");
@@ -18337,6 +20037,7 @@ mod tests {
             trust: BindTrust::FirstParty,
             spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,
+            tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),
             call_mode: subc_protocol::call_mode::CallMode::Classic,
@@ -18349,6 +20050,8 @@ mod tests {
             identity,
             bind_root_id: root.clone(),
             inserted_new_actor: false,
+            expected_snapshot_id: None,
+            applied_snapshot_id: None,
             configure_response: Response::success("subc-bind-8", json!({})),
             diagnostics_on_edit: false,
             ver: PROTOCOL_VERSION,
@@ -18361,6 +20064,7 @@ mod tests {
         let mut pending_binds = HashMap::from([(
             route,
             PendingBind {
+                ack_publication: None,
                 bind_root_id: root,
                 inserted_new_actor: false,
                 cancelled: false,
@@ -18372,6 +20076,7 @@ mod tests {
                 ver: PROTOCOL_VERSION,
                 flags: control_flags(),
                 cancellation: crate::executor::JobCancellation::new(),
+                session: None,
             },
         )]);
         let mut installed_route_epochs = HashMap::from([(route.channel, route.epoch)]);
@@ -18382,6 +20087,8 @@ mod tests {
         handle_route_bind_completion(
             &writer_tx,
             completion,
+            true,
+            &A0Egress::new(writer_tx.clone(), mpsc::channel(8).0),
             &mut HashMap::new(),
             &mut HashMap::new(),
             &mut HashMap::new(),
@@ -18411,6 +20118,7 @@ mod tests {
     async fn a_held_bind_is_refused_before_the_daemon_bind_relay_times_out() {
         let (_dir, root) = test_root("route-bind-held-configure");
         let pending_bind = |age: Duration, corr: u64| PendingBind {
+            ack_publication: None,
             bind_root_id: root.clone(),
             inserted_new_actor: false,
             cancelled: false,
@@ -18424,6 +20132,7 @@ mod tests {
             ver: PROTOCOL_VERSION,
             flags: control_flags(),
             cancellation: crate::executor::JobCancellation::new(),
+            session: None,
         };
         let young = route_key(9, 1);
         let held = route_key(10, 1);
@@ -18439,6 +20148,7 @@ mod tests {
 
         expire_overdue_route_binds(
             &writer_tx,
+            &A0Egress::new(writer_tx.clone(), mpsc::channel(8).0),
             &executor,
             &mut pending_binds,
             &mut installed_route_epochs,
@@ -18463,6 +20173,71 @@ mod tests {
         );
         assert!(pending_binds[&held].deadline_reported);
         assert!(!pending_binds[&young].deadline_reported);
+    }
+
+    /// The frame loop serves every session. After it has served session A,
+    /// the slow-bind warning for a bind that session B requested must carry
+    /// B's tag, and one for a bind with no session must carry no tag; neither
+    /// may carry A's.
+    #[test]
+    fn slow_pending_bind_warning_carries_the_bind_session_not_the_last_served() {
+        let (_dir, root) = test_root("route-bind-slow-warn-session");
+        let pending_bind = |corr: u64, session: Option<&str>| PendingBind {
+            ack_publication: None,
+            bind_root_id: root.clone(),
+            inserted_new_actor: false,
+            cancelled: false,
+            configure_request_id: format!("subc-bind-{corr}"),
+            started_at: Instant::now()
+                .checked_sub(DISPATCH_PATH_BIND_WARN_AFTER + Duration::from_secs(1))
+                .expect("monotonic clock is older than the bind age"),
+            warned_half_deadline: false,
+            deadline_reported: false,
+            corr,
+            ver: PROTOCOL_VERSION,
+            flags: control_flags(),
+            cancellation: crate::executor::JobCancellation::new(),
+            session: session.map(str::to_string),
+        };
+        let owned = route_key(352, 1);
+        let unowned = route_key(353, 1);
+        let mut pending_binds = HashMap::from([
+            (owned, pending_bind(352, Some("ses_B"))),
+            (unowned, pending_bind(353, None)),
+        ]);
+        let executor = Executor::new();
+
+        let ((), lines) = crate::logging::capture_log_lines(|| {
+            log_ctx::with_session(Some("ses_A".to_string()), || {
+                crate::slog_info!("serving session A");
+            });
+            warn_slow_pending_binds(&mut pending_binds, &executor);
+        });
+
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("INFO [ses_A] serving session A")
+        );
+        let owned_line = lines
+            .iter()
+            .find(|line| line.contains("route 352@1"))
+            .unwrap_or_else(|| panic!("no warning for route 352: {lines:?}"));
+        let unowned_line = lines
+            .iter()
+            .find(|line| line.contains("route 353@1"))
+            .unwrap_or_else(|| panic!("no warning for route 353: {lines:?}"));
+        assert!(
+            owned_line.starts_with("WARN [ses_B] subc attach: "),
+            "{owned_line}"
+        );
+        assert!(
+            unowned_line.starts_with("WARN subc attach: "),
+            "{unowned_line}"
+        );
+        assert!(
+            !lines[1..].iter().any(|line| line.contains("ses_A")),
+            "{lines:?}"
+        );
     }
 
     /// A bind whose deadline passes while it waits behind a reader on its root
@@ -18512,6 +20287,7 @@ mod tests {
         let mut pending_binds = HashMap::from([(
             route,
             PendingBind {
+                ack_publication: None,
                 bind_root_id: root.clone(),
                 inserted_new_actor: false,
                 cancelled: false,
@@ -18525,6 +20301,7 @@ mod tests {
                 ver: PROTOCOL_VERSION,
                 flags: control_flags(),
                 cancellation: bind_token,
+                session: None,
             },
         )]);
         let mut installed_route_epochs = HashMap::from([(route.channel, route.epoch)]);
@@ -18533,6 +20310,7 @@ mod tests {
 
         expire_overdue_route_binds(
             &writer_tx,
+            &A0Egress::new(writer_tx.clone(), mpsc::channel(8).0),
             &executor,
             &mut pending_binds,
             &mut installed_route_epochs,
@@ -18706,6 +20484,7 @@ mod tests {
         let mut pending_binds = HashMap::from([(
             route,
             PendingBind {
+                ack_publication: None,
                 bind_root_id: root.clone(),
                 inserted_new_actor: false,
                 cancelled: false,
@@ -18717,6 +20496,7 @@ mod tests {
                 ver: PROTOCOL_VERSION,
                 flags: control_flags(),
                 cancellation,
+                session: None,
             },
         )]);
         let mut installed = HashMap::from([(route.channel, route.epoch)]);
@@ -18753,6 +20533,7 @@ mod tests {
             }
             expire_overdue_route_binds(
                 &writer_tx,
+                &A0Egress::new(writer_tx.clone(), mpsc::channel(8).0),
                 &executor,
                 &mut pending_binds,
                 &mut installed,
@@ -18948,6 +20729,7 @@ mod tests {
         let mut pending_binds = HashMap::from([(
             route,
             PendingBind {
+                ack_publication: None,
                 bind_root_id: root.clone(),
                 inserted_new_actor: false,
                 cancelled: false,
@@ -18959,6 +20741,7 @@ mod tests {
                 ver: PROTOCOL_VERSION,
                 flags: control_flags(),
                 cancellation,
+                session: None,
             },
         )]);
         let mut installed = HashMap::from([(route.channel, route.epoch)]);
@@ -18966,6 +20749,7 @@ mod tests {
         let metrics = Arc::new(DispatchPathMetrics::new());
         expire_overdue_route_binds(
             &writer_tx,
+            &A0Egress::new(writer_tx.clone(), mpsc::channel(8).0),
             &executor,
             &mut pending_binds,
             &mut installed,
@@ -20331,98 +22115,59 @@ mod tests {
         }
     }
 
-    /// The bind-time check that a view's payloads are still stored runs in the
-    /// configure tail, after the bind is answered: a bind never waits on it.
-    /// Held inside the check, the tail leaves the first bind already answered
-    /// and still lets another session's bind of the root be answered.
     #[test]
-    fn route_binds_are_answered_while_the_view_payload_check_is_held() {
-        const ACK_BOUND: Duration = Duration::from_secs(2);
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let executor = Arc::new(Executor::new());
-        let configured = ConfiguredRoot::unconfigured(&executor);
-        let root = configured.canonical_root.clone();
-        // A published generation with call-graph keys gives the check work.
-        let report =
-            crate::views::assembly::publish_checkout(&crate::views::assembly::AssemblyRequest {
-                storage: configured.storage.path().to_path_buf(),
-                project_root: root.clone(),
-                family: crate::search_index::artifact_cache_key(&root),
-                scope: crate::path_identity::project_scope_key(&root),
-                desired_head: crate::views::assembly::head_tree_fingerprint(
-                    &crate::alias::head_tree_entries(&root).unwrap(),
-                ),
-                changed_paths: std::collections::BTreeSet::new(),
-                semantic_keys: Default::default(),
-                require_semantic: false,
-                allow_blob_put: true,
-                callgraph: true,
-            })
-            .unwrap();
-        assert!(report.published, "{report:?}");
-        let (_gate, check_held, release) =
-            crate::commands::configure::gate_configure_tail_stage_for_test(
-                root.clone(),
-                "view_payload_check",
-            );
-        let views_bind = |index: usize| {
-            let mut request = configured.bind_request(index, "opencode");
-            request.params["config"] = json!([{
-                "tier": "user",
-                "source": "/u/aft.jsonc",
-                "doc": json!({
-                    "views": { "enabled": true },
-                    "indexes": { "semantic": false, "trigram": false, "callgraph": true },
-                })
-                .to_string(),
-            }]);
-            request
-        };
-
-        let started = Instant::now();
-        let first = configured
-            .submit_bind(&executor, views_bind(0))
-            .blocking_recv()
-            .expect("first bind completes");
-        let first_ack = started.elapsed();
-        assert!(first.success, "{}", first.data);
-        assert!(
-            check_held.try_recv().is_err(),
-            "the payload check ran before the bind was answered"
-        );
-        let tail = executor.submit_maintenance_async(
-            configured.root.clone(),
-            Lane::MaintenanceCommit,
-            format!("subc-maintenance-drain-configure-tail-{}", root.display()),
-            Box::new(|ctx| {
-                let requeue = runtime_drain::drain_deferred_configure_maintenance_yielding(ctx);
-                Response::success("tail", json!({ "requeue": requeue }))
+    fn fresh_root_catalog_and_role_describe_do_not_wait_for_view_load_or_index_work() {
+        let mut fixture = HeldConfigureTail::start("view_load");
+        let (started, running) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let index = fixture.executor.submit_async(
+            fixture.root.clone(),
+            Lane::HeavyInit,
+            "held-index".into(),
+            Box::new(move |_| {
+                let _ = started.send(());
+                let _ = held.recv();
+                Response::success("index", json!({}))
             }),
         );
-        check_held
-            .recv_timeout(Duration::from_secs(30))
-            .expect("the configure tail reaches the payload check");
-
-        let second_started = Instant::now();
-        let mut second = configured.submit_bind(&executor, views_bind(1));
-        let mut second_ack = None;
-        while second_started.elapsed() < ACK_BOUND {
-            if let Ok(response) = second.try_recv() {
-                assert!(response.success, "{}", response.data);
-                second_ack = Some(second_started.elapsed());
-                break;
+        running.recv_timeout(Duration::from_secs(3)).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime.block_on(async {
+            for (operation, body) in [
+                ("role.describe", json!({})),
+                ("tool.catalog", json!({"preset":"head"})),
+                ("tool.catalog", json!({"preset":"worker"})),
+            ] {
+                let (writer, mut replies) = mpsc::channel(8);
+                let frame =
+                    Frame::build(FrameType::Request, control_flags(), 41, 1, 7, vec![]).unwrap();
+                submit_provider_read(
+                    &writer,
+                    &frame,
+                    route_identity(&fixture.root, "preflight"),
+                    &fixture.executor,
+                    &Arc::default(),
+                    &Arc::new(DispatchPathMetrics::new()),
+                    operation,
+                    body,
+                    PhaseTrace::new(Instant::now()),
+                    test_support::test_request_meta(),
+                )
+                .await
+                .unwrap();
+                let reply = tokio::time::timeout(Duration::from_millis(500), replies.recv()).await;
+                if !matches!(&reply, Ok(Some(frame)) if frame.header.ty == FrameType::Response) {
+                    return false;
+                }
             }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        let _ = release.send(());
-        assert!(tail.blocking_recv().expect("tail completion").success);
-        crate::commands::configure::drain_deferred_configure_maintenance(&configured.ctx);
-        eprintln!(
-            "bind acks with the payload check held: first={first_ack:?} second={second_ack:?}"
-        );
+            true
+        });
+        release.send(()).unwrap();
+        assert!(index.blocking_recv().unwrap().success);
+        fixture.release_tail();
         assert!(
-            second_ack.is_some(),
-            "a bind was not answered within {ACK_BOUND:?} while the payload check was held"
+            result,
+            "preflight must answer while real view-load and index work are held"
         );
     }
 
@@ -20579,7 +22324,7 @@ mod tests {
             )
             .unwrap();
             let mut waits = persistence::DatabaseWaits::default();
-            let decoded = DecodedFrame { parsed_body: Default::default(), confinement: None, launch_restore: None, frame, phase_trace: PhaseTrace::new(Instant::now()) };
+            let decoded = DecodedFrame { parsed_body: Default::default(), confinement: None, launch_restore: None, codemode_policies: None, frame, phase_trace: PhaseTrace::new(Instant::now()) };
             let decoded = match waits.defer(decoded, &routes, executor) {
                 Ok(()) => waits.next().await,
                 Err(decoded) => decoded,
@@ -21180,7 +22925,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let mut waits = persistence::DatabaseWaits::default();
-            let frame = DecodedFrame { parsed_body: Default::default(), confinement: None, launch_restore: None, frame: Frame::build(FrameType::Request, control_flags(), 42, 1, 1,
+            let frame = DecodedFrame { parsed_body: Default::default(), confinement: None, launch_restore: None, codemode_policies: None, frame: Frame::build(FrameType::Request, control_flags(), 42, 1, 1,
                 serde_json::to_vec(&json!({"name": "db_set_host_state", "arguments": {"key": "retry", "value": "ok"}})).unwrap()).unwrap(),
             phase_trace: PhaseTrace::new(Instant::now()), };
             assert!(waits.defer(frame, &routes, &executor).is_ok());
@@ -21459,8 +23204,9 @@ mod tests {
         assert!(queued_a.is_some(), "root A's pi bind waits in the queue");
         assert!(queued_b.is_some(), "root B's pi bind waits in the queue");
         assert_eq!(
-            idle_with_pi_binds_waiting, 2,
-            "both reserved bind workers are free while the pi binds wait"
+            idle_with_pi_binds_waiting,
+            2 + executor.provider_reserve_for_test(),
+            "both bind workers and the unused metadata reservation are free while pi binds wait"
         );
     }
 
@@ -21652,28 +23398,32 @@ mod tests {
 mod terminal_lifecycle_tests {
     use super::*;
 
-    #[test]
-    fn missing_deferred_actor_resolves_and_cancels_pending_work() {
-        let (_dir, root) = test_support::test_root("missing-deferred-actor");
+    fn register_pending_call(
+        registry: &mut PendingSubcResponses,
+        active: &ActiveToolCalls,
+        root: &ProjectRootId,
+        route: RouteChannel,
+        corr: u64,
+        tool: &str,
+    ) -> JobCancellation {
         let cancellation = JobCancellation::new();
         let pending = PendingResponse::polling(
-            "missing-actor".into(),
+            format!("pending-{corr}"),
             "session".into(),
-            "inspect".into(),
-            Box::new(|_| panic!("a removed actor cannot be polled")),
+            tool.into(),
+            Box::new(|_| panic!("removed or drained work cannot be polled")),
         )
         .with_cancellation(cancellation.clone());
-        let mut registry = PendingSubcResponses::default();
         registry.register(PendingSubcResponse {
             io_budget: None,
             ledger_key: None,
-            route: route_key(42, 1),
-            corr: 3,
+            route,
+            corr,
             flags: control_flags(),
             ver: PROTOCOL_VERSION,
-            root,
+            root: root.clone(),
             session_id: "session".into(),
-            bare_name: "inspect".into(),
+            bare_name: tool.into(),
             format_context: crate::subc_format::FormatContext::default(),
             bind_trust: BindTrust::FirstParty,
             pending,
@@ -21681,11 +23431,202 @@ mod terminal_lifecycle_tests {
             phase_trace: PhaseTrace::new(Instant::now()),
             held_since: Instant::now(),
         });
-        let resolved = registry.poll_ready(&Executor::new());
-        assert_eq!(resolved.len(), 1);
-        assert!(registry.is_empty());
-        assert!(cancellation.cancel_already_requested());
-        assert_eq!(resolved[0].response.data["code"], "actor_not_registered");
+        active.lock().unwrap().insert(
+            (route, corr),
+            ActiveToolCall {
+                root_id: root.clone(),
+                cancellation: cancellation.clone(),
+                detach_policy: RouteDetachPolicy::CancelOnDetach,
+                tool: tool.into(),
+                started_at: Instant::now(),
+                request: test_support::test_request_meta(),
+                answering: false,
+            },
+        );
+        cancellation
+    }
+
+    async fn assert_terminals_before_goodbye(
+        tx: &WriterSender,
+        rx: &mut mpsc::Receiver<wire::WriterFrame>,
+        route: RouteChannel,
+        expected: &[(u64, &str)],
+    ) {
+        // Teardown does not send Goodbye itself. Queue a later close on the
+        // same writer to prove the terminals were already queued, not spawned.
+        send_frame(
+            tx,
+            &DispatchPathMetrics::new(),
+            build_goodbye_frame(PROTOCOL_VERSION, route.channel, route.epoch, 0).unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut frames = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            frames.push(frame);
+        }
+        assert_eq!(frames.last().unwrap().header.ty, FrameType::Goodbye);
+        assert_eq!(frames.len(), expected.len() + 1, "one terminal per corr");
+        for &(corr, code) in expected {
+            let terminals: Vec<_> = frames
+                .iter()
+                .filter(|frame| {
+                    frame.header.channel == route.channel
+                        && frame.header.epoch == route.epoch
+                        && frame.header.corr == corr
+                        && matches!(
+                            frame.header.ty,
+                            FrameType::Response | FrameType::Error | FrameType::StreamEnd
+                        )
+                })
+                .collect();
+            assert_eq!(
+                terminals.len(),
+                1,
+                "exactly one terminal for {route} corr {corr}"
+            );
+            let body: Value = serde_json::from_slice(&terminals[0].body).unwrap();
+            assert_eq!(body["structuredContent"]["code"], code);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_deferred_actor_resolves_and_cancels_pending_work() {
+        let (_dir, root) = test_support::test_root("missing-deferred-actor");
+        let executor = Executor::new();
+        let route = route_key(42, 1);
+        let routes = HashMap::from([(route, test_support::route_identity(&root, "session"))]);
+        for transport_gone in [false, true] {
+            let mut registry = PendingSubcResponses::default();
+            let active = ActiveToolCalls::default();
+            let cancellation =
+                register_pending_call(&mut registry, &active, &root, route, 3, "inspect");
+            let resolved = registry.poll_ready(&executor);
+            assert_eq!(resolved.len(), 1);
+            assert!(registry.is_empty());
+            assert!(cancellation.cancel_already_requested());
+            assert_eq!(resolved[0].response.data["code"], "actor_not_registered");
+            let (tx, mut rx) = mpsc::channel(8);
+            if transport_gone {
+                rx.close();
+            }
+            let result = deliver_resolved_subc_response(
+                &tx,
+                resolved.into_iter().next().unwrap(),
+                &routes,
+                &mut HashMap::new(),
+                &executor,
+                &active,
+                &Arc::new(Notify::new()),
+                &DispatchPathMetrics::new(),
+                MAX_FRAME_BODY_LEN as usize,
+            )
+            .await;
+            assert!(active.lock().unwrap().is_empty());
+            assert!(registry.poll_ready(&executor).is_empty());
+            if transport_gone {
+                // A closed writer cannot carry a terminal; delivery must report
+                // that transport failure instead of silently claiming success.
+                assert!(matches!(result, Err(SubcError::WriterClosed)));
+                assert!(rx.try_recv().is_err());
+            } else {
+                result.unwrap();
+                assert_terminals_before_goodbye(
+                    &tx,
+                    &mut rx,
+                    route,
+                    &[(3, "actor_not_registered")],
+                )
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_drain_without_shutdown_callback_sends_one_terminal_per_corr() {
+        for shutdown in [false, true] {
+            for actor_gone in [false, true] {
+                let (_dir, root) = test_support::test_root("deferred-drain-terminal");
+                let executor = Arc::new(Executor::new());
+                if !actor_gone {
+                    executor.register_actor(root.clone(), test_support::test_ctx());
+                }
+                let route = route_key(42, 1);
+                let mut routes =
+                    HashMap::from([(route, test_support::route_identity(&root, "session"))]);
+                let active = ActiveToolCalls::default();
+                let mut registry = PendingSubcResponses::default();
+                let cancellations: Vec<_> = [(3, "lsp_hover"), (4, "bash_watch")]
+                    .into_iter()
+                    .map(|(corr, tool)| {
+                        register_pending_call(&mut registry, &active, &root, route, corr, tool)
+                    })
+                    .collect();
+                let (tx, mut rx) = mpsc::channel(8);
+                let metrics = DispatchPathMetrics::new();
+                let shutdown_signal = Arc::new(Notify::new());
+                if shutdown {
+                    for resolved in registry.drain_on_shutdown(&executor) {
+                        deliver_resolved_subc_response(
+                            &tx,
+                            resolved,
+                            &routes,
+                            &mut HashMap::new(),
+                            &executor,
+                            &active,
+                            &shutdown_signal,
+                            &metrics,
+                            MAX_FRAME_BODY_LEN as usize,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                } else {
+                    teardown_installed_route(
+                        &tx,
+                        &metrics,
+                        &executor,
+                        route,
+                        "higher-epoch RouteBind",
+                        Some(&root),
+                        &mut HashMap::from([(route.channel, route.epoch)]),
+                        &mut routes,
+                        &mut HashMap::new(),
+                        &mut HashMap::from([(root.clone(), HashSet::from([route]))]),
+                        &mut HashMap::new(),
+                        &mut HashMap::new(),
+                        &mut HashMap::new(),
+                        &mut HashMap::new(),
+                        &mut HashMap::new(),
+                        &mut HashMap::new(),
+                        &active,
+                        &mut registry,
+                        &mut HashMap::new(),
+                        &mut RetryBuffer::new(),
+                        &mut HashMap::new(),
+                        &shutdown_signal,
+                        MAX_FRAME_BODY_LEN as usize,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    assert!(routes.is_empty());
+                }
+                assert!(registry.is_empty());
+                assert!(cancellations
+                    .iter()
+                    .all(JobCancellation::cancel_already_requested));
+                assert!(registry.drain_on_shutdown(&executor).is_empty());
+                assert_terminals_before_goodbye(
+                    &tx,
+                    &mut rx,
+                    route,
+                    &[(3, "request_cancelled"), (4, "request_cancelled")],
+                )
+                .await;
+                assert!(active.lock().unwrap().is_empty());
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -21715,6 +23656,35 @@ mod terminal_lifecycle_tests {
 mod compile_fence_tests {
     fn compact(source: &str) -> String {
         source.chars().filter(|ch| !ch.is_whitespace()).collect()
+    }
+
+    #[test]
+    fn frame_loop_contains_no_direct_stderr_io() {
+        let source = include_str!("mod.rs");
+        let body = source
+            .split_once("async fn run_module_loop<")
+            .unwrap()
+            .1
+            .split_once("fn classify_connection_end(")
+            .unwrap()
+            .0;
+        assert!(body.contains("tokio::select!"));
+        assert!(body.contains("mark_frame_loop_tick"));
+        for primitive in [
+            "eprintln!",
+            "eprint!",
+            "io::stderr",
+            "libc::write",
+            "write_stderr_once",
+            "write_stderr_diagnostic",
+            "write_terminal_log_sync",
+            "flush_durable_log",
+        ] {
+            assert!(
+                !body.contains(primitive),
+                "frame loop bypasses its nonblocking log path: {primitive}"
+            );
+        }
     }
 
     #[test]
@@ -22073,6 +24043,7 @@ mod admission_mechanism_tests {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -22316,6 +24287,7 @@ mod pong_priority_tests {
         let _release = ReleaseOnDrop(gate.clone());
         let (setup_tx, mut setup_rx) = mpsc::unbounded_channel();
         let hooks = stall_watchdog::FrameLoopTestHooks {
+            before_turn_work: None,
             metrics: metrics.clone(),
             config: None,
             before_frame: Arc::new(|| {}),
@@ -22340,8 +24312,14 @@ mod pong_priority_tests {
                 &storage_path.join("connection.json"),
                 App::default_shared(),
                 module_executor,
-                |request, _| Response::success(request.id, json!({})),
-                Some(storage_path.join("user.json")),
+                |request, ctx| {
+                    if request.command == "configure" {
+                        crate::commands::configure::handle_configure(&request, ctx)
+                    } else {
+                        Response::success(request.id, json!({}))
+                    }
+                },
+                Some(test_support::bind_config_without_indexes(&storage_path)),
                 false,
                 usize::MAX,
                 None,

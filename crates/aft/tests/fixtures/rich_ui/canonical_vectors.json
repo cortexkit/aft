@@ -1,0 +1,122 @@
+{
+  "schema": "aft.rich-ui.canonical-vectors/1",
+  "note": "Committed canonicalization vectors for the rich-UI manifest. Read with include_bytes! and marked -text in .gitattributes, so the digests here are computed over the bytes every platform checks out.",
+  "cases": [
+    {
+      "name": "rfc8785-3.2.2-and-3.2.3-primitives-sorting",
+      "note": "RFC 8785 sections 3.2.2 and 3.2.3: numbers in ECMAScript form, strings escaped per ECMA-262, members sorted by UTF-16 code unit. The published example's fractional numbers are written here as integers, because manifest objects carry integers only.",
+      "input": {
+        "numbers": [
+          333333333,
+          1000000,
+          4,
+          2,
+          1
+        ],
+        "string": "€$\u000f\nA'B\"\\\\\"/",
+        "literals": [
+          null,
+          true,
+          false
+        ]
+      },
+      "canonical": "{\"literals\":[null,true,false],\"numbers\":[333333333,1000000,4,2,1],\"string\":\"€$\\u000f\\nA'B\\\"\\\\\\\\\\\"/\"}",
+      "digest": "sha256:fbfaec85092b34a52c0730e100510fc564d2fb4a3fbcc757a1965232c68d9c18"
+    },
+    {
+      "name": "rfc8785-3.2.3-property-sorting",
+      "note": "RFC 8785 section 3.2.3's sorting data. A UTF-8 comparison would put the emoji first; UTF-16 code units put it after the Euro sign, and U+0080 is written as itself rather than as an escape.",
+      "input": {
+        "€": "Euro Sign",
+        "\r": "Carriage Return",
+        "דּ": "Hebrew Letter Dalet With Dagesh",
+        "1": "One",
+        "😀": "Emoji: Grinning Face",
+        "": "Control",
+        "ö": "Latin Small Letter O With Diaeresis"
+      },
+      "canonical": "{\"\\r\":\"Carriage Return\",\"1\":\"One\",\"\":\"Control\",\"ö\":\"Latin Small Letter O With Diaeresis\",\"€\":\"Euro Sign\",\"😀\":\"Emoji: Grinning Face\",\"דּ\":\"Hebrew Letter Dalet With Dagesh\"}",
+      "digest": "sha256:5e321556d22018a9656991a9e94f77ec175fa193e52a2429d312f8419ec8b08c"
+    },
+    {
+      "name": "manifest-every-construct-sorts-recursively",
+      "note": "Members sort at every depth and array order is kept, which makes the manifest digest independent of the order the builder fills its maps in.",
+      "input": {
+        "schema": "ckios.richui.manifest/1",
+        "operations": [
+          {
+            "kind": "query",
+            "id": "bash_status",
+            "version": 1
+          },
+          {
+            "version": 1,
+            "id": "read",
+            "kind": "query"
+          }
+        ],
+        "catalog": {
+          "digest": "sha256:00",
+          "version": "1.0"
+        },
+        "dialects": [
+          "1.0"
+        ],
+        "empty": {},
+        "none": []
+      },
+      "canonical": "{\"catalog\":{\"digest\":\"sha256:00\",\"version\":\"1.0\"},\"dialects\":[\"1.0\"],\"empty\":{},\"none\":[],\"operations\":[{\"id\":\"bash_status\",\"kind\":\"query\",\"version\":1},{\"id\":\"read\",\"kind\":\"query\",\"version\":1}],\"schema\":\"ckios.richui.manifest/1\"}",
+      "digest": "sha256:95db6eb78a2365fbd555e5b73c24b3889418db4eafbefeccde3140e3f3c8b79a"
+    },
+    {
+      "name": "manifest-string-escaping",
+      "note": "RFC 8785 section 3.2.2.2: only U+0000..U+001F, quote and backslash are escaped; a solidus, DEL and non-ASCII text stay literal.",
+      "input": {
+        "controls_except_nul": "\u0001\u0002\u0003\u0004\u0005\u0006\u0007\b\t\n\u000b\f\r\u000e\u000f\u0010\u0011\u0012\u0013\u0014\u0015\u0016\u0017\u0018\u0019\u001a\u001b\u001c\u001d\u001e\u001f",
+        "quote_and_backslash": "a\"b\\c",
+        "kept_literal": "/é€"
+      },
+      "canonical": "{\"controls_except_nul\":\"\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007\\b\\t\\n\\u000b\\f\\r\\u000e\\u000f\\u0010\\u0011\\u0012\\u0013\\u0014\\u0015\\u0016\\u0017\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001f\",\"kept_literal\":\"/é€\",\"quote_and_backslash\":\"a\\\"b\\\\c\"}",
+      "digest": "sha256:6fac043e86be70cee5500a66503d777078b3112c01af802e8ec0af84de76dc75"
+    },
+    {
+      "name": "manifest-integer-bounds-pass",
+      "note": "The manifest number rule's exact bounds: +-(2^53-1) is accepted, and negative numbers keep their sign.",
+      "input": {
+        "max": 9007199254740991,
+        "min": -9007199254740991,
+        "zero": 0
+      },
+      "canonical": "{\"max\":9007199254740991,\"min\":-9007199254740991,\"zero\":0}",
+      "digest": "sha256:b7b2401ddca2165824e98c61890c0aaec470258d3119dd265d02be9438bf47e6"
+    },
+    {
+      "name": "manifest-fraction-is-refused",
+      "note": "A fractional number in a manifest object must fail the builder: a reader that parses it as a double cannot promise the value the writer meant.",
+      "input": {
+        "timeoutMs": 30000,
+        "ratio": 0.5
+      },
+      "canonical": null,
+      "digest": null
+    },
+    {
+      "name": "manifest-integer-beyond-the-safe-range-is-refused",
+      "note": "One past 2^53 loses precision as a double, so the builder refuses it rather than publishing a different number.",
+      "input": {
+        "bytes": 9007199254740992
+      },
+      "canonical": null,
+      "digest": null
+    },
+    {
+      "name": "manifest-negative-integer-beyond-the-safe-range-is-refused",
+      "note": "The same bound on the negative side.",
+      "input": {
+        "bytes": -9007199254740992
+      },
+      "canonical": null,
+      "digest": null
+    }
+  ]
+}

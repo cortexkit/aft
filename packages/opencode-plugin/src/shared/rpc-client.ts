@@ -250,7 +250,7 @@ export class AftRpcClient {
     info: PortInfo,
     signal?: AbortSignal,
   ): Promise<T> {
-    const response = await this.fetchWithTimeout(
+    return this.fetchWithTimeout(
       `http://127.0.0.1:${info.port}/rpc/${method}`,
       {
         method: "POST",
@@ -258,12 +258,14 @@ export class AftRpcClient {
         body: JSON.stringify({ ...params, token: info.token }),
       },
       signal,
+      async (response) => {
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(`RPC ${method} failed (${response.status}): ${text}`);
+        }
+        return (await response.json()) as T;
+      },
     );
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`RPC ${method} failed (${response.status}): ${text}`);
-    }
-    return (await response.json()) as T;
   }
 
   /**
@@ -467,39 +469,43 @@ export class AftRpcClient {
     signal?: AbortSignal,
   ): Promise<boolean> {
     try {
-      const response = await this.fetchWithTimeout(
+      return await this.fetchWithTimeout(
         `http://127.0.0.1:${port}/health`,
         { method: "GET" },
         signal,
+        async (response) => {
+          if (!response.ok) return false;
+          // Identity check: the port file records the owning pid and `/health`
+          // echoes the live server's pid. If they disagree, the port was recycled
+          // by a *different* AFT server (or an unrelated localhost service that
+          // happens to answer /health), so this port file is stale — reject it so
+          // we don't POST this file's token to the wrong server. Only enforced when
+          // both sides expose a pid (older port files omit it).
+          if (expectedPid !== undefined) {
+            try {
+              const body = (await response.json()) as { pid?: unknown };
+              if (typeof body?.pid === "number" && body.pid !== expectedPid) return false;
+            } catch {
+              // Non-JSON / unexpected body: not a healthy AFT server we trust.
+              return false;
+            }
+          }
+          if (expectedPid === undefined) await response.body?.cancel();
+          return true;
+        },
       );
-      if (!response.ok) return false;
-      // Identity check: the port file records the owning pid and `/health`
-      // echoes the live server's pid. If they disagree, the port was recycled
-      // by a *different* AFT server (or an unrelated localhost service that
-      // happens to answer /health), so this port file is stale — reject it so
-      // we don't POST this file's token to the wrong server. Only enforced when
-      // both sides expose a pid (older port files omit it).
-      if (expectedPid !== undefined) {
-        try {
-          const body = (await response.json()) as { pid?: unknown };
-          if (typeof body?.pid === "number" && body.pid !== expectedPid) return false;
-        } catch {
-          // Non-JSON / unexpected body: not a healthy AFT server we trust.
-          return false;
-        }
-      }
-      return true;
     } catch {
       throwIfAborted(signal);
       return false;
     }
   }
 
-  private async fetchWithTimeout(
+  private async fetchWithTimeout<T>(
     url: string,
     options: RequestInit,
-    signal?: AbortSignal,
-  ): Promise<Response> {
+    signal: AbortSignal | undefined,
+    consume: (response: Response) => Promise<T>,
+  ): Promise<T> {
     throwIfAborted(signal);
 
     const controller = new AbortController();
@@ -507,7 +513,8 @@ export class AftRpcClient {
     const onAbort = () => controller.abort();
     signal?.addEventListener("abort", onAbort, { once: true });
     try {
-      return await fetch(url, { ...options, signal: controller.signal });
+      const response = await fetch(url, { ...options, signal: controller.signal });
+      return await consume(response);
     } finally {
       clearTimeout(timeout);
       signal?.removeEventListener("abort", onAbort);

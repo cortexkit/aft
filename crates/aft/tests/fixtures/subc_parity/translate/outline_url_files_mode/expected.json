@@ -1,7 +1,6 @@
 {
-  "args": {
-    "file": "<PROJECT_ROOT>/https:/example.com/doc",
-    "files": true
-  },
-  "command": "outline"
+  "error": {
+    "code": "invalid_request",
+    "message": "files mode requires directory targets; URLs aren't directories"
+  }
 }

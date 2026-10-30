@@ -13,18 +13,33 @@ use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// Return inherited credential-shaped names so test child processes can omit them.
+/// AFT's co-author setting is not a secret, but it is dropped too so a test
+/// child never adds the operator's co-author trailer to fixture commits.
 pub(crate) fn secret_named_environment_keys(
     is_secret_environment_key: fn(&str) -> bool,
 ) -> Vec<OsString> {
     std::env::vars_os()
         .map(|(key, _)| key)
-        .filter(|key| key.to_str().is_some_and(is_secret_environment_key))
+        .filter(|key| {
+            key.to_str()
+                .is_some_and(|key| is_secret_environment_key(key) || key == "AFT_GIT_CO_AUTHOR")
+        })
         .collect()
 }
 
 fn process_env_mutex() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Probe from a sibling test thread without waiting on the process-settings
+/// guard. Used to verify that an environment fixture holds the shared mutex.
+#[allow(dead_code)] // The integration helper copy uses this probe.
+pub(crate) fn process_env_lock_is_available() -> bool {
+    !matches!(
+        process_env_mutex().try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    )
 }
 
 /// Acquire a test-only serialization mutex without cascading a prior test panic.
@@ -104,6 +119,21 @@ pub(crate) fn without_storage_override() -> StorageOverrideGuard {
     std::env::remove_var("AFT_STORAGE_DIR");
     StorageOverrideGuard {
         previous,
+        _lock: lock,
+    }
+}
+
+/// Keep transport fixtures from starting project watchers unrelated to their
+/// protocol assertions. Restore the setting before releasing the shared env lock.
+pub(crate) struct ProjectWatcherDisabledGuard {
+    _setting: ScopedEnvVar,
+    _lock: ProcessEnvLockGuard,
+}
+
+pub(crate) fn without_project_watcher() -> ProjectWatcherDisabledGuard {
+    let lock = process_env_lock();
+    ProjectWatcherDisabledGuard {
+        _setting: ScopedEnvVar::set("AFT_TEST_DISABLE_FILE_WATCHER", "1"),
         _lock: lock,
     }
 }

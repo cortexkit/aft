@@ -5,6 +5,7 @@ import {
   readdirSync,
   readFileSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -64,6 +65,7 @@ interface WsData {
 
 const PORT_FILE_HEARTBEAT_MS = 15_000;
 const MAX_BODY_BYTES = 1_048_576;
+const UNREADABLE_TMP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const WS_AUTH_TIMEOUT_MS = 5_000;
 const WS_CLOSE_UNAUTHORIZED = 4401;
 
@@ -97,6 +99,8 @@ export class AftRpcServer {
   /** Unique per-instance ID — distinguishes our entry from duplicate plugin loads. */
   private instanceId: string;
   private sockets = new Set<BunServerWebSocket<WsData>>();
+  private stopped = false;
+  private cancelNodeStartup: (() => void) | null = null;
 
   constructor(storageDir: string, directory: string) {
     this.portsDir = rpcPortFileDir(storageDir, directory);
@@ -148,6 +152,8 @@ export class AftRpcServer {
   private async startNode(): Promise<number> {
     return new Promise((resolve, reject) => {
       const server = createServer((req, res) => this.dispatch(req, res));
+      this.nodeServer = server;
+      this.cancelNodeStartup = () => reject(new Error("RPC server stopped during startup"));
 
       server.on("error", (err) => {
         warn(`RPC server error: ${err.message}`);
@@ -155,6 +161,12 @@ export class AftRpcServer {
       });
 
       server.listen(0, "127.0.0.1", () => {
+        this.cancelNodeStartup = null;
+        if (this.stopped || this.nodeServer !== server) {
+          server.close();
+          reject(new Error("RPC server stopped during startup"));
+          return;
+        }
         const addr = server.address();
         if (!addr || typeof addr === "string") {
           reject(new Error("Failed to get server address"));
@@ -172,6 +184,7 @@ export class AftRpcServer {
   }
 
   private afterServerStarted(): void {
+    if (this.stopped) return;
     try {
       this.writePortFile();
       log(`RPC server listening on 127.0.0.1:${this.port}`);
@@ -219,7 +232,8 @@ export class AftRpcServer {
       return;
     }
     for (const entry of entries) {
-      if (!entry.endsWith(".json")) continue;
+      const temporary = entry.endsWith(".json.tmp");
+      if (!temporary && !entry.endsWith(".json")) continue;
       const filePath = join(this.portsDir, entry);
       if (filePath === this.portFilePath) continue;
       try {
@@ -227,7 +241,13 @@ export class AftRpcServer {
         // Unparsable file: stale tmp/corrupt leftover — remove. Parsable but
         // pid-less (legacy): keep, we cannot prove the owner is dead.
         if (record === null) {
-          unlinkSync(filePath);
+          // An unreadable temporary record may still be in the middle of a live write.
+          if (
+            !temporary ||
+            Date.now() - statSync(join(this.portsDir, entry)).mtimeMs >= UNREADABLE_TMP_MAX_AGE_MS
+          ) {
+            unlinkSync(filePath);
+          }
           continue;
         }
         if (record.pid !== undefined && !isPidAlive(record.pid)) {
@@ -254,6 +274,9 @@ export class AftRpcServer {
 
   /** Stop the server and clean up port file. */
   stop(): void {
+    this.stopped = true;
+    this.cancelNodeStartup?.();
+    this.cancelNodeStartup = null;
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
@@ -305,10 +328,30 @@ export class AftRpcServer {
       return json({ error: `Unknown method: ${method}` }, 404);
     }
 
-    const bodyText = await req.text();
-    if (bodyText.length > MAX_BODY_BYTES) {
+    const declaredLength = Number(req.headers.get("content-length"));
+    if (declaredLength > MAX_BODY_BYTES) {
       return new Response("Request too large", { status: 413 });
     }
+    const chunks: Uint8Array[] = [];
+    let bytes = 0;
+    const reader = req.body?.getReader();
+    if (reader) {
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          bytes += value.byteLength;
+          if (bytes > MAX_BODY_BYTES) {
+            void reader.cancel().catch(() => {});
+            return new Response("Request too large", { status: 413 });
+          }
+          chunks.push(value);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    }
+    const bodyText = Buffer.concat(chunks, bytes).toString("utf8");
 
     let params: Record<string, unknown> = {};
     try {
@@ -435,17 +478,32 @@ export class AftRpcServer {
       return;
     }
 
-    let body = "";
+    if (Number(req.headers["content-length"]) > MAX_BODY_BYTES) {
+      res.writeHead(413);
+      res.end("Request too large");
+      req.resume();
+      return;
+    }
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    let oversized = false;
     req.on("data", (chunk: Buffer) => {
-      body += chunk.toString();
-      if (body.length > MAX_BODY_BYTES) {
+      if (oversized) return;
+      bytes += chunk.byteLength;
+      if (bytes > MAX_BODY_BYTES) {
+        oversized = true;
+        chunks.length = 0;
         res.writeHead(413);
         res.end("Request too large");
         req.destroy();
+        return;
       }
+      chunks.push(chunk);
     });
 
     req.on("end", () => {
+      if (oversized) return;
+      const body = Buffer.concat(chunks, bytes).toString("utf8");
       let params: Record<string, unknown> = {};
       try {
         if (body.length > 0) {

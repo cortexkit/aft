@@ -1,0 +1,22 @@
+{
+  "slice_class": "ranking",
+  "targeted_mechanism": "other",
+  "kind": "ranking",
+  "fixtures": [
+    "followup-census:940001",
+    "crates/aft/src/commands/semantic_search/exact_lane.rs::audit01_approximate_span_stops_at_next_declaration"
+  ],
+  "unreachable_split_rows": [
+    {
+      "episode_id": "followup-census:910001",
+      "predicate": "split_rank1_required",
+      "reason": "Unreachable by any pattern design: the query alone never ranks the answer (commands/ast_search.rs) in its first ten results, and the pattern ast_grep_search is a stale name that declares nothing and does not occur in the answer file, so there is no definition to place and no mention of the answer to lift."
+    },
+    {
+      "episode_id": "followup-census:910002",
+      "predicate": "split_rank1_required",
+      "reason": "Unreachable by any pattern design: the query alone ranks the answer (bash_background/registry.rs) 10th, and the pattern subagent_type is a stale name that declares nothing and does not occur in the answer file, so there is no definition to place and no mention of the answer to lift."
+    }
+  ],
+  "note": "The exact lane's approximate symbol spans (scan_symbols_in_text in commands/semantic_search/exact_lane.rs, a ranking-fenced file) now end where the next declaration starts, so a symbol's span no longer absorbs the code that follows it. Targets mechanism other, which the range-attribution rows followup-census:940001-940005 exercise. Measured on a Linux x86_64 release build (aft 0.62.0, binary sha256 72d69aec9dd5781d04308462f8004f9d9534d13f547a872413f535df0adc86a8) against the reference recorded with those rows: other MRR@10 0.168333 -> 0.185000 (hit@5 0.4 unchanged); real-query MRR@10 0.449857 -> 0.451400; concept recall MRR@10 0.668269 -> 0.674679 (identifier group 0.925926 -> 0.944444); identifier shape MRR@10 0.486111 -> 0.490741; exact recall unchanged at 1.0. Only followup-census:940001 changes answer rank (3 -> 2). Five rows reorder results without moving their answer: 7972 (1), 17364 (2), 930001 (1), 930003 (1), all wrong_lane_nl, and 9372 (miss, not_a_search_failure). No other mechanism or shape moves. The two unreachable_split_rows waivers are the pre-existing split_rank1_required misses on 910001 and 910002, which miss identically on the unchanged engine; they are copied from train-identifier-prose-ranking.json."
+}

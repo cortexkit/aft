@@ -46,8 +46,8 @@ use crate::blob_store::v2::{family_dir, FamilyPlane, FamilyStoreReader};
 use crate::gc::family::{self, FamilySweepPolicy, FamilySweepReport, SweepBounds};
 
 use super::registry::{
-    has_live_session, remove_view_dir, FamilyRegistry, MemberRecord, RegistryError, RegistryResult,
-    STATE_EVICTING,
+    has_live_session, remove_view_dir_with, FamilyRegistry, MemberRecord, RegistryError,
+    RegistryResult, STATE_EVICTING,
 };
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -77,6 +77,99 @@ const MAX_WALK_ENTRIES: usize = 200_000;
 /// How deep a view directory walk goes: the view directory itself, then
 /// `pins/` and `readers/`, then the generation directories under `readers/`.
 const MAX_WALK_DEPTH: usize = 3;
+
+/// The G4c storage gap a refused v3 admission reports. A refusal has no
+/// legacy fallback: the caller serves what v3 already holds and names the gap.
+pub const V3_HARD_LIMIT_GAP: &str = "storage_gap:v3_family_hard_limit";
+
+/// Why a v3 reservation was refused.
+#[derive(Debug)]
+pub enum V3Refusal {
+    /// Committed usage plus the request would cross the family hard limit.
+    HardLimit {
+        usage: u64,
+        request: u64,
+        limit: u64,
+    },
+    /// The ledger refused it (device floor, namespace budget) or failed.
+    Ledger(crate::blob_store::v3::Error),
+}
+
+impl fmt::Display for V3Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HardLimit {
+                usage,
+                request,
+                limit,
+            } => write!(
+                f,
+                "{V3_HARD_LIMIT_GAP}: {usage} used + {request} requested > {limit}"
+            ),
+            Self::Ledger(error) => write!(f, "storage_gap:{error}"),
+        }
+    }
+}
+
+impl std::error::Error for V3Refusal {}
+
+/// An admitted v3 reservation.
+#[derive(Debug)]
+pub struct V3Admission {
+    pub reservation: crate::blob_store::v3::Reservation,
+    /// Usage after this reservation is above the family target: the caller
+    /// runs the family's v3 sweep so reclaimable bytes go before the next
+    /// admission.
+    pub over_target: bool,
+}
+
+impl DiskBudget {
+    /// Admits a v3 reservation of `request` bytes against this family's
+    /// limits: the hard limit refuses, the target (the payload budget) only
+    /// asks for a sweep. Usage is the ledger's committed usage (last covering
+    /// measurement, committed charges since, and every outstanding
+    /// reservation), so concurrent builds are charged before they write.
+    pub fn admit_v3(
+        &self,
+        registry: &mut crate::blob_store::v3::RegistryWriter<'_>,
+        request: u64,
+    ) -> Result<V3Admission, V3Refusal> {
+        let usage = registry.accounting().map_err(V3Refusal::Ledger)?.usage();
+        if usage.saturating_add(request) > self.family_store_hard {
+            return Err(V3Refusal::HardLimit {
+                usage,
+                request,
+                limit: self.family_store_hard,
+            });
+        }
+        let reservation = registry.reserve(request).map_err(V3Refusal::Ledger)?;
+        Ok(V3Admission {
+            reservation,
+            over_target: usage.saturating_add(request) > self.family_payload,
+        })
+    }
+
+    /// Extends an admitted reservation before writing past it, under the same
+    /// hard limit.
+    pub fn extend_v3(
+        &self,
+        registry: &mut crate::blob_store::v3::RegistryWriter<'_>,
+        admission: &V3Admission,
+        additional: u64,
+    ) -> Result<(), V3Refusal> {
+        let usage = registry.accounting().map_err(V3Refusal::Ledger)?.usage();
+        if usage.saturating_add(additional) > self.family_store_hard {
+            return Err(V3Refusal::HardLimit {
+                usage,
+                request: additional,
+                limit: self.family_store_hard,
+            });
+        }
+        registry
+            .extend(&admission.reservation, additional)
+            .map_err(V3Refusal::Ledger)
+    }
+}
 
 /// The limits applied to one family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,6 +205,9 @@ pub enum Hold {
     OpenInProcess,
     /// Its sessions, protection or files could not be read with certainty.
     Uncertain(String),
+    /// A v3 base that a `base_refs` row, a live `base_builds` claim or this
+    /// sweep's marked worker edges still reference.
+    Referenced,
 }
 
 impl fmt::Display for Hold {
@@ -121,6 +217,7 @@ impl fmt::Display for Hold {
             Self::Protected => write!(f, "protected generation"),
             Self::OpenInProcess => write!(f, "open in this process"),
             Self::Uncertain(reason) => write!(f, "uncertain: {reason}"),
+            Self::Referenced => write!(f, "referenced base"),
         }
     }
 }
@@ -289,9 +386,19 @@ impl Default for EnforceOptions<'_> {
     }
 }
 
+/// A budget enforced by another maintenance lane, not measured by this pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnforcementDelegate {
+    /// V3 namespace measurement and idle-member eviction run in retention.
+    StorageRetentionV3,
+}
+
 /// What one enforcement pass did.
 #[derive(Clone, Debug, Default)]
 pub struct EnforcementReport {
+    /// When set, the zero/default usage fields are not measurements or an
+    /// assertion that no eviction is needed. Consult the retention report.
+    pub delegated_to: Option<EnforcementDelegate>,
     pub before: DiskUsage,
     pub after: DiskUsage,
     /// Evicted views with the view-store bytes each one freed, in order.
@@ -332,12 +439,22 @@ thread_local! {
     /// its budget, so tests read it here.
     static LAST_SWEEP_BUDGET: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static TREE_LISTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    #[cfg(windows)]
+    static TREE_BEFORE_STAT: std::cell::RefCell<Option<Box<dyn FnMut(&Path)>>> = const { std::cell::RefCell::new(None) };
 }
 
-fn measured_metadata(path: &Path) -> std::io::Result<fs::Metadata> {
+fn measured_metadata(path: &Path, entry: Option<&fs::DirEntry>) -> std::io::Result<fs::Metadata> {
     #[cfg(test)]
     TREE_STATS.with(|stats| stats.set(stats.get() + 1));
-    fs::symlink_metadata(path)
+    #[cfg(all(test, windows))]
+    TREE_BEFORE_STAT.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(path);
+        }
+    });
+    // Windows can charge a listed entry without reopening a delete-pending
+    // name. Cached paths (used only with Unix directory identities) still stat.
+    entry.map_or_else(|| fs::symlink_metadata(path), fs::DirEntry::metadata)
 }
 
 /// Published v1 and v2 generation artifacts are reconciled even if an
@@ -435,7 +552,7 @@ fn view_tree_bytes(
     deadline: Option<Instant>,
     cache: &mut ViewSizeCache,
 ) -> std::io::Result<(u64, bool)> {
-    let identity = measured_metadata(dir)
+    let identity = measured_metadata(dir, None)
         .ok()
         .as_ref()
         .and_then(directory_identity);
@@ -459,7 +576,7 @@ fn view_tree_bytes(
     cache.directory = identity;
     let reused_snapshot = cache.snapshot.is_some();
     let result = tree_bytes_inner(dir, deadline, Some(cache), None);
-    let after = measured_metadata(dir)
+    let after = measured_metadata(dir, None)
         .ok()
         .as_ref()
         .and_then(directory_identity);
@@ -542,9 +659,10 @@ fn tree_bytes_inner(
                     .map(|(_, paths)| paths.clone())
             })
             .flatten();
-        let entries: Box<dyn Iterator<Item = std::io::Result<(PathBuf, Option<u64>)>>> =
+        type SizeEntry = (PathBuf, Option<u64>, Option<fs::DirEntry>);
+        let entries: Box<dyn Iterator<Item = std::io::Result<SizeEntry>>> =
             if let Some(paths) = cached_paths {
-                Box::new(paths.into_iter().map(|path| Ok((path, None))))
+                Box::new(paths.into_iter().map(|path| Ok((path, None, None))))
             } else {
                 if depth == 0 {
                     if let Some(cache) = cache.as_mut() {
@@ -563,7 +681,7 @@ fn tree_bytes_inner(
                             };
                             #[cfg(not(unix))]
                             let inode = None;
-                            (entry.path(), inode)
+                            (entry.path(), inode, Some(entry))
                         })
                     })),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -580,7 +698,7 @@ fn tree_bytes_inner(
                 break;
             }
             read += 1;
-            let (path, inode) = match entry {
+            let (path, inode, entry) = match entry {
                 Ok(entry) => entry,
                 // Removed while listed: nothing to count.
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -606,7 +724,7 @@ fn tree_bytes_inner(
                     cache.files.remove(&path);
                 }
             }
-            let metadata = match measured_metadata(&path) {
+            let metadata = match measured_metadata(&path, entry.as_ref()) {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
@@ -667,6 +785,20 @@ fn open_in_process(view_dir: &Path, deadline: Option<Instant>) -> Result<bool, S
         .any(|path| crate::db::file_identity::open_connections(path) != 0))
 }
 
+/// Waits for this process's cleanup reads of the view's pointer to close and
+/// keeps new ones out while the guard lives, so that a background cleanup
+/// pass never makes an idle view look open. `None` when one is still open at
+/// the deadline, or after the registry busy timeout when there is none: the
+/// same bound eviction already accepts while it waits for the barrier.
+fn quiesce_cleanup_reads(
+    view_dir: &Path,
+    deadline: Option<Instant>,
+) -> Option<super::generation::CleanupReadsExcluded> {
+    let bound = Instant::now() + Duration::from_millis(crate::blob_store::BUSY_TIMEOUT_MS);
+    let until = deadline.map_or(bound, |deadline| deadline.min(bound));
+    super::generation::exclude_cleanup_reads(view_dir, until)
+}
+
 /// Why `member` cannot be evicted, read inside the registry barrier `tx` so
 /// that no registration can land between this check and the deletion.
 fn hold_inside_barrier(
@@ -682,10 +814,63 @@ fn hold_inside_barrier(
         Ok(true) => return Ok(Some(Hold::Protected)),
         Err(reason) => return Ok(Some(Hold::Uncertain(reason))),
     }
+    let Some(_cleanup_reads) = quiesce_cleanup_reads(&member.view_dir, deadline) else {
+        return Ok(Some(Hold::OpenInProcess));
+    };
     match open_in_process(&member.view_dir, deadline) {
         Ok(false) => Ok(None),
         Ok(true) => Ok(Some(Hold::OpenInProcess)),
         Err(reason) => Ok(Some(Hold::Uncertain(reason))),
+    }
+}
+
+/// Why the v3 base `scope` cannot be reclaimed now, read inside the v3
+/// registry barrier `tx`. Every deleter of a v3 base (the reference sweep's
+/// two-step reclaim, the retention collector and any future LRU eviction)
+/// goes through this check; none parses a manifest inside the barrier.
+///
+/// One indexed `base_refs` query, the `base_builds` claim, then the bounded
+/// `readers/`/`pins/`/session listing. A query error or an over-long listing
+/// is [`Hold::Uncertain`].
+pub(crate) fn v3_base_hold(
+    tx: &rusqlite::Transaction<'_>,
+    scope: &str,
+    view_dir: &Path,
+) -> Option<Hold> {
+    use rusqlite::OptionalExtension;
+    let referenced = tx
+        .query_row(
+            "SELECT 1 FROM base_refs WHERE base_scope=?1 LIMIT 1",
+            [scope],
+            |_| Ok(()),
+        )
+        .optional();
+    match referenced {
+        Ok(Some(())) => return Some(Hold::Referenced),
+        Ok(None) => {}
+        Err(error) => return Some(Hold::Uncertain(error.to_string())),
+    }
+    let claim = tx
+        .query_row(
+            "SELECT owner_pid,owner_start FROM base_builds WHERE base_scope=?1",
+            [scope],
+            |r| {
+                Ok(crate::pins::PinOwner {
+                    pid: r.get(0)?,
+                    start_time: r.get(1)?,
+                })
+            },
+        )
+        .optional();
+    match claim {
+        Ok(Some(owner)) if crate::pins::owner_is_live(&owner) => return Some(Hold::Referenced),
+        Ok(_) => {}
+        Err(error) => return Some(Hold::Uncertain(error.to_string())),
+    }
+    match crate::storage_retention::v3_member_protected(tx, scope, view_dir) {
+        Ok(false) => None,
+        Ok(true) => Some(Hold::Protected),
+        Err(reason) => Some(Hold::Uncertain(reason)),
     }
 }
 
@@ -1017,6 +1202,16 @@ pub fn evict_view(
             )?;
             return Ok(EvictionOutcome::Held(hold));
         }
+        // No cleanup read may open the pointer from here until the deletion
+        // is done. Taken before the file-identity guard: a read counts as in
+        // progress before it takes that guard to open its connection.
+        let Some(_cleanup_reads) = quiesce_cleanup_reads(&current.view_dir, deadline) else {
+            tx.execute(
+                "UPDATE members SET state = 'active' WHERE scope = ?1",
+                params![scope],
+            )?;
+            return Ok(EvictionOutcome::Held(Hold::OpenInProcess));
+        };
         // No connection may open a file of this set between the check above
         // and the deletion below.
         let _files = crate::db::file_identity::filesystem_guard();
@@ -1027,19 +1222,25 @@ pub fn evict_view(
             )?;
             return Ok(EvictionOutcome::Held(Hold::OpenInProcess));
         }
-        if let Err(error) = remove_pointer(&current.view_dir) {
-            tx.execute(
-                "UPDATE members SET state = 'active' WHERE scope = ?1",
-                params![scope],
-            )?;
-            return Ok(EvictionOutcome::Held(Hold::Uncertain(format!(
-                "pointer not removable: {error}"
-            ))));
-        }
-        if let Some(observer) = observer {
-            observer.reached(EvictionStep::PointerRemoved);
-        }
-        if let Err(error) = remove_view_dir(&current.view_dir) {
+        let mut pointer_removed = false;
+        let removal = remove_view_dir_with(&current.view_dir, |directory| {
+            remove_pointer(directory)?;
+            pointer_removed = true;
+            if let Some(observer) = observer {
+                observer.reached(EvictionStep::PointerRemoved);
+            }
+            Ok(())
+        });
+        if let Err(error) = removal {
+            if !pointer_removed {
+                tx.execute(
+                    "UPDATE members SET state = 'active' WHERE scope = ?1",
+                    params![scope],
+                )?;
+                return Ok(EvictionOutcome::Held(Hold::Uncertain(format!(
+                    "pointer not removable: {error}"
+                ))));
+            }
             // The pointer is gone, so the view publishes nothing; leave the
             // member `evicting` for the next pass or registration to finish.
             return Ok(EvictionOutcome::Incomplete(error.to_string()));
@@ -1058,18 +1259,45 @@ fn member_in(tx: &rusqlite::Connection, scope: &str) -> RegistryResult<Option<Me
 }
 
 /// Deletes the pointer database set of a view directory, main file first.
-fn remove_pointer(view_dir: &Path) -> std::io::Result<()> {
-    let pointer = view_dir.join(super::POINTER_DATABASE);
+fn remove_pointer(
+    view_dir: &crate::bash_background::persistence::PinnedDir,
+) -> std::io::Result<()> {
     for suffix in ["", "-wal", "-shm"] {
-        let mut name = pointer.as_os_str().to_owned();
-        name.push(suffix);
-        match fs::remove_file(PathBuf::from(name)) {
+        let name = std::ffi::OsString::from(format!("{}{suffix}", super::POINTER_DATABASE));
+        match view_dir.repair_remove_file(&name) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn pointer_removal_cannot_follow_a_retargeted_view_ancestor() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("views");
+    let view = parent.join("scope");
+    fs::create_dir_all(&view).unwrap();
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(outside.join("scope")).unwrap();
+    for suffix in ["", "-wal", "-shm"] {
+        let name = format!("{}{suffix}", super::POINTER_DATABASE);
+        fs::write(view.join(&name), "own").unwrap();
+        fs::write(outside.join("scope").join(name), "precious").unwrap();
+    }
+    let pinned = crate::bash_background::persistence::PinnedDir::open(&view).unwrap();
+    fs::rename(&parent, temp.path().join("parked")).unwrap();
+    std::os::unix::fs::symlink(&outside, &parent).unwrap();
+    remove_pointer(&pinned).unwrap();
+    for suffix in ["", "-wal", "-shm"] {
+        let name = format!("{}{suffix}", super::POINTER_DATABASE);
+        assert_eq!(
+            fs::read_to_string(outside.join("scope").join(name)).unwrap(),
+            "precious"
+        );
+    }
 }
 
 /// One enforcement pass: finish interrupted evictions, evict views without a
@@ -1091,6 +1319,14 @@ fn enforce_with_schedule(
     options: EnforceOptions<'_>,
     scheduled: Option<bool>,
 ) -> Result<EnforcementReport, EvictionError> {
+    // V3 members and their namespace budget are collected by storage retention.
+    // A v3-only owner has no legacy registry connection to measure or evict.
+    if registry.is_v3_only() {
+        return Ok(EnforcementReport {
+            delegated_to: Some(EnforcementDelegate::StorageRetentionV3),
+            ..EnforcementReport::default()
+        });
+    }
     let budget = registry.disk_budget();
     let deadline = options.deadline;
     let _ = registry.reclaim_dead_sessions();
@@ -1758,6 +1994,9 @@ fn shown_bytes(bytes: u64, complete: bool) -> String {
 }
 
 fn report_line(family: &str, report: &EnforcementReport) -> String {
+    if report.delegated_to == Some(EnforcementDelegate::StorageRetentionV3) {
+        return format!("view disk limits family={family} delegated_to=storage_retention_v3");
+    }
     let after_views = report.after.views_complete();
     format!(
         "view disk limits family={} view_store_bytes={}->{} held_bytes={} family_store_bytes={}->{} \
@@ -1801,6 +2040,23 @@ mod tests {
     use crate::views::RelPath;
 
     const FAMILY: &str = "family";
+
+    #[test]
+    fn v3_enforcement_explicitly_delegates_to_retention() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let view =
+            ViewRegistration::register_v3(storage.path(), FAMILY, "scope", root.path()).unwrap();
+        let report = enforce(view.registry(), EnforceOptions::default()).unwrap();
+        assert_eq!(
+            report.delegated_to,
+            Some(EnforcementDelegate::StorageRetentionV3)
+        );
+        let line = report_line(FAMILY, &report);
+        assert!(line.contains("delegated_to=storage_retention_v3"), "{line}");
+        assert!(!line.contains("evicted=0"), "{line}");
+        assert!(!storage.path().join("blobs/v2").exists());
+    }
 
     /// Deciding whether a family fits its budget never walks for a zero
     /// budget and stops counting once the budget is passed, so an over-budget
@@ -1859,7 +2115,7 @@ mod tests {
             let root = storage.path().join(format!("checkout-{index}"));
             fs::create_dir(&root).unwrap();
             let view = registry
-                .register_view(&format!("view-{index}"), &root)
+                .register_view_with_storage(storage.path(), &format!("view-{index}"), &root)
                 .unwrap();
             fs::write(view.view_dir().join("derived-owner.sqlite"), vec![0; 8192]).unwrap();
             fs::create_dir_all(view.view_dir().join("readers/current")).unwrap();
@@ -1912,7 +2168,9 @@ mod tests {
             let scope = format!("view-{index}");
             let root = storage.path().join(&scope);
             fs::create_dir(&root).unwrap();
-            let view = registry.register_view(&scope, &root).unwrap();
+            let view = registry
+                .register_view_with_storage(storage.path(), &scope, &root)
+                .unwrap();
             fs::write(view.view_dir().join("derived-owner.sqlite"), vec![0; 8192]).unwrap();
             fs::create_dir_all(view.view_dir().join("readers/current")).unwrap();
             fs::write(view.view_dir().join("progress.marker"), b"reader").unwrap();
@@ -2115,6 +2373,86 @@ mod tests {
         assert!(reopened.view_size_caches().lock().unwrap().is_empty());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn tree_bytes_uses_listed_metadata_for_a_delete_pending_file() {
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileDispositionInfo, SetFileInformationByHandle, DELETE, FILE_DISPOSITION_INFO,
+            FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let pending = root.path().join(".lock.tmp");
+        let payload = b"delete-pending view lock";
+        fs::write(&pending, payload).unwrap();
+        let handle = fs::OpenOptions::new()
+            .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&pending)
+            .unwrap();
+        let denied = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let hook_denied = std::rc::Rc::clone(&denied);
+        TREE_BEFORE_STAT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |path| {
+                if path == pending && hook_denied.borrow().is_none() {
+                    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+                    assert_ne!(
+                        unsafe {
+                            SetFileInformationByHandle(
+                                handle.as_raw_handle(),
+                                FileDispositionInfo,
+                                (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                                std::mem::size_of_val(&disposition) as u32,
+                            )
+                        },
+                        0,
+                        "{}",
+                        std::io::Error::last_os_error()
+                    );
+                    // A disappearing pending name makes std's metadata open
+                    // and fallback fail. Deny listing after enumeration to make
+                    // the fallback failure deterministic instead of timing it.
+                    let (guard, enforced) = crate::blob_store::v3::deny_read_for_test(
+                        path.parent().unwrap(),
+                        "stat of a delete-pending file",
+                        || fs::symlink_metadata(path),
+                    );
+                    *hook_denied.borrow_mut() = Some(guard);
+                    if enforced {
+                        assert_eq!(
+                            fs::symlink_metadata(path).unwrap_err().raw_os_error(),
+                            Some(5)
+                        );
+                    }
+                    eprintln!("pathname-stat race modelled: {enforced}");
+                }
+            }));
+        });
+        let result = tree_bytes(root.path(), None);
+        TREE_BEFORE_STAT.with(|hook| *hook.borrow_mut() = None);
+        assert!(
+            denied.borrow_mut().take().is_some(),
+            "file was not measured"
+        );
+        assert_eq!(result.unwrap(), (payload.len() as u64, true));
+
+        let (denied, enforced) =
+            crate::blob_store::v3::deny_read_for_test(root.path(), "directory listing", || {
+                fs::read_dir(root.path())
+            });
+        let result = tree_bytes(root.path(), None);
+        drop(denied);
+        if enforced {
+            assert_eq!(
+                result.unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        } else {
+            assert_eq!(result.unwrap(), (0, true));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn tree_bytes_preserves_permission_errors_for_non_searchable_directory() {
@@ -2312,7 +2650,9 @@ mod tests {
         let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
         let root = storage.path().join("root");
         fs::create_dir(&root).unwrap();
-        let view = registry.register_view("active", &root).unwrap();
+        let view = registry
+            .register_view_with_storage(storage.path(), "active", &root)
+            .unwrap();
         publish(&view, &[("file.txt", text(1, 2_000))], 4);
         for plane in [FamilyPlane::Semantic, FamilyPlane::Callgraph] {
             view.open_store(plane)
@@ -2337,7 +2677,9 @@ mod tests {
             let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
             let root = storage.path().join("root");
             fs::create_dir(&root).unwrap();
-            let view = registry.register_view("active", &root).unwrap();
+            let view = registry
+                .register_view_with_storage(storage.path(), "active", &root)
+                .unwrap();
             let content = text(1, 2_000);
             publish(&view, &[("file.txt", content.clone())], 4);
             let protected = trigram_key(&content);
@@ -2384,7 +2726,9 @@ mod tests {
         let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
         let root = storage.path().join("root");
         fs::create_dir(&root).unwrap();
-        let view = registry.register_view("active", &root).unwrap();
+        let view = registry
+            .register_view_with_storage(storage.path(), "active", &root)
+            .unwrap();
         let store = view.open_store(FamilyPlane::Semantic).unwrap();
         let oldest = FamilyKey::new(FamilyPlane::Semantic, [1; 32]);
         let newest = FamilyKey::new(FamilyPlane::Semantic, [2; 32]);
@@ -2409,7 +2753,9 @@ mod tests {
     fn idle_view(registry: &FamilyRegistry, scope: &str, seed: u64, derived_kib: usize) {
         let root = registry.storage().join("roots").join(scope);
         fs::create_dir_all(&root).unwrap();
-        let view = registry.register_view(scope, &root).unwrap();
+        let view = registry
+            .register_view_with_storage(registry.storage(), scope, &root)
+            .unwrap();
         publish(&view, &[("file.txt", text(seed, 2_000))], derived_kib);
     }
 
@@ -2439,6 +2785,78 @@ mod tests {
         assert!(report.over_hard.is_empty());
     }
 
+    /// After every publication a background cleanup pass reads the view's
+    /// pointer database to learn whether any older generation is left to
+    /// delete, without the family registry barrier. Eviction refuses a view
+    /// while this process has one of its SQLite files open, so it must wait
+    /// for such a read to close rather than keep a view nobody is using.
+    #[test]
+    fn a_cleanup_pass_reading_an_idle_view_never_holds_off_its_eviction() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        #[derive(Debug, PartialEq)]
+        enum Event {
+            CleanupReading,
+            EvictionWaits,
+            EnforcementDone,
+        }
+
+        let storage = tempfile::tempdir().unwrap();
+        let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+        idle_view(&registry, "a", 1, 4);
+        let view_dir = crate::views::registry::view_dir(registry.storage(), "a").unwrap();
+        // The cleanup pass the publication started is finished; the one below
+        // is the only cleanup running.
+        super::super::generation::wait_for_generation_sweep_for_test(&view_dir);
+        let (events_tx, events) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let go_rx = Mutex::new(go_rx);
+        let once = AtomicBool::new(false);
+        let hook_events = events_tx.clone();
+        let hook = crate::storage_retention::observe_test_hook(
+            &view_dir,
+            Arc::new(move |step| {
+                if step == "pointer-census-open" && !once.swap(true, Ordering::SeqCst) {
+                    // Hold the cleanup read open until the test lets it go.
+                    hook_events.send(Event::CleanupReading).unwrap();
+                    go_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(15))
+                        .unwrap();
+                } else if step == "eviction-awaits-cleanup-read" {
+                    hook_events.send(Event::EvictionWaits).unwrap();
+                }
+            }),
+        );
+        let view = crate::views::ViewStore::existing_dir(view_dir.clone())
+            .unwrap()
+            .with_sweep_registry(registry.clone());
+        super::super::generation::schedule_generation_sweep(view);
+        let first = events.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(first, Event::CleanupReading);
+        assert!(open_in_process(&view_dir, None).unwrap());
+
+        registry.set_disk_budget(budget(0, u64::MAX));
+        let enforcing = registry.clone();
+        let enforcement = std::thread::spawn(move || {
+            let report = enforce(&enforcing, EnforceOptions::default());
+            events_tx.send(Event::EnforcementDone).unwrap();
+            report
+        });
+        // Either eviction waits for the read, or it finished while the read
+        // was still open and so could not have evicted the view.
+        let next = events.recv_timeout(Duration::from_secs(10)).unwrap();
+        go_tx.send(()).unwrap();
+        let report = enforcement.join().unwrap().unwrap();
+        super::super::generation::wait_for_generation_sweep_for_test(&view_dir);
+        drop(hook);
+        assert_eq!(next, Event::EvictionWaits, "{:?}", report.held);
+        assert_eq!(evicted(&report), ["a"], "{:?}", report.held);
+        assert!(!view_dir.exists());
+    }
+
     /// A view whose session is alive stays even when it is the least
     /// recently bound and the limit is not met without it.
     #[test]
@@ -2447,7 +2865,9 @@ mod tests {
         let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
         let root = storage.path().join("root-active");
         fs::create_dir_all(&root).unwrap();
-        let active = registry.register_view("active", &root).unwrap();
+        let active = registry
+            .register_view_with_storage(registry.storage(), "active", &root)
+            .unwrap();
         publish(&active, &[("file.txt", text(1, 2_000))], 64);
         idle_view(&registry, "idle", 2, 64);
         set_last_bind(&registry, "active", 1);
@@ -2482,12 +2902,17 @@ mod tests {
         let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
         let root = storage.path().join("root");
         fs::create_dir_all(&root).unwrap();
-        let view = registry.register_view("pinned", &root).unwrap();
+        let view = registry
+            .register_view_with_storage(registry.storage(), "pinned", &root)
+            .unwrap();
         let old = publish(&view, &[("file.txt", text(1, 2_000))], 32);
+        let view_dir = view.view_dir().to_path_buf();
+        // Pin while the generation is current, before publication can reclaim it.
+        let pin = view
+            .under_pin_barrier(|dir| QueryPin::acquire(dir, &old))
+            .unwrap();
         let current = publish(&view, &[("file.txt", text(2, 2_000))], 32);
         assert_ne!(old, current);
-        let view_dir = view.view_dir().to_path_buf();
-        let pin = QueryPin::acquire(&view_dir, &old).unwrap();
         drop(view);
         registry.set_disk_budget(budget(0, u64::MAX));
 
@@ -2515,7 +2940,9 @@ mod tests {
         let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
         let root = storage.path().join("root");
         fs::create_dir_all(&root).unwrap();
-        let assembling = registry.register_view("assembling", &root).unwrap();
+        let assembling = registry
+            .register_view_with_storage(registry.storage(), "assembling", &root)
+            .unwrap();
         publish(&assembling, &[("file.txt", text(1, 2_000))], 16);
         let assembly = AssemblyPin::create_v2(&assembling, "next-generation", &[]).unwrap();
         drop(assembling);
@@ -2555,7 +2982,9 @@ mod tests {
         for (seed, scope) in ["a", "b"].into_iter().enumerate() {
             let root = storage.path().join(scope);
             fs::create_dir_all(&root).unwrap();
-            let view = registry.register_view(scope, &root).unwrap();
+            let view = registry
+                .register_view_with_storage(registry.storage(), scope, &root)
+                .unwrap();
             publish(&view, &[("file.txt", text(seed as u64, 2_000))], 64);
             sessions.push(view);
         }
@@ -2567,7 +2996,9 @@ mod tests {
         let new_root = storage.path().join("c");
         fs::create_dir_all(&new_root).unwrap();
 
-        let refused = registry.register_view("c", &new_root).unwrap_err();
+        let refused = registry
+            .register_view_with_storage(registry.storage(), "c", &new_root)
+            .unwrap_err();
 
         let RegistryError::AdmissionQueued(reason) = &refused else {
             panic!("unexpected error: {refused}");
@@ -2583,7 +3014,7 @@ mod tests {
             "the background pass deleted nothing held"
         );
         let rebound = registry
-            .register_view("a", &storage.path().join("a"))
+            .register_view_with_storage(registry.storage(), "a", &storage.path().join("a"))
             .expect("an existing view re-binds over the limit");
         drop(rebound);
 
@@ -2592,12 +3023,14 @@ mod tests {
         // The last record still shows b held, so this attempt is refused
         // too, and its background pass now finds b idle and evicts it.
         assert!(matches!(
-            registry.register_view("c", &new_root),
+            registry.register_view_with_storage(registry.storage(), "c", &new_root),
             Err(RegistryError::AdmissionQueued(_))
         ));
         wait_for_background_enforcement(&registry);
         assert!(!registered(&registry, "b"), "b was evicted to admit c");
-        let admitted = registry.register_view("c", &new_root).unwrap();
+        let admitted = registry
+            .register_view_with_storage(registry.storage(), "c", &new_root)
+            .unwrap();
         assert!(registered(&registry, "c"));
         drop(admitted);
     }
@@ -2618,14 +3051,22 @@ mod tests {
 
         let before = walks();
         let admitted = registry
-            .register_view("admitted", &storage.path().join("admitted"))
+            .register_view_with_storage(
+                registry.storage(),
+                "admitted",
+                &storage.path().join("admitted"),
+            )
             .unwrap();
         assert_eq!(walks(), before, "admitting walked a directory");
 
         registry.set_disk_budget(budget(0, usage.largest_view() * 3));
         let before = walks();
         let refused = registry
-            .register_view("refused", &storage.path().join("refused"))
+            .register_view_with_storage(
+                registry.storage(),
+                "refused",
+                &storage.path().join("refused"),
+            )
             .unwrap_err();
         assert_eq!(walks(), before, "refusing walked a directory");
         assert!(
@@ -2650,7 +3091,11 @@ mod tests {
             "the background pass evicted every idle view"
         );
         let retried = registry
-            .register_view("refused", &storage.path().join("refused"))
+            .register_view_with_storage(
+                registry.storage(),
+                "refused",
+                &storage.path().join("refused"),
+            )
             .expect("admitted after the background pass");
         drop(retried);
         drop(admitted);
@@ -2671,13 +3116,17 @@ mod tests {
         let root_b = storage.path().join("b");
         fs::create_dir_all(&root_a).unwrap();
         fs::create_dir_all(&root_b).unwrap();
-        let a = registry.register_view("a", &root_a).unwrap();
+        let a = registry
+            .register_view_with_storage(registry.storage(), "a", &root_a)
+            .unwrap();
         publish(
             &a,
             &[("shared.txt", shared.clone()), ("a.txt", only_a.clone())],
             16,
         );
-        let b = registry.register_view("b", &root_b).unwrap();
+        let b = registry
+            .register_view_with_storage(registry.storage(), "b", &root_b)
+            .unwrap();
         publish(
             &b,
             &[("shared.txt", shared.clone()), ("b.txt", only_b.clone())],
@@ -2766,12 +3215,20 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
-            remove_pointer(&member.view_dir).unwrap();
+            remove_pointer(
+                &crate::bash_background::persistence::PinnedDir::repair_open_path(&member.view_dir)
+                    .unwrap(),
+            )
+            .unwrap();
             assert!(registry.member(scope).unwrap().unwrap().evicting);
         }
         let rebind_dir = registry.member("rebind").unwrap().unwrap().view_dir;
         let rebound = registry
-            .register_view("rebind", &storage.path().join("roots").join("rebind"))
+            .register_view_with_storage(
+                registry.storage(),
+                "rebind",
+                &storage.path().join("roots").join("rebind"),
+            )
             .unwrap();
         let leftovers = fs::read_dir(&rebind_dir)
             .unwrap()
@@ -2842,7 +3299,9 @@ mod tests {
     /// Registers and loads `scope` with the real trigram and callgraph
     /// planes, observes it, and drops every handle, which ends its session.
     fn load_and_observe(registry: &FamilyRegistry, scope: &str, root: &Path) -> PlaneObservation {
-        let owner = registry.register_view(scope, root).unwrap();
+        let owner = registry
+            .register_view_with_storage(registry.storage(), scope, root)
+            .unwrap();
         let trigram = Arc::new(TrigramBridge::new(
             registry.storage().to_path_buf(),
             policy(),
@@ -2921,7 +3380,9 @@ mod tests {
         write_tree(&root_a, "a");
         write_tree(&root_b, "b");
         let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
-        let b_session = registry.register_view("b", &root_b).unwrap();
+        let b_session = registry
+            .register_view_with_storage(registry.storage(), "b", &root_b)
+            .unwrap();
         load_and_observe(&registry, "b", &root_b);
         let first = load_and_observe(&registry, "a", &root_a);
         registry.set_disk_budget(budget(0, u64::MAX));
@@ -2983,14 +3444,18 @@ mod tests {
             .collect()
     }
 
+    // Retention enumerates content-addressed family names, not the descriptive
+    // legacy registry name used by the other eviction fixtures.
+    const SEMANTIC_FAMILY: &str = "0123456789abcdef";
+
     fn semantic_view(
         storage: &Path,
         scope: &str,
         root: &Path,
     ) -> crate::views::semantic_runtime::CheckoutSemantic {
         let runtime = crate::views::semantic_runtime::CheckoutSemantic::new(
-            storage,
-            FAMILY,
+            &crate::root_cache::StoragePaths::same(storage),
+            SEMANTIC_FAMILY,
             scope,
             root,
             crate::views::semantic::SemanticProducer::current(
@@ -3022,12 +3487,40 @@ mod tests {
         write_tree(&root_b, "b");
         let b = semantic_view(storage.path(), "b", &root_b);
         drop(semantic_view(storage.path(), "a", &root_a));
-        let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
-        registry.set_disk_budget(budget(0, u64::MAX));
-
-        let report = enforce(&registry, EnforceOptions::default()).unwrap();
-
-        assert_eq!(evicted(&report), ["a"], "{:?}", report.held);
+        // Semantic members now live in v3, so legacy soft-limit enforcement
+        // cannot evict them. Commit an idle member's eviction and let the v3
+        // collector finish it, including removal of its base reference.
+        let scope = crate::views::semantic_runtime::view_scope("a");
+        crate::blob_store::v3::publish(storage.path(), SEMANTIC_FAMILY, 0, None, |publication| {
+            publication.registry.with_barrier(|tx| {
+                assert_eq!(
+                    tx.execute(
+                        "UPDATE members SET state=?2 WHERE scope=?1",
+                        rusqlite::params![scope, crate::views::registry::STATE_EVICTING],
+                    )?,
+                    1
+                );
+                Ok(())
+            })
+        })
+        .unwrap();
+        let report = crate::storage_retention::run_pass_with_budget_for_test(
+            &crate::root_cache::StoragePaths::same(storage.path()),
+            Duration::from_secs(120),
+        );
+        assert_eq!(report.removed_roots, 1, "{report:?}");
+        assert!(
+            !crate::blob_store::v3::view_dir(storage.path(), SEMANTIC_FAMILY, &scope)
+                .unwrap()
+                .exists()
+        );
+        assert!(crate::blob_store::v3::view_dir(
+            storage.path(),
+            SEMANTIC_FAMILY,
+            &crate::views::semantic_runtime::view_scope("b")
+        )
+        .unwrap()
+        .exists());
         fs::write(
             root_a.join("src").join("delta.rs"),
             "pub fn delta_cache_insert() {}\n",
@@ -3065,7 +3558,9 @@ mod tests {
         let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
         let root = storage.path().join("removed-root");
         fs::create_dir_all(&root).unwrap();
-        let view = registry.register_view("removed", &root).unwrap();
+        let view = registry
+            .register_view_with_storage(registry.storage(), "removed", &root)
+            .unwrap();
         let generation = publish(&view, &[("file.txt", text(5, 2_000))], 16);
         let view_dir = view.view_dir().to_path_buf();
         drop(view);
@@ -3132,7 +3627,11 @@ mod tests {
         for scope in ["main", "feature", "review"] {
             let root = roots.path().join(scope);
             write_tree(&root, scope);
-            sessions.push(registry.register_view(scope, &root).unwrap());
+            sessions.push(
+                registry
+                    .register_view_with_storage(registry.storage(), scope, &root)
+                    .unwrap(),
+            );
             load_and_observe(&registry, scope, &root);
         }
         let usage = measure(&registry, None).unwrap();
@@ -3236,7 +3735,9 @@ mod tests {
         let queued = FamilyRegistry::open(queued_storage.path(), FAMILY).unwrap();
         let root = stuck_storage.path().join("held-root");
         fs::create_dir_all(&root).unwrap();
-        let held = stuck.register_view("held", &root).unwrap();
+        let held = stuck
+            .register_view_with_storage(stuck_storage.path(), "held", &root)
+            .unwrap();
         publish(&held, &[("held.txt", text(1, 2_000))], 8);
         idle_view(&queued, "idle", 2, 8);
         wait_for_background_enforcement(&stuck);
@@ -3451,7 +3952,9 @@ mod tests {
         let new_root = storage.path().join("c");
         fs::create_dir_all(&new_root).unwrap();
 
-        let refused = registry.register_view("c", &new_root).unwrap_err();
+        let refused = registry
+            .register_view_with_storage(registry.storage(), "c", &new_root)
+            .unwrap_err();
 
         wait_for_background_enforcement(&registry);
         let RegistryError::AdmissionQueued(reason) = &refused else {

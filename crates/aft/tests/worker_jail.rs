@@ -2253,6 +2253,9 @@ async fn worker_jail_spawns_with_dangling_socket_deny() {
 
 #[tokio::test]
 async fn worker_jail_shell_runs_without_any_packed_refs_files() {
+    if !native_available() {
+        return;
+    }
     let mut jail = Jail::start_with_options(None, None, false).await;
     let common = jail.main.join(".git");
     for name in ["packed-refs", "packed-refs.lock", "packed-refs.new"] {
@@ -2468,7 +2471,136 @@ fn native_available() -> bool {
         eprintln!("Landlock probe skipped: mandatory ABI unavailable");
         return false;
     }
+    #[cfg(target_os = "linux")]
+    {
+        let home = aft::worker_jail_canary::account_home()
+            .expect("resolve account home for worker canary probe");
+        if let Err(error) = account_home_canary_writable(&home) {
+            let reason = format!(
+                "account home {} cannot hold the worker canary: {error}",
+                home.display()
+            );
+            assert_ne!(
+                std::env::var("AFT_REQUIRE_LANDLOCK").as_deref(),
+                Ok("1"),
+                "{reason}"
+            );
+            eprintln!("{reason}");
+            return false;
+        }
+    }
     true
+}
+
+#[cfg(target_os = "linux")]
+fn account_home_canary_writable(home: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let canary = aft::worker_jail_canary::dir_for_home(home);
+    // Canary preparation creates missing parents; probe the nearest existing
+    // directory without creating anything in the account's real home.
+    for ancestor in canary.ancestors() {
+        match std::fs::metadata(ancestor) {
+            Ok(metadata) => {
+                if !metadata.is_dir() {
+                    return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR));
+                }
+                let path = std::ffi::CString::new(ancestor.as_os_str().as_bytes())?;
+                // SAFETY: path is a live, NUL-terminated string for this call.
+                if unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
+                    let error = std::io::Error::last_os_error();
+                    // Preparation chmods only the real canary directory to 0700.
+                    // Its owner can repair permissions, but existing parents are
+                    // not repaired and symlink canary directories are refused.
+                    if error.kind() == std::io::ErrorKind::PermissionDenied && ancestor == canary {
+                        let metadata = std::fs::symlink_metadata(ancestor)?;
+                        // SAFETY: geteuid takes no arguments and has no preconditions.
+                        if metadata.is_dir() && metadata.uid() == unsafe { libc::geteuid() } {
+                            return Ok(());
+                        }
+                    }
+                    return Err(error);
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::from_raw_os_error(libc::ENOENT))
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_canary_preflight_accepts_missing_and_existing_directories_without_writes() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    account_home_canary_writable(&home).unwrap();
+    assert!(!home.exists());
+
+    let canary = aft::worker_jail_canary::dir_for_home(&home);
+    std::fs::create_dir_all(&canary).unwrap();
+    account_home_canary_writable(&home).unwrap();
+    assert!(std::fs::read_dir(&canary).unwrap().next().is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_canary_preflight_accepts_owned_readonly_canary_without_chmod() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let canary = aft::worker_jail_canary::dir_for_home(&home);
+    std::fs::create_dir_all(&canary).unwrap();
+    // SAFETY: geteuid takes no arguments and has no preconditions.
+    assert_eq!(std::fs::metadata(&canary).unwrap().uid(), unsafe {
+        libc::geteuid()
+    });
+    std::fs::set_permissions(&canary, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let result = account_home_canary_writable(&home);
+    let mode = std::fs::metadata(&canary).unwrap().permissions().mode() & 0o777;
+    std::fs::set_permissions(&canary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(mode, 0o500, "the preflight must not repair permissions");
+    result.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_canary_preflight_does_not_repair_readonly_ancestor() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // SAFETY: geteuid takes no arguments and has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("readonly ancestor probe skipped: root can bypass directory permissions");
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let canary = aft::worker_jail_canary::dir_for_home(&home);
+    let parent = canary.parent().unwrap();
+    std::fs::create_dir_all(parent).unwrap();
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let result = account_home_canary_writable(&home);
+    let mode = std::fs::metadata(parent).unwrap().permissions().mode() & 0o777;
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(mode, 0o500, "the preflight must not repair permissions");
+    assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EACCES));
+    assert!(!canary.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_canary_preflight_rejects_a_file_ancestor() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::write(&home, "not a directory").unwrap();
+    let error = account_home_canary_writable(&home).unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(libc::ENOTDIR));
+    assert_eq!(std::fs::read_to_string(&home).unwrap(), "not a directory");
 }
 
 fn executable(path: &Path, contents: &str) {
@@ -3412,6 +3544,57 @@ echo TWO_READS_OK
 }
 
 #[tokio::test]
+async fn worker_gh_read_log_failed_whole_job_fallback_through_sandboxed_gh() {
+    if !native_available() {
+        return;
+    }
+    let mut jail = gh_read_jail().await;
+    let log = include_str!("fixtures/gh_shim/run-40083893167-job-display.txt");
+    jail.read_holder.lock().unwrap().results.extend([
+        json!({"status":200,"body":{"jobs":[
+            {"id":1,"name":"successful job","conclusion":"success"},
+            {"id":120842790454_u64,"name":"Landing policy","conclusion":"failure","steps":[
+                {"name":"checkout","started_at":"2026-10-24T09:57:11Z","completed_at":"2026-10-24T09:57:22Z","conclusion":"success"},
+                {"name":"Original PR commit identity and agent attribution","started_at":"2026-10-24T09:57:22Z","completed_at":"2026-10-24T09:57:22Z","conclusion":"failure"},
+                {"name":"cleanup","started_at":"2026-10-24T09:57:22Z","completed_at":"2026-10-24T09:57:22Z","conclusion":"success"}
+            ]}
+        ]},"next_page":null}),
+        json!({"body":log,"offset":0,"length":log.len()+9,"total_bytes":log.len()+9}),
+    ]);
+    let response = jail
+        .tool_reply(
+            "bash",
+            json!({
+                "command":"gh run view 40083893167 --repo cortexkit/aft --log-failed > gh-log-failed.txt",
+                "timeout":300_000
+            }),
+        )
+        .await;
+    let text = response.to_string();
+    assert_eq!(response["structuredContent"]["exit_code"], 0, "{text}");
+    let expected = log
+        .lines()
+        .map(|line| format!("Landing policy\tUNKNOWN STEP\t{line}\n"))
+        .collect::<String>();
+    // Compare gh's own stdout from a file: AFT's bash reply adds its task
+    // line and, on some sandboxes, notes of its own after the command output.
+    let gh_output = std::fs::read_to_string(jail.worktree.join("gh-log-failed.txt"))
+        .unwrap_or_else(|error| panic!("gh output file missing ({error}): {text}"));
+    assert_eq!(gh_output, expected, "{text}");
+    let calls = jail.read_holder.lock().unwrap().calls.clone();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(
+        calls[1]["request"]["arguments"]["action"],
+        "github.actions.job_log"
+    );
+    assert_eq!(
+        calls[1]["request"]["arguments"]["args"]["job_id"],
+        120842790454_u64
+    );
+    assert!(!jail.worktree.join("native-gh.log").exists());
+}
+
+#[tokio::test]
 async fn worker_gh_read_t8_live_scope_rebind_refuses_before_upstream() {
     if !native_available() {
         return;
@@ -3570,8 +3753,10 @@ async fn cross_command_broker_isolation(profile: &str) {
     let paths = jail.worktree.join("broker-a-paths");
     let finish = jail.worktree.join("broker-a-finish");
     let corr = jail.submit_held_bash(json!({"command":format!(
-        "printf '%s\\n%s\\n%s\\n' \"$AFT_GH_READ_SOCKET\" \"$AFT_GH_READ_CAPABILITY_FILE\" \"$$\" > {}; while ! test -f {}; do sleep 0.02; done",
-        quote(&paths), quote(&finish)),"background":true,"timeout":30_000})).await;
+        "printf '%s\\n%s\\n%s\\n' \"$AFT_GH_READ_SOCKET\" \"$AFT_GH_READ_CAPABILITY_FILE\" \"$$\" > {}.tmp && mv {}.tmp {}; while ! test -f {}; do sleep 0.02; done",
+        quote(&paths), quote(&paths), quote(&paths), quote(&finish)),"background":true,"timeout":30_000})).await;
+    // The file is renamed into place whole: the test polls for it and must
+    // never read a partly written list of three lines.
     let paths = wait_test_file(&paths).await;
     let parts: Vec<_> = paths.lines().collect();
     assert_eq!(parts.len(), 3);
@@ -3801,11 +3986,11 @@ async fn gh_shim_router_host_scope_dials_require_the_live_bind() {
     .await
     .unwrap();
     let stamp = jail.read_holder.lock().unwrap().binds["worker-session"].clone();
-    let selector = subc_protocol::scope::ScopeSelector {
-        owner: stamp.owner.clone(),
-        scope_ref: stamp.scope_ref.clone(),
-        scope_epoch: Some(stamp.scope_epoch),
-    };
+    let selector = subc_protocol::scope::ScopeSelector::new(
+        stamp.owner.clone(),
+        stamp.scope_ref.clone(),
+        Some(stamp.scope_epoch),
+    );
     let target = RouteTarget::ToolProvider {
         module_id: "plexus".into(),
     };
@@ -4085,6 +4270,22 @@ async fn gh_shim_router_host_v1_background_reply_is_terminal_and_flat() {
     assert!(reply["structuredContent"].get("data").is_none());
 }
 
+/// Reads a task record the daemon may be rewriting at that moment. The daemon
+/// replaces the file atomically, and a read that races the replacement fails
+/// with `Interrupted` ("task artifact was concurrently replaced") rather than
+/// returning stale or torn data; that is a "read again", not a test failure.
+fn read_task_settled(metadata: &Path) -> aft::bash_background::persistence::PersistedTask {
+    for _ in 0..200 {
+        match aft::bash_background::persistence::read_task(metadata) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            other => return other.unwrap(),
+        }
+    }
+    panic!("task record at {} kept being replaced", metadata.display());
+}
+
 #[tokio::test]
 async fn worker_gh_read_t10_promotion_keeps_the_original_command_grant() {
     if !native_available() {
@@ -4098,9 +4299,7 @@ async fn worker_gh_read_t10_promotion_keeps_the_original_command_grant() {
     let temp = wait_test_file(&ready).await;
     let (task, metadata) = worker_gh_read::observe_task(Path::new(&temp));
     assert!(
-        !aft::bash_background::persistence::read_task(&metadata)
-            .unwrap()
-            .notify_on_completion,
+        !read_task_settled(&metadata).notify_on_completion,
         "start as a foreground command"
     );
     let scope = jail.read_holder.lock().unwrap().binds["worker-session"].clone();
@@ -4134,10 +4333,7 @@ async fn worker_gh_read_t10_promotion_keeps_the_original_command_grant() {
     .await
     .unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
-        while !aft::bash_background::persistence::read_task(&metadata)
-            .unwrap()
-            .notify_on_completion
-        {
+        while !read_task_settled(&metadata).notify_on_completion {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })

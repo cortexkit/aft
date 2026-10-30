@@ -31,6 +31,8 @@ use aft::protocol::Response;
 use aft::subc_format::{format_response_with_context, FormatContext, OutlineMode};
 use serde_json::{json, Map, Value};
 
+use crate::list_cut_item::extract_item_name;
+
 fn fixture_search_envelope(
     shown: usize,
     more_available: bool,
@@ -77,6 +79,7 @@ pub struct SurfaceSpec {
     pub command: &'static str,
     pub mode: &'static str,
     pub list_id: &'static str,
+    pub requires: Option<&'static str>,
     pub unit: Unit,
     pub narrow: &'static [&'static str],
     pub reasons: &'static [ReasonSpec],
@@ -86,6 +89,16 @@ const CAP_SELECTING: &[ReasonSpec] = &[ReasonSpec {
     reason: Reason::Cap,
     kind: ReasonKind::Selecting,
 }];
+const TIME_CAP: &[ReasonSpec] = &[
+    ReasonSpec {
+        reason: Reason::Cap,
+        kind: ReasonKind::Selecting,
+    },
+    ReasonSpec {
+        reason: Reason::TimeLimit,
+        kind: ReasonKind::Bounding,
+    },
+];
 const DEPTH_BOUNDING: &[ReasonSpec] = &[ReasonSpec {
     reason: Reason::Depth,
     kind: ReasonKind::Bounding,
@@ -203,6 +216,19 @@ const OUTLINE_REASONS: &[ReasonSpec] = &[
 
 pub const SURFACE_SPECS: &[SurfaceSpec] = &[
     SurfaceSpec {
+        requires: Some("tool-result/v1"),
+        command: "ast_search",
+        mode: "matches",
+        list_id: "payload.matches",
+        unit: Unit::Results,
+        narrow: &["paths", "globs", "pattern"],
+        reasons: &[ReasonSpec {
+            reason: Reason::Budget,
+            kind: ReasonKind::Selecting,
+        }],
+    },
+    SurfaceSpec {
+        requires: None,
         command: "callgraph",
         mode: "impact",
         list_id: "payload.sites",
@@ -211,6 +237,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         reasons: CAP_DEPTH,
     },
     SurfaceSpec {
+        requires: None,
         command: "callgraph",
         mode: "callers",
         list_id: "payload.callers",
@@ -219,6 +246,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         reasons: CAP_DEPTH,
     },
     SurfaceSpec {
+        requires: None,
         command: "callgraph",
         mode: "call_tree",
         list_id: "payload.tree",
@@ -227,6 +255,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         reasons: CAP_DEPTH,
     },
     SurfaceSpec {
+        requires: None,
         command: "callgraph",
         mode: "trace_to",
         list_id: "payload.paths",
@@ -235,6 +264,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         reasons: DEPTH_BUDGET_CAP,
     },
     SurfaceSpec {
+        requires: None,
         command: "callgraph",
         mode: "trace_data",
         list_id: "payload.hops",
@@ -243,6 +273,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         reasons: DEPTH_BOUNDING,
     },
     SurfaceSpec {
+        requires: None,
         command: "search",
         mode: "",
         list_id: "payload.results",
@@ -251,6 +282,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         reasons: SEARCH_REASONS,
     },
     SurfaceSpec {
+        requires: None,
         command: "grep",
         mode: "",
         list_id: "payload.matches",
@@ -259,6 +291,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         reasons: GREP_REASONS,
     },
     SurfaceSpec {
+        requires: None,
         command: "glob",
         mode: "",
         list_id: "payload.files",
@@ -267,6 +300,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         reasons: GLOB_REASONS,
     },
     SurfaceSpec {
+        requires: None,
         command: "outline",
         mode: "files",
         list_id: "payload.files",
@@ -275,6 +309,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         reasons: OUTLINE_REASONS,
     },
     SurfaceSpec {
+        requires: None,
         command: "read",
         mode: "directory",
         list_id: "payload.entries",
@@ -283,6 +318,7 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         reasons: WALK_CAP,
     },
     SurfaceSpec {
+        requires: None,
         command: "inspect",
         mode: "",
         list_id: "payload.details",
@@ -291,9 +327,28 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         reasons: CAP_SELECTING,
     },
     SurfaceSpec {
+        requires: None,
         command: "bash",
         mode: "",
         list_id: "bash.output",
+        unit: Unit::Lines,
+        narrow: &[],
+        reasons: CAP_SELECTING,
+    },
+    SurfaceSpec {
+        requires: None,
+        command: "bash",
+        mode: "changed_files",
+        list_id: "bash.changed_files",
+        unit: Unit::Files,
+        narrow: &[],
+        reasons: TIME_CAP,
+    },
+    SurfaceSpec {
+        requires: None,
+        command: "bash",
+        mode: "diff_lines",
+        list_id: "bash.diff_lines",
         unit: Unit::Lines,
         narrow: &[],
         reasons: CAP_SELECTING,
@@ -337,6 +392,9 @@ fn sorted_causes(causes: &[Reason]) -> Vec<Reason> {
 fn build_case_envelope(surface: SurfaceSpec, fired: &[Reason]) -> Option<ListEnvelope> {
     let has = |reason| fired.contains(&reason);
     match (surface.command, surface.mode) {
+        ("ast_search", "matches") => {
+            Some(aft::list_surfaces::ast_search_envelope(15, 24000, false))
+        }
         ("callgraph", "impact" | "callers" | "call_tree") => {
             let total = if has(Reason::Cap) { 21 } else { 15 };
             let truncated = usize::from(has(Reason::Depth));
@@ -422,6 +480,15 @@ fn build_case_envelope(surface: SurfaceSpec, fired: &[Reason]) -> Option<ListEnv
             has(Reason::Walk),
         ),
         ("inspect", "") => build_inspect_envelope(2, 4),
+        ("bash", "changed_files" | "diff_lines") => Some(
+            aft::list_surfaces::bash::build_changed_files_envelope_with_time_limit(
+                2,
+                if has(Reason::Cap) { 4 } else { 2 },
+                surface.mode == "diff_lines",
+                false,
+                has(Reason::TimeLimit),
+            ),
+        ),
         ("bash", "") => build_bash_output_envelope(61, 4000),
         other => panic!("no conformance builder for {other:?}"),
     }
@@ -430,6 +497,7 @@ fn build_case_envelope(surface: SurfaceSpec, fired: &[Reason]) -> Option<ListEnv
 fn expected_total(surface: SurfaceSpec, fired: &[Reason]) -> Total {
     let has = |reason| fired.contains(&reason);
     match (surface.command, surface.mode) {
+        ("ast_search", "matches") => Total::Exact(24000),
         ("callgraph", "impact" | "callers" | "call_tree") => {
             if has(Reason::Depth) {
                 Total::AtLeast(15)
@@ -483,6 +551,14 @@ fn expected_total(surface: SurfaceSpec, fired: &[Reason]) -> Total {
             }
         }
         ("inspect", "") => Total::Exact(4),
+        ("bash", "changed_files" | "diff_lines") => {
+            let total = if has(Reason::Cap) { 4 } else { 2 };
+            if has(Reason::TimeLimit) {
+                Total::AtLeast(total)
+            } else {
+                Total::Exact(total)
+            }
+        }
         ("bash", "") => Total::Exact(4000),
         other => panic!("no expected total for {other:?}"),
     }
@@ -598,6 +674,14 @@ pub fn validate_registry() -> Vec<String> {
             ));
             continue;
         };
+        if actual.requires != expected.requires {
+            errors.push(format!(
+                "{}: route requirement expected {:?}, got {:?}",
+                surface_name(*expected),
+                expected.requires,
+                actual.requires
+            ));
+        }
         if actual.unit != expected.unit {
             errors.push(format!(
                 "{}: registered unit expected {:?}, got {:?}",
@@ -796,6 +880,18 @@ fn push_root_fixture(
 
 pub fn capped_fixtures() -> Vec<FixtureRecord> {
     let mut fixtures = Vec::new();
+    for mode in ["changed_files", "diff_lines"] {
+        let reply = changed_files_fixture(mode);
+        fixtures.push(FixtureRecord {
+            name: format!("bash/{mode}"),
+            surface: registered_surface("bash", mode),
+            list_id: format!("bash.{mode}"),
+            rendered: render("bash", mode, &reply),
+            reply,
+            owner_path: vec!["_bash_changed_files".into()],
+            wire_key: format!("{mode}_list_envelope"),
+        });
+    }
     for name in ["cap", "walk", "walk_and_cap"] {
         push_root_fixture(
             &mut fixtures,
@@ -946,7 +1042,7 @@ pub fn capped_fixtures() -> Vec<FixtureRecord> {
 
     for case in kind_bound_cases()
         .into_iter()
-        .filter(|case| case.surface.command == "callgraph")
+        .filter(|case| matches!(case.surface.command, "callgraph" | "ast_search"))
     {
         let envelope = case.envelope.expect("callgraph case envelope");
         let wire_key = derive_wire_key(case.surface.list_id, false);
@@ -1182,7 +1278,7 @@ fn walk_envelope_keys(value: &Value, path: &mut Vec<String>, errors: &mut Vec<St
                     } else {
                         LIST_SURFACES.iter().any(|surface| {
                             surface.command != "inspect"
-                                && surface.command != "bash"
+                                && surface.list_id != "bash.output"
                                 && derive_wire_key(surface.list_id, false) == *key
                         })
                     };
@@ -1347,6 +1443,9 @@ pub struct CompleteFixture {
 
 fn make_impact_value(count: usize, depth_limited: bool) -> Value {
     let result = StoreImpactResult {
+        callback_dependencies: 0,
+        callback_reference_label: None,
+        test_filter_note: None,
         symbol: "target".to_string(),
         file: "src/app.ts".to_string(),
         signature: None,
@@ -1356,6 +1455,7 @@ fn make_impact_value(count: usize, depth_limited: bool) -> Value {
         affected_files: 1,
         callers: (1..=count)
             .map(|index| StoreImpactCaller {
+                relation: None,
                 caller_symbol: format!("caller{index}"),
                 caller_file: "src/app.ts".to_string(),
                 line: index as u32,
@@ -1378,12 +1478,17 @@ fn make_impact_value(count: usize, depth_limited: bool) -> Value {
 
 fn make_callers_value(count: usize, depth_limited: bool) -> Value {
     let result = StoreCallersResult {
+        callback_dependencies: 0,
+        callback_reference_label: None,
+        test_filter_note: None,
         symbol: "target".to_string(),
         file: "src/app.ts".to_string(),
         callers: vec![StoreCallerGroup {
             file: "src/app.ts".to_string(),
             callers: (1..=count)
                 .map(|index| StoreCallerEntry {
+                    relation: None,
+                    test_status_unknown: false,
                     symbol: format!("caller{index:02}"),
                     line: index as u32,
                     approximate: None,
@@ -1445,6 +1550,7 @@ fn make_tree_value(count: usize, depth_limited: bool) -> Value {
 fn make_capped_impact_value(count: usize) -> Value {
     let callers = (1..=count)
         .map(|i| StoreImpactCaller {
+            relation: None,
             caller_symbol: format!("caller{i}"),
             caller_file: "src/app.ts".to_string(),
             line: i as u32,
@@ -1482,6 +1588,9 @@ fn make_capped_impact_value(count: usize) -> Value {
     let sites_list_envelope = build_callgraph_envelope(Unit::Sites, shown, count, 0);
 
     let result = StoreImpactResult {
+        callback_dependencies: 0,
+        callback_reference_label: None,
+        test_filter_note: None,
         symbol: "target".to_string(),
         file: "src/app.ts".to_string(),
         signature: None,
@@ -1502,6 +1611,8 @@ fn make_capped_impact_value(count: usize) -> Value {
 fn make_capped_callers_value(count: usize) -> Value {
     let entries = (1..=count)
         .map(|i| StoreCallerEntry {
+            relation: None,
+            test_status_unknown: false,
             symbol: format!("caller{i:02}"),
             line: i as u32,
             approximate: None,
@@ -1535,6 +1646,9 @@ fn make_capped_callers_value(count: usize) -> Value {
     let callers_list_envelope = build_callgraph_envelope(Unit::Items, shown, count, 0);
 
     let result = StoreCallersResult {
+        callback_dependencies: 0,
+        callback_reference_label: None,
+        test_filter_note: None,
         symbol: "target".to_string(),
         file: "src/app.ts".to_string(),
         callers: vec![StoreCallerGroup {
@@ -1601,8 +1715,47 @@ pub struct CappedParityFixture {
     pub reply: Value,
 }
 
+fn changed_files_fixture(mode: &str) -> Value {
+    let envelope =
+        aft::list_surfaces::bash::build_changed_files_envelope(2, 4, mode == "diff_lines", false);
+    let text = format!(
+        "Observed changes\n{}",
+        aft::list_envelope::render_trailer(&envelope).unwrap()
+    );
+    json!({"output": text, "_bash_changed_files": {format!("{mode}_list_envelope"): envelope}})
+}
+
 pub fn capped_parity_fixtures() -> Vec<CappedParityFixture> {
     vec![
+        CappedParityFixture {
+            name: "ast_search/result_budget",
+            command: "ast_search",
+            mode: "matches",
+            list_id: "payload.matches",
+            reply: json!({
+                "matches": [{"file":"large.js", "line":1, "text":"console.log(1);"}],
+                "total_matches":24000, "files_searched":1, "files_with_matches":1,
+                "complete":false, "skipped_files":[],
+                "matches_list_envelope": {
+                    "shown":1, "total":{"kind":"exact","value":24000}, "unit":"results",
+                    "reason":"budget", "causes":["budget"], "narrow":["paths","globs","pattern"]
+                }
+            }),
+        },
+        CappedParityFixture {
+            name: "bash/changed_files",
+            command: "bash",
+            mode: "changed_files",
+            list_id: "bash.changed_files",
+            reply: changed_files_fixture("changed_files"),
+        },
+        CappedParityFixture {
+            name: "bash/diff_lines",
+            command: "bash",
+            mode: "diff_lines",
+            list_id: "bash.diff_lines",
+            reply: changed_files_fixture("diff_lines"),
+        },
         CappedParityFixture {
             name: "read/walk_and_cap",
             command: "read",
@@ -1741,7 +1894,7 @@ pub fn render_transports(fixture: &CappedParityFixture) -> (String, String) {
             .unwrap_or("")
             .replace(&format!("\n\n{GLOB_TRUNCATED_MESSAGE}"), "")
             .replace(GLOB_TRUNCATED_MESSAGE, "")
-    } else if matches!(fixture.command, "callgraph" | "read") {
+    } else if matches!(fixture.command, "callgraph" | "read" | "ast_search") {
         let wire_key = derive_wire_key(fixture.list_id, false);
         let env: Option<ListEnvelope> = fixture
             .reply
@@ -2190,38 +2343,7 @@ pub struct DiscoveredCut {
     pub snippet: String,
 }
 
-fn extract_item_name(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    let rest = [
-        "pub(crate) fn ",
-        "pub fn ",
-        "fn ",
-        "async fn ",
-        "pub async fn ",
-        "pub(crate) async fn ",
-        "pub(crate) const ",
-        "pub const ",
-        "const ",
-        "pub(crate) static ",
-        "pub static ",
-        "static ",
-        "pub(crate) struct ",
-        "pub struct ",
-        "struct ",
-        "pub(crate) enum ",
-        "pub enum ",
-        "enum ",
-    ]
-    .iter()
-    .find_map(|prefix| trimmed.strip_prefix(prefix))?;
-    let name = rest
-        .chars()
-        .take_while(|character| character.is_alphanumeric() || *character == '_')
-        .collect::<String>();
-    (!name.is_empty()).then_some(name)
-}
-
-fn enclosing_item(lines: &[&str], target: usize) -> String {
+pub(super) fn enclosing_item(lines: &[&str], target: usize) -> String {
     (0..=target)
         .rev()
         .find_map(|index| extract_item_name(lines[index]))
@@ -2231,8 +2353,11 @@ fn enclosing_item(lines: &[&str], target: usize) -> String {
 pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     let source_dir = aft_src_dir();
     let mut paths = collect_rs_files(&source_dir.join("commands"));
+    paths.push(source_dir.join("bash_changed_files.rs"));
     paths.push(source_dir.join("run_tool_call.rs"));
     paths.push(source_dir.join("subc_format.rs"));
+    paths.push(source_dir.join("subc/bind_log.rs"));
+    paths.push(source_dir.join("subc/diagnostics_findings.rs"));
     paths.push(source_dir.join("runtime_drain.rs"));
     paths.push(source_dir.join("bash_permissions/scan.rs"));
     paths.extend(collect_rs_files(&source_dir.join("compress")));
@@ -2240,6 +2365,7 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
         "budget.exhausted()",
         ".take(",
         "truncate(",
+        "size >= BODY_LIMIT",
         "DEFAULT_MAX_RESULTS",
         "HUB_SUMMARY_LIMIT",
         "TRACE_TO_EXPANSION_BUDGET",
@@ -2310,7 +2436,10 @@ fn surface_matches_file(command: &str, file: &str) -> bool {
         "outline" => file == "commands/outline.rs" || file == "subc_format.rs",
         "inspect" => file == "commands/inspect.rs" || file == "subc_format.rs",
         "bash" => {
-            file.starts_with("compress/") || file == "commands/bash.rs" || file == "subc_format.rs"
+            file == "bash_changed_files.rs"
+                || file.starts_with("compress/")
+                || file == "commands/bash.rs"
+                || file == "subc_format.rs"
         }
         _ => false,
     }

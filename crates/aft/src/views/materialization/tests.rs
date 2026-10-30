@@ -42,6 +42,21 @@ fn manifest_blob_reader_rejects_corrupt_digest_and_schema_at_consumption() {
 thread_local! {
     // Offline paired measurements keep the old SQL lookup as an in-process control.
     pub(super) static PER_REFERENCE_LOOKUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // Paired offline controls exercise the previous WAL/index strategy on the
+    // same fixture without adding a production configuration switch.
+    pub(super) static COLD_BUILD_MODE: std::cell::Cell<Option<(bool, bool)>> = const { std::cell::Cell::new(None) };
+    pub(super) static COLD_WRITE_LIMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn with_cold_mode<T>(mode: (bool, bool), run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<(bool, bool)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            COLD_BUILD_MODE.set(self.0);
+        }
+    }
+    let _restore = Restore(COLD_BUILD_MODE.replace(Some(mode)));
+    run()
 }
 
 struct Fixture {
@@ -134,6 +149,174 @@ fn fixture() -> Fixture {
     }
 }
 
+struct FailingColdReader {
+    panic: bool,
+}
+
+impl join::ManifestBlobReader for FailingColdReader {
+    fn read_callgraph_blob(
+        &self,
+        _: &str,
+    ) -> std::result::Result<Option<Vec<u8>>, join::ManifestJoinError> {
+        assert!(!self.panic, "injected cold build panic");
+        Err(join::ManifestJoinError::InvalidBlob(
+            "injected read failure".into(),
+        ))
+    }
+}
+
+fn assert_no_file_set(path: &Path) {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        assert!(
+            !Path::new(&format!("{}{suffix}", path.display())).exists(),
+            "unpublished file remains: {}{suffix}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn cold_error_removes_files_and_retry_succeeds() {
+    let f = fixture();
+    let path = f.dir.path().join("failed.sqlite");
+    assert!(
+        materialize_from_blob_reader(&path, &f.base, &FailingColdReader { panic: false }).is_err()
+    );
+    assert_no_file_set(&path);
+    materialize_manifest_view_database(&path, &f.blobs, &f.base).unwrap();
+    assert!(path.is_file());
+}
+
+#[test]
+fn cold_panic_removes_files_and_retry_succeeds() {
+    let f = fixture();
+    let path = f.dir.path().join("panicked.sqlite");
+    assert!(std::panic::catch_unwind(|| {
+        materialize_from_blob_reader(&path, &f.base, &FailingColdReader { panic: true })
+    })
+    .is_err());
+    assert_no_file_set(&path);
+    materialize_manifest_view_database(&path, &f.blobs, &f.base).unwrap();
+}
+
+#[test]
+fn cold_sqlite_full_removes_files_and_retry_succeeds() {
+    let f = fixture();
+    let blobs = Connection::open(&f.blobs).unwrap();
+    let files = (0..300)
+        .map(|index| {
+            (
+                format!("f{index}.ts"),
+                format!("export function f{index}() {{ return {index}; }}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let files = files
+        .iter()
+        .map(|(path, source)| (path.as_str(), source.as_str()))
+        .collect::<Vec<_>>();
+    let manifest = manifest(&blobs, &files);
+    drop(blobs);
+    let path = f.dir.path().join("full.sqlite");
+    COLD_WRITE_LIMIT.set(true);
+    let result = materialize_manifest_view_database(&path, &f.blobs, &manifest);
+    COLD_WRITE_LIMIT.set(false);
+    let error = result.unwrap_err();
+    assert!(error.to_string().contains("full"), "{error}");
+    assert_no_file_set(&path);
+    materialize_manifest_view_database(&path, &f.blobs, &manifest).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[path = "cold_bench.rs"]
+mod cold_bench;
+
+#[test]
+fn private_cold_matches_legacy_every_table_and_index() {
+    let f = relinking_fixture();
+    let legacy = f.dir.path().join("legacy-cold.sqlite");
+    with_cold_mode((false, false), || {
+        materialize_manifest_view_database(&legacy, &f.blobs, &f.base).unwrap();
+    });
+    let private = f.dir.path().join("private-cold.sqlite");
+    materialize_manifest_view_database(&private, &f.blobs, &f.base).unwrap();
+    parity::assert_logical_parity(&private, &legacy);
+    let connection = Connection::open(&private).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "delete"
+    );
+    assert_eq!(
+        connection
+            .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+    assert!(!private.with_extension("sqlite-wal").exists());
+}
+
+#[test]
+fn private_finish_syncs_the_owning_database_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("counted.sqlite");
+    let connection =
+        crate::db::wal_credit_probe::open_counted(&path, rusqlite::OpenFlags::default());
+    configure_private_connection(&connection).unwrap();
+    connection
+        .execute_batch(
+            "BEGIN; CREATE TABLE t(v); INSERT INTO t VALUES(randomblob(100000)); COMMIT;",
+        )
+        .unwrap();
+    let before = crate::db::wal_credit_probe::main_io_counts(&connection);
+    assert!(before.0 > 0, "the private build must have written pages");
+    assert_eq!(before.1, 0, "private writes must not sync each transaction");
+    finish_private_database(&connection).unwrap();
+    let after = crate::db::wal_credit_probe::main_io_counts(&connection);
+    assert!(
+        after.1 > before.1,
+        "publication must sync the owning VFS file"
+    );
+}
+
+#[test]
+fn private_finish_restores_journaling_and_full_synchronous_on_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("restored-policy.sqlite");
+    let connection =
+        crate::db::file_identity::IdentityConnection::open(&path, "private-finish-policy-test")
+            .unwrap();
+    configure_private_connection(&connection).unwrap();
+    connection
+        .execute_batch("CREATE TABLE t(v); INSERT INTO t VALUES(1);")
+        .unwrap();
+    let journal_mode = || {
+        connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+            .unwrap()
+    };
+    let synchronous = || {
+        connection
+            .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+            .unwrap()
+    };
+    assert_eq!(journal_mode(), "off");
+    assert_eq!(synchronous(), 0);
+    assert_eq!(
+        connection
+            .query_row("PRAGMA mmap_size", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+
+    finish_private_database(&connection).unwrap();
+
+    // Finalization restores the owner's policy as well as syncing existing pages.
+    assert_eq!(journal_mode(), "delete");
+    assert_eq!(synchronous(), 2);
+}
+
 /// Logical content of a derived database: schema rows plus sorted, typed rows
 /// of every table. See [`parity`] for the definition.
 fn snapshot(path: &Path) -> parity::LogicalSnapshot {
@@ -144,7 +327,7 @@ fn prepare(f: &Fixture) -> (std::path::PathBuf, std::path::PathBuf) {
     let base = f.dir.path().join("base.sqlite");
     let copy = f.dir.path().join("copy.sqlite");
     materialize_manifest_view_database(&base, &f.blobs, &f.base).unwrap();
-    std::fs::copy(&base, &copy).unwrap();
+    crate::views::generation::clone_derived_for_test(&base, &copy).unwrap();
     (base, copy)
 }
 
@@ -167,6 +350,93 @@ fn manifest_blob_reader_decodes_each_payload_once() {
 
     assert!(Arc::ptr_eq(&first, &second));
     assert_eq!(reader.decoded.borrow().len(), 1);
+    let weak = Arc::downgrade(&first);
+    drop((first, second));
+    assert!(
+        weak.upgrade().is_none(),
+        "the reader must not pin emitted blobs"
+    );
+}
+
+#[test]
+fn cold_materialization_decodes_parse_payloads_once_across_join_and_dispatch() {
+    struct Reader<'a> {
+        inner: ManifestViewBlobReader<'a>,
+        reads: RefCell<BTreeMap<String, usize>>,
+    }
+    impl join::ManifestBlobReader for Reader<'_> {
+        fn read_callgraph_blob(
+            &self,
+            key: &str,
+        ) -> std::result::Result<Option<Vec<u8>>, join::ManifestJoinError> {
+            *self.reads.borrow_mut().entry(key.to_string()).or_default() += 1;
+            self.inner.read_payload(key)
+        }
+    }
+    let f = fixture();
+    let connection = Connection::open(&f.blobs).unwrap();
+    let reader = Reader {
+        inner: ManifestViewBlobReader::new(&connection),
+        reads: Default::default(),
+    };
+    let database = f.dir.path().join("decoded-once.sqlite");
+    materialize_from_blob_reader(&database, &f.base, &reader).unwrap();
+    let reads = reader.reads.borrow();
+    assert_eq!(reads.len(), 4);
+    assert!(reads.values().all(|count| *count == 1), "{reads:?}");
+    let normal = f.dir.path().join("normal.sqlite");
+    materialize_manifest_view_database(&normal, &f.blobs, &f.base).unwrap();
+    assert_snapshot_parity(&snapshot(&database), &snapshot(&normal));
+}
+
+#[test]
+fn materialization_join_omits_only_the_duplicate_resolution_order() {
+    let f = fixture();
+    let connection = Connection::open(&f.blobs).unwrap();
+    let reader = ManifestViewBlobReader::new(&connection);
+    let empty = BTreeSet::new();
+    let cached = BTreeMap::new();
+    let full = join::join_selected_manifest_reusing_surfaces(
+        &f.base, &reader, None, &cached, &empty, &empty, &empty, None,
+    )
+    .unwrap();
+    let rows = join::join_selected_manifest_for_materialization(
+        &f.base, &reader, None, &cached, &empty, &empty, &empty, None,
+    )
+    .unwrap();
+    assert!(!full.result.resolution_order.is_empty());
+    assert!(rows.result.resolution_order.is_empty());
+    assert_eq!(full.result.rows, rows.result.rows);
+    assert_eq!(full.bindings, rows.bindings);
+}
+
+#[test]
+fn cold_reference_batches_match_unbatched_rows_and_dispatch() {
+    let f = fixture();
+    let connection = Connection::open(&f.blobs).unwrap();
+    let mut source = String::from("struct Thing; impl Thing { fn run(&self) {} } fn target() {} fn caller() { let thing = Thing; ");
+    for _ in 0..5000 {
+        source.push_str("thing.run(); target(); ");
+    }
+    source.push('}');
+    let manifest = manifest(&connection, &[("batch.rs", &source)]);
+    let reader = ManifestViewBlobReader::new(&connection);
+    let bounded = f.dir.path().join("batched.sqlite");
+    let unbatched = f.dir.path().join("unbatched.sqlite");
+    drop(Connection::open(&unbatched).unwrap());
+    let (batched, _) =
+        materialize_reading(&bounded, &manifest, None, &reader, Some(&connection)).unwrap();
+    let (whole, _) =
+        materialize_reading(&unbatched, &manifest, None, &reader, Some(&connection)).unwrap();
+    assert!(batched.resolved_refs > 4096);
+    assert!(batched.dispatch_resolved_sites > 0);
+    assert_eq!(batched.inserted, whole.inserted);
+    assert_eq!(batched.resolved_refs, whole.resolved_refs);
+    assert_eq!(
+        batched.dispatch_resolved_sites,
+        whole.dispatch_resolved_sites
+    );
+    assert_snapshot_parity(&snapshot(&bounded), &snapshot(&unbatched));
 }
 
 #[test]
@@ -973,7 +1243,7 @@ fn bench_controlled_300_path_diff() {
             .dir
             .path()
             .join(format!("controlled-{incremental}.sqlite"));
-        std::fs::copy(&original, &db).unwrap();
+        crate::views::generation::clone_derived_for_test(&original, &db).unwrap();
         let keeper = Connection::open(&db).unwrap();
         keeper
             .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_checkpoint(TRUNCATE)")
@@ -1469,7 +1739,8 @@ fn memoized_bindings_keep_call_and_value_ref_results_distinct() {
         row.kind == join::BlobRefKind::Call && row.status == join::ResolutionStatus::Resolved
     }));
     assert!(foo_rows.iter().any(|row| {
-        row.kind == join::BlobRefKind::ValueRef && row.status == join::ResolutionStatus::Unresolved
+        row.kind == join::BlobRefKind::CallbackRef
+            && row.status == join::ResolutionStatus::Unresolved
     }));
 }
 
@@ -2286,7 +2557,7 @@ fn incremental_dispatch_resolves_only_files_whose_inputs_changed() {
                 .dir
                 .path()
                 .join(format!("independent-{label}-{every_file}.sqlite"));
-            std::fs::copy(&base_db, &db).unwrap();
+            crate::views::generation::clone_derived_for_test(&base_db, &db).unwrap();
             let work_before = crate::views::io::work_snapshot();
             dispatch::RESOLVE_EVERY_FILE.with(|cell| cell.set(every_file));
             let stats = apply_manifest_diff(&db, &base, next, &f.blobs);
@@ -2538,3 +2809,5 @@ fn relinking_fixture() -> Fixture {
     );
     f
 }
+#[path = "dirty_pages.rs"]
+pub(super) mod dirty_pages;

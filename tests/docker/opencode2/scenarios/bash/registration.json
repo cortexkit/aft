@@ -1169,6 +1169,150 @@
           "triggered_reason": "cap"
         }
       }
+    },
+    {
+      "schema_version": 1,
+      "id": "bash/T6/bash-changed-files/complete",
+      "tool": "bash",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Initialize the watcher, then create one file and report its complete changed-files list.",
+      "fixture": "./fixture",
+      "user_config": { "bash": { "changed_files": "list" } },
+      "turns": [
+        {
+          "label": "warm-watcher",
+          "response": { "kind": "tool_calls", "calls": [{
+            "id": "changed-files-complete-warm", "name": "bash",
+            "arguments": { "command": ":", "wait": true, "compressed": false },
+            "non_mutating_evidence": { "reason": "initialize the project's file watcher without changing files" }
+          }] }
+        },
+        {
+          "label": "call-tool",
+          "response": { "kind": "tool_calls", "calls": [{
+            "id": "changed-files-complete", "name": "bash",
+            "arguments": { "command": "printf 'changed file\\n' > changed-files.txt", "wait": true, "compressed": false },
+            "disk_effects": ["changed-files.txt"]
+          }] }
+        },
+        { "label": "finish", "response": { "kind": "text", "content": "done" } }
+      ],
+      "expected_turns": ["warm-watcher", "call-tool", "finish"],
+      "compare_call_id": "changed-files-complete",
+      "metadata": { "t6": {
+        "surface_id": "bash.changed_files.bash.changed_files", "owner": "bash",
+        "call_id": "changed-files-complete", "fixture": "complete"
+      } }
+    },
+    {
+      "schema_version": 1,
+      "id": "bash/T6/bash-changed-files/incomplete",
+      "tool": "bash",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Initialize the watcher, then create 41 files so the changed-files list exceeds its 40-file cap.",
+      "fixture": "./fixture",
+      "user_config": { "bash": { "changed_files": "list" } },
+      "turns": [
+        {
+          "label": "warm-watcher",
+          "response": { "kind": "tool_calls", "calls": [{
+            "id": "changed-files-incomplete-warm", "name": "bash",
+            "arguments": { "command": ":", "wait": true, "compressed": false },
+            "non_mutating_evidence": { "reason": "initialize the project's file watcher without changing files" }
+          }] }
+        },
+        {
+          "label": "call-tool",
+          "response": { "kind": "tool_calls", "calls": [{
+            "id": "changed-files-incomplete", "name": "bash",
+            "arguments": { "command": "i=0; while [ $i -lt 41 ]; do printf 'changed\\n' > changed-$i.txt; i=$((i+1)); done", "wait": true, "compressed": false },
+            "disk_effects": ["changed-0.txt", "changed-1.txt", "changed-2.txt", "changed-3.txt", "changed-4.txt", "changed-5.txt", "changed-6.txt", "changed-7.txt", "changed-8.txt", "changed-9.txt", "changed-10.txt", "changed-11.txt", "changed-12.txt", "changed-13.txt", "changed-14.txt", "changed-15.txt", "changed-16.txt", "changed-17.txt", "changed-18.txt", "changed-19.txt", "changed-20.txt", "changed-21.txt", "changed-22.txt", "changed-23.txt", "changed-24.txt", "changed-25.txt", "changed-26.txt", "changed-27.txt", "changed-28.txt", "changed-29.txt", "changed-30.txt", "changed-31.txt", "changed-32.txt", "changed-33.txt", "changed-34.txt", "changed-35.txt", "changed-36.txt", "changed-37.txt", "changed-38.txt", "changed-39.txt", "changed-40.txt"]
+          }] }
+        },
+        { "label": "finish", "response": { "kind": "text", "content": "done" } }
+      ],
+      "expected_turns": ["warm-watcher", "call-tool", "finish"],
+      "compare_call_id": "changed-files-incomplete",
+      "metadata": { "t6": {
+        "surface_id": "bash.changed_files.bash.changed_files", "owner": "bash",
+        "call_id": "changed-files-incomplete", "fixture": "incomplete", "triggered_reason": "cap"
+      } }
+    },
+    {
+      "schema_version": 1,
+      "id": "bash/T6/bash-diff-lines/complete",
+      "tool": "bash",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Initialize the watcher, then create one short text file and report its complete diff.",
+      "fixture": "./fixture",
+      "user_config": { "bash": { "changed_files": "diff" } },
+      "turns": [
+        {
+          "label": "warm-watcher",
+          "response": { "kind": "tool_calls", "calls": [{
+            "id": "diff-lines-complete-warm", "name": "bash",
+            "arguments": { "command": ":", "wait": true, "compressed": false },
+            "non_mutating_evidence": { "reason": "initialize the project's file watcher without changing files" }
+          }] }
+        },
+        {
+          "label": "call-tool",
+          "response": { "kind": "tool_calls", "calls": [{
+            "id": "diff-lines-complete", "name": "bash",
+            "arguments": { "command": "printf 'small diff\\n' > diff-lines.txt", "wait": true, "compressed": false },
+            "disk_effects": ["diff-lines.txt"]
+          }] }
+        },
+        { "label": "finish", "response": { "kind": "text", "content": "done" } }
+      ],
+      "expected_turns": ["warm-watcher", "call-tool", "finish"],
+      "compare_call_id": "diff-lines-complete",
+      "metadata": { "t6": {
+        "surface_id": "bash.diff_lines.bash.diff_lines", "owner": "bash",
+        "call_id": "diff-lines-complete", "fixture": "complete"
+      } }
+    },
+    {
+      "schema_version": 1,
+      "id": "bash/T6/bash-diff-lines/incomplete",
+      "tool": "bash",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Initialize the watcher, then create a 250-line file so its diff exceeds the 200-line cap.",
+      "fixture": "./fixture",
+      "user_config": { "bash": { "changed_files": "diff" } },
+      "turns": [
+        {
+          "label": "warm-watcher",
+          "response": { "kind": "tool_calls", "calls": [{
+            "id": "diff-lines-incomplete-warm", "name": "bash",
+            "arguments": { "command": ":", "wait": true, "compressed": false },
+            "non_mutating_evidence": { "reason": "initialize the project's file watcher without changing files" }
+          }] }
+        },
+        {
+          "label": "call-tool",
+          "response": { "kind": "tool_calls", "calls": [{
+            "id": "diff-lines-incomplete", "name": "bash",
+            "arguments": { "command": ": > diff-lines.txt; i=0; while [ $i -lt 250 ]; do printf 'diff-line-%s\\n' $i >> diff-lines.txt; i=$((i+1)); done", "wait": true, "compressed": false },
+            "disk_effects": ["diff-lines.txt"]
+          }] }
+        },
+        { "label": "finish", "response": { "kind": "text", "content": "done" } }
+      ],
+      "expected_turns": ["warm-watcher", "call-tool", "finish"],
+      "compare_call_id": "diff-lines-incomplete",
+      "metadata": { "t6": {
+        "surface_id": "bash.diff_lines.bash.diff_lines", "owner": "bash",
+        "call_id": "diff-lines-incomplete", "fixture": "incomplete", "triggered_reason": "cap"
+      } }
     }
   ]
 }

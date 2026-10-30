@@ -1,1 +1,0 @@
-- With views on, files that are tracked but not on disk, or not valid UTF-8, no longer leave a project stuck at pending; skipped files are listed in status with their reason.

@@ -351,6 +351,40 @@ fn trace_to_symbol_ambiguous_target_with_to_file_traces_selected_file() {
 }
 
 #[test]
+fn callgraph_public_to_path_guidance_and_retry() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    fs::write(
+        root.join("start.ts"),
+        "import { target } from './one';\nexport function run() { target(); }\n",
+    )
+    .unwrap();
+    fs::write(root.join("one.ts"), "export function target() {}\n").unwrap();
+    fs::write(root.join("two.ts"), "export function target() {}\n").unwrap();
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let mut request = serde_json::json!({"id":"public", "command":"tool_call", "name":"callgraph", "arguments": {"op":"trace_to_symbol", "path":root.join("start.ts"), "symbol":"run", "toSymbol":"target"}});
+    let ambiguous = aft.send(&request.to_string());
+    assert_eq!(ambiguous["message"], "trace_to_symbol: target symbol 'target' exists in multiple files; pass 'toPath' to disambiguate");
+    assert_eq!(ambiguous["text"], "trace_to_symbol: ambiguous_target — multiple symbols named \"target\". Pass toPath to disambiguate:\n  - one.ts:1\n  - two.ts:1");
+    request["arguments"]["toPath"] = serde_json::json!(root.join("one.ts"));
+    let selected = aft.send(&request.to_string());
+    assert_eq!(selected["success"], true, "{selected}");
+    // Diagnostic footer availability depends on background analysis, not navigation semantics.
+    let text = selected["text"]
+        .as_str()
+        .unwrap()
+        .split("\n\n[AFT ")
+        .next()
+        .unwrap();
+    assert_eq!(
+        text,
+        "2 hops\n  ↳ run [start.ts:2]\n    ↳ target [one.ts:1]"
+    );
+    aft.shutdown();
+}
+
+#[test]
 fn trace_to_symbol_cycle_does_not_loop_and_finds_shortest_path() {
     let temp = tempdir().unwrap();
     let root = temp.path();

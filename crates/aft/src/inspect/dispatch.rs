@@ -64,7 +64,7 @@ static INSPECT_POOL: LazyLock<Arc<rayon::ThreadPool>> = LazyLock::new(|| {
     Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(default_pool_size())
-            .thread_name(|index| format!("aft-inspect-{index}"))
+            .thread_name(|index| format!("aft-rayon-inspect-{index}"))
             // Rayon defaults workers to ~2MB stacks (vs the main thread's 8MB).
             // The duplicates scanner walks the AST recursively, and deep trees
             // (minified bundles, generated code, long chains) previously

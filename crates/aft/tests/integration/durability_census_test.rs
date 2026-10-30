@@ -908,7 +908,9 @@ fn durability_census_in_process_child() {
 
     census_mark("pins: open family registry and register view (setup)");
     let registry = FamilyRegistry::open(&storage, "census").unwrap();
-    let view = registry.register_view("census", &project).unwrap();
+    let view = registry
+        .register_view_with_storage(registry.storage(), "census", &project)
+        .unwrap();
     census_mark("pins: live pin create");
     let mut live = LivePin::create(&view).unwrap();
     let key = |seed: u8| FamilyKey::new(FamilyPlane::Trigram, [seed; 32]);

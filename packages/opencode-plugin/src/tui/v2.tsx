@@ -9,6 +9,7 @@ import {
   formatStatusDialogMessage,
 } from "../shared/status";
 import { AftRpc } from "./aft-rpc";
+import { readTuiPreferencesFile, resolveAftPrefs, watchTuiPreferences } from "./preferences";
 import {
   AftSidebarPanel,
   createSidebarPreferences,
@@ -250,9 +251,56 @@ function useAftStatus(
   return status;
 }
 
-function FooterStatus(props: { context: V2TuiContext; rpc: AftRpcClient; sessionID?: string }) {
+/**
+ * The `footer` switch from the `aft` entry of `tui-preferences.jsonc`, kept
+ * current while the file is edited, as the sidebar's preferences are.
+ *
+ * It reads as hidden until the file has been read once. Starting from the
+ * default (shown) instead would flash the line on every prompt mount for
+ * someone who turned it off; the read takes milliseconds, and a missing or
+ * unreadable file resolves to the default, so the line still appears for
+ * everyone else.
+ */
+function createFooterVisibility(): () => boolean {
+  const [visible, setVisible] = createSignal(false);
+  // Reads can overlap when the file changes twice in quick succession; only
+  // the most recently started read may set the value.
+  let generation = 0;
+  const reload = async (): Promise<void> => {
+    const current = ++generation;
+    const prefs = resolveAftPrefs(await readTuiPreferencesFile());
+    if (current === generation) setVisible(prefs.footer);
+  };
+  void reload();
+  const unwatch = watchTuiPreferences(() => {
+    void reload();
+  });
+  onCleanup(() => {
+    generation += 1;
+    unwatch();
+  });
+  return visible;
+}
+
+function FooterSegment(props: { context: V2TuiContext; rpc: AftRpcClient; sessionID?: string }) {
   const status = useAftStatus(props.context, props.rpc, () => props.sessionID);
   return <text>{formatAftStatusSegment(status())}</text>;
+}
+
+/**
+ * The prompt footer claim. With `footer: false` it renders no element at all,
+ * so the line takes no space, and the status subscription behind it is torn
+ * down until the switch is turned back on.
+ */
+function FooterStatus(props: { context: V2TuiContext; rpc: AftRpcClient; sessionID?: string }) {
+  const visible = createFooterVisibility();
+  return (
+    <>
+      {visible() ? (
+        <FooterSegment context={props.context} rpc={props.rpc} sessionID={props.sessionID} />
+      ) : null}
+    </>
+  );
 }
 
 function SidebarStatus(props: { context: V2TuiContext; rpc: AftRpcClient; sessionID: string }) {

@@ -6,6 +6,7 @@ import {
   compareSemver,
   findExecutablesOnPath,
   isNativeExecutable,
+  PLATFORM_ARCH_MAP,
   spawnSync,
 } from "@cortexkit/aft-bridge";
 import { CLI } from "./cli.js";
@@ -182,12 +183,7 @@ export function platformKey(
   platform: string = process.platform,
   arch: string = process.arch,
 ): string | null {
-  const table: Record<string, Record<string, string>> = {
-    darwin: { arm64: "darwin-arm64", x64: "darwin-x64" },
-    linux: { arm64: "linux-arm64", x64: "linux-x64" },
-    win32: { x64: "win32-x64" },
-  };
-  return table[platform]?.[arch] ?? null;
+  return PLATFORM_ARCH_MAP[platform]?.[arch] ?? null;
 }
 
 /** The `v<semver>` directory names `aft doctor --fix` creates in the binary cache. */

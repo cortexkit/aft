@@ -165,6 +165,16 @@ describe("resolveAftPrefs", () => {
     expect(prefs.sections.searchIndex).toBe(true);
     expect(prefs.rememberCollapsed).toBe(true);
   });
+
+  test("the prompt footer is on by default, off only for an explicit false", () => {
+    expect(resolveAftPrefs({}).footer).toBe(true);
+    expect(resolveAftPrefs({ aft: {} }).footer).toBe(true);
+    expect(resolveAftPrefs({ aft: { footer: false } }).footer).toBe(false);
+    expect(resolveAftPrefs({ aft: { footer: true } }).footer).toBe(true);
+    for (const invalid of ["false", 0, null, {}, []]) {
+      expect(resolveAftPrefs({ aft: { footer: invalid } }).footer).toBe(true);
+    }
+  });
 });
 
 describe("computeEffectiveOrder", () => {
@@ -329,5 +339,71 @@ describe("watchTuiPreferences", () => {
       watchMock.mockRestore();
       readMock.mockRestore();
     }
+  });
+
+  /**
+   * Drives watchTuiPreferences with a fake directory watch and a scripted
+   * readFile: each read takes the next entry, where a string is the file's
+   * text and an error code makes the read fail with that code.
+   */
+  async function watchScripted(
+    reads: Array<string | { code: string }>,
+    events: number,
+  ): Promise<number> {
+    let onWatch: ((event: string, filename: string) => void) | undefined;
+    const watcher = Object.assign(new EventEmitter(), { close: () => {} });
+    const watchMock = spyOn(fs, "watch").mockImplementation(((
+      _dir: unknown,
+      callback: typeof onWatch,
+    ) => {
+      onWatch = callback;
+      return watcher;
+    }) as typeof fs.watch);
+    let next = 0;
+    const readMock = spyOn(fsPromises, "readFile").mockImplementation((() => {
+      const result = reads[next++];
+      if (result === undefined) throw new Error("more reads than scripted");
+      if (typeof result === "string") return Promise.resolve(result);
+      return Promise.reject(Object.assign(new Error(result.code), { code: result.code }));
+    }) as typeof fsPromises.readFile);
+    let changes = 0;
+    const stop = watchTuiPreferences(() => {
+      changes++;
+    });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      for (let i = 0; i < events; i++) {
+        onWatch?.("rename", "tui-preferences.jsonc");
+        // Past the watcher's 150 ms debounce, so every event reads once.
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+      expect(next).toBe(reads.length);
+      return changes;
+    } finally {
+      stop();
+      watchMock.mockRestore();
+      readMock.mockRestore();
+    }
+  }
+
+  test("deleting the file is one change, and recreating it is another", async () => {
+    const changes = await watchScripted(
+      ['{ "aft": { "footer": false } }', { code: "ENOENT" }, { code: "ENOENT" }, "{}"],
+      3,
+    );
+    expect(changes).toBe(2);
+  });
+
+  test("a file missing at start is not reported as deleted again", async () => {
+    const changes = await watchScripted([{ code: "ENOENT" }, { code: "ENOENT" }, "{}"], 2);
+    expect(changes).toBe(1);
+  });
+
+  test("a present but unreadable file is not a change", async () => {
+    const changes = await watchScripted(
+      ['{ "aft": { "footer": false } }', { code: "EACCES" }, { code: "EISDIR" }],
+      2,
+    );
+    expect(changes).toBe(0);
   });
 });

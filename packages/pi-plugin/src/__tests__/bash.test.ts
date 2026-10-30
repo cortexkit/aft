@@ -389,7 +389,7 @@ describe("bash tool adapter", () => {
         "Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs this machine's own operating system or hardware (its sandbox, code signing, service manager, permission prompts or GUI frameworks)",
       );
       expect(bash.description).toContain(
-        "or runs a binary that already exists on this machine; building and testing still go remote, and a remote build leaves no binaries or target/ output in the local worktree.",
+        'or runs a binary that already exists on this machine; a build or test that needs only macOS (its sandbox, code signing or file watching) can use runon: "macos" instead; building and testing still go remote, and a remote build leaves no binaries or target/ output in the local worktree.',
       );
     },
   );
@@ -469,6 +469,44 @@ describe("bash tool adapter", () => {
       const call = calls.at(-1) as [string, Record<string, unknown>];
       expect(call[1]).toMatchObject({ command: "FOO=1 make | tail -1", runon });
     }
+  });
+
+  test("return_paths is forwarded unchanged beside runon, and absent when not given", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const { bridge, calls } = makeTrackableMockBridge({ output: "ok", exit_code: 0 });
+    registerBashTool(
+      makeMockApi(tools),
+      makeMockContext(bridge, {
+        subc: { connection_file: "/run/subc-connection.json" },
+        remote_exec: { enabled: true },
+        bash: { runon_enabled: true },
+      } as PluginContext["config"]),
+    );
+    const bash = tools.get("bash")!;
+    const returnPaths = ["dist/app.bin", "out/report.json"];
+    await bash.execute(
+      "with-paths",
+      { command: "make dist", runon: "linux", return_paths: returnPaths },
+      undefined,
+      undefined,
+      { cwd: projectRoot, hasUI: false },
+    );
+    const withPaths = calls.at(-1) as [string, Record<string, unknown>];
+    expect(withPaths[1].runon).toBe("linux");
+    expect(withPaths[1].return_paths).toEqual(["dist/app.bin", "out/report.json"]);
+    await bash.execute(
+      "without-paths",
+      { command: "make dist", runon: "linux" },
+      undefined,
+      undefined,
+      {
+        cwd: projectRoot,
+        hasUI: false,
+      },
+    );
+    const withoutPaths = calls.at(-1) as [string, Record<string, unknown>];
+    expect(withoutPaths[1].runon).toBe("linux");
+    expect("return_paths" in withoutPaths[1]).toBe(false);
   });
 
   test("runon refuses a module-down transport without host fallback", async () => {
@@ -1231,6 +1269,63 @@ describe("bash tool adapter", () => {
     expect(sessionBgStates.get("s-watch")?.outstandingTaskIds.has("bash-finished")).toBe(false);
   });
 
+  test("each_line recovery pages forward byte offsets and show only masked text", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const { bridge, calls } = makeTrackableMockBridge({
+      status: "running",
+      output_page_text: "masked output",
+      output_chunk_base64: "RAW-SECRET",
+      output_next_offset: 48,
+      output_has_more: false,
+    });
+    registerBashTool(makeMockApi(tools), makeMockContext(bridge));
+    const result = (await tools
+      .get("bash_status")!
+      .execute(
+        "call",
+        { task_id: "bash-lines", output_offset: 16, stderr_offset: 10 },
+        undefined,
+        undefined,
+        { cwd: projectRoot },
+      )) as { content: { text: string }[] };
+    const status = calls.find((call) => (call as [string])[0] === "bash_status") as [
+      string,
+      Record<string, unknown>,
+    ];
+    expect(status[1]).toMatchObject({ output_offset: 16, stderr_offset: 10 });
+    expect(result.content[0].text).toContain("masked output");
+    expect(result.content[0].text).toContain("next output_offset: 48");
+    expect(result.content[0].text).not.toContain("RAW-SECRET");
+  });
+
+  test("each_line forwards async delivery and refuses sync delivery", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const { bridge, calls } = makeTrackableMockBridge({ watch_id: "watch-lines" });
+    registerBashTool(makeMockApi(tools), makeMockContext(bridge));
+    const tool = tools.get("bash_watch")!;
+    await tool.execute(
+      "call",
+      { task_id: "bash-lines", pattern: "ERROR", background: true, deliver: "each_line" },
+      undefined,
+      undefined,
+      { cwd: projectRoot },
+    );
+    const notify = calls.find((call) => (call as [string])[0] === "bash_notify") as [
+      string,
+      Record<string, unknown>,
+    ];
+    expect(notify[1].deliver).toBe("each_line");
+    await expect(
+      tool.execute(
+        "call",
+        { task_id: "bash-lines", pattern: "ERROR", deliver: "each_line" },
+        undefined,
+        undefined,
+        { cwd: projectRoot },
+      ),
+    ).rejects.toThrow('bash_watch: deliver: "each_line" needs background: true.');
+  });
+
   test('async bash_watch forwards string once "false" as boolean false', async () => {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);
@@ -1450,6 +1545,73 @@ describe("bash tool adapter", () => {
     expect(confirmations).toHaveLength(0);
   });
 
+  test("a memory cap refuses uncontained host fallback before asking", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const bridge = {
+      send: async () => {
+        throw new BridgeTransportUnavailableError("offline");
+      },
+    } as unknown as BinaryBridge;
+    registerBashTool(
+      makeMockApi(tools),
+      makeMockContext(bridge, {
+        bash: { host_fallback: true, memory_limit_mib: 64 },
+      } as PluginContext["config"]),
+    );
+    await expect(
+      tools
+        .get("bash")!
+        .execute("call", { command: "printf should-not-run" }, undefined, undefined, {
+          cwd: projectRoot,
+          hasUI: false,
+        }),
+    ).rejects.toThrow("bash.memory_limit_mib");
+  });
+
+  test("secret placeholders refuse host fallback before confirmation", async () => {
+    for (const [command, effective] of [
+      ["printf '{{ck-secret:test}}'", undefined],
+      ["printf '{{ck-secret:unfinished'", undefined],
+      ["printf clean", "printf '{{ck-secret:test}}'"],
+      ["printf '{{ck-secret:test}}'", "printf clean"],
+    ] as const) {
+      const tools = new Map<string, MockToolDef>();
+      let confirmations = 0;
+      const bridge = {
+        send: async () => {
+          throw new BridgeTransportUnavailableError("offline");
+        },
+      } as unknown as BinaryBridge;
+      const api =
+        effective === undefined
+          ? makeMockApi(tools)
+          : ({
+              registerTool: (tool: MockToolDef) => tools.set(tool.name, tool),
+              getHook: (name: string) =>
+                name === "bashSpawn" ? async () => ({ command: effective }) : undefined,
+            } as unknown as ExtensionAPI);
+      registerBashTool(
+        api,
+        makeMockContext(bridge, { bash: { host_fallback: true } } as PluginContext["config"]),
+      );
+      await expect(
+        tools.get("bash")!.execute("call", { command }, undefined, undefined, {
+          cwd: projectRoot,
+          hasUI: true,
+          ui: {
+            confirm: async () => {
+              confirmations++;
+              return false;
+            },
+          },
+        }),
+      ).rejects.toThrow(
+        "Secret placeholder commands need AFT's shell; Pi's built-in shell cannot run them.",
+      );
+      expect(confirmations).toBe(0);
+    }
+  });
+
   test("a bash call that timed out at the bridge names the task AFT started (issue #577)", async () => {
     const tools = new Map<string, MockToolDef>();
     const confirmations: unknown[] = [];
@@ -1611,6 +1773,14 @@ describe("bash tool adapter", () => {
 
     // Verify progress callbacks were invoked
     expect(progressCallbacks.length).toBe(2);
+    expect(updates).toEqual([
+      expect.objectContaining({
+        content: [{ type: "text", text: "line1\n" }],
+      }),
+      expect.objectContaining({
+        content: [{ type: "text", text: "line1\nline2\n" }],
+      }),
+    ]);
 
     // Verify final result has the output
     const finalResult = result as { content: Array<{ text: string }> };
@@ -1712,6 +1882,55 @@ describe("bash tool adapter", () => {
       sandbox: "host",
       permissions_granted: ["esc_server_minted"],
     });
+  });
+
+  test("permission loop stops early and names an already granted ask", async () => {
+    const tools = new Map<string, MockToolDef>();
+    let calls = 0;
+    let approvals = 0;
+    const bridge = {
+      send: async () => {
+        calls++;
+        return {
+          success: false,
+          code: "permission_required",
+          asks: [
+            {
+              kind: "escalation",
+              command: "rsync -a source/ worker/",
+              cwd: projectRoot,
+              grant_id: "esc_repeat",
+            },
+          ],
+        };
+      },
+    } as unknown as BinaryBridge;
+    registerBashTool(makeMockApi(tools), makeMockContext(bridge));
+    const extCtx: MockExtensionContext = {
+      cwd: projectRoot,
+      hasUI: true,
+      ui: {
+        confirm: async () => {
+          approvals++;
+          return true;
+        },
+      },
+    };
+    await expect(
+      tools
+        .get("bash")!
+        .execute(
+          "repeat",
+          { command: "rsync -a source/ worker/", sandbox: "host" },
+          undefined,
+          undefined,
+          extCtx,
+        ),
+    ).rejects.toThrow(
+      `escalation rsync -a source/ worker/ @ ${projectRoot} (operation: bash; granted already: yes)`,
+    );
+    expect(calls).toBe(2);
+    expect(approvals).toBe(1);
   });
 
   test("permission_required error throws clear message", async () => {
@@ -1845,6 +2064,26 @@ describe("bash tool adapter", () => {
     }
   });
 
+  test("bash_kill preserves its outcome and appends the durable-revocation warning", async () => {
+    const warning =
+      "bot_write_revocation_not_durable: the block on this command's bot writes was not saved and lasts only until AFT restarts; check the command's state.";
+    const tools = new Map<string, MockToolDef>();
+    const bridge = {
+      send: async () => ({
+        success: true,
+        status: "killed",
+        bot_write_revocation_warning: warning,
+      }),
+    } as unknown as BinaryBridge;
+    registerBashTool(makeMockApi(tools), makeMockContext(bridge));
+    const result = await tools
+      .get("bash_kill")!
+      .execute("call", { task_id: "bash-warning" }, undefined, undefined, { cwd: projectRoot });
+    expect((result.content[0] as { text: string }).text).toBe(
+      `Task bash-warning: killed\n${warning}`,
+    );
+  });
+
   test("bash_status text includes a failed task's spawn reason", async () => {
     const reason = "failed to spawn background bash command: No such file or directory";
     const tools = new Map<string, MockToolDef>();
@@ -1899,6 +2138,27 @@ describe("bash tool adapter", () => {
 
     expect(toolText(result)).toContain("Task bash-remote: running");
     expect(toolText(result)).not.toContain("remote job");
+  });
+
+  test("bash_status shows AFT's incomplete-listing sentence exactly", async () => {
+    const sentence =
+      "AFT could not read every process in the task's group, so others may also be running.";
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const { bridge } = makeTrackableMockBridge({
+      status: "timed_out",
+      exit_code: 124,
+      live_descendants: null,
+      live_descendants_unavailable: "listing_incomplete",
+      live_descendants_summary: sentence,
+    });
+    registerBashTool(api, makeMockContext(bridge));
+
+    const result = await tools
+      .get("bash_status")!
+      .execute("call", { task_id: "bash-hidden" }, undefined, undefined, { cwd: projectRoot });
+
+    expect(toolText(result)).toContain(`Task bash-hidden: timed_out (exit 124) · ${sentence}`);
   });
 
   test("bash_watch pattern substring returns waited matched details", async () => {
@@ -2724,6 +2984,31 @@ describe("registerBashTool registers companions only while bash.background is on
     expect((calls[0] as [string, Record<string, unknown>])[1]).toEqual({ task_id: "bash-123" });
     expect((calls[1] as [string, Record<string, unknown>])[0]).toBe("bash_kill");
     expect((calls[1] as [string, Record<string, unknown>])[1]).toEqual({ task_id: "bash-123" });
+  });
+
+  test("bash_kill reports the runner answer without claiming a known task outcome", async () => {
+    for (const remote_cancel of [
+      "runner confirmed cancellation",
+      "runner reports job already ended",
+      "remote cancellation unconfirmed; outcome is still unknown: runner unavailable",
+    ]) {
+      const tools = new Map<string, MockToolDef>();
+      const { bridge } = makeTrackableMockBridge({ status: "fate_unknown", remote_cancel });
+      const ctx: PluginContext = {
+        pool: { getBridge: () => bridge } as unknown as PluginContext["pool"],
+        config: { bash: { background: true } } as PluginContext["config"],
+        storageDir: "/tmp/test",
+      };
+      registerBashTool(makeMockApi(tools), ctx);
+      const result = await tools
+        .get("bash_kill")!
+        .execute("kill-call", { task_id: "bash-unknown" }, undefined, undefined, {
+          cwd: projectRoot,
+        });
+      expect(result.content).toEqual([
+        { type: "text", text: `Task bash-unknown: fate_unknown · ${remote_cancel}` },
+      ]);
+    }
   });
 });
 

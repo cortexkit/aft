@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "note": "No search ranking, routing or index source is touched. Config files are now opened through one shared helper that asks Windows for read, write and delete sharing, so a tool replacing a config file is not refused while AFT reads it, and the bind fixture retries a refused Windows publish. Search output, scores, ordering and page cuts are unchanged; benchmark rows must remain byte-identical.",
+  "slices": [
+    "windows-config-share-delete"
+  ]
+}

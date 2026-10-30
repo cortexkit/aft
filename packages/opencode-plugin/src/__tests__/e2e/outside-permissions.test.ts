@@ -1,5 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
@@ -20,7 +29,16 @@ async function stdoutPath(storage: string, id: string): Promise<string> {
   while (pending.length) {
     const directory = pending.pop();
     if (!directory) break;
-    for (const entry of await readdir(directory, { withFileTypes: true })) {
+    // The engine's index builders create and remove temporary folders under
+    // the same storage root while this walk runs, so a listed folder can be
+    // gone by the time it is read; skip it.
+    const entries = await readdir(directory, { withFileTypes: true }).catch(
+      (error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return [];
+        throw error;
+      },
+    );
+    for (const entry of entries) {
       const path = join(directory, entry.name);
       if (entry.isDirectory()) pending.push(path);
       else if (entry.name === `${id}.stdout` || (entry.name === "stdout" && path.includes(id)))
@@ -31,6 +49,53 @@ async function stdoutPath(storage: string, id: string): Promise<string> {
 }
 
 describe.skipIf(!binary.binaryPath)("real engine outside exemptions", () => {
+  test("grep honors outside directory approval through a symlinked scratch parent", async () => {
+    const h = await createHarness(binary, {
+      fixtureNames: [],
+      configOverrides: configureParamsFromLegacyOverrides({ restrict_to_project_root: false }),
+    });
+    const outside = await mkdtemp(join(homedir(), ".cache", "aft-outside-grep-"));
+    try {
+      const repository = join(outside, "repositories", "antigravity-auth-314-prs");
+      const packages = join(repository, "packages");
+      await mkdir(packages, { recursive: true });
+      await writeFile(join(packages, "probe.ts"), "export const outside_grep_canary = 1;\n");
+      const scratch = join(outside, "CortexKit-scratch");
+      await mkdir(scratch);
+      await symlink(join(outside, "repositories"), join(scratch, "repos"), "junction");
+      const ctx = {
+        pool: { getBridge: () => h.bridge } as unknown as BridgePool,
+        config: {},
+        client: { session: { get: async () => ({ data: { directory: h.tempDir } }) } },
+        storageDir: h.path(".aft-storage"),
+      } as unknown as PluginContext;
+      for (const path of [
+        packages,
+        join(scratch, "repos", "antigravity-auth-314-prs", "packages"),
+      ]) {
+        let questions = 0;
+        const runtime = {
+          directory: h.tempDir,
+          sessionID: "outside-grep-session",
+          callID: path,
+          ask: async () => {
+            questions++;
+          },
+        };
+        const result = await callToolCall(ctx, runtime, "grep", {
+          path,
+          pattern: "outside_grep_canary",
+        });
+        expect(result.success).toBe(true);
+        expect(result.text).toContain("outside_grep_canary");
+        expect(questions).toBe(1);
+      }
+    } finally {
+      await h.cleanup();
+      await rm(outside, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   test("mixed delete waits for every outside approval before any unlink", async () => {
     const h = await createHarness(binary, {
       fixtureNames: [],

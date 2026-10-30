@@ -97,21 +97,26 @@ impl Parent {
     }
 
     fn remove(&self, name: &str) -> io::Result<()> {
+        use crate::bash_background::persistence::{remove_directory_tree_at, PinnedDir};
         self.verify_identity()?;
-        let child = match open_dir_at(&self.file, &CString::new(name)?) {
-            Ok(child) => child,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return remove_if_present(&self.path.join(format!("{name}.owner")));
-            }
-            Err(error) => return Err(error),
-        };
-        if child.metadata()?.uid() != unsafe { libc::geteuid() } {
+        // The command's TMPDIR may hold directories it made read-only (Go's
+        // module cache, tests that `chmod -w` a fixture). The pinned removal
+        // restores owner access to those without following symlinks, where
+        // `fs::remove_dir_all` stopped with "Permission denied" and left the
+        // task bundle undeletable.
+        let parent = PinnedDir::open(&self.path)?;
+        let held = self.file.metadata()?;
+        if parent.directory_identity()? != (held.dev(), held.ino()) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "task temp owner changed",
+                "task temp parent changed",
             ));
         }
-        fs::remove_dir_all(self.path.join(name))?;
+        match remove_directory_tree_at(&parent, std::ffi::OsStr::new(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         remove_if_present(&self.path.join(format!("{name}.owner")))
     }
 }
@@ -316,6 +321,45 @@ mod tests {
             .remove(second.file_name().unwrap().to_str().unwrap())
             .unwrap();
         assert_eq!(fs::read_dir(&parent.path).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn sandbox_task_temp_cleanup_removes_read_only_trees_without_following_links() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = Parent::open(&root.path().join("aft-w")).unwrap();
+        let scratch = parent.allocate(root.path()).unwrap();
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), "outside").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o500)).unwrap();
+        // Go's module cache marks every directory read-only; a test that
+        // `chmod 000`s a fixture and crashes leaves a directory with no
+        // owner access at all.
+        let module = scratch.join("go/pkg/mod/example.com/mod@v1");
+        fs::create_dir_all(&module).unwrap();
+        fs::write(module.join("go.mod"), "module example.com/mod").unwrap();
+        symlink(&outside, module.join("outside-link")).unwrap();
+        let fixture = scratch.join("fixture");
+        fs::create_dir(&fixture).unwrap();
+        fs::write(fixture.join("data"), "data").unwrap();
+        for directory in module.ancestors().take(5) {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        fs::set_permissions(&fixture, fs::Permissions::from_mode(0o000)).unwrap();
+
+        parent
+            .remove(scratch.file_name().unwrap().to_str().unwrap())
+            .unwrap();
+
+        assert!(!scratch.exists());
+        assert!(!scratch.with_extension("owner").exists());
+        assert_eq!(fs::read_to_string(outside.join("keep")).unwrap(), "outside");
+        assert_eq!(
+            fs::metadata(&outside).unwrap().mode() & 0o7777,
+            0o500,
+            "a symlink target's permissions were changed"
+        );
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]

@@ -4,6 +4,9 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use super::helpers::{user_config, AftProcess, ReleaseOnDrop};
+// The project-tier test is Unix-only, so this import is too.
+#[cfg(unix)]
+use super::helpers::user_config_tier;
 
 #[cfg(unix)]
 fn process_exists(pid: i32) -> bool {
@@ -1032,14 +1035,15 @@ fn finished_duplicate_bash_task_does_not_warn() {
 #[test]
 fn user_bash_env_is_applied_and_disclosed_once_without_values() {
     let mut aft = AftProcess::spawn();
+    // Names starting with `AFT_` are AFT's own controls and are refused.
     let _project = configure_background_with_env(
         &mut aft,
         json!({
-            "AFT_CONFIG_ENV_TEST": "config-secret-value",
-            "AFT_SECOND_CONFIG_ENV_TEST": "second-secret-value"
+            "BASHENV_CONFIG_ENV_TEST": "config-secret-value",
+            "BASHENV_SECOND_ENV_TEST": "second-secret-value"
         }),
     );
-    let command = "printf '%s' \"$AFT_CONFIG_ENV_TEST\"";
+    let command = "printf '%s' \"$BASHENV_CONFIG_ENV_TEST\"";
     let from_config = aft.send(
         &json!({
             "id": "config-env-first",
@@ -1053,9 +1057,16 @@ fn user_bash_env_is_applied_and_disclosed_once_without_values() {
         "spawn failed: {from_config:?}"
     );
     let first_reply = from_config["output"].as_str().unwrap();
-    assert!(first_reply.contains("AFT_CONFIG_ENV_TEST"), "{first_reply}");
     assert!(
-        first_reply.contains("AFT_SECOND_CONFIG_ENV_TEST"),
+        first_reply.contains("Configured bash.env keys applied (values not shown):"),
+        "{first_reply}"
+    );
+    assert!(
+        first_reply.contains("BASHENV_CONFIG_ENV_TEST (user)"),
+        "{first_reply}"
+    );
+    assert!(
+        first_reply.contains("BASHENV_SECOND_ENV_TEST (user)"),
         "{first_reply}"
     );
     assert!(
@@ -1078,7 +1089,7 @@ fn user_bash_env_is_applied_and_disclosed_once_without_values() {
                 "command": command,
                 "background": true,
                 "foreground_orchestrate": true,
-                "env": { "AFT_CONFIG_ENV_TEST": "call-secret-value" }
+                "env": { "BASHENV_CONFIG_ENV_TEST": "call-secret-value" }
             }
         })
         .to_string(),
@@ -1086,7 +1097,7 @@ fn user_bash_env_is_applied_and_disclosed_once_without_values() {
     assert_eq!(from_call["success"], true, "spawn failed: {from_call:?}");
     let second_reply = from_call["output"].as_str().unwrap();
     assert!(
-        !second_reply.contains("AFT_CONFIG_ENV_TEST"),
+        !second_reply.contains("BASHENV_CONFIG_ENV_TEST"),
         "{second_reply}"
     );
     assert!(
@@ -1099,6 +1110,92 @@ fn user_bash_env_is_applied_and_disclosed_once_without_values() {
         "completed",
     );
     assert_eq!(second_result["output_preview"], "call-secret-value");
+    assert!(aft.shutdown().success());
+}
+
+/// A project's `bash.env` is disclosed as untrusted, then applies once the
+/// project is on the filter trust list, and the notice never shows a value.
+#[cfg(unix)]
+#[test]
+fn project_bash_env_applies_only_after_trust_and_is_disclosed_once() {
+    let mut aft = AftProcess::spawn();
+    // The configured project root is the directory bash commands run in, so it
+    // is also the root the trust list is keyed by. Storage is separate so the
+    // trust file it writes is easy to find.
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let storage_path = storage.path().to_path_buf();
+    let project_tier = serde_json::json!({
+        "tier": "project",
+        "source": project.path().join(".cortexkit/aft.jsonc").display().to_string(),
+        "doc": serde_json::json!({
+            "bash": { "env": { "BASHENV_PROJECT_ENV": "project-secret-value" } }
+        })
+        .to_string(),
+    });
+    let response = aft.send(
+        &json!({
+            "id": "cfg-project-env",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project.path(),
+            "storage_dir": storage_path,
+            "config": [user_config_tier(json!({ "bash": { "background": true } })), project_tier],
+        })
+        .to_string(),
+    );
+    assert_eq!(response["success"], true, "configure failed: {response:?}");
+
+    let command = "printf '%s' \"${BASHENV_PROJECT_ENV-unset}\"";
+    let untrusted = aft.send(
+        &json!({
+            "id": "project-env-untrusted",
+            "command": "bash",
+            "session_id": "project-env-trusted-session",
+            "params": { "command": command, "background": true, "foreground_orchestrate": true }
+        })
+        .to_string(),
+    );
+    let reply = untrusted["output"].as_str().unwrap();
+    assert!(
+        reply.contains("Project bash.env ignored: project not trusted"),
+        "{reply}"
+    );
+    assert!(!reply.contains("project-secret-value"), "{reply}");
+    let task = wait_for_status(
+        &mut aft,
+        untrusted["task_id"].as_str().unwrap(),
+        "completed",
+    );
+    assert_eq!(task["output_preview"], "unset");
+
+    // Trusting the project root takes effect on the next command, no reload.
+    let trust = aft.send(
+        &json!({
+            "id": "trust-project",
+            "command": "trust_filter_project",
+            "params": { "project_root": project.path() }
+        })
+        .to_string(),
+    );
+    assert_eq!(trust["success"], true, "trust failed: {trust:?}");
+    let trusted = aft.send(
+        &json!({
+            "id": "project-env-trusted",
+            "command": "bash",
+            "session_id": "project-env-trusted-session",
+            "params": { "command": command, "background": true, "foreground_orchestrate": true }
+        })
+        .to_string(),
+    );
+    let reply = trusted["output"].as_str().unwrap();
+    // The untrusted first reply already claimed the once-per-session notice,
+    // so this reply applies the value without repeating it.
+    assert!(!reply.contains("BASHENV_PROJECT_ENV"), "{reply}");
+    assert!(!reply.contains("project-secret-value"), "{reply}");
+    let task = wait_for_status(&mut aft, trusted["task_id"].as_str().unwrap(), "completed");
+    assert_eq!(task["output_preview"], "project-secret-value");
+
     assert!(aft.shutdown().success());
 }
 
@@ -1739,9 +1836,9 @@ fn background_spawn_honors_env_overrides() {
     let _dir = configure_background(&mut aft);
 
     #[cfg(windows)]
-    let command = "Write-Host -NoNewline $env:AFT_BG_ENV_TEST";
+    let command = "Write-Host -NoNewline $env:BASHENV_BG_ENV_TEST";
     #[cfg(not(windows))]
-    let command = "printf '%s' \"$AFT_BG_ENV_TEST\"";
+    let command = "printf '%s' \"$BASHENV_BG_ENV_TEST\"";
 
     let task_id = spawn_bg_params(
         &mut aft,
@@ -1749,7 +1846,7 @@ fn background_spawn_honors_env_overrides() {
         json!({
             "command": command,
             "background": true,
-            "env": { "AFT_BG_ENV_TEST": "from-bg-env" }
+            "env": { "BASHENV_BG_ENV_TEST": "from-bg-env" }
         }),
     );
     let completed = wait_for_status(&mut aft, &task_id, "completed");

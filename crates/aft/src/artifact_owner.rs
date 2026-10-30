@@ -111,10 +111,8 @@ pub fn claim_or_open_read_only(
     }
 
     let manifest_dir = resolve_manifest_dir(storage_dir, project_root, project_key);
-    crate::private_storage::open_dir(
-        &crate::bash_background::storage_dir(storage_dir),
-        &manifest_dir,
-    )?;
+    let storage_root = crate::bash_background::storage_dir(storage_dir);
+    crate::private_storage::open_dir(&storage_root, &manifest_dir)?;
     let path = manifest_dir.join("owner.json");
     let checkout_path = project_root.display().to_string();
     let git_common_dir = git_common_dir.map(|path| path.display().to_string());
@@ -141,10 +139,7 @@ pub fn claim_or_open_read_only(
                         // The orphaned-manifest sweep removed the key
                         // directory; recreate it and claim again.
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                            crate::private_storage::open_dir(
-                                &crate::bash_background::storage_dir(storage_dir),
-                                &manifest_dir,
-                            )?;
+                            crate::private_storage::open_dir(&storage_root, &manifest_dir)?;
                             continue;
                         }
                         result => return result,
@@ -185,10 +180,7 @@ pub fn claim_or_open_read_only(
                     // The orphaned-manifest sweep removes empty key
                     // directories; recreate it and try again.
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        crate::private_storage::open_dir(
-                            &crate::bash_background::storage_dir(storage_dir),
-                            &manifest_dir,
-                        )?;
+                        crate::private_storage::open_dir(&storage_root, &manifest_dir)?;
                         continue;
                     }
                     Err(error) => return Err(error),

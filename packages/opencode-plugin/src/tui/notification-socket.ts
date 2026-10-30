@@ -49,6 +49,14 @@ const WEB_SOCKET_OPEN = 1;
 const clients = new Map<string, AftRpcClient>();
 const statusInvalidationListeners = new Set<(event: StatusInvalidation) => void>();
 const lastHandledIdBySession = new Map<string, number>();
+const socketEndpoints = new WeakMap<WebSocketLike, AftRpcEndpoint>();
+const CURSOR_CACHE_LIMIT = 200;
+
+function cursorKey(ws: WebSocketLike, sessionId: string): string | null {
+  const endpoint = socketEndpoints.get(ws);
+  // The authentication token distinguishes server instances, even when a new instance reuses the port.
+  return endpoint?.token ? `${endpoint.token}\0${sessionId}` : null;
+}
 
 function defaultWebSocketCtor(): WebSocketFactory | null {
   const ctor = (globalThis as typeof globalThis & { WebSocket?: WebSocketFactory }).WebSocket;
@@ -128,6 +136,7 @@ export function stopAftTuiSocket(): void {
   closeCurrentSocket(false);
   for (const client of clients.values()) client.reset();
   clients.clear();
+  lastHandledIdBySession.clear();
   reconnectAttempt = 0;
 }
 
@@ -250,6 +259,7 @@ async function connect(scope: SocketScope, connectGeneration: number): Promise<v
   }
 
   socket = ws;
+  socketEndpoints.set(ws, endpoint);
   socketScope = scope;
   helloedScope = null;
 
@@ -335,13 +345,21 @@ async function sendHelloWithFreshToken(
   ) {
     return;
   }
-  sendHello(ws, scope, endpoint?.token ?? null);
+  const connected = socketEndpoints.get(ws);
+  if (!endpoint || endpoint.port !== connected?.port || endpoint.token !== connected.token) {
+    generation += 1;
+    closeCurrentSocket(false);
+    void connect(scope, generation);
+    return;
+  }
+  sendHello(ws, scope, connected.token);
 }
 
 function sendHello(ws: WebSocketLike, scope: SocketScope, token: string | null): void {
   helloedScope = scope;
   if (socket === ws) socketScope = scope;
-  const lastReceivedId = lastHandledIdBySession.get(scope.sessionId) ?? 0;
+  const key = cursorKey(ws, scope.sessionId);
+  const lastReceivedId = key ? (lastHandledIdBySession.get(key) ?? 0) : 0;
   ws.send(
     JSON.stringify({
       type: "hello",
@@ -400,8 +418,16 @@ async function handleSocketMessage(
     ) {
       return;
     }
-    if (consumed && notification.id > (lastHandledIdBySession.get(active) ?? 0)) {
-      lastHandledIdBySession.set(active, notification.id);
+    const key = cursorKey(ws, active);
+    if (consumed && notification.id > (key ? (lastHandledIdBySession.get(key) ?? 0) : 0)) {
+      if (key) {
+        lastHandledIdBySession.delete(key);
+        lastHandledIdBySession.set(key, notification.id);
+        if (lastHandledIdBySession.size > CURSOR_CACHE_LIMIT) {
+          const oldest = lastHandledIdBySession.keys().next().value;
+          if (oldest !== undefined) lastHandledIdBySession.delete(oldest);
+        }
+      }
       try {
         ws.send(JSON.stringify({ type: "ack", lastReceivedId: notification.id }));
       } catch {

@@ -5,16 +5,18 @@
 //! serves grep, glob, `aft_search`, the call graph tools and inspect from the
 //! children's own published indexes, read-only:
 //!
-//! - **trigram:** the child's persisted `cache.bin`, opened through the
-//!   borrowed read-only loader and reconciled with the child's files in RAM.
-//!   With views on, a child's trigram plane is still this legacy artifact
-//!   (the content-addressed view's own trigram file is empty), so the parent
-//!   reads the artifact the child actually publishes.
-//! - **semantic:** the child's per-checkout (v2) view, opened through a
-//!   registry *reader* registration (a reader marker, never a view) and a read
-//!   marker on the generation it serves.
-//! - **callgraph:** the child's content-addressed view generation, protected
-//!   by a query pin (a read marker in the child's view directory).
+//! - **trigram:** the child's published v3 lexical view when its sessions run
+//!   with views on, answered as of that publication (the child's own session
+//!   is the only one that claims freshness, so the parent applies no file
+//!   changes on top). A child whose sessions run with views off publishes
+//!   only its persisted `cache.bin`, which the parent opens through the
+//!   borrowed read-only loader and keeps current in RAM from its watcher.
+//! - **semantic:** the child's published v3 semantic member
+//!   (`<scope>.semantic`), opened with read markers on the generation it
+//!   serves and the base it composes; answers are as of that publication.
+//! - **callgraph:** the child's published v3 call-graph view, protected by a
+//!   read marker on the generation it serves. Answers name the publication
+//!   they are as of (`as_of`).
 //!
 //! Everything slow happens on the session's background worker: finding the
 //! children, loading each child plane once, following the children's later
@@ -53,7 +55,7 @@ use crate::readonly_artifacts::BorrowedArtifactGeneration;
 use crate::search_index::SearchIndex;
 
 use super::contracts::ViewAccess;
-use super::registry::{FamilyRegistry, ReaderRegistration};
+
 use super::semantic::SemanticPlane;
 use super::snapshot::{OpenGeneration, Snapshot};
 
@@ -465,6 +467,9 @@ pub fn activate(
 ) -> bool {
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let mut registry = lock(registry());
+    let trigram_policy = crate::blob_store::v2::TrigramPolicy {
+        max_file_size: ctx.config().search_index_max_file_size,
+    };
     let Some(planes) = registry.prepared.remove(&root) else {
         if let Some(session) = registry.sessions.get(&root) {
             session.release(context_id(ctx));
@@ -474,7 +479,11 @@ pub fn activate(
     if let Some(existing) = registry.sessions.get(&root) {
         // A rebind with the same planes and storage joins the warm session
         // instead of loading every child again.
-        if !existing.stopped() && existing.planes == planes && existing.storage == storage {
+        if !existing.stopped()
+            && existing.planes == planes
+            && existing.storage == storage
+            && existing.trigram_policy == trigram_policy
+        {
             existing.hold(Holder::of(ctx));
             return true;
         }
@@ -484,6 +493,7 @@ pub fn activate(
         planes,
         storage.to_path_buf(),
         semantic.clone(),
+        trigram_policy,
         Holder::of(ctx),
     );
     if let Some(previous) = registry.sessions.insert(root, session) {
@@ -706,7 +716,48 @@ impl<T> Plane<T> {
 
 pub(crate) struct TrigramChild {
     pub index: Arc<SearchIndex>,
-    artifact: BorrowedArtifactGeneration,
+    source: TrigramSource,
+}
+
+/// Where a child's trigram snapshot came from.
+#[derive(Clone)]
+pub(crate) enum TrigramSource {
+    /// The persisted `cache.bin` of a child whose sessions run with views
+    /// off. The parent keeps it current from its own watcher and backstop.
+    Legacy(BorrowedArtifactGeneration),
+    /// The child's published v3 lexical view. Answers are as of the child's
+    /// publication ([`PublishedFrontier`]); only the child's own session
+    /// claims freshness, so the parent applies no file changes on top.
+    View(PublishedChild),
+}
+
+/// A v3 generation a child's own session published, as a foreign reader
+/// sees it: its name and the frontier its answers are as of.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PublishedChild {
+    pub generation: String,
+    pub frontier: Option<super::manifest_v2::PublishedFrontier>,
+}
+
+impl PublishedChild {
+    fn of(generation: &super::snapshot::ComposedGeneration) -> Self {
+        Self {
+            generation: generation.name().to_owned(),
+            frontier: generation.published().cloned(),
+        }
+    }
+
+    /// The `as_of` object a parent answer carries for this child.
+    pub(crate) fn as_of(&self, child: &Child) -> serde_json::Value {
+        let frontier = self.frontier.clone().unwrap_or_default();
+        serde_json::json!({
+            "child": child.display(),
+            "generation": self.generation,
+            "published_at_ms": frontier.published_at_ms,
+            "delta_cut_version": frontier.delta_cut_version,
+            "watcher_epoch": frontier.watcher_epoch,
+        })
+    }
 }
 
 pub(crate) struct SemanticChild {
@@ -717,7 +768,7 @@ pub(crate) struct SemanticChild {
 
 pub(crate) struct CallgraphChild {
     pub store: Arc<crate::callgraph_store::ReadonlyCallGraphStore>,
-    generation: String,
+    pub published: PublishedChild,
 }
 
 /// One child repository of a parent folder.
@@ -742,13 +793,6 @@ pub struct Child {
     /// Ignore files read for deciding whether a newly created file belongs
     /// to the child, keyed by path with the mtime they were read at.
     ignore_files: Mutex<worker::IgnoreCache>,
-    /// The family registry reader registration, created once on first use.
-    reader: Mutex<Option<Arc<ReaderRegistration>>>,
-    /// Size and mtime of the child's semantic view pointer database and its
-    /// WAL when the worker last read the pointer; see `worker::refresh_semantic`.
-    pub(crate) semantic_pointer_stat: Mutex<Option<Vec<u8>>>,
-    /// HEAD fingerprint, cached against the `.git/HEAD` bytes it came from.
-    head: Mutex<Option<(Vec<u8>, String)>>,
     loads: AtomicUsize,
     applied: AtomicUsize,
 }
@@ -772,9 +816,6 @@ impl Child {
             engine: Mutex::new(None),
             pending: Mutex::new(BTreeSet::new()),
             ignore_files: Mutex::new(worker::IgnoreCache::default()),
-            reader: Mutex::new(None),
-            semantic_pointer_stat: Mutex::new(None),
-            head: Mutex::new(None),
             loads: AtomicUsize::new(0),
             applied: AtomicUsize::new(0),
         }
@@ -828,7 +869,7 @@ impl Child {
     pub fn callgraph_generation(&self) -> Option<String> {
         read(&self.callgraph)
             .ready()
-            .map(|callgraph| callgraph.generation.clone())
+            .map(|callgraph| callgraph.published.generation.clone())
     }
 
     /// The semantic generation this session holds a read marker on.
@@ -836,28 +877,6 @@ impl Child {
         read(&self.semantic)
             .ready()
             .map(|semantic| semantic.generation.name().to_owned())
-    }
-
-    fn reader(&self, storage: &Path) -> Result<Option<Arc<ReaderRegistration>>, String> {
-        let mut reader = lock(&self.reader);
-        if let Some(reader) = reader.as_ref() {
-            return Ok(Some(Arc::clone(reader)));
-        }
-        // The family registry lists a repository's per-checkout views. A
-        // reader never creates one: a child whose own sessions never
-        // published such a view has nothing to read yet.
-        let Some(registry) = FamilyRegistry::open_existing(storage, self.family(storage)?)
-            .map_err(|e| e.to_string())?
-        else {
-            return Ok(None);
-        };
-        let registration = Arc::new(
-            registry
-                .register_reader("parent-folder")
-                .map_err(|error| error.to_string())?,
-        );
-        *reader = Some(Arc::clone(&registration));
-        Ok(Some(registration))
     }
 }
 
@@ -877,6 +896,11 @@ pub struct ParentSession {
     pub(crate) planes: RequestedPlanes,
     storage: PathBuf,
     semantic_config: crate::config::SemanticBackendConfig,
+    /// The trigram policy of the children's v3 views: the producer their
+    /// lexical and call-graph members are published under.
+    trigram_policy: crate::blob_store::v2::TrigramPolicy,
+    /// Parent call-graph and lexical answers served from children's v3 views.
+    view_routes: [AtomicU64; 2],
     /// `None` until the worker's first full discovery walk finishes.
     discovery: RwLock<Option<Arc<Discovery>>>,
     children: RwLock<Vec<Arc<Child>>>,
@@ -899,6 +923,7 @@ impl ParentSession {
         planes: RequestedPlanes,
         storage: PathBuf,
         semantic_config: crate::config::SemanticBackendConfig,
+        trigram_policy: crate::blob_store::v2::TrigramPolicy,
         holder: Holder,
     ) -> Arc<Self> {
         let root_for_backstop = root.clone();
@@ -907,6 +932,8 @@ impl ParentSession {
             planes,
             storage,
             semantic_config,
+            trigram_policy,
+            view_routes: Default::default(),
             discovery: RwLock::new(None),
             children: RwLock::new(Vec::new()),
             semantic: RwLock::new(if planes.semantic {
@@ -949,6 +976,16 @@ impl ParentSession {
     /// The finished discovery, or `None` while the worker is still walking.
     pub fn discovery(&self) -> Option<Arc<Discovery>> {
         read(&self.discovery).clone()
+    }
+
+    /// Parent answers served from the children's v3 views, ordered as call
+    /// graph, then grep and glob.
+    pub fn view_route_counts(&self) -> [u64; 2] {
+        std::array::from_fn(|index| self.view_routes[index].load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn note_view_route(&self, index: usize) {
+        self.view_routes[index].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Completed worker rounds; the first one is the initial load.

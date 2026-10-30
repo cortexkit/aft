@@ -62,6 +62,9 @@ struct BashParams {
     /// Run the whole line on the remote runner this demand names.
     #[serde(default)]
     runon: Option<String>,
+    /// With `runon`: files the runner copies back, relative to `workdir`.
+    #[serde(default)]
+    return_paths: Vec<String>,
 }
 
 /// The hard kill for a bash request: the caller's explicit `timeout`, or the
@@ -74,6 +77,7 @@ fn hard_kill_for(params: &BashParams) -> crate::bash_background::HardKill {
 }
 
 pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
+    let launch_started = std::time::Instant::now();
     let raw_params = req
         .params
         .get("params")
@@ -89,15 +93,121 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     };
-    let configured_env = ctx.config().bash.env.clone();
-    let configured_env_keys = configured_env.keys().cloned().collect::<Vec<_>>();
-    // The request map is the process-creation channel, with call-specific values
-    // taking precedence over the user's stable defaults.
-    for (key, value) in &configured_env {
-        params
-            .env
-            .entry(key.clone())
-            .or_insert_with(|| value.clone());
+    let secret_labels = crate::bash_background::secrets::labels(&params.command);
+    let has_secrets = !secret_labels.is_empty();
+    // Remote runs are resolved later, but whether `bash.env` travels with the
+    // job depends only on the request, so decide it up front: a `runon` job
+    // receives no configured value unless the user listed the name in
+    // `bash.runon_env`, and it never receives a project value.
+    let remote_requested = params.runon.is_some()
+        || crate::bash_background::remote_for_legacy_command(
+            &ctx.config(),
+            &params.command,
+            params.pty,
+            params.shell.is_powershell(),
+        )
+        .is_some();
+    let _runon_timings =
+        remote_requested.then(|| crate::bash_background::RunonTimingScope::start(launch_started));
+    if has_secrets && remote_requested {
+        return crate::bash_background::secrets::refusal(
+            &req.id,
+            &secret_labels,
+            "secrets_remote_refused",
+            crate::bash_background::secrets::REMOTE_REFUSED,
+        );
+    }
+    // Host escalation can never protect the daemon's memory, even if approved.
+    if has_secrets && (cfg!(windows) || params.sandbox.is_some()) {
+        return crate::bash_background::secrets::refusal(
+            &req.id,
+            &secret_labels,
+            "secrets_sandbox_required",
+            crate::bash_background::secrets::SANDBOX_REQUIRED,
+        );
+    }
+    #[cfg(unix)]
+    let secret_preflight = if has_secrets {
+        match crate::bash_background::secrets::preflight(
+            ctx,
+            req.session(),
+            params.pty,
+            params.background,
+        ) {
+            Ok(preflight) => Some(preflight),
+            Err(()) => {
+                return crate::bash_background::secrets::refusal(
+                    &req.id,
+                    &secret_labels,
+                    "secrets_sandbox_required",
+                    crate::bash_background::secrets::SANDBOX_REQUIRED,
+                )
+            }
+        }
+    } else {
+        None
+    };
+    // A project's `bash.env` applies only while the project root is trusted at
+    // the time of the call, so trusting or untrusting takes effect on the next
+    // command without a reload.
+    crate::bash_background::enter_runon_phase("request_environment");
+    let project_trusted = project_env_trusted(ctx);
+    let remote_env_plan = if remote_requested {
+        crate::commands::bash_remote_env::plan(ctx.config().as_ref())
+    } else {
+        crate::commands::bash_remote_env::RemoteEnvPlan::default()
+    };
+    let mut applied_env = Vec::new();
+    // Every configured name, including one a remote job does receive: the
+    // remote request drops them all from its shell environment, so a value is
+    // sent only when `bash.runon_env` puts it in the request map explicitly.
+    let configured_env_names = ctx
+        .config()
+        .bash
+        .configured_env(true)
+        .iter()
+        .flat_map(|configured| configured.names.keys().cloned())
+        .collect::<Vec<_>>();
+    for configured in ctx.config().bash.configured_env(project_trusted) {
+        let names = if remote_requested {
+            crate::commands::bash_remote_env::forwarded_names(&remote_env_plan, &configured)
+        } else {
+            configured.names
+        };
+        // AFT's worker test-thread budget is written by `inject` below, which
+        // keeps a value the request already carries; configured thread counts
+        // must not reach it, and a value rejected at load could not apply
+        // anyway. The disclosure still names them, so nothing is silent.
+        let names = names
+            .into_iter()
+            .filter(|(key, _)| !crate::agent_child_env::is_worker_test_thread_env_name(key))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        // The request map is the process-creation channel, with call-specific
+        // values taking precedence over the configured stable defaults.
+        for (key, value) in &names {
+            params
+                .env
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+        applied_env.push(crate::config_resolve::ConfiguredBashEnv {
+            names,
+            tier: configured.tier,
+        });
+    }
+    let disclosure = crate::commands::bash_remote_env::Disclosure::build(
+        &applied_env,
+        &ctx.config().bash.shadowed_project_env(project_trusted),
+        !project_trusted && !ctx.config().bash.project_env.is_empty(),
+        &remote_env_plan,
+    );
+    if has_secrets && crate::bash_background::secrets::env_conflicts(&params.env) {
+        return crate::bash_background::secrets::refusal(
+            &req.id,
+            &secret_labels,
+            "secrets_env_conflict",
+            crate::bash_background::secrets::ENV_CONFLICT,
+        );
     }
     // The dedicated external route is defensive as well as convenient: callers
     // cannot accidentally execute Bash merely by omitting the selector.
@@ -125,7 +235,11 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     // `runon` sends the whole line, as written, to the remote runner. Every
     // reason that cannot happen is refused here, before any local work (even
     // resolving a local shell).
-    let remote = match params.runon.as_deref() {
+    crate::bash_background::enter_runon_phase("routing_validation");
+    let mut remote = match params.runon.as_deref() {
+        // Placeholder routing was decided before sandbox checks. A live config
+        // change must not turn a locally admitted launch into a remote job.
+        None if has_secrets => None,
         None => crate::bash_background::remote_for_legacy_command(
             &ctx.config(),
             &params.command,
@@ -150,6 +264,9 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         },
     };
 
+    if let Some(launch) = remote.as_mut() {
+        launch.configured_env_names = configured_env_names;
+    }
     let shell_path = match crate::bash_background::resolve_shell_path(params.pty, params.shell) {
         Ok(path) => path,
         // The only refusal here is a missing PowerShell. Rebuild its message so
@@ -214,13 +331,19 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
+    crate::bash_background::enter_runon_phase("workdir_return_paths");
     let workdir = resolve_workdir(params.workdir.as_deref(), ctx);
+    let mut remote = remote;
+    if let Err(response) = attach_return_paths(&req.id, ctx, &params, &workdir, &mut remote) {
+        return response;
+    }
     let duplicate_workdir = workdir.clone();
     let duplicate_project_root = ctx
         .config()
         .project_root
         .clone()
         .unwrap_or_else(|| default_workdir(ctx));
+    crate::bash_background::enter_runon_phase("permission_preflight");
     let principal = crate::sandbox_spawn::current_authenticated_principal();
     let host_requested = matches!(params.sandbox, Some(BashSandbox::Host));
     if host_requested && !crate::sandbox_spawn::principal_is_first_party(&principal) {
@@ -376,7 +499,9 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     // workdir/notes.txt — silent wrong-file mutation. Rewrite is a pure
     // optimization, so skip it and let native bash (which honors cwd) run the
     // command verbatim when the workdir differs from the project root.
-    if !params.shell.is_powershell()
+    if !has_secrets
+        && !params.shell.is_powershell()
+        && ctx.config().bash.changed_files == crate::config::BashChangedFiles::Off
         && host_escalation.is_none()
         && remote.is_none()
         && params.env.is_empty()
@@ -448,7 +573,20 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         &duplicate_project_root,
         &duplicate_workdir,
     );
-    let mut response = crate::bash_background::spawn(
+    #[cfg(unix)]
+    let secret_launch = match secret_preflight {
+        Some(preflight) => match crate::bash_background::secrets::authorize(
+            &req.id,
+            &secret_labels,
+            preflight,
+            &params.env,
+        ) {
+            Ok(launch) => Some(launch),
+            Err(response) => return response,
+        },
+        None => None,
+    };
+    let mut response = crate::bash_background::spawn_with_secrets(
         &req.id,
         req.session(),
         &execution_command,
@@ -468,6 +606,8 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         scanner_requires_approval,
         host_escalation,
         remote,
+        #[cfg(unix)]
+        secret_launch,
     );
     if response.success {
         let object = response
@@ -480,12 +620,12 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 json!(format_duplicate_warning(&duplicate)),
             );
         }
-        if !configured_env_keys.is_empty()
+        if !disclosure.is_empty()
             && ctx
                 .bash_background()
                 .claim_bash_env_disclosure(req.session())
         {
-            object.insert("_bash_env_keys".to_string(), json!(configured_env_keys));
+            object.insert("_bash_env_keys".to_string(), json!(disclosure));
         }
     }
     response
@@ -527,6 +667,28 @@ fn validate_pty_dimensions(rows: Option<u16>, cols: Option<u16>) -> Result<(), &
     Ok(())
 }
 
+/// Whether the session's project root is on the filter trust list right now. A
+/// linked worktree inherits its main checkout's trust.
+fn project_env_trusted(ctx: &AppContext) -> bool {
+    let Some(root) = ctx.config().project_root.clone() else {
+        return false;
+    };
+    // `aft doctor filters trust` writes the trust file under the configured
+    // storage directory; a routed session's task storage sits one segment
+    // deeper, so both are checked and the user's decision is found either way.
+    let staged = crate::bash_background::task_storage_dir(ctx);
+    if crate::compress::trust::is_project_env_trusted(Some(&staged), &root) {
+        return true;
+    }
+    ctx.config()
+        .storage_dir
+        .as_ref()
+        .filter(|configured| **configured != staged)
+        .is_some_and(|configured| {
+            crate::compress::trust::is_project_env_trusted(Some(configured), &root)
+        })
+}
+
 fn blocked_env_var(env: &HashMap<String, String>) -> Option<&str> {
     crate::bash_env::first_blocked_env_key(env)
 }
@@ -542,12 +704,51 @@ fn permissions_granted_cover(
         return false;
     }
 
-    asks.iter().all(|ask| {
-        ask.patterns
+    asks.iter().all(|ask| match ask.kind {
+        crate::bash_permissions::PermissionKind::ExternalDirectory => {
+            !ask.targets.is_empty()
+                && ask.targets.iter().all(|target| {
+                    granted
+                        .iter()
+                        .any(|grant| external_approval_covers(grant, target))
+                })
+        }
+        crate::bash_permissions::PermissionKind::Bash => ask
+            .patterns
             .iter()
             .chain(ask.always.iter())
-            .any(|pattern| granted.iter().any(|grant| grant == pattern))
+            .any(|pattern| granted.iter().any(|grant| grant == pattern)),
     })
+}
+
+fn external_approval_covers(granted: &str, target: &crate::access_policy::AccessGrant) -> bool {
+    use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+    // Compare Windows identities without rewriting host patterns or stored targets.
+    let path = Path::new(granted);
+    #[cfg(windows)]
+    let normalized_grant = crate::windows_path::normalize_windows_path(path);
+    #[cfg(windows)]
+    let path = normalized_grant.as_path();
+    let target_path = target.path.as_path();
+    #[cfg(windows)]
+    let normalized_target = crate::windows_path::normalize_windows_path(target_path);
+    #[cfg(windows)]
+    let target_path = normalized_target.as_path();
+    let (path, kind) = if path.file_name().is_some_and(|name| name == "*") {
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        (parent, GrantKind::Subtree)
+    } else {
+        (path, GrantKind::File)
+    };
+    path.is_absolute()
+        && AccessGrant {
+            path: path.to_path_buf(),
+            kind,
+            operation: AccessOperation::Read,
+        }
+        .covers_kind(AccessOperation::Read, target_path, target.kind)
 }
 
 fn conservative_powershell_permission_asks(
@@ -557,6 +758,8 @@ fn conservative_powershell_permission_asks(
         kind: crate::bash_permissions::PermissionKind::Bash,
         patterns: vec![command.to_string()],
         always: Vec::new(),
+        reason: None,
+        targets: Vec::new(),
     }]
 }
 
@@ -594,6 +797,85 @@ fn default_workdir(ctx: &AppContext) -> PathBuf {
         return root;
     }
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Check `return_paths` and hand them to the remote launch, before anything
+/// runs. They need `runon`: only a remote run has files to copy back. Each
+/// path must name a file inside the project, checked exactly as `write`
+/// checks its path, including symlinks that lead out of it.
+fn attach_return_paths(
+    req_id: &str,
+    ctx: &AppContext,
+    params: &BashParams,
+    workdir: &Path,
+    remote: &mut Option<crate::bash_background::RemoteLaunch>,
+) -> Result<(), Response> {
+    use crate::bash_background::registry::return_files::{
+        check_requested_paths, resolve_destination, NotReturned,
+    };
+    if params.return_paths.is_empty() {
+        return Ok(());
+    }
+    let refused = |message: String| Response::error(req_id, "return_paths_refused", message);
+    let Some(launch) = remote.as_mut().filter(|_| params.runon.is_some()) else {
+        return Err(refused(
+            "return_paths refused: return_paths needs runon; a local command already writes its files here"
+                .into(),
+        ));
+    };
+    // ck-motor's Windows runners do not copy files back, and the demand
+    // already names the platform, so refuse before anything is submitted.
+    if launch.requested_platform == Some(crate::exec_remote::types::Platform::Windows) {
+        return Err(refused(
+            "return_paths refused: return_paths is not supported on Windows runners; the command did not run"
+                .into(),
+        ));
+    }
+    check_requested_paths(&params.return_paths).map_err(|message| {
+        refused(format!(
+            "return_paths refused: {message}; the command did not run"
+        ))
+    })?;
+    // The files are written into the project whether or not this session
+    // restricts other tools to it, so containment is checked here too.
+    let root = ctx
+        .config()
+        .project_root
+        .clone()
+        .unwrap_or_else(|| workdir.to_path_buf());
+    let root = std::fs::canonicalize(&root).map_err(|error| {
+        refused(format!(
+            "return_paths refused: cannot resolve the project root {}: {error}",
+            root.display()
+        ))
+    })?;
+    for path in &params.return_paths {
+        let shown = path.escape_default();
+        if let Err(response) = ctx.validate_path(req_id, &workdir.join(path)) {
+            let reason = response.data["message"]
+                .as_str()
+                .unwrap_or("the path is not allowed")
+                .to_string();
+            return Err(refused(format!(
+                "return_paths refused: {shown}: {reason}; the command did not run"
+            )));
+        }
+        match resolve_destination(&root, &workdir.join(path)) {
+            Ok(_) => {}
+            Err(NotReturned::LocalWrite { error }) => {
+                return Err(refused(format!(
+                    "return_paths refused: {shown}: {error}; the command did not run"
+                )))
+            }
+            Err(_) => {
+                return Err(refused(format!(
+                    "return_paths refused: {shown} resolves outside the project; the command did not run"
+                )))
+            }
+        }
+    }
+    launch.return_paths = params.return_paths.clone();
+    Ok(())
 }
 
 fn resolve_workdir(workdir: Option<&Path>, ctx: &AppContext) -> PathBuf {
@@ -694,6 +976,705 @@ mod tests {
                 ..crate::config::Config::default()
             },
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_file_approval_survives_scope_probe_timeout() {
+        let project = tempfile::tempdir().unwrap();
+        // System temporary paths are exempt from external-directory asks, so
+        // use a distinct non-temporary parent to exercise the real scanner.
+        let scratch = std::env::current_dir()
+            .unwrap()
+            .join("target/approval-scope-tests");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let outside = tempfile::tempdir_in(&scratch).unwrap();
+        let parent = crate::access_policy::policy_path(outside.path());
+        let file = parent.join("file.txt");
+        let command = format!("cat \"{}\"", file.display());
+        let stall = crate::bounded_io::stall_helper(&parent);
+        let first = crate::bash_permissions::scan::scan_with_project_root(
+            &command,
+            project.path(),
+            project.path(),
+        );
+        stall
+            .reached
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let external = first
+            .iter()
+            .find(|ask| {
+                matches!(
+                    ask.kind,
+                    crate::bash_permissions::PermissionKind::ExternalDirectory
+                )
+            })
+            .unwrap();
+        assert_eq!(external.patterns, [file.to_string_lossy()]);
+        let granted: Vec<String> = first
+            .iter()
+            .flat_map(|ask| {
+                if ask.always.is_empty() {
+                    ask.patterns.clone()
+                } else {
+                    ask.always.clone()
+                }
+            })
+            .collect();
+        drop(stall);
+        let retry = crate::bash_permissions::scan::scan_with_project_root(
+            &command,
+            project.path(),
+            project.path(),
+        );
+        let external = retry
+            .iter()
+            .find(|ask| {
+                matches!(
+                    ask.kind,
+                    crate::bash_permissions::PermissionKind::ExternalDirectory
+                )
+            })
+            .unwrap();
+        assert_eq!(external.patterns, [format!("{}/*", parent.display())]);
+        assert!(
+            permissions_granted_cover(&retry, &granted),
+            "the approved file must not ask again after its folder becomes eligible"
+        );
+
+        let sibling = parent.join("sibling.txt");
+        let batch = crate::bash_permissions::scan::scan_with_project_root(
+            &format!("cat \"{}\" \"{}\"", file.display(), sibling.display()),
+            project.path(),
+            project.path(),
+        );
+        let external: Vec<_> = batch
+            .iter()
+            .filter(|ask| {
+                matches!(
+                    ask.kind,
+                    crate::bash_permissions::PermissionKind::ExternalDirectory
+                )
+            })
+            .collect();
+        assert_eq!(
+            external.len(),
+            1,
+            "the displayed folder asks are deduplicated"
+        );
+        assert_eq!(external[0].targets.len(), 2);
+        assert!(
+            !permissions_granted_cover(&batch, &granted),
+            "one approved file cannot cover a deduplicated sibling"
+        );
+        let mut both = granted;
+        both.push(sibling.to_string_lossy().into_owned());
+        assert!(permissions_granted_cover(&batch, &both));
+    }
+
+    #[test]
+    fn bash_permissions_roundtrip_unknown_cwd_requires_exact_command() {
+        use crate::bash_permissions::{scan::scan_with_project_root, PermissionKind};
+        let project = tempfile::tempdir().unwrap();
+        for command in [
+            "cd \"$DEST\" && rm -rf build",
+            "mkdir -p \"$DEST\" && rsync -a source/ \"$DEST/\" && cd \"$DEST\" && shasum -c checksums",
+            "mkdir -p \"$DEST\" && rsync -a source/ \"$DEST/\" && cd \"$DEST\" && cat checksums",
+            "cd \"$DEST\" && cat < checksums",
+            "pushd \"$DEST\" && cp -R source/ copy/",
+        ] {
+            let first = scan_with_project_root(command, project.path(), project.path());
+            let grants: Vec<_> = first.iter().flat_map(|ask| {
+                if ask.always.is_empty() { &ask.patterns } else { &ask.always }
+            }).cloned().collect();
+            let retry = scan_with_project_root(command, project.path(), project.path());
+            assert!(permissions_granted_cover(&retry, &grants),
+                "command={command}, grants={grants:?}, asks={retry:?}");
+            let exact = retry.iter().find(|ask| ask.reason.as_deref() == Some(crate::bash_permissions::scan::UNKNOWN_CWD_PERMISSION_REASON))
+                .expect("the unknown cwd requires exact-command approval");
+            assert_eq!(exact.kind, PermissionKind::Bash);
+            assert_eq!(exact.patterns, [command]);
+            assert!(exact.always.is_empty(), "unknown cwd must not offer a folder or reusable command grant");
+            assert!(!permissions_granted_cover(&retry, &[command.into()]),
+                "exact-command approval cannot replace individual command approvals");
+            assert!(!permissions_granted_cover(&retry, &["build".into(), "rm *".into(), "*".into()]),
+                "relative paths and reusable commands cannot approve an unknown cwd");
+        }
+    }
+
+    #[test]
+    fn bash_permissions_roundtrip_external_copy_shapes() {
+        use crate::bash_permissions::scan::scan_with_project_root;
+
+        let scratch = std::env::current_dir()
+            .unwrap()
+            .join("target/bash-roundtrip");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let fixture = tempfile::tempdir_in(scratch).unwrap();
+        let project = fixture.path().join("project");
+        let source = fixture.path().join("source");
+        let worker = fixture.path().join("worker/.cortexkit/internal-docs/copy");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        #[cfg(unix)]
+        let destinations = {
+            let alias = fixture.path().join("home-alias");
+            std::os::unix::fs::symlink(fixture.path(), &alias).unwrap();
+            vec![worker, alias.join("worker/.cortexkit/internal-docs/copy")]
+        };
+        #[cfg(not(unix))]
+        let destinations = vec![worker];
+        for exists in [false, true] {
+            if exists {
+                std::fs::create_dir_all(&destinations[0]).unwrap();
+            }
+            for destination in &destinations {
+                let src = source.display();
+                let dst = destination.display();
+                let commands = [
+                    format!("mkdir -p '{dst}'"),
+                    format!("rsync -a '{src}' '{dst}'"),
+                    format!("rsync -a '{src}/' '{dst}'"),
+                    format!("rsync -a '{src}' '{dst}/'"),
+                    format!("rsync -a '{src}/' '{dst}/'"),
+                    format!("cp -R '{src}/' '{dst}/'"),
+                    format!("cd '{dst}' && cat checksums"),
+                    format!("mkdir -p '{dst}' && rsync -a '{src}/' '{dst}/' && cd '{dst}' && shasum -c checksums"),
+                    format!("mkdir -p '{dst}' && cp -R '{src}/' '{dst}/' && cd '{dst}' && cat checksums"),
+                ];
+                for command in commands {
+                    let first = scan_with_project_root(&command, &project, &project);
+                    assert!(!first.is_empty(), "{command}");
+                    for always in [false, true] {
+                        let grants: Vec<_> = first
+                            .iter()
+                            .flat_map(|ask| {
+                                if always && !ask.always.is_empty() {
+                                    &ask.always
+                                } else {
+                                    &ask.patterns
+                                }
+                            })
+                            .cloned()
+                            .collect();
+                        let retry = scan_with_project_root(&command, &project, &project);
+                        assert!(permissions_granted_cover(&retry, &grants),
+                            "command={command}, exists={exists}, always={always}, grants={grants:?}, asks={retry:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_permissions_roundtrip_readonly_corpus_in_worktree() {
+        use crate::access_policy::{AccessOperation, GrantKind};
+        use crate::bash_permissions::{scan::scan_with_project_root, PermissionKind};
+
+        let scratch = std::env::current_dir()
+            .unwrap()
+            .join("target/bash-roundtrip");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let fixture = tempfile::tempdir_in(scratch).unwrap();
+        let project = fixture.path().join("project");
+        let worktree = project.join("worker");
+        let source = fixture.path().join("specimens/two-pass-private-20261025");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("SHA256SUMS"), "").unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&project)
+                .args([
+                    "-c",
+                    "user.name=AFT test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init"]);
+        git(&["commit", "--allow-empty", "-m", "fixture"]);
+        git(&["worktree", "add", "--detach", worktree.to_str().unwrap()]);
+        assert!(worktree.join(".git").is_file());
+        assert!(std::fs::canonicalize(&worktree)
+            .unwrap()
+            .starts_with(std::fs::canonicalize(&project).unwrap()));
+
+        // Keep the variable directory changes and nested status pipeline while
+        // using a literal fixture source instead of the user's private corpus.
+        let copy = format!("cp -R '{}/.' $W/corpus-readonly/", source.display());
+        let command = format!(
+            "W='{}'; mkdir -p $W/corpus-readonly && {copy} && chmod -R a-w $W/corpus-readonly && cd $W/corpus-readonly && shasum -a 256 -c SHA256SUMS --quiet && echo ok; cd $W && echo \"status lines: $(git status --short | wc -l)\"",
+            worktree.display(),
+        );
+        let first = scan_with_project_root(&command, &project, &project);
+        let canonical_source = std::fs::canonicalize(&source).unwrap();
+        assert!(!canonical_source.starts_with(std::fs::canonicalize(&project).unwrap()));
+        let source_pattern = format!("{}/*", canonical_source.display());
+        assert!(
+            first
+                .iter()
+                .any(|ask| ask.kind == PermissionKind::ExternalDirectory
+                    && ask.patterns == [source_pattern.as_str()]
+                    && ask.always == [source_pattern.as_str()]
+                    && ask
+                        .targets
+                        .iter()
+                        .any(|target| target.path == canonical_source
+                            && target.kind == GrantKind::Subtree
+                            && target.operation == AccessOperation::Read
+                            && target.covers(
+                                AccessOperation::Read,
+                                &canonical_source.join("SHA256SUMS")
+                            ))),
+            "the copy source must have an external-directory read ask: {first:?}"
+        );
+        for resource in [
+            "mkdir -p $W/corpus-readonly",
+            copy.as_str(),
+            "chmod -R a-w $W/corpus-readonly",
+            "shasum -a 256 -c SHA256SUMS --quiet",
+            "echo ok",
+            "echo \"status lines: $(git status --short | wc -l)\"",
+            "git status --short",
+            "wc -l",
+        ] {
+            assert!(
+                first.iter().any(|ask| ask.kind == PermissionKind::Bash
+                    && ask.patterns == [resource]
+                    && ask.reason.is_none()),
+                "individual command resource missing: {resource}; asks={first:?}"
+            );
+        }
+        assert!(first.iter().any(|ask| ask.kind == PermissionKind::Bash
+            && ask.patterns == [command.as_str()]
+            && ask.always.is_empty()
+            && ask.reason.as_deref()
+                == Some(crate::bash_permissions::scan::UNKNOWN_CWD_PERMISSION_REASON)));
+
+        for prefer_always in [false, true] {
+            let mut grants = Vec::new();
+            let mut retry = first.clone();
+            let mut rounds = 0;
+            while !permissions_granted_cover(&retry, &grants) {
+                assert!(
+                    rounds < 2,
+                    "permission retry did not settle: {retry:?}; grants={grants:?}"
+                );
+                for ask in &retry {
+                    let approved = if prefer_always && !ask.always.is_empty() {
+                        &ask.always
+                    } else {
+                        &ask.patterns
+                    };
+                    for grant in approved {
+                        if !grants.contains(grant) {
+                            grants.push(grant.clone());
+                        }
+                    }
+                }
+                rounds += 1;
+                retry = scan_with_project_root(&command, &project, &project);
+            }
+            assert_eq!(rounds, 1, "the approved set must cover the first retry");
+            assert!(permissions_granted_cover(&retry, &grants));
+        }
+    }
+
+    fn assert_bash_permission_roundtrip(
+        command: &str,
+        project: &Path,
+    ) -> Vec<crate::bash_permissions::PermissionAsk> {
+        let first =
+            crate::bash_permissions::scan::scan_with_project_root(command, project, project);
+        assert!(!first.is_empty(), "the command must actually be scanned");
+        for prefer_always in [false, true] {
+            let mut grants = Vec::new();
+            let mut retry = first.clone();
+            let mut rounds = 0;
+            while !permissions_granted_cover(&retry, &grants) {
+                assert!(
+                    rounds < 2,
+                    "permission retry did not settle: {retry:?}; grants={grants:?}"
+                );
+                for ask in &retry {
+                    let approved = if prefer_always && !ask.always.is_empty() {
+                        &ask.always
+                    } else {
+                        &ask.patterns
+                    };
+                    for grant in approved {
+                        if !grants.contains(grant) {
+                            grants.push(grant.clone());
+                        }
+                    }
+                }
+                rounds += 1;
+                retry = crate::bash_permissions::scan::scan_with_project_root(
+                    command, project, project,
+                );
+            }
+            assert_eq!(rounds, 1, "the granted set must cover the first retry");
+        }
+        first
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_permissions_roundtrip_alf_quoted_gate() {
+        use crate::bash_permissions::PermissionKind;
+        const CHILD_HOME: &str = "AFT_ALF_PERMISSION_TEST_HOME";
+        if let Some(home) = std::env::var_os(CHILD_HOME) {
+            assert_eq!(std::env::var_os("HOME"), Some(home.clone()));
+            let project = PathBuf::from(home).join("fixture-project");
+            let command = include_str!("../../tests/fixtures/bash_permissions/alf_quoted_gate.sh");
+            let asks = assert_bash_permission_roundtrip(command, &project);
+            assert!(
+                asks.iter().all(|ask| ask.kind == PermissionKind::Bash),
+                "{asks:?}"
+            );
+            assert_eq!(
+                asks.iter().filter(|ask| ask.reason.is_none()).count(),
+                8,
+                "heredoc commands must remain data: {asks:?}"
+            );
+            for resource in [
+                "set -e",
+                "git worktree add -q --detach $S/fixture-s14 HEAD",
+                "git log --oneline -1",
+                "chmod +x .gate-s14.sh",
+                "chmod +x /tmp/run-s14.sh",
+                "grep -n '^run \\|^wait\\|nats' /tmp/run-s14.sh",
+            ] {
+                assert!(
+                    asks.iter()
+                        .any(|ask| ask.patterns == [resource] && ask.reason.is_none()),
+                    "outer command missing: {resource}; asks={asks:?}"
+                );
+            }
+            assert!(
+                asks.iter().any(|ask| ask.reason.is_none()
+                    && (ask.patterns[0] == "cat" || ask.patterns[0].starts_with("cat "))
+                    && ask.always == ["cat *"]),
+                "outer cat resource missing: {asks:?}"
+            );
+            assert!(
+                asks.iter().any(|ask| ask.patterns[0]
+                    .starts_with("sed -e '/^run fixture-lanes-s2/d'")
+                    && ask.always == ["sed *"]),
+                "outer sed resource missing: {asks:?}"
+            );
+            assert!(asks.iter().any(|ask| ask.patterns == [command]
+                && ask.always.is_empty()
+                && ask.reason.as_deref()
+                    == Some(crate::bash_permissions::scan::UNKNOWN_CWD_PERMISSION_REASON)));
+            return;
+        }
+
+        // HOME belongs to the child only, so parallel tests cannot observe the
+        // fixture's tilde expansion instead of their own environment.
+        let scratch = std::env::current_dir()
+            .unwrap()
+            .join("target/bash-roundtrip");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let fixture = tempfile::tempdir_in(scratch).unwrap();
+        let home = fixture.path().join("home");
+        std::fs::create_dir_all(home.join("fixture-project")).unwrap();
+        std::fs::create_dir_all(home.join("fixture-scratch")).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::bash::tests::bash_permissions_roundtrip_alf_quoted_gate",
+                "--nocapture",
+            ])
+            .env(CHILD_HOME, &home)
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the isolated child must run its test: {stdout}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_permissions_roundtrip_unix_temp_aliases() {
+        use crate::bash_permissions::{is_system_temp_path, PermissionKind};
+        let scratch = std::env::current_dir()
+            .unwrap()
+            .join("target/bash-roundtrip");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let fixture = tempfile::tempdir_in(scratch).unwrap();
+        let project = fixture.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::write(temp.path().join("existing.txt"), "fixture").unwrap();
+        let canonical = std::fs::canonicalize(temp.path()).unwrap();
+        let alias = fixture.path().join("tmp-alias");
+        std::os::unix::fs::symlink(&canonical, &alias).unwrap();
+        assert!(!alias.starts_with(&project));
+        assert_eq!(std::fs::canonicalize(&alias).unwrap(), canonical);
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            std::fs::canonicalize("/tmp").unwrap(),
+            PathBuf::from("/private/tmp")
+        );
+        let private_alias = Path::new("/private/tmp").join(temp.path().file_name().unwrap());
+        for directory in [
+            temp.path(),
+            canonical.as_path(),
+            alias.as_path(),
+            private_alias.as_path(),
+        ] {
+            for tail in ["existing.txt", "missing/deep/file.txt"] {
+                let path = directory.join(tail);
+                assert!(
+                    is_system_temp_path(&path),
+                    "temporary alias must be recognized: {path:?}"
+                );
+                let command = format!("chmod +x '{}' && cat '{}'", path.display(), path.display());
+                let asks = assert_bash_permission_roundtrip(&command, &project);
+                assert!(
+                    asks.iter().all(|ask| ask.kind == PermissionKind::Bash),
+                    "temp paths must not create external asks: {asks:?}"
+                );
+            }
+        }
+        let ordinary = fixture.path().join("not-system-temp/file.txt");
+        assert!(!is_system_temp_path(&ordinary));
+        let asks = crate::bash_permissions::scan::scan_with_project_root(
+            &format!("cat '{}'", ordinary.display()),
+            &project,
+            &project,
+        );
+        assert!(asks
+            .iter()
+            .any(|ask| ask.kind == PermissionKind::ExternalDirectory));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bash_permissions_roundtrip_windows_temp_short_and_long() {
+        use crate::bash_permissions::{is_system_temp_path, PermissionKind};
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+        let temp = tempfile::Builder::new()
+            .prefix("aft permission temp long name ")
+            .tempdir()
+            .unwrap();
+        let long = crate::windows_path::normalize_windows_path(
+            &std::fs::canonicalize(temp.path()).unwrap(),
+        );
+        let input: Vec<u16> = long.as_os_str().encode_wide().chain(Some(0)).collect();
+        let size = unsafe { GetShortPathNameW(input.as_ptr(), std::ptr::null_mut(), 0) };
+        assert_ne!(
+            size,
+            0,
+            "GetShortPathNameW: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut output = vec![0; size as usize];
+        let written = unsafe { GetShortPathNameW(input.as_ptr(), output.as_mut_ptr(), size) };
+        assert!(written > 0 && written < size);
+        let short = PathBuf::from(std::ffi::OsString::from_wide(&output[..written as usize]));
+        if short
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&long.to_string_lossy())
+        {
+            assert!(
+                std::env::var_os("AFT_TEST_REQUIRE_WINDOWS_SHORT_PATH").is_none(),
+                "Windows temp volume did not provide an 8.3 alias"
+            );
+            eprintln!("skipped: the temp volume does not create 8.3 short names");
+            return;
+        }
+        assert_eq!(
+            crate::windows_path::normalize_windows_path(&std::fs::canonicalize(&short).unwrap()),
+            long
+        );
+        std::fs::write(long.join("existing.txt"), "fixture").unwrap();
+        let scratch = std::env::current_dir()
+            .unwrap()
+            .join("target/bash-roundtrip");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let project = tempfile::tempdir_in(scratch).unwrap();
+        for directory in [&short, &long] {
+            for tail in ["existing.txt", "missing/deep/file.txt"] {
+                let path = directory.join(tail);
+                assert!(
+                    is_system_temp_path(&path),
+                    "temporary alias must be recognized: {path:?}"
+                );
+                let command = format!("chmod +x '{}' && cat '{}'", path.display(), path.display());
+                let asks = assert_bash_permission_roundtrip(&command, project.path());
+                assert!(
+                    asks.iter().all(|ask| ask.kind == PermissionKind::Bash),
+                    "temp paths must not create external asks: {asks:?}"
+                );
+            }
+        }
+        println!("Windows temp aliases exercised: {short:?} == {long:?}");
+    }
+
+    #[test]
+    fn external_approval_coverage_respects_path_and_kind() {
+        use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+        let directory = std::env::current_dir()
+            .unwrap()
+            .join("target/coverage-fixture");
+        let file = directory.join("file.txt");
+        let target = AccessGrant {
+            path: file.clone(),
+            kind: GrantKind::File,
+            operation: AccessOperation::Read,
+        };
+        let exact = file.to_string_lossy().into_owned();
+        let folder = format!("{}/*", directory.display());
+        assert!(external_approval_covers(&exact, &target));
+        assert!(external_approval_covers(&folder, &target));
+        assert!(external_approval_covers(
+            &folder,
+            &AccessGrant {
+                path: directory.join("nested/other.txt"),
+                ..target.clone()
+            }
+        ));
+        assert!(!external_approval_covers(
+            &exact,
+            &AccessGrant {
+                path: directory.join("sibling.txt"),
+                ..target.clone()
+            }
+        ));
+        assert!(!external_approval_covers(
+            &exact,
+            &AccessGrant {
+                kind: GrantKind::Subtree,
+                ..target.clone()
+            }
+        ));
+        assert!(external_approval_covers(
+            &folder,
+            &AccessGrant {
+                path: directory.join("nested"),
+                kind: GrantKind::Subtree,
+                ..target.clone()
+            }
+        ));
+        assert!(!external_approval_covers(
+            &folder,
+            &AccessGrant {
+                path: directory
+                    .with_file_name("coverage-fixture-other")
+                    .join("file.txt"),
+                ..target.clone()
+            }
+        ));
+        assert!(!external_approval_covers("*", &target));
+        assert!(!external_approval_covers("cat *", &target));
+
+        let ask = crate::bash_permissions::PermissionAsk {
+            kind: crate::bash_permissions::PermissionKind::ExternalDirectory,
+            patterns: vec![folder.clone()],
+            always: vec![folder.clone()],
+            reason: None,
+            targets: vec![target],
+        };
+        let serialized = serde_json::to_value(&ask).unwrap();
+        assert!(
+            serialized.get("targets").is_none(),
+            "internal targets must not change host prompts"
+        );
+        let missing: crate::bash_permissions::PermissionAsk =
+            serde_json::from_value(serialized).unwrap();
+        assert!(
+            !permissions_granted_cover(&[missing], &[folder]),
+            "unknown targets must fail closed"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn external_approval_coverage_normalizes_windows_path_spellings() {
+        use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+        for (plain, verbatim) in [
+            (r"D:\a\aft\file.txt", r"\\?\D:\a\aft\file.txt"),
+            (r"D:/a/aft/file.txt", r"\\?\d:\a\aft\file.txt"),
+            (
+                r"\\server\share\folder\file.txt",
+                r"\\?\UNC\server\share\folder\file.txt",
+            ),
+        ] {
+            for (approved, requested) in [(plain, verbatim), (verbatim, plain)] {
+                let target = AccessGrant {
+                    path: PathBuf::from(requested),
+                    kind: GrantKind::File,
+                    operation: AccessOperation::Read,
+                };
+                let original = target.clone();
+                assert!(
+                    external_approval_covers(approved, &target),
+                    "file: {approved} -> {requested}"
+                );
+                let folder = format!("{}/*", Path::new(approved).parent().unwrap().display());
+                assert!(
+                    external_approval_covers(&folder, &target),
+                    "folder: {folder} -> {requested}"
+                );
+                assert!(!external_approval_covers(
+                    approved,
+                    &AccessGrant {
+                        kind: GrantKind::Subtree,
+                        ..target.clone()
+                    }
+                ));
+                assert!(!external_approval_covers(
+                    approved,
+                    &AccessGrant {
+                        path: target.path.with_file_name("other.txt"),
+                        ..target.clone()
+                    }
+                ));
+                assert!(!external_approval_covers(
+                    &folder,
+                    &AccessGrant {
+                        path: target
+                            .path
+                            .parent()
+                            .unwrap()
+                            .with_file_name("other-folder")
+                            .join("file.txt"),
+                        ..target.clone()
+                    }
+                ));
+                assert_eq!(
+                    target, original,
+                    "comparison must preserve the requested spelling"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1080,6 +2061,43 @@ mod tests {
     }
 
     #[test]
+    fn split_cache_root_bash_launch_persists_the_real_task_under_durable_storage() {
+        // Tests elsewhere set AFT_STORAGE_DIR process-wide, which outranks the
+        // configured storage_dir; hold the shared env lock without it.
+        let _storage_env = crate::test_env::without_storage_override();
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config {
+            project_root: Some(project.path().to_path_buf()),
+            storage_dir: Some(storage.path().to_path_buf()),
+            cache_dir: Some(cache.path().to_path_buf()),
+            experimental_bash_background: true,
+            ..Default::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        let artifacts = crate::root_cache::cache_root(&config);
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        crate::sandbox_spawn::install_sandbox_spawn_test_seam(project.path().to_path_buf());
+        let response = handle(
+            &spawn_test_request("split-root-task", "echo durable-task", true),
+            &ctx,
+        );
+        crate::sandbox_spawn::clear_sandbox_spawn_test_seam(project.path());
+        assert!(response.success, "{response:?}");
+        let task_id = response.data["task_id"].as_str().unwrap();
+        let root = crate::bash_background::task_storage_dir(&ctx);
+        assert_eq!(root, storage.path());
+        let task =
+            crate::bash_background::persistence::resolve_task(&root, "sandbox-spawn-test", task_id)
+                .unwrap();
+        assert!(task.paths.json.is_file());
+        assert!(task.paths.json.starts_with(storage.path()));
+        assert!(!artifacts.join("bash-tasks").exists());
+        stop_spawned_test_task(&ctx, &response);
+    }
+
+    #[test]
     fn synthetic_load_role_gate_refuses_worker_not_head() {
         use crate::sandbox_spawn::{with_spawn_plan_for_test, SpawnPlan};
 
@@ -1460,14 +2478,24 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         let ctx = spawn_test_context(&project, storage.path());
 
+        // A per-call test-thread value cannot defeat the budget: the names are
+        // refused before the launch, so the worker still gets its budget.
         let mut explicit = worker_thread_output_request("budget-explicit");
         explicit.params["params"]["env"] = json!({
             "NEXTEST_TEST_THREADS": "13",
             "RUST_TEST_THREADS": "17"
         });
+        let refused = crate::bash_background::with_worker_preset(true, || handle(&explicit, &ctx));
+        assert!(!refused.success, "{:?}", refused.data);
+        assert_eq!(refused.data["code"], "blocked_env_var");
         assert_eq!(
-            bash_output_for_test(&ctx, &project, &explicit, true),
-            "13|17"
+            bash_output_for_test(
+                &ctx,
+                &project,
+                &worker_thread_output_request("budget"),
+                true
+            ),
+            "8|8"
         );
 
         let mut head = worker_thread_output_request("budget-head");
@@ -1489,10 +2517,6 @@ mod tests {
             "19|23"
         );
         assert_eq!(bash_output_for_test(&ctx, &project, &head, false), "19|23");
-        assert_eq!(
-            bash_output_for_test(&ctx, &project, &explicit, true),
-            "13|17"
-        );
     }
 
     #[cfg(unix)]
@@ -2249,8 +3273,8 @@ mod tests {
         let launcher = PathBuf::from("/bin/sh");
         crate::executable_cache::write_executable_with_mode(
             &launcher_script,
-            br#"printf '%s\n' "$0" "$@" > "$AFT_TEST_LAUNCH_ARGS.tmp"
-mv -f "$AFT_TEST_LAUNCH_ARGS.tmp" "$AFT_TEST_LAUNCH_ARGS"
+            br#"printf '%s\n' "$0" "$@" > "$BASHENV_TEST_LAUNCH_ARGS.tmp"
+mv -f "$BASHENV_TEST_LAUNCH_ARGS.tmp" "$BASHENV_TEST_LAUNCH_ARGS"
 [ "$1" = "--profile-json" ] || exit 92
 [ -n "$2" ] || exit 93
 [ "$3" = "--failure-fd" ] || exit 95
@@ -2282,7 +3306,7 @@ exec "$@"
             "params": {
                 "command": "printf launcher-wrapped",
                 "compressed": false,
-                "env": { "AFT_TEST_LAUNCH_ARGS": args_log.to_string_lossy() },
+                "env": { "BASHENV_TEST_LAUNCH_ARGS": args_log.to_string_lossy() },
             },
         }))
         .unwrap();
@@ -2511,4 +3535,7 @@ exec "$@"
         assert_eq!(observations[0].requested_tier, RequestedSandboxTier::Native);
         stop_spawned_test_task(&ctx, &retried);
     }
+    #[cfg(unix)]
+    #[path = "bash_env_tests.rs"]
+    mod bash_env_tests;
 }

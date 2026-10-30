@@ -1,0 +1,38 @@
+{
+  "github_reads": [
+    {
+      "request_body": null,
+      "request_line": "GET /repos/org/repo/stacks/3 HTTP/1.1",
+      "response": {
+        "number": 3,
+        "url": "https://api.github.com/repos/org/repo/stacks/3"
+      },
+      "status": 200
+    }
+  ],
+  "name": "stack-unstack-stack-read-incomplete",
+  "reply": {
+    "repo_binding_generation": 1,
+    "result": {
+      "refusal_code": "pre_dispatch_read_incomplete{reason: invalid_response}",
+      "retry_same_nonce": true,
+      "status": "refused"
+    }
+  },
+  "request": {
+    "action": "api:POST:/repos/*/*/stacks/*/unstack",
+    "body": {},
+    "gh_route_schema": 1,
+    "manifest_version": 22,
+    "metadata": {
+      "agent_id": "alfonso-aft",
+      "pid": 4242
+    },
+    "operation": "gh.route",
+    "repository": "org/repo",
+    "rung_as_of_unix_secs": 1793066213,
+    "target": {
+      "stack_number": "3"
+    }
+  }
+}

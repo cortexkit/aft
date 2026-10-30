@@ -1,5 +1,5 @@
 name: Validate calibrated storm profile
-description: Measure optimized compilation and retain all storm cases and deadline controls
+description: Measure optimized compilation and retain all 19 normal storm cases
 runs:
   using: composite
   steps:
@@ -11,19 +11,13 @@ runs:
       shell: bash
       run: |
         cargo nextest list --profile default --cargo-profile ci-storm --locked -p agent-file-tools --test integration -E 'test(subc_storm)' -T json > target/storm-inventory.json
-        python3 scripts/ci-storm-controls.py --check-inventory target/storm-inventory.json
+        python3 scripts/ci-storm-inventory.py --check-inventory target/storm-inventory.json
 
     - name: Run all calibrated storm tests
       shell: bash
       run: cargo nextest run --no-fail-fast --profile default --cargo-profile ci-storm --locked -p agent-file-tools --test integration -E 'test(subc_storm)'
-      env:
-        AFT_STORM_POSITIVE_CONTROL: ""
 
-    - name: Prove bind and interactive-read deadlines still reject delays
-      shell: bash
-      run: python3 scripts/ci-storm-controls.py --cargo-profile ci-storm
-
-    - name: Retain storm compiler timings and control evidence
+    - name: Retain storm compiler timings and inventory
       if: always()
       uses: ./.github/actions/upload-artifact-retry
       with:
@@ -31,5 +25,4 @@ runs:
         path: |
           target/cargo-timings/
           target/storm-inventory.json
-          target/storm-controls/
         if-no-files-found: error

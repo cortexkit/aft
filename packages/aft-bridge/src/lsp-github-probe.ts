@@ -13,6 +13,98 @@
 
 import { warn as defaultWarn } from "./active-logger.js";
 
+/**
+ * Hosts we will fetch GitHub release metadata and artifacts from. The GitHub
+ * API returns `browser_download_url` values that almost always live on
+ * `github.com` (the canonical URL), but the actual blob is served from
+ * `objects.githubusercontent.com` after redirect. We allow both.
+ *
+ * Without this allowlist, a compromised or malicious GitHub API response
+ * could swap `browser_download_url` to an attacker-controlled host (e.g.
+ * `evil.example/payload.zip`) and we would happily follow the redirect
+ * chain. The download size cap and SHA-256 TOFU help but cannot stop the
+ * very first install on a tag we have never seen.
+ *
+ * Redirects are handled manually so every hop is checked before any bytes
+ * are accepted. A compromised release URL may start on github.com and
+ * redirect to an attacker-controlled host; `redirect: "follow"` would hide
+ * that hop.
+ */
+const ALLOWED_GITHUB_HOSTS = new Set([
+  "github.com",
+  "api.github.com",
+  "objects.githubusercontent.com",
+  "release-assets.githubusercontent.com",
+  "raw.githubusercontent.com",
+  "codeload.github.com",
+]);
+
+/** Throw unless `rawUrl` is an https URL on one of the allowed GitHub hosts. */
+export function assertAllowedDownloadUrl(rawUrl: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error(`download url is not a valid URL: ${rawUrl}`);
+  }
+  if (parsed.protocol !== "https:") {
+    throw new Error(`download url must be https (got ${parsed.protocol}): ${rawUrl}`);
+  }
+  if (!ALLOWED_GITHUB_HOSTS.has(parsed.hostname.toLowerCase())) {
+    throw new Error(
+      `download url host ${parsed.hostname} is not in the GitHub allowlist: ${rawUrl}`,
+    );
+  }
+  return parsed;
+}
+
+/** The only origin that may receive the GitHub token. */
+const GITHUB_API_ORIGIN = "https://api.github.com";
+const MAX_GITHUB_REDIRECTS = 5;
+
+function withoutAuthorization(headers: Record<string, string>): Record<string, string> {
+  // Header names are case-insensitive, so `Authorization` must go too.
+  return Object.fromEntries(
+    Object.entries(headers).filter(([name]) => name.toLowerCase() !== "authorization"),
+  );
+}
+
+/**
+ * Fetch a GitHub API URL, following redirects by hand. Every hop must be on
+ * an allowed GitHub host, and once a hop leaves the API origin the
+ * Authorization header is dropped for that hop and every later one. The
+ * runtime's own redirect handling is not relied on: whether it drops the
+ * header on a cross-origin hop differs between runtimes.
+ */
+export async function fetchGithubApiFollowingRedirects(
+  url: string,
+  headers: Record<string, string>,
+  fetchImpl: typeof fetch,
+  signal?: AbortSignal,
+): Promise<Response> {
+  let currentUrl = url;
+  let requestHeaders = { ...headers };
+  for (let i = 0; i <= MAX_GITHUB_REDIRECTS; i += 1) {
+    const parsed = assertAllowedDownloadUrl(currentUrl);
+    if (parsed.origin !== GITHUB_API_ORIGIN) {
+      requestHeaders = withoutAuthorization(requestHeaders);
+    }
+    const res = await fetchImpl(currentUrl, {
+      headers: { ...requestHeaders },
+      redirect: "manual",
+      signal,
+    });
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers.get("location");
+      if (!location) throw new Error(`redirect status ${res.status} without Location`);
+      currentUrl = new URL(location, currentUrl).toString();
+      continue;
+    }
+    return res;
+  }
+  throw new Error(`too many redirects (>${MAX_GITHUB_REDIRECTS})`);
+}
+
 interface GithubRelease {
   tag_name: string;
   name?: string;
@@ -88,6 +180,7 @@ export async function probeGithubReleases(
   graceDays: number,
   fetchImpl: typeof fetch = fetch,
   warn: (message: string) => void = defaultWarn,
+  signal?: AbortSignal,
 ): Promise<GithubVersionPickResult | null> {
   const url = `https://api.github.com/repos/${githubRepo}/releases?per_page=30`;
   try {
@@ -95,10 +188,14 @@ export async function probeGithubReleases(
     if (process.env.GITHUB_TOKEN) {
       headers.authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
     }
-    const res = await fetchImpl(url, {
+    const res = await fetchGithubApiFollowingRedirects(
+      url,
       headers,
-      signal: AbortSignal.timeout(10_000),
-    });
+      fetchImpl,
+      // The caller's signal (plugin shutdown) cancels the probe as well as
+      // the fixed timeout.
+      signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000),
+    );
     if (!res.ok) {
       warn(`[lsp] github releases probe failed for ${githubRepo}: HTTP ${res.status}`);
       return null;

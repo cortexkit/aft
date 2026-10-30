@@ -35,7 +35,8 @@ import {
   cachedFileSha256,
   cachedFileSha256Sync,
   isSafeVersion,
-  npmInvocation,
+  lspNpmInstallInvocation,
+  lspPublicationCutoff,
   npmSpawnEnv,
   resolveNpm,
   spawn,
@@ -274,46 +275,54 @@ export function ensureInstallAnchor(cwd: string): void {
   }
 }
 
-function runInstall(
+/** How long one `npm install` may run before termination of its process tree is requested. */
+const NPM_INSTALL_DEADLINE_MS = 120_000;
+
+async function runInstall(
   spec: NpmServerSpec,
   version: string,
   cwd: string,
   installLock: InstallLockLease,
+  before: string | undefined,
   signal?: AbortSignal,
+  // A stalled npm (dead registry socket, hung lifecycle) would otherwise hold
+  // the shared install lease until the host exits. Tests inject a shorter
+  // deadline and a fake spawn/terminate pair.
+  deadlineMs = NPM_INSTALL_DEADLINE_MS,
+  runtime = { spawn, terminate: terminateNpmProcessTree },
 ): Promise<boolean> {
+  const target = `${spec.npm}@${version}`;
+  log(`[lsp] installing ${target} to ${cwd}`);
+
+  if (signal?.aborted) {
+    warn(`[lsp] install ${target} aborted before spawn`);
+    return false;
+  }
+
+  // Resolve npm beyond PATH. Windows npm is `npm.cmd` (Node's spawn does not
+  // auto-resolve `.cmd`), and GUI/Desktop launches often have a stripped PATH
+  // with no version-manager bin dir, so a bare `npm` spawn fails with ENOENT.
+  // resolveNpm() handles discovery, npmSpawnEnv() makes npm's node sibling
+  // reachable, and the shared policy safely routes Windows shims through cmd.exe
+  // without enabling shell parsing on other platforms.
+  const npm = resolveNpm();
+  if (!npm) {
+    warn(`[lsp] npm not found on PATH or known locations; cannot install ${target}`);
+    return false;
+  }
+
+  const invocation = await lspNpmInstallInvocation(npm, target, before);
+  if (signal?.aborted) {
+    warn(`[lsp] install ${target} aborted during npm capability probe`);
+    return false;
+  }
+  if (!invocation) {
+    warn(`[lsp] npm cannot enforce the publication cutoff; cannot install ${target}`);
+    return false;
+  }
+  ensureInstallAnchor(cwd);
   return new Promise((resolve) => {
-    const target = `${spec.npm}@${version}`;
-    log(`[lsp] installing ${target} to ${cwd}`);
-
-    if (signal?.aborted) {
-      warn(`[lsp] install ${target} aborted before spawn`);
-      resolve(false);
-      return;
-    }
-
-    // Resolve npm beyond PATH. Windows npm is `npm.cmd` (Node's spawn does not
-    // auto-resolve `.cmd`), and GUI/Desktop launches often have a stripped PATH
-    // with no version-manager bin dir, so a bare `npm` spawn fails with ENOENT.
-    // resolveNpm() handles discovery, npmSpawnEnv() makes npm's node sibling
-    // reachable, and npmInvocation() safely routes Windows shims through cmd.exe
-    // without enabling shell parsing on other platforms.
-    const npm = resolveNpm();
-    if (!npm) {
-      warn(`[lsp] npm not found on PATH or known locations; cannot install ${target}`);
-      resolve(false);
-      return;
-    }
-
-    ensureInstallAnchor(cwd);
-
-    const invocation = npmInvocation(npm, [
-      "install",
-      "--no-save",
-      "--ignore-scripts",
-      "--silent",
-      target,
-    ]);
-    const child = spawn(invocation.command, invocation.args, {
+    const child = runtime.spawn(invocation.command, invocation.args, {
       stdio: ["ignore", "pipe", "pipe"],
       cwd,
       env: { ...npmSpawnEnv(npm), ...invocation.env },
@@ -324,9 +333,11 @@ function runInstall(
     let stderrBuf = "";
     let settled = false;
     let terminationPromise: Promise<void> | null = null;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
 
     const cleanup = () => {
       signal?.removeEventListener("abort", onAbort);
+      clearTimeout(deadline);
     };
     const finish = (ok: boolean) => {
       if (settled) return;
@@ -340,13 +351,15 @@ function runInstall(
       if (completedSuccessfully) log(`[lsp] installed ${target}`);
       finish(completedSuccessfully);
     };
-    const onAbort = () => {
+    // Shutdown and the install deadline share one path: the lease is released
+    // only after the npm process tree is confirmed gone.
+    const terminateInstall = (reason: string) => {
       if (childCompletedSuccessfully()) {
         finishAfterConfirmedTermination();
         return;
       }
-      warn(`[lsp] install ${target} aborted during shutdown`);
-      terminationPromise ??= terminateNpmProcessTree(child, invocation);
+      warn(`[lsp] install ${target} ${reason}`);
+      terminationPromise ??= runtime.terminate(child, invocation);
       void terminationPromise.then(finishAfterConfirmedTermination, (terminationError) => {
         // A child with no PID never spawned, so it cannot still be mutating the
         // cache and does not need cross-process quarantine.
@@ -363,6 +376,11 @@ function runInstall(
         finish(false);
       });
     };
+    const onAbort = () => terminateInstall("aborted during shutdown");
+    deadline = setTimeout(() => terminateInstall("exceeded its installation deadline"), deadlineMs);
+    // The deadline bounds a running install; it must not keep an otherwise
+    // finished host alive on its own.
+    deadline.unref?.();
 
     signal?.addEventListener("abort", onAbort, { once: true });
     if (signal?.aborted) onAbort();
@@ -495,6 +513,7 @@ async function ensureServerInstalled(
       version,
       cachedPackageDir(spec.npm),
       installLock,
+      lspPublicationCutoff(config.graceDays, Boolean(config.versions[spec.npm])),
       signal,
     ).catch((err: unknown) => {
       error(`[lsp] background install ${spec.npm} crashed: ${err}`);
@@ -724,3 +743,5 @@ export async function pushLspPathsAfterAutoInstall(
   pool.setConfigureOverride("lsp_paths_extra", paths);
   await pool.reconfigure(projectRoot, { lsp_paths_extra: paths });
 }
+
+export { runInstall as _runInstallForTesting };

@@ -1,1 +1,0 @@
-- `runon` now refuses, before anything runs, a command that `cd`s into a folder the build server doesn't have, such as your home folder or another local checkout; set the bash tool's `workdir` instead. On Windows runners it also refuses `cd` to an absolute path.

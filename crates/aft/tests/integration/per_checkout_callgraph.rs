@@ -43,7 +43,11 @@ fn query_fixture(with_graph: bool) -> QueryFixture {
     let source = b"function target() { return 1; }\nexport function caller() { return target(); }\ncaller();\n";
     std::fs::write(root_path.join("fixture.ts"), source).unwrap();
     let registry = FamilyRegistry::open(storage.path(), "query-callgraph-test").unwrap();
-    let access = ViewAccess::Owner(registry.register_view("scope", &root_path).unwrap());
+    let access = ViewAccess::Owner(
+        registry
+            .register_view_with_storage(registry.storage(), "scope", &root_path)
+            .unwrap(),
+    );
     let driver = Driver {
         plane: CallgraphPlane::default(),
         source: source.to_vec(),
@@ -80,11 +84,19 @@ fn query_fixture(with_graph: bool) -> QueryFixture {
         };
         let views = view.view_store().unwrap();
         let name = GenerationName::for_manifest(&manifest).unwrap();
+        // Pin the generation before materializing its derived database, as
+        // production publication does: the post-publication sweep scheduled
+        // by an earlier commit would otherwise reclaim the unpinned file.
+        let prepared = views.prepare_v2(&name, None, &manifest, None).unwrap();
         let database = views.derived_path(&name.to_string()).unwrap();
         std::fs::create_dir_all(database.parent().unwrap()).unwrap();
         let store = view.open_store(FamilyPlane::Callgraph).unwrap();
-        callgraph::materialize(&database, &manifest, &BlobReader(store.reader())).unwrap();
-        let prepared = views.prepare_v2(&name, None, &manifest, None).unwrap();
+        callgraph::materialize(
+            &database,
+            &OpenGeneration::new("projected", manifest.clone(), None),
+            &BlobReader(store.reader()),
+        )
+        .unwrap();
         views.commit_v2(prepared, None).unwrap();
         let marker =
             aft::root_cache::ReadMarker::create(view.view_dir(), &name.to_string()).unwrap();
@@ -267,6 +279,9 @@ impl FirstLoadDriver for Driver {
         let mut live = LiveEntry::new(DiskState::of_bytes(&self.source), self.revision(access));
         callgraph::attach(&mut live, &self.source, "typescript")?;
         Ok(ReconciledCheckout {
+            cut: None,
+            readiness: Default::default(),
+            publication_base: None,
             revision: self.revision(access),
             entries: BTreeMap::from([(RelPath::new(b"fixture.ts").unwrap(), live)]),
         })
@@ -296,7 +311,10 @@ impl FirstLoadDriver for Driver {
                 .downcast_ref::<CallgraphAttachment>()
                 .unwrap();
             store
-                .put_or_touch(&attachment.key, &attachment.blob.to_bytes().map_err(error)?)
+                .put_or_touch(
+                    &attachment.key,
+                    &attachment.payload().expect("unpublished payload"),
+                )
                 .map_err(error)?;
             let DiskState::Present { content, size } = live.disk else {
                 continue;
@@ -317,12 +335,19 @@ impl FirstLoadDriver for Driver {
         }
         let name = GenerationName::for_manifest(&manifest).map_err(error)?;
         let views = view.view_store().map_err(error)?;
-        let database = views.derived_path(&name.to_string()).map_err(error)?;
-        std::fs::create_dir_all(database.parent().unwrap()).map_err(error)?;
-        callgraph::materialize(&database, &manifest, &BlobReader(store.reader()))?;
+        // Pin the generation before materializing its derived database, as
+        // production publication does: the post-publication sweep scheduled
+        // by an earlier commit would otherwise reclaim the unpinned file.
         let prepared = views
             .prepare_v2(&name, None, &manifest, None)
             .map_err(error)?;
+        let database = views.derived_path(&name.to_string()).map_err(error)?;
+        std::fs::create_dir_all(database.parent().unwrap()).map_err(error)?;
+        callgraph::materialize(
+            &database,
+            &OpenGeneration::new("projected", manifest.clone(), None),
+            &BlobReader(store.reader()),
+        )?;
         views.commit_v2(prepared, None).map_err(error)?;
         let marker = aft::root_cache::ReadMarker::create(view.view_dir(), &name.to_string())
             .map_err(error)?;
@@ -365,7 +390,11 @@ fn callgraph_plane_driver_attaches_materializes_and_installs_pinned_reader() {
     let storage = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let registry = FamilyRegistry::open(storage.path(), "callgraph-test").unwrap();
-    let access = ViewAccess::Owner(registry.register_view("scope", root.path()).unwrap());
+    let access = ViewAccess::Owner(
+        registry
+            .register_view_with_storage(registry.storage(), "scope", root.path())
+            .unwrap(),
+    );
     let driver = Driver { plane: CallgraphPlane::default(), source: b"interface I { m(): void; }\nclass A implements I { m() {} }\nclass B implements I { m() {} }\nexport function caller(x: I) { x.m(); }".to_vec(), revision: Mutex::new(1), installed: Mutex::new(None) };
     let reconciled = driver.reconcile(&access).unwrap();
     let empty = ManifestV2::new(ManifestHeader {
@@ -422,7 +451,9 @@ fn store_clone_pins_old_blobs_after_swap_and_gc() {
     let storage = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let registry = FamilyRegistry::open(storage.path(), "callgraph-pin-test").unwrap();
-    let view = registry.register_view("scope-pin", root.path()).unwrap();
+    let view = registry
+        .register_view_with_storage(registry.storage(), "scope-pin", root.path())
+        .unwrap();
     let access = ViewAccess::Owner(view.clone());
     let driver = Driver {
         plane: CallgraphPlane::default(),
@@ -450,7 +481,8 @@ fn store_clone_pins_old_blobs_after_swap_and_gc() {
     let held_store = reader.store.clone();
     let old_name = old.name().to_string();
     let key_hex = old
-        .manifest()
+        .flatten()
+        .unwrap()
         .entries()
         .find_map(|(_, e)| match e.plane_state(FamilyPlane::Callgraph) {
             Some(PlaneState::Ready { key }) => Some(key.clone()),
@@ -463,12 +495,20 @@ fn store_clone_pins_old_blobs_after_swap_and_gc() {
     );
     let views = view.view_store().unwrap();
     let name = GenerationName::for_manifest(&empty).unwrap();
-    let database = views.derived_path(&name.to_string()).unwrap();
-    let store = view.open_store(FamilyPlane::Callgraph).unwrap();
-    callgraph::materialize(&database, &empty, &BlobReader(store.reader())).unwrap();
+    // Pin the generation before materializing its derived database, as
+    // production publication does: the post-publication sweep scheduled by
+    // the old generation's commit would otherwise reclaim the unpinned file.
     let prepared = views
         .prepare_v2(&name, Some(&old_name), &empty, None)
         .unwrap();
+    let database = views.derived_path(&name.to_string()).unwrap();
+    let store = view.open_store(FamilyPlane::Callgraph).unwrap();
+    callgraph::materialize(
+        &database,
+        &OpenGeneration::new("empty", empty.clone(), None),
+        &BlobReader(store.reader()),
+    )
+    .unwrap();
     views.commit_v2(prepared, None).unwrap();
     let marker = aft::root_cache::ReadMarker::create(view.view_dir(), &name.to_string()).unwrap();
     let successor = LiveDelta::new(Arc::new(OpenGeneration::new(

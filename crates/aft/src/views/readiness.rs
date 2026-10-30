@@ -15,8 +15,19 @@ use serde::{Deserialize, Serialize};
 use crate::blob_store::v2::{ContentHash, FamilyKey, FamilyPlane};
 
 use super::manifest_v2::{EntryV2, ManifestV2, Producers};
-use super::snapshot::DiskState;
+use super::snapshot::{ComposedGeneration, DiskState};
 use super::{RelPath, Result, ViewError};
+
+/// Whether a live delta's bytes were stably observed, independently of whether
+/// its plane artifacts have finished materializing.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ReconciledDelta {
+    #[default]
+    Unreconciled,
+    Reconciled,
+    /// Repeated unstable reads supplied no bytes safe to insert.
+    Pending,
+}
 
 /// The state of one plane for one manifest entry.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -119,13 +130,20 @@ impl FillMap {
         self.keys.values()
     }
 
+    /// Use on a new binding's copy: older readers can still need retired fills.
+    pub(super) fn retain_current(&mut self, snapshot: &super::snapshot::Snapshot) {
+        self.keys.retain(|(path, content, _), _| {
+            matches!(snapshot.disk_state(path), DiskState::Present { content: current, .. } if current == *content)
+        });
+    }
+
     /// Drops fills the given manifest already records as `Ready`.
-    pub fn trim_folded(&mut self, manifest: &ManifestV2) {
+    pub fn trim_folded(&mut self, manifest: &ComposedGeneration) {
         self.keys.retain(|(path, content, plane), key| {
             !matches!(
-                manifest.get(path),
+                manifest.entry(path),
                 Some(entry) if entry.content() == Some(*content)
-                    && entry.plane_state(*plane) == Some(&PlaneState::ready(key))
+                    && manifest.plane_readiness(path, *plane) == Some(&PlaneState::ready(key))
             )
         });
     }
@@ -139,7 +157,7 @@ impl FillMap {
         completion: &Completion,
         current_producer: &str,
         live: Option<&DiskState>,
-        generation: Option<&ManifestV2>,
+        generation: Option<&ComposedGeneration>,
     ) -> Admission {
         let item = &completion.item;
         if item.producer != current_producer {
@@ -149,7 +167,7 @@ impl FillMap {
             Some(DiskState::Present { content, .. }) => Some(*content),
             Some(DiskState::Absent) => None,
             None => generation
-                .and_then(|manifest| manifest.get(&item.rel_path))
+                .and_then(|manifest| manifest.entry(&item.rel_path))
                 .and_then(EntryV2::content),
         };
         if current != Some(item.content) {
@@ -168,6 +186,9 @@ pub trait LiveEntries {
     /// The last observed disk state of every path with a live entry.
     fn live_states(&self) -> Box<dyn Iterator<Item = (&RelPath, &DiskState)> + '_>;
     fn live_state(&self, rel_path: &RelPath) -> Option<&DiskState>;
+    fn readiness_patch(&self, _path: &RelPath, _plane: FamilyPlane) -> Option<&PlaneState> {
+        None
+    }
 }
 
 /// Counts outstanding work for `plane` in one snapshot.
@@ -180,7 +201,7 @@ pub trait LiveEntries {
 /// `applies_to` says whether the plane has work for a path.
 pub fn plane_readiness(
     plane: FamilyPlane,
-    generation: Option<&ManifestV2>,
+    generation: Option<&ComposedGeneration>,
     live: &dyn LiveEntries,
     fill: &FillMap,
     applies_to: &dyn Fn(&RelPath) -> bool,
@@ -191,13 +212,18 @@ pub fn plane_readiness(
     let mut pending = 0;
     let mut failed = 0;
     for (path, entry) in generation.entries() {
-        if live.live_state(path).is_some() {
+        // A member the plane has no work for counts neither way, whatever
+        // state an older base recorded for it.
+        if live.live_state(path).is_some() || !applies_to(path) {
             continue;
         }
         let Some(content) = entry.content() else {
             continue;
         };
-        match entry.plane_state(plane) {
+        match live
+            .readiness_patch(path, plane)
+            .or_else(|| generation.plane_readiness(path, plane))
+        {
             Some(PlaneState::Pending { .. }) if fill.get(path, &content, plane).is_none() => {
                 pending += 1;
             }
@@ -208,7 +234,11 @@ pub fn plane_readiness(
     for (path, state) in live.live_states() {
         if let DiskState::Present { content, .. } = state {
             if applies_to(path) && fill.get(path, content, plane).is_none() {
-                pending += 1;
+                match live.readiness_patch(path, plane) {
+                    Some(PlaneState::Ready { .. }) => {}
+                    Some(PlaneState::Failed { .. }) => failed += 1,
+                    _ => pending += 1,
+                }
             }
         }
     }
@@ -220,7 +250,7 @@ pub fn plane_readiness(
 pub fn work_queue(
     plane: FamilyPlane,
     producer: &str,
-    generation: Option<&ManifestV2>,
+    generation: Option<&ComposedGeneration>,
     live: &dyn LiveEntries,
     fill: &FillMap,
     applies_to: &dyn Fn(&RelPath) -> bool,
@@ -234,7 +264,12 @@ pub fn work_queue(
             let Some(content) = entry.content() else {
                 continue;
             };
-            if matches!(entry.plane_state(plane), Some(PlaneState::Pending { .. }))
+            if (generation.owns_work(path, plane) || live.readiness_patch(path, plane).is_some())
+                && matches!(
+                    live.readiness_patch(path, plane)
+                        .or_else(|| generation.plane_readiness(path, plane)),
+                    Some(PlaneState::Pending { .. })
+                )
                 && fill.get(path, &content, plane).is_none()
             {
                 items.push(WorkItem {
@@ -248,7 +283,13 @@ pub fn work_queue(
     }
     for (path, state) in live.live_states() {
         if let DiskState::Present { content, .. } = state {
-            if applies_to(path) && fill.get(path, content, plane).is_none() {
+            if applies_to(path)
+                && fill.get(path, content, plane).is_none()
+                && !matches!(
+                    live.readiness_patch(path, plane),
+                    Some(PlaneState::Ready { .. } | PlaneState::Failed { .. })
+                )
+            {
                 items.push(WorkItem {
                     plane,
                     rel_path: path.clone(),
@@ -268,7 +309,7 @@ pub fn work_queue(
 /// states; any `Pending` state whose key is in the fill map becomes `Ready`.
 /// A producer change is not a fold: it needs a rebuild, so it is refused.
 pub fn fold(
-    base: &ManifestV2,
+    base: &ComposedGeneration,
     producers: &Producers,
     updates: impl IntoIterator<Item = (RelPath, Option<EntryV2>)>,
     fill: &FillMap,
@@ -278,25 +319,5 @@ pub fn fold(
             "a fold cannot change producers; rebuild the generation instead".to_string(),
         )
     })?;
-    let mut next = base.clone();
-    for (path, entry) in updates {
-        next.set(path, entry)?;
-    }
-    for (path, entry) in next.entries_mut() {
-        let EntryV2::Regular {
-            content, planes, ..
-        } = entry
-        else {
-            continue;
-        };
-        for plane in FamilyPlane::ALL {
-            let state = planes.get_mut(plane);
-            if matches!(state, Some(PlaneState::Pending { .. })) {
-                if let Some(key) = fill.get(path, content, plane) {
-                    *state = Some(PlaneState::ready(key));
-                }
-            }
-        }
-    }
-    Ok(next)
+    base.fold(producers, updates, fill)
 }

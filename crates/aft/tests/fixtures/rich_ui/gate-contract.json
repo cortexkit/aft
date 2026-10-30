@@ -1,0 +1,40 @@
+{
+  "evidence": "20aba8d97b65c788759f9ee5024d71fdb98133f5, landing (parent supplied; not in base main)",
+  "path": "crates/aft/src/subc/carrier_read_only.rs",
+  "served": [
+    "read",
+    "aft_outline",
+    "aft_zoom",
+    "aft_search",
+    "grep",
+    "glob",
+    "aft_callgraph",
+    "bash_status",
+    "bash_watch"
+  ],
+  "tool_refusals": [
+    {
+      "tool": "bash",
+      "code": "carrier_read_only"
+    },
+    {
+      "tool": "edit",
+      "code": "carrier_read_only"
+    },
+    {
+      "tool": "write",
+      "code": "carrier_read_only"
+    },
+    {
+      "tool": "inspect",
+      "code": "carrier_read_only"
+    }
+  ],
+  "precedence": [
+    "tool name",
+    "target",
+    "rich_ui_op"
+  ],
+  "refusal_message": "This route is read-only: <tool> is not available to the rich-UI provider.",
+  "target_refusal_message": "This route is read-only: <kind> targets are not available to the rich-UI provider."
+}

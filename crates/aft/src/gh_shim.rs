@@ -35,11 +35,22 @@ use subc_protocol::{BindIdentity, RouteTarget};
 mod native_guard;
 pub(crate) mod read_contract;
 mod rename_guard;
+mod v22_rows;
 mod worker_reads;
+
+use v22_rows::{
+    canonicalize_pr_edit_from, canonicalize_review_thread, canonicalize_v22_api_from,
+    classify_review_thread_mutation, is_review_thread_tuple, review_reply_tuple,
+    review_thread_mutation,
+};
 
 #[cfg(test)]
 #[path = "gh_shim/security_audit_tests.rs"]
 mod security_audit_tests;
+
+#[cfg(test)]
+#[path = "gh_shim/plexus_contract_judge.rs"]
+mod plexus_contract_judge;
 
 #[cfg(test)]
 #[path = "gh_shim/v19_compat_tests.rs"]
@@ -115,6 +126,89 @@ const V19_ADMIN_TUPLES: &[&str] = &[
     "workflow enable",
 ];
 const PRIVATE_REPORTING_PATH_GLOB: &str = "/repos/*/*/private-vulnerability-reporting";
+// v22 bot speech on pull requests. `pr edit` (title and body only) is limited to
+// pull requests the calling seat's bot opened: the route holder checks the
+// author before it writes, as it does for `issue edit`. Resolving or
+// unresolving a review thread changes only that thread's public state, the
+// same class as closing an issue. Before v22, `pr edit` was an admin-tier row
+// that ran only as the operator's label-only edit; at v22 it is declared
+// governed and the label-only shape keeps its operator row (see
+// `is_reviewed_operator_label_tuple`).
+const V22_GOVERNED_TUPLES: &[&str] = &[
+    "pr edit",
+    REVIEW_THREAD_RESOLVE_TUPLE,
+    REVIEW_THREAD_UNRESOLVE_TUPLE,
+];
+// Installing, upgrading or removing a gh extension puts a program on the
+// operator's machine that later runs with the operator's gh login, so it is
+// operator administration. Listing installed extensions is a read and is
+// declared in the manifest's mechanical tier instead.
+const V22_ADMIN_TUPLES: &[&str] = &[
+    "extension install",
+    "extension upgrade",
+    "extension remove",
+    "stack merge",
+];
+/// `gh stack` (the github/gh-stack extension) subcommands that can write to
+/// GitHub. The extension calls the GitHub API in-process with whatever token gh
+/// is logged in with and never through `gh` itself, so delegating one of these
+/// would publish pull requests and stacks as the operator, not the bot, and the
+/// shim would never see the individual calls. They are declared admin: refused
+/// with a text naming the bot-speech route, or run as audited operator
+/// administration under `GH_SHIM_BYPASS=operator`. `checkout` is here because
+/// its interactive conflict resolution can unstack on GitHub; `delete` is the
+/// extension's alias of `unstack`. `push` makes no API call, but it writes the
+/// stack's branches to GitHub with the operator's git credentials, always as
+/// a `--force-with-lease` push, so it is the operator writing too.
+const V22_STACK_WRITE_TUPLES: &[&str] = &[
+    "stack submit",
+    "stack sync",
+    "stack link",
+    "stack unstack",
+    "stack delete",
+    "stack checkout",
+    "stack push",
+];
+/// Refusal for a `gh stack` subcommand that would write as the operator.
+/// `{command}` is replaced with the command, such as `stack submit`.
+const STACK_WRITE_REFUSAL_TEXT: &str = r#"`{command}` is refused: the gh-stack extension writes to GitHub with the operator's login, not the bot's. To do it as the bot: push the branch with git, open each pull request with `gh pr create --base <parent branch>`, then create the stack with `gh api -X POST repos/<owner>/<repo>/stacks --input <file>`, where the file holds `{"pull_requests": [...]}`. Add to a stack with `.../stacks/<number>/add` and dissolve it with `.../stacks/<number>/unstack`. To run it as the operator instead, re-run with GH_SHIM_BYPASS=operator; the shim records that in its audit log."#;
+/// The stack REST endpoints admitted as bot speech, and the asynchronous merge
+/// endpoint kept as operator administration like `pr merge`.
+const STACK_CREATE_PATH_GLOB: &str = "/repos/*/*/stacks";
+const STACK_ADD_PATH_GLOB: &str = "/repos/*/*/stacks/*/add";
+const STACK_UNSTACK_PATH_GLOB: &str = "/repos/*/*/stacks/*/unstack";
+const STACK_WRITE_METHOD: &str = "POST";
+const MERGE_ASYNC_PATH_GLOB: &str = "/repos/*/*/pulls/*/merge-async";
+const MERGE_ASYNC_METHOD: &str = "PUT";
+/// Governed tuples for the GraphQL review-thread mutations. `gh api graphql`
+/// has no subcommand to name them by, so the tuple is `graphql` plus the
+/// mutation name, lower-cased like every manifest tuple.
+const REVIEW_THREAD_RESOLVE_TUPLE: &str = "graphql resolvereviewthread";
+const REVIEW_THREAD_UNRESOLVE_TUPLE: &str = "graphql unresolvereviewthread";
+/// The argv form of the review-thread mutations: one inline GraphQL mutation
+/// document whose only input is the thread's node id.
+const GRAPHQL_MUTATION_FORM: &str = "graphql-mutation";
+/// The REST reply to a pull request review comment, which posts into that
+/// comment's review thread.
+const REVIEW_REPLY_PATH_GLOB: &str = "/repos/*/*/pulls/*/comments/*/replies";
+const REVIEW_REPLY_METHOD: &str = "POST";
+/// The REST edit of a pull request. Through the shim it carries only a title
+/// and a body and is routed as `pr edit`, so it has the same own-pull-request
+/// author check. Changing the base branch is refused: it changes what the pull
+/// request merges into, which is not speech.
+const PULL_EDIT_PATH_GLOB: &str = "/repos/*/*/pulls/*";
+const PULL_EDIT_METHOD: &str = "PATCH";
+/// The body fields a governed `pr edit` may carry, in manifest order.
+const PR_EDIT_BODY_FIELDS: &[&str] = &["title", "body"];
+/// `gh pr edit` flags that change labels. They have their own operator row
+/// (`GH_SHIM_BYPASS=operator`, labels and nothing else), so the governed
+/// route refuses them by name rather than as unknown flags.
+const PR_EDIT_LABEL_FLAGS: &[&str] = &["--add-label", "--remove-label"];
+/// Refusal for a governed `pr edit` that also changes labels.
+const PR_EDIT_LABEL_REFUSAL_TEXT: &str = r#"`pr edit` as the bot changes only the title and body of a pull request the bot opened. Label changes run as the operator: re-run with GH_SHIM_BYPASS=operator (labels only)."#;
+/// Refusal for any other `gh pr edit` flag on the governed route. `{flag}` is
+/// replaced with the refused flag as the caller spelled it.
+const PR_EDIT_FLAG_REFUSAL_TEXT: &str = r#"`{flag}`: `pr edit` as the bot accepts only --title/-t, --body/-b, --body-file/-F and --repo."#;
 /// The body fields the `pr create` reader produces, in the order the manifest
 /// declares them. The reader is purpose-built for this list, so a signed
 /// declaration naming any other list is refused rather than half-honoured.
@@ -160,6 +254,9 @@ const PR_CREATE_UNSUPPORTED_FLAGS: &[&str] = &[
 // is refused on this path, and without the bypass `issue edit` stays on the
 // governed own-issue route.
 const V14_OPERATOR_LABEL_TUPLES: &[&str] = &["issue edit"];
+// v22 declares `pr edit` governed, so its label-only operator row moves from
+// the admin tier to this governed-tuple bypass, exactly like `issue edit`.
+const V22_OPERATOR_LABEL_TUPLES: &[&str] = &["pr edit"];
 // v14 extends the same operator row to two verbs that have no bot-speech route
 // at all. Maintainers gating design work put labels such as `design-approved`
 // on issues and `trivial` on pull requests, and create those labels when a
@@ -439,6 +536,11 @@ const REPO_VALUE_FLAGS: &[&str] = &[
 const RESERVED_SELF_REPORT: &[&str] = &["--status", "--shim-version"];
 const CO_AUTHOR_LINE_REPORT: &str = "--co-author-line";
 const GOVERNANCE_UNAVAILABLE_TEXT: &str = "the governance daemon is unreachable and this repository's actions are identity-governed; retry after the daemon returns";
+/// Refusal text for a write-class command from a worker shell. A worker shell
+/// carries a read broker, never a write ticket, so no write can ever be
+/// spoken from it: the text names the permanent condition and tells the agent
+/// where to take the write instead of suggesting a retry.
+const WORKER_WRITE_REFUSED_TEXT: &str = crate::gh_shim_speech::WORKER_WRITE_REFUSED;
 /// Human-readable text for a local discovery-probe deadline expiry. A deadline
 /// that expires on a loaded host does not mean the daemon is unreachable, so
 /// this arm must not say "unreachable". The classification stays
@@ -458,10 +560,12 @@ const GH_SHIM_STATE_DIR_ENV: &str = "AFT_GH_SHIM_STATE_DIR";
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RefusalCode {
     WorkerNativeGh,
+    WorkerWriteRefused,
     Unclassified,
     AdminTier,
     ManifestBelowFloor,
     ManifestRegressed,
+    ManifestUnavailable,
     SeamSchemaMismatch,
     UnboundIdentity,
     BypassAuditUnavailable,
@@ -480,12 +584,14 @@ pub enum RefusalCode {
 }
 
 impl RefusalCode {
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 22] = [
         Self::WorkerNativeGh,
+        Self::WorkerWriteRefused,
         Self::Unclassified,
         Self::AdminTier,
         Self::ManifestBelowFloor,
         Self::ManifestRegressed,
+        Self::ManifestUnavailable,
         Self::SeamSchemaMismatch,
         Self::UnboundIdentity,
         Self::BypassAuditUnavailable,
@@ -506,10 +612,12 @@ impl RefusalCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::WorkerNativeGh => "gh_shim_worker_native_gh",
+            Self::WorkerWriteRefused => crate::gh_shim_speech::WORKER_WRITE_CODE,
             Self::Unclassified => "gh_shim_unclassified",
             Self::AdminTier => "gh_shim_admin_tier",
             Self::ManifestBelowFloor => "gh_shim_manifest_below_floor",
             Self::ManifestRegressed => "gh_shim_manifest_regressed",
+            Self::ManifestUnavailable => "gh_shim_manifest_unavailable",
             Self::SeamSchemaMismatch => "gh_shim_seam_schema_mismatch",
             Self::UnboundIdentity => "gh_shim_unbound_identity",
             Self::BypassAuditUnavailable => "gh_shim_bypass_audit_unavailable",
@@ -644,7 +752,7 @@ fn run(args: &[OsString]) -> i32 {
 
 fn run_with(
     args: &[OsString],
-    mut delegate: impl FnMut(&[OsString]) -> i32,
+    mut native_delegate: impl FnMut(&[OsString]) -> i32,
     mut read_identity: impl FnMut(
         &[OsString],
         &Manifest,
@@ -653,6 +761,10 @@ fn run_with(
     ) -> Result<Option<bool>, String>,
 ) -> i32 {
     let paths = StatePaths::from_process();
+    // The manifest can disappear after authority and audit checks finish.
+    // Recheck it before calling upstream gh, including audited operator writes.
+    let mut delegate =
+        |args: &[OsString]| delegate_with_manifest_guard(args, &paths, &mut native_delegate);
     if args.first().and_then(|arg| arg.to_str()) == Some(CO_AUTHOR_LINE_REPORT) {
         if let Some(line) = co_author_line(&paths) {
             println!("{line}");
@@ -662,6 +774,16 @@ fn run_with(
     if is_reserved_self_report(args) {
         print_self_report(&paths);
         return 0;
+    }
+    if crate::environment::non_empty_var(crate::gh_shim_speech::start_view::WORKER_POLICY_ENV)
+        .as_deref()
+        == Some("1")
+        && speech_protected_without_view(args)
+    {
+        return refuse(
+            RefusalCode::WorkerWriteRefused,
+            crate::gh_shim_speech::WORKER_WRITE_REFUSED,
+        );
     }
 
     let now = unix_seconds();
@@ -691,6 +813,36 @@ fn run_with(
         );
     }
 
+    // A worker shell carries a read broker, never a write ticket, so no
+    // write-class command can be spoken from it. Refuse here, before the
+    // manifest lookup, the rung probe for governance reachability, and any
+    // relay traffic, with an instruction instead of a retry hint: retrying
+    // cannot help, and the old governance-unavailable text sent agents back
+    // to retry forever. Credential commands (`gh auth token`, token-revealing
+    // status flags, login/logout and friends) are not writes: they are
+    // excluded here so they keep their existing operator-credentials refusal
+    // below. Reads (`is_unbound_safe`) fall through to the governed-read path
+    // unchanged.
+    if relay_client::RelayContext::from_process()
+        .worker_broker
+        .is_some()
+        && operator_credential_use(args).is_none()
+        && !is_unbound_safe(args)
+    {
+        return refuse(RefusalCode::WorkerWriteRefused, WORKER_WRITE_REFUSED_TEXT);
+    }
+    // Explicit operator administration keeps its audited path; worker writes
+    // have already been refused above, regardless of the bypass request.
+    if !operator_bypass_requested() && crate::gh_shim_speech::start_view::protected(args) {
+        return run_captured_protected(
+            args,
+            &paths,
+            &TargetRepository::from_invocation(args),
+            &cwd,
+            now,
+        );
+    }
+
     // Presence-based regressed-manifest arm. Decide from the installed artifact
     // BEFORE any rung probe so a governed refusal never depends on daemon
     // reachability: a validation failure after a prior valid manifest makes
@@ -716,13 +868,19 @@ fn run_with(
     }
 
     let target = TargetRepository::from_invocation(args);
+    // Probing can publish captured context after the initial check. Recheck at
+    // every later passthrough boundary without changing unprovisioned fallback.
+    let captured_now = || {
+        (!operator_bypass_requested() && crate::gh_shim_speech::start_view::protected(args))
+            .then(|| run_captured_protected(args, &paths, &target, &cwd, now))
+    };
     // A write aimed at a repository no signed binding covers cannot be spoken
     // by any bot, and upstream `gh` would run it under the operator's own
     // login. Decide that before the rung probe: the answer does not depend on
     // the governance daemon, and a bound target falls through to the governed
-    // path below unchanged. Without a signed manifest (a public installation,
-    // or one that never verified) there are no bindings to compare against,
-    // so those keep passing through as before.
+    // path below unchanged. Without a signed manifest there are no bindings to
+    // compare against; the fallback below separately checks whether this machine
+    // was previously provisioned before allowing upstream execution.
     if let ManifestResolution::Active(manifest) = &initial_manifest {
         if let Some(status) =
             worker_reads::dispatch(args, manifest, &cwd, &paths, &mut read_identity)
@@ -761,9 +919,28 @@ fn run_with(
                 &manifest,
                 current_platform(),
             ),
-            ManifestResolution::Regressed { .. }
-            | ManifestResolution::Invalid(_)
-            | ManifestResolution::Dormant => GovernanceDisposition::Delegate,
+            ManifestResolution::Regressed { manifest, problem } => {
+                if let Some(status) = captured_now() {
+                    return status;
+                }
+                return match regressed_disposition(args, &manifest, current_platform(), &problem) {
+                    RegressedDisposition::Passthrough => {
+                        delegate_after_invalid_manifest_notice(args, &problem, delegate)
+                    }
+                    RegressedDisposition::Refuse { code, text } => refuse(code, &text),
+                };
+            }
+            ManifestResolution::Invalid(_) | ManifestResolution::Dormant => {
+                if let Some(status) = captured_now() {
+                    return status;
+                }
+                return dispatch_without_valid_manifest(
+                    args,
+                    &paths,
+                    invalid_manifest_problem.as_ref(),
+                    delegate,
+                );
+            }
         };
         return match disposition {
             GovernanceDisposition::Unavailable(agent_binding) => {
@@ -782,6 +959,9 @@ fn run_with(
                 "destructive GitHub operations are not available through the shim",
             ),
             GovernanceDisposition::Delegate | GovernanceDisposition::Ready => {
+                if let Some(status) = captured_now() {
+                    return status;
+                }
                 match invalid_manifest_problem.as_ref() {
                     Some(problem) => {
                         delegate_after_invalid_manifest_notice(args, problem, delegate)
@@ -794,27 +974,44 @@ fn run_with(
 
     // A valid manifest gates R3 both during fresh discovery and when a cached
     // R3 determination is reused. If it disappears or fails validation between
-    // those two moments, the whole invocation falls back to R2 passthrough
-    // instead of a classification-shaped refusal.
+    // those two moments, use the same unavailable-manifest gate as below R3.
     let manifest = match resolve_manifest(&paths, now) {
         ManifestResolution::Active(manifest) => manifest,
         ManifestResolution::Regressed { manifest, problem } => {
+            if let Some(status) = captured_now() {
+                return status;
+            }
             return match regressed_disposition(args, &manifest, current_platform(), &problem) {
                 RegressedDisposition::Passthrough => {
                     delegate_after_invalid_manifest_notice(args, &problem, delegate)
                 }
                 RegressedDisposition::Refuse { code, text } => refuse(code, &text),
-            }
+            };
         }
         ManifestResolution::Invalid(problem) => {
-            return delegate_after_invalid_manifest_notice(args, &problem, delegate)
+            if let Some(status) = captured_now() {
+                return status;
+            }
+            return dispatch_without_valid_manifest(args, &paths, Some(&problem), delegate);
         }
-        ManifestResolution::Dormant => return delegate(args),
+        ManifestResolution::Dormant => {
+            if let Some(status) = captured_now() {
+                return status;
+            }
+            return dispatch_without_valid_manifest(args, &paths, None, delegate);
+        }
     };
     let classification = classify(args, &manifest, current_platform());
     let Some(agent_binding) = governing_binding(&classification, &manifest, &target, &cwd) else {
+        if let Some(status) = captured_now() {
+            return status;
+        }
         return delegate(args);
     };
+
+    if let Some(status) = captured_now() {
+        return status;
+    }
 
     dispatch_r3(
         args,
@@ -928,7 +1125,7 @@ where
                     delegate_to_upstream,
                 )
             } else {
-                refuse(RefusalCode::AdminTier, &admin_refusal_text(&tuple))
+                refuse(RefusalCode::AdminTier, &admin_tier_refusal_text(&tuple))
             }
         }
         Classification::Governed { tuple, canonical } => {
@@ -938,10 +1135,15 @@ where
             if operator_bypass_requested()
                 && is_reviewed_operator_label_tuple(manifest.manifest_version, &tuple)
             {
+                let target = if tuple == "pr edit" {
+                    LabelTarget::PullRequest
+                } else {
+                    LabelTarget::Issue
+                };
                 return dispatch_operator_label_edit(
                     args,
                     &tuple,
-                    LabelTarget::Issue,
+                    target,
                     paths,
                     now,
                     delegate_to_upstream,
@@ -1106,6 +1308,16 @@ where
         );
     }
     delegate_to_upstream(args)
+}
+
+/// Refusal text for an administration-tier verb reached without the operator
+/// bypass: the `gh stack` writes explain why the extension cannot speak as the
+/// bot and name the route that can; every other verb gets the generic text.
+fn admin_tier_refusal_text(tuple: &str) -> String {
+    if V22_STACK_WRITE_TUPLES.contains(&tuple) {
+        return STACK_WRITE_REFUSAL_TEXT.replace("{command}", tuple);
+    }
+    admin_refusal_text(tuple)
 }
 
 /// Refusal text for an administration-tier verb reached without the operator
@@ -1885,7 +2097,10 @@ struct GraphqlDocumentShape {
 /// Parser recovery trees cannot authorize reads. GitHub still validates fields
 /// against its schema; only queries and fragments may cross this boundary.
 fn graphql_document_shape(document: &str) -> GraphqlDocumentShape {
-    use apollo_parser::{cst::Definition, Parser};
+    use apollo_parser::{
+        cst::{CstNode, Definition},
+        Parser,
+    };
 
     let parsed = Parser::new(document).parse();
     if parsed.errors().next().is_some() {
@@ -1911,6 +2126,24 @@ fn graphql_document_shape(document: &str) -> GraphqlDocumentShape {
         }
     }
     shape.read_only &= has_operation;
+    // The review-thread mutations are admitted only as their own governed
+    // documents. A read-only document that names either field anywhere (in a
+    // fragment, behind an alias) is not passed through as an operator read:
+    // GitHub would reject it, and refusing it keeps the one admitted shape of
+    // these mutations unambiguous.
+    shape.read_only &= !parsed
+        .document()
+        .syntax()
+        .descendants()
+        .filter_map(apollo_parser::cst::Field::cast)
+        .any(|field| {
+            field.name().is_some_and(|name| {
+                matches!(
+                    name.text().as_str(),
+                    "resolveReviewThread" | "unresolveReviewThread"
+                )
+            })
+        });
     shape
 }
 
@@ -1923,7 +2156,12 @@ fn write_target(args: &[OsString], target: &TargetRepository, cwd: &Path) -> Wri
             // `{owner}/{repo}` placeholders are filled by upstream `gh` from
             // `GH_REPO` or the origin, so those endpoints resolve below.
             if let Some(shape) = api_request_shape(&args[head_index..]) {
-                if !shape.path.starts_with("/repos/") {
+                // A review-thread mutation names its thread by node id, so
+                // its repository comes from `GH_REPO` or the origin below,
+                // like an endpoint written with `{owner}/{repo}`.
+                let review_thread =
+                    shape.path == "/graphql" && review_thread_mutation(args).is_ok();
+                if !shape.path.starts_with("/repos/") && !review_thread {
                     return WriteTarget::NotARepository {
                         description: format!(
                             "calls {}, an endpoint outside /repos/<owner>/<repo>",
@@ -2059,7 +2297,8 @@ fn governed_outcome_status(
             eprint!("{output}");
             0
         }
-        RouteOutcome::StateAppliedCommentFailed(output) => {
+        RouteOutcome::StateAppliedCommentFailed(output)
+        | RouteOutcome::PartiallyApplied(output) => {
             print!("{output}");
             UPSTREAM_FAILURE_EXIT_STATUS
         }
@@ -2089,6 +2328,10 @@ fn governed_outcome_status(
         }
         RouteOutcome::Unavailable(message) => refuse(RefusalCode::SeamUnavailable, &message),
         RouteOutcome::NoAgentSession => refuse(RefusalCode::UnboundIdentity, NO_AGENT_SESSION_TEXT),
+        RouteOutcome::WorkerWriteRefused => refuse(
+            RefusalCode::WorkerWriteRefused,
+            crate::gh_shim_speech::WORKER_WRITE_REFUSED,
+        ),
         RouteOutcome::RelayRefusal { text, .. } => refuse(RefusalCode::SeamRefusal, &text),
         RouteOutcome::OutcomeUndetermined(text) => {
             refuse_outcome_unknown_with_text(paths, agent_binding, now, &text)
@@ -4007,7 +4250,7 @@ fn load_manifest_with_trust_set(
     if manifest.manifest_version > newest_accepted {
         write_version_high_water(paths, manifest.manifest_version);
     }
-    write_last_valid_manifest(paths, &manifest);
+    write_last_valid_manifest(paths, &manifest, &bytes);
     // Retain the exact verified bytes for later reproducibility checks. The
     // signature already verified above; the admission filter re-checks that the
     // version inside the verified payload matches the filing name. This never
@@ -4228,14 +4471,88 @@ fn resolve_manifest(paths: &StatePaths, now: u64) -> ManifestResolution {
     }
 }
 
+fn manifest_state_was_provisioned(root: &Path) -> bool {
+    [
+        "last-valid-manifest.json",
+        "manifest-version-high-water.json",
+    ]
+    .iter()
+    .any(|name| match fs::symlink_metadata(root.join(name)) {
+        Ok(_) => true,
+        // An unreadable record cannot establish that this is a public,
+        // never-provisioned installation. Only absence permits that fallback.
+        Err(error) => error.kind() != io::ErrorKind::NotFound,
+    })
+}
+
+fn dispatch_without_valid_manifest(
+    args: &[OsString],
+    paths: &StatePaths,
+    problem: Option<&ManifestProblem>,
+    delegate: impl FnOnce(&[OsString]) -> i32,
+) -> i32 {
+    if let Some(status) = unavailable_manifest_refusal(args, paths) {
+        return status;
+    }
+    match problem {
+        Some(problem) => delegate_after_invalid_manifest_notice(args, problem, delegate),
+        None => delegate(args),
+    }
+}
+
+fn unavailable_manifest_refusal(args: &[OsString], paths: &StatePaths) -> Option<i32> {
+    // The agent may select an empty override. Check the default location too,
+    // without constructing StatePaths there: that constructor tightens permissions.
+    let default_root = gh_shim_state_dir_from(
+        None,
+        crate::environment::non_empty_os_var("XDG_STATE_HOME").as_deref(),
+        crate::environment::non_empty_os_var("HOME").as_deref(),
+    );
+    if (manifest_state_was_provisioned(&paths.root)
+        || manifest_state_was_provisioned(&default_root))
+        && !is_unbound_safe(args)
+    {
+        return Some(refuse(
+            RefusalCode::ManifestUnavailable,
+            "GitHub writes are refused because this machine's signed routing manifest is missing or invalid; without it the write would run as the operator's own account. Ask the operator to repair the manifest. Reads still work.",
+        ));
+    }
+    None
+}
+
+fn delegate_with_manifest_guard(
+    args: &[OsString],
+    paths: &StatePaths,
+    delegate: impl FnOnce(&[OsString]) -> i32,
+) -> i32 {
+    if !is_unbound_safe(args) {
+        match resolve_manifest(paths, unix_seconds()) {
+            ManifestResolution::Invalid(_) | ManifestResolution::Dormant => {
+                if let Some(status) = unavailable_manifest_refusal(args, paths) {
+                    return status;
+                }
+            }
+            ManifestResolution::Regressed { manifest, problem } => {
+                if let RegressedDisposition::Refuse { code, text } =
+                    regressed_disposition(args, &manifest, current_platform(), &problem)
+                {
+                    return refuse(code, &text);
+                }
+            }
+            ManifestResolution::Active(_) => {}
+        }
+    }
+    delegate(args)
+}
+
 fn delegate_after_invalid_manifest_notice(
     args: &[OsString],
     problem: &ManifestProblem,
     delegate: impl FnOnce(&[OsString]) -> i32,
 ) -> i32 {
-    // Missing manifests identify public installations and must remain silent.
-    // An installed but invalid manifest instead signals a misconfigured
-    // governed seat, so say which ambient identity will execute the fallback.
+    // An invalid artifact gets a notice on permitted fallback, explaining which
+    // ambient identity upstream gh will use. Missing-manifest passthrough stays
+    // silent only when the unavailable-manifest gate permits it.
     eprintln!(
         "gh-shim: manifest invalid ({}); executing with ambient gh credentials",
         problem.fallback_notice_reason().replace(['\n', '\r'], " ")
@@ -4298,15 +4615,18 @@ enum RegressedDisposition {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct LastValidManifest {
     manifest: Manifest,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    signed_envelope: Vec<u8>,
 }
 
 fn read_last_valid_manifest(paths: &StatePaths) -> Option<LastValidManifest> {
     serde_json::from_slice(&fs::read(&paths.last_valid_manifest).ok()?).ok()
 }
 
-fn write_last_valid_manifest(paths: &StatePaths, manifest: &Manifest) {
+fn write_last_valid_manifest(paths: &StatePaths, manifest: &Manifest, signed_envelope: &[u8]) {
     let record = LastValidManifest {
         manifest: manifest.clone(),
+        signed_envelope: signed_envelope.to_vec(),
     };
     let Ok(bytes) = serde_json::to_vec(&record) else {
         return;
@@ -4480,6 +4800,8 @@ fn is_reviewed_admin_tuple(manifest_version: u64, tuple: &str) -> bool {
         || (manifest_version >= 13 && V13_ADMIN_TUPLES.contains(&tuple))
         || (manifest_version >= 15 && V15_ADMIN_TUPLES.contains(&tuple))
         || (manifest_version >= 19 && V19_ADMIN_TUPLES.contains(&tuple))
+        || (manifest_version >= 22
+            && (V22_ADMIN_TUPLES.contains(&tuple) || V22_STACK_WRITE_TUPLES.contains(&tuple)))
 }
 
 fn is_reviewed_governed_tuple(manifest_version: u64, tuple: &str) -> bool {
@@ -4488,12 +4810,14 @@ fn is_reviewed_governed_tuple(manifest_version: u64, tuple: &str) -> bool {
         || (manifest_version >= 14 && V14_GOVERNED_TUPLES.contains(&tuple))
         || (manifest_version >= 16 && V16_GOVERNED_TUPLES.contains(&tuple))
         || (manifest_version >= 19 && V19_GOVERNED_TUPLES.contains(&tuple))
+        || (manifest_version >= 22 && V22_GOVERNED_TUPLES.contains(&tuple))
 }
 
 /// True for a governed tuple whose label-only form the operator bypass may run
 /// upstream. Only reached for a tuple the manifest already declares governed.
 fn is_reviewed_operator_label_tuple(manifest_version: u64, tuple: &str) -> bool {
-    manifest_version >= 14 && V14_OPERATOR_LABEL_TUPLES.contains(&tuple)
+    (manifest_version >= 14 && V14_OPERATOR_LABEL_TUPLES.contains(&tuple))
+        || (manifest_version >= 22 && V22_OPERATOR_LABEL_TUPLES.contains(&tuple))
 }
 
 /// True for an admin-tier tuple that runs only in its operator row's narrow
@@ -4503,13 +4827,57 @@ fn is_reviewed_operator_row_admin_tuple(manifest_version: u64, tuple: &str) -> b
     manifest_version >= 14 && V14_OPERATOR_ROW_ADMIN_TUPLES.contains(&tuple)
 }
 
-/// True for the one API rule that may be governed rather than admin: the v14
-/// own-comment PATCH. Every other governed API rule stays undeclared, so a
-/// signed rule alone cannot widen raw API writes into bot speech.
+/// True for the API rules that may be governed rather than admin: the v14
+/// own-comment PATCH, and from v22 the review-comment reply POST, the pull
+/// request PATCH (title and body), and the three stack writes. Every other
+/// governed API rule stays undeclared, so a signed rule alone cannot widen raw
+/// API writes into bot speech.
 fn is_reviewed_governed_api_rule(manifest_version: u64, rule: &ApiRule) -> bool {
-    manifest_version >= 14
-        && rule.method.eq_ignore_ascii_case(OWN_COMMENT_PATCH_METHOD)
-        && rule.path_glob == OWN_COMMENT_PATCH_PATH_GLOB
+    let is = |method: &str, glob: &str| {
+        rule.method.eq_ignore_ascii_case(method) && rule.path_glob == glob
+    };
+    (manifest_version >= 14 && is(OWN_COMMENT_PATCH_METHOD, OWN_COMMENT_PATCH_PATH_GLOB))
+        || (manifest_version >= 22
+            && (is(REVIEW_REPLY_METHOD, REVIEW_REPLY_PATH_GLOB)
+                || is(PULL_EDIT_METHOD, PULL_EDIT_PATH_GLOB)
+                || is(STACK_WRITE_METHOD, STACK_CREATE_PATH_GLOB)
+                || is(STACK_WRITE_METHOD, STACK_ADD_PATH_GLOB)
+                || is(STACK_WRITE_METHOD, STACK_UNSTACK_PATH_GLOB)))
+}
+
+/// The fixed canonicalization of a reviewed governed API rule. API rules carry
+/// none of their own (manifest canonicalization keys name argv tuples), so the
+/// shape is fixed here, next to the reader that produces it.
+fn governed_api_canonicalization(rule: &ApiRule) -> Canonicalization {
+    let strings = |values: &[&str]| values.iter().map(|value| value.to_string()).collect();
+    match rule.path_glob.as_str() {
+        REVIEW_REPLY_PATH_GLOB => Canonicalization {
+            argv_forms: strings(&[BODY_ONLY_FORM]),
+            target_fields: strings(&["number", "comment_id"]),
+            body_fields: strings(&["body"]),
+        },
+        PULL_EDIT_PATH_GLOB => Canonicalization {
+            argv_forms: strings(&["target-and-fields"]),
+            target_fields: strings(&["number"]),
+            body_fields: strings(PR_EDIT_BODY_FIELDS),
+        },
+        STACK_CREATE_PATH_GLOB => Canonicalization {
+            argv_forms: strings(&[FIELDS_ONLY_FORM]),
+            target_fields: Vec::new(),
+            body_fields: strings(&["pull_requests"]),
+        },
+        STACK_ADD_PATH_GLOB => Canonicalization {
+            argv_forms: strings(&["target-and-fields"]),
+            target_fields: strings(&["stack_number"]),
+            body_fields: strings(&["pull_requests"]),
+        },
+        STACK_UNSTACK_PATH_GLOB => Canonicalization {
+            argv_forms: strings(&["target-only"]),
+            target_fields: strings(&["stack_number"]),
+            body_fields: Vec::new(),
+        },
+        _ => own_comment_patch_canonicalization(),
+    }
 }
 
 /// The own-comment PATCH is declared by an API rule, which carries no
@@ -4645,18 +5013,23 @@ fn command_head(args: &[OsString]) -> Option<(String, Option<String>, usize)> {
 }
 
 fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Classification {
-    let Some((method, path, has_fields)) = api_method_and_path(args) else {
+    let Some(shape) = api_request_shape(args) else {
         return Classification::Unclassified;
     };
+    // The method upstream `gh` sends: a field or `--input` payload without a
+    // named method is a POST, which is how a review reply is usually written.
+    // Before v22 no POST rule exists, so an implicit POST stays undeclared
+    // exactly as it did when it was read as a GET with fields.
+    let method = shape.effective_method();
+    let (path, has_fields) = (shape.path, shape.has_fields);
     if path == "/graphql" {
         // Like a field-free REST GET, an inspected GraphQL read delegates to
         // the real gh unchanged under the operator's existing login. It never
         // mints an assertion or routes through the governed-write relay.
-        return if graphql_query_is_read_only(args) {
-            Classification::Mechanical
-        } else {
-            Classification::Unclassified
-        };
+        if graphql_query_is_read_only(args) {
+            return Classification::Mechanical;
+        }
+        return classify_review_thread_mutation(args, manifest, platform);
     }
     let matches = manifest
         .api_rules
@@ -4682,19 +5055,26 @@ fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Class
         {
             return Classification::Unclassified;
         }
+        // The asynchronous merge is `pr merge` by another endpoint, reviewed as
+        // operator administration from v22 and for PUT only.
+        if rule.path_glob == MERGE_ASYNC_PATH_GLOB
+            && (manifest.manifest_version < 22 || method != MERGE_ASYNC_METHOD)
+        {
+            return Classification::Unclassified;
+        }
         return Classification::Admin {
             tuple: api_tuple(rule),
         };
     }
-    // The own-comment PATCH is the one API write admitted as bot speech. It
-    // crosses the field wall below because the shim parses its payload itself
-    // and forwards only the single body field it recognized, rather than
+    // The reviewed governed API rules are the only API writes admitted as bot
+    // speech. They cross the field wall below because the shim parses their
+    // payload itself and forwards only the fields it recognized, rather than
     // handing the holder bytes it never read.
     if rule.tier == Tier::Governed && is_reviewed_governed_api_rule(manifest.manifest_version, rule)
     {
         return Classification::Governed {
             tuple: api_tuple(rule),
-            canonical: own_comment_patch_canonicalization(),
+            canonical: governed_api_canonicalization(rule),
         };
     }
     // Field payloads change request semantics independently of the endpoint.
@@ -4724,6 +5104,29 @@ fn api_rule_matches_path(rule: &ApiRule, path: &str) -> bool {
         let segments = path.split('/').collect::<Vec<_>>();
         return matches!(segments.as_slice(), ["", "repos", owner, repo, "private-vulnerability-reporting"]
             if !owner.is_empty() && !repo.is_empty());
+    }
+    if matches!(
+        rule.path_glob.as_str(),
+        REVIEW_REPLY_PATH_GLOB
+            | PULL_EDIT_PATH_GLOB
+            | STACK_CREATE_PATH_GLOB
+            | STACK_ADD_PATH_GLOB
+            | STACK_UNSTACK_PATH_GLOB
+            | MERGE_ASYNC_PATH_GLOB
+    ) {
+        // The same reason: `/repos/*/*/pulls/*` must name one pull request,
+        // not every endpoint below it, so each `*` matches one non-empty
+        // path segment.
+        let pattern = rule.path_glob.split('/').collect::<Vec<_>>();
+        let segments = path.split('/').collect::<Vec<_>>();
+        return pattern.len() == segments.len()
+            && pattern.iter().zip(&segments).all(|(expected, actual)| {
+                if *expected == "*" {
+                    !actual.is_empty()
+                } else {
+                    expected == actual
+                }
+            });
     }
     glob::Pattern::new(&rule.path_glob).is_ok_and(|pattern| pattern.matches(path))
 }
@@ -4904,6 +5307,305 @@ struct GovernedRequest {
     manifest_version: u64,
     edit_last: bool,
     author_scope: Option<String>,
+    invocation: Option<crate::gh_shim_speech::invocation::Invocation>,
+}
+
+fn attach_invocation(
+    args: &[OsString],
+    tuple: &str,
+    mut request: GovernedRequest,
+    inputs: BTreeMap<String, String>,
+) -> Result<GovernedRequest, CanonicalizeError> {
+    use crate::gh_shim_speech::{Code, Refusal};
+    let denied = || {
+        CanonicalizeError::typed(
+            RefusalCode::SeamRefusal,
+            Refusal::new(Code::PolicyDenied, "payload_denied").agent_text(),
+        )
+    };
+    let mut frozen_args = args
+        .iter()
+        .map(|value| value.to_str().map(str::to_string).ok_or_else(denied))
+        .collect::<Result<Vec<_>, _>>()?;
+    if !is_api_tuple(tuple) && explicit_repo(args).is_none() {
+        if let Some(repository) = request.repository.as_ref() {
+            frozen_args.push("--repo".into());
+            frozen_args.push(repository.clone());
+        }
+    }
+    let invocation = crate::gh_shim_speech::invocation::Invocation {
+        args: frozen_args,
+        body_inputs: inputs,
+    };
+    invocation
+        .validate()
+        .map_err(|error| CanonicalizeError::typed(RefusalCode::SeamRefusal, error.agent_text()))?;
+    request.invocation = Some(invocation);
+    Ok(request)
+}
+
+pub(crate) fn capture_speech_policy() -> Result<
+    Option<(
+        crate::gh_shim_speech::model::PolicySnapshot,
+        BTreeMap<String, String>,
+        u64,
+    )>,
+    crate::gh_shim_speech::Refusal,
+> {
+    use crate::gh_shim_speech::{Code, Refusal};
+    use sha2::Digest;
+    let paths = StatePaths::from_process();
+    if !paths.manifest.exists()
+        && !paths.last_valid_manifest.exists()
+        && !paths.version_high_water.exists()
+    {
+        return Ok(None);
+    }
+    let high: VersionHighWater = fs::read(&paths.version_high_water)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .filter(|high: &VersionHighWater| high.newest_accepted_version > 0)
+        .ok_or_else(|| Refusal::new(Code::PolicyDenied, "manifest_rollback"))?;
+    let accepted: LastValidManifest = fs::read(&paths.last_valid_manifest)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or_else(|| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
+    let bytes = accepted.signed_envelope;
+    let current = fs::read(&paths.manifest)
+        .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
+    let manifest = verified_speech_manifest(&bytes)
+        .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
+    if manifest.manifest_version != high.newest_accepted_version {
+        return Err(Refusal::new(Code::PolicyDenied, "manifest_rollback"));
+    }
+    if bytes != current
+        || serde_json::to_value(&accepted.manifest).ok() != serde_json::to_value(&manifest).ok()
+    {
+        return Err(Refusal::new(
+            Code::AuthorityUnavailable,
+            "current_manifest_unverifiable",
+        ));
+    }
+    Ok(Some((
+        crate::gh_shim_speech::model::PolicySnapshot {
+            artifact_id: manifest.artifact_id.clone(),
+            version: manifest.manifest_version,
+            digest: sha2::Sha256::digest(&bytes).to_vec(),
+            signed_envelope: bytes,
+        },
+        manifest.bindings,
+        high.newest_accepted_version,
+    )))
+}
+
+fn verified_speech_manifest(bytes: &[u8]) -> Result<Manifest, crate::gh_shim_speech::Refusal> {
+    let invalid = |check| {
+        crate::gh_shim_speech::snapshot_invalid(
+            "gh_shim::verified_speech_manifest",
+            check,
+            json!({"envelope_bytes": bytes.len()}),
+        )
+    };
+    let envelope: SignedManifest =
+        serde_json::from_slice(bytes).map_err(|_| invalid("envelope_json"))?;
+    if envelope.artifact_id != MANIFEST_ARTIFACT_ID {
+        return Err(invalid("artifact_id"));
+    }
+    if envelope.envelope_version != ENVELOPE_VERSION {
+        return Err(invalid("envelope_version"));
+    }
+    let verified = verify_manifest_envelope(&envelope, compiled_manifest_trust_set())
+        .map_err(|_| invalid("envelope_verification"))?;
+    let manifest = verified.manifest;
+    manifest
+        .validate()
+        .map_err(|_| invalid("manifest_validation"))?;
+    if manifest.schema_floor < SCHEMA_FLOOR {
+        return Err(invalid("schema_floor"));
+    }
+    if manifest.issued_at_unix_secs > unix_seconds() + ISSUED_AT_FUTURE_SKEW.as_secs() {
+        return Err(invalid("issued_at_in_future"));
+    }
+    Ok(manifest)
+}
+
+pub(crate) fn speech_start_classification(
+    snapshot: &crate::gh_shim_speech::model::PolicySnapshot,
+    args: &[OsString],
+) -> Result<bool, crate::gh_shim_speech::Refusal> {
+    use sha2::Digest;
+    let manifest = verified_speech_manifest(&snapshot.signed_envelope)?;
+    if snapshot.version != manifest.manifest_version
+        || snapshot.artifact_id != manifest.artifact_id
+        || snapshot.digest.as_slice() != sha2::Sha256::digest(&snapshot.signed_envelope).as_slice()
+    {
+        return Err(crate::gh_shim_speech::Refusal::new(
+            crate::gh_shim_speech::Code::PolicyDenied,
+            "manifest_rollback",
+        ));
+    }
+    Ok(!matches!(
+        classify(args, &manifest, current_platform()),
+        Classification::Mechanical
+    ) || unbound_write(
+        args,
+        &manifest,
+        current_platform(),
+        &TargetRepository::from_invocation(args),
+        &std::env::current_dir().unwrap_or_default(),
+    )
+    .is_some()
+        || operator_credential_use(args).is_some())
+}
+
+fn mutation_semantics(request: &GovernedRequest) -> Value {
+    json!({"action":request.action,"repository":request.repository,"target":request.target,"body":request.body,"edit_last":request.edit_last,"author_scope":request.author_scope})
+}
+
+fn wire_mutation_semantics(request: &Value) -> Option<Value> {
+    let object = request.as_object()?;
+    if object.get("operation").and_then(Value::as_str) != Some(ROUTING_OPERATION)
+        || object.get("gh_route_schema").and_then(Value::as_u64) != Some(1)
+    {
+        return None;
+    }
+    let metadata = object.get("metadata")?.as_object()?;
+    if metadata
+        .keys()
+        .any(|key| !matches!(key.as_str(), "agent_id" | "pid"))
+    {
+        return None;
+    }
+    let action = object
+        .get("action")
+        .or_else(|| object.get("verb"))?
+        .as_str()?;
+    let state = V12_GOVERNED_TUPLES.contains(&action) || action == "pr ready";
+    let allowed = if state {
+        &[
+            "operation",
+            "gh_route_schema",
+            "verb",
+            "repository",
+            "number",
+            "manifest_version",
+            "rung_as_of_unix_secs",
+            "metadata",
+            "undo",
+            "reason",
+            "comment",
+        ][..]
+    } else {
+        &[
+            "operation",
+            "gh_route_schema",
+            "action",
+            "repository",
+            "target",
+            "body",
+            "manifest_version",
+            "rung_as_of_unix_secs",
+            "metadata",
+            "author_scope",
+            "edit_last",
+        ][..]
+    };
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return None;
+    }
+    let edit_last = match object.get("edit_last") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        _ => return None,
+    };
+    let (target, body) = if state {
+        let mut body = Map::new();
+        for field in ["undo", "reason", "comment"] {
+            if let Some(value) = object.get(field) {
+                body.insert(field.into(), value.clone());
+            }
+        }
+        (json!({"number":object.get("number")?}), Value::Object(body))
+    } else {
+        (object.get("target")?.clone(), object.get("body")?.clone())
+    };
+    Some(
+        json!({"action":action,"repository":object.get("repository")?,"target":target,"body":body,"edit_last":edit_last,"author_scope":object.get("author_scope").cloned().unwrap_or(Value::Null)}),
+    )
+}
+
+pub(crate) fn validate_speech_policy(
+    start: &crate::gh_shim_speech::model::PolicySnapshot,
+    current: &crate::gh_shim_speech::model::PolicySnapshot,
+    request: &Value,
+    invocation: &crate::gh_shim_speech::invocation::Invocation,
+) -> Result<(), crate::gh_shim_speech::Refusal> {
+    use crate::gh_shim_speech::{Code, Refusal};
+    use sha2::Digest;
+    invocation.validate()?;
+    let actual = wire_mutation_semantics(request)
+        .ok_or_else(|| Refusal::new(Code::PolicyDenied, "payload_denied"))?;
+    let args: Vec<OsString> = invocation.args.iter().map(OsString::from).collect();
+    let mut previous = None;
+    for snapshot in [start, current] {
+        if snapshot.digest.as_slice() != sha2::Sha256::digest(&snapshot.signed_envelope).as_slice()
+        {
+            return Err(Refusal::new(Code::PolicyDenied, "manifest_rollback"));
+        }
+        let manifest = verified_speech_manifest(&snapshot.signed_envelope)?;
+        if manifest.manifest_version != snapshot.version
+            || manifest.artifact_id != snapshot.artifact_id
+            || current.version < start.version
+        {
+            return Err(Refusal::new(Code::PolicyDenied, "manifest_rollback"));
+        }
+        let Classification::Governed { tuple, canonical } =
+            classify(&args, &manifest, current_platform())
+        else {
+            return Err(Refusal::new(Code::PolicyDenied, "classification_changed"));
+        };
+        if previous.as_ref().is_some_and(|old| old != &tuple) {
+            return Err(Refusal::new(Code::PolicyDenied, "classification_changed"));
+        }
+        previous = Some(tuple.clone());
+        let parsed = crate::gh_shim_speech::invocation::replay(invocation, || {
+            let mut stdin = io::Cursor::new(Vec::<u8>::new());
+            if is_api_tuple(&tuple) {
+                canonicalize_governed_api_from(
+                    &args,
+                    &tuple,
+                    &canonical,
+                    manifest.manifest_version,
+                    &mut stdin,
+                )
+            } else {
+                canonicalize_governed_from(
+                    &args,
+                    &tuple,
+                    &canonical,
+                    manifest.manifest_version,
+                    &mut stdin,
+                )
+            }
+        })?
+        .map_err(|_| Refusal::new(Code::PolicyDenied, "canonicalization_changed"))?;
+        if mutation_semantics(&parsed) != actual {
+            return Err(Refusal::new(Code::PolicyDenied, "canonicalization_changed"));
+        }
+        let repo = parsed
+            .repository
+            .as_deref()
+            .ok_or_else(|| Refusal::new(Code::PolicyDenied, "repository_denied"))?;
+        if manifest.bindings.get(repo).map(String::as_str)
+            != request
+                .get("metadata")
+                .and_then(|v| v.get("agent_id"))
+                .and_then(Value::as_str)
+        {
+            return Err(Refusal::new(Code::IdentityConflict, "binding_changed"));
+        }
+    }
+    Ok(())
 }
 
 /// The normalized GitHub resource changed by a structured governed request.
@@ -4920,9 +5622,10 @@ impl GithubReadMutation {
             "issue comment" | "issue edit" | "issue reaction" | "issue close" | "issue reopen" => {
                 GithubReadResourceKind::Issue
             }
-            "pr comment" | "pr review" | "pr close" | "pr reopen" | "pr ready" => {
+            "pr comment" | "pr review" | "pr close" | "pr reopen" | "pr ready" | "pr edit" => {
                 GithubReadResourceKind::PullRequest
             }
+            action if action == review_reply_tuple() => GithubReadResourceKind::PullRequest,
             _ => return None,
         };
         let normalized_repository = canonical_repository_key(request.repository.as_deref()?)?;
@@ -4949,6 +5652,7 @@ fn invalidate_successful_github_read_mutation_at(
         RouteOutcome::Result(_)
             | RouteOutcome::ResultStderr(_)
             | RouteOutcome::StateAppliedCommentFailed(_)
+            | RouteOutcome::PartiallyApplied(_)
     ) {
         return;
     }
@@ -4975,13 +5679,16 @@ fn canonicalize_governed(
     canonical: &Canonicalization,
     manifest_version: u64,
 ) -> Result<GovernedRequest, CanonicalizeError> {
-    canonicalize_governed_from(
-        args,
-        tuple,
-        canonical,
-        manifest_version,
-        &mut io::stdin().lock(),
-    )
+    let (result, inputs) = crate::gh_shim_speech::invocation::record(|| {
+        canonicalize_governed_from(
+            args,
+            tuple,
+            canonical,
+            manifest_version,
+            &mut io::stdin().lock(),
+        )
+    });
+    attach_invocation(args, tuple, result?, inputs)
 }
 
 fn canonicalize_governed_from<R: Read>(
@@ -5006,6 +5713,18 @@ fn canonicalize_governed_from<R: Read>(
             manifest_version,
             stdin,
         );
+    }
+    if tuple == "pr edit" {
+        return canonicalize_pr_edit_from(
+            args,
+            subcommand_index,
+            canonical,
+            manifest_version,
+            stdin,
+        );
+    }
+    if is_review_thread_tuple(tuple) {
+        return canonicalize_review_thread(args, tuple, canonical, manifest_version);
     }
     let target_and_state = is_target_and_state(canonical);
     let pr_ready = tuple == "pr ready";
@@ -5257,12 +5976,22 @@ fn canonicalize_governed_from<R: Read>(
     let url_repository = positional
         .iter()
         .find_map(|value| thread_url_repository(value));
+    // ... and its own number: the route holder routes on the bare thread
+    // number, so a URL positional contributes its digits, not the URL.
+    // Anything else (a bare number, a non-URL) passes through unchanged.
     let target = canonical
         .target_fields
         .iter()
         .cloned()
         .zip(positional)
-        .map(|(field, value)| (field, Value::String(value)))
+        .map(|(field, value)| {
+            let value = if field == "number" {
+                thread_url_number(&value).unwrap_or(value)
+            } else {
+                value
+            };
+            (field, Value::String(value))
+        })
         .collect::<Map<_, _>>();
     // A global `--repo` may precede the command head, so inspect the original
     // argv before a command-local flag. The shared resolver then falls back
@@ -5298,6 +6027,7 @@ fn canonicalize_governed_from<R: Read>(
         manifest_version,
         edit_last,
         author_scope: (tuple == "issue edit").then(|| "own".to_string()),
+        invocation: None,
     })
 }
 
@@ -5474,6 +6204,7 @@ fn canonicalize_pr_create_from<R: Read>(
         manifest_version,
         edit_last: false,
         author_scope: None,
+        invocation: None,
     })
 }
 
@@ -5531,13 +6262,16 @@ fn canonicalize_governed_api(
     canonical: &Canonicalization,
     manifest_version: u64,
 ) -> Result<GovernedRequest, CanonicalizeError> {
-    canonicalize_governed_api_from(
-        args,
-        tuple,
-        canonical,
-        manifest_version,
-        &mut io::stdin().lock(),
-    )
+    let (result, inputs) = crate::gh_shim_speech::invocation::record(|| {
+        canonicalize_governed_api_from(
+            args,
+            tuple,
+            canonical,
+            manifest_version,
+            &mut io::stdin().lock(),
+        )
+    });
+    attach_invocation(args, tuple, result?, inputs)
 }
 
 fn canonicalize_governed_api_from<R: Read>(
@@ -5547,6 +6281,9 @@ fn canonicalize_governed_api_from<R: Read>(
     manifest_version: u64,
     stdin: &mut R,
 ) -> Result<GovernedRequest, CanonicalizeError> {
+    if let Some(request) = canonicalize_v22_api_from(args, tuple, manifest_version, stdin) {
+        return request;
+    }
     let target_field = canonical
         .target_fields
         .first()
@@ -5576,6 +6313,7 @@ fn canonicalize_governed_api_from<R: Read>(
         manifest_version,
         edit_last: false,
         author_scope: Some("own".to_string()),
+        invocation: None,
     })
 }
 
@@ -5605,127 +6343,16 @@ fn own_comment_patch_payload<R: Read>(
     body_field: &str,
     stdin: &mut R,
 ) -> Result<String, CanonicalizeError> {
-    let mut body = None;
-    let mut index = 1;
-    while index < args.len() {
-        let value = args[index].to_str().ok_or_else(|| {
-            CanonicalizeError::unclassified("non-UTF-8 governed arguments are undeclared")
-        })?;
-        // The method and the endpoint were both matched against the declared
-        // rule during classification, so they are skipped rather than reparsed.
-        if matches!(value, "--method" | "-X") {
-            index += 2;
-            continue;
-        }
-        if value.starts_with("--method=") {
-            index += 1;
-            continue;
-        }
-        let (supplied, consumed) = match api_payload_argument(value, args.get(index + 1))? {
-            Some(found) => found,
-            None => {
-                if value.starts_with('-') {
-                    return Err(CanonicalizeError::unclassified(format!(
-                        "undeclared flag {value}"
-                    )));
-                }
-                index += 1;
-                continue;
-            }
-        };
-        let text = match supplied {
-            ApiPayload::Field(text) => text,
-            ApiPayload::Document(source) => {
-                let document = read_body_file_from(Path::new(&source), stdin)
-                    .map_err(CanonicalizeError::unclassified)?;
-                json_body_only(&document, body_field)?
-            }
-        };
-        if body.replace(text).is_some() {
-            return Err(CanonicalizeError::unclassified(format!(
-                "the governed comment PATCH admits one {body_field} payload"
-            )));
-        }
-        index += consumed;
-    }
-    body.ok_or_else(|| {
-        CanonicalizeError::unclassified(format!(
-            "the governed comment PATCH requires a {body_field}"
-        ))
-    })
-}
-
-enum ApiPayload {
-    /// A `body=<text>` field supplied directly on the command line.
-    Field(String),
-    /// A JSON document behind `--input`, where `-` means standard input.
-    Document(String),
-}
-
-fn api_payload_argument(
-    value: &str,
-    next: Option<&OsString>,
-) -> Result<Option<(ApiPayload, usize)>, CanonicalizeError> {
-    let value_of = |flag: &str| -> Result<(String, usize), CanonicalizeError> {
-        next.and_then(|arg| arg.to_str())
-            .map(|supplied| (supplied.to_string(), 2))
-            .ok_or_else(|| CanonicalizeError::unclassified(format!("{flag} requires a value")))
-    };
-    if value == "--input" {
-        let (supplied, consumed) = value_of(value)?;
-        return Ok(Some((ApiPayload::Document(supplied), consumed)));
-    }
-    if let Some(supplied) = value.strip_prefix("--input=") {
-        return Ok(Some((ApiPayload::Document(supplied.to_string()), 1)));
-    }
-    for flag in ["--field", "--raw-field", "-f", "-F"] {
-        let (supplied, consumed) = if value == flag {
-            value_of(flag)?
-        } else if let Some(rest) = value
-            .strip_prefix(&format!("{flag}="))
-            .or_else(|| value.strip_prefix(flag).filter(|_| flag.len() == 2))
-        {
-            (rest.to_string(), 1)
-        } else {
-            continue;
-        };
-        let (name, text) = supplied
-            .split_once('=')
-            .ok_or_else(|| CanonicalizeError::unclassified(format!("{flag} takes name=value")))?;
-        if name != "body" {
-            return Err(CanonicalizeError::unclassified(format!(
-                "{name} is not declared; the governed comment PATCH is body-only"
-            )));
-        }
-        return Ok(Some((ApiPayload::Field(text.to_string()), consumed)));
-    }
-    Ok(None)
-}
-
-/// Read the one declared field out of a JSON payload. A document carrying
-/// anything besides that field is not the declared request, and forwarding it
-/// would mean routing bytes the shim never interpreted.
-fn json_body_only(document: &str, body_field: &str) -> Result<String, CanonicalizeError> {
-    let value: Value = serde_json::from_str(document).map_err(|error| {
-        CanonicalizeError::unclassified(format!("governed PATCH payload is not JSON: {error}"))
-    })?;
-    let object = value.as_object().ok_or_else(|| {
-        CanonicalizeError::unclassified("governed PATCH payload must be a JSON object")
-    })?;
-    let text = object
-        .get(body_field)
-        .and_then(Value::as_str)
+    let mut fields =
+        v22_rows::api_fields_payload(args, &[body_field], "the governed comment PATCH", stdin)?;
+    fields
+        .remove(body_field)
+        .and_then(|value| value.as_str().map(str::to_string))
         .ok_or_else(|| {
             CanonicalizeError::unclassified(format!(
-                "governed PATCH payload needs a string {body_field}"
+                "the governed comment PATCH requires a {body_field}"
             ))
-        })?;
-    if object.len() != 1 {
-        return Err(CanonicalizeError::unclassified(format!(
-            "governed PATCH payload admits only {body_field}"
-        )));
-    }
-    Ok(text.to_string())
+        })
 }
 
 fn declared_body_value<R: Read>(
@@ -5896,6 +6523,9 @@ fn declared_reason_value(
 }
 
 fn read_body_file_from<R: Read>(path: &Path, stdin: &mut R) -> Result<String, String> {
+    if let Some(captured) = crate::gh_shim_speech::invocation::captured(path) {
+        return captured;
+    }
     let mut body = String::new();
     // When the path is '-', upstream gh reads the body from standard input.
     // Do the same here so callers can provide stdin through this shim instead
@@ -5908,6 +6538,7 @@ fn read_body_file_from<R: Read>(path: &Path, stdin: &mut R) -> Result<String, St
         body = fs::read_to_string(path)
             .map_err(|error| format!("could not read body file {}: {error}", path.display()))?;
     }
+    crate::gh_shim_speech::invocation::remember(path, &body)?;
     Ok(body)
 }
 
@@ -6017,10 +6648,11 @@ impl TargetRepository {
     }
 }
 
-/// Canonical `owner/name` of a `https://github.com/<owner>/<repo>/issues/<n>`
-/// or `.../pull/<n>` URL. Trailing path segments, a query, or a fragment
-/// (`#issuecomment-1`) do not change which repository the URL names.
-fn thread_url_repository(value: &str) -> Option<String> {
+/// The repository and thread number named by a
+/// `https://github.com/<owner>/<repo>/issues/<n>` or `.../pull/<n>` URL.
+/// Trailing path segments, a query, or a fragment (`#issuecomment-1`) do not
+/// change which repository or thread the URL names; they are not forwarded.
+fn thread_url_parts(value: &str) -> Option<(String, String)> {
     let path = ["https://github.com/", "http://github.com/"]
         .iter()
         .find_map(|prefix| value.strip_prefix(prefix))?;
@@ -6035,7 +6667,25 @@ fn thread_url_repository(value: &str) -> Option<String> {
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-    canonical_repository_key(&format!("{owner}/{name}"))
+    Some((
+        canonical_repository_key(&format!("{owner}/{name}"))?,
+        digits.to_string(),
+    ))
+}
+
+/// Canonical `owner/name` of a `https://github.com/<owner>/<repo>/issues/<n>`
+/// or `.../pull/<n>` URL. Trailing path segments, a query, or a fragment
+/// (`#issuecomment-1`) do not change which repository the URL names.
+fn thread_url_repository(value: &str) -> Option<String> {
+    thread_url_parts(value).map(|(repository, _)| repository)
+}
+
+/// The bare thread number of a GitHub issue/pull URL, for the
+/// `target.number` the route holder routes on. Anything that is not such a
+/// URL (a bare number, a non-GitHub host, a malformed URL) returns `None`
+/// and is left to the existing handling unchanged.
+fn thread_url_number(value: &str) -> Option<String> {
+    thread_url_parts(value).map(|(_, number)| number)
 }
 
 /// Canonical `owner/name` of a `/repos/<owner>/<repo>/...` API endpoint. The
@@ -6542,10 +7192,12 @@ fn parse_thread_target(target: &str, segment: &str) -> Option<(Option<String>, u
 
 #[derive(Debug)]
 enum RouteOutcome {
+    WorkerWriteRefused,
     Result(String),
     /// Native close/reopen confirmations go to stderr, as upstream gh does.
     ResultStderr(String),
     StateAppliedCommentFailed(String),
+    PartiallyApplied(String),
     UpstreamError(String),
     Refusal(String),
     UnboundIdentity,
@@ -6612,6 +7264,7 @@ fn route_governed(
         RouteOutcome::Result(_)
             | RouteOutcome::ResultStderr(_)
             | RouteOutcome::StateAppliedCommentFailed(_)
+            | RouteOutcome::PartiallyApplied(_)
     ) && determination.rung == Rung::R3
     {
         let mut updated = determination.clone();
@@ -7561,9 +8214,57 @@ fn exec_real_gh(real_gh: PathBuf, args: &[OsString]) -> i32 {
     }
 }
 
-fn refuse(code: RefusalCode, text: &str) -> i32 {
+fn refusal_line(code: RefusalCode, text: &str) -> String {
     let text = text.replace(['\n', '\r'], " ");
-    eprintln!("gh-shim: {}: {text}", code.as_str());
+    format!("gh-shim: {}: {text}", code.as_str())
+}
+
+// Test seam: when a test installs a refusal sink, `refuse` records the
+// rendered line there instead of writing to stderr, so tests can assert the
+// exact refusal the agent would see without stealing the process's shared
+// file descriptor 2 (which parallel tests also use). The sink is
+// thread-local, so parallel tests never see each other's refusals.
+// (Plain comments: doc comments do not attach to a `thread_local!` block.)
+#[cfg(test)]
+thread_local! {
+    static REFUSAL_SINK: std::cell::RefCell<
+        Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Holds an installed refusal sink; dropping restores plain stderr output.
+#[cfg(test)]
+pub(crate) struct RefusalSinkGuard;
+
+#[cfg(test)]
+impl Drop for RefusalSinkGuard {
+    fn drop(&mut self) {
+        REFUSAL_SINK.with(|slot| slot.replace(None));
+    }
+}
+
+/// Records every `refuse` line until the returned guard drops.
+#[cfg(test)]
+pub(crate) fn capture_refusals_for_test() -> (
+    RefusalSinkGuard,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    REFUSAL_SINK.with(|slot| slot.replace(Some(lines.clone())));
+    (RefusalSinkGuard, lines)
+}
+
+fn emit_refusal_line(line: &str) {
+    #[cfg(test)]
+    if let Some(sink) = REFUSAL_SINK.with(|slot| slot.borrow().clone()) {
+        sink.lock().unwrap().push(line.to_string());
+        return;
+    }
+    eprintln!("{line}");
+}
+
+fn refuse(code: RefusalCode, text: &str) -> i32 {
+    emit_refusal_line(&refusal_line(code, text));
     match code {
         RefusalCode::OutcomeUnknown => OUTCOME_UNKNOWN_EXIT_STATUS,
         _ => REFUSAL_EXIT_STATUS,
@@ -7592,11 +8293,22 @@ fn unix_seconds() -> u64 {
 mod v19_tests;
 
 #[cfg(test)]
+#[path = "gh_shim/v22_tests.rs"]
+mod v22_tests;
+
+#[cfg(test)]
 // Release-profile test builds carry no dev key in the trust set, so the tests
 // that verify under it are `cfg(debug_assertions)` and the helpers only they
 // use read as dead there; the module compiles in both profiles.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 mod tests {
+    /// Deadline for tests that expect rung discovery to finish. The product
+    /// budget is 2 s; a loaded Windows runner has exceeded it, which turns the
+    /// answer into R1 (budget exhausted) and fails tests that are not about the
+    /// budget. Tests of the budget itself (expired deadlines, slow test
+    /// daemons, probe stages) keep `DISCOVERY_BUDGET` so they still time out.
+    const TEST_DISCOVERY_DEADLINE: Duration = Duration::from_secs(60);
+
     #[cfg(unix)]
     #[test]
     fn supplemental_numeric_id_probe_does_not_accept_an_expired_deadline() {
@@ -7731,7 +8443,7 @@ mod tests {
         }
     }
 
-    fn fixture_manifest() -> Manifest {
+    pub(super) fn fixture_manifest() -> Manifest {
         serde_json::from_str(include_str!(
             "../tests/fixtures/gh_shim/initial-manifest-v1.json"
         ))
@@ -7855,7 +8567,7 @@ mod tests {
         }
     }
 
-    fn signed(manifest: &Manifest, fetched_at_unix_secs: u64) -> SignedManifest {
+    pub(super) fn signed(manifest: &Manifest, fetched_at_unix_secs: u64) -> SignedManifest {
         let key = Ed25519KeyPair::from_seed_unchecked(&TEST_SEED).expect("test key");
         assert_eq!(key.public_key().as_ref(), DEV_MANIFEST_PUBLIC_KEY);
         signed_with(
@@ -7979,6 +8691,41 @@ mod tests {
         let _guard = crate::test_env::gh_shim_state_guard();
         let selected = std::env::var_os(GH_SHIM_STATE_DIR_ENV).expect("test state override");
         assert_eq!(StatePaths::from_process().root, PathBuf::from(selected));
+    }
+
+    #[test]
+    fn native_manifest_guard_rechecks_writes_before_upstream_execution() {
+        let _guard = crate::test_env::gh_shim_state_guard();
+        let paths = StatePaths::from_process();
+        let _home = ScopedTestEnvVar::set("HOME", paths.root.to_str());
+        let _xdg = ScopedTestEnvVar::set("XDG_STATE_HOME", paths.root.to_str());
+        write_version_high_water(&paths, 1);
+        let mut calls = 0;
+        for bypass in [None, Some("operator")] {
+            let _bypass = ScopedTestEnvVar::set("GH_SHIM_BYPASS", bypass);
+            let status = delegate_with_manifest_guard(
+                &os_args(&["pr", "merge", "1", "--squash"]),
+                &paths,
+                |_| {
+                    calls += 1;
+                    73
+                },
+            );
+            assert_eq!(status, 86);
+        }
+        assert_eq!(calls, 0);
+
+        write_signed_manifest(&paths, fixture_manifest(), unix_seconds());
+        let status = delegate_with_manifest_guard(
+            &os_args(&["pr", "merge", "1", "--squash"]),
+            &paths,
+            |_| {
+                calls += 1;
+                73
+            },
+        );
+        assert_eq!(status, 73);
+        assert_eq!(calls, 1);
     }
 
     /// The shim's state ladder is the operator's XDG state home, deliberately
@@ -8123,7 +8870,7 @@ mod tests {
             &paths,
             Path::new("/cwd"),
             123,
-            std::time::Instant::now() + DISCOVERY_BUDGET,
+            std::time::Instant::now() + TEST_DISCOVERY_DEADLINE,
             Some(&doc),
         );
         assert_eq!(record.record.rung, Rung::R1);
@@ -8152,7 +8899,7 @@ mod tests {
             &paths,
             Path::new("/cwd"),
             1,
-            std::time::Instant::now() + DISCOVERY_BUDGET,
+            std::time::Instant::now() + TEST_DISCOVERY_DEADLINE,
             Some(&doc),
         );
         assert_eq!(record.record.rung, Rung::R1);
@@ -8175,7 +8922,7 @@ mod tests {
             &paths,
             Path::new("/cwd"),
             1,
-            std::time::Instant::now() + DISCOVERY_BUDGET,
+            std::time::Instant::now() + TEST_DISCOVERY_DEADLINE,
             Some("{}"),
         );
         assert_eq!(record.record.rung, Rung::R1);
@@ -9266,6 +10013,7 @@ mod tests {
             manifest_version: 1,
             edit_last: false,
             author_scope: None,
+            invocation: None,
         };
         let determination = RungDetermination::r3(7, 1, &test_rung_provenance());
         let wire = governed_wire_request(&determination.record, "alfonso-aft", request);
@@ -10345,7 +11093,7 @@ mod tests {
             "subc": { "connection_file": connection_file }
         })
         .to_string();
-        let future_deadline = || std::time::Instant::now() + DISCOVERY_BUDGET;
+        let future_deadline = || std::time::Instant::now() + TEST_DISCOVERY_DEADLINE;
         let r1_cases = [
             (
                 R1Reason::DisabledByConfig,
@@ -10556,7 +11304,15 @@ mod tests {
 
     #[test]
     fn refusal_and_self_report_codes_are_separate_closed_sets() {
-        assert_eq!(RefusalCode::ALL.len(), 20);
+        assert_eq!(RefusalCode::ALL.len(), 22);
+        assert_eq!(
+            RefusalCode::WorkerWriteRefused.as_str(),
+            crate::gh_shim_speech::WORKER_WRITE_CODE
+        );
+        assert_eq!(
+            RefusalCode::ManifestUnavailable.as_str(),
+            "gh_shim_manifest_unavailable"
+        );
         assert_eq!(
             RefusalCode::WorkerNativeGh.as_str(),
             "gh_shim_worker_native_gh"
@@ -10565,8 +11321,20 @@ mod tests {
             .iter()
             .all(|code| code.as_str().starts_with("gh_shim_")));
         assert_eq!(
+            RefusalCode::WorkerWriteRefused.as_str(),
+            "gh_shim_worker_write_refused"
+        );
+        assert_eq!(
             RefusalCode::GovernanceUnavailable.as_str(),
             "gh_shim_governance_unavailable"
+        );
+        assert_eq!(
+            WORKER_WRITE_REFUSED_TEXT,
+            "workers cannot write to GitHub; report what should be posted to your parent instead"
+        );
+        assert_eq!(
+            refusal_line(RefusalCode::WorkerWriteRefused, WORKER_WRITE_REFUSED_TEXT),
+            "gh-shim: gh_shim_worker_write_refused: workers cannot write to GitHub; report what should be posted to your parent instead"
         );
         assert_eq!(
             RefusalCode::OutcomeUnknown.as_str(),
@@ -10727,7 +11495,7 @@ mod tests {
     /// v14 payload adds. Built here rather than read from the assembled
     /// payload, which lives under the gitignored `.alfonso/` and is absent on a
     /// clean checkout.
-    fn v14_manifest() -> Manifest {
+    pub(super) fn v14_manifest() -> Manifest {
         let mut manifest = v12_fixture_manifest();
         manifest.manifest_version = 14;
         manifest
@@ -12898,6 +13666,47 @@ INHERITED FLAGS
     }
 
     #[test]
+    fn thread_url_number_extracts_the_bare_thread_number() {
+        // Issues and pull forms, with and without trailing path, query and
+        // fragment: the route holder routes on the digits, not the URL.
+        for (url, number) in [
+            ("https://github.com/o/r/issues/42", "42"),
+            ("https://github.com/o/r/pull/7", "7"),
+            ("http://github.com/o/r/issues/42", "42"),
+            ("https://github.com/o/r/pull/7/files/abc", "7"),
+            ("https://github.com/o/r/issues/42?foo=bar", "42"),
+            ("https://github.com/o/r/pull/7#issuecomment-123", "7"),
+            ("https://github.com/Owner/Repo/issues/5#issuecomment-1", "5"),
+        ] {
+            assert_eq!(thread_url_number(url).as_deref(), Some(number), "{url}");
+            // The repository half still resolves from the same URL.
+            assert!(thread_url_repository(url).is_some(), "{url}");
+        }
+        assert_eq!(
+            thread_url_parts("https://github.com/Owner/Repo/pull/7#issuecomment-123"),
+            Some(("owner/repo".to_string(), "7".to_string()))
+        );
+        // Anything else is left alone: a bare number, a non-GitHub host, a
+        // malformed URL, a non-thread path, or a non-numeric segment.
+        for value in [
+            "42",
+            "#42",
+            "o/r",
+            "https://example.com/o/r/issues/42",
+            "https://github.com/o/r",
+            "https://github.com/o/r/issues",
+            "https://github.com/o/r/issues/",
+            "https://github.com/o/r/issues/abc",
+            "https://github.com/o/r/issues/0x2a",
+            "https://github.com/o/r/blob/main/README.md",
+            "https://github.com/o/r/pull",
+            "ghe.example.com/o/r/issues/42",
+        ] {
+            assert_eq!(thread_url_number(value), None, "{value}");
+        }
+    }
+
+    #[test]
     fn unbound_safe_list_passes_reads_and_local_commands_and_refuses_everything_else() {
         let safe = |raw: &[&str]| is_unbound_safe(&os_args(raw));
         for raw in [
@@ -13950,7 +14759,21 @@ INHERITED FLAGS
     #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
     #[test]
     fn future_issued_at_fixture_is_refused_and_aged_fixture_serves_governed_classification() {
+        // Self-report reads process-wide config. Keep fixtures that disable the
+        // shim from changing it while this test observes an active manifest.
+        let _lock = crate::test_env::process_env_lock();
         let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_str().unwrap();
+        let _home = ScopedTestEnvVar::set("HOME", Some(root));
+        let _profile = ScopedTestEnvVar::set("USERPROFILE", Some(root));
+        let _xdg = ScopedTestEnvVar::set("XDG_CONFIG_HOME", Some(root));
+        let config = crate::subc_config::user_config_path_from(
+            Some(directory.path().as_os_str()),
+            Some(directory.path().as_os_str()),
+        )
+        .unwrap();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(config, br#"{"github":{"shim":true}}"#).unwrap();
         let paths = StatePaths::from_root(directory.path().to_path_buf());
 
         write_envelope_fixture(
@@ -14959,7 +15782,7 @@ INHERITED FLAGS
                     &paths,
                     &project,
                     TEST_NOW,
-                    Instant::now() + DISCOVERY_BUDGET,
+                    Instant::now() + TEST_DISCOVERY_DEADLINE,
                     Some(&doc),
                 );
                 let same_repo = repo == Some("cortexkit/motor");
@@ -15035,7 +15858,7 @@ INHERITED FLAGS
             &paths,
             &unbound,
             now,
-            Instant::now() + DISCOVERY_BUDGET,
+            Instant::now() + TEST_DISCOVERY_DEADLINE,
             Some(&doc),
         );
         assert_eq!(unbound_determination.record.rung, Rung::R2);
@@ -15059,7 +15882,7 @@ INHERITED FLAGS
             &target,
             &bound,
             now + 1,
-            Instant::now() + DISCOVERY_BUDGET,
+            Instant::now() + TEST_DISCOVERY_DEADLINE,
             Some(&doc),
         );
         assert!(
@@ -15642,6 +16465,7 @@ mod github_read_mutation_tests {
             manifest_version: 1,
             edit_last: false,
             author_scope: None,
+            invocation: None,
         }
     }
 
@@ -15787,3 +16611,98 @@ mod github_read_mutation_tests {
         );
     }
 }
+
+fn run_captured_protected(
+    args: &[OsString],
+    paths: &StatePaths,
+    target: &TargetRepository,
+    cwd: &Path,
+    now: u64,
+) -> i32 {
+    use crate::gh_shim_speech::{Code, Refusal};
+    // Background writes retain a signed policy snapshot from command launch,
+    // but still require the current manifest. Report its absence before dispatch.
+    if matches!(
+        resolve_manifest(paths, now),
+        ManifestResolution::Invalid(_) | ManifestResolution::Dormant
+    ) {
+        if let Some(status) = unavailable_manifest_refusal(args, paths) {
+            return status;
+        }
+    }
+    let (manifest, classification, binding, rung) = match captured_plan(
+        args, paths, target, cwd, now,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            let mut text = error.agent_text();
+            // run_with refuses worker writes before this head-shell path.
+            // Do not put operator-bypass advice in shared refusal text.
+            if error.code == Code::PolicyDenied && error.reason == "not_governed" {
+                text.push_str(" This GitHub command is not a bot operation. If it should run as the operator, run it again with GH_SHIM_BYPASS=operator; the shim records that use.");
+            }
+            return refuse(RefusalCode::SeamRefusal, &text);
+        }
+    };
+    // Protected invocations never hand native gh the operator's credentials.
+    dispatch_r3(
+        args,
+        classification,
+        &manifest,
+        paths,
+        &rung,
+        &binding,
+        now,
+        |_| {
+            refuse(
+                RefusalCode::SeamRefusal,
+                &Refusal::new(Code::PolicyDenied, "not_r3").agent_text(),
+            )
+        },
+    )
+}
+
+fn captured_plan(
+    args: &[OsString],
+    paths: &StatePaths,
+    target: &TargetRepository,
+    cwd: &Path,
+    now: u64,
+) -> Result<(Manifest, Classification, AgentBinding, RungRecord), crate::gh_shim_speech::Refusal> {
+    use crate::gh_shim_speech::{Code, Refusal};
+    if shim_disabled_by_operator() {
+        return Err(Refusal::new(Code::PolicyDenied, "not_r3"));
+    }
+    if operator_bypass_requested() || operator_credential_use(args).is_some() {
+        return Err(Refusal::new(Code::PolicyDenied, "not_governed"));
+    }
+    load_manifest(paths, now)
+        .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
+    let (snapshot, _, _) = capture_speech_policy()?
+        .ok_or_else(|| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
+    let manifest = verified_speech_manifest(&snapshot.signed_envelope)
+        .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
+    let classification = classify(args, &manifest, current_platform());
+    if !matches!(&classification, Classification::Governed { .. }) {
+        return Err(Refusal::new(Code::PolicyDenied, "not_governed"));
+    }
+    let binding = governing_binding(&classification, &manifest, target, cwd)
+        .ok_or_else(|| Refusal::new(Code::PolicyDenied, "repository_denied"))?;
+    let determination = determine_rung(paths, target, cwd, now);
+    if determination.record.rung != Rung::R3 {
+        return Err(Refusal::new(Code::PolicyDenied, "not_r3"));
+    }
+    Ok((manifest, classification, binding, determination.record))
+}
+
+pub(crate) fn speech_protected_without_view(args: &[OsString]) -> bool {
+    !is_unbound_safe(args)
+}
+
+#[cfg(test)]
+#[path = "gh_shim_speech/policy_tests.rs"]
+mod speech_policy_tests;
+
+#[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
+#[path = "gh_shim_speech/dispatch_tests.rs"]
+mod speech_dispatch_tests;

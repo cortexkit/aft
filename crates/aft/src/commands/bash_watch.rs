@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 
 use crate::bash_background::persistence::{BgMode, TaskArtifact};
 use crate::bash_background::registry::BgTaskSnapshot;
+use crate::bash_background::watch_lines::EACH_LINE_NEEDS_BACKGROUND;
 use crate::bash_background::{BgTaskRegistry, BgTaskStatus};
 use crate::commands::bash_orchestrate::{
     format_wait_limit, kill_deadline_sentence, worker_kill_deadline_within_handoff_margin,
@@ -52,6 +53,8 @@ const PREVIEW_BYTES: usize = crate::bash_background::output::RUNNING_OUTPUT_PREV
 
 #[derive(Debug, Default, Deserialize)]
 struct BashWatchParams {
+    #[serde(default)]
+    deliver: Option<Value>,
     #[serde(default)]
     task_id: Option<String>,
     #[serde(default)]
@@ -280,6 +283,17 @@ pub(crate) fn handle_deferred_with_budget(
     ctx: Arc<AppContext>,
     budget: crate::commands::blocking_wait::ReplyBudget,
 ) -> DispatchOutcome {
+    handle_deferred_with_observation_only(req, ctx, budget, false)
+}
+
+/// An observation-only transport may wait on output, but cannot renew, recover,
+/// or otherwise change the task that produced it. The flag is not a tool argument.
+pub(crate) fn handle_deferred_with_observation_only(
+    req: &RawRequest,
+    ctx: Arc<AppContext>,
+    budget: crate::commands::blocking_wait::ReplyBudget,
+    observation_only: bool,
+) -> DispatchOutcome {
     let id = req.id.clone();
     let params = match parse_params(req) {
         Ok(params) => params,
@@ -294,6 +308,13 @@ pub(crate) fn handle_deferred_with_budget(
             "bash_watch: missing taskId",
         ));
     };
+    if params.deliver.is_some() {
+        return DispatchOutcome::Immediate(Response::error(
+            &id,
+            "invalid_request",
+            EACH_LINE_NEEDS_BACKGROUND,
+        ));
+    }
     let pattern = match parse_pattern(params.pattern.as_ref()) {
         Ok(pattern) => pattern,
         Err(response) => return DispatchOutcome::Immediate(with_id(response, &id)),
@@ -315,7 +336,12 @@ pub(crate) fn handle_deferred_with_budget(
     let session = req.session().to_string();
     let shell_tool = req.host_tool_names().shell().to_string();
     let registry = ctx.bash_background().clone();
-    if registry.has_erased_watch_reference(&task_id) {
+    let erased = if observation_only {
+        registry.observed_erased_watch_reference(&task_id)
+    } else {
+        registry.has_erased_watch_reference(&task_id)
+    };
+    if erased {
         return DispatchOutcome::Immediate(Response::error(
             &id,
             "task_erased",
@@ -344,7 +370,7 @@ pub(crate) fn handle_deferred_with_budget(
                 // Configure acknowledges the route before its replay tail finishes.
                 // Resolve the durable record before starting the wait, off executor
                 // slots, and without replaying unrelated tasks or relaxing the session.
-                if registry.observed_status(&task_id, &session, 0).is_none() {
+                if !observation_only && registry.observed_status(&task_id, &session, 0).is_none() {
                     registry.set_worker_wait_window(Duration::from_millis(worker_limit_ms));
                     if let Err(error) = registry.recover_watch_task(
                         &storage_dir,
@@ -357,14 +383,6 @@ pub(crate) fn handle_deferred_with_budget(
                         return;
                     }
                 }
-                if registry.observed_status(&task_id, &session, 0).is_none() {
-                    let _ = tx.send(Response::error(
-                        &thread_id,
-                        "task_not_found",
-                        format_unknown_polled_task_message(&task_id, &shell_tool),
-                    ));
-                    return;
-                }
                 let watch = WatchJob {
                     registry,
                     task_id,
@@ -375,7 +393,18 @@ pub(crate) fn handle_deferred_with_budget(
                     worker_limit_ms,
                     primary_cap_ms,
                     budget,
+                    observation_only,
+                    storage_dir,
+                    project_root,
                 };
+                if watch.observed_status(0).is_none() {
+                    let _ = tx.send(Response::error(
+                        &thread_id,
+                        "task_not_found",
+                        format_unknown_polled_task_message(&watch.task_id, &shell_tool),
+                    ));
+                    return;
+                }
                 let Some(waited) = watch.wait(&worker_cancellation) else {
                     // Cancelled: the transport already answered the call.
                     return;
@@ -383,10 +412,7 @@ pub(crate) fn handle_deferred_with_budget(
                 // The task was already resolved under this route's identity. Do not
                 // re-adopt another session's task through status's relaxed fallback if
                 // the record disappears while the watch is waiting.
-                let snapshot =
-                    watch
-                        .registry
-                        .observed_status(&watch.task_id, &watch.session, PREVIEW_BYTES);
+                let snapshot = watch.observed_status(PREVIEW_BYTES);
                 let response = match snapshot {
                     Some(snapshot) => watch.reply(&thread_id, snapshot, &waited),
                     None => Response::error(
@@ -446,9 +472,29 @@ struct WatchJob {
     worker_limit_ms: u64,
     primary_cap_ms: u64,
     budget: crate::commands::blocking_wait::ReplyBudget,
+    observation_only: bool,
+    storage_dir: std::path::PathBuf,
+    project_root: Option<std::path::PathBuf>,
 }
 
 impl WatchJob {
+    fn observed_status(&self, preview_bytes: usize) -> Option<BgTaskSnapshot> {
+        if self.observation_only {
+            self.registry
+                .observation_status(
+                    &self.task_id,
+                    &self.session,
+                    self.project_root.as_deref(),
+                    &self.storage_dir,
+                    preview_bytes,
+                )
+                .map(|(snapshot, _)| snapshot)
+        } else {
+            self.registry
+                .observed_status(&self.task_id, &self.session, preview_bytes)
+        }
+    }
+
     /// Waits until the task exits, the pattern matches, or the limit passes.
     /// `None` when the call was cancelled first.
     fn wait(&self, cancellation: &crate::executor::JobCancellation) -> Option<Waited> {
@@ -472,16 +518,14 @@ impl WatchJob {
             // A worker waiting on its task keeps the task's default hard kill
             // at least one worker wait limit away, as every other worker wait
             // does (see `BgTaskRegistry::renew_hard_kill`).
-            if self.worker {
+            if self.worker && !self.observation_only {
                 self.registry.renew_hard_kill(
                     &self.task_id,
                     &self.session,
                     Duration::from_millis(self.worker_limit_ms),
                 );
             }
-            let snapshot = self
-                .registry
-                .observed_status(&self.task_id, &self.session, 0);
+            let snapshot = self.observed_status(0);
             let mut terminal = snapshot
                 .as_ref()
                 .is_none_or(|snapshot| snapshot.info.status.is_terminal());
@@ -581,13 +625,36 @@ impl WatchJob {
                 scan.has_more = true;
                 continue;
             }
-            let page = match self.registry.read_artifact_page_until(
-                &self.task_id,
-                &self.session,
-                artifact,
-                scan.next,
-                self.budget.deadline,
-            ) {
+            let page = if self.observation_only {
+                self.registry
+                    .observation_status(
+                        &self.task_id,
+                        &self.session,
+                        self.project_root.as_deref(),
+                        &self.storage_dir,
+                        0,
+                    )
+                    .ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::NotFound, "task_not_found")
+                    })
+                    .and_then(|(_, paths)| {
+                        self.registry.observation_artifact_page_until(
+                            paths,
+                            artifact,
+                            scan.next,
+                            self.budget.deadline,
+                        )
+                    })
+            } else {
+                self.registry.read_artifact_page_until(
+                    &self.task_id,
+                    &self.session,
+                    artifact,
+                    scan.next,
+                    self.budget.deadline,
+                )
+            };
+            let page = match page {
                 Ok(page) => page,
                 Err(error) => {
                     // The helper's queue-wait or access cap can expire before the reply deadline.
@@ -674,6 +741,9 @@ impl WatchJob {
             }
         }
         data["output"] = json!(text);
+        if !self.observation_only {
+            self.registry.attach_terminal_view(&mut data, &self.session);
+        }
         Response::success(id, data)
     }
 
@@ -807,11 +877,16 @@ impl WatchJob {
 }
 
 /// Turns `note` (from `remote_phase_note`) into a sentence: first character
-/// upper-cased, a period appended. An empty note gives an empty string.
+/// upper-cased, a period added if missing. An empty note gives an empty string.
 fn remote_phase_sentence(note: &str) -> String {
     let mut chars = note.chars();
     match chars.next() {
-        Some(first) => format!("{}{}.", first.to_uppercase(), chars.as_str()),
+        Some(first) => format!(
+            "{}{}{}",
+            first.to_uppercase(),
+            chars.as_str(),
+            if note.ends_with('.') { "" } else { "." }
+        ),
         None => String::new(),
     }
 }
@@ -833,7 +908,35 @@ fn output_tail(output: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remote_progress_sentences_keep_the_approved_final_period() {
+        assert_eq!(
+            super::remote_phase_sentence("queued on the runner (12 s)"),
+            "Queued on the runner (12 s)."
+        );
+        for note in [
+            "The remote job is uploading its files (14s so far).",
+            "The remote job is waiting for a free build host (2m 10s so far): room available.",
+            "The remote job is connecting to its build host (3s so far).",
+        ] {
+            assert_eq!(super::remote_phase_sentence(note), note);
+        }
+    }
     use super::*;
+    #[test]
+    fn each_line_sync_watch_refuses_delivery() {
+        let project = tempfile::tempdir().unwrap();
+        let ctx = context(project.path(), project.path());
+        let req = serde_json::from_value(json!({"id":"sync-delivery", "command":"bash_watch", "task_id":"task", "deliver":"each_line"})).unwrap();
+        let DispatchOutcome::Immediate(response) = handle_deferred(&req, ctx) else {
+            panic!("sync delivery must refuse immediately")
+        };
+        assert!(!response.success);
+        assert_eq!(
+            serde_json::to_value(&response).unwrap()["message"],
+            r#"bash_watch: deliver: "each_line" needs background: true."#
+        );
+    }
     use crate::bash_background::persistence::{create_task_layout, write_task_at, PersistedTask};
     use crate::config::Config;
     use crate::harness::Harness;
@@ -871,6 +974,133 @@ mod tests {
             session_id: SESSION.into(),
             principal_id: Some("reserved:broca".into()),
         }
+    }
+
+    /// A terminal pinned task with its row and view record in aft.db, as a
+    /// restart recovery plus terminal upsert would leave it.
+    fn view_watch_fixture() -> (
+        tempfile::TempDir,
+        WatchJob,
+        BgTaskSnapshot,
+        Waited,
+        serde_json::Value,
+    ) {
+        let manifest = crate::db::rich_ui::test_view_manifest_for_test();
+        let pin = manifest.pins[0].clone();
+        let _writing = crate::db::rich_ui::enable_test_view_writing_for_test(manifest.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path(), dir.path());
+        let db = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::db::open(&dir.path().join("aft.db")).unwrap(),
+        ));
+        ctx.set_db(std::sync::Arc::clone(&db));
+        ctx.bash_background()
+            .set_db_pool(std::sync::Arc::clone(&db));
+        let bound = principal(dir.path());
+        let (snapshot, stored) = with_authenticated_principal(bound, || {
+            let storage = crate::bash_background::task_storage_dir(&ctx);
+            let resolved = create_task_layout(&storage, SESSION, TASK).unwrap();
+            let mut metadata = crate::db::rich_ui::terminal_task_metadata_for_test(Some(&pin));
+            metadata.session_id = SESSION.into();
+            metadata.task_id = TASK.into();
+            metadata.harness = Some("runner".into());
+            metadata.workdir = dir.path().to_path_buf();
+            metadata.project_root = Some(dir.path().to_path_buf());
+            metadata.status = crate::bash_background::BgTaskStatus::Failed;
+            write_task_at(&resolved, &metadata).unwrap();
+            std::fs::write(&resolved.paths.stdout, "durable worker output\n").unwrap();
+            std::fs::write(&resolved.paths.stderr, "").unwrap();
+            std::fs::write(&resolved.paths.exit, "1\n").unwrap();
+            let row =
+                crate::db::rich_ui::task_row_for_test(&metadata, "runner", "failed", Some(1), true);
+            let conn = db.lock().unwrap();
+            crate::db::rich_ui::upsert_task_row_with_view(&conn, &row, &metadata).unwrap();
+            let stored = crate::db::rich_ui::view_record_json(&conn, "runner", SESSION, TASK)
+                .unwrap()
+                .expect("record must be stored");
+            drop(conn);
+            let storage = crate::bash_background::task_storage_dir(&ctx);
+            ctx.bash_background()
+                .recover_watch_task(&storage, SESSION, TASK, Some(dir.path()), Some("runner"))
+                .unwrap();
+            let snapshot = ctx
+                .bash_background()
+                .observed_status(TASK, SESSION, 0)
+                .expect("recovered terminal snapshot");
+            (snapshot, stored)
+        });
+        assert!(snapshot.info.status.is_terminal());
+        let storage = crate::bash_background::task_storage_dir(&ctx);
+        let job = WatchJob {
+            registry: ctx.bash_background().clone(),
+            task_id: TASK.into(),
+            session: SESSION.into(),
+            pattern: None,
+            limit_ms: 30_000,
+            worker: false,
+            worker_limit_ms: 1_800_000,
+            primary_cap_ms: 120_000,
+            budget: Instant::now().into(),
+            observation_only: false,
+            storage_dir: storage,
+            project_root: Some(dir.path().into()),
+        };
+        // The writing guard drops here: seeding is complete, and delivery
+        // reads only the stored record plus a thread-local result-body flag.
+        let waited = Waited {
+            reason: WaitReason::Exited,
+            elapsed_ms: 1,
+            limit_ms: 30_000,
+            matched: None,
+            scan_incomplete: false,
+        };
+        (dir, job, snapshot, waited, stored)
+    }
+
+    /// A terminal `bash_watch` on a tool-result/v1 route carries the stored
+    /// record; legacy routes, carrier (observation-only) reads and running
+    /// snapshots never do.
+    #[test]
+    fn terminal_bash_watch_carries_the_stored_record_on_tool_result_routes() {
+        let (_dir, mut job, snapshot, waited, stored) = view_watch_fixture();
+        assert!(stored.is_object());
+        // A legacy-envelope route never receives the record.
+        let legacy = job.reply("legacy", snapshot.clone(), &waited);
+        assert!(legacy.success);
+        assert!(legacy.data.get("view").is_none());
+        let _v1 = crate::subc::result_body::enter(true);
+        // A terminal reply on a versioned route carries the stored record.
+        let response = job.reply("terminal", snapshot.clone(), &waited);
+        assert!(response.success);
+        assert_eq!(response.data["view"], stored);
+        assert_eq!(response.data["view"]["task_id"], TASK);
+        // The extra member leaves the rendered output bytes unchanged.
+        assert_eq!(
+            response.data["output"], legacy.data["output"],
+            "view must not change content"
+        );
+        // A carried (observation-only) read keeps its ordinary result shape.
+        job.observation_only = true;
+        let carried = job.reply("carried", snapshot.clone(), &waited);
+        assert!(carried.success);
+        assert!(carried.data.get("view").is_none());
+        // A running snapshot carries no record either.
+        job.observation_only = false;
+        let mut running = snapshot;
+        running.info.status = crate::bash_background::BgTaskStatus::Running;
+        let timeout = job.reply(
+            "timeout",
+            running,
+            &Waited {
+                reason: WaitReason::Timeout,
+                elapsed_ms: 1,
+                limit_ms: 1,
+                matched: None,
+                scan_incomplete: false,
+            },
+        );
+        assert!(timeout.success);
+        assert!(timeout.data.get("view").is_none());
     }
 
     fn request(task: &str, session: &str) -> RawRequest {
@@ -946,6 +1176,9 @@ mod tests {
                 worker_limit_ms: 1_800_000,
                 primary_cap_ms: 120_000,
                 budget: Instant::now().into(),
+                observation_only: false,
+                storage_dir: storage,
+                project_root: Some(dir.path().into()),
             };
             (dir, job, snapshot)
         })
@@ -1299,8 +1532,11 @@ mod tests {
             let waited = job.wait(&crate::executor::JobCancellation::new());
             let _ = tx.send((job, waited, started.elapsed()));
         });
+        // The hard deadline must outlast the longest reply budget a test gives
+        // its watch (20 s), or a slow runner trips this guard while the watch
+        // is still inside its own budget.
         let (job, waited, elapsed) = rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(60))
             .expect("watch did not answer within the test's hard deadline");
         (job, waited.expect("watch was not cancelled"), elapsed)
     }

@@ -1,5 +1,6 @@
 #[path = "../helpers/context_storage.rs"]
 mod context_storage;
+mod context_storage_test;
 
 #[path = "../helpers/mod.rs"]
 mod test_helpers;
@@ -17,6 +18,7 @@ mod bash_compress_extras_test;
 mod bash_compress_test;
 mod bash_db_hints_test;
 mod bash_drain_completions_test;
+mod bash_exit_status_test;
 mod bash_foreground_background_architecture_test;
 mod bash_orchestrate_test;
 mod bash_permissions_test;
@@ -31,6 +33,7 @@ mod bash_token_count_test;
 mod bash_watch_test;
 mod bind_trust_quota_test;
 mod blob_store_core_test;
+mod cache_root_doctor_test;
 mod callgraph_restart_reuse_test;
 mod callgraph_rust_bin_targets_test;
 mod callgraph_stale_missing_refresh_test;
@@ -68,6 +71,8 @@ mod edit_match_test;
 mod edit_test;
 mod effective_path_cache_test;
 mod error_path_test;
+#[cfg(unix)]
+mod executable_replacement_test;
 mod executable_warm_test;
 mod exported_boost_test;
 mod extract_function_test;
@@ -100,6 +105,10 @@ mod inspect_todos_test;
 mod inspect_tsconfig_membership_test;
 mod inspect_unused_exports_test;
 mod is_semantic_indexed_extension_test;
+// Edits that used to leave Python with an IndentationError while reporting success
+// (issue #824).
+mod issue_824_edit_indentation_test;
+mod issue_827_828_repro_test;
 mod lexical_rank_test;
 mod lexical_score_test;
 mod locks_test;
@@ -158,6 +167,7 @@ mod score_floor_drop_test;
 mod search_index_warm_restart_test;
 mod security_test;
 mod semantic_disk_test;
+mod shared_db_call_ledger_test;
 mod shared_db_contention_test;
 mod shared_index_scope_test;
 mod stage_card_floor_test;
@@ -188,6 +198,7 @@ mod trace_to_symbol_test;
 mod typescript_native_lsp_test;
 mod undo_path_lifecycle_test;
 mod url_fetch_test;
+mod v3_base_refs;
 mod v3_isolation;
 mod view_assembly_wiring_test;
 mod vue_test;

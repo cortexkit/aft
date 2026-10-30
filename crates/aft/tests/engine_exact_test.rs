@@ -98,7 +98,9 @@ fn test_alf_specimen_outside_lexical_top_50_found_rank_1_ready() {
     let query_trigrams = SearchIndex::query_trigrams_from_tokens(&["character", "cap"]);
 
     // 1. Assert rooms.rs is strictly OUTSIDE the lexical top-50
-    let lexical_top_50 = snapshot.lexical_rank_at_depth(&query_trigrams, None, 50);
+    let lexical_top_50 = snapshot
+        .lexical_rank_at_depth(&query_trigrams, None, 50)
+        .unwrap();
     assert_eq!(
         lexical_top_50.files.len(),
         50,

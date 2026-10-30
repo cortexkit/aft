@@ -1,4 +1,4 @@
-//! `aft fix-config`: the configuration half of `aft doctor --fix`.
+//! Native configuration and inactive-cache repair for `aft doctor --fix`.
 //!
 //! Repairs the files ordinary loading consumes for this invocation (the user
 //! file and, when the invocation directory has one, the project file) by
@@ -29,8 +29,21 @@ pub fn run(args: Vec<OsString>) -> i32 {
     };
     let user = aft::subc_config::cortexkit_user_config_path();
     let outcomes = fix_files(&fix_targets(user.as_deref(), &cwd));
-    let failed = outcomes.iter().any(|outcome| outcome.status == "failed");
-    let report = serde_json::json!({ "files": outcomes });
+    let cleanup = inactive_cache_cleanup(user.as_deref(), &cwd);
+    let failed =
+        outcomes.iter().any(|outcome| outcome.status == "failed") || cleanup.error.is_some();
+    let report = serde_json::json!({ "files": outcomes, "cache_cleanup": cleanup });
     let _ = writeln!(io::stdout().lock(), "{report}");
     i32::from(failed)
+}
+
+fn inactive_cache_cleanup(
+    user: Option<&std::path::Path>,
+    cwd: &std::path::Path,
+) -> aft::root_cache::CleanupReport {
+    let tiers = aft::subc_config::read_local_cortexkit_config_tiers(user, cwd);
+    aft::root_cache::reclaim_configured_inactive_caches(
+        &tiers,
+        &aft::bash_background::storage_dir(None),
+    )
 }

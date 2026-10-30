@@ -11,19 +11,31 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rusqlite::{params, Connection, TransactionBehavior};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 pub mod assembly;
+pub mod base_builder;
+pub mod base_refs;
+pub mod base_sweep;
+pub(crate) mod donor;
 mod generation;
 #[cfg(test)]
-pub(crate) use generation::{
-    checkpoint_test_hooks, wait_for_derived_checkpoint_for_test, CheckpointTestHooks,
-};
+pub(crate) use generation::wait_for_derived_checkpoint_for_test;
 pub(crate) mod io;
 #[cfg(aft_views_lazy_benchmark)]
 pub mod lazy_read_benchmark;
 pub mod materialization;
 mod profile;
+pub(crate) mod publication_reason;
+pub(crate) mod write_accounting;
 #[cfg(test)]
 pub(crate) use profile::observe_publication_phases_for_test;
 pub(crate) mod read;
+pub(crate) mod reference_sidecar;
+
+/// Make every manifest reference sidecar be fully re-verified on its next use.
+/// Benchmarks use this to measure the cost the verification memo saves.
+#[doc(hidden)]
+pub fn forget_verified_reference_sidecars() {
+    reference_sidecar::global().forget_verified();
+}
 
 // Per-checkout (v2) view core: registry, manifests, snapshots, readiness,
 // trigram segments, the plane contracts and the parity harness.
@@ -35,6 +47,7 @@ pub mod readiness;
 pub mod registry;
 pub mod segment_store;
 pub mod snapshot;
+pub mod symbol_store;
 
 // Plane and runtime modules of the per-checkout views. Each starts as a
 // documented empty module that its plane fills in.
@@ -47,13 +60,18 @@ pub mod parent;
 pub mod query_wait;
 pub mod semantic;
 pub mod semantic_arena;
+pub(crate) mod semantic_batch_lease;
 pub mod semantic_runtime;
+mod tree_base;
 pub mod trigram;
+mod verification;
 
 #[cfg(test)]
 mod dispatch_parity_probe;
 #[cfg(test)]
 mod per_checkout_core_tests;
+#[cfg(test)]
+mod v3_plane_tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -96,7 +114,7 @@ pub(crate) fn generation_matches_head(generation: &str, head_fingerprint: &str) 
 }
 
 pub fn callgraph_paths_match_v2(
-    manifest: &manifest_v2::ManifestV2,
+    manifest: &snapshot::ComposedGeneration,
     root: &Path,
     paths: &[PathBuf],
 ) -> Result<bool> {
@@ -106,8 +124,18 @@ pub fn callgraph_paths_match_v2(
 pub(crate) fn resolve_derived_path(view_dir: &Path, generation: &str) -> Result<PathBuf> {
     ViewStore {
         view_dir: view_dir.to_path_buf(),
+        sweep_registry: None,
     }
     .derived_path(generation)
+}
+
+/// Synchronize a fixture that has stopped publishing before it audits closed
+/// SQLite files. Do not call while holding a view-pointer transaction or a
+/// family-registry write transaction; generation maintenance acquires those locks.
+#[doc(hidden)]
+pub fn wait_for_generation_maintenance_for_test(view_dir: &Path) {
+    generation::wait_for_derived_checkpoint_for_test(view_dir);
+    generation::wait_for_generation_sweep_for_test(view_dir);
 }
 
 /// Errors raised while constructing, verifying, or publishing a view.
@@ -457,17 +485,27 @@ impl ManifestEntry {
 }
 
 /// The one manifest that defines a view generation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Manifest {
     pub path_identity_version: u8,
-    entries: BTreeMap<RelPath, ManifestEntry>,
+    entries: std::sync::Arc<BTreeMap<RelPath, ManifestEntry>>,
+    json: std::sync::Arc<std::sync::OnceLock<(u8, std::sync::Arc<[u8]>)>>,
 }
+
+impl PartialEq for Manifest {
+    fn eq(&self, other: &Self) -> bool {
+        self.path_identity_version == other.path_identity_version && self.entries == other.entries
+    }
+}
+
+impl Eq for Manifest {}
 
 impl Manifest {
     pub fn new(entries: impl IntoIterator<Item = (RelPath, ManifestEntry)>) -> Result<Self> {
         let mut manifest = Self {
             path_identity_version: PATH_IDENTITY_VERSION,
-            entries: BTreeMap::new(),
+            entries: Default::default(),
+            json: Default::default(),
         };
         for (rel_path, entry) in entries {
             manifest.insert(rel_path, entry)?;
@@ -477,7 +515,11 @@ impl Manifest {
 
     pub fn insert(&mut self, rel_path: RelPath, entry: ManifestEntry) -> Result<()> {
         validate_member(&rel_path, &entry)?;
-        if self.entries.insert(rel_path, entry).is_some() {
+        self.json = Default::default();
+        if std::sync::Arc::make_mut(&mut self.entries)
+            .insert(rel_path, entry)
+            .is_some()
+        {
             return Err(ViewError::InvalidManifest(
                 "a manifest cannot contain the same rel_path twice".to_string(),
             ));
@@ -504,7 +546,19 @@ impl Manifest {
     }
 
     pub fn to_json_bytes(&self) -> Result<Vec<u8>> {
-        Ok(serde_json::to_vec(self)?)
+        Ok(self.json_bytes()?.to_vec())
+    }
+
+    /// Fingerprints and the durable writer share the same canonical encoding.
+    pub(super) fn json_bytes(&self) -> Result<std::sync::Arc<[u8]>> {
+        if let Some((version, bytes)) = self.json.get() {
+            if *version == self.path_identity_version {
+                return Ok(bytes.clone());
+            }
+        }
+        let bytes: std::sync::Arc<[u8]> = serde_json::to_vec(self)?.into();
+        let _ = self.json.set((self.path_identity_version, bytes.clone()));
+        Ok(bytes)
     }
 
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self> {
@@ -710,6 +764,7 @@ pub struct PreparedPublication {
     store: ViewStore,
     generation: String,
     base_generation: Option<String>,
+    _pin: crate::pins::QueryPin,
     pointer: crate::db::file_identity::IdentityConnection,
 }
 
@@ -765,19 +820,27 @@ pub struct PointerPragmas {
 #[derive(Clone, Debug)]
 pub struct ViewStore {
     view_dir: PathBuf,
+    // Registered V2 views serialize cleanup with their family's pin admission.
+    sweep_registry: Option<registry::RegistryLocation>,
 }
 
 impl ViewStore {
+    pub(super) fn cache_key(storage: &Path, project_scope_key: &str) -> Result<PathBuf> {
+        validate_scope_key(project_scope_key)?;
+        Ok(storage.join("views").join(project_scope_key))
+    }
     /// Opens `<storage>/views/<project_scope_key>` and initializes its singleton
     /// pointer row under `BEGIN IMMEDIATE` so concurrent first opens agree.
     pub fn open(storage: impl AsRef<Path>, project_scope_key: &str) -> Result<Self> {
         crate::production_storage::refuse_write(storage.as_ref())
             .map_err(|error| ViewError::io_at("opening writable view", storage.as_ref(), error))?;
-        validate_scope_key(project_scope_key)?;
-        let view_dir = storage.as_ref().join("views").join(project_scope_key);
+        let view_dir = Self::cache_key(storage.as_ref(), project_scope_key)?;
         crate::private_storage::open_dir(storage.as_ref(), &view_dir)
             .map_err(|error| ViewError::io_at("creating directory", &view_dir, error))?;
-        let store = Self { view_dir };
+        let store = Self {
+            view_dir,
+            sweep_registry: None,
+        };
         store.initialize_pointer()?;
         Ok(store)
     }
@@ -790,7 +853,10 @@ impl ViewStore {
             .map_err(|error| ViewError::io_at("opening writable view", &view_dir, error))?;
         crate::private_storage::open_dir(view_storage_root(&view_dir), &view_dir)
             .map_err(|error| ViewError::io_at("creating directory", &view_dir, error))?;
-        let store = Self { view_dir };
+        let store = Self {
+            view_dir,
+            sweep_registry: None,
+        };
         store.initialize_pointer()?;
         Ok(store)
     }
@@ -798,11 +864,17 @@ impl ViewStore {
     /// A view directory that already has a pointer database, without creating
     /// or initializing anything. Registry readers use this.
     pub(crate) fn existing_dir(view_dir: PathBuf) -> Option<Self> {
+        crate::root_cache::check_cache_access(&view_dir).ok()?;
         crate::private_storage::tighten_open_dir(view_storage_root(&view_dir), &view_dir);
-        view_dir
-            .join(POINTER_DATABASE)
-            .is_file()
-            .then_some(Self { view_dir })
+        view_dir.join(POINTER_DATABASE).is_file().then_some(Self {
+            view_dir,
+            sweep_registry: None,
+        })
+    }
+
+    pub(crate) fn with_sweep_registry(mut self, registry: registry::FamilyRegistry) -> Self {
+        self.sweep_registry = Some(registry.location());
+        self
     }
 
     pub fn view_dir(&self) -> &Path {
@@ -937,6 +1009,7 @@ impl ViewStore {
                 request.generation.to_string(),
             ));
         }
+        let generation_pin = self.pin_prepared_generation(request.generation)?;
 
         let mut timing = profile::PublicationTiming::new(&self.view_dir);
         let blob_durability_barrier = crate::blob_store::publication_durability_barrier();
@@ -967,32 +1040,34 @@ impl ViewStore {
         observe(observer, PublicationStep::AliasRowsDurable);
         timing.phase("alias_durability");
 
-        if let Some(previous) = reused {
-            // The pinned base already proved closure for immutable shared blobs.
-            // A semantic-only fill must validate just the newly referenced keys.
-            let old_keys = previous
-                .plane_keys()
-                .map(|(plane, key)| (plane == ArtifactPlane::Semantic, key))
-                .collect::<BTreeSet<_>>();
-            let new_keys = request
-                .manifest
-                .plane_keys()
-                .filter(|(plane, key)| {
-                    !old_keys.contains(&(*plane == ArtifactPlane::Semantic, *key))
-                })
-                .collect::<Vec<_>>();
-            closure.probe_blobs(&new_keys)?;
-            if !closure.trigram_is_present()? {
-                return Err(ViewError::MissingTrigram);
-            }
-        } else {
-            probe_publication_closure(request.manifest, &request.closure_requirements, closure)?;
-        }
+        // Reusing a derived database says nothing about deleted blob rows.
+        // Only the store-backed closure can revoke or reuse that proof.
+        probe_publication_closure(request.manifest, &request.closure_requirements, closure)?;
         observe(observer, PublicationStep::ClosureProbed);
         drop(blob_durability_barrier);
         timing.phase("closure_probe");
 
-        write_manifest_once(&manifest_path, request.manifest)?;
+        let manifest_digest = write_manifest_once(&manifest_path, request.manifest)?;
+        // Blob GC reads this generation's keys from the sidecar instead of the
+        // JSON. A failure only means GC derives the sidecar from the JSON later.
+        let reference_keys = request
+            .manifest
+            .plane_keys()
+            .filter_map(|(_, key)| crate::blob_store::v2::parse_hex32(key))
+            .collect::<BTreeSet<_>>();
+        if let Err(error) = reference_sidecar::write_published(
+            &self.view_dir,
+            request.generation,
+            &reference_keys,
+            &manifest_digest,
+        ) {
+            log::debug!(
+                "views: reference sidecar not written view={} generation={} error={error}",
+                self.view_dir.display(),
+                request.generation
+            );
+        }
+        drop(reference_keys);
         observe(observer, PublicationStep::ManifestFileWritten);
         sync_directory(&self.view_dir)?;
         observe(observer, PublicationStep::ManifestParentFsynced);
@@ -1000,7 +1075,6 @@ impl ViewStore {
 
         let pointer = self.open_pointer_connection()?;
         pointer.pragma_update(None, "synchronous", "FULL")?;
-        pointer.busy_timeout(Duration::from_millis(20))?;
         sync_directory(&self.view_dir)?;
         timing.phase("pointer_prepare");
         Ok(PreparedPublication {
@@ -1008,6 +1082,7 @@ impl ViewStore {
             store: self.clone(),
             generation: request.generation.to_owned(),
             base_generation: request.base_generation.map(str::to_owned),
+            _pin: generation_pin,
         })
     }
 
@@ -1044,6 +1119,15 @@ impl ViewStore {
              INSERT OR IGNORE INTO pointer (singleton, generation) VALUES (1, '');
              COMMIT;",
         )?;
+        drop(connection);
+        // Registered v2 views recover under their family registry's pin barrier.
+        if !self
+            .view_dir
+            .parent()
+            .is_some_and(|parent| parent.ends_with("v2"))
+        {
+            self.recover_abandoned_derived(None);
+        }
         Ok(())
     }
 
@@ -1061,6 +1145,26 @@ impl ViewStore {
         generation: &str,
         base_generation: &str,
     ) -> Result<PublishOutcome> {
+        self.compare_and_swap_pointer_with_pin(generation, base_generation, false)
+            .map(|(outcome, _)| outcome)
+    }
+
+    fn pin_prepared_generation(&self, generation: &str) -> Result<crate::pins::QueryPin> {
+        let mut connection = self.open_pointer_connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let pin = crate::pins::QueryPin::acquire(self.view_dir(), generation)
+            .map_err(|error| ViewError::Io(std::io::Error::other(error.to_string())))?;
+        bump_pointer_generation_epoch(&transaction)?;
+        transaction.commit()?;
+        Ok(pin)
+    }
+
+    fn compare_and_swap_pointer_with_pin(
+        &self,
+        generation: &str,
+        base_generation: &str,
+        protect_result: bool,
+    ) -> Result<(PublishOutcome, Option<crate::pins::QueryPin>)> {
         let mut connection = self.open_pointer_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let updated = transaction.execute(
@@ -1068,20 +1172,61 @@ impl ViewStore {
             params![generation, base_generation],
         )?;
         if updated == 1 {
+            let pin = if protect_result {
+                Some(
+                    crate::pins::QueryPin::acquire(self.view_dir(), generation)
+                        .map_err(|error| ViewError::Io(std::io::Error::other(error.to_string())))?,
+                )
+            } else {
+                None
+            };
+            if protect_result {
+                bump_pointer_generation_epoch(&transaction)?;
+            }
             transaction.commit()?;
-            Ok(PublishOutcome::Published)
+            Ok((PublishOutcome::Published, pin))
         } else {
             let current_generation: String = transaction.query_row(
                 "SELECT generation FROM pointer WHERE singleton = 1",
                 [],
                 |row| row.get(0),
             )?;
+            let pin = if protect_result && !current_generation.is_empty() {
+                Some(
+                    crate::pins::QueryPin::acquire(self.view_dir(), &current_generation)
+                        .map_err(|error| ViewError::Io(std::io::Error::other(error.to_string())))?,
+                )
+            } else {
+                None
+            };
+            if pin.is_some() {
+                bump_pointer_generation_epoch(&transaction)?;
+            }
             transaction.commit()?;
-            Ok(PublishOutcome::Conflict {
-                current_generation: (!current_generation.is_empty()).then_some(current_generation),
-            })
+            Ok((
+                PublishOutcome::Conflict {
+                    current_generation: (!current_generation.is_empty())
+                        .then_some(current_generation),
+                },
+                pin,
+            ))
         }
     }
+}
+
+// Filesystem-only protection/reference changes must invalidate a cleanup read
+// snapshot before it can promote that snapshot to an unlink claim. The epoch
+// lives in the header's user_version, so bumping it commits a real change
+// (which advances other connections' data_version) without adding a page.
+fn bump_pointer_generation_epoch(connection: &Connection) -> rusqlite::Result<()> {
+    let epoch: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    // user_version is a signed 32-bit header field.
+    let next = if epoch >= i64::from(i32::MAX) {
+        1
+    } else {
+        epoch + 1
+    };
+    connection.pragma_update(None, "user_version", next)
 }
 
 fn view_storage_root(view_dir: &Path) -> &Path {
@@ -1186,6 +1331,8 @@ fn configure_connection(connection: &Connection) -> Result<()> {
     })?;
     connection.pragma_update(None, "synchronous", "NORMAL")?;
     connection.pragma_update(None, "foreign_keys", "OFF")?;
+    #[cfg(test)]
+    materialization::probe_connection(connection);
     Ok(())
 }
 
@@ -1234,11 +1381,16 @@ fn sqlite_full_sync_checkpoint(path: &Path, seam: &'static str) -> Result<(i64, 
     // and flushes the main database before the checkpoint returns. Keeping the
     // operation inside the VFS preserves its process-wide advisory locks.
     connection.pragma_update(None, "synchronous", "FULL")?;
-    connection
+    let result = connection
         .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })
-        .map_err(ViewError::from)
+        .map_err(ViewError::from)?;
+    #[cfg(test)]
+    unsafe {
+        materialization::probe_checkpoint(connection.handle(), result.0, result.1, result.2)
+    };
+    Ok(result)
 }
 
 fn checkpoint_pointer_after_cas(path: &Path) -> Result<()> {
@@ -1246,7 +1398,9 @@ fn checkpoint_pointer_after_cas(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_manifest_once(path: &Path, manifest: &Manifest) -> Result<()> {
+/// Returns the digest of the bytes written, which the generation's reference
+/// sidecar records so readers can prove it describes this file.
+fn write_manifest_once(path: &Path, manifest: &Manifest) -> Result<[u8; 32]> {
     crate::production_storage::refuse_write(path)
         .map_err(|error| ViewError::io_at("writing manifest", path, error))?;
     let parent = path.parent().ok_or_else(|| {
@@ -1263,16 +1417,23 @@ fn write_manifest_once(path: &Path, manifest: &Manifest) -> Result<()> {
             .unwrap_or_default()
             .as_nanos()
     ));
-    let write_result = (|| -> Result<()> {
+    let write_result = (|| -> Result<[u8; 32]> {
         let mut file = crate::private_storage::options()
             .create_new(true)
             .write(true)
             .open(&temporary)
             .map_err(|error| ViewError::io_at("creating", &temporary, error))?;
-        file.write_all(&manifest.to_json_bytes()?)
+        let bytes = manifest.json_bytes()?;
+        let mut writer = write_accounting::ManifestWriter(&mut file);
+        writer
+            .write_all(&bytes)
             .map_err(|error| ViewError::io_at("writing", &temporary, error))?;
-        file.write_all(b"\n")
+        writer
+            .write_all(b"\n")
             .map_err(|error| ViewError::io_at("writing", &temporary, error))?;
+        let mut digest = blake3::Hasher::new();
+        digest.update(&bytes);
+        digest.update(b"\n");
         file.sync_all()
             .map_err(|error| ViewError::io_at("syncing", &temporary, error))?;
         drop(file);
@@ -1291,7 +1452,7 @@ fn write_manifest_once(path: &Path, manifest: &Manifest) -> Result<()> {
         // The hard link gives the generation its permanent name without an
         // overwrite race; fsync that name before its directory is persisted.
         sync_file(path)?;
-        Ok(())
+        Ok(*digest.finalize().as_bytes())
     })();
     let _ = fs::remove_file(&temporary);
     write_result
@@ -1394,6 +1555,35 @@ fn observe(observer: Option<&dyn PublicationObserver>, step: PublicationStep) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manifest_serialization_cache_is_shared_but_invalidated_by_insert() {
+        let mut manifest = super::Manifest::new([]).unwrap();
+        let bytes = manifest.json_bytes().unwrap();
+        let clone = manifest.clone();
+        assert!(std::sync::Arc::ptr_eq(&bytes, &clone.json_bytes().unwrap()));
+        manifest
+            .insert(
+                super::RelPath::new(b"link".to_vec()).unwrap(),
+                super::ManifestEntry::Symlink {
+                    target_bytes: super::ByteString::new(b"target".to_vec()),
+                },
+            )
+            .unwrap();
+        assert_ne!(
+            manifest.to_json_bytes().unwrap(),
+            clone.to_json_bytes().unwrap()
+        );
+        assert_eq!(
+            manifest.to_json_bytes().unwrap(),
+            serde_json::to_vec(&manifest).unwrap()
+        );
+        manifest.path_identity_version = super::PATH_IDENTITY_VERSION + 1;
+        assert_eq!(
+            manifest.to_json_bytes().unwrap(),
+            serde_json::to_vec(&manifest).unwrap()
+        );
+    }
+
     use super::*;
 
     /// Two publishers checkpoint the same artifact database before publishing.

@@ -1,0 +1,9 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "Fenced file changed: crates/aft/src/search_index.rs. The cold trigram build walks the root a chunk at a time instead of collecting every path first, moves its file table and path lookup into the cache writer instead of cloning them, and streams the cache file header to the writer instead of building it in memory. Configure skips rewriting cache.bin straight after a cold build that already wrote it when nothing changed since. File order, file ids, postings and the cache bytes are unchanged (a reloaded cache rewrites to the same bytes), so scoring and routing are unchanged; benchmark rows must remain byte-identical."
+}

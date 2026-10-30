@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "plexus-contract-0025bdf6"
+  ],
+  "note": "Test-only: re-vendors Plexus gh.route contract vectors at 0025bdf6 (review_thread_not_own) and extends the stand-in. No changed path matches RANKING_FENCE_PREFIXES."
+}

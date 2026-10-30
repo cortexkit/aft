@@ -4,6 +4,48 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+/// Keep the error kind and native source available to retry/absence checks
+/// while naming the I/O that failed. OS errors alone do not include its path.
+pub(crate) fn at(
+    operation: &str,
+    path: &std::path::Path,
+    source: std::io::Error,
+) -> std::io::Error {
+    std::io::Error::new(
+        source.kind(),
+        PathIoError {
+            operation: operation.to_owned(),
+            path: path.to_path_buf(),
+            source,
+        },
+    )
+}
+
+#[derive(Debug)]
+struct PathIoError {
+    operation: String,
+    path: std::path::PathBuf,
+    source: std::io::Error,
+}
+
+impl std::fmt::Display for PathIoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {}: {}",
+            self.operation,
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for PathIoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Lifetime totals for measured work sites, shared by every root in this process.
 /// Relaxed loads are intentionally not a transactional snapshot; difference them
 /// only within one daemon lifetime, never sum overlapping per-root intervals.
@@ -13,6 +55,7 @@ pub(crate) struct WorkCounters {
     pub content_reads: AtomicU64,
     pub content_read_bytes: AtomicU64,
     pub full_walks: AtomicU64,
+    pub git_subprocesses: AtomicU64,
     pub applicability_walks: AtomicU64,
     pub logical_aggregates: AtomicU64,
     pub own_generation_folds: AtomicU64,
@@ -35,6 +78,7 @@ pub(crate) static WORK: WorkCounters = WorkCounters {
     content_reads: AtomicU64::new(0),
     content_read_bytes: AtomicU64::new(0),
     full_walks: AtomicU64::new(0),
+    git_subprocesses: AtomicU64::new(0),
     applicability_walks: AtomicU64::new(0),
     logical_aggregates: AtomicU64::new(0),
     own_generation_folds: AtomicU64::new(0),
@@ -74,6 +118,7 @@ pub(crate) fn work_snapshot() -> serde_json::Value {
         "content_reads": WORK.content_reads.load(Ordering::Relaxed),
         "content_read_bytes": WORK.content_read_bytes.load(Ordering::Relaxed),
         "full_walks": WORK.full_walks.load(Ordering::Relaxed),
+        "git_subprocesses": WORK.git_subprocesses.load(Ordering::Relaxed),
         "applicability_walks": WORK.applicability_walks.load(Ordering::Relaxed),
         "logical_aggregates": WORK.logical_aggregates.load(Ordering::Relaxed),
         "own_generation_folds": WORK.own_generation_folds.load(Ordering::Relaxed),
@@ -158,9 +203,14 @@ pub(crate) enum Phase {
 }
 /// Disjoint intervals use the same sample at each boundary. Nested derived
 /// subtotals are aliases, not additional bytes to add to the top-level sum.
+///
+/// The derived-output index row is written after the publication's phases,
+/// once the publisher has left its commit barrier. That separate interval is
+/// `derived_index`; it is part of the derived subtotal and of the total.
 pub(crate) struct PublicationIo {
     previous: Option<Bytes>,
     buckets: [Bytes; 7],
+    derived_index: Bytes,
     available: bool,
     phase: Phase,
     blob_counter: crate::write_ledger::Counter,
@@ -176,6 +226,7 @@ impl PublicationIo {
         Self {
             previous: sample,
             buckets: [Bytes::default(); 7],
+            derived_index: Bytes::default(),
             available: sample.is_some(),
             phase: Phase::Manifest,
             blob_counter: crate::write_ledger::register(
@@ -218,16 +269,27 @@ impl PublicationIo {
     pub(crate) fn finish(&mut self) {
         self.advance(Bytes::capture());
     }
+    /// Add the deferred derived-index write, sampled from `before` to `after`
+    /// after [`Self::finish`], and credit it to the derived write ledger.
+    pub(crate) fn credit_derived_index(&mut self, before: Option<Bytes>, after: Option<Bytes>) {
+        match before.zip(after).and_then(|(a, b)| b.delta(a)) {
+            Some(delta) => {
+                self.derived_index = self.derived_index.add(delta);
+                self.derived_counter.credit(delta.logical, delta.written);
+            }
+            None => self.available = false,
+        }
+    }
     pub(crate) fn fields(&self) -> String {
         let derived = self.buckets[2..6]
             .iter()
             .copied()
-            .fold(Bytes::default(), Bytes::add);
+            .fold(self.derived_index, Bytes::add);
         let total = self
             .buckets
             .iter()
             .copied()
-            .fold(Bytes::default(), Bytes::add);
+            .fold(self.derived_index, Bytes::add);
         let mut fields = format!("io_scope=process io_available={}", self.available);
         for (name, value) in [
             ("manifest", self.buckets[0]),
@@ -238,6 +300,7 @@ impl PublicationIo {
             ("materialize", self.buckets[3]),
             ("closure", self.buckets[4]),
             ("derived_other", self.buckets[5]),
+            ("derived_index", self.derived_index),
             ("total", total),
         ] {
             fields.push(' ');
@@ -294,6 +357,43 @@ impl Drop for Event {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn path_context_preserves_absence_and_retry_kinds() {
+        for kind in [std::io::ErrorKind::NotFound, std::io::ErrorKind::WouldBlock] {
+            let error = super::at(
+                "reading",
+                std::path::Path::new("missing-input"),
+                std::io::Error::new(kind, "original failure"),
+            );
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), "reading missing-input: original failure");
+        }
+    }
+
+    #[test]
+    fn path_context_preserves_native_error_sources() {
+        let error = super::at(
+            "opening",
+            std::path::Path::new("busy-database"),
+            std::io::Error::from_raw_os_error(32),
+        );
+        let context = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<super::PathIoError>()
+            .unwrap();
+        assert_eq!(context.source.raw_os_error(), Some(32));
+        assert_eq!(
+            std::error::Error::source(context)
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(32)
+        );
+        assert!(error.to_string().starts_with("opening busy-database: "));
+    }
+
     use super::*;
     #[test]
     fn performance_work_counts_real_source_operations() {
@@ -389,6 +489,38 @@ mod tests {
             "ledger uses the exact blobs + derived publication byte buckets"
         );
     }
+    #[test]
+    fn deferred_derived_index_write_counts_in_derived_total_and_ledger() {
+        let bytes = |n| Bytes {
+            written: n,
+            logical: n * 2,
+            read: n * 3,
+        };
+        let root = std::path::Path::new("/ledger-derived-index-fixture");
+        let mut p = PublicationIo::from_sample(Some(bytes(100)), root);
+        p.phase = Phase::Materialize;
+        p.advance(Some(bytes(110)));
+        p.credit_derived_index(Some(bytes(500)), Some(bytes(507)));
+        let fields = p.fields();
+        for expected in [
+            "derived_index_physical_bytes_written=7 ",
+            "derived_physical_bytes_written=17 ",
+            "total_physical_bytes_written=17 ",
+            "total_logical_bytes_written=34 ",
+        ] {
+            assert!(fields.contains(expected), "{expected}: {fields}");
+        }
+        assert_eq!(
+            crate::write_ledger::pending_for_test(
+                crate::write_ledger::Domain::ViewsDerived,
+                &root.display().to_string()
+            ),
+            (34, 17)
+        );
+        p.credit_derived_index(None, Some(bytes(600)));
+        assert!(p.fields().contains("io_available=false"));
+    }
+
     #[test]
     fn missing_counters_are_unknown_not_zero() {
         let mut p = PublicationIo::from_sample(None, std::path::Path::new("/missing"));

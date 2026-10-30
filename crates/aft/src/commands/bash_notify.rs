@@ -13,6 +13,8 @@ struct BashNotifyParams {
     regex: Option<String>,
     #[serde(default = "default_once")]
     once: bool,
+    #[serde(default)]
+    deliver: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,6 +44,17 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
+    if params
+        .deliver
+        .as_deref()
+        .is_some_and(|value| value != "each_line")
+    {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            "bash_watch: deliver must be each_line",
+        );
+    }
     let pattern = if let Some(regex) = params.regex.as_deref() {
         match WatchPattern::regex(regex) {
             Ok(pattern) => pattern,
@@ -70,8 +83,12 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         .observed_status(&params.task_id, req.session(), 0)
         .is_some()
     {
-        ctx.bash_background()
-            .register_watch(params.task_id.clone(), pattern, params.once)
+        ctx.bash_background().register_watch_delivery(
+            params.task_id.clone(),
+            pattern,
+            params.once,
+            params.deliver.is_some(),
+        )
     } else {
         Err("task_not_found")
     };

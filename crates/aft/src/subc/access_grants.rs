@@ -32,14 +32,16 @@ pub(super) fn scope_key(identity: &RouteIdentity) -> ScopeKey {
     }
 }
 
-/// A codemode run has its own lifetime, but uses its agent's authority. Keep
-/// grant checks on the attested parent identity instead of copying grants into
-/// the run, so revocation remains effective and ending a run retains agent grants.
+/// A codemode run has its own lifetime, but uses its owner route's authority:
+/// its head agent's for an agent run, its worker's for a worker run. Keep
+/// grant checks on the attested owner identity instead of copying grants into
+/// the run, so revocation remains effective and ending a run retains its
+/// owner's grants.
 pub(super) fn policy_scope_key(identity: &RouteIdentity) -> ScopeKey {
-    // A codemode call runs on its head agent's policy, read from the head
-    // agent's own route exactly as the head's direct calls read it.
+    // A codemode call runs on its owner route's policy, read from that route
+    // exactly as the owner's direct calls read it.
     if let Some(owner) = identity.run_owner.as_ref() {
-        return scope_key(&owner.head);
+        return scope_key(&owner.owner_route);
     }
     if let Some(stamp) = identity
         .scope
@@ -63,6 +65,74 @@ fn principal_label_for_identity(identity: &RouteIdentity) -> Option<&str> {
     match &identity.spawn_principal {
         AuthenticatedPrincipal::RouteBind { principal_id, .. } => principal_id.as_deref(),
         _ => None,
+    }
+}
+
+// Core's scope_carriers and worker_runner_module identify these session hosts.
+// The stamp does not carry the recorded runner module: supporting another
+// runner requires adding its authenticated principal to this explicit list.
+const SAVED_GRANT_SESSION_HOSTS: &[&str] =
+    &["direct", "reserved:broca", "reserved:thalamus-harness"];
+
+pub(super) fn scope_grants_denial(
+    identity: &RouteIdentity,
+) -> Option<crate::access_policy::ScopeGrantsDenial> {
+    scope_grants_denial_for_parent(
+        identity,
+        identity.run_owner.as_ref().map(|owner| &owner.owner_route),
+    )
+}
+
+/// A parent link names an identity, not its kind. Codemode admission supplies
+/// the head or worker parent; flow-read admission supplies its verified head.
+pub(super) fn scope_grants_denial_for_parent(
+    identity: &RouteIdentity,
+    parent: Option<&RouteIdentity>,
+) -> Option<crate::access_policy::ScopeGrantsDenial> {
+    use crate::access_policy::ScopeGrantsDenial;
+    use subc_protocol::scope::ScopeKind;
+    let Some(stamp) = identity.scope.as_ref() else {
+        return Some(ScopeGrantsDenial::UnknownScopeKind);
+    };
+    if stamp.attributes.flow_id.is_some() {
+        return Some(ScopeGrantsDenial::Flow);
+    }
+    if !alfonso(stamp) {
+        return Some(ScopeGrantsDenial::UnknownScopeKind);
+    }
+    // Codemode retains the run's stamp but substitutes the owner's sandbox
+    // principal. Saved-grant eligibility must still check the original carrier.
+    let principal = identity
+        .run_owner
+        .as_ref()
+        .map_or(&identity.spawn_principal, |owner| &owner.run_principal);
+    let principal = match principal {
+        AuthenticatedPrincipal::RouteBind { principal_id, .. } => principal_id.as_deref(),
+        _ => None,
+    };
+    match stamp.kind {
+        ScopeKind::Head | ScopeKind::Worker => (!principal
+            .is_some_and(|id| SAVED_GRANT_SESSION_HOSTS.contains(&id)))
+        .then_some(ScopeGrantsDenial::NotSessionHost),
+        ScopeKind::Ephemeral => {
+            if principal != Some("reserved:basal") {
+                return Some(ScopeGrantsDenial::NotSessionHost);
+            }
+            let session_parent =
+                parent
+                    .and_then(|route| route.scope.as_ref())
+                    .is_some_and(|session| {
+                        alfonso(session)
+                            && matches!(session.kind, ScopeKind::Head | ScopeKind::Worker)
+                            && session.attributes.flow_id.is_none()
+                            && stamp.parent.as_ref().is_some_and(|link| {
+                                link.owner == session.owner
+                                    && link.scope_ref == session.scope_ref
+                                    && link.scope_epoch == session.scope_epoch
+                            })
+                    });
+            (!session_parent).then_some(ScopeGrantsDenial::UnknownScopeKind)
+        }
     }
 }
 
@@ -266,13 +336,14 @@ pub(super) fn head_scope(identity: &RouteIdentity) -> Option<ScopeKey> {
 }
 
 /// Whether this route's calls are a stamped Alfonso worker's: a `Worker`
-/// scope, or an `Ephemeral` (codemode run) scope that names a parent. Heads'
-/// runs carry no parent, so a parented run is a worker's run and is judged as
-/// that worker.
+/// scope, or an `Ephemeral` (run) scope that names a parent. A codemode call
+/// is judged by its owner route instead: an agent run's call is never a
+/// worker's, and a worker run's call is exactly its worker's.
 pub(super) fn alfonso_worker(identity: &RouteIdentity) -> bool {
-    // A codemode call acts for a head agent, never as a worker.
-    if identity.run_owner.is_some() {
-        return false;
+    // An agent run's codemode call acts for a head agent, never as a worker; a
+    // worker run's call is exactly its worker's.
+    if let Some(owner) = identity.run_owner.as_ref() {
+        return owner.is_worker_run() && alfonso_worker(&owner.owner_route);
     }
     identity.scope.as_ref().is_some_and(|stamp| {
         alfonso(stamp)
@@ -288,8 +359,14 @@ pub(super) fn alfonso_worker(identity: &RouteIdentity) -> bool {
 /// to Cingulate, the consent service, never to a plugin prompt. Other routes
 /// use their plugin UI or reverse elicitation, never the consent service.
 pub(super) fn ask_route(identity: &RouteIdentity) -> crate::access_policy::AskRoute {
-    // No path yet carries a codemode call's question to the head agent's
-    // user, so such a call is refused rather than asked or allowed.
+    // A rich UI read has nobody to answer a permission question.
+    if super::carrier_read_only::restricted(identity) {
+        return crate::access_policy::AskRoute::Deny;
+    }
+    // No path yet carries a codemode call's question to anyone who could
+    // answer it: an agent run's head agent's user, or a worker run's head.
+    // Such a call is refused rather than asked or allowed, and never filed
+    // as the head's or the worker's own ask.
     if identity.run_owner.is_some() {
         return crate::access_policy::AskRoute::Unavailable;
     }

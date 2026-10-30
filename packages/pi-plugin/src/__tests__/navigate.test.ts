@@ -5,7 +5,7 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { describe, expect, test } from "bun:test";
-import { registerNavigateTool } from "../tools/navigate.js";
+import { buildNavigateSections, registerNavigateTool } from "../tools/navigate.js";
 import { executeTool, makeMockApi, makeMockBridge, makePluginContext } from "./tool-test-utils.js";
 
 async function expectRejectMessage(action: () => Promise<unknown>): Promise<string> {
@@ -23,6 +23,57 @@ function toolArgs(call: { params: Record<string, unknown> }): Record<string, unk
 }
 
 describe("aft_callgraph adapter", () => {
+  test("uses the approved callback count wording in caller and impact rendering", () => {
+    const theme = { fg: (_role: string, text: string) => text } as Parameters<
+      typeof buildNavigateSections
+    >[2];
+    const callback = {
+      callback_dependencies: 1,
+      callback_reference_label: " (callback reference)",
+    };
+    expect(
+      buildNavigateSections(
+        { op: "callers" },
+        {
+          ...callback,
+          total_callers: 2,
+          callers: [
+            {
+              file: "main.ts",
+              callers: [
+                { symbol: "process", line: 2 },
+                { symbol: "process", line: 3, relation: "callback_reference" },
+              ],
+            },
+          ],
+        },
+        theme,
+      ).join("\n"),
+    ).toBe(
+      "2 callers (1 by callback reference) · 1 file group\nmain.ts\n  ↳ process:2\n  ↳ process:3 (callback reference)",
+    );
+    expect(
+      buildNavigateSections(
+        { op: "impact" },
+        {
+          ...callback,
+          total_affected: 1,
+          affected_files: 1,
+          callers: [
+            {
+              caller_file: "main.ts",
+              caller_symbol: "process",
+              line: 3,
+              relation: "callback_reference",
+            },
+          ],
+        },
+        theme,
+      ).join("\n"),
+    ).toBe(
+      "1 affected site (1 by callback reference) · 1 file\nmain.ts:3\n  ↳ process (callback reference)",
+    );
+  });
   test("describes callgraph guidance without invalid read callgraph syntax", () => {
     const enabledApi = makeMockApi();
     const { bridge } = makeMockBridge();
@@ -204,7 +255,7 @@ describe("aft_callgraph adapter", () => {
     );
 
     expect(message).toBe(
-      'trace_to_symbol: ambiguous_target — multiple symbols named "target". Pass toFile to disambiguate:\n  - file1.rs:42\n  - file2.rs:78',
+      'trace_to_symbol: ambiguous_target — multiple symbols named "target". Pass toPath to disambiguate:\n  - file1.rs:42\n  - file2.rs:78',
     );
   });
 
@@ -230,7 +281,7 @@ describe("aft_callgraph adapter", () => {
     );
 
     expect(message).toBe(
-      'trace_to_symbol: ambiguous_target — multiple symbols named "target". Pass toFile to disambiguate:\n  - file1.rs:42',
+      'trace_to_symbol: ambiguous_target — multiple symbols named "target". Pass toPath to disambiguate:\n  - file1.rs:42',
     );
   });
 
@@ -258,7 +309,7 @@ describe("aft_callgraph adapter", () => {
     );
 
     expect(message).toContain("target_symbol_not_in_file");
-    expect(message).toContain("Try one of these files for toFile");
+    expect(message).toContain("Try one of these files for toPath");
     expect(message).toContain("right1.rs:12");
     expect(message).toContain("right2.rs:99");
   });

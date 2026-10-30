@@ -65,6 +65,10 @@ jobs:
           python3 scripts/check-path-deps.py --self-test
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -93,6 +97,8 @@ jobs:
         run: python3 scripts/rust-test-inventory-proof.py
         env:
           AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/linux-nextest.tar.zst
+          # Must equal the unit-linux-libtest-shard matrix size.
+          AFT_UNIT_PARTITION_COUNT: "3"
 
       - name: Report nextest archive size
         run: |
@@ -153,6 +159,7 @@ jobs:
         with:
           name: linux-nextest-archive
           path: ${{ runner.temp }}
+          verify-zstd: linux-nextest.tar.zst
       - name: Run Linux unit archive partition
         run: ./scripts/rust-test-gate.sh
         env:
@@ -183,6 +190,10 @@ jobs:
           components: rustfmt
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -217,12 +228,13 @@ jobs:
 
       - name: CI workflow and compiler-cache invariant guards
         run: |
+          bash scripts/test-ci-sccache-start.sh
           python3 -m unittest discover -s scripts/lib -p test_workflow_gates.py -v
           python3 -m unittest discover -s scripts/lib -p test_ci_rustc_cache.py -v
           python3 -m unittest discover -s scripts/lib -p test_rust_gate_collection.py -v
           python3 -m unittest discover -s scripts/lib -p test_ci_macos_integration_archive.py -v
           python3 -m unittest discover -s scripts/lib -p test_ci_windows_probes.py -v
-          python3 -m unittest discover -s scripts/lib -p test_ci_storm_controls.py -v
+          python3 -m unittest discover -s scripts/lib -p test_ci_storm_inventory.py -v
           python3 -m unittest discover -s scripts/lib -p test_cache_write_policy.py -v
           python3 -m unittest discover -s scripts/lib -p test_native_release_artifact.py -v
           python3 -m unittest discover -s scripts/lib -p test_native_release_workflow.py -v
@@ -271,7 +283,13 @@ jobs:
       - name: Publication input gate
         run: |
           set -euo pipefail
-          git fetch --force origin refs/tags/v0.48.1:refs/tags/v0.48.1
+          # A runner that briefly cannot reach github.com must not fail the
+          # merge-queue group: retry the tag fetch before giving up.
+          for attempt in 1 2 3; do
+            git fetch --force origin refs/tags/v0.48.1:refs/tags/v0.48.1 && break
+            if [ "$attempt" = 3 ]; then exit 1; fi
+            sleep 20
+          done
           node scripts/release-gate-v049.mjs --check-inputs
 
       - name: Cargo build (debug — needed by plugin e2e tests)
@@ -557,6 +575,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -582,6 +604,10 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: ci-storm-thin
@@ -616,6 +642,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.92
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -635,8 +665,10 @@ jobs:
   # cannot exercise these paths.
   #
   # Build library, binary, and non-watcher integration archives in parallel,
-  # then split each inventory into three hash partitions. The library harness
-  # is the dominant link, so it does not share an archive build with other tests.
+  # then split them into hash partitions: five for the lib/bin tests and three
+  # for the integration tests. The library harness is the dominant link, so it
+  # does not share an archive build with other tests. With five lib shards, the
+  # slowest one takes about as long as its single longest test (about 4 minutes).
   # Watcher tests stay serial; conformance and Bun tests use their own lane.
   # ---------------------------------------------------------------------------
   unit-macos-nextest-archive:
@@ -655,6 +687,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: ./.github/actions/setup-nextest
 
@@ -701,18 +737,30 @@ jobs:
     name: Cargo libtest archive (macOS)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
     runs-on: macos-26
-    timeout-minutes: 30
+    # A cold compile of the crate's lib tests takes 19-28 min on these
+    # runners, and a slow runner reached 30 min in 2 of 12 recent main runs.
+    # The job then shows as cancelled and fails the whole macOS unit suite
+    # without any test having run.
+    timeout-minutes: 45
     env:
       SCCACHE_GHA_ENABLED: "true"
       SCCACHE_IDLE_TIMEOUT: "0"
       RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
+      # Non-incremental Cargo builds default to 16 codegen units. Split the
+      # large library harness more finely without changing dependency profiles,
+      # debug assertions, unwind behavior, or the backtrace probe's line tables.
+      LIBTEST_CARGO_CONFIG: profile.test.package.agent-file-tools.codegen-units=256
     steps:
       - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: ./.github/actions/setup-nextest
 
@@ -726,15 +774,25 @@ jobs:
       - name: Build nextest archive (macOS lib tests)
         # The selected integration probe makes Cargo build the real aft CLI.
         # Its tests are filtered out; only the library bucket enters this archive.
-        run: cargo nextest archive --workspace --lib --test sandbox_launch_probe -E 'kind(lib)' --archive-file "$MACOS_LIBTEST_ARCHIVE"
+        run: cargo nextest archive --workspace --lib --test sandbox_launch_probe -E 'kind(lib)' --config "$LIBTEST_CARGO_CONFIG" --timings --archive-file "$MACOS_LIBTEST_ARCHIVE"
         env:
           MACOS_LIBTEST_ARCHIVE: ${{ runner.temp }}/macos-libtest-nextest.tar.zst
 
+      # Keep the build's timing report even when a later step fails; it is the
+      # evidence for diagnosing slow archive builds.
+      - name: Save libtest build timings
+        if: ${{ always() && hashFiles('target/cargo-timings/*.html') != '' }}
+        uses: ./.github/actions/upload-artifact-retry
+        with:
+          name: macos-libtest-timings
+          path: target/cargo-timings/
+          if-no-files-found: error
+
       - name: Run the serial backtrace probe with local debug objects
-        run: cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists
+        run: cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists --config "$LIBTEST_CARGO_CONFIG"
 
       - name: Capture lib source inventory
-        run: cargo nextest list --workspace --lib --profile gate -T json --cargo-quiet > "$RUNNER_TEMP/macos-libtest-inventory.json"
+        run: cargo nextest list --workspace --lib --profile gate -T json --cargo-quiet --config "$LIBTEST_CARGO_CONFIG" > "$RUNNER_TEMP/macos-libtest-inventory.json"
 
       - name: Report macOS libtest archive size
         run: |
@@ -768,6 +826,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: ./.github/actions/setup-nextest
 
@@ -825,16 +887,19 @@ jobs:
         with:
           name: macos-nextest-archive
           path: ${{ runner.temp }}
+          verify-zstd: macos-nextest.tar.zst
 
       - uses: ./.github/actions/download-artifact-retry
         with:
           name: macos-libtest-archive
           path: ${{ runner.temp }}
+          verify-zstd: macos-libtest-nextest.tar.zst
 
       - uses: ./.github/actions/download-artifact-retry
         with:
           name: macos-bin-archive
           path: ${{ runner.temp }}
+          verify-zstd: macos-bin-nextest.tar.zst
 
       - uses: ./.github/actions/download-artifact-retry
         with:
@@ -852,6 +917,8 @@ jobs:
           AFT_NEXTEST_SOURCE_INVENTORY_INTEGRATION_FILE: ${{ runner.temp }}/macos-integration-inventory.json
           AFT_WATCHER_TEST_INVENTORY_FILE: ${{ runner.temp }}/macos-watcher-inventory.txt
           AFT_DOCTEST_INVENTORY_FILE: ${{ runner.temp }}/macos-doctest-inventory.txt
+          # Must equal the unit-macos-libtest-shard matrix size.
+          AFT_UNIT_PARTITION_COUNT: "5"
 
   unit-macos:
     name: Unit tests (macOS)
@@ -935,7 +1002,7 @@ jobs:
           shard: "3"
 
   unit-macos-libtest-shard:
-    name: Cargo libtest shard ${{ matrix.shard }}/3 (macOS)
+    name: Cargo libtest shard ${{ matrix.shard }}/5 (macOS)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
     needs:
       - unit-macos-libtest-archive
@@ -948,15 +1015,19 @@ jobs:
       CARGO_INCREMENTAL: "0"
     strategy:
       fail-fast: false
-      max-parallel: 3
+      max-parallel: 5
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -971,11 +1042,13 @@ jobs:
         with:
           name: macos-libtest-archive
           path: ${{ runner.temp }}
+          verify-zstd: macos-libtest-nextest.tar.zst
 
       - uses: ./.github/actions/download-artifact-retry
         with:
           name: macos-bin-archive
           path: ${{ runner.temp }}
+          verify-zstd: macos-bin-nextest.tar.zst
 
       - name: Rust libtest shard (nextest archive)
         run: ./scripts/rust-test-gate.sh
@@ -988,7 +1061,7 @@ jobs:
           AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/macos-libtest-nextest.tar.zst
           AFT_NEXTEST_ARCHIVE_BIN_FILE: ${{ runner.temp }}/macos-bin-nextest.tar.zst
           AFT_NEXTEST_EXTRACT_TO: ${{ github.workspace }}
-          AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/3
+          AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/5
           AFT_GATE_SKIP_RELEASE_STORM: "1"
           NEXTEST_TEST_THREADS: "num-cpus"
 
@@ -1015,6 +1088,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -1063,7 +1140,9 @@ jobs:
     # This runner builds its own binary and consumes no archive artifacts.
     # The summary still requires both conformance and every archive/shard lane.
     runs-on: macos-26
-    timeout-minutes: 30
+    # 45 minutes: a cold-cache cargo build alone has taken 15 minutes here, and
+    # three merge-queue runs hit 30 while their tests were still passing.
+    timeout-minutes: 45
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -1079,6 +1158,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -1162,9 +1245,11 @@ jobs:
   # and Windows process/path/signal differences. Same suite as Linux but on a
   # real Windows runner — does NOT spin up OpenCode, that's the e2e job.
   #
-  # Build the full non-watcher nextest archive once. Integration and libtest
-  # cases run in separate three-way partitions; watcher tests retain their
-  # single-threaded libtest execution alongside the conformance gate.
+  # Build the full non-watcher nextest archive once. Integration cases run in
+  # three hash partitions and lib/bin cases in six. The lib/bin tests keep
+  # every runner thread busy, so their time falls almost in proportion to the
+  # shard count. Watcher tests retain their single-threaded libtest execution
+  # alongside the conformance gate.
   #
   # These shards cover Windows-only cfg paths and native process/path/signal
   # behavior. Integration tests send filesystem paths in NDJSON requests through
@@ -1224,6 +1309,8 @@ jobs:
         shell: pwsh
         env:
           AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/windows-nextest.tar.zst
+          # Must equal the unit-windows-libtest-shard matrix size.
+          AFT_UNIT_PARTITION_COUNT: "6"
 
       - name: Report nextest archive size
         run: |
@@ -1271,16 +1358,16 @@ jobs:
           done
 
   unit-windows-libtest-shard:
-    name: Cargo libtest shard ${{ matrix.shard }}/3 (Windows)
+    name: Cargo libtest shard ${{ matrix.shard }}/6 (Windows)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
     needs: unit-windows-nextest-archive
     runs-on: windows-2022
     timeout-minutes: 20
     strategy:
       fail-fast: false
-      max-parallel: 3
+      max-parallel: 6
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@v5
 
@@ -1302,6 +1389,7 @@ jobs:
         with:
           name: windows-nextest-archive
           path: ${{ runner.temp }}
+          verify-zstd: windows-nextest.tar.zst
 
       - name: Rust libtest shard (nextest archive)
         # The gate writes AFT_GATE_LOG itself; do not pipe it through `tee`.
@@ -1316,7 +1404,7 @@ jobs:
           AFT_UNIT_TEST_RUNNER: nextest
           AFT_GATE_PHASES: lib-shard
           AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/windows-nextest.tar.zst
-          AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/3
+          AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/6
           AFT_GATE_SKIP_RELEASE_STORM: "1"
           NEXTEST_TEST_THREADS: "4"
 

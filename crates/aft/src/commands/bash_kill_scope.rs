@@ -159,17 +159,55 @@ pub(crate) fn handle_bash_kill_scope_with_saved_tasks(
     for registry in &recovered {
         registry.detach();
     }
+    let mut speech_databases = all_registries
+        .iter()
+        .filter_map(|(registry, _)| registry.speech_database_path())
+        .collect::<std::collections::BTreeSet<_>>();
+    if let Some(root) = saved_storage_root {
+        let path = root.join("aft.db");
+        if path.is_file() {
+            speech_databases.insert(path);
+        }
+    }
+    let queued = speech_databases.into_iter().try_fold(0_u64, |total, path| {
+        crate::db::gh_speech::Store::new(path)
+            .pending_legacy_for_scope(&params.scope)
+            .ok()
+            .map(|count| total.saturating_add(count))
+    });
+    let warning = match queued {
+        Some(count) if count > 0 => Some(super::bash_kill::queued_writes_warning(count)),
+        None => Some("bot_writes_already_queued: writes already queued for this scope may still post; the pending count could not be read.".to_string()),
+        _ => None,
+    };
     if let Some(error) = kill_error {
-        return Response::error(ID, "kill_scope_failed", error);
+        return Response::error(
+            ID,
+            "kill_scope_failed",
+            warning
+                .as_ref()
+                .map_or(error.clone(), |warning| format!("{error}\n{warning}")),
+        );
     }
     if !recovery_errors.is_empty() {
-        return Response::error(ID, "kill_scope_failed", recovery_errors.join("; "));
+        let error = recovery_errors.join("; ");
+        return Response::error(
+            ID,
+            "kill_scope_failed",
+            warning
+                .as_ref()
+                .map_or(error.clone(), |warning| format!("{error}\n{warning}")),
+        );
     }
     killed.sort_by(|a, b| a.task_id.cmp(&b.task_id));
-    Response::success(
-        ID,
-        json!({"killed":killed, "already_finished":already_finished, "not_found":0}),
-    )
+    let mut data = json!({"killed":killed, "already_finished":already_finished, "not_found":0});
+    if let Some(warning) = warning {
+        data["bot_write_revocation_warning"] = json!(warning);
+    }
+    if queued.is_some_and(|count| count > 0) {
+        data["bot_writes_already_queued"] = json!(queued.unwrap());
+    }
+    Response::success(ID, data)
 }
 
 #[cfg(all(test, unix))]

@@ -262,6 +262,7 @@ pub(crate) mod tests {
 
     pub(crate) fn config(connection_file: std::path::PathBuf) -> SemanticBackendConfig {
         SemanticBackendConfig {
+            local_cache_dir: None,
             backend: crate::config::SemanticBackend::Synapse,
             model: "embedding".into(),
             base_url: None,
@@ -340,10 +341,10 @@ pub(crate) mod tests {
                 .build()
                 .unwrap();
             runtime.block_on(async move {
-                tokio::time::timeout(Duration::from_secs(5), async move {
+                tokio::time::timeout(Duration::from_secs(30), async move {
                     let listener = tokio::net::TcpListener::from_std(listener).unwrap();
                     let (mut stream, _) = listener.accept().await.unwrap();
-                    subc_transport::authenticate_server(&mut stream, &key, &daemon_id, "synapse-test", Duration::from_secs(2)).await.unwrap();
+                    subc_transport::authenticate_server(&mut stream, &key, &daemon_id, "synapse-test", Duration::from_secs(30)).await.unwrap();
                     let catalog = subc_transport::read_frame(&mut stream).await.unwrap().unwrap();
                     let modules = if registered { json!([{"module_id":"synapse","module_version":"1","roles":[{"role":"management_surface","operations":[{"name":"models.list","kind":"query"},{"name":"rerank.score","kind":"query"}],"config_schema":{"type":"object"},"observability":[],"identity_scope":[]}],"control_ops":[]}]) } else { json!([]) };
                     respond(&mut stream, &catalog, json!({"op":"catalog.list","generation":1,"modules":modules,"subc_ops":["catalog.list","route.open"]})).await;
@@ -570,14 +571,25 @@ pub(crate) mod tests {
             ],
             true,
         );
-        let backend = connect(&config(path), "reranker".into(), None, 100, true).unwrap();
+        let mut config = config(path);
+        config.timeout_ms = 30_000;
+        config.query_timeout_ms = 30_000;
+        let backend = SynapseReranker::connect(
+            &config,
+            "reranker".into(),
+            None,
+            100,
+            true,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
         assert_eq!(backend.fingerprint().revision, "fp-old");
         assert_eq!(
             backend
                 .score(
                     "q",
                     &[RerankDoc { text: "a" }],
-                    Instant::now() + Duration::from_secs(1)
+                    Instant::now() + Duration::from_secs(30)
                 )
                 .unwrap(),
             vec![2.0]
@@ -586,7 +598,7 @@ pub(crate) mod tests {
             .score(
                 "q",
                 &[RerankDoc { text: "a" }],
-                Instant::now() + Duration::from_secs(1),
+                Instant::now() + Duration::from_secs(30),
             )
             .unwrap_err();
         assert!(

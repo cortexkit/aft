@@ -1,0 +1,15 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/search_index.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/commands/semantic_search/exact_lane.rs"
+  ],
+  "slices": [
+    "views-h-semantic-routes"
+  ],
+  "note": "Views step H, first part: views-routed roots stop the v1 view writers, symbol prewarm reads and writes the v3 symbol plane, and parent folders read children's v3 lexical and call-graph views. search_index.rs gains only a file-entry accessor and a read-only index built from a view snapshot, both reached only with views on; commands/semantic_search is not changed. Views are default-off, so the benchmark runs the views-off path and ranked rows must remain byte-identical to the committed reference."
+}

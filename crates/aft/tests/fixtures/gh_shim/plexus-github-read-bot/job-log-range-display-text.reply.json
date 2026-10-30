@@ -1,0 +1,21 @@
+{
+  "content": [
+    {
+      "text": "{\n  \"result\": {\n    \"body\": \"✓ ok\\n�\",\n    \"length\": 18,\n    \"offset\": 100,\n    \"total_bytes\": 4000\n  }\n}",
+      "type": "text"
+    }
+  ],
+  "isError": false,
+  "result": {
+    "body": "✓ ok\n�",
+    "length": 18,
+    "offset": 100,
+    "total_bytes": 4000
+  },
+  "structuredContent": {
+    "body": "✓ ok\n�",
+    "length": 18,
+    "offset": 100,
+    "total_bytes": 4000
+  }
+}

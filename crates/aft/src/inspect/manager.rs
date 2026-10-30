@@ -119,6 +119,14 @@ struct InspectCacheIdentity {
     project_root: PathBuf,
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+enum CacheWriterWatchObservation {
+    Subscribed,
+    Failed(String),
+    Activity { release: bool, detail: String },
+}
+
 type CacheOpenGates = Mutex<HashMap<InspectCacheIdentity, Weak<Mutex<()>>>>;
 
 /// A published generation names an immutable cold build; the durable revision
@@ -177,6 +185,17 @@ impl ProjectionFleet {
         self.clock = self.clock.saturating_add(1);
         if let Some(previous) = self.entries.remove(&root) {
             self.bytes = self.bytes.saturating_sub(previous.bytes);
+        }
+        // A snapshot that cannot fit alone must not evict useful roots before
+        // eventually evicting itself. It is still available to the scan caller.
+        if bytes > budget {
+            if let Some(slot) = slot.upgrade() {
+                if let Ok(mut cached) = slot.lock() {
+                    cached.take();
+                }
+            }
+            self.drops = self.drops.saturating_add(1);
+            return;
         }
         self.bytes = self.bytes.saturating_add(bytes);
         self.entries.insert(
@@ -357,6 +376,7 @@ struct BuilderStateEntry {
     retry_paused_until: Option<(Instant, u64)>,
     /// A resource wait survives source edits: they do not release a foreign lease.
     resource_retry_at: Option<(Instant, u64)>,
+    cache_writer_timeouts: u32,
     /// The manager's input-change epoch when the current (or last) attempt
     /// started. A failure is not paused when inputs changed during the attempt,
     /// because the build may not have seen that change.
@@ -378,6 +398,7 @@ impl BuilderStateEntry {
             identical_failures: 0,
             retry_paused_until: None,
             resource_retry_at: None,
+            cache_writer_timeouts: 0,
             input_epoch_at_start: 0,
             suspension: None,
             progress: "checking cached analysis".into(),
@@ -457,7 +478,9 @@ impl BuilderStateEntry {
         self.last_failure = None;
         self.identical_failures = 0;
         self.retry_paused_until = None;
-        let delay = super::tier2_scheduler::TIER2_CACHE_WRITER_RETRY_BACKOFF;
+        self.cache_writer_timeouts = self.cache_writer_timeouts.saturating_add(1);
+        let delay =
+            super::tier2_scheduler::tier2_cache_writer_retry_backoff(self.cache_writer_timeouts);
         self.resource_retry_at = Some((
             Instant::now() + delay,
             unix_millis_now().saturating_add(delay.as_millis() as u64),
@@ -762,14 +785,126 @@ fn retry_pause_from_states(
     })
 }
 
-fn callgraph_store_ready_for_dead_code(callgraph_dir: PathBuf, project_root: PathBuf) -> bool {
-    match CallGraphStore::open_readonly(callgraph_dir, project_root) {
-        Ok(Some(store)) => store
-            .stale_files()
-            .ok()
-            .is_some_and(|files| files.is_empty()),
-        _ => false,
+fn wake_cache_writer_if_available(
+    identity: &InspectCacheIdentity,
+    states: &Mutex<HashMap<JobKey, BuilderStateEntry>>,
+    waits: &Mutex<HashMap<InspectCacheIdentity, (Instant, String)>>,
+    caches: &Mutex<HashMap<InspectCacheIdentity, Arc<InspectCache>>>,
+) {
+    let Some(dir) = identity.sqlite_path.parent() else {
+        return;
+    };
+    if !matches!(
+        crate::fs_lock::lock_availability(&crate::root_cache::writer_lease_path(dir)),
+        Ok(crate::fs_lock::LockAvailability::Available | crate::fs_lock::LockAvailability::Stale)
+    ) {
+        return;
     }
+    if let Ok(mut waits) = waits.lock() {
+        waits.remove(identity);
+    }
+    if let Ok(mut caches) = caches.lock() {
+        // A contended reader's short open cooldown must not hide the release.
+        // Outstanding readers retain their Arc and keep serving the snapshot.
+        if caches
+            .get(identity)
+            .is_some_and(|cache| cache.waiting_for_writer())
+        {
+            caches.remove(identity);
+        }
+    }
+    if let Ok(mut states) = states.lock() {
+        for entry in states.values_mut() {
+            if entry.state == Some(InspectBuilderState::WaitingForCacheWriterLease) {
+                entry.resource_retry_at = Some((Instant::now(), unix_millis_now()));
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum Tier2RunError {
+    Failed(String),
+    CallgraphBusy,
+}
+
+impl From<String> for Tier2RunError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl From<CallGraphStoreError> for Tier2RunError {
+    fn from(error: CallGraphStoreError) -> Self {
+        if error.is_transient_lock_contention() {
+            Self::CallgraphBusy
+        } else {
+            Self::Failed(error.to_string())
+        }
+    }
+}
+
+fn callgraph_pending_payload() -> Value {
+    json!({"status": "pending", "reason": "callgraph_building", "complete": false})
+}
+
+fn callgraph_pending_result(job: &InspectJob, duration: Duration) -> InspectResult {
+    InspectResult::success(
+        job,
+        InspectScanSuccess {
+            scanned_files: Vec::new(),
+            contributions: Vec::new(),
+            aggregate: callgraph_pending_payload(),
+        },
+        duration,
+    )
+}
+
+fn retry_dead_code_store_read<T>(
+    mut read: impl FnMut() -> Result<T, CallGraphStoreError>,
+) -> Result<T, CallGraphStoreError> {
+    // Even a published WAL generation can briefly reject a read-only open while
+    // another handle closes and cleans up its WAL. Readiness probes fail fast;
+    // give contention the same short grace period as serving-reader queries.
+    let deadline = Instant::now() + Duration::from_millis(100);
+    loop {
+        match read() {
+            Err(error) if error.is_transient_lock_contention() && Instant::now() < deadline => {
+                #[cfg(test)]
+                guard_tests::notify_callgraph_read_retry_for_test();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            result => return result,
+        }
+    }
+}
+
+fn callgraph_store_ready_for_dead_code(
+    callgraph_dir: PathBuf,
+    project_root: PathBuf,
+) -> Result<bool, CallGraphStoreError> {
+    let readiness = match CallGraphStore::open_readonly(callgraph_dir, project_root) {
+        Ok(Some(store)) => store.stale_files().map(|files| files.is_empty()),
+        Ok(None) => Ok(false),
+        Err(error) => Err(error),
+    };
+    match readiness {
+        Err(error) if error.is_transient_lock_contention() => Err(error),
+        other => Ok(other.unwrap_or(false)),
+    }
+}
+
+fn callgraph_store_busy_for_dead_code(inspect_dir: &Path, project_root: &Path) -> bool {
+    for dir in callgraph_store_dirs_from_inspect_dir(inspect_dir, project_root) {
+        match retry_dead_code_store_read(|| {
+            callgraph_store_ready_for_dead_code(dir.clone(), project_root.to_path_buf())
+        }) {
+            Ok(true) => return false,
+            Err(_) => return true,
+            Ok(false) => {}
+        }
+    }
+    false
 }
 
 /// Completes the builder registration and sends `Failed` to leftover waiters
@@ -801,6 +936,9 @@ fn cached_tier2_aggregate_usable(
     options: &Tier2ReuseOptions,
     aggregate: &Value,
 ) -> bool {
+    if aggregate["status"] == "pending" {
+        return false;
+    }
     if category == InspectCategory::DeadCode
         && options.allow_callgraph_cold_build
         && aggregate
@@ -849,6 +987,10 @@ pub struct InspectManager {
     caches: Arc<Mutex<HashMap<InspectCacheIdentity, Arc<InspectCache>>>>,
     cache_writer_waits: Arc<Mutex<HashMap<InspectCacheIdentity, (Instant, String)>>>,
     cache_open_gates: Arc<CacheOpenGates>,
+    cache_writer_watches:
+        Mutex<HashMap<InspectCacheIdentity, crate::callgraph_store::ReadinessWatcher>>,
+    #[cfg(test)]
+    cache_writer_watch_observer: Mutex<Option<Sender<CacheWriterWatchObservation>>>,
     /// One root-scoped dead-code graph projection. It is cleared with the
     /// manager's other idle artifacts rather than on a separate timer.
     callgraph_projection: Arc<ProjectionSlot>,
@@ -867,7 +1009,7 @@ pub struct InspectManager {
     /// read this registry. The waiter map (`in_flight`) fans out completions;
     /// both surfaces treat a category as busy when it has an entry here, and
     /// fall back to the waiter map if the registry is empty.
-    builder_states: Mutex<HashMap<JobKey, BuilderStateEntry>>,
+    builder_states: Arc<Mutex<HashMap<JobKey, BuilderStateEntry>>>,
     /// Advances whenever a watcher-observed change could alter the Tier-2
     /// inputs (a file the scope walk can include, an ignore file, a rescan or
     /// a config change). Compared against each attempt's start epoch.
@@ -1028,6 +1170,9 @@ impl InspectManager {
             caches,
             cache_writer_waits,
             cache_open_gates,
+            cache_writer_watches: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            cache_writer_watch_observer: Mutex::new(None),
             callgraph_projection: Arc::new(Mutex::new(None)),
             oxc_facts_cache: Mutex::new(OxcFactsCache::new()),
             soft_deadline,
@@ -1041,7 +1186,7 @@ impl InspectManager {
             dead_code_borrow_only_roots: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
             interactive_tier2_acquisitions: AtomicU64::new(0),
-            builder_states: Mutex::new(HashMap::new()),
+            builder_states: Arc::new(Mutex::new(HashMap::new())),
             tier2_input_epoch: AtomicU64::new(0),
             completed_build_durations: Mutex::new(HashMap::new()),
             checkout_view_verification: Mutex::new(None),
@@ -1244,6 +1389,19 @@ impl InspectManager {
                 }
             }
         }
+        drop(states);
+        if matches!(
+            builder_attempt_terminal(outcome),
+            BuilderAttemptTerminal::CacheWriterLeaseWait
+        ) {
+            // Close the race where the holder released before the failed
+            // attempt registered its resource wait.
+            if let Ok(watches) = self.cache_writer_watches.lock() {
+                for identity in watches.keys() {
+                    self.wake_cache_writer_if_available(identity);
+                }
+            }
+        }
     }
 
     fn tier2_flight_exit_guard(&self, key: JobKey) -> Tier2FlightExitGuard<'_> {
@@ -1442,10 +1600,11 @@ impl InspectManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Nothing to end and no attempt that could miss the change: skip the
         // per-path work on the watcher drain's hot path.
-        if !states
-            .values()
-            .any(|entry| entry.retry_paused_until.is_some() || entry.is_in_flight())
-        {
+        if !states.values().any(|entry| {
+            entry.retry_paused_until.is_some()
+                || entry.is_in_flight()
+                || entry.cache_writer_timeouts > 0
+        }) {
             return false;
         }
         let canonical_root = project_root.map(crate::inspect::job::canonicalize_normalized);
@@ -1473,6 +1632,14 @@ impl InspectManager {
         self.tier2_input_epoch.fetch_add(1, Ordering::SeqCst);
         for entry in states.values_mut() {
             entry.retry_paused_until = None;
+            entry.cache_writer_timeouts = 0;
+            if entry.state == Some(InspectBuilderState::WaitingForCacheWriterLease) {
+                let delay = super::tier2_scheduler::TIER2_CACHE_WRITER_RETRY_BACKOFF;
+                entry.resource_retry_at = Some((
+                    Instant::now() + delay,
+                    unix_millis_now() + delay.as_millis() as u64,
+                ));
+            }
         }
     }
 
@@ -1608,8 +1775,9 @@ impl InspectManager {
             snapshot.project_root,
             snapshot.inspect_dir
         );
+        let cache_storage = snapshot.config.cache_storage_dir();
         let storage = checkout_view_some!(
-            snapshot.config.storage_dir.as_ref(),
+            cache_storage.as_ref(),
             "verification_storage_missing: config.storage_dir=None root={:?}",
             snapshot.project_root
         );
@@ -1879,7 +2047,10 @@ impl InspectManager {
         }
         callgraph_store_dirs_from_inspect_dir(&snapshot.inspect_dir, &snapshot.project_root)
             .into_iter()
-            .any(|dir| callgraph_store_ready_for_dead_code(dir, snapshot.project_root.clone()))
+            .any(|dir| {
+                callgraph_store_ready_for_dead_code(dir, snapshot.project_root.clone())
+                    .unwrap_or(false)
+            })
     }
 
     pub fn set_automatic_tier2_refresh_allowed(&self, allowed: bool) {
@@ -2391,6 +2562,10 @@ impl InspectManager {
     /// [`Self::tier2_any_in_flight`] first so a running scan never loses its
     /// cache while it is being used.
     pub fn evict_idle_caches(&self) {
+        // Drop watches before taking the maps their callbacks may access.
+        if let Ok(mut watches) = self.cache_writer_watches.lock() {
+            watches.clear();
+        }
         if let Ok(mut caches) = self.caches.lock() {
             caches.clear();
         }
@@ -2646,6 +2821,7 @@ impl InspectManager {
             build_if_missing,
             refresh_paths,
         )
+        .expect("test snapshot readiness")
         .map(|(snapshot, _, _)| snapshot)
     }
 
@@ -2658,7 +2834,8 @@ impl InspectManager {
         allow_cold_build: bool,
         build_if_missing: bool,
         refresh_paths: &[PathBuf],
-    ) -> Option<(Arc<CallgraphSnapshot>, ProjectionVerdict, Duration)> {
+    ) -> Result<Option<(Arc<CallgraphSnapshot>, ProjectionVerdict, Duration)>, CallGraphStoreError>
+    {
         build_tier2_callgraph_snapshot_with_refresh_inner(
             job,
             allow_cold_build,
@@ -2860,13 +3037,89 @@ impl InspectManager {
         inspect_dir: PathBuf,
         project_root: PathBuf,
     ) -> Result<Arc<InspectCache>, String> {
-        Self::open_cache_for_paths(
+        let result = Self::open_cache_for_paths(
             &self.caches,
             &self.cache_writer_waits,
             &self.cache_open_gates,
-            inspect_dir,
-            project_root,
-        )
+            inspect_dir.clone(),
+            project_root.clone(),
+        );
+        if result.as_ref().map_or_else(
+            |message| message.contains("writer_lease_timeout:"),
+            |cache| cache.waiting_for_writer(),
+        ) {
+            let (dir, identity) = Self::cache_identity(inspect_dir, project_root);
+            self.watch_cache_writer(&dir, identity);
+        }
+        result
+    }
+
+    fn wake_cache_writer_if_available(&self, identity: &InspectCacheIdentity) {
+        wake_cache_writer_if_available(
+            identity,
+            &self.builder_states,
+            &self.cache_writer_waits,
+            &self.caches,
+        );
+    }
+
+    fn watch_cache_writer(&self, dir: &Path, identity: InspectCacheIdentity) {
+        let Ok(mut watches) = self.cache_writer_watches.lock() else {
+            return;
+        };
+        if watches.contains_key(&identity) {
+            return;
+        }
+        let Ok(dir) = std::fs::canonicalize(dir) else {
+            return;
+        };
+        let lease = crate::root_cache::writer_lease_path(&dir);
+        let states = Arc::clone(&self.builder_states);
+        let waits = Arc::clone(&self.cache_writer_waits);
+        let caches = Arc::clone(&self.caches);
+        let watched_identity = identity.clone();
+        #[cfg(test)]
+        let observer = self.cache_writer_watch_observer.lock().unwrap().clone();
+        #[cfg(test)]
+        let event_observer = observer.clone();
+        let watcher = crate::callgraph_store::watch_readiness_directory(&dir, move |event| {
+            if let Ok(event) = event {
+                let release = crate::callgraph_store::refresh_lease_release_event(&event, &lease);
+                if release {
+                    wake_cache_writer_if_available(&watched_identity, &states, &waits, &caches);
+                }
+                #[cfg(test)]
+                if let Some(observer) = &event_observer {
+                    let _ = observer.send(CacheWriterWatchObservation::Activity {
+                        release,
+                        detail: format!(
+                            "event={event:?} lease={} exists={}",
+                            lease.display(),
+                            lease.exists()
+                        ),
+                    });
+                }
+            }
+        });
+        match watcher {
+            Ok(watcher) => {
+                watches.insert(identity, watcher);
+                #[cfg(test)]
+                if let Some(observer) = observer {
+                    let _ = observer.send(CacheWriterWatchObservation::Subscribed);
+                }
+            }
+            Err(error) => {
+                #[cfg(test)]
+                if let Some(observer) = observer {
+                    let _ = observer.send(CacheWriterWatchObservation::Failed(error.to_string()));
+                }
+                crate::slog_debug!(
+                    "inspect lease readiness watch unavailable: {}; using retry timer",
+                    error
+                );
+            }
+        }
     }
 
     fn open_cache_for_paths(
@@ -3028,7 +3281,7 @@ impl InspectManager {
 
         match waiter_rx.recv() {
             Ok(outcome) => filter_outcome_for_scope_with_contributions(
-                None,
+                Some(self),
                 outcome,
                 &snapshot,
                 category,
@@ -3280,8 +3533,10 @@ impl InspectManager {
         snapshot: &InspectSnapshot,
     ) -> JobOutcome {
         match waiter_rx.recv() {
+            // Scoped completions need the shared scan's revision-checked graph
+            // and contribution-checked rollup, not a full projection per waiter.
             Ok(outcome) => filter_outcome_for_scope_with_contributions(
-                None,
+                Some(self),
                 outcome,
                 snapshot,
                 key.category,
@@ -3444,8 +3699,9 @@ impl InspectManager {
         let project_files = scope_files(&snapshot.project_root, &project_scope);
         let current_by_relative = current_project_files(&snapshot.project_root, &project_files);
 
-        let mut records_match = true;
         for record in &cached_records {
+            #[cfg(test)]
+            FRESHNESS_RECORD_VISITS.with(|visits| visits.set(visits.get() + 1));
             let absolute = if record.file_path.is_absolute() {
                 record.file_path.clone()
             } else {
@@ -3454,13 +3710,12 @@ impl InspectManager {
             match verify_contribution_file(&absolute, &record.freshness) {
                 ContributionFreshness::Fresh { .. } => {}
                 ContributionFreshness::Stale | ContributionFreshness::Deleted => {
-                    records_match = false;
+                    return Ok(false);
                 }
             }
         }
 
-        Ok(records_match
-            && current_by_relative.len() == cached_relative.len()
+        Ok(current_by_relative.len() == cached_relative.len()
             && current_by_relative
                 .keys()
                 .all(|relative| cached_relative.contains(relative)))
@@ -3560,6 +3815,14 @@ impl InspectManager {
             return result;
         }
 
+        if job.category == InspectCategory::DeadCode
+            && job.config.indexes.callgraph
+            && !job.config.views.enabled
+            && callgraph_store_busy_for_dead_code(&job.inspect_dir, &job.project_root)
+        {
+            return callgraph_pending_result(&job, started.elapsed());
+        }
+
         let project_scope = JobScope::for_project(job.project_root.clone());
         self.record_build_progress(&job.key, "enumerating checkout source files");
         job.scope_files = scope_files(&job.project_root, &project_scope);
@@ -3655,7 +3918,12 @@ impl InspectManager {
         } else {
             match scan_result {
                 Ok(success) => InspectResult::success(&job, success, started.elapsed()),
-                Err(message) => InspectResult::failed(&job, message, started.elapsed()),
+                Err(Tier2RunError::Failed(message)) => {
+                    InspectResult::failed(&job, message, started.elapsed())
+                }
+                Err(Tier2RunError::CallgraphBusy) => {
+                    callgraph_pending_result(&job, started.elapsed())
+                }
             }
         };
         // Always-on perf line: a full (reuse=miss) scan is the expensive path —
@@ -3804,7 +4072,7 @@ impl InspectManager {
         job: &InspectJob,
         cache: &InspectCache,
         options: &Tier2ReuseOptions,
-    ) -> Result<InspectScanSuccess, String> {
+    ) -> Result<InspectScanSuccess, Tier2RunError> {
         let view_epoch = self.view_publication_epoch(&job.project_root);
         let mut phases = Tier2PhaseTimings::default();
         self.record_build_progress(
@@ -3876,7 +4144,9 @@ impl InspectManager {
 
         for record in cached_records {
             if crate::executor::current_job_cancelled() {
-                return Err("tier2 pass cancelled during freshness scan".to_string());
+                return Err("tier2 pass cancelled during freshness scan"
+                    .to_string()
+                    .into());
             }
             let relative = freshness_record_relative_key(&record);
             let relative_path = PathBuf::from(&relative);
@@ -3940,7 +4210,9 @@ impl InspectManager {
         let dead_code_callgraph_refresh =
             job.category == InspectCategory::DeadCode && !callgraph_refresh_files.is_empty();
         if crate::executor::current_job_cancelled() {
-            return Err("tier2 pass cancelled before incremental scan".to_string());
+            return Err("tier2 pass cancelled before incremental scan"
+                .to_string()
+                .into());
         }
         if !scan_files.is_empty() {
             let mut scan_job = job.clone();
@@ -3959,7 +4231,7 @@ impl InspectManager {
                     options.allow_callgraph_cold_build,
                     options.require_callgraph_snapshot,
                     &callgraph_refresh_files,
-                ) {
+                )? {
                     Some((snapshot, verdict, projection_cost)) => {
                         scan_job.callgraph_snapshot = Some(snapshot);
                         phases.projection = Some(verdict);
@@ -3977,9 +4249,7 @@ impl InspectManager {
             }
             aggregate_job.callgraph_snapshot = scan_job.callgraph_snapshot.clone();
             #[cfg(debug_assertions)]
-            if debug_cold_cache {
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            cold_cache_test_delay(debug_cold_cache, std::thread::sleep);
             let scan_started = Instant::now();
             self.record_build_progress(
                 &job.key,
@@ -4061,7 +4331,9 @@ impl InspectManager {
         }
 
         if crate::executor::current_job_cancelled() {
-            return Err("tier2 pass cancelled before projection refresh".to_string());
+            return Err("tier2 pass cancelled before projection refresh"
+                .to_string()
+                .into());
         }
         let refresh_dead_code_facts = if job.category == InspectCategory::DeadCode {
             dead_code_contributions_need_fact_refresh(cache, job)?
@@ -4097,7 +4369,7 @@ impl InspectManager {
                         options.allow_callgraph_cold_build,
                         options.require_callgraph_snapshot,
                         &callgraph_refresh_files,
-                    ) {
+                    )? {
                         Some((snapshot, verdict, projection_cost)) => {
                             rescan_job.callgraph_snapshot = Some(snapshot);
                             phases.projection = Some(verdict);
@@ -4172,7 +4444,9 @@ impl InspectManager {
         }
 
         if crate::executor::current_job_cancelled() {
-            return Err("tier2 pass cancelled before aggregate projection".to_string());
+            return Err("tier2 pass cancelled before aggregate projection"
+                .to_string()
+                .into());
         }
         if aggregate_job.category == InspectCategory::DeadCode
             && aggregate_job.callgraph_snapshot.is_none()
@@ -4183,7 +4457,7 @@ impl InspectManager {
                 options.allow_callgraph_cold_build,
                 options.require_callgraph_snapshot,
                 &callgraph_refresh_files,
-            ) {
+            )? {
                 Some((snapshot, verdict, projection_cost)) => {
                     aggregate_job.callgraph_snapshot = Some(snapshot);
                     phases.projection = Some(verdict);
@@ -4236,7 +4510,7 @@ impl InspectManager {
                 });
             }
             if options.require_callgraph_snapshot {
-                if let Some(reason) = callgraph_path_identity_gap(job) {
+                if let Some(reason) = callgraph_path_identity_gap(job)? {
                     return Ok(InspectScanSuccess {
                         scanned_files: scan_files,
                         contributions: Vec::new(),
@@ -4266,12 +4540,13 @@ impl InspectManager {
                 return Err(format!(
                     "tier2 dead_code aggregate did not complete; builder_state={}",
                     self.builder_state_detail_for_job(job)
-                ));
+                )
+                .into());
             }
         }
         let rollup_started = Instant::now();
         if crate::executor::current_job_cancelled() {
-            return Err("tier2 pass cancelled before rollup".to_string());
+            return Err("tier2 pass cancelled before rollup".to_string().into());
         }
         if aggregate_job.category == InspectCategory::DeadCode {
             // This pass reached a rollup, so dead code is not borrow-only
@@ -4353,7 +4628,7 @@ impl InspectManager {
             roll_up_tier2_contributions(&aggregate_job, &contributions)
         };
         if crate::executor::current_job_cancelled() {
-            return Err("tier2 pass cancelled after rollup".to_string());
+            return Err("tier2 pass cancelled after rollup".to_string().into());
         }
         cache
             .store_tier2_aggregate(job.key.clone(), &contribution_set_hash, aggregate.clone())
@@ -4682,6 +4957,10 @@ impl InspectManager {
         let Ok(success) = &result.outcome else {
             return Ok(());
         };
+        // Pending observations are renderable gaps, not reusable scan results.
+        if success.aggregate["status"] == "pending" {
+            return Ok(());
+        }
         let cache = Self::open_cache_for_paths(
             caches,
             writer_waits,
@@ -4759,6 +5038,15 @@ struct Tier2PhaseTimings {
 }
 
 const TIER2_WORK_LOG_THRESHOLD: Duration = Duration::from_millis(50);
+
+#[cfg(debug_assertions)]
+// Timing fixtures are built with Cargo's test-timing-hooks feature to request
+// this artificial delay. Ordinary debug builds do not enable that feature.
+fn cold_cache_test_delay(cold: bool, sleep: impl FnOnce(Duration)) {
+    if cold && cfg!(feature = "test-timing-hooks") {
+        sleep(Duration::from_millis(10));
+    }
+}
 
 fn projection_estimator_duration(phases: &Tier2PhaseTimings) -> Duration {
     // Projection journal files are the denominator used by the cost model.
@@ -5153,6 +5441,7 @@ fn build_tier2_callgraph_snapshot(
     allow_cold_build: bool,
 ) -> Option<Arc<CallgraphSnapshot>> {
     build_tier2_callgraph_snapshot_with_refresh_inner(job, allow_cold_build, false, &[], None)
+        .expect("test snapshot readiness")
         .map(|(snapshot, _, _)| snapshot)
 }
 
@@ -5169,6 +5458,7 @@ fn build_tier2_callgraph_snapshot_with_refresh(
         refresh_paths,
         None,
     )
+    .expect("test snapshot readiness")
     .map(|(snapshot, _, _)| snapshot)
 }
 
@@ -5288,27 +5578,27 @@ fn refresh_writable_dead_code_store(
     }
 }
 
-fn callgraph_path_identity_gap(job: &InspectJob) -> Option<String> {
+fn callgraph_path_identity_gap(job: &InspectJob) -> Result<Option<String>, CallGraphStoreError> {
     if job.config.views.enabled {
-        return None;
+        return Ok(None);
     }
     for callgraph_dir in callgraph_store_dirs_from_inspect_dir(&job.inspect_dir, &job.project_root)
     {
-        let Ok(Some(store)) =
-            CallGraphStore::open_readonly(callgraph_dir, job.project_root.clone())
-        else {
-            continue;
+        let store = match CallGraphStore::open_readonly(callgraph_dir, job.project_root.clone()) {
+            Ok(Some(store)) => store,
+            Err(error) if error.is_transient_lock_contention() => return Err(error),
+            _ => continue,
         };
-        let Err(CallGraphStoreError::Unavailable(reason)) =
-            project_dead_code_snapshot_with_revision(store.sqlite_path())
-        else {
-            continue;
+        let reason = match project_dead_code_snapshot_with_revision(store.sqlite_path()) {
+            Err(CallGraphStoreError::Unavailable(reason)) => reason,
+            Err(error) if error.is_transient_lock_contention() => return Err(error),
+            _ => continue,
         };
         if reason.starts_with("callgraph_path_identity_mismatch ") {
-            return Some(reason);
+            return Ok(Some(reason));
         }
     }
-    None
+    Ok(None)
 }
 
 fn open_writable_dead_code_store(
@@ -5389,8 +5679,7 @@ fn current_view_projection_result(
 ) -> Result<(ReadonlyCallGraphStore, String), CheckoutViewUnavailable> {
     let result = (|| -> Result<(ReadonlyCallGraphStore, String), CheckoutViewUnavailable> {
         let storage = config
-            .storage_dir
-            .clone()
+            .cache_storage_dir()
             .or_else(|| {
                 callgraph_store_dir_from_inspect_dir(inspect_dir, project_root)
                     .and_then(|path| path.parent()?.parent().map(Path::to_path_buf))
@@ -5515,16 +5804,6 @@ fn current_view_projection_result(
     result
 }
 
-/// The reader Tier-2 dead-code projection uses for `project_root`'s published
-/// view, for tests that compare it with an independent build.
-#[cfg(test)]
-pub(crate) fn current_view_projection_store_for_test(
-    project_root: &Path,
-    config: &crate::config::Config,
-) -> Option<(ReadonlyCallGraphStore, String)> {
-    current_view_projection_store(project_root, Path::new(""), config, &[])
-}
-
 fn build_view_callgraph_snapshot(
     job: &InspectJob,
     projection_cache: Option<&InspectManager>,
@@ -5598,17 +5877,21 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
     build_if_missing: bool,
     refresh_paths: &[PathBuf],
     projection_cache: Option<&InspectManager>,
-) -> Option<(Arc<CallgraphSnapshot>, ProjectionVerdict, Duration)> {
+) -> Result<Option<(Arc<CallgraphSnapshot>, ProjectionVerdict, Duration)>, CallGraphStoreError> {
     let started = Instant::now();
     if !job.config.indexes.callgraph {
         crate::slog_info!(
             "tier2 dead_code: callgraph store disabled; reporting callgraph_unavailable"
         );
-        return None;
+        return Ok(None);
     }
 
     if job.config.views.enabled {
-        return build_view_callgraph_snapshot(job, projection_cache, refresh_paths);
+        return Ok(build_view_callgraph_snapshot(
+            job,
+            projection_cache,
+            refresh_paths,
+        ));
     }
 
     let callgraph_dirs = callgraph_store_dirs_from_inspect_dir(&job.inspect_dir, &job.project_root);
@@ -5617,7 +5900,7 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
             "tier2 dead_code: inspect_dir has no root-keyed storage parent ({}); reporting callgraph_unavailable",
             job.inspect_dir.display()
         );
-        return None;
+        return Ok(None);
     };
     for callgraph_dir in &callgraph_dirs {
         match CallGraphStore::cold_build_suspension(callgraph_dir, &job.project_root) {
@@ -5633,7 +5916,7 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
                     suspension.domain.as_str(),
                     suspension.death_count
                 );
-                return None;
+                return Ok(None);
             }
             Ok(None) => {}
             Err(error) => {
@@ -5718,6 +6001,7 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
                     );
                     continue;
                 }
+                Err(error) if error.is_transient_lock_contention() => return Err(error),
                 Err(error) => {
                     crate::slog_warn!(
                         "tier2 dead_code: failed to open callgraph store read-only at {}: {}; trying fallback={}",
@@ -5755,6 +6039,7 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
                         );
                         continue;
                     }
+                    Err(error) if error.is_transient_lock_contention() => return Err(error),
                     Err(error) => {
                         crate::slog_warn!(
                             "tier2 dead_code: failed to open callgraph writer at {}: {}; trying fallback={}",
@@ -5785,6 +6070,7 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
                     );
                     continue;
                 }
+                Err(error) if error.is_transient_lock_contention() => return Err(error),
                 Err(error) => {
                     crate::slog_warn!(
                         "tier2 dead_code: failed to open callgraph writer at {}: {}; trying fallback={}",
@@ -5803,6 +6089,7 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
 
         let cache_identity = match projection_store.current_projection_identity(&job.project_root) {
             Ok(identity) => identity,
+            Err(error) if error.is_transient_lock_contention() => return Err(error),
             Err(error) => {
                 crate::slog_warn!(
                     "tier2 dead_code: failed to read callgraph projection identity at {}: {}; trying fallback={}",
@@ -5819,7 +6106,7 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
             // graph mutation. Equal identities therefore prove identical store
             // bytes for dead-code projection: this cache is exact, not heuristic.
             if let Some(snapshot) = cache.cached_callgraph_projection(identity) {
-                return Some((
+                return Ok(Some((
                     snapshot,
                     ProjectionVerdict {
                         kind: ProjectionKind::Reused,
@@ -5828,7 +6115,7 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
                         changed_files: 0,
                     },
                     Duration::ZERO,
-                ));
+                )));
             }
         } else if cache_identity.is_none() {
             // Stores from older binaries lack a durable revision, so keeping an
@@ -5863,6 +6150,7 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
                     );
                     continue;
                 }
+                Err(error) if error.is_transient_lock_contention() => return Err(error),
                 Err(error) => {
                     crate::slog_warn!(
                         "tier2 dead_code: callgraph store projection failed at {}: {}; trying fallback={}",
@@ -5898,14 +6186,14 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
             started.elapsed().as_millis()
         );
 
-        return Some((snapshot, verdict, projection_cost));
+        return Ok(Some((snapshot, verdict, projection_cost)));
     }
 
     crate::slog_info!(
         "tier2 dead_code: no ready callgraph store found for inspect_dir {}; reporting callgraph_unavailable",
         job.inspect_dir.display()
     );
-    None
+    Ok(None)
 }
 
 fn estimate_callgraph_snapshot_bytes(snapshot: &CallgraphSnapshot) -> u64 {
@@ -6245,12 +6533,20 @@ fn scoped_tier2_payload_from_contributions(
     project_payload: Value,
     scope: &JobScope,
 ) -> Result<Value, String> {
-    if scope.is_project_wide() {
+    // A pending pass scanned no current graph. A later unlock cannot make its
+    // cached source contributions into a completed scoped analysis.
+    if scope.is_project_wide() || project_payload["status"] == "pending" {
         return Ok(project_payload);
     }
 
     let project_scope = JobScope::for_project(snapshot.project_root.clone());
-    let rollup_job = scoped_tier2_rollup_job(manager, snapshot, category, &project_scope);
+    let rollup_job = match scoped_tier2_rollup_job(manager, snapshot, category, &project_scope) {
+        Ok(job) => job,
+        Err(error) if error.is_transient_lock_contention() => {
+            return Ok(callgraph_pending_payload())
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     let contributions = load_contributions(cache, &rollup_job)?;
     if let (Some(manager), Some(graph)) = (manager, rollup_job.callgraph_snapshot.as_deref()) {
         let cache_key = cache
@@ -6302,7 +6598,7 @@ fn scoped_tier2_rollup_job(
     snapshot: &InspectSnapshot,
     category: InspectCategory,
     scope: &JobScope,
-) -> InspectJob {
+) -> Result<InspectJob, CallGraphStoreError> {
     let mut job = InspectJob {
         job_id: 0,
         key: JobKey::for_project_category(category),
@@ -6328,12 +6624,13 @@ fn scoped_tier2_rollup_job(
         // contributions. Use a real ready store snapshot when one exists; if no
         // snapshot is available, leave it absent so the rollup reports degraded
         // callgraph_unavailable instead of treating an empty graph as truth.
-        job.callgraph_snapshot =
+        job.callgraph_snapshot = retry_dead_code_store_read(|| {
             build_tier2_callgraph_snapshot_with_refresh_inner(&job, false, false, &[], manager)
-                .map(|(snapshot, _, _)| snapshot);
+        })?
+        .map(|(snapshot, _, _)| snapshot);
     }
 
-    job
+    Ok(job)
 }
 
 fn roll_up_dead_code_contributions(
@@ -7071,6 +7368,16 @@ fn filter_outcome_for_scope_with_contributions(
     cache: &(impl InspectCacheRead + ?Sized),
     scope: &JobScope,
 ) -> JobOutcome {
+    // Fresh source files do not establish graph liveness while its store is busy.
+    if category == InspectCategory::DeadCode
+        && snapshot.config.indexes.callgraph
+        && !snapshot.config.views.enabled
+        && callgraph_store_busy_for_dead_code(&snapshot.inspect_dir, &snapshot.project_root)
+    {
+        return JobOutcome::Fresh {
+            payload: callgraph_pending_payload(),
+        };
+    }
     if !category.is_tier2() || scope.is_project_wide() {
         return filter_outcome_for_scope(outcome, scope);
     }
@@ -7557,11 +7864,30 @@ fn display_file_from_occurrence(value: &str) -> &str {
 }
 
 #[cfg(test)]
+thread_local! {
+    static FRESHNESS_RECORD_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 // Some tests here are `cfg(debug_assertions)` (they lean on debug-only seams);
 // helpers only they use read as dead in release-profile test builds.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 mod guard_tests {
     use super::*;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn audit05_debug_cold_scans_use_only_opt_in_delay() {
+        let requested = std::cell::Cell::new(None);
+        cold_cache_test_delay(true, |duration| requested.set(Some(duration)));
+        assert_eq!(
+            requested.get(),
+            cfg!(feature = "test-timing-hooks").then_some(Duration::from_millis(10))
+        );
+        cold_cache_test_delay(false, |_| {
+            panic!("warm scans never request a fixture delay")
+        });
+    }
 
     fn write_ts_project(file_count: usize) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -7720,6 +8046,7 @@ mod guard_tests {
 
     include!("view_projection_tests.rs");
     include!("completion_perf_tests.rs");
+    include!("tier2_refresh_perf_tests.rs");
 
     fn published_projection_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, InspectJob) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -8340,6 +8667,89 @@ mod guard_tests {
     }
 
     #[test]
+    fn inspect_dead_code_busy_callgraph_reports_pending() {
+        let dir = write_ts_project(3);
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let inspect_dir = root.join(".aft-cache").join("inspect");
+        let callgraph_dir = callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).unwrap();
+        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        let (store, _) =
+            CallGraphStore::cold_build_with_lease(callgraph_dir, root.clone(), &files).unwrap();
+        let blocker = store.lock_readiness_for_test();
+        drop(store);
+        let mut job = snapshot_job(&root, &inspect_dir, true);
+        job.scope_files = files;
+        job.callgraph_writer = false;
+        let manager = InspectManager::new();
+        let result = manager.tier2_run_with_reuse_job_result(job.clone());
+        InspectManager::store_completion(
+            &manager.caches,
+            &manager.cache_writer_waits,
+            &manager.cache_open_gates,
+            &result,
+        )
+        .unwrap();
+        assert!(
+            manager.caches.lock().unwrap().is_empty(),
+            "pending must not create a reusable cache"
+        );
+        let outcome = manager.completion_outcome(result);
+        assert!(matches!(
+            builder_attempt_terminal(&outcome),
+            BuilderAttemptTerminal::Inconclusive
+        ));
+        let payload = outcome.payload().expect("pending payload");
+        assert_eq!(payload["status"], "pending", "{outcome:?}");
+        assert_eq!(payload["complete"], false, "{outcome:?}");
+        assert!(payload.get("count").is_none(), "{outcome:?}");
+        assert!(payload.get("items").is_none(), "{outcome:?}");
+        let snapshot = InspectSnapshot::new(
+            root.clone(),
+            inspect_dir,
+            Arc::clone(&job.config),
+            Arc::clone(&job.symbol_cache),
+        );
+        let cache = manager.cache_for_snapshot(&snapshot).unwrap();
+        let cached = filter_outcome_for_scope_with_contributions(
+            Some(&manager),
+            JobOutcome::Fresh {
+                payload: json!({"count": 0, "items": [], "complete": true}),
+            },
+            &snapshot,
+            InspectCategory::DeadCode,
+            cache.as_ref(),
+            &JobScope::for_project(root.clone()),
+        );
+        assert_eq!(
+            cached.payload().unwrap()["status"],
+            "pending",
+            "a cached project-wide zero cannot bypass a busy graph: {cached:?}"
+        );
+        assert!(cached.payload().unwrap().get("count").is_none());
+        blocker.execute_batch("ROLLBACK").unwrap();
+        let scoped = filter_outcome_for_scope_with_contributions(
+            Some(&manager),
+            outcome,
+            &snapshot,
+            InspectCategory::DeadCode,
+            cache.as_ref(),
+            &JobScope::from_roots(root.clone(), vec![root.join("file0.ts")]),
+        );
+        assert_eq!(
+            scoped.payload().unwrap()["status"],
+            "pending",
+            "unlock cannot complete unscanned facts: {scoped:?}"
+        );
+        assert!(scoped.payload().unwrap().get("count").is_none());
+        let ready = manager.completion_outcome(manager.tier2_run_with_reuse_job_result(job));
+        assert_eq!(
+            ready.payload().unwrap()["callgraph_available"],
+            true,
+            "{ready:?}"
+        );
+    }
+
+    #[test]
     fn explicit_inspect_five_categories_share_one_permit_acquisition() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = std::fs::canonicalize(dir.path()).expect("canonical fixture root");
@@ -8461,7 +8871,10 @@ mod guard_tests {
             outcome_tx.send(outcome).expect("send inspect outcome");
         });
 
-        let deadline = Instant::now() + Duration::from_secs(3);
+        // The inspect thread opens its cache and checks for a reusable result
+        // before it reaches the seed gate; a loaded Windows runner needed more
+        // than 3 s for that. The gate itself is what the test checks.
+        let deadline = Instant::now() + Duration::from_secs(30);
         while manager.tier2_builder_state(InspectCategory::DeadCode)
             != InspectBuilderState::GatedBySemanticSeed
         {
@@ -8469,7 +8882,7 @@ mod guard_tests {
                 Instant::now() < deadline,
                 "inspect must queue while the active seed owns the slot"
             );
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(5));
         }
         assert!(
             outcome_rx.try_recv().is_err(),
@@ -8582,14 +8995,26 @@ mod guard_tests {
             outcome_tx.send(outcome).expect("send rebound outcome");
         });
 
+        // Cache reopening and source checks can be slow on a busy runner. Holding
+        // the only cold slot until the reply, not a short deadline, proves bypass.
         let rebound = outcome_rx
-            .recv_timeout(Duration::from_secs(3))
-            .expect("unchanged persisted aggregate bypasses the occupied cold-build queue");
+            .recv_timeout(Duration::from_secs(60))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "unchanged persisted aggregate bypasses the occupied cold-build queue: \
+                     {error:?}; cold limiter: {:?}",
+                    limiter.census()
+                )
+            });
         assert!(rebound.payload().is_some());
         assert_eq!(
             limiter.admission_events().len(),
             events_before,
             "quick reuse must not request an interactive cold-build permit"
+        );
+        assert!(
+            limiter.try_acquire().is_none(),
+            "maintenance must still own the only cold slot when quick reuse replies"
         );
         drop(maintenance);
         assert_eq!(
@@ -9197,7 +9622,9 @@ export function bannerUnused() {}
         drop(store);
 
         let job = snapshot_job(&root, &inspect_dir, true);
-        let reason = callgraph_path_identity_gap(&job).expect("durable path identity gap");
+        let reason = callgraph_path_identity_gap(&job)
+            .unwrap()
+            .expect("durable path identity gap");
         assert!(reason.contains("callgraph_path_identity_mismatch"));
         assert!(reason.contains(&foreign.display().to_string()));
         let aggregate =
@@ -9900,6 +10327,254 @@ export function bannerUnused() {}
         (dir, root, InspectManager::new(), snapshot)
     }
 
+    fn seed_dead_code_fact_cache(
+        manager: &InspectManager,
+        snapshot: &InspectSnapshot,
+    ) -> (InspectJob, Arc<InspectCache>) {
+        let mut job = manager.tier2_reuse_job(snapshot.clone(), InspectCategory::DeadCode, None);
+        job.scope_files = scope_files(
+            &job.project_root,
+            &JobScope::for_project(job.project_root.clone()),
+        );
+        let (graph, _, _) = manager
+            .build_tier2_callgraph_snapshot_with_refresh_and_verdict(&job, false, true, &[])
+            .unwrap()
+            .expect("ready fixture call graph");
+        job.callgraph_snapshot = Some(graph);
+        let facts = run_tier2_scan(&job, None).outcome.expect("seed file facts");
+        let cache = manager.cache_for_snapshot(snapshot).expect("inspect cache");
+        // Seed only per-file facts: no project aggregate has been published yet.
+        cache
+            .apply_contribution_updates_for_config(
+                job.category,
+                Tier2ContributionUpdates {
+                    upserts: facts.contributions,
+                    ..Tier2ContributionUpdates::default()
+                },
+                &job.config,
+            )
+            .unwrap();
+        assert!(cache
+            .get_aggregated_for_config(&job.key, &job.config)
+            .unwrap()
+            .is_none());
+        (job, cache)
+    }
+
+    fn corrupt_cached_dead_code_exports(cache: &InspectCache, file: &str, corruption: &str) {
+        let expected = canonicalize_for_snapshot(&cache.project_root().join(file));
+        // Match fixture aliases by identity, but bind the producer's exact SQL
+        // key spelling, including native Windows separators, without rewriting it.
+        let file = cache
+            .contribution_freshness(InspectCategory::DeadCode)
+            .unwrap()
+            .into_iter()
+            .find(|(path, _)| {
+                canonicalize_for_snapshot(&cache.project_root().join(path)) == expected
+            })
+            .expect("seeded facts must contain the fixture source")
+            .0
+            .to_string_lossy()
+            .into_owned();
+        let conn = rusqlite::Connection::open(cache.sqlite_path()).unwrap();
+        let blob: Vec<u8> = conn
+            .query_row(
+                "SELECT contribution FROM tier2_contributions \
+                 WHERE category = 'dead_code' AND project_key = ?1 AND file_path = ?2",
+                rusqlite::params![cache.project_key(), file],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut facts: Value = serde_json::from_slice(&blob).unwrap();
+        assert!(facts["exports"].is_array());
+        assert_eq!(
+            facts["facts_format_version"],
+            super::super::scanners::dead_code::DEAD_CODE_FACTS_FORMAT_VERSION
+        );
+        match corruption {
+            "missing exports" => {
+                facts.as_object_mut().unwrap().remove("exports");
+            }
+            "invalid exports" => facts["exports"] = json!("damaged exports"),
+            _ => panic!("unknown corruption: {corruption}"),
+        }
+        // Leave file hashes, freshness and fact-version metadata intact. Only
+        // the cached fact body is damaged, not the source or its cache key.
+        assert_eq!(
+            conn.execute(
+                "UPDATE tier2_contributions SET contribution = ?3 \
+                 WHERE category = 'dead_code' AND project_key = ?1 AND file_path = ?2",
+                rusqlite::params![
+                    cache.project_key(),
+                    file,
+                    serde_json::to_vec(&facts).unwrap()
+                ],
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    fn assert_cached_dead_code_gap(payload: &Value, file: &str) {
+        assert_eq!(payload["complete"], false, "{payload:#}");
+        assert_eq!(
+            payload["parse_errors"],
+            json!([{
+                "file": file,
+                "message": "cached dead-code contribution could not be decoded",
+            }])
+        );
+    }
+
+    #[test]
+    fn dead_code_cache_gap_before_rollup_survives_project_reuse() {
+        for corruption in ["missing exports", "invalid exports"] {
+            let (_dir, root, manager, snapshot) = dead_code_edge_case_fixture(&[]);
+            let (job, cache) = seed_dead_code_fact_cache(&manager, &snapshot);
+            corrupt_cached_dead_code_exports(&cache, "src/./main.rs", corruption);
+            let first = manager
+                .tier2_run_with_reuse_job_result_with_options(
+                    job.clone(),
+                    Tier2ReuseOptions::default(),
+                    None,
+                )
+                .outcome
+                .expect("initial project rollup")
+                .aggregate;
+            assert_cached_dead_code_gap(&first, "src/main.rs");
+            assert!(aggregate_has_file_symbol(
+                &first,
+                "src/dead.rs",
+                "planted_dead"
+            ));
+            assert_eq!(
+                cache
+                    .get_aggregated_for_config(&job.key, &job.config)
+                    .unwrap(),
+                Some(first.clone())
+            );
+
+            super::super::cache::CONTRIBUTION_LOAD_WORK.with(|work| work.set((0, 0, 0)));
+            let reused = manager
+                .tier2_quick_reuse_success(&job, &cache, &Tier2ReuseOptions::default())
+                .unwrap()
+                .expect("unchanged project must reuse its saved aggregate");
+            assert_eq!(
+                super::super::cache::CONTRIBUTION_LOAD_WORK.with(std::cell::Cell::get),
+                (0, 0, 0),
+                "reuse must not decode contribution bodies"
+            );
+            assert_cached_dead_code_gap(&reused.aggregate, "src/main.rs");
+            assert_eq!(reused.aggregate, first);
+
+            // Fresh describes source freshness, not analysis completeness. Both
+            // writer and read-only project lookups must retain the saved gap.
+            let scope = JobScope::for_project(root);
+            for outcome in [
+                manager.tier2_read_cached(snapshot.clone(), job.category, scope.clone()),
+                manager.tier2_read_cached_readonly(snapshot.clone(), job.category, scope),
+            ] {
+                let payload = fresh_payload(outcome);
+                assert_cached_dead_code_gap(&payload, "src/main.rs");
+                assert_eq!(payload, first);
+            }
+        }
+    }
+
+    #[test]
+    fn dead_code_cache_gap_after_rollup_waits_until_recompute() {
+        for corruption in ["missing exports", "invalid exports"] {
+            let (_dir, root, manager, snapshot) = dead_code_edge_case_fixture(&[]);
+            let (job, cache) = seed_dead_code_fact_cache(&manager, &snapshot);
+            let first = manager
+                .tier2_run_with_reuse_job_result_with_options(
+                    job.clone(),
+                    Tier2ReuseOptions::default(),
+                    None,
+                )
+                .outcome
+                .expect("successful initial project rollup")
+                .aggregate;
+            assert_eq!(first["complete"], true);
+            assert!(aggregate_has_file_symbol(
+                &first,
+                "src/dead.rs",
+                "planted_dead"
+            ));
+            let original_hash = cache
+                .contribution_set_hash_for_config(job.category, &job.config)
+                .unwrap();
+            corrupt_cached_dead_code_exports(&cache, "src/../src/dead.rs", corruption);
+            assert_eq!(
+                cache
+                    .contribution_set_hash_for_config(job.category, &job.config)
+                    .unwrap(),
+                original_hash,
+                "fact-body damage does not change the analyzed source hashes"
+            );
+            let reused = manager
+                .tier2_quick_reuse_success(&job, &cache, &Tier2ReuseOptions::default())
+                .unwrap()
+                .expect("unchanged source findings remain reusable");
+            assert_eq!(reused.aggregate, first);
+            assert_eq!(
+                fresh_payload(manager.tier2_read_cached(
+                    snapshot.clone(),
+                    job.category,
+                    JobScope::for_project(root.clone()),
+                )),
+                first
+            );
+
+            // A manifest change invalidates the aggregate key without reparsing
+            // the unchanged Rust file, so the next rollup must read its bad row.
+            let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+            write_fixture_file(
+                &root,
+                "Cargo.toml",
+                &format!("{manifest}\n# refresh rollup\n"),
+                3_200_000_050,
+            );
+            assert_ne!(
+                cache
+                    .contribution_set_hash_for_config(job.category, &job.config)
+                    .unwrap(),
+                original_hash
+            );
+            assert!(manager
+                .tier2_quick_reuse_success(&job, &cache, &Tier2ReuseOptions::default())
+                .unwrap()
+                .is_none());
+            let recomputed = manager
+                .tier2_run_with_reuse_job_result_with_options(
+                    job,
+                    Tier2ReuseOptions::default(),
+                    None,
+                )
+                .outcome
+                .expect("recompute after manifest change");
+            let scanned = recomputed
+                .scanned_files
+                .iter()
+                .map(|file| canonicalize_for_snapshot(file))
+                .collect::<BTreeSet<_>>();
+            assert!(
+                scanned.contains(&canonicalize_for_snapshot(&root.join("Cargo.toml"))),
+                "the changed manifest must be recognized among the rescanned files"
+            );
+            assert!(
+                !scanned.contains(&canonicalize_for_snapshot(&root.join("src/dead.rs"))),
+                "the corrupted row must not be repaired by rescanning its unchanged source"
+            );
+            assert_cached_dead_code_gap(&recomputed.aggregate, "src/dead.rs");
+            assert!(!aggregate_has_file_symbol(
+                &recomputed.aggregate,
+                "src/dead.rs",
+                "planted_dead"
+            ));
+        }
+    }
+
     /// Runs one dead-code pass over an edge-case fixture and checks the rollup
     /// completes with every walked file covered by stored facts.
     fn assert_dead_code_rollup_completes_with(extra: &[(&str, &str)]) -> Value {
@@ -10194,6 +10869,18 @@ export function bannerUnused() {}
         let (_dir, manager, snapshot, scope, files) = duplicate_cache_fixture();
         std::fs::remove_file(&files[0]).expect("delete cached contribution file");
         assert_stale(manager.tier2_read_cached(snapshot, InspectCategory::Duplicates, scope));
+    }
+
+    #[test]
+    fn audit05_freshness_stops_after_first_mismatch() {
+        let (_dir, manager, snapshot, _scope, files) = duplicate_cache_fixture();
+        std::fs::remove_file(&files[1]).unwrap();
+        let cache = manager.cache_for_snapshot(&snapshot).unwrap();
+        FRESHNESS_RECORD_VISITS.with(|visits| visits.set(0));
+        assert!(!manager
+            .tier2_cached_aggregate_is_fresh(&snapshot, InspectCategory::Duplicates, cache.as_ref())
+            .unwrap());
+        assert_eq!(FRESHNESS_RECORD_VISITS.with(|visits| visits.get()), 1);
     }
 
     fn duplicate_cache_fixture() -> (
@@ -11782,6 +12469,24 @@ export function main() { foo(); }
     }
 
     #[test]
+    fn audit05_oversized_projection_preserves_other_roots() {
+        let first: Arc<ProjectionSlot> = Arc::new(Mutex::new(None));
+        let oversized: Arc<ProjectionSlot> = Arc::new(Mutex::new(None));
+        let mut fleet = ProjectionFleet::default();
+        fleet.admit(PathBuf::from("first"), Arc::downgrade(&first), 40, 100);
+        fleet.admit(
+            PathBuf::from("oversized"),
+            Arc::downgrade(&oversized),
+            101,
+            100,
+        );
+        assert!(fleet.entries.contains_key(Path::new("first")));
+        assert!(!fleet.entries.contains_key(Path::new("oversized")));
+        assert_eq!(fleet.bytes, 40);
+        assert_eq!(fleet.drops, 1);
+    }
+
+    #[test]
     fn projection_estimator_and_verdict_report_only_projection_work() {
         let phases = Tier2PhaseTimings {
             snapshot: Duration::from_millis(2_620),
@@ -12418,18 +13123,16 @@ mod tier2_unreadable_source_tests {
         );
 
         drop(held);
-        // Advance both the resource deadline and the cache-open backoff, not the
-        // input epoch. A lease release needs no watcher edit to permit a retry.
+        // This checks resource retry state, not native notification latency.
+        // Advance both retry clocks without manufacturing an input change.
+        manager.expire_tier2_resource_waits_for_test();
         for (retry_at, _) in manager.cache_writer_waits.lock().unwrap().values_mut() {
             *retry_at = Instant::now();
         }
-        manager
-            .builder_states
-            .lock()
-            .unwrap()
-            .get_mut(&key)
-            .unwrap()
-            .resource_retry_at = Some((Instant::now(), unix_millis_now()));
+        assert!(
+            manager.tier2_resource_wait(category).is_none(),
+            "the controlled resource deadline must permit retry"
+        );
         // The serial worker publishes its completion (removing the category
         // from `in_flight`) before it drops its cold-build limiter permit. While
         // that permit is being torn down, a same-root admission is refused and
@@ -12466,6 +13169,134 @@ mod tier2_unreadable_source_tests {
     }
 
     #[test]
+    fn writer_lease_release_native_watch_acknowledges_retry() {
+        let (_dir, root, snapshot) = fixture();
+        let project_dir = snapshot
+            .inspect_dir
+            .join(crate::path_identity::project_scope_key(&root));
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let held = crate::fs_lock::try_acquire(
+            &crate::root_cache::writer_lease_path(&project_dir),
+            Duration::ZERO,
+        )
+        .unwrap();
+        let manager = InspectManager::new();
+        let (events, received) = crossbeam_channel::unbounded();
+        *manager.cache_writer_watch_observer.lock().unwrap() = Some(events);
+        let error = manager
+            .cache_for_paths(snapshot.inspect_dir.clone(), root.clone())
+            .err()
+            .expect("live writer excludes the cache open");
+        assert!(error.contains("writer_lease_timeout:"), "{error}");
+        let category = InspectCategory::Complexity;
+        let key = JobKey::for_project_category(category);
+        manager.record_flight_start(&key);
+        manager.record_builder_attempt_outcome(&key, &JobOutcome::Failed { message: error });
+        assert!(manager.tier2_resource_wait(category).is_some());
+        let mut active = false;
+        loop {
+            match received
+                .recv_timeout(Duration::from_secs(5))
+                .expect("watch subscription acknowledgement")
+            {
+                CacheWriterWatchObservation::Subscribed => break,
+                CacheWriterWatchObservation::Failed(error) => {
+                    panic!("native watch subscription failed: {error}")
+                }
+                CacheWriterWatchObservation::Activity { .. } => active = true,
+            }
+        }
+        // Prove the OS stream is delivering before releasing the lease. Merely
+        // constructing a watcher does not establish that event ordering.
+        std::fs::write(project_dir.join(".readiness-probe"), b"ready").unwrap();
+        while !active {
+            match received
+                .recv_timeout(Duration::from_secs(5))
+                .expect("native watch activity acknowledgement")
+            {
+                CacheWriterWatchObservation::Activity { .. } => active = true,
+                CacheWriterWatchObservation::Failed(error) => {
+                    panic!("native watch failed: {error}")
+                }
+                CacheWriterWatchObservation::Subscribed => {}
+            }
+        }
+        assert!(
+            manager.tier2_resource_wait(category).is_some(),
+            "activity must not release a live holder"
+        );
+        drop(held);
+        assert!(
+            !crate::root_cache::writer_lease_path(&project_dir).exists(),
+            "held lease must have been removed"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut activity = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match received
+                .recv_timeout(remaining)
+                .unwrap_or_else(|error| panic!("native lease release callback acknowledgement: {error:?}; observed={activity:?}"))
+            {
+                CacheWriterWatchObservation::Activity { release: true, detail } => {
+                    eprintln!("acknowledged lease release: {detail}");
+                    break;
+                }
+                CacheWriterWatchObservation::Activity { detail, .. } => activity.push(detail),
+                CacheWriterWatchObservation::Failed(error) => {
+                    panic!("native watch failed: {error}")
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            manager.tier2_resource_wait(category).is_none(),
+            "the acknowledged callback must make the retry due"
+        );
+        assert_eq!(manager.tier2_input_epoch.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cache_writer_wait_backoff_doubles_caps_and_resets() {
+        let (_dir, root, _snapshot) = fixture();
+        let manager = InspectManager::new();
+        let key = JobKey::for_project_category(InspectCategory::Complexity);
+        let timeout = JobOutcome::Failed {
+            message: "writer_lease_timeout: inspect writer lease deadline elapsed".into(),
+        };
+        for seconds in [30, 60, 120, 240, 480, 960, 1800, 1800] {
+            manager.record_flight_start(&key);
+            manager.record_builder_attempt_outcome(&key, &timeout);
+            let states = manager.builder_states.lock().unwrap();
+            let retry_at = states[&key].resource_retry_at.unwrap().0;
+            let remaining = retry_at.saturating_duration_since(Instant::now());
+            assert!(remaining <= Duration::from_secs(seconds), "{remaining:?}");
+            assert!(
+                remaining > Duration::from_secs(seconds - 1),
+                "{remaining:?}"
+            );
+        }
+        assert!(
+            manager.note_tier2_input_paths_changed(Some(&root), [root.join("source.ts").as_path()])
+        );
+        manager.record_flight_start(&key);
+        manager.record_builder_attempt_outcome(&key, &timeout);
+        let after_input = manager.builder_states.lock().unwrap()[&key]
+            .resource_retry_at
+            .unwrap()
+            .0;
+        assert!(after_input <= Instant::now() + Duration::from_secs(30));
+        manager.record_builder_attempt_outcome(&key, &JobOutcome::Fresh { payload: json!({}) });
+        manager.record_flight_start(&key);
+        manager.record_builder_attempt_outcome(&key, &timeout);
+        let after_success = manager.builder_states.lock().unwrap()[&key]
+            .resource_retry_at
+            .unwrap()
+            .0;
+        assert!(after_success <= Instant::now() + Duration::from_secs(30));
+    }
+
+    #[test]
     fn repeated_lease_waits_are_bounded_and_explicit_inspect_bypasses_them() {
         let (_dir, root, snapshot) = fixture();
         let manager = Arc::new(InspectManager::new());
@@ -12488,7 +13319,7 @@ mod tier2_unreadable_source_tests {
             let entry = &states[&key];
             let retry_at = entry.resource_retry_at.unwrap().0;
             assert!(retry_at > Instant::now());
-            assert!(retry_at <= Instant::now() + Duration::from_secs(30));
+            assert!(retry_at <= Instant::now() + Duration::from_secs(30 * 60));
             assert!(entry.retry_paused_until.is_none());
             assert!(entry.last_failure.is_none());
         }

@@ -130,6 +130,32 @@ pub(crate) const fn default_bash_worker_wait_max_ms() -> u64 {
 
 use crate::harness::Harness;
 
+/// Open a configuration file for reading.
+///
+/// On Windows a plain open asks for read access only, and the file then
+/// refuses to be replaced while this handle lives: an editor that saves by
+/// writing a temporary file and renaming it over this path, or an `aft write`
+/// replacing it, gets ERROR_ACCESS_DENIED (os error 5). A handle that shares
+/// delete lets the replacement land; it reaches the old file's bytes, which is
+/// what a reader already under way should see. Config files are read and
+/// released quickly, so this window is small either way.
+///
+/// Prefer this over `std::fs::read_to_string` for any file a user or tool may
+/// rewrite while AFT runs: the user and project config files.
+pub(crate) fn open_config_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+    }
+    options.open(path)
+}
+
 /// Idle reclamation window for unbound-root artifacts.
 ///
 /// `root_ttl_minutes` controls when an unbound root's indexes are evicted.
@@ -206,23 +232,38 @@ pub fn expand_index_root_path(
     path: &str,
     home: Option<&std::path::Path>,
 ) -> Result<PathBuf, String> {
+    expand_configured_absolute_path("index.roots", path, home)
+}
+
+/// Expand the supported `~` forms in `storage.cache_dir` and require the
+/// result to be absolute.
+pub fn expand_cache_dir_path(
+    path: &str,
+    home: Option<&std::path::Path>,
+) -> Result<PathBuf, String> {
+    expand_configured_absolute_path("storage.cache_dir", path, home)
+}
+
+/// Shared `~` expansion and absolute-path check for user-configured paths.
+/// `key` is the setting's name as the user writes it, so a refusal names the
+/// setting that actually holds the bad value.
+fn expand_configured_absolute_path(
+    key: &str,
+    path: &str,
+    home: Option<&std::path::Path>,
+) -> Result<PathBuf, String> {
+    let no_home = || format!("{key} path uses ~ but no home directory is available");
     let expanded = if path == "~" {
-        home.ok_or_else(|| {
-            "index.roots path uses ~ but no home directory is available".to_string()
-        })?
-        .to_path_buf()
+        home.ok_or_else(no_home)?.to_path_buf()
     } else if let Some(remainder) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
-        home.ok_or_else(|| {
-            "index.roots path uses ~ but no home directory is available".to_string()
-        })?
-        .join(remainder)
+        home.ok_or_else(no_home)?.join(remainder)
     } else {
         PathBuf::from(path)
     };
 
     if !expanded.is_absolute() {
         return Err(format!(
-            "index.roots path must be absolute after ~ expansion: {path:?}"
+            "{key} path must be absolute after ~ expansion: {path:?}"
         ));
     }
     Ok(expanded)
@@ -262,6 +303,9 @@ impl SemanticBackend {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SemanticBackendConfig {
+    /// Runtime-only local model location selected with the artifact root.
+    #[serde(skip)]
+    pub local_cache_dir: Option<PathBuf>,
     pub backend: SemanticBackend,
     pub model: String,
     pub base_url: Option<String>,
@@ -333,6 +377,7 @@ impl SemanticBackendConfig {
 impl Default for SemanticBackendConfig {
     fn default() -> Self {
         Self {
+            local_cache_dir: None,
             backend: SemanticBackend::Fastembed,
             model: DEFAULT_SEMANTIC_MODEL.to_string(),
             base_url: None,
@@ -649,6 +694,11 @@ pub struct SearchConfig {
 }
 
 impl Config {
+    /// Optional artifact location for APIs that keep disk persistence opt-in.
+    pub fn cache_storage_dir(&self) -> Option<PathBuf> {
+        (self.cache_dir.is_some() || self.storage_dir.is_some())
+            .then(|| crate::root_cache::cache_root(self))
+    }
     pub fn semantic_backend_label(&self) -> &'static str {
         self.semantic.backend.as_str()
     }
@@ -730,9 +780,20 @@ pub struct RemoteExecConfig {
     pub project_off: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BashChangedFiles {
+    #[default]
+    Off,
+    List,
+    Diff,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BashConfig {
+    /// Optional watcher-based reporting after shell commands. Disabled by default.
+    pub changed_files: BashChangedFiles,
     /// Runtime gate for every bash-execution operation, including the
     /// background companions. When false those operations report
     /// `bash_disabled`; registration is decided by `disabled_tools` alone.
@@ -763,21 +824,37 @@ pub struct BashConfig {
     pub worker_wait_max_ms: u64,
     /// Put Linux tool shells in transient user scopes when systemd is available.
     pub linux_scope: bool,
+    /// Aggregate local-command memory ceiling in MiB; absent means unlimited.
+    pub memory_limit_mib: Option<u64>,
     /// On macOS, agent commands become responsible for their own privacy permissions.
     /// Other platforms accept the setting but do not change process creation.
     pub disclaim_privacy: bool,
     /// Pi-only fallback gate for its optional PowerShell default tool. The Rust
     /// executor accepts this solely to keep shared config parsing in parity.
     pub powershell_tool: bool,
-    /// Fixed environment entries merged into each bash request. Only trusted
-    /// user configuration supplies them; replies disclose names, never values.
+    /// Fixed environment entries merged into each local bash request. User
+    /// configuration supplies these, and a trusted project's `bash.env` adds
+    /// more in [`BashConfig::project_env`]; replies disclose names, never
+    /// values.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// Validated project-tier `bash.env` values. The resolver never applies
+    /// them: `commands/bash.rs` merges them only while the project root is on
+    /// the filter trust list at the time of the call, and a name the user tier
+    /// already sets keeps the user value.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub project_env: BTreeMap<String, String>,
+    /// User-only names whose `bash.env` value is also sent to a `runon` build
+    /// job. Every other configured name stays on this machine, and a project
+    /// value is never sent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runon_env: Vec<String>,
 }
 
 impl Default for BashConfig {
     fn default() -> Self {
         Self {
+            changed_files: BashChangedFiles::Off,
             enabled: true,
             host_fallback: false,
             runon_enabled: false,
@@ -786,16 +863,96 @@ impl Default for BashConfig {
             watch_sync_max_ms: default_bash_watch_sync_max_ms(),
             worker_wait_max_ms: default_bash_worker_wait_max_ms(),
             linux_scope: false,
+            memory_limit_mib: None,
             disclaim_privacy: false,
             powershell_tool: false,
             env: BTreeMap::new(),
+            project_env: BTreeMap::new(),
+            runon_env: Vec::new(),
         }
+    }
+}
+
+/// `storage.cache_dir` as configured and the directory it named when the cache
+/// root was prepared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredCacheDir {
+    pub spelling: PathBuf,
+    pub resolved: PathBuf,
+}
+
+impl BashConfig {
+    /// The `bash.env` values a local command should start with, lowest tier
+    /// first, tagged with the tier that supplied them.
+    ///
+    /// `project_trusted` is the caller's per-command trust decision; an
+    /// untrusted project's map is not included at all. A name both tiers set
+    /// keeps the user value: user names are often protective
+    /// (`GIT_TERMINAL_PROMPT=0`), and a repository should add names rather
+    /// than undo the user's.
+    pub(crate) fn configured_env(
+        &self,
+        project_trusted: bool,
+    ) -> Vec<crate::config_resolve::ConfiguredBashEnv> {
+        let mut applied = Vec::new();
+        if !self.env.is_empty() {
+            applied.push(crate::config_resolve::ConfiguredBashEnv {
+                names: self.env.clone(),
+                tier: crate::bash_env::BashEnvTier::User,
+            });
+        }
+        if project_trusted && !self.project_env.is_empty() {
+            applied.push(crate::config_resolve::ConfiguredBashEnv {
+                names: self.project_env.clone(),
+                tier: crate::bash_env::BashEnvTier::Project,
+            });
+        }
+        applied
+    }
+
+    /// Project names that a user value already covers, and so do not apply.
+    pub(crate) fn shadowed_project_env(&self, project_trusted: bool) -> Vec<String> {
+        if !project_trusted {
+            return Vec::new();
+        }
+        self.project_env
+            .keys()
+            .filter(|name| self.env.contains_key(*name))
+            .cloned()
+            .collect()
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Existing cache parent; AFT owns only its `aft` namespace. None preserves the storage-root layout.
+    #[serde(skip_deserializing)]
+    pub cache_dir: Option<PathBuf>,
+    /// The spelling of `cache_dir` the user configured, kept once preparation
+    /// replaces `cache_dir` with the directory it resolved to. A symlink in
+    /// that spelling may later be repointed; every recheck resolves the
+    /// configured spelling again so the change is noticed.
+    #[serde(skip)]
+    pub cache_dir_configured: Option<ConfiguredCacheDir>,
+    /// Runtime validation failure; a configured unavailable root never falls back.
+    #[serde(skip_deserializing)]
+    pub cache_unavailable: Option<String>,
+    /// The user document could not establish whether a cache volume was selected.
+    #[serde(skip)]
+    pub cache_config_unknown: Option<String>,
+    /// The user config sets `storage.cache_dir` to null: caches deliberately
+    /// return to the storage root even if it earlier used a cache directory.
+    #[serde(skip)]
+    pub cache_dir_opt_out: bool,
+    /// Runtime cache-volume transition identity, used to retire old handles.
+    #[serde(skip_deserializing)]
+    pub cache_epoch: u64,
+    #[serde(skip)]
+    pub cache_lease: Option<std::sync::Arc<crate::root_cache::CacheLease>>,
+    /// A trusted process lease, never accepted from configuration or tool input.
+    #[serde(skip)]
+    pub storage_lease: Option<std::sync::Arc<crate::root_cache::ProcessStorageLease>>,
     /// Root directory of the project being analyzed. `None` if not scoped.
     pub project_root: Option<PathBuf>,
     /// Legacy serialized setting (default: 1); validation does not consume it.
@@ -948,6 +1105,14 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            cache_dir: None,
+            cache_dir_configured: None,
+            cache_unavailable: None,
+            cache_config_unknown: None,
+            cache_dir_opt_out: false,
+            cache_epoch: 0,
+            cache_lease: None,
+            storage_lease: None,
             project_root: None,
             validation_depth: 1,
             checkpoint_ttl_hours: 24,
@@ -1113,5 +1278,27 @@ mod tests {
         );
         assert!(expand_index_root_path("relative/root", Some(&home)).is_err());
         assert!(expand_index_root_path("~", None).is_err());
+    }
+
+    #[test]
+    fn relative_path_refusals_name_the_setting_that_holds_the_path() {
+        let home = std::env::temp_dir().join("aft-home");
+        let cache_error = expand_cache_dir_path("relative/cache", Some(&home)).unwrap_err();
+        assert!(
+            cache_error.starts_with("storage.cache_dir path must be absolute"),
+            "{cache_error}"
+        );
+        assert!(!cache_error.contains("index.roots"), "{cache_error}");
+        let no_home = expand_cache_dir_path("~/cache", None).unwrap_err();
+        assert!(
+            no_home.starts_with("storage.cache_dir path uses ~"),
+            "{no_home}"
+        );
+
+        // The index.roots refusal keeps its own key name and exact text.
+        assert_eq!(
+            expand_index_root_path("relative/root", Some(&home)).unwrap_err(),
+            "index.roots path must be absolute after ~ expansion: \"relative/root\""
+        );
     }
 }

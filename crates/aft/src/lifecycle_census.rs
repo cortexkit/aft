@@ -105,6 +105,18 @@ impl LifecycleCensusCache {
             Err(std::sync::TryLockError::WouldBlock) => LifecycleCensusSnapshot::default(),
         }
     }
+
+    pub(crate) fn lsp_applicability_for_root(
+        &self,
+        root: &str,
+    ) -> Option<crate::lsp::manager::ApplicabilityMetrics> {
+        let snapshot = match self.snapshot.try_read() {
+            Ok(snapshot) => snapshot,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        snapshot.lsp.applicability_by_root.get(root).cloned()
+    }
 }
 
 /// Collect the process census after root contexts have been snapshotted by the
@@ -194,7 +206,7 @@ pub(crate) fn thread_class(name: Option<&str>) -> &'static str {
         name.starts_with(prefix)
             || (cfg!(target_os = "linux") && prefix.len() > 15 && name == &prefix[..15])
     };
-    if name.starts_with("aft-inspect-") {
+    if name.starts_with("aft-inspect-") || matches("aft-rayon-inspect-") {
         "aft-inspect"
     } else if matches("aft-fs-lock-heartbeat") {
         "aft-fs-lock-heartbeat"
@@ -206,7 +218,7 @@ pub(crate) fn thread_class(name: Option<&str>) -> &'static str {
         "reqwest-internal-sync-runtime"
     } else if name.starts_with("tokio-rt-worker") {
         "tokio-rt-worker"
-    } else if name.starts_with("aft-callgraph-") {
+    } else if name.starts_with("aft-callgraph-") || matches("aft-rayon-callgraph-") {
         "aft-callgraph"
     } else if name.starts_with("aft-mem-") {
         "aft-mem"
@@ -604,6 +616,8 @@ mod tests {
     #[test]
     fn thread_class_recognizes_linux_comm_truncation() {
         for (full, expected) in [
+            ("aft-rayon-inspect-0", "aft-inspect"),
+            ("aft-rayon-callgraph-build-0", "aft-callgraph"),
             ("aft-fs-lock-heartbeat", "aft-fs-lock-heartbeat"),
             ("aft-health-rollup", "aft-health-rollup"),
             (
@@ -626,6 +640,7 @@ mod tests {
     fn thread_class_parser_buckets_known_prefixes_and_unnamed_threads() {
         for (name, expected) in [
             ("aft-inspect-scan", "aft-inspect"),
+            ("aft-rayon-inspect-0", "aft-inspect"),
             ("aft-fs-lock-heartbeat", "aft-fs-lock-heartbeat"),
             ("aft-lsp-rust", "aft-lsp"),
             ("notify-rs fsevents loop", "notify-rs fsevents loop"),
@@ -635,6 +650,7 @@ mod tests {
             ),
             ("tokio-rt-worker", "tokio-rt-worker"),
             ("aft-callgraph-refresh", "aft-callgraph"),
+            ("aft-rayon-callgraph-build-0", "aft-callgraph"),
             ("aft-mem-sampler", "aft-mem"),
             ("aft-health-rollup", "aft-health-rollup"),
             ("dependency-worker", "unnamed"),

@@ -443,7 +443,7 @@ impl ReusePauseCheckpoint {
 
 struct ViewPauseCheckpoint {
     runs: Vec<Vec<EmbeddingEntry>>,
-    refused_files: Vec<bool>,
+    refused_files: Vec<usize>,
     pending: Vec<(usize, SemanticChunk)>,
     next_chunk: usize,
     dimension: Option<usize>,
@@ -1305,7 +1305,7 @@ fn finish_semantic_index_build(
                 .field("elapsed_ms", scope.elapsed_ms())
                 .field("files", index.file_mtimes.len())
                 .field("chunks", index.entries.len())
-                .field("skipped_rows", index.skipped_rows())
+                .field("skipped_chunks", index.skipped_rows())
                 .field("embed_ms", embedding_timing.total_ms())
                 .field("embed_max_ms", embedding_timing.max_ms()),
             );
@@ -1566,6 +1566,7 @@ fn provider_refusal_limit_exceeded() -> bool {
 struct SkippedEmbeddingRows {
     total: usize,
     refused: BTreeMap<PathBuf, usize>,
+    context_exceeded: BTreeMap<PathBuf, usize>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -1580,16 +1581,22 @@ impl SkippedEmbeddingRows {
         self.total += 1;
         if reason == PROVIDER_REFUSAL_REASON {
             *self.refused.entry(chunk.file.clone()).or_default() += 1;
+        } else {
+            *self.context_exceeded.entry(chunk.file.clone()).or_default() += 1;
         }
     }
 
     fn extend(&mut self, other: Self) {
         self.total += other.total;
         self.refused.extend(other.refused);
+        self.context_exceeded.extend(other.context_exceeded);
     }
 
     fn remove(&mut self, path: &Path) {
         if let Some(count) = self.refused.remove(path) {
+            self.total = self.total.saturating_sub(count);
+        }
+        if let Some(count) = self.context_exceeded.remove(path) {
             self.total = self.total.saturating_sub(count);
         }
     }
@@ -1599,6 +1606,37 @@ impl Display for SkippedEmbeddingRows {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.total.fmt(f)
     }
+}
+
+pub(crate) fn format_skipped_chunks_summary(
+    root: &Path,
+    files: &BTreeMap<PathBuf, usize>,
+    reason: &str,
+) -> Option<String> {
+    if files.is_empty() {
+        return None;
+    }
+    let count: usize = files.values().sum();
+    let preview = files
+        .keys()
+        .take(5)
+        .map(|path| {
+            path.strip_prefix(root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let omitted = files.len().saturating_sub(5);
+    let more = if omitted > 0 {
+        format!(" (+{omitted} more files)")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "semantic search is incomplete: {count} chunks skipped because {reason}: {preview}{more}"
+    ))
 }
 
 thread_local! {
@@ -1725,7 +1763,7 @@ impl SemanticIndexLock {
         crate::private_storage::open_dir(storage_dir, &dir)?;
         let _acquire_guard = SEMANTIC_LOCK_ACQUIRE_MUTEX
             .lock()
-            .map_err(|_| std::io::Error::other("semantic cache lock acquisition mutex poisoned"))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         fs_lock::try_acquire(&path, Duration::from_secs(2))
             .map(|guard| Self {
                 _guard: Some(guard),
@@ -1766,6 +1804,23 @@ pub struct SemanticIndexFingerprint {
 
 fn default_chunking_version() -> u32 {
     2
+}
+
+/// Per-file key revision for capped summaries; it does not change model identity.
+pub(crate) const FILE_SUMMARY_BUDGET_KEY_FORMAT: u32 = 1;
+
+/// Artifact metadata is separate from model identity, which is also used by
+/// view producers and chunk-vector keys.
+#[derive(Serialize, Deserialize)]
+struct StoredSemanticIdentity {
+    #[serde(flatten)]
+    fingerprint: SemanticIndexFingerprint,
+    #[serde(default, skip_serializing_if = "legacy_summary_budget")]
+    file_summary_budget_limited: bool,
+}
+
+fn legacy_summary_budget(limited: &bool) -> bool {
+    !*limited
 }
 
 impl SemanticIndexFingerprint {
@@ -2070,10 +2125,14 @@ struct LocalEmbeddingEngine {
 impl LocalEmbeddingEngine {
     fn new(
         model: Box<dyn LocalEmbeddingProvider>,
+        query_model: Option<Box<dyn LocalEmbeddingProvider>>,
         query_cache: Arc<Mutex<QueryEmbeddingCache>>,
     ) -> Result<Self, String> {
         let model = Arc::new(Mutex::new(model));
-        let query_worker = LocalQueryEmbedWorker::start(Arc::clone(&model), query_cache)?;
+        let query_model = query_model
+            .map(|provider| Arc::new(Mutex::new(provider)))
+            .unwrap_or_else(|| Arc::clone(&model));
+        let query_worker = LocalQueryEmbedWorker::start(query_model, query_cache)?;
         Ok(Self {
             model,
             query_worker,
@@ -2214,7 +2273,6 @@ fn validate_embedding_batch(
             "{context} returned no vectors for {expected_count} inputs"
         ));
     }
-
     if vectors.len() != expected_count {
         return Err(format!(
             "{context} returned {} vectors for {} inputs",
@@ -2222,7 +2280,6 @@ fn validate_embedding_batch(
             expected_count
         ));
     }
-
     let Some(first_vector) = vectors.first() else {
         return Ok(());
     };
@@ -2230,6 +2287,8 @@ fn validate_embedding_batch(
     validate_embedding_dimension(expected_dimension)
         .map_err(|error| format!("{context} returned {error}"))?;
     for (index, vector) in vectors.iter().enumerate() {
+        validate_finite_embedding(vector)
+            .map_err(|error| format!("{context} vector {index}: {error}"))?;
         if vector.len() != expected_dimension {
             return Err(format!(
                 "{context} returned inconsistent embedding dimensions: vector 0 has length {expected_dimension}, vector {index} has length {}",
@@ -2238,6 +2297,13 @@ fn validate_embedding_batch(
         }
     }
 
+    Ok(())
+}
+
+fn validate_finite_embedding(vector: &[f32]) -> Result<(), String> {
+    if vector.iter().any(|value| !value.is_finite()) {
+        return Err("embedding contains non-finite components".to_string());
+    }
     Ok(())
 }
 
@@ -2913,6 +2979,76 @@ fn sleep_before_embedding_retry(attempt_index: usize) {
 const QUERY_EMBEDDING_CANCELLED_MARKER: &str = "__AFT_QUERY_EMBEDDING_CANCELLED__";
 const QUERY_EMBEDDING_CANCEL_POLL: Duration = Duration::from_millis(10);
 
+#[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+type QueryEmbeddingPhaseObserver = Box<dyn FnMut(&'static str)>;
+
+#[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+thread_local! {
+    static QUERY_EMBEDDING_PHASE_OBSERVER: std::cell::RefCell<Option<QueryEmbeddingPhaseObserver>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Observe query phases on the calling test thread without changing other searches.
+/// The observer and its call sites are absent from normal release builds.
+#[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+#[doc(hidden)]
+pub fn with_query_embedding_phase_observer_for_test<T>(
+    observer: impl FnMut(&'static str) + 'static,
+    action: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<QueryEmbeddingPhaseObserver>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            QUERY_EMBEDDING_PHASE_OBSERVER.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _reset =
+        Reset(QUERY_EMBEDDING_PHASE_OBSERVER.with(|slot| slot.replace(Some(Box::new(observer)))));
+    action()
+}
+
+#[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+pub(crate) fn observe_query_embedding_phase(phase: &'static str) {
+    QUERY_EMBEDDING_PHASE_OBSERVER.with(|slot| {
+        if let Some(observer) = slot.borrow_mut().as_mut() {
+            observer(phase);
+        }
+    });
+}
+
+#[cfg(all(test, any(debug_assertions, feature = "test-timing-hooks")))]
+mod query_embedding_phase_observer_tests {
+    use super::*;
+    use std::{cell::RefCell, rc::Rc};
+
+    #[test]
+    fn query_embedding_phase_observer_restores_scope_after_panic_and_ignores_other_threads() {
+        let phases = Rc::new(RefCell::new(Vec::new()));
+        let observed = Rc::clone(&phases);
+        with_query_embedding_phase_observer_for_test(
+            move |phase| observed.borrow_mut().push(phase),
+            || {
+                observe_query_embedding_phase("outer_before");
+                let nested = std::panic::catch_unwind(|| {
+                    with_query_embedding_phase_observer_for_test(
+                        |phase| assert_eq!(phase, "nested"),
+                        || {
+                            observe_query_embedding_phase("nested");
+                            panic!("exercise observer cleanup");
+                        },
+                    );
+                });
+                assert!(nested.is_err());
+                std::thread::spawn(|| observe_query_embedding_phase("other_thread"))
+                    .join()
+                    .unwrap();
+                observe_query_embedding_phase("outer_after");
+            },
+        );
+        observe_query_embedding_phase("outside_scope");
+        assert_eq!(*phases.borrow(), ["outer_before", "outer_after"]);
+    }
+}
+
 enum EmbeddingExchange {
     SendFailed(reqwest::Error),
     Response {
@@ -2935,13 +3071,31 @@ fn execute_embedding_exchange(request: reqwest::blocking::RequestBuilder) -> Emb
             std::thread::sleep(*delay);
         }
     });
-    match request.send() {
+    #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+    observe_query_embedding_phase("request_send");
+    let exchange = match request.send() {
         Ok(response) => EmbeddingExchange::Response {
             status: response.status(),
             body: response.text(),
         },
         Err(error) => EmbeddingExchange::SendFailed(error),
+    };
+    #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+    {
+        let error = match &exchange {
+            EmbeddingExchange::SendFailed(error)
+            | EmbeddingExchange::Response {
+                body: Err(error), ..
+            } => Some(error),
+            _ => None,
+        };
+        // Reqwest owns the timer. Record when its timeout becomes observable,
+        // rather than pretending to know when the private timer was scheduled.
+        if error.is_some_and(reqwest::Error::is_timeout) {
+            observe_query_embedding_phase("deadline_fire_observed");
+        }
     }
+    exchange
 }
 
 fn execute_query_embedding_exchange(
@@ -3147,18 +3301,19 @@ fn query_embedding_text(query: &str, instruction: Option<&str>) -> String {
 
 impl SemanticEmbeddingModel {
     pub fn from_config(config: &SemanticBackendConfig) -> Result<Self, String> {
-        Self::from_config_with_timeout_ms(config, configured_embedding_timeout_ms(config))
+        Self::from_config_with_timeout_ms(config, configured_embedding_timeout_ms(config), false)
     }
 
     pub fn from_config_for_query(config: &SemanticBackendConfig) -> Result<Self, String> {
-        // The model may later be reused by a background build, so retain the build
-        // client's timeout. QueryBudget overrides each interactive HTTP request.
-        Self::from_config(config)
+        // Keep the configured timeout for build requests; QueryBudget overrides
+        // each interactive request. Local queries select only the warm query session.
+        Self::from_config_with_timeout_ms(config, configured_embedding_timeout_ms(config), true)
     }
 
     fn from_config_with_timeout_ms(
         config: &SemanticBackendConfig,
         timeout_ms: u64,
+        local_query_only: bool,
     ) -> Result<Self, String> {
         let max_batch_size = if config.max_batch_size == 0 {
             DEFAULT_MAX_BATCH_SIZE
@@ -3173,8 +3328,17 @@ impl SemanticEmbeddingModel {
 
         let engine = match config.backend {
             SemanticBackend::Fastembed => {
+                let cache_dir = config.local_cache_dir.as_deref();
+                let local = if local_query_only {
+                    LocalEmbedder::with_query_cache_dir(&model, cache_dir)?
+                } else {
+                    LocalEmbedder::with_cache_dir(&model, cache_dir)?
+                };
                 SemanticEmbeddingEngine::Local(LocalEmbeddingEngine::new(
-                    Box::new(LocalEmbedder::new(&model)?),
+                    Box::new(local),
+                    Some(Box::new(LocalEmbedder::with_query_cache_dir(
+                        &model, cache_dir,
+                    )?)),
                     Arc::clone(&query_embedding_cache),
                 )?)
             }
@@ -3246,7 +3410,7 @@ impl SemanticEmbeddingModel {
     ) -> Self {
         let query_embedding_cache = Arc::new(Mutex::new(QueryEmbeddingCache::default()));
         let engine = SemanticEmbeddingEngine::Local(
-            LocalEmbeddingEngine::new(provider, Arc::clone(&query_embedding_cache))
+            LocalEmbeddingEngine::new(provider, None, Arc::clone(&query_embedding_cache))
                 .expect("start test local query embed worker"),
         );
         Self {
@@ -4881,6 +5045,7 @@ where
 
         validate_embedding_dimension(vector.len())
             .map_err(|error| format!("embedding backend returned {error}"))?;
+        validate_finite_embedding(&vector)?;
         match expected_dimension {
             None => expected_dimension = Some(vector.len()),
             Some(expected) if expected != vector.len() => {
@@ -4909,7 +5074,7 @@ where
 
 fn format_skipped_row_warning(chunk: &SemanticChunk, embedded_text: &str, reason: &str) -> String {
     format!(
-        "semantic embed skipped row: file={} symbol={} chars={} reason={}",
+        "semantic embed skipped chunk: file={} symbol={} chars={} reason={}",
         chunk.file.display(),
         chunk.name,
         embedded_text.chars().count(),
@@ -4938,7 +5103,7 @@ fn take_test_skipped_row_warnings() -> Vec<String> {
 #[derive(Debug, Default)]
 pub struct SemanticVectors {
     entries: Vec<EmbeddingEntry>,
-    pub(crate) provider_refused: bool,
+    pub(crate) provider_refused_chunks: usize,
 }
 
 impl SemanticVectors {
@@ -4948,7 +5113,7 @@ impl SemanticVectors {
     #[cfg(test)]
     pub(crate) fn synthetic_for_test(file: &Path, chunks: usize, dimension: usize) -> Self {
         Self {
-            provider_refused: false,
+            provider_refused_chunks: 0,
             entries: (0..chunks)
                 .map(|ordinal| {
                     EmbeddingEntry::new(
@@ -5045,6 +5210,7 @@ struct SharedSemanticBase {
     file_hashes: HashMap<PathBuf, blake3::Hash>,
     dimension: usize,
     fingerprint: Option<SemanticIndexFingerprint>,
+    summary_budget_limited: bool,
     deferred_files: HashSet<PathBuf>,
     skipped_rows: SkippedEmbeddingRows,
     persistence: Arc<Mutex<Option<SemanticPersistenceState>>>,
@@ -5333,6 +5499,8 @@ pub struct SemanticIndex {
     /// Embedding dimension (384 for MiniLM-L6-v2)
     dimension: usize,
     fingerprint: Option<SemanticIndexFingerprint>,
+    /// Saved summary input format, not part of model or vector identity.
+    summary_budget_limited: bool,
     project_root: PathBuf,
     deferred_files: HashSet<PathBuf>,
     shared_base: Option<Arc<SharedSemanticBase>>,
@@ -5366,12 +5534,15 @@ impl Clone for SemanticIndex {
             file_hashes: self.file_hashes.clone(),
             dimension: self.dimension,
             fingerprint: self.fingerprint.clone(),
+            summary_budget_limited: self.summary_budget_limited,
             project_root: self.project_root.clone(),
             deferred_files: self.deferred_files.clone(),
             shared_base: self.shared_base.clone(),
             tombstones: self.tombstones.clone(),
             view_runs: self.view_runs.clone(),
-            dirty_paths: Arc::clone(&self.dirty_paths),
+            // Cloned payloads can mutate independently. Sharing their dirty set
+            // lets one writer erase changes that only the other payload holds.
+            dirty_paths: Arc::new(Mutex::new(self.dirty_paths_snapshot())),
             persistence: Arc::clone(&self.persistence),
             last_append_read_bytes: Arc::clone(&self.last_append_read_bytes),
             skipped_rows: self.skipped_rows.clone(),
@@ -5386,6 +5557,13 @@ impl Clone for SemanticIndex {
         clone.materialize_view_runs();
         clone
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SHARED_PATH_JOINS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PERSIST_DIRTY_SNAPSHOT_PROBE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -5414,9 +5592,32 @@ impl SemanticCollectPhaseTimings {
     }
 }
 
+#[derive(Debug)]
+enum SemanticCollectError {
+    UnsupportedExtension,
+    Io(std::io::Error),
+    Parse(String),
+}
+
+impl SemanticCollectError {
+    fn is_expected_non_code(&self) -> bool {
+        matches!(self, Self::UnsupportedExtension)
+    }
+}
+
+impl std::fmt::Display for SemanticCollectError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedExtension => formatter.write_str("unsupported file extension"),
+            Self::Io(error) => std::fmt::Display::fmt(error, formatter),
+            Self::Parse(message) => formatter.write_str(message),
+        }
+    }
+}
+
 type CollectedSemanticFile = (
     PathBuf,
-    Result<(IndexedFileMetadata, Vec<SemanticChunk>), String>,
+    Result<(IndexedFileMetadata, Vec<SemanticChunk>), SemanticCollectError>,
     SemanticCollectPhaseTimings,
 );
 
@@ -5737,6 +5938,7 @@ impl SemanticIndex {
             file_hashes: HashMap::new(),
             dimension: shared_base.dimension,
             fingerprint: shared_base.fingerprint.clone(),
+            summary_budget_limited: shared_base.summary_budget_limited,
             project_root: project_root.clone(),
             deferred_files: shared_base
                 .deferred_files
@@ -5759,6 +5961,12 @@ impl SemanticIndex {
                 refused: shared_base
                     .skipped_rows
                     .refused
+                    .iter()
+                    .map(|(path, count)| (project_root.join(path), *count))
+                    .collect(),
+                context_exceeded: shared_base
+                    .skipped_rows
+                    .context_exceeded
                     .iter()
                     .map(|(path, count)| (project_root.join(path), *count))
                     .collect(),
@@ -5874,6 +6082,7 @@ impl SemanticIndex {
                 .chain(self.file_sizes.keys())
                 .chain(self.file_hashes.keys())
                 .chain(self.skipped_rows.refused.keys())
+                .chain(self.skipped_rows.context_exceeded.keys())
                 .chain(self.deferred_files.iter())
                 .all(|path| shareable(path))
             && self
@@ -5925,6 +6134,12 @@ impl SemanticIndex {
             .into_iter()
             .map(|(path, count)| (relative(&path).expect("validated refused path"), count))
             .collect();
+        self.skipped_rows.context_exceeded = self
+            .skipped_rows
+            .context_exceeded
+            .into_iter()
+            .map(|(path, count)| (relative(&path).expect("validated skipped path"), count))
+            .collect();
         let persistence = *self
             .persistence
             .lock()
@@ -5938,7 +6153,7 @@ impl SemanticIndex {
                 .collect(),
             entry_count: self.entries.len(),
             segments: vec![Arc::new(SemanticVectors {
-                provider_refused: false,
+                provider_refused_chunks: 0,
                 entries: self.entries,
             })],
             file_mtimes,
@@ -5947,10 +6162,19 @@ impl SemanticIndex {
             file_hashes,
             dimension: self.dimension,
             fingerprint: self.fingerprint,
+            summary_budget_limited: self.summary_budget_limited,
             deferred_files,
             skipped_rows: self.skipped_rows,
             persistence: Arc::new(Mutex::new(persistence)),
         })
+    }
+
+    /// Absolute path of a root-relative base or view-run chunk path. Tests
+    /// count the calls to prove refresh joins only the paths it needs.
+    fn join_shared_path(&self, file: &Path) -> PathBuf {
+        #[cfg(test)]
+        SHARED_PATH_JOINS.with(|count| count.set(count.get() + 1));
+        self.project_root.join(file)
     }
 
     // Base paths are relative; delta paths are absolute. Iteration preserves the
@@ -5965,7 +6189,7 @@ impl SemanticIndex {
             .chain(self.view_run_entries())
             .map(|entry| {
                 (
-                    std::borrow::Cow::Owned(self.project_root.join(&entry.chunk.file)),
+                    std::borrow::Cow::Owned(self.join_shared_path(&entry.chunk.file)),
                     entry,
                 )
             })
@@ -6085,6 +6309,7 @@ impl SemanticIndex {
             file_hashes: HashMap::new(),
             dimension,
             fingerprint: None,
+            summary_budget_limited: true,
             project_root,
             deferred_files: HashSet::new(),
             shared_base: None,
@@ -6104,48 +6329,26 @@ impl SemanticIndex {
         self.skipped_rows.total
     }
 
-    pub(crate) fn refused_rows_summary(&self) -> Option<String> {
-        if self.skipped_rows.total == 0 {
-            return None;
-        }
-        let files = &self.skipped_rows.refused;
-        let preview = files
-            .keys()
-            .take(5)
-            .map(|path| {
-                path.strip_prefix(&self.project_root)
-                    .unwrap_or(path)
-                    .display()
-                    .to_string()
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let omitted = files.len().saturating_sub(5);
-        let more = if omitted > 0 {
-            format!(" (+{omitted} more files)")
-        } else {
-            String::new()
-        };
-        let reason = if files.is_empty() {
-            "input exceeded model context"
-        } else {
-            PROVIDER_REFUSAL_REASON
-        };
-        Some(format!(
-            "semantic coverage is partial: {} skipped row{}; {reason}{}{}{}",
-            self.skipped_rows.total,
-            if self.skipped_rows.total == 1 {
-                ""
-            } else {
-                "s"
-            },
-            if preview.is_empty() { "" } else { ": " },
-            preview,
-            more
-        ))
+    pub(crate) fn skipped_chunks_summary(&self) -> Option<String> {
+        let summaries = [
+            format_skipped_chunks_summary(
+                &self.project_root,
+                &self.skipped_rows.refused,
+                "the embedding provider refused them",
+            ),
+            format_skipped_chunks_summary(
+                &self.project_root,
+                &self.skipped_rows.context_exceeded,
+                "they exceed the model's input limit",
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        (!summaries.is_empty()).then(|| summaries.join("\n"))
     }
 
-    pub(crate) fn skipped_row_reason(&self) -> SemanticSkipReason {
+    pub(crate) fn skipped_chunk_reason(&self) -> SemanticSkipReason {
         if self.skipped_rows.refused.is_empty() {
             SemanticSkipReason::InputExceededModelContext
         } else {
@@ -6167,9 +6370,33 @@ impl SemanticIndex {
 
     pub fn apply_refused_rows_update(&mut self, refused: BTreeMap<PathBuf, usize>) {
         for (path, count) in refused {
-            self.skipped_rows.remove(&path);
+            if let Some(previous) = self.skipped_rows.refused.remove(&path) {
+                self.skipped_rows.total = self.skipped_rows.total.saturating_sub(previous);
+            }
             self.skipped_rows.total += count;
             self.skipped_rows.refused.insert(path, count);
+        }
+    }
+
+    pub(crate) fn context_skipped_for_paths(&self, paths: &[PathBuf]) -> BTreeMap<PathBuf, usize> {
+        paths
+            .iter()
+            .filter_map(|path| {
+                self.skipped_rows
+                    .context_exceeded
+                    .get(path)
+                    .map(|count| (path.clone(), *count))
+            })
+            .collect()
+    }
+
+    pub fn apply_context_skips_update(&mut self, skipped: BTreeMap<PathBuf, usize>) {
+        for (path, count) in skipped {
+            if let Some(previous) = self.skipped_rows.context_exceeded.remove(&path) {
+                self.skipped_rows.total = self.skipped_rows.total.saturating_sub(previous);
+            }
+            self.skipped_rows.total += count;
+            self.skipped_rows.context_exceeded.insert(path, count);
         }
     }
 
@@ -6417,12 +6644,10 @@ impl SemanticIndex {
                     chunks.extend(file_chunks);
                 }
                 Err(error) => {
-                    // "unsupported file extension" is expected for non-code files
-                    // (json, xml, .gitignore, etc.) that get included in the
-                    // project walk. Pre-fix this was swallowed by .unwrap_or_default();
-                    // we now skip silently to keep the log clean. Only real read/parse
-                    // errors are worth surfacing.
-                    if error == "unsupported file extension" {
+                    // Project walks include non-code files. Only the typed
+                    // extension exclusion is expected; read/parse failures
+                    // must still be surfaced even if their wording is similar.
+                    if error.is_expected_non_code() {
                         continue;
                     }
                     slog_warn!(
@@ -6479,13 +6704,50 @@ impl SemanticIndex {
         let requested: HashSet<&Path> = files.iter().map(PathBuf::as_path).collect();
         let mut reuse_map: ChunkReuseMap = HashMap::new();
 
-        for (path, entry) in self.live_entries() {
-            #[cfg(test)]
-            crate::search_hot_path_measurements::record(|counts| counts.refresh_entry_visits += 1);
-            if !requested.contains(path.as_ref()) {
-                continue;
-            }
-
+        // Base and view-run chunks carry root-relative paths. Match them
+        // against the requested files in that relative form, so only the
+        // chunks actually reused pay for an absolute path allocation. The
+        // visit order and visit count are the same as `live_entries`.
+        let requested_relative: HashSet<&Path> = files
+            .iter()
+            .filter_map(|path| path.strip_prefix(&self.project_root).ok())
+            .collect();
+        let shared_entries = self
+            .shared_base
+            .iter()
+            .flat_map(|base| base.entries())
+            .filter(|entry| !self.tombstones.contains(&entry.chunk.file))
+            .chain(self.view_run_entries())
+            .inspect(|_| {
+                #[cfg(test)]
+                crate::search_hot_path_measurements::record(|counts| {
+                    counts.refresh_entry_visits += 1
+                });
+            })
+            .filter(|entry| requested_relative.contains(entry.chunk.file.as_path()))
+            .map(|entry| {
+                (
+                    std::borrow::Cow::Owned(self.join_shared_path(&entry.chunk.file)),
+                    entry,
+                )
+            });
+        let local_entries = self
+            .entries
+            .iter()
+            .inspect(|_| {
+                #[cfg(test)]
+                crate::search_hot_path_measurements::record(|counts| {
+                    counts.refresh_entry_visits += 1
+                });
+            })
+            .filter(|entry| requested.contains(entry.chunk.file.as_path()))
+            .map(|entry| {
+                (
+                    std::borrow::Cow::Borrowed(entry.chunk.file.as_path()),
+                    entry,
+                )
+            });
+        for (path, entry) in shared_entries.chain(local_entries) {
             // `embed_text` is already persisted in the current on-disk format,
             // so refresh-time reuse can hash it in memory and confirm the exact
             // string without bumping `SEMANTIC_INDEX_VERSION` and forcing every
@@ -6809,6 +7071,7 @@ impl SemanticIndex {
                     .collect(),
                 dimension: DEFAULT_DIMENSION,
                 fingerprint: None,
+                summary_budget_limited: true,
                 project_root: project_root.to_path_buf(),
                 deferred_files: HashSet::new(),
                 shared_base: None,
@@ -6949,7 +7212,7 @@ impl SemanticIndex {
             .unwrap_or(0) as u64;
         let embedding_timing = embedding_timing.snapshot();
         slog_info!(
-            "semantic embed: {} chunks in {} batches, {} ms ({} chunks/s), skipped_rows={} elapsed_ms={} embed_ms={} embed_max_ms={}",
+            "semantic embed: {} chunks in {} batches, {} ms ({} chunks/s), skipped_chunks={} elapsed_ms={} embed_ms={} embed_max_ms={}",
             total_chunks,
             batch_count,
             embed_phase_ms,
@@ -6983,6 +7246,7 @@ impl SemanticIndex {
             dimension,
             fingerprint: None,
             project_root: project_root.to_path_buf(),
+            summary_budget_limited: true,
             deferred_files: HashSet::new(),
             shared_base: None,
             tombstones: HashSet::new(),
@@ -7358,6 +7622,7 @@ impl SemanticIndex {
         let indexed_paths: Vec<PathBuf> = indexed_paths.into_iter().collect();
         let mut checks: Vec<Option<IndexedFileCheck>> = Vec::with_capacity(indexed_paths.len());
         let mut strict_verify_inputs: Vec<(usize, PathBuf, FileFreshness)> = Vec::new();
+        let mut skipped_verify_inputs = Vec::new();
 
         for indexed_path in indexed_paths {
             let check_index = checks.len();
@@ -7378,7 +7643,16 @@ impl SemanticIndex {
                 _ => None,
             };
             if let Some(freshness) = cached {
-                strict_verify_inputs.push((check_index, indexed_path, freshness));
+                // Oversized semantic files have deliberately empty rows and a
+                // zero hash. Equal stat metadata keeps that exclusion valid;
+                // indexable zero-hash files still require strict verification.
+                if freshness.size > MAX_SEMANTIC_FILE_BYTES
+                    && freshness.content_hash == cache_freshness::zero_hash()
+                {
+                    skipped_verify_inputs.push((check_index, indexed_path, freshness));
+                } else {
+                    strict_verify_inputs.push((check_index, indexed_path, freshness));
+                }
                 checks.push(None);
             } else {
                 checks.push(Some(IndexedFileCheck::MissingMetadata(indexed_path)));
@@ -7397,6 +7671,12 @@ impl SemanticIndex {
         for (check_index, path, verdict) in verified {
             checks[check_index] = Some(IndexedFileCheck::Verified(path, verdict));
         }
+        for (check_index, path, verdict) in cache_freshness::verify_files_bounded(
+            skipped_verify_inputs,
+            cache_freshness::VerifyStrategy::StatFirst,
+        ) {
+            checks[check_index] = Some(IndexedFileCheck::Verified(path, verdict));
+        }
 
         for check in checks {
             match check.expect("freshness check should be populated") {
@@ -7411,7 +7691,8 @@ impl SemanticIndex {
                     },
                 ) => {
                     self.file_mtimes.insert(path.clone(), new_mtime);
-                    self.file_sizes.insert(path, new_size);
+                    self.file_sizes.insert(path.clone(), new_size);
+                    self.extend_dirty_paths(std::iter::once(path));
                 }
                 IndexedFileCheck::Verified(
                     path,
@@ -8066,6 +8347,9 @@ impl SemanticIndex {
     where
         F: Fn(&Path) -> bool,
     {
+        if validate_finite_embedding(query_vector).is_err() {
+            return Vec::new();
+        }
         // `true` marks a path relative to the root (base and shared view
         // runs); `false` an absolute own-entry path.
         let entries = self
@@ -8122,7 +8406,9 @@ impl SemanticIndex {
             let denom = query_norm * entry.norm;
             let mut score = if denom == 0.0 { 0.0 } else { dot / denom };
             if entry.chunk.exported {
-                score *= 1.1;
+                // Preserve nonnegative weighting; an export bonus must not
+                // lower a negative similarity.
+                score *= if score >= 0.0 { 1.1 } else { 0.9 };
             }
             scored.push((score, i));
         }
@@ -8177,7 +8463,14 @@ impl SemanticIndex {
         let Some(cached) = self.recorded_file_freshness(file) else {
             return true;
         };
-        match cache_freshness::verify_file_strict(file, &cached) {
+        let verdict = if cached.size > MAX_SEMANTIC_FILE_BYTES
+            && cached.content_hash == cache_freshness::zero_hash()
+        {
+            cache_freshness::verify_file(file, &cached)
+        } else {
+            cache_freshness::verify_file_strict(file, &cached)
+        };
+        match verdict {
             FreshnessVerdict::HotFresh => false,
             FreshnessVerdict::ContentFresh { .. } => false,
             FreshnessVerdict::Stale | FreshnessVerdict::Deleted => true,
@@ -8363,11 +8656,126 @@ impl SemanticIndex {
         self.fingerprint = Some(fingerprint);
     }
 
+    pub(crate) fn set_summary_budget_limited(&mut self, limited: bool) {
+        self.summary_budget_limited = limited;
+    }
+
+    fn limited_summary_budget(&self) -> Option<usize> {
+        self.fingerprint
+            .as_ref()
+            .map(|identity| identity.embed_text_caps.total_chars)
+            .filter(|budget| *budget < EmbedTextCaps::default().total_chars)
+    }
+
+    pub(crate) fn summaries_need_repair(&self) -> bool {
+        !self.summary_budget_limited && self.limited_summary_budget().is_some()
+    }
+
+    pub(crate) fn note_borrowed_summary_format(&self) {
+        if self.summaries_need_repair() {
+            slog_info!("borrowed semantic cache has legacy small-budget summaries; serving the owner's published artifact until owner repair");
+        }
+    }
+
+    fn persisted_summary_budget(&self) -> bool {
+        self.limited_summary_budget().is_some() && self.summary_budget_limited
+    }
+
+    fn stored_identity(&self) -> Option<String> {
+        self.fingerprint.as_ref().and_then(|fingerprint| {
+            serde_json::to_string(&StoredSemanticIdentity {
+                fingerprint: fingerprint.clone(),
+                file_summary_budget_limited: self.persisted_summary_budget(),
+            })
+            .ok()
+        })
+    }
+
+    /// A cached summary's new input is an exact prefix of its old input. Repair
+    /// that row directly: unchanged symbol vectors do not need parsing or calls
+    /// to the embedding backend. The marker is checked before examining rows.
+    pub(crate) fn repair_legacy_file_summaries<F>(
+        &mut self,
+        embed: &mut F,
+        max_batch_size: usize,
+    ) -> Result<bool, String>
+    where
+        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+    {
+        if !self.summaries_need_repair() {
+            return Ok(false);
+        }
+        if self.shared_base.is_some() || !self.view_runs.is_empty() {
+            // Refresh workers fork the published cache into a frozen base.
+            // Materialize a private snapshot, never the published vector slots.
+            *self = Self::from_bytes(&self.to_bytes(), &self.project_root)?;
+        }
+        let budget = self
+            .limited_summary_budget()
+            .expect("legacy small-cap identity");
+        let candidates = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(position, entry)| {
+                if entry.chunk.kind != SymbolKind::FileSummary {
+                    return None;
+                }
+                let mut chunk = entry.chunk.clone();
+                chunk.embed_text = truncate_chars(&chunk.embed_text, budget);
+                (chunk.embed_text != entry.chunk.embed_text).then_some((position, chunk))
+            })
+            .collect::<Vec<_>>();
+        let mut replacements = Vec::new();
+        for batch in candidates.chunks(max_batch_size.max(1)) {
+            let texts = batch
+                .iter()
+                .map(|(_, chunk)| chunk.embed_text.clone())
+                .collect();
+            let rows = execute_build_embedding_batch(texts, embed)?;
+            for ((position, chunk), row) in batch.iter().zip(rows) {
+                let BuildEmbeddingRow::Embedded {
+                    embedded_text,
+                    vector,
+                } = row
+                else {
+                    return Err(
+                        "cached file-summary repair was rejected by the embedding backend"
+                            .to_string(),
+                    );
+                };
+                if vector.len() != self.dimension {
+                    return Err(format!(
+                        "file-summary repair dimension mismatch: expected {}, got {}",
+                        self.dimension,
+                        vector.len()
+                    ));
+                }
+                let mut chunk = chunk.clone();
+                chunk.embed_text = embedded_text;
+                replacements.push((*position, EmbeddingEntry::new(chunk, vector)));
+            }
+        }
+        // No entry or marker changes until every replacement has been validated.
+        for (position, entry) in replacements {
+            self.entries[position] = entry;
+        }
+        self.summary_budget_limited = true;
+        self.set_persistence(None);
+        self.mark_all_dirty();
+        slog_info!(
+            "semantic cache repaired {} legacy small-budget file summaries",
+            candidates.len()
+        );
+        Ok(true)
+    }
+
     fn scan_artifact_for_append(
         data_path: &Path,
         expected: SemanticPersistenceState,
         expected_fingerprint: &str,
         expected_dimension: usize,
+        expected_summary_budget: bool,
     ) -> Result<SemanticArtifactLayout, String> {
         let mut file = fs::File::open(data_path).map_err(|error| error.to_string())?;
         let identity = semantic_artifact_identity(data_path)
@@ -8401,8 +8809,22 @@ impl SemanticIndex {
         let mut fingerprint = vec![0_u8; fingerprint_len];
         file.read_exact(&mut fingerprint)
             .map_err(|error| error.to_string())?;
-        if fingerprint != expected_fingerprint.as_bytes() {
-            return Err("semantic artifact fingerprint changed".to_string());
+        if fingerprint != expected_fingerprint.as_bytes() || expected_summary_budget {
+            let mut stored: serde_json::Value = serde_json::from_slice(&fingerprint)
+                .map_err(|error| format!("invalid stored semantic identity: {error}"))?;
+            let fields = stored
+                .as_object_mut()
+                .ok_or("invalid stored semantic identity object")?;
+            let limited = match fields.remove("file_summary_budget_limited") {
+                None => false,
+                Some(serde_json::Value::Bool(limited)) => limited,
+                Some(_) => return Err("invalid stored summary-budget marker".to_string()),
+            };
+            let expected: serde_json::Value = serde_json::from_str(expected_fingerprint)
+                .map_err(|error| format!("invalid expected semantic identity: {error}"))?;
+            if stored != expected || limited != expected_summary_budget {
+                return Err("semantic artifact fingerprint changed".to_string());
+            }
         }
 
         file.seek(SeekFrom::Start(expected.base_bytes as u64))
@@ -8542,6 +8964,7 @@ impl SemanticIndex {
 
     fn persistence_identity_matches(&self, previous: &Self) -> bool {
         self.dimension == previous.dimension
+            && self.persisted_summary_budget() == previous.persisted_summary_budget()
             && self
                 .fingerprint
                 .as_ref()
@@ -8555,10 +8978,15 @@ impl SemanticIndex {
     fn delta_for_paths(&self, paths: &BTreeSet<PathBuf>) -> Self {
         let mut delta = Self::new(self.project_root.clone(), self.dimension);
         delta.fingerprint = self.fingerprint.clone();
+        delta.summary_budget_limited = self.summary_budget_limited;
         delta.skipped_rows = self.skipped_rows.clone();
         delta
             .skipped_rows
             .refused
+            .retain(|path, _| paths.contains(path));
+        delta
+            .skipped_rows
+            .context_exceeded
             .retain(|path, _| paths.contains(path));
         delta.entries = self
             .live_entries()
@@ -8786,6 +9214,7 @@ impl SemanticIndex {
                     persistence,
                     &fingerprint,
                     self.dimension,
+                    self.persisted_summary_budget(),
                 ) {
                     Ok(layout) => Some(layout),
                     Err(error) => {
@@ -8888,6 +9317,13 @@ impl SemanticIndex {
                 }
             };
 
+            #[cfg(test)]
+            PERSIST_DIRTY_SNAPSHOT_PROBE.with(|probe| {
+                let callback = probe.borrow_mut().take();
+                if let Some(callback) = callback {
+                    callback();
+                }
+            });
             self.last_append_read_bytes
                 .store(layout.bytes_read, Ordering::Relaxed);
             if layout.torn_tail {
@@ -9028,9 +9464,15 @@ impl SemanticIndex {
             .as_ref()
             .map(SemanticIndexFingerprint::as_string)
             .unwrap_or_default();
-        Self::scan_artifact_for_append(&data_path, persistence, &fingerprint, self.dimension)
-            .ok()
-            .map(|layout| layout.bytes_read)
+        Self::scan_artifact_for_append(
+            &data_path,
+            persistence,
+            &fingerprint,
+            self.dimension,
+            self.persisted_summary_budget(),
+        )
+        .ok()
+        .map(|layout| layout.bytes_read)
     }
 
     #[doc(hidden)]
@@ -9228,6 +9670,8 @@ impl SemanticIndex {
                 index.dimension,
                 canonical_parents,
             )?;
+            // An older writer may append uncapped summaries to a repaired base.
+            index.summary_budget_limited &= delta.summary_budget_limited;
             let tombstones = tombstones.into_iter().collect::<Vec<_>>();
             index.remove_indexed_files(&tombstones);
             index.entries.extend(delta.entries);
@@ -9239,6 +9683,10 @@ impl SemanticIndex {
                 .skipped_rows
                 .refused
                 .extend(delta.skipped_rows.refused);
+            index
+                .skipped_rows
+                .context_exceeded
+                .extend(delta.skipped_rows.context_exceeded);
             index.any_missing_sizes = index
                 .file_mtimes
                 .keys()
@@ -9311,6 +9759,7 @@ impl SemanticIndex {
         expected_fingerprint: Option<&str>,
     ) -> Option<Self> {
         debug_assert!(current_canonical_root.is_absolute());
+        crate::root_cache::check_cache_access(&storage_dir.join("semantic")).ok()?;
         crate::private_storage::tighten_open_dir(
             storage_dir,
             &storage_dir.join("semantic").join(project_key),
@@ -9405,6 +9854,44 @@ impl SemanticIndex {
         }
     }
 
+    pub(crate) fn read_from_disk_with_summary_repair<F>(
+        storage_dir: &Path,
+        project_key: &str,
+        current_canonical_root: &Path,
+        is_worktree_bridge: bool,
+        expected_fingerprint: Option<&str>,
+        embed: &mut F,
+        max_batch_size: usize,
+    ) -> Result<Option<(Self, bool)>, String>
+    where
+        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+    {
+        let Some(mut index) = Self::read_from_disk(
+            storage_dir,
+            project_key,
+            current_canonical_root,
+            is_worktree_bridge,
+            expected_fingerprint,
+        ) else {
+            return Ok(None);
+        };
+        let repaired = match index.repair_legacy_file_summaries(embed, max_batch_size) {
+            Ok(repaired) => repaired,
+            Err(error)
+                if embedding_failure_is_transient(&error)
+                    || crate::synapse_embed::LanePause::from_error(&error).is_some() =>
+            {
+                slog_warn!(
+                    "summary budget repair deferred; keeping saved semantic vectors: {}",
+                    strip_transient_embedding_marker(&error)
+                );
+                false
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(Some((index, repaired)))
+    }
+
     /// Refuse, by name, a `semantic.bin` whose base snapshot version byte is
     /// above [`SEMANTIC_BASE_FORMAT_VERSION`] (or any snapshot while the
     /// storage root's reader floor is above it). Reads one byte. Delta segments
@@ -9471,6 +9958,9 @@ impl SemanticIndex {
             project_key,
             current_canonical_root,
         );
+        if let Some(index) = loaded.as_ref() {
+            index.note_borrowed_summary_format();
+        }
         let outcome = if loaded.is_some() { "ready" } else { "denied" };
         let build_id = crate::logging::in_flight_build_id(
             crate::logging::IndexPlane::Semantic,
@@ -9505,6 +9995,7 @@ impl SemanticIndex {
         project_key: &str,
         current_canonical_root: &Path,
     ) -> Option<Self> {
+        crate::root_cache::check_cache_access(&storage_dir.join("semantic")).ok()?;
         let data_path = storage_dir
             .join("semantic")
             .join(project_key)
@@ -9598,14 +10089,7 @@ impl SemanticIndex {
 
     fn write_to_writer<W: Write>(&self, writer: &mut W) -> io::Result<usize> {
         let mut bytes_written = 0usize;
-        let fingerprint = self.fingerprint.as_ref().and_then(|fingerprint| {
-            let encoded = fingerprint.as_string();
-            if encoded.is_empty() {
-                None
-            } else {
-                Some(encoded)
-            }
-        });
+        let fingerprint = self.stored_identity();
         let fp_bytes_ref = fingerprint.as_deref().map(str::as_bytes).unwrap_or(&[]);
         let mut file_metadata = self
             .indexed_paths()
@@ -9784,28 +10268,31 @@ impl SemanticIndex {
             &(self.skipped_rows.total as u64).to_le_bytes(),
             &mut bytes_written,
         )?;
-        let refused = self
-            .skipped_rows
-            .refused
-            .iter()
-            .filter_map(|(path, count)| {
-                cache_relative_path(&self.project_root, path).map(|relative| (relative, count))
-            })
-            .collect::<Vec<_>>();
-        write_counted(
-            writer,
-            &(refused.len() as u32).to_le_bytes(),
-            &mut bytes_written,
-        )?;
-        for (path, count) in refused {
-            let path = path.to_string_lossy();
+        for skipped_files in [
+            &self.skipped_rows.refused,
+            &self.skipped_rows.context_exceeded,
+        ] {
+            let skipped = skipped_files
+                .iter()
+                .filter_map(|(path, count)| {
+                    cache_relative_path(&self.project_root, path).map(|relative| (relative, count))
+                })
+                .collect::<Vec<_>>();
             write_counted(
                 writer,
-                &(path.len() as u32).to_le_bytes(),
+                &(skipped.len() as u32).to_le_bytes(),
                 &mut bytes_written,
             )?;
-            write_counted(writer, path.as_bytes(), &mut bytes_written)?;
-            write_counted(writer, &(*count as u64).to_le_bytes(), &mut bytes_written)?;
+            for (path, count) in skipped {
+                let path = path.to_string_lossy();
+                write_counted(
+                    writer,
+                    &(path.len() as u32).to_le_bytes(),
+                    &mut bytes_written,
+                )?;
+                write_counted(writer, path.as_bytes(), &mut bytes_written)?;
+                write_counted(writer, &(*count as u64).to_le_bytes(), &mut bytes_written)?;
+            }
         }
         Ok(bytes_written)
     }
@@ -9902,7 +10389,7 @@ impl SemanticIndex {
             || version == SEMANTIC_INDEX_VERSION_V5
             || version == SEMANTIC_INDEX_VERSION_V6
             || version >= SEMANTIC_INDEX_VERSION_V7;
-        let fingerprint = if has_fingerprint_field {
+        let (fingerprint, summary_budget_limited) = if has_fingerprint_field {
             let fingerprint_len = read_u32_stream(&mut reader)? as usize;
             if total_len
                 .is_some_and(|len| reader.bytes_read().saturating_add(fingerprint_len) > len)
@@ -9910,7 +10397,7 @@ impl SemanticIndex {
                 return Err("unexpected end of data reading fingerprint".to_string());
             }
             if fingerprint_len == 0 {
-                None
+                (None, false)
             } else {
                 let mut raw = vec![0u8; fingerprint_len];
                 read_exact_stream(
@@ -9919,13 +10406,12 @@ impl SemanticIndex {
                     "unexpected end of data reading fingerprint",
                 )?;
                 let raw = String::from_utf8_lossy(&raw).to_string();
-                Some(
-                    serde_json::from_str::<SemanticIndexFingerprint>(&raw)
-                        .map_err(|error| format!("invalid semantic fingerprint: {error}"))?,
-                )
+                let stored: StoredSemanticIdentity = serde_json::from_str(&raw)
+                    .map_err(|error| format!("invalid semantic fingerprint: {error}"))?;
+                (Some(stored.fingerprint), stored.file_summary_budget_limited)
             }
         } else {
-            None
+            (None, false)
         };
 
         // File mtimes
@@ -9967,9 +10453,9 @@ impl SemanticIndex {
                 || version == SEMANTIC_INDEX_VERSION_V6
                 || version >= SEMANTIC_INDEX_VERSION_V7
             {
-                read_u64_stream(&mut reader)?
+                Some(read_u64_stream(&mut reader)?)
             } else {
-                0
+                None
             };
             let content_hash = if version >= SEMANTIC_INDEX_VERSION_V6 {
                 let mut hash_bytes = [0u8; 32];
@@ -10014,7 +10500,9 @@ impl SemanticIndex {
                 PathBuf::from(path)
             };
             file_mtimes.insert(path.clone(), mtime);
-            file_sizes.insert(path.clone(), size);
+            if let Some(size) = size {
+                file_sizes.insert(path.clone(), size);
+            }
             file_hashes.insert(path, content_hash);
         }
 
@@ -10050,7 +10538,7 @@ impl SemanticIndex {
                 None
             };
 
-            let kind = u8_to_symbol_kind(read_u8_stream(&mut reader, "unexpected end of data")?);
+            let kind = u8_to_symbol_kind(read_u8_stream(&mut reader, "unexpected end of data")?)?;
 
             let start_line = read_u32_stream(&mut reader)?;
             let end_line = read_u32_stream(&mut reader)?;
@@ -10073,6 +10561,7 @@ impl SemanticIndex {
                 .chunks_exact(F32_BYTES)
                 .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
                 .collect::<Arc<[f32]>>();
+            validate_finite_embedding(&vector)?;
 
             entries.push(EmbeddingEntry::new(
                 SemanticChunk {
@@ -10112,34 +10601,41 @@ impl SemanticIndex {
         let mut skipped_rows = SkippedEmbeddingRows::default();
         if version >= SEMANTIC_INDEX_VERSION_V8 {
             skipped_rows.total = usize::try_from(read_u64_stream(&mut reader)?)
-                .map_err(|_| "skipped row count overflow")?;
-            let count = read_u32_stream(&mut reader)? as usize;
-            if count > MAX_ENTRIES {
-                return Err("too many refused semantic files".to_string());
-            }
-            let mut refused_total = 0usize;
-            for _ in 0..count {
-                let raw = read_string_stream(&mut reader, total_len)?;
-                let path = cached_path_under_root_with_memo(
-                    current_canonical_root,
-                    Path::new(&raw),
-                    canonical_parents,
-                )
-                .ok_or_else(|| "cached semantic refusal path escapes project root".to_string())?;
-                let rows = usize::try_from(read_u64_stream(&mut reader)?)
-                    .map_err(|_| "refused row count overflow")?;
-                refused_total = refused_total
-                    .checked_add(rows)
-                    .ok_or("refused row count overflow")?;
-                if rows == 0
-                    || skipped_rows.refused.insert(path.clone(), rows).is_some()
-                    || !file_mtimes.contains_key(&path)
-                {
-                    return Err("invalid refused semantic file metadata".to_string());
+                .map_err(|_| "skipped chunk count overflow")?;
+            let mut decoded_total = 0usize;
+            for files in [
+                &mut skipped_rows.refused,
+                &mut skipped_rows.context_exceeded,
+            ] {
+                let count = read_u32_stream(&mut reader)? as usize;
+                if count > MAX_ENTRIES {
+                    return Err("too many skipped semantic files".to_string());
+                }
+                for _ in 0..count {
+                    let raw = read_string_stream(&mut reader, total_len)?;
+                    let path = cached_path_under_root_with_memo(
+                        current_canonical_root,
+                        Path::new(&raw),
+                        canonical_parents,
+                    )
+                    .ok_or_else(|| {
+                        "cached semantic skipped path escapes project root".to_string()
+                    })?;
+                    let rows = usize::try_from(read_u64_stream(&mut reader)?)
+                        .map_err(|_| "refused chunk count overflow")?;
+                    decoded_total = decoded_total
+                        .checked_add(rows)
+                        .ok_or("refused chunk count overflow")?;
+                    if rows == 0
+                        || files.insert(path.clone(), rows).is_some()
+                        || !file_mtimes.contains_key(&path)
+                    {
+                        return Err("invalid skipped semantic file metadata".to_string());
+                    }
                 }
             }
-            if refused_total > skipped_rows.total {
-                return Err("refused row count exceeds skipped rows".to_string());
+            if decoded_total > skipped_rows.total {
+                return Err("skipped chunk count exceeds total skipped chunks".to_string());
             }
         }
         let bytes_read = reader.bytes_read();
@@ -10152,6 +10648,7 @@ impl SemanticIndex {
                 file_hashes,
                 dimension,
                 fingerprint,
+                summary_budget_limited,
                 project_root: current_canonical_root.to_path_buf(),
                 deferred_files: HashSet::new(),
                 shared_base: None,
@@ -10420,7 +10917,7 @@ impl Default for EmbedTextCaps {
     }
 }
 
-fn truncate_chars(value: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_chars(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
@@ -10548,7 +11045,7 @@ fn build_file_summary_chunk_with_lines_and_caps(
                     .map(|stem| stem.to_string_lossy().to_string())
                     .unwrap_or_default()
             ),
-            caps.total_chars,
+            caps.total_chars.min(EmbedTextCaps::default().total_chars),
         ),
         snippet,
     }
@@ -10653,7 +11150,7 @@ fn collect_semantic_file(
     file: &Path,
     embed_text_caps: EmbedTextCaps,
     phases: &mut SemanticCollectPhaseTimings,
-) -> Result<(IndexedFileMetadata, Vec<SemanticChunk>), String> {
+) -> Result<(IndexedFileMetadata, Vec<SemanticChunk>), SemanticCollectError> {
     if let Some(job) = prepared_pause_job() {
         let key = FileCheckpointKey {
             root: project_root.to_path_buf(),
@@ -10684,20 +11181,22 @@ fn collect_semantic_file_uncached(
     file: &Path,
     embed_text_caps: EmbedTextCaps,
     phases: &mut SemanticCollectPhaseTimings,
-) -> Result<(IndexedFileMetadata, Vec<SemanticChunk>), String> {
+) -> Result<(IndexedFileMetadata, Vec<SemanticChunk>), SemanticCollectError> {
     let read_hash_started = Instant::now();
     let read_result = (|| {
-        let metadata = fs::metadata(file).map_err(|error| error.to_string())?;
+        let metadata = fs::metadata(file).map_err(SemanticCollectError::Io)?;
         if !metadata.is_file() {
-            return Err("not a regular file".to_string());
+            return Err(SemanticCollectError::Parse(
+                "not a regular file".to_string(),
+            ));
         }
-        let mtime = metadata.modified().map_err(|error| error.to_string())?;
+        let mtime = metadata.modified().map_err(SemanticCollectError::Io)?;
         let size = metadata.len();
 
         if !is_semantic_indexed_extension(file) {
-            return Err("unsupported file extension".to_string());
+            return Err(SemanticCollectError::UnsupportedExtension);
         }
-        let lang = detect_language(file).ok_or_else(|| "unsupported file extension".to_string())?;
+        let lang = detect_language(file).ok_or(SemanticCollectError::UnsupportedExtension)?;
 
         let mut indexed_metadata = IndexedFileMetadata {
             mtime,
@@ -10714,7 +11213,7 @@ fn collect_semantic_file_uncached(
         #[cfg(test)]
         crate::search_hot_path_measurements::record_file_read();
         let source =
-            crate::project_content::read_to_string(file).map_err(|error| error.to_string())?;
+            crate::project_content::read_to_string(file).map_err(SemanticCollectError::Io)?;
         indexed_metadata.content_hash = if size <= cache_freshness::CONTENT_HASH_SIZE_CAP {
             cache_freshness::hash_bytes(source.as_bytes())
         } else {
@@ -10735,7 +11234,8 @@ fn collect_semantic_file_uncached(
         &source,
         embed_text_caps,
         phases,
-    )?;
+    )
+    .map_err(SemanticCollectError::Parse)?;
     Ok((indexed_metadata, chunks))
 }
 
@@ -10916,12 +11416,13 @@ fn symbols_to_chunks_with_caps(
             .iter()
             .map(|(_, signature)| *signature)
             .collect::<Vec<_>>();
-        chunks.push(build_file_summary_chunk_with_lines(
+        chunks.push(build_file_summary_chunk_with_lines_and_caps(
             file,
             project_root,
             &line_cache,
             &top_exports,
             &top_export_signatures,
+            caps,
         ));
     }
 
@@ -11069,7 +11570,7 @@ impl SemanticVectors {
         rel_path: &Path,
         producer: &ViewPayloadProducer<'_>,
     ) -> Result<Self, String> {
-        Self::decode_view_payload_inner(payload, rel_path, producer, None)
+        Self::decode_view_payload_inner(payload, rel_path, producer, None, false)
     }
 
     /// Decodes like [`Self::decode_view_payload`] and also returns the BLAKE3
@@ -11082,8 +11583,24 @@ impl SemanticVectors {
         producer: &ViewPayloadProducer<'_>,
     ) -> Result<(Self, Vec<blake3::Hash>), String> {
         let mut digests = Vec::new();
-        let run = Self::decode_view_payload_inner(payload, rel_path, producer, Some(&mut digests))?;
+        let run = Self::decode_view_payload_inner(
+            payload,
+            rel_path,
+            producer,
+            Some(&mut digests),
+            false,
+        )?;
         Ok((run, digests))
+    }
+
+    /// Retains exact persisted inputs only while repairing an old file run.
+    /// Ordinary loads keep their compact, text-free resident representation.
+    pub(crate) fn decode_view_payload_for_summary_repair(
+        payload: &[u8],
+        rel_path: &Path,
+        producer: &ViewPayloadProducer<'_>,
+    ) -> Result<Self, String> {
+        Self::decode_view_payload_inner(payload, rel_path, producer, None, true)
     }
 
     fn decode_view_payload_inner(
@@ -11091,6 +11608,7 @@ impl SemanticVectors {
         rel_path: &Path,
         producer: &ViewPayloadProducer<'_>,
         mut text_digests: Option<&mut Vec<blake3::Hash>>,
+        retain_embed_text: bool,
     ) -> Result<Self, String> {
         let mut cursor = 0usize;
         let version = take_view_slice(payload, &mut cursor, 1)?[0];
@@ -11116,7 +11634,7 @@ impl SemanticVectors {
         for _ in 0..count {
             let name = take_view_string(payload, &mut cursor)?;
             let qualified_name = take_view_string(payload, &mut cursor)?;
-            let kind = u8_to_symbol_kind(take_view_slice(payload, &mut cursor, 1)?[0]);
+            let kind = u8_to_symbol_kind(take_view_slice(payload, &mut cursor, 1)?[0])?;
             let start_line = take_view_u32(payload, &mut cursor)?;
             let end_line = take_view_u32(payload, &mut cursor)?;
             let exported = take_view_slice(payload, &mut cursor, 1)?[0] != 0;
@@ -11135,6 +11653,8 @@ impl SemanticVectors {
                 .chunks_exact(4)
                 .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four bytes")))
                 .collect::<Arc<[f32]>>();
+            validate_embedding_dimension(vector.len())?;
+            validate_finite_embedding(&vector)?;
             match dimension {
                 None => dimension = Some(vector.len()),
                 Some(expected) if expected != vector.len() => {
@@ -11151,7 +11671,13 @@ impl SemanticVectors {
                     start_line,
                     end_line,
                     exported,
-                    embed_text: String::new(),
+                    embed_text: if retain_embed_text {
+                        std::str::from_utf8(embed_text)
+                            .map_err(|error| format!("invalid cached embedding text: {error}"))?
+                            .to_string()
+                    } else {
+                        String::new()
+                    },
                     snippet,
                 },
                 vector,
@@ -11162,7 +11688,7 @@ impl SemanticVectors {
         }
         Ok(Self {
             entries,
-            provider_refused: false,
+            provider_refused_chunks: 0,
         })
     }
 
@@ -11180,6 +11706,30 @@ impl SemanticVectors {
         self.entries
             .iter()
             .map(|entry| (entry.chunk.embed_text.as_str(), &entry.vector))
+    }
+
+    /// The file key already binds these rows to unchanged source bytes. Keep
+    /// their exact metadata and vector slots, replacing only oversized summary
+    /// inputs; equal text in two symbol rows need not have equal float bytes.
+    pub(crate) fn into_summary_repair_chunks(
+        self,
+        caps: EmbedTextCaps,
+    ) -> (Vec<SemanticChunk>, Vec<Option<Arc<[f32]>>>) {
+        let budget = caps.total_chars.min(EmbedTextCaps::default().total_chars);
+        self.entries
+            .into_iter()
+            .map(|entry| {
+                let mut chunk = entry.chunk;
+                if chunk.kind == SymbolKind::FileSummary {
+                    let limited = truncate_chars(&chunk.embed_text, budget);
+                    if limited != chunk.embed_text {
+                        chunk.embed_text = limited;
+                        return (chunk, None);
+                    }
+                }
+                (chunk, Some(entry.vector))
+            })
+            .unzip()
     }
 }
 
@@ -11260,6 +11810,7 @@ where
 }
 
 /// Assembles the same canonical file runs from validated fresh or reused rows.
+#[cfg(test)]
 pub(crate) fn embed_view_files_with_rows<F>(
     files: Vec<Vec<SemanticChunk>>,
     rows_fn: &mut F,
@@ -11267,6 +11818,20 @@ pub(crate) fn embed_view_files_with_rows<F>(
 ) -> Result<Vec<SemanticVectors>, String>
 where
     F: FnMut(Vec<String>) -> Result<Vec<BuildEmbeddingRow>, String>,
+{
+    embed_view_files_with_rows_at_offset(files, &mut |_, texts| rows_fn(texts), max_batch_size)
+}
+
+/// The offset is the checkpoint's flattened chunk cursor, including batches
+/// completed by an earlier attempt. Callers can align their reused-row slots
+/// without consuming the beginning of a resumed file twice.
+pub(crate) fn embed_view_files_with_rows_at_offset<F>(
+    files: Vec<Vec<SemanticChunk>>,
+    rows_fn: &mut F,
+    max_batch_size: usize,
+) -> Result<Vec<SemanticVectors>, String>
+where
+    F: FnMut(usize, Vec<String>) -> Result<Vec<BuildEmbeddingRow>, String>,
 {
     let _refusal_run = EmbeddingRefusalRunScope::new();
     let resume = prepared_pause_job()
@@ -11292,7 +11857,7 @@ where
                 state.next_chunk,
             )
         } else {
-            let refused_files = vec![false; files.len()];
+            let refused_files = vec![0usize; files.len()];
             let runs = files
                 .iter()
                 .map(|chunks| Vec::with_capacity(chunks.len()))
@@ -11311,7 +11876,7 @@ where
             .iter()
             .map(|(_, chunk)| chunk.embed_text.clone())
             .collect();
-        let rows = match rows_fn(texts) {
+        let rows = match rows_fn(batch_start, texts) {
             Ok(rows) => rows,
             Err(error) => {
                 if let Some(job) = observe_lane_pause(&error) {
@@ -11351,7 +11916,7 @@ where
                     embedded_text,
                     reason,
                 } => {
-                    refused_files[*file] |= reason == PROVIDER_REFUSAL_REASON;
+                    refused_files[*file] += usize::from(reason == PROVIDER_REFUSAL_REASON);
                     log_skipped_row_warning(&chunk, &embedded_text, &reason);
                 }
             }
@@ -11360,9 +11925,9 @@ where
     Ok(runs
         .into_iter()
         .zip(refused_files)
-        .map(|(entries, provider_refused)| SemanticVectors {
+        .map(|(entries, provider_refused_chunks)| SemanticVectors {
             entries,
-            provider_refused,
+            provider_refused_chunks,
         })
         .collect())
 }
@@ -11399,6 +11964,7 @@ impl ViewSemanticBase {
                 dimension,
                 fingerprint: None,
                 deferred_files: HashSet::new(),
+                summary_budget_limited: false,
                 skipped_rows: SkippedEmbeddingRows::default(),
                 persistence: Arc::new(Mutex::new(None)),
             }),
@@ -11443,9 +12009,23 @@ impl SemanticIndex {
 }
 
 fn semantic_score_order(a: &(f32, usize), b: &(f32, usize)) -> std::cmp::Ordering {
-    b.0.partial_cmp(&a.0)
-        .unwrap_or(std::cmp::Ordering::Equal)
-        .then_with(|| a.1.cmp(&b.1))
+    // Preserve equal-score ties, including signed zero, while giving corrupt
+    // scores a consistent position after finite similarities.
+    let score_a = if a.0.is_finite() {
+        a.0
+    } else {
+        f32::NEG_INFINITY
+    };
+    let score_b = if b.0.is_finite() {
+        b.0
+    } else {
+        f32::NEG_INFINITY
+    };
+    if score_a == score_b {
+        a.1.cmp(&b.1)
+    } else {
+        score_b.total_cmp(&score_a)
+    }
 }
 
 /// Compute an embedding's L2 norm for its in-memory search cache.
@@ -11499,8 +12079,8 @@ fn symbol_kind_to_u8(kind: &SymbolKind) -> u8 {
     }
 }
 
-fn u8_to_symbol_kind(v: u8) -> SymbolKind {
-    match v {
+fn u8_to_symbol_kind(v: u8) -> Result<SymbolKind, String> {
+    Ok(match v {
         0 => SymbolKind::Function,
         1 => SymbolKind::Class,
         2 => SymbolKind::Method,
@@ -11512,9 +12092,12 @@ fn u8_to_symbol_kind(v: u8) -> SymbolKind {
         8 => SymbolKind::Heading,
         9 => SymbolKind::FileSummary,
         10 => SymbolKind::Kernel,
-        _ => SymbolKind::Heading,
-    }
+        _ => return Err(format!("invalid semantic symbol kind: {v}")),
+    })
 }
+
+#[cfg(test)]
+pub(crate) use tests::saved_pre_budget_summary_fixture;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -13786,9 +14369,10 @@ Connection: close
     #[test]
     fn response_body_read_failures_are_marked_transient() {
         let (url, handle) = start_truncated_body_server(EMBEDDING_REQUEST_MAX_ATTEMPTS);
-        // Generous client timeout: this test classifies BODY-TRUNCATION errors,
-        // and a tight budget flips the failure into a connect/send timeout on a
-        // loaded machine, changing which error string the assertions see.
+        // Generous client timeout and build deadline: this test classifies
+        // BODY-TRUNCATION errors, and a tight budget flips the failure into a
+        // connect/send timeout on a loaded machine, changing which error
+        // string the assertions see.
         let client = Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
@@ -13799,7 +14383,7 @@ Connection: close
             "test backend",
             EmbeddingRequestPolicy::Build(BuildRequestBudget {
                 batch_size: 1,
-                deadline_ms: 250,
+                deadline_ms: 5_000,
             }),
         )
         .expect_err("truncated body should fail");
@@ -14284,6 +14868,127 @@ Connection: close
 
     fn test_project_root() -> PathBuf {
         std::env::current_dir().unwrap()
+    }
+
+    #[test]
+    fn audit10_oversized_semantic_refresh_stays_clean() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let file = project.path().join("large.rs");
+        fs::File::create(&file)
+            .unwrap()
+            .set_len(MAX_SEMANTIC_FILE_BYTES + 1)
+            .unwrap();
+        let mut index = build_test_index(project.path(), std::slice::from_ref(&file));
+        assert_eq!(index.len(), 0);
+        assert!(index.write_to_disk(storage.path(), "large"));
+        let summary = index
+            .refresh_stale_files(
+                project.path(),
+                std::slice::from_ref(&file),
+                &mut |_| -> Result<Vec<Vec<f32>>, String> {
+                    panic!("excluded files must not embed")
+                },
+                8,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        assert!(summary.is_noop());
+        assert!(!index.is_file_stale(&file));
+        assert!(index.dirty_paths_snapshot().unwrap().is_empty());
+        fs::write(&file, "pub fn now_indexable() {}\n").unwrap();
+        assert!(index.is_file_stale(&file));
+        let small = cache_freshness::collect(&file).unwrap();
+        index.file_mtimes.insert(file.clone(), small.mtime);
+        index.file_sizes.insert(file.clone(), small.size);
+        index
+            .file_hashes
+            .insert(file.clone(), cache_freshness::zero_hash());
+        assert!(index.is_file_stale(&file));
+    }
+
+    #[test]
+    fn audit10_contentfresh_metadata_survives_persistence() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let file = project.path().join("fresh.rs");
+        fs::write(&file, "pub fn fresh() {}\n").unwrap();
+        let mut index = build_test_index(project.path(), std::slice::from_ref(&file));
+        assert!(index.write_to_disk(storage.path(), "fresh"));
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        let summary = index
+            .refresh_stale_files(
+                project.path(),
+                std::slice::from_ref(&file),
+                &mut |_| -> Result<Vec<Vec<f32>>, String> {
+                    panic!("unchanged content must be reused")
+                },
+                8,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        assert_eq!(summary.changed, 0);
+        assert!(index.write_to_disk(storage.path(), "fresh"));
+        let bytes = fs::read(storage.path().join("semantic/fresh/semantic.bin")).unwrap();
+        let restored = SemanticIndex::from_bytes(&bytes, project.path()).unwrap();
+        assert_eq!(restored.file_mtimes.get(&file), Some(&mtime));
+    }
+
+    #[test]
+    fn audit10_47_collection_category_not_error_words_controls_skipping() {
+        assert!(SemanticCollectError::UnsupportedExtension.is_expected_non_code());
+        let parse = SemanticCollectError::Parse("unsupported file extension".to_string());
+        let io = SemanticCollectError::Io(std::io::Error::other("unsupported file extension"));
+        assert_eq!(parse.to_string(), "unsupported file extension");
+        assert!(!parse.is_expected_non_code());
+        assert!(!io.is_expected_non_code());
+    }
+
+    #[test]
+    fn audit10_plain_clone_dirty_updates_survive_another_writer() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let files = (0..64)
+            .map(|i| project.path().join(format!("file_{i}.rs")))
+            .collect::<Vec<_>>();
+        for file in &files {
+            fs::write(file, "pub fn symbol() {}\n").unwrap();
+        }
+        let mut first = build_test_index(project.path(), &files);
+        assert!(first.write_to_disk(storage.path(), "overlap"));
+        let second = std::rc::Rc::new(std::cell::RefCell::new(first.clone()));
+        first
+            .file_mtimes
+            .insert(files[0].clone(), SystemTime::UNIX_EPOCH);
+        first.extend_dirty_paths(std::iter::once(files[0].clone()));
+        let second_at_snapshot = second.clone();
+        let path = files[1].clone();
+        let updated_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(50);
+        PERSIST_DIRTY_SNAPSHOT_PROBE.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(move || {
+                let mut second = second_at_snapshot.borrow_mut();
+                second.file_mtimes.insert(path.clone(), updated_mtime);
+                second.extend_dirty_paths(std::iter::once(path));
+            }));
+        });
+        assert!(first.write_to_disk(storage.path(), "overlap"));
+        assert_eq!(
+            second.borrow().file_mtimes.get(&files[1]),
+            Some(&updated_mtime)
+        );
+        assert!(first.last_append_read_bytes.load(Ordering::Relaxed) > 0);
+        assert!(second.borrow().write_to_disk(storage.path(), "overlap"));
+        let bytes = fs::read(storage.path().join("semantic/overlap/semantic.bin")).unwrap();
+        let restored = SemanticIndex::from_bytes(&bytes, project.path()).unwrap();
+        assert_eq!(restored.file_mtimes.get(&files[1]), Some(&updated_mtime));
+        let fork = first.fork_for_refresh();
+        assert!(!Arc::ptr_eq(&fork.dirty_paths, &first.dirty_paths));
     }
 
     #[test]
@@ -15630,8 +16335,8 @@ Connection: close
         .unwrap();
         assert_eq!(loaded.to_bytes(), bytes);
         assert_eq!(read, bytes.len());
-        // The empty V8 skipped-row section follows the last vector (8 + 4 bytes).
-        let vector_end = bytes.len() - 12;
+        // The empty V8 skipped-chunk section follows the last vector (8 + 4 + 4 bytes).
+        let vector_end = bytes.len() - 16;
         for total_len in [None, Some(vector_end - 1)] {
             let error = SemanticIndex::from_reader_after_version(
                 ShortReader(&bytes[1..vector_end - 1]),
@@ -15943,7 +16648,7 @@ Connection: close
 
         let current_bytes = index.to_bytes();
         assert_eq!(current_bytes[0], SEMANTIC_INDEX_VERSION_V8);
-        let mut v7_bytes = current_bytes[..current_bytes.len() - 12].to_vec();
+        let mut v7_bytes = current_bytes[..current_bytes.len() - 16].to_vec();
         v7_bytes[0] = SEMANTIC_INDEX_VERSION_V7;
         assert_eq!(v7_bytes[0], SEMANTIC_INDEX_VERSION_V7);
         assert_ne!(v7_bytes, legacy_bytes);
@@ -16019,7 +16724,7 @@ Connection: close
 
         for (kind, encoded) in cases {
             assert_eq!(symbol_kind_to_u8(&kind), encoded);
-            assert_eq!(u8_to_symbol_kind(encoded), kind);
+            assert_eq!(u8_to_symbol_kind(encoded).unwrap(), kind);
         }
     }
 
@@ -16424,7 +17129,7 @@ public class Greeter {
         assert_eq!(views[0].entry_count(), 2048);
         assert_eq!(base.estimated_memory(), expected);
         let replacement = ViewSemanticBase::new(vec![Arc::new(SemanticVectors {
-            provider_refused: false,
+            provider_refused_chunks: 0,
             entries: changed.entries,
         })]);
         assert_eq!(replacement.base.estimated_memory().counts["entries"], 1);
@@ -17685,7 +18390,7 @@ public class Greeter {
         assert!(
             events
                 .iter()
-                .any(|line| line.contains("kind=build_ready") && line.contains("skipped_rows=0")),
+                .any(|line| line.contains("kind=build_ready") && line.contains("skipped_chunks=0")),
             "semantic ready event must disclose zero skipped rows: {events:?}",
         );
         let mut full_rows = 0usize;
@@ -17775,13 +18480,13 @@ public class Greeter {
             .all(|entry| entry.chunk.name != "symbol_1"));
         let warnings = take_test_skipped_row_warnings();
         assert_eq!(warnings.len(), 1, "warnings={warnings:?}");
-        assert!(warnings[0].contains("semantic embed skipped row:"));
+        assert!(warnings[0].contains("semantic embed skipped chunk:"));
         assert!(warnings[0].contains(&format!("file={skipped_file}")));
         assert!(warnings[0].contains("symbol=symbol_1"));
         assert!(
             events
                 .iter()
-                .any(|line| line.contains("kind=build_ready") && line.contains("skipped_rows=1")),
+                .any(|line| line.contains("kind=build_ready") && line.contains("skipped_chunks=1")),
             "semantic ready event must disclose skipped rows: {events:?}",
         );
     }
@@ -17932,6 +18637,45 @@ public class Greeter {
         let requests = server.requests();
         assert!(requests.len() < 2 * 16 - 1, "{requests:?}");
         assert_eq!(requests.iter().filter(|rows| rows.len() == 1).count(), 9);
+    }
+
+    #[test]
+    fn skipped_chunk_summaries_pin_approved_text_and_persist_both_reasons() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("src")).unwrap();
+        let mut index = SemanticIndex::new(root.path().to_path_buf(), 2);
+        let files = ('a'..='g')
+            .map(|name| root.path().join(format!("src/{name}.rs")))
+            .collect::<Vec<_>>();
+        for (ordinal, file) in files.iter().enumerate() {
+            add_invalidation_fixture_entry(&mut index, file.clone(), ordinal as u64);
+        }
+        index.apply_refused_rows_update(files.iter().map(|file| (file.clone(), 1)).collect());
+        let refused = "semantic search is incomplete: 7 chunks skipped because the embedding provider refused them: src/a.rs, src/b.rs, src/c.rs, src/d.rs, src/e.rs (+2 more files)";
+        assert_eq!(index.skipped_chunks_summary().as_deref(), Some(refused));
+        index.apply_context_skips_update(BTreeMap::from([(files[2].clone(), 1)]));
+        let expected = format!("{refused}\nsemantic search is incomplete: 1 chunks skipped because they exceed the model's input limit: src/c.rs");
+        assert_eq!(index.skipped_rows(), 8);
+        assert_eq!(
+            index.skipped_chunks_summary().as_deref(),
+            Some(expected.as_str())
+        );
+        let restored = SemanticIndex::from_bytes(&index.to_bytes(), root.path()).unwrap();
+        assert_eq!(
+            restored.skipped_chunks_summary().as_deref(),
+            Some(expected.as_str())
+        );
+        let base = Arc::new(
+            restored
+                .into_shared_base()
+                .unwrap_or_else(|_| panic!("shareable fixture")),
+        );
+        let sibling = tempfile::tempdir().unwrap();
+        let shared = SemanticIndex::from_shared_base(sibling.path().to_path_buf(), base);
+        assert_eq!(
+            shared.skipped_chunks_summary().as_deref(),
+            Some(expected.as_str())
+        );
     }
 
     #[test]
@@ -18810,6 +19554,383 @@ public class Greeter {
     }
 
     #[test]
+    fn audit10_9_summary_honors_smaller_backend_budget_without_reordering_chunks() {
+        let root = PathBuf::from("/project");
+        let file = root.join("src/summary.rs");
+        let source = "//! A long module description for a small configured embedding budget.\npub fn exported() {\n}\n";
+        let mut symbol = make_symbol(SymbolKind::Function, "exported", 1, 2);
+        symbol.exported = true;
+        let default = symbols_to_chunks_with_caps(
+            &file,
+            std::slice::from_ref(&symbol),
+            source,
+            &root,
+            EmbedTextCaps::default(),
+        );
+        let small = symbols_to_chunks_with_caps(
+            &file,
+            std::slice::from_ref(&symbol),
+            source,
+            &root,
+            EmbedTextCaps {
+                total_chars: 40,
+                ..EmbedTextCaps::default()
+            },
+        );
+        assert_eq!(
+            small
+                .iter()
+                .map(|chunk| (&chunk.name, &chunk.kind))
+                .collect::<Vec<_>>(),
+            default
+                .iter()
+                .map(|chunk| (&chunk.name, &chunk.kind))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(small[0].kind, SymbolKind::FileSummary);
+        assert_eq!(small[0].embed_text.chars().count(), 40);
+        assert_eq!(
+            small[0].embed_text,
+            "file:src/summary.rs kind:file-summary na"
+        );
+        let expanded = symbols_to_chunks_with_caps(
+            &file,
+            &[symbol],
+            source,
+            &root,
+            EmbedTextCaps {
+                total_chars: 4000,
+                ..EmbedTextCaps::default()
+            },
+        );
+        assert_eq!(
+            expanded[0].embed_text.as_bytes(),
+            default[0].embed_text.as_bytes()
+        );
+    }
+
+    #[test]
+    fn audit10_9_expanded_budget_keeps_fixed_summary_limit() {
+        let root = Path::new("/project");
+        let file = root.join("summary.rs");
+        let exports = "x".repeat(2000);
+        let lines = SourceLineCache::new("");
+        let summary = build_file_summary_chunk_with_lines_and_caps(
+            &file,
+            root,
+            &lines,
+            &[&exports],
+            &[],
+            EmbedTextCaps {
+                total_chars: 4000,
+                ..EmbedTextCaps::default()
+            },
+        );
+        assert_eq!(summary.embed_text.chars().count(), 1600);
+        assert!(summary.embed_text.ends_with('x'));
+    }
+
+    pub(crate) fn saved_pre_budget_summary_fixture(
+        small: bool,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PathBuf,
+        SemanticIndexFingerprint,
+    ) {
+        saved_summary_fixture_for_tokens(small.then_some(20))
+    }
+
+    fn saved_summary_fixture_for_tokens(
+        max_input_tokens: Option<usize>,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PathBuf,
+        SemanticIndexFingerprint,
+    ) {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        let file = root.join("summary.rs");
+        let source = "//! A long module description that deliberately exceeds the configured small embedding budget.\npub fn exported() {\n    42;\n}\n";
+        fs::write(&file, source).unwrap();
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::Ollama,
+            max_input_tokens,
+            ..Default::default()
+        };
+        let fingerprint = SemanticIndexFingerprint::from_config(&config, 4);
+        let mut embedder = RecordingEmbedder::default();
+        let mut index = SemanticIndex::build_with_caps(
+            &root,
+            &[file.clone()],
+            &mut |texts| embedder.embed(texts),
+            16,
+            fingerprint.embed_text_caps,
+        )
+        .unwrap();
+        let old = build_file_summary_chunk(
+            &file,
+            &root,
+            source,
+            &["exported"],
+            &[Some("pub fn exported()")],
+        );
+        let summary = index
+            .entries
+            .iter_mut()
+            .find(|entry| entry.chunk.kind == SymbolKind::FileSummary)
+            .unwrap();
+        *summary = EmbeddingEntry::new(old.clone(), deterministic_test_vector(&old.embed_text));
+        index.set_fingerprint(fingerprint.clone());
+        assert!(index.write_to_disk(storage.path(), "summary-budget"));
+        let path = storage.path().join("semantic/summary-budget/semantic.bin");
+        let mut bytes = fs::read(&path).unwrap();
+        let len = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
+        let mut identity: serde_json::Value = serde_json::from_slice(&bytes[13..13 + len]).unwrap();
+        identity
+            .as_object_mut()
+            .unwrap()
+            .remove("file_summary_budget_limited");
+        let legacy_identity = serde_json::to_vec(&identity).unwrap();
+        bytes.splice(13..13 + len, legacy_identity.iter().copied());
+        bytes[9..13].copy_from_slice(&(legacy_identity.len() as u32).to_le_bytes());
+        fs::write(path, bytes).unwrap();
+        (project, storage, root, fingerprint)
+    }
+
+    #[test]
+    fn audit10_9_legacy_small_cap_load_repairs_only_summaries_and_borrowers_adopt() {
+        let (_project, storage, root, fingerprint) = saved_pre_budget_summary_fixture(true);
+        let before =
+            SemanticIndex::read_from_disk_borrow_tolerant(storage.path(), "summary-budget", &root)
+                .unwrap();
+        assert!(!before.search(&[1.0, 0.0, 0.0, 0.0], 100).is_empty());
+        assert!(before
+            .live_entries()
+            .any(|(_, entry)| entry.chunk.kind == SymbolKind::FileSummary
+                && entry.chunk.embed_text.chars().count() > 70));
+        let symbols = |index: &SemanticIndex| {
+            index
+                .live_entries()
+                .filter(|(_, entry)| entry.chunk.kind != SymbolKind::FileSummary)
+                .map(|(_, entry)| (entry.chunk.name.clone(), entry.vector.to_vec()))
+                .collect::<Vec<_>>()
+        };
+        let symbols_before = symbols(&before);
+        assert_eq!(
+            symbols_before.len(),
+            1,
+            "the fixture must contain a reusable symbol vector"
+        );
+        let mut embedder = RecordingEmbedder::default();
+        let (repaired, changed) = SemanticIndex::read_from_disk_with_summary_repair(
+            storage.path(),
+            "summary-budget",
+            &root,
+            false,
+            Some(&fingerprint.as_string()),
+            &mut |texts| embedder.embed(texts),
+            16,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            changed,
+            "a legacy small-cap cache needs summary invalidation"
+        );
+        assert_eq!(embedder.total_embedded_texts(), 1);
+        assert!(embedder
+            .embedded_texts()
+            .iter()
+            .all(|text| text.contains("kind:file-summary") && text.chars().count() <= 70));
+        assert_eq!(symbols_before, symbols(&repaired));
+        assert!(repaired.write_to_disk(storage.path(), "summary-budget"));
+        let scanned = repaired
+            .append_scan_bytes_for_test(storage.path(), "summary-budget")
+            .unwrap();
+        assert!(
+            scanned
+                < fs::metadata(storage.path().join("semantic/summary-budget/semantic.bin"))
+                    .unwrap()
+                    .len() as usize
+        );
+        let after =
+            SemanticIndex::read_from_disk_borrow_tolerant(storage.path(), "summary-budget", &root)
+                .unwrap();
+        assert!(!after.search(&[1.0, 0.0, 0.0, 0.0], 100).is_empty());
+        assert!(after
+            .live_entries()
+            .filter(|(_, entry)| entry.chunk.kind == SymbolKind::FileSummary)
+            .all(|(_, entry)| entry.chunk.embed_text.chars().count() <= 70));
+        let mut again = RecordingEmbedder::default();
+        let (_, changed) = SemanticIndex::read_from_disk_with_summary_repair(
+            storage.path(),
+            "summary-budget",
+            &root,
+            false,
+            Some(&fingerprint.as_string()),
+            &mut |texts| again.embed(texts),
+            16,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!changed);
+        assert_eq!(again.total_embedded_texts(), 0);
+    }
+
+    #[test]
+    fn audit10_9_legacy_default_cap_load_does_not_rebuild_summaries() {
+        let (_project, storage, root, fingerprint) = saved_pre_budget_summary_fixture(false);
+        let path = storage.path().join("semantic/summary-budget/semantic.bin");
+        let before = fs::read(&path).unwrap();
+        let mut embedder = RecordingEmbedder::default();
+        let (_, changed) = SemanticIndex::read_from_disk_with_summary_repair(
+            storage.path(),
+            "summary-budget",
+            &root,
+            false,
+            Some(&fingerprint.as_string()),
+            &mut |texts| embedder.embed(texts),
+            16,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!changed);
+        assert_eq!(embedder.total_embedded_texts(), 0);
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn audit10_9_legacy_small_cap_fitting_summaries_persist_marker_without_embedding() {
+        let (_project, storage, root, identity) = saved_summary_fixture_for_tokens(Some(256));
+        let mut embedder = RecordingEmbedder::default();
+        let (index, changed) = SemanticIndex::read_from_disk_with_summary_repair(
+            storage.path(),
+            "summary-budget",
+            &root,
+            false,
+            Some(&identity.as_string()),
+            &mut |texts| embedder.embed(texts),
+            16,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(changed);
+        assert_eq!(embedder.total_embedded_texts(), 0);
+        assert!(index.write_to_disk(storage.path(), "summary-budget"));
+        let (_, changed) = SemanticIndex::read_from_disk_with_summary_repair(
+            storage.path(),
+            "summary-budget",
+            &root,
+            false,
+            Some(&identity.as_string()),
+            &mut |_| panic!("metadata-only repair must persist"),
+            16,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!changed);
+    }
+
+    #[test]
+    fn audit10_9_older_writer_delta_reopens_summary_repair() {
+        let (_project, storage, root, identity) = saved_pre_budget_summary_fixture(true);
+        let old =
+            SemanticIndex::read_from_disk(storage.path(), "summary-budget", &root, false, None)
+                .unwrap();
+        let (fixed, _) = SemanticIndex::read_from_disk_with_summary_repair(
+            storage.path(),
+            "summary-budget",
+            &root,
+            false,
+            Some(&identity.as_string()),
+            &mut |texts: Vec<String>| {
+                Ok(texts
+                    .iter()
+                    .map(|text| deterministic_test_vector(text))
+                    .collect())
+            },
+            16,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(fixed.write_to_disk(storage.path(), "summary-budget"));
+        let paths = BTreeSet::from([root.join("summary.rs")]);
+        let frame = old.build_segment_frame(1, &paths).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(storage.path().join("semantic/summary-budget/semantic.bin"))
+            .unwrap()
+            .write_all(&frame)
+            .unwrap();
+        let mut embedder = RecordingEmbedder::default();
+        let (_, changed) = SemanticIndex::read_from_disk_with_summary_repair(
+            storage.path(),
+            "summary-budget",
+            &root,
+            false,
+            Some(&identity.as_string()),
+            &mut |texts| embedder.embed(texts),
+            16,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            changed,
+            "an old writer's delta cannot retain the repaired marker"
+        );
+        assert_eq!(embedder.total_embedded_texts(), 1);
+    }
+
+    #[test]
+    fn audit10_9_summary_repair_failure_keeps_rows_and_marker_unchanged() {
+        let (_project, storage, root, _) = saved_pre_budget_summary_fixture(true);
+        let mut index =
+            SemanticIndex::read_from_disk(storage.path(), "summary-budget", &root, false, None)
+                .unwrap();
+        let file = root.join("second.rs");
+        let source = "//! Another description long enough to exceed the small embedding budget.\npub fn second() {}\n";
+        fs::write(&file, source).unwrap();
+        let chunk = build_file_summary_chunk(
+            &file,
+            &root,
+            source,
+            &["second"],
+            &[Some("pub fn second()")],
+        );
+        let vector = deterministic_test_vector(&chunk.embed_text);
+        index.entries.push(EmbeddingEntry::new(chunk, vector));
+        let metadata = fs::metadata(&file).unwrap();
+        index
+            .file_mtimes
+            .insert(file.clone(), metadata.modified().unwrap());
+        index.file_sizes.insert(file.clone(), metadata.len());
+        index
+            .file_hashes
+            .insert(file, blake3::hash(source.as_bytes()));
+        let before = index.to_bytes();
+        let mut calls = 0;
+        let result = index.repair_legacy_file_summaries(
+            &mut |texts: Vec<String>| {
+                calls += 1;
+                if calls == 2 {
+                    return Err("backend interrupted".to_string());
+                }
+                Ok(texts
+                    .iter()
+                    .map(|text| deterministic_test_vector(text))
+                    .collect())
+            },
+            1,
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, 2);
+        assert_eq!(index.to_bytes(), before);
+    }
+
+    #[test]
     fn unbounded_chunk_caps_preserve_full_signature_and_body() {
         let project_root = PathBuf::from("/proj");
         let file = project_root.join("long.rs");
@@ -19281,6 +20402,278 @@ public class Greeter {
 #[cfg(test)]
 mod embedding_backend_retry_status_tests {
     use super::*;
+
+    #[test]
+    fn audit10_semantic_lock_poison_recovers() {
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = SEMANTIC_LOCK_ACQUIRE_MUTEX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            panic!("simulate acquisition panic");
+        });
+        assert!(poisoned.is_err());
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let lock = SemanticIndexLock::acquire(storage.path(), "poison", project.path()).unwrap();
+        assert!(lock._guard.is_some());
+    }
+
+    #[test]
+    fn audit10_reuse_map_joins_only_requested_shared_paths() {
+        let mut index = audit10_vector_index(vec![vec![1.0, 0.0]; 64]);
+        for (i, entry) in index.entries.iter_mut().enumerate() {
+            entry.chunk.file = index.project_root.join(format!("file_{i}.rs"));
+            index
+                .file_mtimes
+                .insert(entry.chunk.file.clone(), SystemTime::UNIX_EPOCH);
+            index.file_sizes.insert(entry.chunk.file.clone(), 0);
+        }
+        let requested = index.entries[0].chunk.file.clone();
+        let mut worker = index.fork_for_refresh();
+        assert!(worker.shared_base.is_some());
+        SHARED_PATH_JOINS.with(|count| count.set(0));
+        let reuse = worker.build_chunk_reuse_map(std::slice::from_ref(&requested));
+        assert_eq!(reuse.len(), 1);
+        let rows = reuse[&requested].values().next().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(&*rows[0].vector, &[1.0, 0.0]);
+        SHARED_PATH_JOINS.with(|count| assert_eq!(count.get(), 1));
+        worker.tombstones.insert(
+            requested
+                .strip_prefix(&worker.project_root)
+                .unwrap()
+                .to_path_buf(),
+        );
+        SHARED_PATH_JOINS.with(|count| count.set(0));
+        assert!(worker.build_chunk_reuse_map(&[requested]).is_empty());
+        SHARED_PATH_JOINS.with(|count| assert_eq!(count.get(), 0));
+    }
+
+    fn audit10_vector_index(vectors: Vec<Vec<f32>>) -> SemanticIndex {
+        let root = std::env::current_dir().unwrap();
+        let file = root.join("vectors.rs");
+        let mut index = SemanticIndex::new(root, 2);
+        index
+            .file_mtimes
+            .insert(file.clone(), SystemTime::UNIX_EPOCH);
+        index.file_sizes.insert(file.clone(), 0);
+        for (i, vector) in vectors.into_iter().enumerate() {
+            index.entries.push(EmbeddingEntry::new(
+                SemanticChunk {
+                    file: file.clone(),
+                    name: format!("audit_vector_{i}"),
+                    qualified_name: None,
+                    kind: SymbolKind::Function,
+                    start_line: i as u32 + 1,
+                    end_line: i as u32 + 1,
+                    exported: false,
+                    snippet: String::new(),
+                    embed_text: String::new(),
+                },
+                vector,
+            ));
+        }
+        index
+    }
+
+    #[test]
+    fn audit10_embedding_rejects_nonfinite_batch() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(validate_embedding_batch(&[vec![value, 1.0]], 1, "test").is_err());
+        }
+        assert!(validate_embedding_batch(&[vec![1.0, 0.0]], 1, "test").is_ok());
+    }
+
+    #[test]
+    fn audit10_embedding_rejects_nonfinite_build_rows() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(
+                execute_build_embedding_batch(vec!["input".to_string()], &mut |_| {
+                    Ok(vec![vec![value, 1.0]])
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn audit10_semantic_cache_rejects_nonfinite_vectors() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let index = audit10_vector_index(vec![vec![value, 1.0]]);
+            let error =
+                SemanticIndex::from_bytes(&index.to_bytes(), &index.project_root).unwrap_err();
+            assert!(error.contains("non-finite"), "{error}");
+        }
+    }
+
+    #[test]
+    fn audit10_semantic_view_rejects_nonfinite_vectors() {
+        let producer = ViewPayloadProducer {
+            chunker_version: "1",
+            template_version: "1",
+            model_fingerprint: "test",
+        };
+        let run = SemanticVectors {
+            entries: audit10_vector_index(vec![vec![f32::NAN, 1.0]]).entries,
+            provider_refused_chunks: 0,
+        };
+        let bytes = run.encode_view_payload(&producer);
+        assert!(
+            SemanticVectors::decode_view_payload(&bytes, Path::new("vectors.rs"), &producer)
+                .is_err()
+        );
+        let valid = SemanticVectors {
+            entries: audit10_vector_index(vec![vec![1.0, 0.0]]).entries,
+            provider_refused_chunks: 0,
+        };
+        let bytes = valid.encode_view_payload(&producer);
+        let decoded =
+            SemanticVectors::decode_view_payload(&bytes, Path::new("vectors.rs"), &producer)
+                .unwrap();
+        assert_eq!(decoded.encode_view_payload(&producer), bytes);
+    }
+
+    #[test]
+    fn audit10_semantic_view_rejects_unknown_kind() {
+        let producer = ViewPayloadProducer {
+            chunker_version: "1",
+            template_version: "1",
+            model_fingerprint: "test",
+        };
+        let run = SemanticVectors {
+            entries: audit10_vector_index(vec![vec![1.0, 0.0]]).entries,
+            provider_refused_chunks: 0,
+        };
+        let mut bytes = run.encode_view_payload(&producer);
+        let name = b"audit_vector_0";
+        let offset = bytes.windows(name.len()).position(|w| w == name).unwrap();
+        bytes[offset + name.len() + 4] = 255;
+        assert!(
+            SemanticVectors::decode_view_payload(&bytes, Path::new("vectors.rs"), &producer)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn audit10_semantic_query_rejects_nonfinite_vectors() {
+        let index = audit10_vector_index(vec![vec![1.0, 0.0]]);
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(index.search(&[value, 1.0], 10).is_empty());
+        }
+        assert!(index.search(&[1.0], 10).is_empty());
+        assert_eq!(index.search(&[1.0, 0.0], 10).len(), 1);
+    }
+
+    #[test]
+    fn audit10_score_order_handles_corrupt_scores() {
+        let mut scores = [(f32::NAN, 0), (0.5, 1), (-0.5, 2), (f32::INFINITY, 3)];
+        scores.sort_by(semantic_score_order);
+        assert_eq!(
+            scores.iter().map(|(_, i)| *i).collect::<Vec<_>>(),
+            vec![1, 2, 0, 3]
+        );
+        let mut valid = [(0.0, 0), (-0.0, 1), (0.5, 2), (-0.5, 3), (0.5, 4)];
+        valid.sort_by(semantic_score_order);
+        assert_eq!(
+            valid.iter().map(|(_, i)| *i).collect::<Vec<_>>(),
+            vec![2, 4, 0, 1, 3]
+        );
+    }
+
+    #[test]
+    fn audit10_3_positive_export_scores_keep_current_order_and_bits() {
+        let mut index = audit10_vector_index(vec![vec![1.0, 0.0], vec![1.0, 0.0], vec![0.0, 1.0]]);
+        index.entries[0].chunk.exported = true;
+        index.entries[2].chunk.exported = true;
+        let results = index.search(&[1.0, 0.0], 3);
+        assert_eq!(
+            results
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["audit_vector_0", "audit_vector_1", "audit_vector_2"]
+        );
+        assert_eq!(
+            results
+                .iter()
+                .map(|row| row.score.to_bits())
+                .collect::<Vec<_>>(),
+            vec![0x3f8ccccd, 0x3f800000, 0]
+        );
+        assert_eq!(
+            results
+                .iter()
+                .map(|row| row.rank_score.to_bits())
+                .collect::<Vec<_>>(),
+            vec![0x3f8ccccd, 0x3f800000, 0]
+        );
+    }
+
+    #[test]
+    fn audit10_3_negative_export_ranks_ahead_of_equal_non_export() {
+        let mut index = audit10_vector_index(vec![vec![-1.0, 0.0], vec![-1.0, 0.0]]);
+        index.entries[0].chunk.exported = true;
+        let results = index.search(&[1.0, 0.0], 2);
+        assert_eq!(
+            results
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["audit_vector_0", "audit_vector_1"]
+        );
+        assert_eq!(results[0].score.to_bits(), 0xbf666666);
+        assert_eq!(results[1].score.to_bits(), 0xbf800000);
+        assert_eq!(results[0].rank_score.to_bits(), 0xbf666666);
+        assert_eq!(results[1].rank_score.to_bits(), 0xbf800000);
+    }
+
+    #[test]
+    fn audit10_valid_input_order_and_cache_bytes_unchanged() {
+        let index = audit10_vector_index(vec![vec![0.0, 1.0], vec![1.0, 0.0], vec![-1.0, 0.0]]);
+        let bytes = index.to_bytes();
+        let restored = SemanticIndex::from_bytes(&bytes, &index.project_root).unwrap();
+        assert_eq!(restored.to_bytes(), bytes);
+        let results = restored.search(&[1.0, 0.0], 3);
+        assert_eq!(
+            results.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["audit_vector_1", "audit_vector_0", "audit_vector_2"]
+        );
+        assert_eq!(
+            results.iter().map(|r| r.score).collect::<Vec<_>>(),
+            vec![1.0, 0.0, -1.0]
+        );
+    }
+
+    #[test]
+    fn audit10_semantic_cache_rejects_unknown_kind() {
+        let index = audit10_vector_index(vec![vec![1.0, 0.0]]);
+        let mut bytes = index.to_bytes();
+        let name = b"audit_vector_0";
+        let offset = bytes.windows(name.len()).position(|w| w == name).unwrap();
+        let kind_offset = offset + name.len() + 4;
+        assert_eq!(bytes[kind_offset], symbol_kind_to_u8(&SymbolKind::Function));
+        bytes[kind_offset] = 255;
+        let error = SemanticIndex::from_bytes(&bytes, &index.project_root).unwrap_err();
+        assert!(error.contains("invalid semantic symbol kind"), "{error}");
+        assert_eq!(u8_to_symbol_kind(8).unwrap(), SymbolKind::Heading);
+    }
+
+    #[test]
+    fn audit10_legacy_decoder_marks_missing_sizes() {
+        let root = std::env::current_dir().unwrap();
+        let file = root.join("legacy.rs");
+        let path = file.to_str().unwrap().as_bytes();
+        let mut bytes = vec![SEMANTIC_INDEX_VERSION_V1];
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(path);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        let restored = SemanticIndex::from_bytes(&bytes, &root).unwrap();
+        assert!(restored.any_missing_sizes);
+        assert!(!restored.file_sizes.contains_key(&file));
+    }
 
     fn unique_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("aft-backend-status-{name}-{}", std::process::id()))

@@ -1,1 +1,0 @@
-- `grep` no longer prints matching lines from lockfiles, generated and minified files, logs and command output, or JSON data files. It counts them and names the `path` or `include` value that shows them. Large results start with match counts per file and a short first page drawn from every file, totals are exact, and long lines show the part around the match.

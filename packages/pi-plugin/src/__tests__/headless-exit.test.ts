@@ -21,11 +21,15 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { linkCachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
+import { __test__ } from "../index.js";
 
 /** How long the process may live after its shutdown hook returned. */
 const EXIT_BOUND_MS = 5_000;
 /** When to stop waiting and kill a child that is evidently not going to exit. */
 const HANG_KILL_MS = 15_000;
+// Each notification test spawns a harness process; on a loaded runner it can take
+// longer than bun's 5 s default to finish, so allow more than the 15 s rescue kill.
+const SUBPROCESS_TEST_MS = 30_000;
 
 interface HarnessRun {
   events: Array<{ name: string; detail: string; at: number }>;
@@ -55,7 +59,12 @@ function spawnHarness(
     | "subagent"
     | "plugin-validate"
     | "session-warmup"
-    | "session-repeat",
+    | "session-repeat"
+    | "notification-upgrade"
+    | "notification-headless"
+    | "notification-summary"
+    | "notification-retry"
+    | "notification-log-retry",
 ) {
   const tempDir = mkdtempSync(join(tmpdir(), "aft-pi-headless-exit-"));
   tempDirs.push(tempDir);
@@ -66,19 +75,26 @@ function spawnHarness(
   mkdirSync(binDir, { recursive: true });
   mkdirSync(projectDir, { recursive: true });
   mkdirSync(join(configDir, "cortexkit"), { recursive: true });
-  // A stand-in for npm that records its pid and then just sits there, so the
-  // LSP install is guaranteed to still be running when the session ends.
+  // Only the install should sleep and record its PID. A stalled version probe
+  // could overwrite the marker and make shutdown assertions check the wrong child.
   linkCachedExecutable(
     join(binDir, "npm"),
-    '#!/bin/sh\necho $$ > "$HARNESS_NPM_MARKER"\nexec sleep 60\n',
+    [
+      "#!/bin/sh",
+      'if [ "$1" = "--version" ]; then echo 10.9.2; exit 0; fi',
+      'if [ "$1" != "install" ]; then exit 0; fi',
+      'echo $$ > "$HARNESS_NPM_MARKER"',
+      "exec sleep 60",
+      "",
+    ].join("\n"),
   );
   // A TypeScript project makes typescript-language-server relevant; pinning
-  // its version skips the registry probe so no network is needed.
+  // its version and disabling the other relevant servers avoids registry lookups.
   writeFileSync(join(projectDir, "a.ts"), "export const a = 1;\n");
   writeFileSync(join(projectDir, "package.json"), '{ "name": "headless-exit" }\n');
   writeFileSync(
     join(configDir, "cortexkit", "aft.jsonc"),
-    '{ "indexes": { "semantic": true }, "lsp": { "versions": { "typescript-language-server": "4.3.3" } } }\n',
+    '{ "indexes": { "semantic": true }, "lsp": { "disabled": ["typescript-sdk", "biome"], "versions": { "typescript-language-server": "4.3.3" } } }\n',
   );
 
   const env: Record<string, string> = {};
@@ -97,8 +113,19 @@ function spawnHarness(
     HARNESS_PLUGIN: resolve(import.meta.dir, "../index.ts"),
     HARNESS_MODE: mode,
   });
+  if (mode.startsWith("notification-")) {
+    const storage = join(tempDir, "storage");
+    mkdirSync(join(storage, "pi"), { recursive: true });
+    writeFileSync(join(storage, "pi", "last_announced_version"), "0.1.0");
+    env.AFT_STORAGE_DIR = storage;
+    writeFileSync(
+      join(configDir, "cortexkit", "aft.jsonc"),
+      '{ "indexes": { "semantic": false }, "lsp": { "auto_install": false } }',
+    );
+  }
   if (mode === "subagent") env.MAGIC_CONTEXT_PI_SUBAGENT = "1";
   else delete env.MAGIC_CONTEXT_PI_SUBAGENT;
+  if (mode === "notification-log-retry") env.AFT_LOG_STDERR = "1";
 
   const child = spawn(
     process.execPath,
@@ -287,6 +314,7 @@ describe.skipIf(process.platform === "win32")(
     test("the in-flight npm install is stopped with the session instead of left running", async () => {
       const run = await runHarness();
       expect(run.npmPid).not.toBeNull();
+      expect(run.events.map((event) => event.name)).toContain("npm-stopped");
       expect(isAlive(run.npmPid ?? -1)).toBe(false);
     }, 70_000);
   },
@@ -303,8 +331,9 @@ describe.skipIf(process.platform === "win32")("SIGTERM ends a Pi host running th
     expect(run.killedAsHung).toBe(false);
     expect({ code: run.exitCode, signal: run.exitSignal }).toEqual({ code: 143, signal: null });
     expect(run.exitedAfterSignalMs ?? Number.POSITIVE_INFINITY).toBeLessThan(SIGTERM_EXIT_BOUND_MS);
-    // The plugin's own cleanup still ran: the in-flight npm install is gone.
+    // The real terminator confirmed the install's exit before the host exited.
     expect(run.npmPid).not.toBeNull();
+    expect(run.events).toContain("npm-stopped");
     expect(isAlive(run.npmPid ?? -1)).toBe(false);
   }, 70_000);
 });
@@ -543,4 +572,157 @@ describe.skipIf(process.platform === "win32")("session startup runs once per pro
     expect(run.killedAsHung).toBe(false);
     expect(run.exitCode).toBe(0);
   }, 60_000);
+});
+
+describe.skipIf(process.platform === "win32")("approved session UI binding", () => {
+  async function notifications(
+    mode:
+      | "notification-upgrade"
+      | "notification-headless"
+      | "notification-summary"
+      | "notification-retry"
+      | "notification-log-retry",
+  ) {
+    const { child } = spawnHarness(mode);
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    const rescue = setTimeout(() => child.kill("SIGKILL"), HANG_KILL_MS);
+    const code = await new Promise<number | null>((resolve) => child.on("close", resolve));
+    clearTimeout(rescue);
+    return { code, stdout, stderr };
+  }
+
+  test(
+    "factory without UI delivers the release announcement through session context",
+    async () => {
+      const run = await notifications("notification-upgrade");
+      expect(run.code).toBe(0);
+      const toasts = run.stdout.split("\n").filter((line) => line.startsWith("EVENT ui-toast "));
+      expect(toasts).toHaveLength(1);
+      const toast = JSON.parse(toasts[0]?.slice("EVENT ui-toast ".length) ?? "null") as {
+        sessionId: string;
+        message: string;
+        type: string;
+      };
+      // The dialog names the announcement release, not the package version:
+      // a patch release keeps the last minor's announcement.
+      const version = __test__.announcementVersion;
+      expect(toast.sessionId).toBe("harness-session");
+      expect(toast.type).toBe("info");
+      expect(toast.message).toContain(`v${version}:`);
+      expect(run.stdout).toContain(`EVENT announcement-marker ${version}`);
+    },
+    SUBPROCESS_TEST_MS,
+  );
+
+  test(
+    "real headless context with callable UI preserves pending upgrade",
+    async () => {
+      const run = await notifications("notification-headless");
+      expect(run.code).toBe(0);
+      expect(run.stdout).not.toContain("EVENT ui-toast ");
+      expect(run.stdout).toContain("EVENT announcement-marker 0.1.0");
+    },
+    SUBPROCESS_TEST_MS,
+  );
+
+  test(
+    "pending announcements and install summaries retry once on a later UI context",
+    async () => {
+      const run = await notifications("notification-retry");
+      expect(run.code).toBe(0);
+      expect(run.stdout).toContain("EVENT pending-marker 0.1.0");
+      const toasts = run.stdout
+        .split("\n")
+        .filter((line) => line.startsWith("EVENT ui-toast "))
+        .map((line) => JSON.parse(line.slice("EVENT ui-toast ".length)));
+      expect(toasts.map((toast) => [toast.sessionId, toast.type])).toEqual([
+        ["retry-session", "info"],
+        ["retry-session", "warning"],
+      ]);
+      expect(toasts[1].message).toContain("fixture install failed");
+      expect(toasts[1].message).not.toContain("routine-server");
+    },
+    SUBPROCESS_TEST_MS,
+  );
+
+  test(
+    "install completion notifies the active session UI rather than the factory API",
+    async () => {
+      const run = await notifications("notification-summary");
+      expect(run.code).toBe(0);
+      const toasts = run.stdout
+        .split("\n")
+        .filter((line) => line.startsWith("EVENT ui-toast "))
+        .map(
+          (line) =>
+            JSON.parse(line.slice("EVENT ui-toast ".length)) as {
+              sessionId: string;
+              message: string;
+              type: string;
+            },
+        );
+      const warnings = toasts.filter((toast) => toast.type === "warning");
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]?.sessionId).toBe("harness-session");
+      expect(warnings[0]?.message).toContain("fixture install failed");
+      expect(warnings[0]?.message).not.toContain("routine-server");
+    },
+    SUBPROCESS_TEST_MS,
+  );
+
+  test(
+    "headless install-summary retries log once and deliver once when UI becomes available",
+    async () => {
+      const run = await notifications("notification-log-retry");
+      expect(run.code).toBe(0);
+      expect(run.stdout).toContain("EVENT headless-turns-done");
+      expect(run.stdout).toContain("EVENT ui-turns-done");
+      expect(run.stdout.split("EVENT headless-turns-done")[0]).not.toContain("EVENT ui-toast ");
+      const summaryLogs = run.stderr.match(
+        /\] WARN \[aft-pi\] \[lsp\] skipped or failed to install \d+ server\(s\):/g,
+      );
+      expect(summaryLogs).toHaveLength(1);
+      const warnings = run.stdout
+        .split("\n")
+        .filter((line) => line.startsWith("EVENT ui-toast "))
+        .map((line) => JSON.parse(line.slice("EVENT ui-toast ".length)))
+        .filter((toast) => toast.type === "warning");
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]?.sessionId).toBe("retry-session");
+      expect(warnings[0]?.message).toContain("fixture install failed");
+      expect(warnings[0]?.message).not.toContain("routine-server");
+    },
+    SUBPROCESS_TEST_MS,
+  );
+
+  test(
+    "headless announcement retries log once and deliver once when UI becomes available",
+    async () => {
+      const run = await notifications("notification-log-retry");
+      expect(run.code).toBe(0);
+      expect(run.stdout).toContain("EVENT headless-turns-done");
+      expect(run.stdout).toContain("EVENT ui-turns-done");
+      expect(run.stdout.split("EVENT headless-turns-done")[0]).not.toContain("EVENT ui-toast ");
+      const announcementLogs = run.stderr.match(/\] INFO \[aft-pi\] 🔧 AFT: ✨ v[^\r\n]+:/g);
+      expect(announcementLogs).toHaveLength(1);
+      const announcements = run.stdout
+        .split("\n")
+        .filter((line) => line.startsWith("EVENT ui-toast "))
+        .map((line) => JSON.parse(line.slice("EVENT ui-toast ".length)))
+        .filter((toast) => toast.type === "info" && toast.message.startsWith("🔧 AFT: ✨"));
+      expect(announcements).toHaveLength(1);
+      expect(announcements[0]?.sessionId).toBe("retry-session");
+      const version = __test__.announcementVersion;
+      expect(announcements[0]?.message).toContain(`v${version}:`);
+      expect(run.stdout).toContain(`EVENT announcement-marker ${version}`);
+    },
+    SUBPROCESS_TEST_MS,
+  );
 });

@@ -1,1 +1,0 @@
-- With the Synapse embedding backend, a reply saying the model is still compiling or loading no longer throws away the semantic index: indexing waits for the time Synapse names (or its usual retry delay, if that is longer) and then carries on, and searches made meanwhile use keyword results and say the model is warming up.

@@ -28,7 +28,9 @@ fn v2_source(storage: &Path, payload: &[u8]) -> V2Source {
     let registry = FamilyRegistry::open(storage, FAMILY).unwrap();
     let root = storage.join("checkout");
     fs::create_dir_all(&root).unwrap();
-    let registration = registry.register_view(HOLDER, &root).unwrap();
+    let registration = registry
+        .register_view_with_storage(storage, HOLDER, &root)
+        .unwrap();
     fs::create_dir_all(registration.view_dir().join("pins")).unwrap();
     let store = registration.open_store(FamilyPlane::Semantic).unwrap();
     let key = FamilyKey::new(FamilyPlane::Semantic, *blake3::hash(payload).as_bytes());
@@ -74,6 +76,7 @@ fn v1_contains(store: &BlobStore, key: [u8; 32]) -> bool {
 
 fn v1_sweep(storage: &Path) -> crate::gc::SweepReport {
     crate::gc::sweep(crate::gc::SweepRequest {
+        durable_storage: storage,
         storage,
         family: FAMILY,
         view_dir: &storage.join("views").join(HOLDER),

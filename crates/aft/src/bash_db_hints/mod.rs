@@ -99,7 +99,7 @@ impl HintJob {
         plan: &SpawnPlan,
         enabled: bool,
     ) -> Self {
-        let found = detect(command, cwd);
+        let found = detect(command, cwd, env);
         let pipeline = shell_segments(command)
             .is_some_and(|segments| segments.iter().any(|(_, separator)| *separator == "|"));
         let (cli, mut target) = match found {
@@ -235,15 +235,47 @@ fn resolve_binary(binary: &Path, cwd: &Path, path: &std::ffi::OsStr) -> Option<P
     })
 }
 
-fn detect(command: &str, cwd: &Path) -> Option<(&'static dyn DbCliHint, DbTarget)> {
+fn detect(
+    command: &str,
+    cwd: &Path,
+    env: &HashMap<String, String>,
+) -> Option<(&'static dyn DbCliHint, DbTarget)> {
     let segments = shell_segments(command)?;
     let mut cwd = cwd.to_path_buf();
+    let mut vars: HashMap<String, String> = HashMap::new();
+    let home = env
+        .get("HOME")
+        .cloned()
+        .or_else(|| std::env::var("HOME").ok());
+    let home_ref = home.as_deref();
     let mut found = None;
     let mut in_pipeline = false;
-    for (segment, separator) in segments {
-        let parsed = parse(segment)?;
+    for (raw_segment, separator) in segments {
+        let segment = raw_segment.trim();
+        if segment.is_empty() {
+            if separator.is_empty() {
+                continue;
+            }
+            return None;
+        }
+        // Leading `VAR=value` assignments establish the database path for a
+        // later segment (`DB=...; sqlite3 "$DB" ...`). The value itself may
+        // use `~` or earlier variables; command substitution stays unsupported.
+        if let Some((name, raw_value)) = parse_hint_assignment(segment) {
+            if raw_value.contains("$(") || raw_value.contains('`') {
+                return None;
+            }
+            let expanded = expand_hint_segment(&raw_value, &vars, env, home_ref)?;
+            vars.insert(name, strip_outer_quotes(&expanded));
+            if separator == "|" {
+                return None;
+            }
+            continue;
+        }
+        let expanded = expand_hint_segment(segment, &vars, env, home_ref)?;
+        let parsed = parse(expanded.trim())?;
         if parsed.args.first().map(String::as_str) == Some("cd") {
-            if in_pipeline || parsed.args.len() != 2 || separator != "&&" {
+            if in_pipeline || parsed.args.len() != 2 || (separator != "&&" && separator != ";") {
                 return None;
             }
             cwd = cwd.join(&parsed.args[1]);
@@ -258,7 +290,7 @@ fn detect(command: &str, cwd: &Path) -> Option<(&'static dyn DbCliHint, DbTarget
         } else if !in_pipeline {
             return None;
         }
-        if separator == "&&" && parsed.args[0] != "cd" {
+        if (separator == "&&" || separator == ";") && parsed.args[0] != "cd" {
             return None;
         }
         if separator == "|" {
@@ -268,7 +300,227 @@ fn detect(command: &str, cwd: &Path) -> Option<(&'static dyn DbCliHint, DbTarget
     found
 }
 
-/// Split only unquoted `&&` and pipes; the existing parser then proves every
+/// A single `NAME=value` (or `export NAME=value`) statement with no trailing
+/// command. Segments with unquoted whitespace belong to a command, not a
+/// pure assignment, so `VAR=value sqlite3 ...` prefix forms stay unsupported.
+fn parse_hint_assignment(segment: &str) -> Option<(String, String)> {
+    let rest = match segment.strip_prefix("export") {
+        Some(after) if after.starts_with([' ', '\t']) => after.trim_start(),
+        Some(_) => return None,
+        None => segment,
+    };
+    // `export` alone (without a name) is not an assignment.
+    if rest.len() != segment.len() && rest.trim().is_empty() {
+        return None;
+    }
+    let eq = rest.find('=')?;
+    let (lhs, rhs) = rest.split_at(eq);
+    let name = lhs.trim();
+    if !is_hint_var_name(name) {
+        return None;
+    }
+    let rhs = &rhs[1..];
+    if has_unquoted_hint_space(rhs) {
+        return None;
+    }
+    Some((name.to_string(), rhs.trim().to_string()))
+}
+
+fn is_hint_var_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 256 {
+        return false;
+    }
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn has_unquoted_hint_space(value: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in value.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        if quote == Some(ch) {
+            quote = None;
+            continue;
+        }
+        if quote.is_some() {
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+        if ch.is_whitespace() {
+            return true;
+        }
+    }
+    false
+}
+
+fn strip_outer_quotes(value: &str) -> String {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2
+        && (bytes[0] == b'\'' || bytes[0] == b'"')
+        && bytes[bytes.len() - 1] == bytes[0]
+    {
+        value[1..value.len() - 1].to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+/// Expand leading `~` and `$NAME`/`${NAME}` for hint detection only, honoring
+/// shell quoting: no expansion inside single quotes, no `~` inside double
+/// quotes. Command substitution (`$(...)`), backticks outside single quotes,
+/// `~otheruser`, and special parameters (`$?`, `$$`, ...) decline the command
+/// so the probe never guesses a target. Unknown variables are left verbatim
+/// for the literal parser to decline.
+fn expand_hint_segment(
+    segment: &str,
+    vars: &HashMap<String, String>,
+    env: &HashMap<String, String>,
+    home: Option<&str>,
+) -> Option<String> {
+    let chars: Vec<char> = segment.chars().collect();
+    let mut out = String::with_capacity(segment.len());
+    let mut quote: Option<char> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\\' && quote != Some('\'') {
+            out.push(ch);
+            if let Some(next) = chars.get(i + 1) {
+                out.push(*next);
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if quote == Some(ch) {
+            quote = None;
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+        if quote.is_some() {
+            if quote == Some('"') {
+                if ch == '`' {
+                    return None;
+                }
+                if ch == '$' {
+                    match expand_hint_dollar(&chars, i, vars, env, &mut out)? {
+                        Some(next) => {
+                            i = next;
+                            continue;
+                        }
+                        None => return None,
+                    }
+                } else {
+                    out.push(ch);
+                    i += 1;
+                }
+                continue;
+            }
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+        if ch == '`' {
+            return None;
+        }
+        if ch == '~' && (i == 0 || matches!(chars[i - 1], ' ' | '\t' | '=' | ':')) {
+            let next = chars.get(i + 1);
+            if next.is_none()
+                || matches!(next, Some(' ' | '\t' | ';' | '&' | '|' | '"' | '\'' | '/'))
+            {
+                out.push_str(home?);
+                i += 1;
+                continue;
+            }
+            return None;
+        }
+        if ch == '$' {
+            match expand_hint_dollar(&chars, i, vars, env, &mut out)? {
+                Some(next) => {
+                    i = next;
+                    continue;
+                }
+                None => return None,
+            }
+        }
+        out.push(ch);
+        i += 1;
+    }
+    if quote.is_some() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Expand one `$NAME` or `${NAME}` at `chars[i] == '$'`, appending to `out`.
+/// Returns the index after the expansion, or `None` for unsupported forms.
+/// Unknown names are left verbatim so the literal parser still declines them.
+fn expand_hint_dollar(
+    chars: &[char],
+    i: usize,
+    vars: &HashMap<String, String>,
+    env: &HashMap<String, String>,
+    out: &mut String,
+) -> Option<Option<usize>> {
+    let next = chars.get(i + 1)?;
+    if *next == '(' {
+        return Some(None);
+    }
+    if *next == '{' {
+        let rest = &chars[i + 2..];
+        let end = rest.iter().position(|&c| c == '}')?;
+        let name: String = rest[..end].iter().collect();
+        if !is_hint_var_name(&name) {
+            return Some(None);
+        }
+        if let Some(value) = vars.get(&name).or_else(|| env.get(&name)) {
+            out.push_str(value);
+        } else {
+            out.push_str(&format!("${{{name}}}"));
+        }
+        return Some(Some(i + 2 + end + 1));
+    }
+    if next.is_ascii_alphabetic() || *next == '_' {
+        let mut j = i + 2;
+        while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+            j += 1;
+        }
+        let name: String = chars[i + 1..j].iter().collect();
+        if let Some(value) = vars.get(&name).or_else(|| env.get(&name)) {
+            out.push_str(value);
+        } else {
+            out.push('$');
+            out.push_str(&name);
+        }
+        return Some(Some(j));
+    }
+    Some(None)
+}
+
+/// Split unquoted `&&`, `;` and pipes; the existing parser then proves every
 /// word is literal. Other shell control flow cannot establish a stable target.
 fn shell_segments(command: &str) -> Option<Vec<(&str, &str)>> {
     let mut segments = Vec::new();
@@ -296,7 +548,7 @@ fn shell_segments(command: &str) -> Option<Vec<(&str, &str)>> {
             quote = Some(ch);
             continue;
         }
-        if matches!(ch, ';' | '\n' | '(' | ')' | '`') {
+        if matches!(ch, '\n' | '(' | ')' | '`') {
             return None;
         }
         let separator = match ch {
@@ -305,6 +557,7 @@ fn shell_segments(command: &str) -> Option<Vec<(&str, &str)>> {
                 "&&"
             }
             '|' if !chars.peek().is_some_and(|(_, c)| matches!(c, '|' | '&')) => "|",
+            ';' => ";",
             '&' | '|' => return None,
             _ => continue,
         };

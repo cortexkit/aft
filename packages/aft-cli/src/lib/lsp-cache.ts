@@ -65,9 +65,15 @@ function inspectDir(path: string): {
     try {
       if (!statSync(full).isDirectory()) continue;
       const size = dirSize(full);
+      let decodedName = name;
+      try {
+        decodedName = decodeURIComponent(name);
+      } catch {
+        // Corrupt encodings still identify a real cache entry for cleanup.
+      }
       entries.push({
         // Reverse the URL-encoding the plugin applies so users see real names.
-        name: decodeURIComponent(name),
+        name: decodedName,
         path: full,
         size,
       });

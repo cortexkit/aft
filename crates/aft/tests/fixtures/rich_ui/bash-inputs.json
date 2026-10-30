@@ -1,0 +1,10 @@
+{
+  "fields": ["command", "description", "runon", "workdir"],
+  "variants": [
+    {"preset": "head", "runon": false, "command": {"present": true, "required": true, "type": "string"}, "description": {"present": true, "required": false, "type": "string"}, "workdir": {"present": true, "required": false, "type": "string"}, "runonField": {"present": false}},
+    {"preset": "head", "runon": true, "command": {"present": true, "required": true, "type": "string"}, "description": {"present": true, "required": false, "type": "string"}, "workdir": {"present": true, "required": false, "type": "string"}, "runonField": {"present": true, "required": false, "type": "string"}},
+    {"preset": "worker", "runon": false, "command": {"present": true, "required": true, "type": "string"}, "description": {"present": true, "required": false, "type": "string"}, "workdir": {"present": true, "required": false, "type": "string"}, "runonField": {"present": false}},
+    {"preset": "worker", "runon": true, "command": {"present": true, "required": true, "type": "string"}, "description": {"present": true, "required": false, "type": "string"}, "workdir": {"present": true, "required": false, "type": "string"}, "runonField": {"present": true, "required": false, "type": "string"}}
+  ],
+  "pageRule": "command is required. description and workdir may be omitted in every variant. runon is not a member of no-runon definitions; the page must not unconditionally access input.runon for those pins. Hide the runon label or show field unavailable/no explicit target; never synthesize a runner value. In runon-enabled definitions runon is still optional."
+}

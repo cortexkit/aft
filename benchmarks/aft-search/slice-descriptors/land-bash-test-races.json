@@ -1,0 +1,8 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "slices": ["bash-test-race-waits"],
+  "note": "Test-only: three bash tests now wait on an observable signal instead of racing it (a complete pid in the pid file, the aborted command's start marker, and a replay time budget wide enough to reach the injected recording failure). No product code changed and no changed path matches RANKING_FENCE_PREFIXES."
+}

@@ -170,6 +170,12 @@ fn run_with_paths(
 
     config.storage_dir = Some(paths.storage_dir);
     let notices = index_notices(&warnings);
+    if let Some(warning) = aft::root_cache::prepare_cache_root(&mut config) {
+        return Err(IndexError::validation(format!(
+            "cache_dir_unavailable: {}",
+            warning.message
+        )));
+    }
     let plan = prepare_snapshot(config, notices)?;
 
     writeln!(output, "aft index: snapshot operation").map_err(|error| {
@@ -265,10 +271,8 @@ fn prepare_snapshot(config: Config, notices: Vec<String>) -> Result<SnapshotPlan
         .reconcile(&config)
         .map_err(|error| IndexError::validation(error.to_string()))?;
 
-    let storage_dir = config
-        .storage_dir
-        .as_deref()
-        .expect("snapshot storage directory is set before planning");
+    let cache_root = aft::root_cache::cache_root(&config);
+    let storage_dir = cache_root.as_path();
     let has_semantic = report
         .active_entries
         .iter()
@@ -446,10 +450,8 @@ fn build_unit(config: &Config, unit: &SnapshotUnit) -> UnitResult {
 }
 
 fn build_search(config: &Config, unit: &SnapshotUnit) -> Result<UnitResult, String> {
-    let storage_dir = config
-        .storage_dir
-        .as_deref()
-        .ok_or_else(|| "snapshot storage directory is unavailable".to_string())?;
+    let cache_root = aft::root_cache::cache_root(config);
+    let storage_dir = cache_root.as_path();
     let cache_dir = cache_dir_for(storage_dir, &unit.entry.artifact_key, unit.kind);
     let mut index = SearchIndex::build_with_limit_to_cache_dir(
         &unit.entry.resolved_target,
@@ -469,10 +471,8 @@ fn build_search(config: &Config, unit: &SnapshotUnit) -> Result<UnitResult, Stri
 }
 
 fn build_semantic(config: &Config, unit: &SnapshotUnit) -> Result<UnitResult, String> {
-    let storage_dir = config
-        .storage_dir
-        .as_deref()
-        .ok_or_else(|| "snapshot storage directory is unavailable".to_string())?;
+    let cache_root = aft::root_cache::cache_root(config);
+    let storage_dir = cache_root.as_path();
     let files = unit.semantic_files.as_deref().unwrap_or_default();
     let mut model = SemanticEmbeddingModel::from_config(&config.semantic)?;
     let fingerprint = model.fingerprint(&config.semantic)?;
@@ -497,10 +497,8 @@ fn build_semantic(config: &Config, unit: &SnapshotUnit) -> Result<UnitResult, St
 }
 
 fn build_callgraph(config: &Config, unit: &SnapshotUnit) -> Result<UnitResult, String> {
-    let storage_dir = config
-        .storage_dir
-        .as_deref()
-        .ok_or_else(|| "snapshot storage directory is unavailable".to_string())?;
+    let cache_root = aft::root_cache::cache_root(config);
+    let storage_dir = cache_root.as_path();
     let files = callgraph::walk_project_files(&unit.entry.resolved_target).collect::<Vec<_>>();
     let cache_dir = cache_dir_for(storage_dir, &unit.entry.artifact_key, unit.kind);
     let (_store, stats) = publish_if_current(unit, || {

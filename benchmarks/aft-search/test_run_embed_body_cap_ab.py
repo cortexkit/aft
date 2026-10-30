@@ -70,6 +70,7 @@ class EmbedBodyCapRunnerTests(unittest.TestCase):
             b"\x08", struct.pack("<III", 2, 0, 0), struct.pack("<I", 1),
             packed_string("poison.rs"), bytes(8 + 4 + 8 + 32),
             struct.pack("<QI", 2, 1), packed_string("poison.rs"), struct.pack("<Q", 2),
+            struct.pack("<I", 0),
         ])
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "semantic.bin"

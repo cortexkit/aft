@@ -446,6 +446,87 @@ pub(crate) fn init_repository_with_corrupt_head_for_test(path: &Path) {
     std::fs::write(path.join(".git").join("HEAD"), "not a ref\n").unwrap();
 }
 
+/// A real repository with every nested-checkout shape below its root:
+/// - `linked/`: a linked worktree of this repository (`git worktree add`), to
+///   be skipped by project walks;
+/// - `vendor/independent/`: a nested independent repository (its own `.git`
+///   directory), still walked;
+/// - `submod/`: a submodule-style checkout (a `.git` file naming
+///   `<root>/.git/modules/submod`), still walked.
+#[cfg(test)]
+pub(crate) struct NestedWorktreeFixture {
+    pub root: PathBuf,
+    pub worktree: PathBuf,
+    pub independent: PathBuf,
+    pub submodule: PathBuf,
+}
+
+/// Test fixture: `root` becomes the repository above, with `marker` written
+/// into one committed source file. Asserts Git runs and every step succeeds.
+#[cfg(test)]
+pub(crate) fn init_repo_with_nested_worktree_for_test(
+    root: &Path,
+    marker: &str,
+) -> NestedWorktreeFixture {
+    assert!(
+        crate::developer_tools::git_usable(),
+        "nested-worktree fixtures need git"
+    );
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let git = |dir: &Path, args: &[&str]| {
+        let output = command()
+            .args([
+                "-c",
+                "user.name=AFT Tests",
+                "-c",
+                "user.email=aft-tests@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_COUNT", "0")
+            .output()
+            .expect("git runs");
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    };
+    let source = format!("pub fn probe_marker() {{ let _ = \"{marker}\"; }}\n");
+    for relative in ["src/main.rs", "lib/util.rs"] {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, &source).unwrap();
+    }
+    git(&root, &["init", "--quiet"]);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "--quiet", "-m", "initial"]);
+    // A linked worktree of this repository, nested in a subfolder of the main
+    // checkout: the worktree's `.git` file names its admin dir under the
+    // main checkout's `.git/worktrees/`.
+    git(&root, &["worktree", "add", "--quiet", "linked"]);
+    let worktree = root.join("linked");
+    std::fs::write(worktree.join("extra.rs"), &source).unwrap();
+    // A nested independent repository: its own `.git` directory.
+    let independent = root.join("vendor").join("independent");
+    std::fs::create_dir_all(&independent).unwrap();
+    git(&independent, &["init", "--quiet"]);
+    std::fs::write(independent.join("inner.rs"), &source).unwrap();
+    // A submodule-style checkout: a `.git` file whose gitdir lives under
+    // `.git/modules/`, not `worktrees/`.
+    let submodule = root.join("submod");
+    std::fs::create_dir_all(&submodule).unwrap();
+    std::fs::create_dir_all(root.join(".git").join("modules").join("submod")).unwrap();
+    std::fs::write(submodule.join(".git"), "gitdir: ../.git/modules/submod\n").unwrap();
+    std::fs::write(submodule.join("code.rs"), &source).unwrap();
+    NestedWorktreeFixture {
+        root,
+        worktree,
+        independent,
+        submodule,
+    }
+}
+
 /// Test fixture: a `.git` folder holding only `info/exclude` and no HEAD, which
 /// Git itself does not treat as a repository.
 #[cfg(test)]

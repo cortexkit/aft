@@ -1,0 +1,7 @@
+{
+  "bash": {
+    "env": {
+      "AFT_INTERNAL_LINUX_SCOPE": "1"
+    }
+  }
+}

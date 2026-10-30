@@ -235,4 +235,47 @@ describe("TUI notification socket", () => {
     expect(index).not.toMatch(/setInterval\s*\(/);
     expect(sidebar).not.toMatch(/setInterval\s*\(/);
   });
+
+  test("notification cursor resets for a new server token even at the same port", async () => {
+    let token = "old-incarnation";
+    __setAftTuiSocketDepsForTest({
+      createClient: () => ({
+        resolveEndpoint: async () => ({ port: 7777, token }),
+        reset: () => {},
+      }),
+      WebSocketCtor: FakeWebSocket as any,
+    });
+    startAftTuiSocket({
+      getDirectory: () => "/project",
+      getSessionId: () => "ses_A",
+      onNotification: () => true,
+    });
+    await flush();
+    const first = FakeWebSocket.instances[0]!;
+    first.open();
+    first.message(
+      JSON.stringify({
+        type: "notification",
+        notification: { id: 41, type: "action", payload: {} },
+      }),
+    );
+    await flush();
+    token = "new-incarnation";
+    __recordRpcRedirectForTest("/project", "/new-project");
+    await flush();
+    const second = FakeWebSocket.instances[1]!;
+    second.open();
+    expect(JSON.parse(second.sent[0]!).lastReceivedId).toBe(0);
+    second.message(
+      JSON.stringify({
+        type: "notification",
+        notification: { id: 1, type: "action", payload: {} },
+      }),
+    );
+    await flush();
+    expect(second.sent.map((message) => JSON.parse(message))).toContainEqual({
+      type: "ack",
+      lastReceivedId: 1,
+    });
+  });
 });

@@ -176,9 +176,13 @@ fn lane_paused_six_cold_roots_leave_slots_and_maintenance_available() {
             })
         }));
     }
-    let paused = (0..ROOTS)
-        .take_while(|_| entered_rx.recv_timeout(Duration::from_secs(3)).is_ok())
-        .count();
+    // Each notification follows the attempt's permit and writer-lock drops.
+    // Allow slow roots to arrive before probing resources; no pause is resumed yet.
+    let pause_deadline = Instant::now() + Duration::from_secs(60);
+    let mut paused = 0;
+    while paused < ROOTS && entered_rx.recv_deadline(pause_deadline).is_ok() {
+        paused += 1;
+    }
     let writer_locks_free = directories
         .iter()
         .filter(|(_, key)| {
@@ -222,7 +226,7 @@ fn lane_paused_six_cold_roots_leave_slots_and_maintenance_available() {
     }
     assert_eq!(
         paused, ROOTS,
-        "paused roots monopolized the shared cold limiter"
+        "not all roots entered the pause before the deadline"
     );
     assert_eq!(writer_locks_free, ROOTS, "a pause retained a writer lock");
     assert_eq!(
@@ -492,6 +496,158 @@ fn actor_entries_return_roots_and_contexts() {
     assert!(entries
         .iter()
         .any(|(root, ctx)| root == &root_b && Arc::ptr_eq(ctx, &ctx_b)));
+}
+
+#[test]
+fn parked_maintenance_root_stat_leaves_submit_and_scheduler_lock_available() {
+    let (_dir, root) = test_root("parked-root-stat");
+    let executor = Arc::new(test_executor(2, 2, 2, 1));
+    executor.register_actor(root.clone(), test_ctx());
+    let (parked_tx, parked_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    *executor.inner.maintenance_root_check_hook.lock() = Some(Box::new(move || {
+        parked_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    }));
+
+    let maintenance_executor = executor.clone();
+    let maintenance_root = root.clone();
+    let maintenance_thread = thread::spawn(move || {
+        maintenance_executor.submit_maintenance_async(
+            maintenance_root,
+            Lane::HeavyInit,
+            "parked-stat".into(),
+            Box::new(|_| ok("parked-stat")),
+        )
+    });
+    parked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+    let (submitted_tx, submitted_rx) = crossbeam_channel::bounded(1);
+    let interactive_executor = executor.clone();
+    let interactive_thread = thread::spawn(move || {
+        let response = interactive_executor.submit_async(
+            root,
+            Lane::PureRead,
+            "interactive".into(),
+            Box::new(|_| ok("interactive")),
+        );
+        submitted_tx.send(response).unwrap();
+    });
+    let (locked_tx, locked_rx) = crossbeam_channel::bounded(1);
+    let lock_executor = executor.clone();
+    let lock_thread = thread::spawn(move || {
+        let _state = lock_executor.inner.state.lock();
+        locked_tx.send(()).unwrap();
+    });
+
+    let interactive = submitted_rx.recv_timeout(Duration::from_secs(5));
+    let lock_available = locked_rx.recv_timeout(Duration::from_secs(5));
+    // Release and join before asserting so a regression cannot strand the test's threads.
+    release_tx.send(()).unwrap();
+    let maintenance = maintenance_thread.join().unwrap();
+    interactive_thread.join().unwrap();
+    lock_thread.join().unwrap();
+
+    assert!(
+        interactive.is_ok(),
+        "another submit waited behind the parked maintenance root stat"
+    );
+    assert!(
+        lock_available.is_ok(),
+        "scheduler lock was held across the parked maintenance root stat"
+    );
+    assert!(recv_async(interactive.unwrap(), "interactive beside parked stat").success);
+    assert!(recv_async(maintenance, "maintenance after stat release").success);
+}
+
+#[test]
+fn parked_requeue_root_probe_leaves_submit_and_scheduler_lock_available() {
+    let (dir, root) = test_root("parked-requeue-stat");
+    let executor = Arc::new(test_executor(2, 2, 2, 1));
+    executor.register_actor(root.clone(), test_ctx());
+    // An in-flight epoch reader makes the bind start shared and request a requeue.
+    let reader = StuckReader::start(&executor, &root, "requeue-reader", "read");
+    let (parked_tx, parked_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let (bind, _token) =
+        submit_repeatable_bind(&executor, &root, "subc-bind-parked-requeue", move |_| {
+            assert!(
+                request_exclusive_rerun(),
+                "only the shared attempt should run"
+            );
+            let token = current_job_cancellation().expect("bind cancellation token");
+            *token.inner.root_probe_barrier.lock() = Some((parked_tx.clone(), release_rx.clone()));
+            ok("shared-attempt")
+        });
+    parked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+    let (submitted_tx, submitted_rx) = crossbeam_channel::bounded(1);
+    let interactive_executor = executor.clone();
+    let interactive_thread = thread::spawn(move || {
+        let response = interactive_executor.submit_async(
+            root,
+            Lane::PureRead,
+            "interactive".into(),
+            Box::new(|_| ok("interactive")),
+        );
+        submitted_tx.send(response).unwrap();
+    });
+    let (locked_tx, locked_rx) = crossbeam_channel::bounded(1);
+    let lock_executor = executor.clone();
+    let lock_thread = thread::spawn(move || {
+        let _state = lock_executor.inner.state.lock();
+        locked_tx.send(()).unwrap();
+    });
+
+    let interactive = submitted_rx.recv_timeout(Duration::from_secs(5));
+    let lock_available = locked_rx.recv_timeout(Duration::from_secs(5));
+    // Deletion while the probe is parked must still cancel the requeue.
+    dir.close().unwrap();
+    release_tx.send(()).unwrap();
+    interactive_thread.join().unwrap();
+    lock_thread.join().unwrap();
+    let reader_response = reader.finish();
+
+    assert!(
+        interactive.is_ok(),
+        "another submit waited behind the parked requeue root probe"
+    );
+    assert!(
+        lock_available.is_ok(),
+        "scheduler lock was held across the parked requeue root probe"
+    );
+    assert!(
+        recv_async(
+            interactive.unwrap(),
+            "interactive beside parked requeue probe"
+        )
+        .success
+    );
+    let response = recv_async(bind, "requeue after root deletion");
+    assert!(!response.success);
+    assert_eq!(response.data["code"], "request_cancelled");
+    assert!(reader_response.success);
+}
+
+#[test]
+fn missing_maintenance_root_preserves_admission_refusal() {
+    let (dir, root) = test_root("missing-maintenance-root");
+    let executor = test_executor(2, 2, 2, 1);
+    executor.register_actor(root.clone(), test_ctx());
+    dir.close().unwrap();
+    let response = executor.submit_maintenance_async(
+        root,
+        Lane::HeavyInit,
+        "missing-root".into(),
+        Box::new(|_| panic!("missing root admitted maintenance")),
+    );
+    let response = recv_async(response, "missing root refusal");
+    assert!(!response.success);
+    assert_eq!(response.data["code"], "maintenance_cancelled");
+    assert_eq!(
+        response.data["message"],
+        "maintenance root is unbound or missing"
+    );
 }
 
 #[test]
@@ -1170,23 +1326,28 @@ fn bind_blocker_snapshot_attributes_queue_reader_maintenance_and_worker_pressure
     occupied_started_rx
         .recv_timeout(Duration::from_secs(12))
         .expect("second worker starts");
-    // The general pool is now full, but binds have their own reserved
-    // workers. Hold those with binds of other roots so the target bind finds
-    // every worker busy.
+    // Hold both bind and metadata reservations on other roots as well, so the
+    // target bind's diagnostic really observes every worker occupied.
     let (reserve_started_tx, reserve_started_rx) = crossbeam_channel::unbounded();
     let (release_reserve_tx, release_reserve_rx) = crossbeam_channel::unbounded::<()>();
-    let mut reserve_binds = Vec::new();
+    let mut reserve_jobs = Vec::new();
     let mut reserve_dirs = Vec::new();
-    for index in 0..BIND_RESERVE_WORKERS {
+    let reserved_workers = BIND_RESERVE_WORKERS + PROVIDER_RESERVE_WORKERS;
+    for index in 0..reserved_workers {
         let (dir, root) = test_root(&format!("blocker-reserve-{index}"));
         executor.register_actor(root.clone(), test_ctx());
         reserve_dirs.push(dir);
         let started = reserve_started_tx.clone();
         let release = release_reserve_rx.clone();
-        reserve_binds.push(executor.submit(
+        let (lane, request_id) = if index < BIND_RESERVE_WORKERS {
+            (Lane::Mutating, format!("subc-bind-reserve-{index}"))
+        } else {
+            (Lane::ProviderMetadata, format!("metadata-reserve-{index}"))
+        };
+        reserve_jobs.push(executor.submit(
             root,
-            Lane::Mutating,
-            format!("subc-bind-reserve-{index}"),
+            lane,
+            request_id,
             Box::new(move |_| {
                 started.send(()).expect("reserve bind starts");
                 release.recv().expect("release reserve bind");
@@ -1194,7 +1355,7 @@ fn bind_blocker_snapshot_attributes_queue_reader_maintenance_and_worker_pressure
             }),
         ));
     }
-    for _ in 0..BIND_RESERVE_WORKERS {
+    for _ in 0..reserved_workers {
         reserve_started_rx
             .recv_timeout(Duration::from_secs(12))
             .expect("reserved bind worker starts");
@@ -1224,15 +1385,15 @@ fn bind_blocker_snapshot_attributes_queue_reader_maintenance_and_worker_pressure
         .send(())
         .expect("release maintenance");
     release_occupied_tx.send(()).expect("release occupied read");
-    for _ in 0..BIND_RESERVE_WORKERS {
+    for _ in 0..reserved_workers {
         release_reserve_tx.send(()).expect("release reserve bind");
     }
-    for reserve_bind in reserve_binds {
+    for reserve_bind in reserve_jobs {
         reserve_bind
             .recv_timeout(Duration::from_secs(12))
             .expect("reserve bind completion");
     }
-    assert_eq!(reserve_dirs.len(), BIND_RESERVE_WORKERS);
+    assert_eq!(reserve_dirs.len(), reserved_workers);
     assert!(recv_async(maintenance, "maintenance completion").success);
     occupied
         .recv_timeout(Duration::from_secs(12))
@@ -1346,12 +1507,16 @@ fn held_inspect_writer_lease_times_out_and_queued_bind_proceeds() {
     .expect("hold inspect writer lease");
 
     let (inspect_started_tx, inspect_started_rx) = crossbeam_channel::bounded(1);
+    let (inspect_release_tx, inspect_release_rx) = crossbeam_channel::bounded(1);
     let inspect = executor.submit(
         root.clone(),
         Lane::SerialLspStatus,
         "inspect-held-writer-lease".to_string(),
         Box::new(move |_| {
             inspect_started_tx.send(()).expect("inspect starts");
+            inspect_release_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("bind is queued before the lease attempt");
             match InspectCache::open(inspect_dir, project_root) {
                 Err(InspectCacheError::WriterLeaseTimeout) => Response::error(
                     "inspect-held-writer-lease",
@@ -1364,7 +1529,7 @@ fn held_inspect_writer_lease_times_out_and_queued_bind_proceeds() {
         }),
     );
     inspect_started_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(Duration::from_secs(30))
         .expect("inspect starts while lease is held");
 
     let (bind_started_tx, bind_started_rx) = crossbeam_channel::bounded(1);
@@ -1378,21 +1543,25 @@ fn held_inspect_writer_lease_times_out_and_queued_bind_proceeds() {
         }),
     );
     assert!(
-        bind_started_rx
-            .recv_timeout(Duration::from_millis(50))
-            .is_err(),
+        matches!(
+            bind_started_rx.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Empty)
+        ),
         "bind must wait while inspect still occupies the LSP lane"
     );
+    inspect_release_tx
+        .send(())
+        .expect("start the lease attempt");
 
     let inspect_response = inspect
-        .recv_timeout(Duration::from_secs(3))
+        .recv_timeout(Duration::from_secs(30))
         .expect("inspect reaches its writer lease deadline");
     assert!(!inspect_response.success);
     assert_eq!(inspect_response.data["code"], "writer_lease_timeout");
     bind_started_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(Duration::from_secs(30))
         .expect("bind starts after inspect reports the timeout");
-    bind.recv_timeout(Duration::from_secs(1))
+    bind.recv_timeout(Duration::from_secs(30))
         .expect("bind completes while competing lease remains held");
     drop(held);
 }
@@ -2414,6 +2583,7 @@ fn starved_bind_promotes_over_pure_reads() {
         force_exclusive: false,
         not_before: None,
         exclusive_attempts: 0,
+        provider_generation: None,
     };
     let read_job = QueuedJob {
         request_id: "read-1".to_string(),
@@ -2427,6 +2597,7 @@ fn starved_bind_promotes_over_pure_reads() {
         force_exclusive: false,
         not_before: None,
         exclusive_attempts: 0,
+        provider_generation: None,
     };
     // Read arrived FIRST in arrival order; the starved bind must still win.
     actor.push_job(JobClass::Interactive, Lane::PureRead, read_job);
@@ -2464,6 +2635,7 @@ fn fresh_bind_does_not_preempt_pure_reads() {
             force_exclusive: false,
             not_before: None,
             exclusive_attempts: 0,
+            provider_generation: None,
         },
     );
     actor.push_job(
@@ -2481,6 +2653,7 @@ fn fresh_bind_does_not_preempt_pure_reads() {
             force_exclusive: false,
             not_before: None,
             exclusive_attempts: 0,
+            provider_generation: None,
         },
     );
 
@@ -2515,6 +2688,7 @@ fn maintenance_defers_to_queued_interactive_mutating_anywhere_in_queue() {
             force_exclusive: false,
             not_before: None,
             exclusive_attempts: 0,
+            provider_generation: None,
         },
     );
     actor.push_job(
@@ -2532,6 +2706,7 @@ fn maintenance_defers_to_queued_interactive_mutating_anywhere_in_queue() {
             force_exclusive: false,
             not_before: None,
             exclusive_attempts: 0,
+            provider_generation: None,
         },
     );
 
@@ -2849,6 +3024,7 @@ fn remove_cancellable_removes_matching_lane_order_occurrence_not_first() {
             force_exclusive: false,
             not_before: None,
             exclusive_attempts: 0,
+            provider_generation: None,
         },
     );
     actor.push_job(
@@ -2866,6 +3042,7 @@ fn remove_cancellable_removes_matching_lane_order_occurrence_not_first() {
             force_exclusive: false,
             not_before: None,
             exclusive_attempts: 0,
+            provider_generation: None,
         },
     );
     actor.push_job(
@@ -2883,6 +3060,7 @@ fn remove_cancellable_removes_matching_lane_order_occurrence_not_first() {
             force_exclusive: false,
             not_before: None,
             exclusive_attempts: 0,
+            provider_generation: None,
         },
     );
 
@@ -3852,11 +4030,8 @@ fn bind_needing_exclusive_use_is_rerun_after_a_polling_tail_steps_aside() {
     );
 }
 
-/// A cancel can land in the handoff window: the worker has put a requeued
-/// bind's token back to pending, but the scheduler has not queued the job yet,
-/// so `cancel_job` finds nothing to remove and only signals the token. The
-/// scheduler must settle that bind as cancelled when it takes the requeue,
-/// not queue cancelled writer demand behind the tail still holding the actor.
+/// A cancel after the token returns to pending but before the worker's full
+/// probe must be settled by the worker without queuing exclusive writer demand.
 #[test]
 fn bind_cancelled_during_the_requeue_handoff_is_settled_without_queuing() {
     let executor = Arc::new(test_executor(4, 2, 2, 2));
@@ -3903,7 +4078,7 @@ fn bind_cancelled_during_the_requeue_handoff_is_settled_without_queuing() {
         .recv_timeout(Duration::from_secs(5))
         .expect("the hook ran in the handoff window");
 
-    // The tail still holds the actor: only settlement at requeue answers now.
+    // The tail still holds the actor, so cancellation must settle before execution.
     let deadline = Instant::now() + Duration::from_secs(2);
     let response = loop {
         if let Ok(response) = bind.try_recv() {
@@ -3935,6 +4110,61 @@ fn bind_cancelled_during_the_requeue_handoff_is_settled_without_queuing() {
         demand_while_tail_held, 0,
         "no cancelled writer demand queued"
     );
+}
+
+/// Cancellation after the worker's full probe must be settled by the scheduler,
+/// not left as exclusive writer demand behind an existing reader.
+#[test]
+fn bind_cancelled_after_the_worker_probe_is_settled_without_queuing() {
+    let executor = Arc::new(test_executor(4, 2, 2, 2));
+    let (_dir, root) = test_root("bind-after-worker-probe-cancel");
+    assert!(executor.register_actor(root.clone(), test_ctx()));
+    let (_epoch, waiting_writers, _detached) = actor_epoch_and_demand(&executor, &root);
+    let reader = StuckReader::start(&executor, &root, "after-probe-reader", "read");
+    let (parked_tx, parked_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    set_requeue_after_probe_hook_for_test("subc-bind-after-worker-probe", move || {
+        parked_tx.send(()).expect("signal post-probe handoff");
+        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+    });
+    let (mut bind, token) =
+        submit_repeatable_bind(&executor, &root, "subc-bind-after-worker-probe", |_| {
+            assert!(
+                request_exclusive_rerun(),
+                "the held reader forces a shared attempt"
+            );
+            ok("subc-bind-after-worker-probe")
+        });
+    parked_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the worker's cancellation probe passed");
+    let cancel = executor.cancel_job(&root, &token);
+    release_tx.send(()).expect("release post-probe handoff");
+
+    // The reader prevents an incorrectly queued exclusive rerun from answering.
+    let response = try_recv_within(&mut bind, Duration::from_secs(2));
+    let demand_while_reader_held = waiting_writers.load(Ordering::Acquire);
+    let queued_while_reader_held = {
+        let state = executor.inner.state.lock();
+        state.actors[&root].has_queued_mutating_job("subc-bind-after-worker-probe")
+    };
+    assert!(reader.finish().success);
+    let response = response.unwrap_or_else(|| {
+        let late = recv_async(bind, "late post-probe cancellation");
+        panic!(
+            "scheduler left a cancelled post-probe requeue behind the reader \
+             (writer demand: {demand_while_reader_held}, queued: {queued_while_reader_held}): {:?}",
+            late.data
+        );
+    });
+    assert_eq!(cancel, JobCancelOutcome::RunningSignalled);
+    assert!(!response.success);
+    assert_eq!(response.data["code"], "request_cancelled");
+    assert_eq!(
+        demand_while_reader_held, 0,
+        "no cancelled writer demand queued"
+    );
+    assert!(!queued_while_reader_held, "cancelled bind was queued");
 }
 
 /// A bind sent back for exclusive use waits in the actor's queue, not on a
@@ -4754,4 +4984,357 @@ fn quiesced_root_rebound_within_grace_preserves_running_maintenance() {
     ctx.mark_subc_bound();
     release_tx.send(()).unwrap();
     assert!(recv_async(running, "short rebind maintenance").success);
+}
+
+#[test]
+fn provider_metadata_reservation_bypasses_index_writers_and_serializes_each_root() {
+    let executor = test_executor(2, 1, 1, 1);
+    let roots: Vec<_> = (0..4)
+        .map(|i| test_root(&format!("provider-reserve-{i}")))
+        .collect();
+    for (_, root) in &roots {
+        executor.register_actor(root.clone(), test_ctx());
+    }
+    let (entered, running) = crossbeam_channel::unbounded();
+    let mut releases = Vec::new();
+    let mut held_jobs = Vec::new();
+    for (index, lane, id) in [
+        (0, Lane::Mutating, "held-writer"),
+        (1, Lane::HeavyInit, "held-index"),
+        (2, Lane::Mutating, "subc-bind-provider-a"),
+        (3, Lane::Mutating, "subc-bind-provider-b"),
+    ] {
+        let (release, held) = crossbeam_channel::bounded::<()>(1);
+        releases.push(release);
+        let entered = entered.clone();
+        held_jobs.push(executor.submit(
+            roots[index].1.clone(),
+            lane,
+            id.into(),
+            Box::new(move |_| {
+                let _ = entered.send(id);
+                let _ = held.recv();
+                ok(id)
+            }),
+        ));
+    }
+    // These are positive waits for blocked jobs to start: every held job and
+    // every admitted metadata job blocks until released, so a slow (loaded)
+    // runner can only make them late, never let a violation pass. 30 s bounds
+    // a real hang without making a loaded Windows runner fail the setup.
+    for _ in 0..4 {
+        running
+            .recv_timeout(Duration::from_secs(30))
+            .expect("general and bind slots occupied");
+    }
+    let mut provider_releases = Vec::new();
+    let mut provider_jobs = Vec::new();
+    for index in 0..2 {
+        let (release, held) = crossbeam_channel::bounded::<()>(1);
+        provider_releases.push(release);
+        let entered = entered.clone();
+        provider_jobs.push(executor.submit(
+            roots[index].1.clone(),
+            Lane::ProviderMetadata,
+            format!("provider-{index}"),
+            Box::new(move |_| {
+                let _ = entered.send("provider");
+                let _ = held.recv();
+                ok("provider")
+            }),
+        ));
+    }
+    for _ in 0..2 {
+        running
+            .recv_timeout(Duration::from_secs(30))
+            .expect("metadata bypasses held index, writer, and bind slots");
+    }
+    assert_eq!(
+        executor.inner.state.lock().provider_inflight,
+        PROVIDER_RESERVE_WORKERS
+    );
+    let second_ran = Arc::new(AtomicBool::new(false));
+    let probe = second_ran.clone();
+    let second = executor.submit(
+        roots[0].1.clone(),
+        Lane::ProviderMetadata,
+        "same-root-provider".into(),
+        Box::new(move |_| {
+            probe.store(true, Ordering::SeqCst);
+            ok("same-root")
+        }),
+    );
+    let (release_third, held_third) = crossbeam_channel::bounded::<()>(1);
+    let entered_third = entered.clone();
+    let third = executor.submit(
+        roots[2].1.clone(),
+        Lane::ProviderMetadata,
+        "third-root-provider".into(),
+        Box::new(move |_| {
+            let _ = entered_third.send("third-root");
+            let _ = held_third.recv();
+            ok("third-root")
+        }),
+    );
+    assert!(
+        running.try_recv().is_err(),
+        "metadata reservation must not exceed two jobs"
+    );
+    provider_releases[1].send(()).unwrap();
+    assert_eq!(
+        running.recv_timeout(Duration::from_secs(30)).unwrap(),
+        "third-root"
+    );
+    assert!(
+        !second_ran.load(Ordering::SeqCst),
+        "same-root policy operations must not overlap"
+    );
+    provider_releases[0].send(()).unwrap();
+    assert!(
+        second
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap()
+            .success
+    );
+    release_third.send(()).unwrap();
+    for release in releases {
+        release.send(()).unwrap();
+    }
+    for job in held_jobs.into_iter().chain(provider_jobs).chain([third]) {
+        assert!(job.recv_timeout(Duration::from_secs(30)).unwrap().success);
+    }
+}
+
+#[test]
+fn provider_metadata_quiesce_cancels_queued_work_but_preserves_a_started_commit() {
+    let executor = test_executor(2, 1, 1, 1);
+    let (_dir, root) = test_root("provider-quiesce");
+    let ctx = test_ctx();
+    executor.register_actor(root.clone(), ctx.clone());
+    let (entered, running) = crossbeam_channel::bounded(1);
+    let (release, held) = crossbeam_channel::bounded::<()>(1);
+    let started = executor.submit(
+        root.clone(),
+        Lane::ProviderMetadata,
+        "started-provider".into(),
+        Box::new(move |_| {
+            let _ = entered.send(());
+            let _ = held.recv();
+            assert!(!current_job_cancelled());
+            ok("started-provider")
+        }),
+    );
+    running.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(!executor.actor_is_idle(&root));
+    assert!(!executor.retire_idle_actor_in_background(&root));
+    let ran = Arc::new(AtomicBool::new(false));
+    let probe = ran.clone();
+    let queued = executor.submit(
+        root.clone(),
+        Lane::ProviderMetadata,
+        "queued-provider".into(),
+        Box::new(move |_| {
+            probe.store(true, Ordering::SeqCst);
+            ok("queued")
+        }),
+    );
+    assert_eq!(
+        executor.cancel_queued_maintenance(&root),
+        0,
+        "standing-root maintenance cancellation must not cancel a bound session's metadata"
+    );
+    assert!(
+        executor
+            .submit(
+                root.clone(),
+                Lane::PureRead,
+                "read-beside-metadata".into(),
+                Box::new(|_| ok("read"))
+            )
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .success,
+        "metadata must not spend the root's ordinary actor capacity"
+    );
+    ctx.mark_subc_unbound();
+    assert_eq!(executor.cancel_queued_root_maintenance(&root), 1);
+    assert_eq!(
+        queued.recv_timeout(Duration::from_secs(1)).unwrap().data["code"],
+        "request_cancelled"
+    );
+    let probe = ran.clone();
+    let late = executor.submit(
+        root.clone(),
+        Lane::ProviderMetadata,
+        "unbound-provider".into(),
+        Box::new(move |_| {
+            probe.store(true, Ordering::SeqCst);
+            ok("late")
+        }),
+    );
+    assert_eq!(
+        late.recv_timeout(Duration::from_secs(1)).unwrap().data["code"],
+        "request_cancelled"
+    );
+    ctx.mark_subc_bound();
+    release.send(()).unwrap();
+    assert!(
+        started
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .success
+    );
+    assert!(!ran.load(Ordering::SeqCst));
+    assert!(
+        executor
+            .submit(
+                root,
+                Lane::ProviderMetadata,
+                "rebound-provider".into(),
+                Box::new(|_| ok("rebound"))
+            )
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .success
+    );
+}
+
+#[test]
+fn dispatched_provider_metadata_cannot_start_after_unbind_and_rebind() {
+    let executor = test_executor(2, 1, 1, 1);
+    let (_dir, root) = test_root("provider-dispatched-unbind");
+    let ctx = test_ctx();
+    executor.register_actor(root.clone(), ctx.clone());
+    let token = JobCancellation::new();
+    let (entered, running) = crossbeam_channel::bounded(1);
+    let (release, held) = crossbeam_channel::bounded(1);
+    *token.inner.root_probe_barrier.lock() = Some((entered, held));
+    let ran = Arc::new(AtomicBool::new(false));
+    let probe = ran.clone();
+    let response = executor.submit_tool_call_with_cancellation_async(
+        root.clone(),
+        Lane::ProviderMetadata,
+        "dispatched-provider".into(),
+        "tool.catalog",
+        Box::new(move |_| {
+            probe.store(true, Ordering::SeqCst);
+            ok("provider")
+        }),
+        token,
+    );
+    running.recv_timeout(Duration::from_secs(2)).unwrap();
+    ctx.mark_subc_unbound();
+    ctx.mark_subc_bound();
+    release.send(()).unwrap();
+    let response = recv_async(response, "provider fenced by unbind");
+    assert_eq!(response.data["code"], "request_cancelled");
+    assert!(!ran.load(Ordering::SeqCst));
+    assert!(
+        executor
+            .submit(
+                root,
+                Lane::ProviderMetadata,
+                "after-provider-unbind".into(),
+                Box::new(|_| ok("after"))
+            )
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .success
+    );
+}
+
+#[test]
+fn binds_first_dispatch_preserves_the_general_worker_pool() {
+    let config = ExecutorConfig {
+        pool_size: 2,
+        read_cap: 1,
+        actor_cap: 1,
+        heavy_permits: 1,
+        drr_quantum: 1,
+    }
+    .effective();
+    let mut state = SchedulerState::new(config.clone());
+    let roots: Vec<_> = (0..4)
+        .map(|i| test_root(&format!("binds-first-{i}")))
+        .collect();
+    for (_, root) in &roots {
+        state.actor_order.push(root.clone());
+        state
+            .actors
+            .insert(root.clone(), ActorState::new(test_ctx()));
+    }
+    let queued_at = Instant::now();
+    for (index, lane, id) in [
+        (0, Lane::Mutating, "subc-bind-first-a"),
+        (1, Lane::Mutating, "subc-bind-first-b"),
+        (2, Lane::Mutating, "general-writer"),
+        (3, Lane::HeavyInit, "general-index"),
+    ] {
+        let (completion, _) = crossbeam_channel::bounded(1);
+        state.actors.get_mut(&roots[index].1).unwrap().push_job(
+            JobClass::Interactive,
+            lane,
+            QueuedJob {
+                job: Box::new(move |_| ok(id)),
+                completion: CompletionSender::Sync(completion),
+                request_id: id.into(),
+                command: id.into(),
+                queued_at: queued_at + Duration::from_nanos(index as u64),
+                cancellation: None,
+                maintenance_coalesce_key: None,
+                rerun: None,
+                force_exclusive: false,
+                not_before: None,
+                exclusive_attempts: 0,
+                provider_generation: None,
+            },
+        );
+    }
+    let (run_tx, run_rx) = crossbeam_channel::unbounded();
+    let (event_tx, event_rx) = crossbeam_channel::unbounded();
+    let violations = AtomicUsize::new(0);
+    // Seed all queues before a single dispatcher pass. No scheduler thread can
+    // admit general work first and accidentally hide the binds-first case.
+    dispatch_runnable(
+        &mut state,
+        &Arc::new(HeavySemaphore::new(config.heavy_permits)),
+        &run_tx,
+        &event_tx,
+        &violations,
+    );
+    let jobs: Vec<_> = run_rx.try_iter().collect();
+    let ids: Vec<_> = jobs.iter().map(|job| job.request_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "subc-bind-first-a",
+            "subc-bind-first-b",
+            "general-writer",
+            "general-index"
+        ],
+        "running binds must not reserve their already-occupied workers a second time"
+    );
+    assert_eq!(state.binds_inflight, 2);
+    assert_eq!(state.idle_workers, config.provider_reserve);
+    assert_eq!(violations.load(Ordering::SeqCst), 0);
+    for mut job in jobs {
+        let response = match run_lane_job(&mut job) {
+            LaneRun::Finished(response) => response,
+            LaneRun::RerunExclusive { .. } => panic!("ordinary binds do not requeue"),
+        };
+        assert!(response.success);
+        job.completion_guard
+            .as_mut()
+            .unwrap()
+            .set_outcome(JobCompletionOutcome::Completed);
+        drop(job);
+        let SchedulerEvent::Completed(event) =
+            event_rx.recv_timeout(Duration::from_secs(30)).unwrap()
+        else {
+            panic!("one completion event per dispatched job")
+        };
+        complete_job(&mut state, event);
+    }
+    assert_eq!(state.binds_inflight, 0);
+    assert_eq!(state.idle_workers, config.total_workers());
 }

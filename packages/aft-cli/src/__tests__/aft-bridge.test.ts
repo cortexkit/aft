@@ -344,3 +344,17 @@ describe("createNdjsonLineSplitter", () => {
     expect(lines).toEqual(["one", "", "two", "stop"]);
   });
 });
+
+describe("bridge request deadline", () => {
+  test("a nonresponding child is reaped and rejects with pending request context", async () => {
+    const binary = makeFakeBinary("stalled", "echo fixture-error >&2\nexec /bin/sleep 1");
+    try {
+      await sendAftRequests(binary, [{ id: "pending", command: "configure" }], 20);
+      throw new Error("stalled child unexpectedly responded");
+    } catch (error) {
+      expect((error as Error).message).toMatch(/deadline.*configure/s);
+      expect((error as Error).message).toContain("fixture-error");
+      expect((error as Error).cause).toEqual({ exitCode: null, signal: "SIGKILL" });
+    }
+  });
+});

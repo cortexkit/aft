@@ -5,7 +5,7 @@ import argparse,json,subprocess,sys
 from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[2]
-SCRIPTS={"scripts/telemetry/cost-gate.sh","scripts/telemetry/imports-resolve.sh","scripts/telemetry/mutate.sh","scripts/telemetry/postA-remeasure.sh"}
+SCRIPTS={"scripts/telemetry/cost-gate.sh","scripts/telemetry/imports-resolve.sh","scripts/telemetry/postA-remeasure.sh"}
 WORKFLOW=".github/workflows/tests.yml"
 EXCLUDED=("benchmarks/aft-search/engine-fixtures/","crates/aft/src/query_shape.rs","crates/aft/src/semantic_index.rs","crates/aft/src/embed/","crates/aft/src/lib.rs","crates/aft/src/commands/semantic_search.rs","crates/aft/src/commands/semantic_search/")
 

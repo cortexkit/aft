@@ -428,17 +428,7 @@ fn scan_source(project_root: &Path, path: &Path, source: &str) -> ComplexityCont
     };
     let language_name = crate::inspect::job::language_name(language).to_string();
     let tree = match parse_source_with_cached_parser(path, source, language) {
-        Ok(tree) if !tree.root_node().has_error() => tree,
-        Ok(_) => {
-            return ComplexityContribution {
-                file,
-                language: Some(language_name),
-                functions: Vec::new(),
-                parse_error: Some("tree-sitter parse contains syntax errors".to_string()),
-                language_skipped: None,
-                skipped_reason: None,
-            };
-        }
+        Ok(tree) => tree,
         Err(error) => {
             return ComplexityContribution {
                 file,
@@ -461,7 +451,10 @@ fn scan_source(project_root: &Path, path: &Path, source: &str) -> ComplexityCont
         file,
         language: Some(language_name),
         functions,
-        parse_error: None,
+        parse_error: tree
+            .root_node()
+            .has_error()
+            .then(|| "tree-sitter parse contains syntax errors".to_string()),
         language_skipped: None,
         skipped_reason: None,
     }
@@ -485,6 +478,12 @@ fn collect_functions(root: Node<'_>, source: &str, spec: LanguageSpec) -> Vec<Fu
     let mut pending = vec![(root, None)];
     while let Some((node, enclosing_function)) = pending.pop() {
         let function = if is_function_node(node, spec) {
+            if node.has_error() {
+                // An invalid function cannot be scored reliably. Independent
+                // functions elsewhere in the file still have valid subtrees.
+                push_children_with_state(node, None, &mut pending);
+                continue;
+            }
             let function = functions.len();
             functions.push(FunctionComplexity {
                 name: function_name(node, source),
@@ -544,6 +543,7 @@ fn short_circuits_in_subtree(root: Node<'_>, source: &str, spec: LanguageSpec) -
 fn direct_short_circuit_operator_count(node: Node<'_>, source: &str) -> u32 {
     let mut cursor = node.walk();
     node.children(&mut cursor)
+        .filter(|child| !child.is_named())
         .filter_map(|child| child.utf8_text(source.as_bytes()).ok())
         .filter(|token| matches!(*token, "&&" | "||" | "and" | "or"))
         .count() as u32
@@ -740,6 +740,37 @@ mod tests {
 
     fn fixture_scan(name: &str, source: &str) -> ComplexityContribution {
         scan_source(Path::new("fixtures"), Path::new(name), source)
+    }
+
+    #[test]
+    fn audit05_identifier_is_not_short_circuit_operator() {
+        let scan = fixture_scan(
+            "field.ts",
+            "function f(value: {or: boolean}) { if (value.or) { return 1; } return 0; }",
+        );
+        assert!(scan.parse_error.is_none());
+        assert_eq!(scan.functions[0].complexity, 2);
+    }
+
+    #[test]
+    fn audit05_parse_error_keeps_valid_nested_functions() {
+        let scan = fixture_scan("nested.ts", "function broken() { function intact(flag: boolean) { if (flag) return 1; } const = 1; }");
+        assert!(scan.parse_error.is_some());
+        assert_eq!(scan.functions.len(), 1);
+        assert_eq!(scan.functions[0].name, "intact");
+        assert_eq!(scan.functions[0].complexity, 2);
+    }
+
+    #[test]
+    fn audit05_parse_error_keeps_valid_functions() {
+        let scan = fixture_scan(
+            "partial.ts",
+            "function good(flag: boolean) { if (flag) { return 1; } return 0; }\nfunction bad( {",
+        );
+        assert!(scan.parse_error.is_some());
+        assert_eq!(scan.functions.len(), 1);
+        assert_eq!(scan.functions[0].name, "good");
+        assert_eq!(scan.functions[0].complexity, 2);
     }
 
     fn collect_functions_two_pass_reference(

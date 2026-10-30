@@ -98,6 +98,7 @@ fn reap_killed_child(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_pty_for_command(
+    registry: &super::registry::BgTaskRegistry,
     spawn_plan: &SpawnPlan,
     task_id: &str,
     session_id: &str,
@@ -112,11 +113,15 @@ pub(crate) fn spawn_pty_for_command(
     wake_tx: crossbeam_channel::Sender<()>,
     io_handles: &mut TaskIoHandles,
     spawned_pgid: &mut Option<i32>,
+    memory_monitor: &mut Option<super::memory_limit::Monitor>,
+    publish_memory_policy: &mut dyn FnMut(&super::memory_limit::MemoryPolicy) -> Result<(), String>,
+    defer_bootstrap: bool,
 ) -> Result<PtyRuntime, String> {
+    let launch_gated = memory_monitor.is_some() || defer_bootstrap;
     #[cfg(unix)]
     {
         let _ = shell_kind;
-        let args = if let Some(prepared) = spawn_plan.prepared_task() {
+        let mut args = if let Some(prepared) = spawn_plan.prepared_task() {
             vec![
                 OsString::from("-c"),
                 OsString::from(prepared.command_text()?),
@@ -124,11 +129,45 @@ pub(crate) fn spawn_pty_for_command(
         } else {
             vec![OsString::from("-c"), OsString::from(user_command)]
         };
+        let secret_ready = spawn_plan
+            .prepared_task()
+            .and_then(|task| task.secret_runtime())
+            .is_some();
+        // Secret proxy setup and speech sealing may both apply; neither may
+        // bypass the shared bootstrap wait before user code runs.
+        let program = if launch_gated || secret_ready {
+            let mut gated = vec![
+                OsString::from("-c"),
+                OsString::from(if secret_ready {
+                    "printf '%s' ready > \"$1\" || exit 125; shift; read -r ready || exit 125; exec \"$@\""
+                } else {
+                    "read -r ready || exit 125; exec \"$@\""
+                }),
+                OsString::from("aft-memory-gate"),
+            ];
+            if secret_ready {
+                // The child can write command scratch, not task-record paths.
+                gated.push(
+                    spawn_plan
+                        .temp_dir()
+                        .ok_or(super::secrets::PROXY_UNAVAILABLE)?
+                        .join("secret-ready")
+                        .into_os_string(),
+                );
+            }
+            gated.push(shell_path.as_os_str().to_owned());
+            gated.append(&mut args);
+            args = gated;
+            std::ffi::OsStr::new("/bin/sh")
+        } else {
+            shell_path.as_os_str()
+        };
         try_spawn_pty(
+            registry,
             spawn_plan,
             task_id,
             session_id,
-            shell_path.as_os_str(),
+            program,
             &args,
             paths,
             workdir,
@@ -138,6 +177,9 @@ pub(crate) fn spawn_pty_for_command(
             wake_tx,
             io_handles,
             spawned_pgid,
+            memory_monitor,
+            publish_memory_policy,
+            defer_bootstrap,
         )
     }
     #[cfg(windows)]
@@ -151,7 +193,11 @@ pub(crate) fn spawn_pty_for_command(
             shell_candidates()
         };
         let attempt = crate::windows_shell::spawn_pty_candidates(&candidates, |shell| {
-            let wrapper_body = shell.wrapper_script_bytes(user_command, &paths.exit);
+            let wrapper_body = if launch_gated {
+                shell.memory_gated_wrapper_bytes(user_command, &paths.exit)
+            } else {
+                shell.wrapper_script_bytes(user_command, &paths.exit)
+            };
             let wrapper_path = windows_wrapper_path(paths, shell);
             if let Err(error) = crate::private_storage::write(&wrapper_path, wrapper_body) {
                 return Err(crate::windows_shell::PtyAttemptError::Wrapper(format!(
@@ -163,6 +209,10 @@ pub(crate) fn spawn_pty_for_command(
             let env = match shell.wrapper_environment(user_command) {
                 Some((key, value)) => {
                     wrapper_env = env.clone();
+                    // Windows environment names are case-insensitive, but the PTY
+                    // builder keeps every spelling, so drop any caller-supplied
+                    // variant of the generated key before inserting it.
+                    wrapper_env.retain(|name, _| !name.eq_ignore_ascii_case(key));
                     wrapper_env.insert(key.to_string(), value.to_string());
                     &wrapper_env
                 }
@@ -170,16 +220,77 @@ pub(crate) fn spawn_pty_for_command(
             };
 
             let args: Vec<OsString> = shell
-                .pty_wrapper_args(&wrapper_path)
+                .wrapper_file_args(&wrapper_path)
                 .into_iter()
                 .map(OsString::from)
                 .collect();
+            let mut waiter_environment = None;
+            let mut memory_file_gate = shell.uses_memory_file_gate();
+            let (program, args) = if matches!(
+                shell,
+                crate::windows_shell::WindowsShell::Pwsh
+                    | crate::windows_shell::WindowsShell::Powershell
+            ) {
+                super::windows_waiter::wrap(
+                    std::ffi::OsStr::new(shell.binary().as_ref()),
+                    &args,
+                    paths,
+                    workdir,
+                    env,
+                    true,
+                    launch_gated,
+                )
+                .map_err(|error| crate::windows_shell::PtyAttemptError::Wrapper(error.to_string()))?
+                .map(|waiter| {
+                    waiter_environment = Some(waiter.environment);
+                    (waiter.program, waiter.args)
+                })
+                .unwrap_or_else(|| (OsString::from(shell.binary().as_ref()), args))
+            } else {
+                (OsString::from(shell.binary().as_ref()), args)
+            };
+            let mut waiter_env;
+            let memory_cmd_waiter = waiter_environment.is_some();
+            let env = if let Some((key, value)) = waiter_environment {
+                // The job is attached to the cmd root before its stdin gate is
+                // released. PowerShell must not wait on a second file gate.
+                memory_file_gate = false;
+                if launch_gated {
+                    shell
+                        .write_wrapper(user_command, &paths.exit, &wrapper_path)
+                        .map_err(|error| {
+                            crate::windows_shell::PtyAttemptError::Wrapper(error.to_string())
+                        })?;
+                }
+                waiter_env = env.clone();
+                waiter_env.insert(key, value);
+                &waiter_env
+            } else {
+                if matches!(
+                    shell,
+                    crate::windows_shell::WindowsShell::Pwsh
+                        | crate::windows_shell::WindowsShell::Powershell
+                ) {
+                    shell
+                        .write_direct_wrapper(
+                            user_command,
+                            &paths.exit,
+                            &wrapper_path,
+                            launch_gated,
+                        )
+                        .map_err(|error| {
+                            crate::windows_shell::PtyAttemptError::Wrapper(error.to_string())
+                        })?;
+                }
+                env
+            };
 
             try_spawn_pty(
+                registry,
                 spawn_plan,
                 task_id,
                 session_id,
-                std::ffi::OsStr::new(shell.binary().as_ref()),
+                &program,
                 &args,
                 paths,
                 workdir,
@@ -189,6 +300,11 @@ pub(crate) fn spawn_pty_for_command(
                 wake_tx.clone(),
                 io_handles,
                 spawned_pgid,
+                memory_monitor,
+                publish_memory_policy,
+                defer_bootstrap,
+                memory_file_gate,
+                memory_cmd_waiter,
             )
             .map_err(crate::windows_shell::PtyAttemptError::Spawn)
         });
@@ -223,6 +339,7 @@ fn windows_wrapper_path(
 
 #[allow(clippy::too_many_arguments)]
 fn try_spawn_pty(
+    #[cfg_attr(windows, allow(unused_variables))] registry: &super::registry::BgTaskRegistry,
     spawn_plan: &SpawnPlan,
     task_id: &str,
     session_id: &str,
@@ -236,6 +353,11 @@ fn try_spawn_pty(
     wake_tx: crossbeam_channel::Sender<()>,
     io_handles: &mut TaskIoHandles,
     spawned_pgid: &mut Option<i32>,
+    memory_monitor: &mut Option<super::memory_limit::Monitor>,
+    publish_memory_policy: &mut dyn FnMut(&super::memory_limit::MemoryPolicy) -> Result<(), String>,
+    defer_bootstrap: bool,
+    #[cfg(windows)] memory_file_gate: bool,
+    #[cfg(windows)] memory_cmd_waiter: bool,
 ) -> Result<PtyRuntime, String> {
     let (command, profile_handle) = crate::sandbox_spawn::pty_command_for_plan(
         spawn_plan,
@@ -297,8 +419,44 @@ fn try_spawn_pty(
         master: Some(pair.master),
     };
     let child_pid = child.child.as_ref().unwrap().process_id();
+    #[cfg(unix)]
+    if spawn_plan
+        .prepared_task()
+        .and_then(|task| task.secret_runtime())
+        .is_some()
+    {
+        // PTY setup can close the spawn error pipe before exec finishes. A
+        // forked non-dumpable child is not inspectable until exec resets its
+        // state. The AFT-supplied shell gate writes readiness before waiting
+        // for the release line; user command execution follows that wait.
+        let ready = spawn_plan
+            .temp_dir()
+            .ok_or(super::secrets::PROXY_UNAVAILABLE)?
+            .join("secret-ready");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::fs::read(&ready).ok().as_deref() == Some(b"ready") {
+                let _ = std::fs::remove_file(&ready);
+                break;
+            }
+            if std::time::Instant::now() >= until {
+                return Err(super::secrets::PROXY_UNAVAILABLE.to_owned());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    #[cfg(unix)]
+    registry.arm_secret_proxy(
+        spawn_plan,
+        task_id,
+        child_pid.ok_or(super::secrets::PROXY_UNAVAILABLE)?,
+    )?;
     // Preserve group identity for scratch cleanup even if setup returns no runtime.
     *spawned_pgid = child_pid.map(|pid| pid as i32);
+    if let Some(monitor) = memory_monitor.as_mut() {
+        monitor.attach(child_pid.ok_or("memory cap launch PID missing")?)?;
+        publish_memory_policy(&monitor.policy)?;
+    }
     let killer = child.child.as_ref().unwrap().clone_killer();
     #[cfg(test)]
     fail_pty_setup_for_test(child_pid)?;
@@ -316,6 +474,55 @@ fn try_spawn_pty(
         .unwrap()
         .take_writer()
         .map_err(|error| format!("take PTY writer failed: {error}"))?;
+    let writer = Arc::new(Mutex::new(writer));
+    let mut bootstrap_release: Option<Box<dyn FnOnce() -> Result<(), String> + Send>> = None;
+    if memory_monitor.is_some() || defer_bootstrap || {
+        #[cfg(unix)]
+        {
+            spawn_plan
+                .prepared_task()
+                .and_then(|task| task.secret_runtime())
+                .is_some()
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    } {
+        #[cfg(unix)]
+        let ready: &[u8] = b"\n";
+        #[cfg(windows)]
+        let ready: &[u8] = if memory_file_gate {
+            b""
+        } else if memory_cmd_waiter {
+            // cmd's console SET /P gate needs an Enter key, not a literal LF.
+            b"aft-memory-ready\r"
+        } else {
+            b"aft-memory-ready\n"
+        };
+        let gate_writer = Arc::clone(&writer);
+        #[cfg(windows)]
+        let gate_exit = paths.exit.clone();
+        let release: Box<dyn FnOnce() -> Result<(), String> + Send> = Box::new(move || {
+            use std::io::Write;
+            // Release the Windows file gate immediately before the stdin
+            // payload, inside the callback so speech sealing defers both.
+            #[cfg(windows)]
+            if memory_file_gate {
+                crate::windows_shell::release_memory_file_gate(&gate_exit)?;
+            }
+            gate_writer
+                .lock()
+                .map_err(|_| "PTY launch writer lock poisoned".to_string())?
+                .write_all(ready)
+                .map_err(|error| format!("memory cap launch gate failed: {error}"))
+        });
+        if defer_bootstrap {
+            bootstrap_release = Some(release);
+        } else {
+            release()?;
+        }
+    }
 
     let reader_done = Arc::new(AtomicBool::new(false));
     let reader_eof = Arc::new(AtomicBool::new(false));
@@ -327,7 +534,6 @@ fn try_spawn_pty(
         wake_tx,
     ));
 
-    let writer = Arc::new(Mutex::new(writer));
     let spill = io_handles
         .clone_file(TaskArtifact::Pty)
         .map_err(|error| format!("failed to clone PTY spill handle: {error}"))?;
@@ -353,6 +559,7 @@ fn try_spawn_pty(
     .map_err(|error| format!("failed to start PTY waiter: {error}"))?;
 
     Ok(PtyRuntime {
+        bootstrap_release,
         master: child.master.take(),
         writer,
         killer,
@@ -855,6 +1062,7 @@ fn lifecycle_pty_setup_failure_terminates_and_reaps_child() {
         .with(|failure| *failure.borrow_mut() = Some((dir.path().join("ready"), pid.clone())));
     let mut spawned_pgid = None;
     let result = try_spawn_pty(
+        &super::registry::BgTaskRegistry::new(Default::default()),
         &SpawnPlan::Unsandboxed,
         "bash-0000000000000901",
         "session",
@@ -868,6 +1076,9 @@ fn lifecycle_pty_setup_failure_terminates_and_reaps_child() {
         crossbeam_channel::unbounded().0,
         &mut handles,
         &mut spawned_pgid,
+        &mut None,
+        &mut |_| Ok(()),
+        false,
     );
     let pid = pid.load(Ordering::SeqCst);
     assert_ne!(pid, 0);
@@ -894,6 +1105,7 @@ fn approved_pty_worker_admission_failure(worker: super::worker_thread::Worker) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         super::worker_thread::with_refusal(worker, || {
             try_spawn_pty(
+                &super::registry::BgTaskRegistry::new(Default::default()),
                 &SpawnPlan::Unsandboxed,
                 "bash-0000000000000010",
                 "session",
@@ -907,6 +1119,9 @@ fn approved_pty_worker_admission_failure(worker: super::worker_thread::Worker) {
                 crossbeam_channel::unbounded().0,
                 &mut handles,
                 &mut spawned_pgid,
+                &mut None,
+                &mut |_| Ok(()),
+                false,
             )
         })
     }));

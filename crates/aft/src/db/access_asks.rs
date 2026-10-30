@@ -4,12 +4,14 @@
 //! `call_key` its open ask was first sent under, so a retried call re-sends
 //! that key and Cingulate returns the same ask instead of a second one.
 //!
-//! An `allow_once` answer is applied at most once: the dispatch that claims it
+//! An `allow_once` answer authorizes at most one tool run: the dispatch that claims it
 //! moves the asked grant into `approved` and stamps itself as `holder` in one
 //! statement, so a concurrent identical retry finds the ask already claimed.
 //! A call that needs several outside paths asks for them one at a time; the
 //! grants already approved for the same call stay on the row until that call
-//! finishes, and only the holder may use them.
+//! finishes, and only the holder may use them. An unused claim released on
+//! hold-budget expiry can be claimed by an identical retry; cancellation
+//! instead consumes that claim.
 //!
 //! Rollback to schema 16 requires stopping AFT, dropping access_asks, then
 //! setting schema_version.version to 16; this discards every open ask.
@@ -253,6 +255,26 @@ pub fn consume(conn: &Connection, key: &AskKey, holder: &str) -> rusqlite::Resul
     )? == 1)
 }
 
+/// Make an unused, answered approval claimable again after a hold deadline.
+/// Only the current holder can restore the original ask; approvals already
+/// accumulated for this call stay on the row and `claim` deduplicates them.
+pub fn release_claim(
+    conn: &Connection,
+    key: &AskKey,
+    holder: &str,
+    call_key: &str,
+    elicitation_id: Option<&str>,
+    request: &serde_json::Value,
+    pending: &AccessGrant,
+) -> rusqlite::Result<bool> {
+    Ok(conn.execute(
+        "UPDATE access_asks SET call_key=?6, elicitation_id=?7, request=?8, pending=?9, holder=NULL
+         WHERE owner=?1 AND scope_ref=?2 AND epoch=?3 AND args_hash=?4 AND holder=?5 AND call_key IS NULL",
+        params![key.scope.owner, key.scope.scope_ref, key.scope.epoch.to_string(), key.args_hash,
+            holder, call_key, elicitation_id, encode(request), encode(pending)],
+    )? == 1)
+}
+
 /// Drop an ask outright: it was declined, refused, withdrawn, or its claim
 /// belongs to a process that no longer exists.
 pub fn discard(conn: &Connection, key: &AskKey) -> rusqlite::Result<bool> {
@@ -315,7 +337,7 @@ mod tests {
             claim(&conn, &ask, "k1", &first).unwrap(),
             Some(vec![grant("/a")])
         );
-        // The same settled answer seen again grants nothing.
+        // While claimed, the same settled answer seen again grants nothing.
         assert_eq!(claim(&conn, &ask, "k1", &second).unwrap(), None);
         let record = get(&conn, &ask).unwrap().unwrap();
         assert!(record.holder_is_live());
@@ -357,6 +379,62 @@ mod tests {
         assert_eq!(for_scope(&conn, &base.scope).unwrap().len(), 1);
         assert!(discard(&conn, &base).unwrap());
         assert!(for_scope(&conn, &base.scope).unwrap().is_empty());
+    }
+
+    #[test]
+    fn access_asks_release_unused_claim_preserves_answer_and_exclusive_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let ask = key("hash");
+        let selector = serde_json::json!({"ref":"worker"});
+        let request = serde_json::json!({"tool":"read"});
+        open(&conn, &ask, "k1", &selector, &request, &grant("/a"), 1).unwrap();
+        set_elicitation(&conn, &ask, "k1", "acc_1").unwrap();
+        let original = get(&conn, &ask).unwrap().unwrap();
+        let first = new_holder();
+        let second = new_holder();
+        let release = |holder: &str| {
+            release_claim(
+                &conn,
+                &ask,
+                holder,
+                "k1",
+                Some("acc_1"),
+                &request,
+                &grant("/a"),
+            )
+        };
+        assert_eq!(
+            claim(&conn, &ask, "k1", &first).unwrap(),
+            Some(vec![grant("/a")])
+        );
+        assert!(!release(&second).unwrap());
+        assert!(release(&first).unwrap());
+        let released = get(&conn, &ask).unwrap().unwrap();
+        assert_eq!(released.call_key, original.call_key);
+        assert_eq!(released.elicitation_id, original.elicitation_id);
+        assert_eq!(released.request, original.request);
+        assert_eq!(released.pending, original.pending);
+        assert_eq!(released.approved, vec![grant("/a")]);
+        assert_eq!(released.holder, None);
+        assert_eq!(
+            claim(&conn, &ask, "k1", &second).unwrap(),
+            Some(vec![grant("/a")])
+        );
+        assert!(!release(&first).unwrap());
+        open(&conn, &ask, "k2", &selector, &request, &grant("/b"), 2).unwrap();
+        assert!(!release(&second).unwrap());
+        assert_eq!(
+            get(&conn, &ask).unwrap().unwrap().call_key.as_deref(),
+            Some("k2")
+        );
+        let third = new_holder();
+        assert_eq!(
+            claim(&conn, &ask, "k2", &third).unwrap(),
+            Some(vec![grant("/a"), grant("/b")])
+        );
+        assert!(consume(&conn, &ask, &third).unwrap());
+        assert!(!release(&third).unwrap());
     }
 
     #[test]

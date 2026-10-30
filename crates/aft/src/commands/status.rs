@@ -4,6 +4,58 @@ use crate::context::AppContext;
 use crate::context::SemanticIndexStatus;
 use crate::db::compression_events::CompressionAggregate;
 use crate::protocol::{RawRequest, Response, StatusPayload, DEFAULT_SESSION_ID};
+use crate::views::semantic_runtime::CoordinationState;
+
+// Operator-only copy: never use these lines as fill errors or agent reply reasons.
+const PENDING_REASON: &str =
+    "Waiting for another AFT process that is embedding the same new code; results will follow.";
+const ERROR_REASON: &str = "Can't coordinate embedding with other AFT processes";
+
+fn coordination_detail(detail: &str) -> String {
+    let redacted = crate::log_redact::aft_redactor(detail);
+    let single_line = redacted
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect::<String>();
+    single_line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn project_semantic_coordination(info: &mut serde_json::Value, state: CoordinationState) {
+    match state {
+        CoordinationState::Contended => {
+            info["pending_reason"] = serde_json::json!(PENDING_REASON);
+        }
+        CoordinationState::BaseBusy { owner_pid, attempt } => {
+            info["pending_reason"] = serde_json::json!(PENDING_REASON);
+            info["pending_owner"] = serde_json::json!({
+                "kind": "base_claim", "pid": owner_pid, "attempt": attempt,
+            });
+        }
+        CoordinationState::Error { failure, retry_in } => {
+            let detail = coordination_detail(&failure.detail);
+            let line = match retry_in {
+                Some(wait) => format!(
+                    "{ERROR_REASON}: {detail}. Retrying in {}.",
+                    crate::lsp::manager::format_retry_delay(wait)
+                ),
+                None => format!("{ERROR_REASON}: {detail}. No retry is scheduled."),
+            };
+            info["pending_reason"] = serde_json::json!(line);
+            info["coordination_error"] = serde_json::json!({
+                "state": "error", "kind": failure.kind_label(), "reason": ERROR_REASON,
+                "detail": detail, "retryable": failure.retryable,
+                "retry_scheduled": retry_in.is_some(),
+                "retry_in_ms": retry_in.map(|wait| u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)),
+            });
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct CompressionStats {
@@ -54,6 +106,12 @@ pub fn handle_status(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(removal) = removal_health_for_status(req) {
         snapshot["removal"] = removal;
     }
+    // Integration fixtures pin only the unpredictable producer input. Formatting
+    // and legacy/result-body serialization below the handler remain unchanged.
+    #[cfg(feature = "test-conformance-result-inputs")]
+    if let Ok(input) = std::env::var("AFT_TEST_CONFORMANCE_STATUS_SNAPSHOT") {
+        snapshot = serde_json::from_str(&input).expect("conformance status snapshot is JSON");
+    }
     Response::success(&req.id, snapshot)
 }
 
@@ -93,38 +151,55 @@ fn removal_health_for_status(req: &RawRequest) -> Option<serde_json::Value> {
     )
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StatusSnapshotKind {
+    Explicit,
+    Push,
+}
+
 impl AppContext {
     pub fn build_status_snapshot(&self) -> StatusPayload {
-        #[cfg(test)]
-        self.status_emitter()
-            .snapshot_builds
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.build_status_snapshot_for_session(DEFAULT_SESSION_ID)
     }
 
     pub fn build_status_snapshot_for_session(&self, session_id: &str) -> StatusPayload {
-        self.build_status_snapshot_with_counts(session_id, self.status_bar_count_values())
+        self.build_status_snapshot_with_counts(
+            session_id,
+            self.status_bar_count_values(),
+            StatusSnapshotKind::Explicit,
+        )
     }
 
+    #[cfg(test)]
     pub(crate) fn try_build_status_snapshot(&self) -> Option<StatusPayload> {
         let counts = self.try_status_bar_count_values()?;
-        #[cfg(test)]
-        self.status_emitter()
-            .snapshot_builds
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Some(self.build_status_snapshot_with_counts(DEFAULT_SESSION_ID, counts))
+        Some(self.build_status_snapshot_with_counts(
+            DEFAULT_SESSION_ID,
+            counts,
+            StatusSnapshotKind::Explicit,
+        ))
     }
 
     pub(crate) fn try_build_status_push_snapshot(&self) -> Option<StatusPayload> {
-        self.try_build_status_snapshot()
-            .map(|snapshot| crate::status_push::project(self, snapshot))
+        let counts = self.try_status_bar_count_values()?;
+        let snapshot = self.build_status_snapshot_with_counts(
+            DEFAULT_SESSION_ID,
+            counts,
+            StatusSnapshotKind::Push,
+        );
+        Some(crate::status_push::project(self, snapshot))
     }
 
     fn build_status_snapshot_with_counts(
         &self,
         session_id: &str,
         status_bar_values: crate::context::StatusBarCountValues,
+        kind: StatusSnapshotKind,
     ) -> StatusPayload {
+        #[cfg(test)]
+        self.status_emitter()
+            .snapshot_builds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let config = self.config();
 
         // Search index status. Status is a control-path snapshot, so lock
@@ -192,9 +267,9 @@ impl AppContext {
                                     "refreshing_count": refreshing_count,
                                     "entries": idx.entry_count(),
                                     "dimension": idx.dimension(),
-                                    "skipped_rows": idx.skipped_rows(),
-                                    "refused_rows_summary": idx.refused_rows_summary(),
-                                    "skipped_row_reason": if idx.skipped_rows() > 0 { Some(idx.skipped_row_reason()) } else { None },
+                                    "skipped_chunks": idx.skipped_rows(),
+                                    "skipped_chunks_summary": idx.skipped_chunks_summary(),
+                                    "skipped_chunk_reason": if idx.skipped_rows() > 0 { Some(idx.skipped_chunk_reason()) } else { None },
                                     "backend": idx.backend_label().unwrap_or(config.semantic_backend_label()),
                                     "model": idx.model_label().unwrap_or(config.semantic.model.as_str()),
                                 })
@@ -298,13 +373,26 @@ impl AppContext {
         } else {
             search_index_info
         };
-        let semantic_index_info = if self.root_too_broad() {
+        let mut semantic_index_info = if self.root_too_broad() {
             safety_disabled_info()
         } else if config.indexes.semantic {
             refused_info(crate::feature_status::IndexPlane::Semantic).unwrap_or(semantic_index_info)
         } else {
             semantic_index_info
         };
+
+        if config.views.enabled && config.indexes.semantic {
+            if let Some(Some(crate::views::semantic_runtime::CheckoutSemanticState::Ready(
+                runtime,
+            ))) = self.checkout_semantic().try_state()
+            {
+                if let Some(coordination) = runtime.coordination_state() {
+                    // Existing semantic vectors remain queryable; expose coordination
+                    // diagnostics only in operator status output.
+                    project_semantic_coordination(&mut semantic_index_info, coordination);
+                }
+            }
+        }
 
         // Disk cache sizes — scoped to the **current project** only.
         //
@@ -322,7 +410,8 @@ impl AppContext {
         // resolved (no project_root), fall back to zeros — the cross-project
         // total is never the right answer to display per-session.
         let storage_dir = config.storage_dir.as_ref().map(|d| d.display().to_string());
-        let disk_info = match (&config.storage_dir, &config.project_root) {
+        let cache_dir = config.cache_storage_dir();
+        let disk_info = match (&cache_dir, &config.project_root) {
             (Some(dir), Some(root)) => {
                 let key_root = self
                     .canonical_cache_root_opt()
@@ -336,14 +425,16 @@ impl AppContext {
                         let trigram_size = dir_size(&dir.join("index").join(&key));
                         let semantic_size = dir_size(&dir.join("semantic").join(&key));
                         serde_json::json!({
-                            "storage_dir": dir.display().to_string(),
+                            "storage_dir": storage_dir,
+                            "cache_dir": dir.display().to_string(),
                             "project_cache_key": key,
                             "trigram_disk_bytes": trigram_size,
                             "semantic_disk_bytes": semantic_size,
                         })
                     }
                     None => serde_json::json!({
-                        "storage_dir": dir.display().to_string(),
+                        "storage_dir": storage_dir,
+                        "cache_dir": dir.display().to_string(),
                         "project_cache_key": null,
                         "trigram_disk_bytes": 0,
                         "semantic_disk_bytes": 0,
@@ -351,7 +442,8 @@ impl AppContext {
                 }
             }
             (Some(dir), None) => serde_json::json!({
-                "storage_dir": dir.display().to_string(),
+                "storage_dir": storage_dir,
+                "cache_dir": dir.display().to_string(),
                 "project_cache_key": null,
                 "trigram_disk_bytes": 0,
                 "semantic_disk_bytes": 0,
@@ -397,8 +489,6 @@ impl AppContext {
             0
         };
         let compression = self.compression_stats_for_session(session_id);
-        let (backup_skipped_too_large_total, backup_skipped_temp_path_total) =
-            crate::backup::backup_skipped_totals();
 
         // Degraded-mode reasons recorded by `handle_configure` when the
         // project root doesn't look like a real project (`home_root`). Heavy
@@ -406,10 +496,22 @@ impl AppContext {
         // surface the reason so users know why and can decide whether to open a
         // project subdirectory. Empty list = full-featured mode.
         let mut degraded_reasons = self.degraded_reasons();
+        if let Some(reason) = self.cache_unavailable_reason() {
+            let code = crate::root_cache::cache_status_code(&reason);
+            if !degraded_reasons.iter().any(|reason| reason == code) {
+                degraded_reasons.push(code.into());
+            }
+        }
         // Everything under the storage root that this build refused because a
         // newer build wrote it (or the reader floor requires a newer reader).
         let storage_root = crate::bash_background::storage_dir(config.storage_dir.as_deref());
-        let storage_refusals = crate::persisted_format::refusals_under(&storage_root);
+        // Push projection supplies only this project's refusals. Do not build
+        // the full-storage list that it would immediately discard.
+        let storage_refusals = if kind == StatusSnapshotKind::Explicit {
+            crate::persisted_format::refusals_under(&storage_root)
+        } else {
+            Vec::new()
+        };
         for refusal in &storage_refusals {
             // A single unreadable task does not disable bash for any other
             // task or session. Health still lists it by path below; a floor
@@ -511,46 +613,13 @@ impl AppContext {
         if let Some(reason) = diagnostics_reason {
             status_bar_values["diagnostics_reason"] = serde_json::json!(reason);
         }
-        let memory_root = self
-            .canonical_cache_root_opt()
-            .or_else(|| config.project_root.clone());
-        let callgraph_write_metrics = memory_root
-            .as_deref()
-            .and_then(|root| self.cached_artifact_cache_key(root))
-            .map(|project_key| {
-                crate::callgraph_store::callgraph_write_metrics_for_project(&project_key)
-            })
-            .unwrap_or_default();
-        let callgraph_write_metrics_total = crate::callgraph_store::callgraph_write_metrics_total();
-        // `MemorySnapshot::new` uses the process-wide allocator observation so
-        // status never walks allocator zones on a request worker.
-        let memory = serde_json::to_value(self.memory_snapshot(memory_root.as_deref()))
-            .unwrap_or(serde_json::Value::Null);
         let watcher = serde_json::to_value(self.watcher_counters().snapshot())
             .unwrap_or(serde_json::Value::Null);
-        // The control-path status response reads the health worker's published
-        // lifecycle snapshot; it never probes processes or opens a database.
-        let lifecycle = self.app().lifecycle_census_snapshot();
-        let mut runtime = serde_json::json!({
+        let runtime = serde_json::json!({
             "live_watchers": self.app().watcher_count(),
             "live_actor_roots": self.app().actor_root_count(),
             "open_routes": self.app().open_route_count(),
-            "callgraph_commits_60s_total": callgraph_write_metrics_total.commits_60s,
-            "callgraph_pages_or_bytes_written_60s_total": callgraph_write_metrics_total
-                .pages_or_bytes_written_60s,
         });
-        #[cfg(unix)]
-        {
-            runtime["bash_spawn"] = crate::posix_spawn::health();
-        }
-        if callgraph_write_metrics.commits_60s > 0 {
-            runtime["callgraph_commits_60s"] =
-                serde_json::json!(callgraph_write_metrics.commits_60s);
-        }
-        if callgraph_write_metrics.pages_or_bytes_written_60s > 0 {
-            runtime["callgraph_pages_or_bytes_written_60s"] =
-                serde_json::json!(callgraph_write_metrics.pages_or_bytes_written_60s);
-        }
 
         let mut payload = serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
@@ -562,9 +631,6 @@ impl AppContext {
             "artifact_owner": artifact_owner,
             "degraded": degraded,
             "degraded_reasons": degraded_reasons,
-            "storage_refusals": storage_refusals,
-            "storage_retention": crate::storage_retention::snapshot(&storage_root),
-            "git": crate::developer_tools::git_status_json(),
             "features": {
                 "format_on_edit": config.format_on_edit,
                 "validate_on_edit": config.validate_on_edit.as_deref().unwrap_or("off"),
@@ -582,20 +648,14 @@ impl AppContext {
             "disk": disk_info,
             "lsp_servers": lsp_count,
             "symbol_cache": symbol_cache_stats,
-            "memory": memory,
             "watcher": watcher,
-            "lsp": lifecycle.lsp,
-            "threads": lifecycle.threads,
-            "sqlite": lifecycle.sqlite,
-            "children": lifecycle.children,
-            "fds": lifecycle.fds,
             "runtime": runtime,
             "compression": compression,
             "storage_dir": storage_dir,
+            "cache_dir": self.cache_dir(),
+            "cache_unavailable_reason": self.cache_unavailable_reason().map(|reason| crate::root_cache::unavailable_code(&reason)),
             // Project-wide (all sessions): total in-memory checkpoint count.
             "checkpoints_total": checkpoint_total,
-            "backup_skipped_too_large_total": backup_skipped_too_large_total,
-            "backup_skipped_temp_path_total": backup_skipped_temp_path_total,
             // Current session slice: only when the caller passed `session_id`.
             "session": {
                 "id": session_id,
@@ -606,6 +666,71 @@ impl AppContext {
         if config.views.enabled {
             payload["views"] = serde_json::to_value(self.view_health_snapshot())
                 .unwrap_or(serde_json::Value::Null);
+        }
+        if kind == StatusSnapshotKind::Push {
+            // Read only this root's LSP applicability rather than cloning
+            // applicability for every root and the other lifecycle details.
+            let root = config.project_root.clone().unwrap_or_default();
+            let normalized = crate::inspect::job::canonicalize_normalized(&root)
+                .display()
+                .to_string();
+            let mut roots = serde_json::Map::new();
+            if let Some(own) = self.app().lifecycle_lsp_applicability_for_root(&normalized) {
+                roots.insert(normalized, serde_json::json!(own));
+            }
+            payload["lsp"] = serde_json::json!({"applicability_by_root": roots});
+        } else {
+            // Process details belong to explicit reads only. In particular,
+            // memory attribution walks every registered project's context.
+            let memory_root = self
+                .canonical_cache_root_opt()
+                .or_else(|| config.project_root.clone());
+            let callgraph_write_metrics = memory_root
+                .as_deref()
+                .and_then(|root| self.cached_artifact_cache_key(root))
+                .map(|project_key| {
+                    crate::callgraph_store::callgraph_write_metrics_for_project(&project_key)
+                })
+                .unwrap_or_default();
+            let callgraph_write_metrics_total =
+                crate::callgraph_store::callgraph_write_metrics_total();
+            // The allocator observation is cached; attribution still walks roots.
+            payload["memory"] = serde_json::to_value(self.memory_snapshot(memory_root.as_deref()))
+                .unwrap_or(serde_json::Value::Null);
+            // The health worker publishes lifecycle details off the reply path.
+            let lifecycle = self.app().lifecycle_census_snapshot();
+            payload["lsp"] = serde_json::json!(lifecycle.lsp);
+            payload["threads"] = serde_json::json!(lifecycle.threads);
+            payload["sqlite"] = serde_json::json!(lifecycle.sqlite);
+            payload["children"] = serde_json::json!(lifecycle.children);
+            payload["fds"] = serde_json::json!(lifecycle.fds);
+            payload["storage_refusals"] = serde_json::json!(storage_refusals);
+            payload["storage_retention"] =
+                serde_json::json!(crate::storage_retention::snapshot(&self.cache_dir()));
+            payload["git"] = crate::developer_tools::git_status_json();
+            let (backup_skipped_too_large_total, backup_skipped_temp_path_total) =
+                crate::backup::backup_skipped_totals();
+            payload["backup_skipped_too_large_total"] =
+                serde_json::json!(backup_skipped_too_large_total);
+            payload["backup_skipped_temp_path_total"] =
+                serde_json::json!(backup_skipped_temp_path_total);
+            let runtime = &mut payload["runtime"];
+            runtime["callgraph_commits_60s_total"] =
+                serde_json::json!(callgraph_write_metrics_total.commits_60s);
+            runtime["callgraph_pages_or_bytes_written_60s_total"] =
+                serde_json::json!(callgraph_write_metrics_total.pages_or_bytes_written_60s);
+            #[cfg(unix)]
+            {
+                runtime["bash_spawn"] = crate::posix_spawn::health();
+            }
+            if callgraph_write_metrics.commits_60s > 0 {
+                runtime["callgraph_commits_60s"] =
+                    serde_json::json!(callgraph_write_metrics.commits_60s);
+            }
+            if callgraph_write_metrics.pages_or_bytes_written_60s > 0 {
+                runtime["callgraph_pages_or_bytes_written_60s"] =
+                    serde_json::json!(callgraph_write_metrics.pages_or_bytes_written_60s);
+            }
         }
         payload
     }
@@ -681,6 +806,113 @@ fn dir_size_recursive(path: &std::path::Path) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    fn coordination_error_status(
+        retryable: bool,
+        retry_in: Option<std::time::Duration>,
+        detail: &str,
+    ) -> serde_json::Value {
+        let mut info = json!({"status": "ready"});
+        super::project_semantic_coordination(
+            &mut info,
+            super::CoordinationState::Error {
+                failure: crate::views::semantic::LeaseError {
+                    kind: crate::views::semantic::LeaseErrorKind::Storage(
+                        std::io::ErrorKind::PermissionDenied,
+                    ),
+                    detail: detail.into(),
+                    retryable,
+                },
+                retry_in,
+            },
+        );
+        info
+    }
+
+    #[test]
+    fn semantic_batch_lease_operator_pending_text_is_exact_for_both_owners() {
+        for state in [
+            super::CoordinationState::Contended,
+            super::CoordinationState::BaseBusy {
+                owner_pid: 42,
+                attempt: 3,
+            },
+        ] {
+            let mut info = json!({"status": "ready"});
+            super::project_semantic_coordination(&mut info, state);
+            assert_eq!(info["pending_reason"], "Waiting for another AFT process that is embedding the same new code; results will follow.");
+            assert_eq!(info["status"], "ready");
+            assert!(info.get("coordination_error").is_none());
+        }
+    }
+
+    #[test]
+    fn semantic_batch_lease_operator_retry_text_and_wait_are_exact() {
+        for (seconds, expected) in [
+            (4, "Can't coordinate embedding with other AFT processes: permission denied. Retrying in 4s."),
+            (80, "Can't coordinate embedding with other AFT processes: permission denied. Retrying in 1m 20s."),
+        ] {
+            let info = coordination_error_status(true, Some(std::time::Duration::from_secs(seconds)), "permission denied");
+            assert_eq!(info["pending_reason"], expected);
+            assert_eq!(info["status"], "ready");
+            assert_eq!(info["coordination_error"]["retry_scheduled"], true);
+            assert_eq!(info["coordination_error"]["retry_in_ms"], seconds * 1_000);
+            assert_eq!(info["coordination_error"]["retryable"], true);
+            assert_eq!(info["coordination_error"]["detail"], "permission denied");
+        }
+    }
+
+    #[test]
+    fn semantic_batch_lease_operator_no_retry_text_is_exact_after_refusal_or_exhaustion() {
+        for retryable in [false, true] {
+            let info = coordination_error_status(retryable, None, "permission denied");
+            assert_eq!(info["pending_reason"], "Can't coordinate embedding with other AFT processes: permission denied. No retry is scheduled.");
+            assert_eq!(info["coordination_error"]["retry_scheduled"], false);
+            assert_eq!(
+                info["coordination_error"]["retry_in_ms"],
+                serde_json::Value::Null
+            );
+            assert_eq!(info["coordination_error"]["retryable"], retryable);
+        }
+    }
+
+    #[test]
+    fn semantic_batch_lease_operator_detail_is_single_line_and_secret_free() {
+        let secret = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let detail = format!(
+            "lease refused\nAuthorization: Bearer {secret}\r\towner unavailable\u{2028}\u{2029}"
+        );
+        let info = coordination_error_status(false, None, &detail);
+        let rendered = info["coordination_error"]["detail"].as_str().unwrap();
+        assert!(!rendered.contains(secret));
+        assert!(!rendered
+            .chars()
+            .any(|ch| ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}')));
+        assert!(!info["pending_reason"].as_str().unwrap().contains(secret));
+    }
+
+    #[test]
+    fn semantic_batch_lease_disabled_status_never_probes_view_slot() {
+        for (views, semantic) in [(false, true), (true, false), (false, false), (true, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = Config::default();
+            config.project_root = Some(dir.path().to_path_buf());
+            config.storage_dir = Some(dir.path().join("storage"));
+            config.views.enabled = views;
+            config.indexes.semantic = semantic;
+            let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+            crate::views::semantic_runtime::TEST_TRY_STATE_READS.with(|reads| reads.set(0));
+            let response = handle_status(&request(), &ctx);
+            let probes =
+                crate::views::semantic_runtime::TEST_TRY_STATE_READS.with(|reads| reads.get());
+            assert!(response.success);
+            if views && semantic {
+                assert!(probes > 0, "enabled status must exercise the probe counter");
+            } else {
+                assert_eq!(probes, 0, "disabled status touched the semantic slot (views={views}, semantic={semantic})");
+            }
+        }
+    }
+
     use super::handle_status;
     use crate::config::Config;
     use crate::context::AppContext;
@@ -696,6 +928,134 @@ mod tests {
             session_id: None,
             params: json!({}),
         }
+    }
+
+    fn registered_status_contexts(
+        count: usize,
+    ) -> (tempfile::TempDir, Vec<std::sync::Arc<AppContext>>) {
+        let dir = tempfile::tempdir().unwrap();
+        let app = crate::context::App::default_shared();
+        let contexts = (0..count)
+            .map(|i| {
+                let root = dir.path().join(format!("project-{i}"));
+                std::fs::create_dir(&root).unwrap();
+                let mut config = Config::default();
+                config.project_root = Some(root.clone());
+                config.storage_dir = Some(dir.path().join("storage"));
+                config.backup.enabled = Some(false);
+                let ctx = std::sync::Arc::new(AppContext::from_app(app.clone(), config));
+                // Actor registration keys the census by project identity, not
+                // the caller's spelling of a temporary or symlinked path.
+                let memory_root = cortexkit_paths::ProjectRootId::from_path(&root)
+                    .expect("fixture root identity")
+                    .as_path()
+                    .to_path_buf();
+                app.register_memory_context(memory_root, &ctx);
+                ctx
+            })
+            .collect();
+        (dir, contexts)
+    }
+
+    #[test]
+    fn status_push_skips_process_census_but_explicit_status_builds_one() {
+        use std::sync::atomic::Ordering;
+
+        let (_dir, contexts) = registered_status_contexts(2);
+        let ctx = &contexts[0];
+        let census_builds = &ctx.status_emitter().memory_census_builds;
+        let push = ctx.try_build_status_push_snapshot().unwrap();
+        assert_eq!(
+            census_builds.load(Ordering::Relaxed),
+            0,
+            "push built a process census"
+        );
+        assert!(push.get("memory").is_none());
+
+        let explicit = handle_status(&request(), ctx).data;
+        assert_eq!(census_builds.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            explicit["memory"]["roots_total"],
+            2,
+            "memory root keys: {:?}",
+            explicit["memory"]["roots"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            ctx.try_build_status_push_snapshot().unwrap(),
+            crate::status_push::project(ctx, explicit)
+        );
+        assert_eq!(census_builds.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn status_memory_actor_registration_keeps_one_row_for_aliased_current_root() {
+        use cortexkit_paths::ProjectRootId;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        #[cfg(unix)]
+        let root = {
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(&real, &alias).unwrap();
+            alias
+        };
+        #[cfg(windows)]
+        let root = std::fs::canonicalize(&real).unwrap();
+        let root_id = ProjectRootId::from_path(&root).unwrap();
+        assert_ne!(root, root_id.as_path());
+
+        let app = crate::context::App::default_shared();
+        let mut config = Config::default();
+        config.project_root = Some(root.clone());
+        config.storage_dir = Some(dir.path().join("storage"));
+        config.backup.enabled = Some(false);
+        let ctx = Arc::new(AppContext::from_app(app.clone(), config));
+        let executor = crate::executor::Executor::new();
+        assert!(executor.register_actor(root_id.clone(), ctx.clone()));
+        let registered: Vec<_> = app
+            .try_memory_contexts()
+            .unwrap()
+            .into_iter()
+            .map(|(root, _)| root)
+            .collect();
+        eprintln!("configured root: {root:?}; actor census keys: {registered:?}");
+        assert_eq!(registered, vec![root_id.as_path().to_path_buf()]);
+
+        let explicit = handle_status(&request(), &ctx).data;
+        let roots = explicit["memory"]["roots"].as_object().unwrap();
+        eprintln!(
+            "explicit memory root keys: {:?}",
+            roots.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(explicit["memory"]["roots_total"], 1);
+        assert!(roots.contains_key(&root_id.as_path().display().to_string()));
+    }
+
+    #[test]
+    #[ignore = "manual push snapshot timing with 200 registered projects"]
+    fn status_push_snapshot_time_with_200_projects() {
+        let (_dir, contexts) = registered_status_contexts(200);
+        let ctx = &contexts[0];
+        assert_eq!(ctx.app().try_memory_contexts().unwrap().len(), 200);
+        for _ in 0..5 {
+            std::hint::black_box(ctx.try_build_status_push_snapshot().unwrap());
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..50 {
+            std::hint::black_box(ctx.try_build_status_push_snapshot().unwrap());
+        }
+        eprintln!(
+            "200 projects, 50 push snapshots: {:?} total, {:?}/push",
+            start.elapsed(),
+            start.elapsed() / 50
+        );
     }
 
     #[test]

@@ -377,7 +377,8 @@ pub fn fix_files(targets: &[(PathBuf, FixTier)]) -> Vec<FixOutcome> {
     targets
         .iter()
         .map(|(path, tier)| {
-            let result = std::fs::read_to_string(path)
+            let result = crate::config::open_config_file(path)
+                .and_then(|file| std::io::read_to_string(file))
                 .map_err(|error| format!("could not read: {error}"))
                 .and_then(|text| {
                     let migration = migrate_config_text(&text, *tier)?;
@@ -600,7 +601,40 @@ fn auto_migrate_user_config_with_writer(
     path: &Path,
     write: impl FnOnce(&Path, &str) -> std::io::Result<Option<std::io::Error>>,
 ) -> Option<UserConfigMigration> {
-    let text = std::fs::read_to_string(path).ok()?;
+    auto_migrate_user_config_with_reader(path, write, |path| std::fs::read_to_string(path))
+}
+
+pub(crate) fn auto_migrate_user_config_bounded(
+    path: &Path,
+    limit: usize,
+) -> std::io::Result<Option<UserConfigMigration>> {
+    let mut failure = None;
+    let result = auto_migrate_user_config_with_reader(
+        path,
+        jsonc_edit::write_atomic_with_sync_warning,
+        |path| {
+            let read = (|| {
+                let file = crate::config::open_config_file(path)?;
+                crate::subc_config::read_bounded_config(file, limit)
+            })();
+            if let Err(error) = &read {
+                failure = Some(std::io::Error::new(error.kind(), error.to_string()));
+            }
+            read
+        },
+    );
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(result),
+    }
+}
+
+fn auto_migrate_user_config_with_reader(
+    path: &Path,
+    write: impl FnOnce(&Path, &str) -> std::io::Result<Option<std::io::Error>>,
+    mut read: impl FnMut(&Path) -> std::io::Result<String>,
+) -> Option<UserConfigMigration> {
+    let text = read(path).ok()?;
     let translation = retired_key_translation(&text)?;
     let display = path.display().to_string();
     let not_migrated = |reason: String, translation: &feature_config::DocumentTranslation| {
@@ -632,7 +666,7 @@ fn auto_migrate_user_config_with_writer(
     };
 
     // Re-read under the lock: another process may have finished meanwhile.
-    let text = match std::fs::read_to_string(&target) {
+    let text = match read(&target) {
         Ok(text) => text,
         Err(error) => return not_migrated(format!("could not read it: {error}"), &translation),
     };

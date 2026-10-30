@@ -1,1 +1,0 @@
-- With index views on, a call graph reflects an edit within seconds. A finished update no longer waits up to five minutes for an unrelated maintenance timer before it is published.

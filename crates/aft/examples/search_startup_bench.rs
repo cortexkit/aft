@@ -118,7 +118,13 @@ fn measure_fixture(root: &Path) {
     };
 
     let t0 = Instant::now();
-    let indexed = index.search_grep(&compiled, &[], &[], &canonical, 10);
+    let indexed = match index.search_grep(&compiled, &[], &[], &canonical, 10) {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("indexed grep failed: {error}");
+            std::process::exit(1);
+        }
+    };
     eprintln!(
         "#2 indexed grep cap=10: {} ms, files_searched={}, matches={}",
         t0.elapsed().as_millis(),

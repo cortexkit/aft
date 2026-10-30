@@ -202,6 +202,8 @@ export interface ScenarioDefinition {
   expected_fail_issue?: string;
   preconditions?: ScenarioPrecondition[];
   project_config?: Record<string, unknown>;
+  /** AFT user-tier settings needed to enable features that projects may only restrict. */
+  user_config?: Record<string, unknown>;
   /** Environment overrides for this scenario's isolated host and native engine. */
   env?: Record<string, string>;
   metadata?: Record<string, unknown>;

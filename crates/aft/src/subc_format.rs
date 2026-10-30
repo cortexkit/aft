@@ -302,7 +302,12 @@ pub(crate) fn format_response_unbounded(
 
     let data = &response.data;
     if !response.success {
-        return format_error(bare_name, data, ctx);
+        let text = format_error(bare_name, data, ctx);
+        return if matches!(bare_name, "edit" | "grep" | "glob") {
+            append_ast_skipped_files(text, data.get("skipped_files"))
+        } else {
+            text
+        };
     }
 
     let mut text = match bare_name {
@@ -342,6 +347,9 @@ pub(crate) fn format_response_unbounded(
         "bash_write" => format_bash_write(data),
         _ => unreachable!("core agent tools are exhaustive"),
     };
+    if bare_name == "edit" {
+        text = append_ast_skipped_files(text, data.get("skipped_files"));
+    }
     if matches!(bare_name, "read" | "outline" | "zoom") {
         if let Some(header) = revision_header(data) {
             text = if text.is_empty() {
@@ -1189,6 +1197,23 @@ fn format_bash_status(
         data.get("exit_code").and_then(Value::as_i64),
         data.get("status_reason").and_then(Value::as_str),
     );
+    let mut paged = false;
+    for (stream, cursor) in [("output", "outputOffset"), ("stderr", "stderrOffset")] {
+        if let Some(page) = data
+            .get(format!("{stream}_page_text"))
+            .and_then(Value::as_str)
+        {
+            text.push_str(&format!(
+                "\n{stream} page (next {cursor}: {}, has_more: {}):\n{page}",
+                data[format!("{stream}_next_offset")],
+                data[format!("{stream}_has_more")]
+            ));
+            paged = true;
+        }
+    }
+    if paged {
+        return text;
+    }
     if let Some(duration_ms) = data.get("duration_ms").and_then(Value::as_u64) {
         // Rounded to the nearest second, as the plugin displays it.
         text.push_str(&format!(" {}s", duration_ms.saturating_add(500) / 1000));
@@ -1282,18 +1307,30 @@ fn format_bash_status(
 // consumers show the model the same text.
 fn format_bash_kill(data: &Value) -> String {
     let task_id = bash_task_id(data);
-    if data.get("kill_signaled").and_then(Value::as_bool) == Some(true) {
+    let outcome = if data.get("kill_signaled").and_then(Value::as_bool) == Some(true) {
         let reached = data
             .get("kill_reached")
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        return format!("Task {task_id}: kill_signaled · reached {reached} live descendants");
-    }
-    let status = data
-        .get("status")
+        format!("Task {task_id}: kill_signaled · reached {reached} live descendants")
+    } else {
+        let status = data
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("killed");
+        if let Some(cancel) = data.get("remote_cancel").and_then(Value::as_str) {
+            format!("Task {task_id}: {status} · {cancel}")
+        } else {
+            format!("Task {task_id}: {status}")
+        }
+    };
+    match data
+        .get("bot_write_revocation_warning")
         .and_then(Value::as_str)
-        .unwrap_or("killed");
-    format!("Task {task_id}: {status}")
+    {
+        Some(warning) => format!("{outcome}\n{warning}"),
+        None => outcome,
+    }
 }
 
 // Formats a PTY write result exactly as the OpenCode tool does
@@ -1540,6 +1577,31 @@ mod edit_diagnostics_tests {
     }
 
     #[test]
+    fn edit_summary_renders_each_loose_match_notice_once() {
+        let notice = "oldString matched only after ignoring indentation and trailing whitespace; newString was re-indented to match the file.";
+        let data = serde_json::json!({
+            "edits_applied": 1,
+            "diff": {"additions": 2, "deletions": 2},
+            "fuzzy_matches": [
+                {"pass": 3, "replaced_text": [], "notice": notice},
+                {"pass": 3, "replaced_text": [], "notice": notice},
+                {"pass": 4, "replaced_text": ["title = “a”"], "notice": "four"},
+            ],
+        });
+        assert_eq!(
+            super::format_edit_summary(&data),
+            format!("Edited (+2/-2).\n{notice}\nfour\nReplaced text 1: title = “a”")
+        );
+        // An exact match carries no fuzzy field and no notice.
+        assert_eq!(
+            super::format_edit_summary(
+                &serde_json::json!({"diff": {"additions": 1, "deletions": 1}})
+            ),
+            "Edited (+1/-1)."
+        );
+    }
+
+    #[test]
     fn frozen_lsp_edit_rendering_reports_diagnostics_unknown() {
         let data = serde_json::json!({
             "replacements": 1, "lsp_complete": false, "lsp_diagnostics": [],
@@ -1622,7 +1684,39 @@ fn format_edit_summary(data: &Value) -> String {
     if is_truthy_formatted(data) {
         s.push_str(&format_auto_formatted_suffix(data));
     }
+    append_loose_match_notices(&mut s, data);
     s
+}
+
+/// One line per loose (fuzzy) match: the producer's `notice`, followed by
+/// any file text that differed from `oldString` in more than whitespace. A
+/// notice identical to the previous one is not repeated, so a replace-all
+/// over many identical matches shows it once. Mirrors the fuzzy block of
+/// packages/aft-bridge/src/edit-summary.ts formatEditSummary.
+fn append_loose_match_notices(s: &mut String, data: &Value) {
+    let entries: Vec<&Value> = match data.get("fuzzy_matches").and_then(Value::as_array) {
+        Some(entries) => entries.iter().collect(),
+        None => data.get("fuzzy_match").into_iter().collect(),
+    };
+    let mut previous_notice: Option<&str> = None;
+    for entry in entries {
+        let notice = entry.get("notice").and_then(Value::as_str);
+        if let Some(notice) = notice.filter(|notice| previous_notice != Some(*notice)) {
+            s.push('\n');
+            s.push_str(notice);
+        }
+        previous_notice = notice.or(previous_notice);
+        for (index, text) in entry
+            .get("replaced_text")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .enumerate()
+        {
+            s.push_str(&format!("\nReplaced text {}: {text}", index + 1));
+        }
+    }
 }
 
 fn is_truthy_formatted(data: &Value) -> bool {
@@ -1809,9 +1903,15 @@ fn format_glob_response(data: &Value) -> String {
         .get("files_list_envelope")
         .and_then(|v| serde_json::from_value::<crate::list_envelope::ListEnvelope>(v.clone()).ok());
     if let Some(env) = envelope {
-        append_glob_envelope_trailer(base, &env)
+        let trailer = render_envelope_trailer(&env).map(|trailer| format!("\n\n{trailer}"));
+        let base = trailer
+            .as_ref()
+            .and_then(|trailer| base.strip_suffix(trailer))
+            .unwrap_or(base);
+        let base = append_ast_skipped_files(base.to_string(), data.get("skipped_files"));
+        append_glob_envelope_trailer(&base, &env)
     } else {
-        base.to_string()
+        append_ast_skipped_files(base.to_string(), data.get("skipped_files"))
     }
 }
 
@@ -1877,6 +1977,7 @@ fn format_grep(data: &Value) -> String {
         }
     };
 
+    let base = append_ast_skipped_files(base, data.get("skipped_files"));
     if let Some(env) = envelope {
         if let Some(trailer) = render_envelope_trailer(&env) {
             if base.is_empty() {
@@ -1932,7 +2033,14 @@ fn format_ast_search(data: &Value) -> String {
                 }
                 if let Some(meta_vars) = m.get("meta_variables").and_then(Value::as_object) {
                     if !meta_vars.is_empty() {
+                        let capture_text = m.get("meta_variable_text").and_then(Value::as_object);
                         for (key, value) in meta_vars {
+                            // A `$$$` capture shows its source text, not its
+                            // node list, when the engine supplied it.
+                            let value = capture_text
+                                .and_then(|texts| texts.get(key))
+                                .filter(|text| text.is_string())
+                                .unwrap_or(value);
                             output.push_str(&format!(
                                 "  {}\n",
                                 format_ast_search_capture(key, value, match_text, line)
@@ -1953,6 +2061,13 @@ fn format_ast_search(data: &Value) -> String {
             .is_some_and(|skipped| !skipped.is_empty())
     {
         output = append_ast_skipped_files(output, data.get("skipped_files"));
+    }
+    if let Some(env) = data.get("matches_list_envelope").and_then(|value| {
+        serde_json::from_value::<crate::list_envelope::ListEnvelope>(value.clone()).ok()
+    }) {
+        if let Some(trailer) = render_envelope_trailer(&env) {
+            output.push_str(&format!("\n\n{trailer}"));
+        }
     }
     output
 }
@@ -2313,10 +2428,14 @@ fn format_search(data: &Value) -> String {
     }
 }
 
+/// Search-status note for an answer whose results were read from files
+/// directly because no index served it (the response's `fully_degraded`).
+pub(crate) const FILESYSTEM_SCAN_STATUS: &str = "answered by a filesystem scan";
+
 fn search_status_only_note(data: &Value) -> Option<String> {
     let mut notes = Vec::new();
     if data.get("fully_degraded").and_then(Value::as_bool) == Some(true) {
-        notes.push("fully degraded");
+        notes.push(FILESYSTEM_SCAN_STATUS);
     }
     if data.get("complete").and_then(Value::as_bool) == Some(false) {
         notes.push("partial/incomplete");
@@ -2337,7 +2456,7 @@ fn semantic_honesty_note(data: &Value) -> Option<String> {
         notes.push("enumeration capped");
     }
     if data.get("fully_degraded").and_then(Value::as_bool) == Some(true) {
-        notes.push("fully degraded");
+        notes.push(FILESYSTEM_SCAN_STATUS);
     }
     if data.get("complete").and_then(Value::as_bool) == Some(false) {
         notes.push("partial/incomplete");
@@ -2352,7 +2471,7 @@ fn semantic_honesty_note(data: &Value) -> Option<String> {
 fn extra_honesty_note(data: &Value) -> Option<String> {
     let mut notes = Vec::new();
     if data.get("fully_degraded").and_then(Value::as_bool) == Some(true) {
-        notes.push("fully degraded");
+        notes.push(FILESYSTEM_SCAN_STATUS);
     }
     if data.get("complete").and_then(Value::as_bool) == Some(false) {
         notes.push("partial/incomplete");
@@ -3169,6 +3288,9 @@ pub fn format_callgraph(op: &str, response_data: &Value, include_unresolved: boo
         if let Some(reason) = string_field(record, "incomplete_reason") {
             sections.insert(0, reason.to_string());
         }
+        if let Some(note) = string_field(record, "test_filter_note") {
+            sections.insert(0, note.to_string());
+        }
     }
     let body = sections.join("\n");
     // A checkout that reads another checkout's callgraph gets a one-line
@@ -3276,9 +3398,9 @@ fn format_callgraph_error(command: &str, data: &Value) -> String {
                 .map(|symbol| format!("multiple symbols named \"{symbol}\""))
                 .unwrap_or_else(|| strip_terminal_punctuation(message));
             let action = if code == Some("ambiguous_target") {
-                "Pass toFile to disambiguate"
+                "Pass toPath to disambiguate"
             } else {
-                "Try one of these files for toFile"
+                "Try one of these files for toPath"
             };
             let mut lines = vec![format!(
                 "{command}: {} — {target}. {action}:",
@@ -3535,6 +3657,15 @@ fn unresolved_summary_text(nodes: &[&serde_json::Map<String, Value>]) -> String 
     format!("+ {} unresolved external {noun}: {names}", nodes.len())
 }
 
+fn callback_reference_count_suffix(record: &serde_json::Map<String, Value>) -> String {
+    let count = number_field(record, "callback_dependencies").unwrap_or(0);
+    if count > 0 {
+        format!(" ({count} by callback reference)")
+    } else {
+        String::new()
+    }
+}
+
 fn format_callers_sections(record: &serde_json::Map<String, Value>) -> Vec<String> {
     let envelope = record
         .get("callers_list_envelope")
@@ -3561,9 +3692,10 @@ fn format_callers_sections(record: &serde_json::Map<String, Value>) -> Vec<Strin
         let total = number_field(record, "total_callers").unwrap_or(0);
         format!("{}", total.saturating_sub(hidden_test_callers))
     };
+    let callback_note = callback_reference_count_suffix(record);
     let mut sections = vec![join_non_empty(&[
         Some(format!(
-            "{total_str} caller{}",
+            "{total_str} caller{}{callback_note}",
             if total_str == "1" { "" } else { "s" }
         )),
         Some(format!(
@@ -3613,7 +3745,8 @@ fn render_callers_group_lines(group: &serde_json::Map<String, Value>) -> Vec<Str
             "exact"
         };
         let via = string_field(caller, "via").unwrap_or("");
-        let key = format!("{symbol}\0{via}\0{provenance}");
+        let relation = string_field(caller, "relation").unwrap_or("");
+        let key = format!("{symbol}\0{via}\0{relation}\0{provenance}");
         let bucket = by_symbol_provenance.entry(key).or_default();
         if let Some(line) = number_field(caller, "line") {
             bucket.push(line);
@@ -3623,6 +3756,7 @@ fn render_callers_group_lines(group: &serde_json::Map<String, Value>) -> Vec<Str
         let mut parts = key.split('\0');
         let symbol = parts.next().unwrap_or("(unknown)");
         let via = parts.next().unwrap_or("");
+        let relation = parts.next().unwrap_or("");
         let is_name_match = key.ends_with("\0name_match");
         line_nums.sort_unstable();
         let line_part = if line_nums.is_empty() {
@@ -3640,7 +3774,14 @@ fn render_callers_group_lines(group: &serde_json::Map<String, Value>) -> Vec<Str
         } else {
             format!(" via {via}")
         };
-        lines.push(format!("  ↳ {symbol}:{line_part}{marker}{via_part}"));
+        let reference = if relation == "callback_reference" {
+            crate::commands::callgraph_store_adapter::CALLBACK_REFERENCE_LABEL
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "  ↳ {symbol}:{line_part}{marker}{via_part}{reference}"
+        ));
     }
     lines
 }
@@ -3796,9 +3937,15 @@ fn format_impact_sections(record: &serde_json::Map<String, Value>) -> Vec<String
         format!("{}", total_affected.saturating_sub(hidden_test_callers))
     };
     let affected_files = number_field(record, "affected_files").unwrap_or(0);
+    let callback_note = callback_reference_count_suffix(record);
     let mut sections = vec![join_non_empty(&[
         Some(format!(
-            "{total_str} affected call site{}",
+            "{total_str} affected {}{}{callback_note}",
+            if callback_note.is_empty() {
+                "call site"
+            } else {
+                "site"
+            },
             if total_str == "1" { "" } else { "s" }
         )),
         Some(format!(
@@ -3837,7 +3984,14 @@ fn format_impact_sections(record: &serde_json::Map<String, Value>) -> Vec<String
             .unwrap_or_default();
         let mut lines = vec![
             format!("{file}:{line}"),
-            format!("  ↳ {symbol}{entry}{name_match}"),
+            format!(
+                "  ↳ {symbol}{entry}{name_match}{}",
+                if string_field(caller, "relation") == Some("callback_reference") {
+                    crate::commands::callgraph_store_adapter::CALLBACK_REFERENCE_LABEL
+                } else {
+                    ""
+                }
+            ),
         ];
         if let Some(expression) = expression {
             lines.push(format!("  {expression}"));
@@ -4139,7 +4293,7 @@ fn format_status(data: &Value) -> String {
             s = format!("{s} [{model}]");
         }
         if let Some(summary) = data
-            .pointer("/semantic_index/refused_rows_summary")
+            .pointer("/semantic_index/skipped_chunks_summary")
             .and_then(Value::as_str)
         {
             s = format!("{s}; {summary}");
@@ -4401,9 +4555,9 @@ mod status_memory_tests {
     #[test]
     fn status_text_reports_skipped_semantic_coverage() {
         let summary =
-            "semantic coverage is partial: 1 skipped row; provider refused the input: poison.rs";
+            "semantic search is incomplete: 1 chunks skipped because the embedding provider refused them: poison.rs";
         let text = format_status(&serde_json::json!({"semantic_index": {
-            "status": "ready", "model": "example", "skipped_rows": 1, "refused_rows_summary": summary
+            "status": "ready", "model": "example", "skipped_chunks": 1, "skipped_chunks_summary": summary
         }}));
         assert!(text.contains(summary), "{text}");
     }
@@ -5022,6 +5176,22 @@ mod bash_companion_format_tests {
     }
 
     #[test]
+    fn bash_kill_unknown_outcome_reports_runner_answer() {
+        for cancel in [
+            "runner confirmed cancellation",
+            "runner reports job already ended",
+            "remote cancellation unconfirmed; outcome is still unknown: runner unavailable",
+        ] {
+            assert_eq!(
+                format_bash_kill(&json!({
+                    "task_id": "bash-unknown", "status": "fate_unknown", "remote_cancel": cancel,
+                })),
+                format!("Task bash-unknown: fate_unknown · {cancel}")
+            );
+        }
+    }
+
+    #[test]
     fn bash_kill_and_write_render_like_the_opencode_tools() {
         let ctx = FormatContext::default();
         assert_eq!(
@@ -5301,5 +5471,150 @@ mod executed_outline_mode_tests {
             rendered.contains("Unchecked files:\n  src/b.ts"),
             "{rendered}"
         );
+    }
+}
+
+/// Render a bounded line batch; offsets refer to the original, unmasked stream.
+pub fn format_watch_line_batch(
+    task_id: &str,
+    batch: &crate::bash_background::watch_lines::LineBatch,
+) -> String {
+    let mut text = String::new();
+    for line in &batch.lines {
+        let body = if line.unavailable {
+            crate::bash_background::watch_lines::unavailable_match_text(
+                line.count,
+                batch
+                    .masking_limit_bytes
+                    .map(|limit| limit as usize)
+                    .unwrap_or(crate::bash_background::watch_lines::MASKING_LINE_CAP_BYTES),
+            )
+        } else {
+            line.text.clone()
+        };
+        let repeats = if line.count > 1 {
+            format!(" ×{}", line.count)
+        } else {
+            String::new()
+        };
+        text.push_str(&format!(
+            "{} byte {}{repeats}: {}\n",
+            line.stream, line.offset, body
+        ));
+    }
+    if batch.dropped_lines > 0 || batch.skipped_long_lines > 0 {
+        let incomplete = if batch.skipped_long_lines > 0 {
+            format!(
+                " {} lines longer than 64 KiB were skipped, so the scan is incomplete.",
+                batch.skipped_long_lines
+            )
+        } else {
+            String::new()
+        };
+        let cursor = if batch.first_dropped_stream.as_deref() == Some("stderr") {
+            "stderr_offset"
+        } else {
+            "output_offset"
+        };
+        text.push_str(&format!("{} matching lines dropped.{incomplete} Read them with bash_status({{ task_id: {}, {cursor}: {} }}).\n", batch.dropped_lines, serde_json::to_string(task_id).unwrap_or_default(), batch.first_dropped_offset.unwrap_or(0)));
+    }
+    if let Some(gap) = &batch.retry_gap {
+        let missing = match gap.known_missing_occurrences {
+            0 => "Some matches may be missing.".to_string(),
+            1 => "At least 1 match is missing.".to_string(),
+            count => format!("At least {count} matches are missing."),
+        };
+        let cursor = if gap.stream.as_deref() == Some("stderr") {
+            "stderr_offset"
+        } else {
+            "output_offset"
+        };
+        text.push_str(&format!("Some watch notices were lost: a stalled connection dropped {} of them, and they cannot be recovered. {missing} Read the task output with bash_status({{ task_id: {}, {cursor}: {} }}).\n", gap.dropped_notifications, serde_json::to_string(task_id).unwrap_or_default(), gap.first_offset.unwrap_or(0)));
+    }
+    text.trim_end().to_string()
+}
+
+#[cfg(test)]
+mod watch_line_format_tests {
+    use super::format_watch_line_batch;
+    use crate::bash_background::watch_lines::{LineBatch, RetryGap, WatchLine};
+
+    #[test]
+    fn retry_gap_wording_golden() {
+        for (notices, missing, expected) in [
+            (2, 1, "Some watch notices were lost: a stalled connection dropped 2 of them, and they cannot be recovered. At least 1 match is missing. Read the task output with bash_status({ task_id: \"bash-gap\", stderr_offset: 16 })."),
+            (1, 0, "Some watch notices were lost: a stalled connection dropped 1 of them, and they cannot be recovered. Some matches may be missing. Read the task output with bash_status({ task_id: \"bash-gap\", stderr_offset: 16 })."),
+            (1, 1, "Some watch notices were lost: a stalled connection dropped 1 of them, and they cannot be recovered. At least 1 match is missing. Read the task output with bash_status({ task_id: \"bash-gap\", stderr_offset: 16 })."),
+            (2, 3, "Some watch notices were lost: a stalled connection dropped 2 of them, and they cannot be recovered. At least 3 matches are missing. Read the task output with bash_status({ task_id: \"bash-gap\", stderr_offset: 16 })."),
+        ] {
+            let batch = LineBatch {
+                retry_gap: Some(RetryGap {
+                    reason: "retry_overflow".into(), dropped_notifications: notices,
+                    known_missing_occurrences: missing, first_offset: Some(16), stream: Some("stderr".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(format_watch_line_batch("bash-gap", &batch), expected);
+        }
+    }
+
+    #[test]
+    fn each_line_row_wording_golden() {
+        let mut batch = LineBatch {
+            lines: vec![WatchLine {
+                stream: "stdout".into(),
+                offset: 18234,
+                end_offset: 18257,
+                text: "ERROR db timeout".into(),
+                unavailable: false,
+                count: 1,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            format_watch_line_batch("task", &batch),
+            "stdout byte 18234: ERROR db timeout"
+        );
+        batch.lines[0].count = 3;
+        assert_eq!(
+            format_watch_line_batch("task", &batch),
+            "stdout byte 18234 ×3: ERROR db timeout"
+        );
+    }
+
+    #[test]
+    fn each_line_drop_wording_golden() {
+        let mut batch = LineBatch {
+            dropped_lines: 7,
+            first_dropped_stream: Some("stdout".into()),
+            first_dropped_offset: Some(18240),
+            ..Default::default()
+        };
+        assert_eq!(format_watch_line_batch("task", &batch),
+            "7 matching lines dropped. Read them with bash_status({ task_id: \"task\", output_offset: 18240 }).");
+        batch.skipped_long_lines = 2;
+        batch.first_dropped_stream = Some("stderr".into());
+        assert_eq!(format_watch_line_batch("task", &batch),
+            "7 matching lines dropped. 2 lines longer than 64 KiB were skipped, so the scan is incomplete. Read them with bash_status({ task_id: \"task\", stderr_offset: 18240 }).");
+    }
+}
+
+#[cfg(test)]
+mod bot_kill_warning_tests {
+    use super::*;
+    #[test]
+    fn kill_warning_keeps_the_reported_kill_outcome_first() {
+        let text = format_bash_kill(
+            &serde_json::json!({"task_id":"bash-warning","status":"killed","bot_write_revocation_warning":crate::gh_shim_speech::REVOCATION_NOT_DURABLE}),
+        );
+        assert_eq!(
+            text,
+            format!(
+                "Task bash-warning: killed\n{}",
+                crate::gh_shim_speech::REVOCATION_NOT_DURABLE
+            )
+        );
+        assert!(!text.contains("clean cancellation"));
     }
 }

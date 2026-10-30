@@ -15,7 +15,12 @@ use crate::pattern_compile::CompiledPattern;
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{GrepResult, IndexStatus, PathFilters};
 
-use super::{display_relative, read, Child, ParentSession, Plane};
+use super::{display_relative, read, Child, ParentSession, Plane, TrigramSource};
+
+/// Index of [`ParentSession::view_route_counts`] for call-graph answers.
+const CALLGRAPH_ROUTE: usize = 0;
+/// Index of [`ParentSession::view_route_counts`] for grep and glob answers.
+const LEXICAL_ROUTE: usize = 1;
 
 /// Commands a parent session answers itself from its children.
 const ROUTED_COMMANDS: &[&str] = &[
@@ -177,6 +182,7 @@ pub(crate) fn grep_fan_out(
     let mut gaps = Gaps::default();
     let mut phases = GrepExecutionPhaseTimings::default();
     let mut scope_has_files = false;
+    let mut from_views = false;
     for root in &scope.roots {
         let search_root = &root.search_root;
         if search_root.is_file() || !search_root.starts_with(session.root()) {
@@ -209,6 +215,7 @@ pub(crate) fn grep_fan_out(
             };
             let snapshot = trigram.index.snapshot();
             if snapshot.has_file_in_scope(search_root) {
+                from_views |= matches!(trigram.source, TrigramSource::View(_));
                 snapshots.push(snapshot);
             }
         }
@@ -221,7 +228,7 @@ pub(crate) fn grep_fan_out(
             .par_iter()
             .map(|snapshot| {
                 let has_files = snapshot.has_file_in_scope_with_filters(search_root, filters);
-                let (result, timings) = snapshot
+                let (result, timings) = match snapshot
                     .search_grep_profiled_with_filters_and_query_in_order_with_row_budget(
                         pattern,
                         &query,
@@ -231,7 +238,13 @@ pub(crate) fn grep_fan_out(
                         params.path_exclusion,
                         order,
                         row_budget,
-                    );
+                    ) {
+                    Ok(result) => result,
+                    Err(error) => (
+                        crate::grep_executor::failed_index_grep(error),
+                        crate::search_index::GrepQueryPhaseTimings::default(),
+                    ),
+                };
                 (has_files, result, timings)
             })
             .collect::<Vec<_>>();
@@ -246,8 +259,13 @@ pub(crate) fn grep_fan_out(
         gaps.scope(&session, search_root);
     }
     phases.indexed_scope_has_files = Some(scope_has_files || !gaps.is_empty());
+    if from_views {
+        session.note_view_route(LEXICAL_ROUTE);
+    }
     let result = if results.is_empty() {
         GrepResult {
+            index_sources_unavailable: false,
+            index_read_gaps: Vec::new(),
             matches: Vec::new(),
             total_matches: 0,
             files_searched: 0,
@@ -293,6 +311,7 @@ pub(crate) fn glob_fan_out(
         gaps: Vec::new(),
     };
     let mut gaps = Gaps::default();
+    let mut from_views = false;
     for search_root in search_roots {
         let search_root =
             std::fs::canonicalize(search_root).unwrap_or_else(|_| search_root.clone());
@@ -317,11 +336,15 @@ pub(crate) fn glob_fan_out(
                     .index
                     .snapshot()
                     .glob_profiled(pattern, &search_root, false);
+            from_views |= matches!(trigram.source, TrigramSource::View(_));
             answer.scope_has_files |= scope_has_files;
             answer.entries_visited += visited;
             answer.files.extend(files);
         }
         gaps.scope(&session, &search_root);
+    }
+    if from_views {
+        session.note_view_route(LEXICAL_ROUTE);
     }
     answer.files.sort();
     answer.files.dedup();
@@ -564,6 +587,12 @@ fn callgraph(
     match value {
         Ok(Ok(mut value)) => {
             prefix_paths(&mut value, &child.relative);
+            // The child's own session is the only one that claims its graph
+            // is current; the parent answers as of the child's publication.
+            if let Some(object) = value.as_object_mut() {
+                object.insert("as_of".into(), callgraph.published.as_of(&child));
+            }
+            session.note_view_route(CALLGRAPH_ROUTE);
             Response::success(&req.id, value)
         }
         Ok(Err(response)) => response,

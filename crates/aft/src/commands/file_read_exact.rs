@@ -115,7 +115,13 @@ fn read_with(
 /// identify it by its device and inode; otherwise (or when the handle cannot
 /// even be identified) it is deliberately leaked. Every return after the open,
 /// refusal or success, goes through this drop.
-struct OpenedFile(std::mem::ManuallyDrop<File>);
+pub(crate) struct OpenedFile(std::mem::ManuallyDrop<File>);
+
+/// Open below a checked root without following a swapped path component. The
+/// caller must verify the handle location and policy before reading any bytes.
+pub(crate) fn open_no_follow(root: &Path, target: &Path) -> Result<OpenedFile, ReadExactRefusal> {
+    open_contents(root, target).map(OpenedFile::new)
+}
 
 impl OpenedFile {
     fn new(file: File) -> Self {

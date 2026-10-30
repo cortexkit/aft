@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::bash_background::process::LiveDescendant;
+use crate::bash_background::process::{LiveDescendant, LiveDescendantsUnavailable};
 use crate::bash_background::BgTaskStatus;
 use crate::list_envelope::ListEnvelope;
 
@@ -55,6 +55,11 @@ pub struct PermissionAskFrame {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BashCompletedFrame {
+    #[serde(
+        rename = "_bash_changed_files",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub changed_files: Option<crate::bash_changed_files::Report>,
     #[serde(rename = "type")]
     pub frame_type: &'static str,
     pub task_id: String,
@@ -91,6 +96,10 @@ pub struct BashCompletedFrame {
     pub live_descendants: Option<Vec<LiveDescendant>>,
     #[serde(skip_serializing_if = "is_zero_usize")]
     pub live_descendants_omitted: usize,
+    /// For a finished task, why `live_descendants` is null, or, with
+    /// `listing_incomplete`, why the list may be only part of the group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_descendants_unavailable: Option<LiveDescendantsUnavailable>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub live_descendants_summary: Option<String>,
 }
@@ -125,6 +134,8 @@ pub struct BashPatternMatchFrame {
     pub context: String,
     pub once: bool,
     pub reason: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch: Option<crate::bash_background::watch_lines::LineBatch>,
 }
 
 /// Pushed after configure has completed, when the deferred file walk and
@@ -349,6 +360,7 @@ impl BashCompletedFrame {
     ) -> Self {
         Self {
             frame_type: "bash_completed",
+            changed_files: None,
             task_id: task_id.into(),
             session_id: session_id.into(),
             status,
@@ -364,6 +376,7 @@ impl BashCompletedFrame {
             output_incomplete: false,
             live_descendants: None,
             live_descendants_omitted: 0,
+            live_descendants_unavailable: None,
             live_descendants_summary: None,
         }
     }
@@ -398,6 +411,7 @@ impl BashPatternMatchFrame {
     ) -> Self {
         Self {
             frame_type: "bash_pattern_match",
+            batch: None,
             task_id: task_id.into(),
             session_id: session_id.into(),
             watch_id: watch_id.into(),
@@ -417,6 +431,7 @@ impl BashPatternMatchFrame {
     ) -> Self {
         Self {
             frame_type: "bash_pattern_match",
+            batch: None,
             task_id: task_id.into(),
             session_id: session_id.into(),
             watch_id: "exit".to_string(),
@@ -439,6 +454,7 @@ impl BashPatternMatchFrame {
         // reason because clients only accept pattern_match and task_exit.
         Self {
             frame_type: "bash_pattern_match",
+            batch: None,
             task_id: task_id.into(),
             session_id: session_id.into(),
             watch_id: watch_id.into(),

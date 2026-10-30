@@ -26,7 +26,10 @@ fn resident_chunk_shortcut_matches_store_and_full_rebuild() {
             .sum();
         eprintln!("LARGE_EDIT shortcut={resident_shortcut} chunks={} resident_hits={} gets={gets} payload_bytes={} page_misses={}", report.chunks, report.chunk_resident_hits, after["semantic_store_payload_bytes"].as_u64().unwrap() - before["semantic_store_payload_bytes"].as_u64().unwrap(), reads.misses);
         assert_canonical_blob(&checkout, &edited);
-        assert_eq!(gets, if resident_shortcut { 4 } else { 366 });
+        // Admission preflight and the file/lease rechecks are intentional reads:
+        // file claims cannot span cold readmission, and chunk ownership must
+        // recheck persistence after excluding another process's dispatch.
+        assert_eq!(gets, if resident_shortcut { 8 } else { 519 });
         assert_eq!(report.source_reads, 1);
         assert_eq!(report.embedded_texts, 1);
         assert_eq!(
@@ -61,6 +64,12 @@ fn resident_chunk_shortcut_matches_store_and_full_rebuild() {
         assert!(arena.chunk_vector(&chunk_key).is_some());
         plane.unbind(&checkout.access);
         drop(run);
+        arena.trim();
+        assert!(
+            arena.chunk_vector(&chunk_key).is_some(),
+            "unbind evicted a run while the installed bundle still holds its reader"
+        );
+        drop(checkout);
         arena.trim();
         assert!(
             arena.chunk_vector(&chunk_key).is_none(),
@@ -151,7 +160,7 @@ fn incremental_reuse_requires_matching_path_and_content() {
         panic!("missing member")
     };
     assert!(matches!(
-        SemanticPlane::vector_source(&state, &resident, &old, &unchanged, content),
+        SemanticPlane::vector_source(&state, &resident, &old, &unchanged, content, true),
         VectorSource::Base
     ));
     write_tree(
@@ -166,7 +175,7 @@ fn incremental_reuse_requires_matching_path_and_content() {
     };
     assert!(
         matches!(
-            SemanticPlane::vector_source(&state, &resident, &changed, &path, content),
+            SemanticPlane::vector_source(&state, &resident, &changed, &path, content, true),
             VectorSource::Pending
         ),
         "changed content reused an old generation's vector"

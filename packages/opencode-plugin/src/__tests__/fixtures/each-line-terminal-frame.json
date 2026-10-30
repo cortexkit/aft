@@ -1,0 +1,19 @@
+{
+  "type": "bash_pattern_match",
+  "task_id": "bash-running",
+  "session_id": "session-v2",
+  "watch_id": "watch-ready",
+  "match_text": "matching lines",
+  "match_offset": 123,
+  "context": "7 matching lines dropped. Read them with bash_status({ task_id: \"bash-running\", stderr_offset: 123 }).",
+  "once": false,
+  "reason": "pattern_match",
+  "batch": {
+    "terminal_summary": true,
+    "lines": [],
+    "dropped_lines": 7,
+    "first_dropped_offset": 123,
+    "first_dropped_stream": "stderr",
+    "skipped_long_lines": 0
+  }
+}

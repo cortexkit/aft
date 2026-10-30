@@ -75,7 +75,7 @@ impl SymbolCacheLock {
         crate::private_storage::open_dir(storage_dir, &dir)?;
         let _acquire_guard = SYMBOL_LOCK_ACQUIRE_MUTEX
             .lock()
-            .map_err(|_| std::io::Error::other("symbol cache lock acquisition mutex poisoned"))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         #[cfg(test)]
         LOCK_ACQUIRE_OBSERVER.with(|slot| {
             if let Some(observer) = slot.borrow_mut().take() {
@@ -174,6 +174,7 @@ fn note_cache_write(path: &Path) {
 }
 
 pub fn read_from_disk(storage_dir: &Path, project_key: &str) -> Option<DiskSymbolCache> {
+    crate::root_cache::check_cache_access(&storage_dir.join("symbols")).ok()?;
     crate::private_storage::tighten_open_dir(
         storage_dir,
         &storage_dir.join("symbols").join(project_key),
@@ -310,8 +311,41 @@ pub(crate) fn check_disk_format(
 }
 
 fn read_cache_file(path: &Path) -> Result<DiskSymbolCache, String> {
-    let mut reader = BufReader::new(File::open(path).map_err(|error| error.to_string())?);
+    let reader = BufReader::new(File::open(path).map_err(|error| error.to_string())?);
+    let mut entries = Vec::new();
+    for_each_raw_entry(reader, &mut |raw| {
+        let symbols: Vec<Symbol> = serde_json::from_slice(&raw.symbols_json)
+            .map_err(|error| format!("failed to decode cached symbols: {error}"))?;
+        entries.push(DiskSymbolEntry {
+            relative_path: raw.relative_path,
+            mtime: raw.mtime,
+            size: raw.size,
+            content_hash: raw.content_hash,
+            symbols,
+        });
+        Ok(())
+    })?;
+    Ok(DiskSymbolCache { entries })
+}
 
+/// One entry of `symbols.bin` with its symbols still in the stored JSON.
+pub(crate) struct RawSymbolEntry {
+    pub(crate) relative_path: PathBuf,
+    pub(crate) mtime: SystemTime,
+    pub(crate) size: u64,
+    pub(crate) content_hash: blake3::Hash,
+    pub(crate) symbols_json: Vec<u8>,
+}
+
+/// Streams the entries of a `symbols.bin` from `reader` to `visit`, one at a
+/// time, with the header, format, schema, bound and relative-path checks of
+/// the disk cache reader. A file of another format or extraction schema is an
+/// error, so a parser or schema change never yields entries. Oversized
+/// entries are skipped, as the cache reader skips them.
+pub(crate) fn for_each_raw_entry<R: Read>(
+    mut reader: R,
+    visit: &mut dyn FnMut(RawSymbolEntry) -> Result<(), String>,
+) -> Result<(), String> {
     let mut magic = [0u8; 8];
     reader
         .read_exact(&mut magic)
@@ -344,7 +378,6 @@ fn read_cache_file(path: &Path) -> Result<DiskSymbolCache, String> {
     }
 
     let _project_root = PathBuf::from(read_string_with_len(&mut reader, root_len)?);
-    let mut entries = Vec::with_capacity(entry_count);
 
     for _ in 0..entry_count {
         let path_len = read_u32(&mut reader)? as usize;
@@ -389,23 +422,19 @@ fn read_cache_file(path: &Path) -> Result<DiskSymbolCache, String> {
             continue;
         }
 
-        let mut symbol_bytes = vec![0u8; symbol_bytes_len];
+        let mut symbols_json = vec![0u8; symbol_bytes_len];
         reader
-            .read_exact(&mut symbol_bytes)
+            .read_exact(&mut symbols_json)
             .map_err(|error| format!("failed to read symbol payload: {error}"))?;
-        let symbols: Vec<Symbol> = serde_json::from_slice(&symbol_bytes)
-            .map_err(|error| format!("failed to decode cached symbols: {error}"))?;
-
-        entries.push(DiskSymbolEntry {
+        visit(RawSymbolEntry {
             relative_path,
             mtime: system_time_from_parts(mtime_secs, mtime_nanos)?,
             size,
             content_hash,
-            symbols,
-        });
+            symbols_json,
+        })?;
     }
-
-    Ok(DiskSymbolCache { entries })
+    Ok(())
 }
 
 fn write_cache_file(
@@ -581,6 +610,22 @@ fn write_u64<W: Write>(writer: &mut W, value: u64) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit10_symbol_lock_poison_recovers() {
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = SYMBOL_LOCK_ACQUIRE_MUTEX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            panic!("simulate acquisition panic");
+        });
+        assert!(poisoned.is_err());
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let lock = SymbolCacheLock::acquire(storage.path(), "poison", project.path()).unwrap();
+        assert!(lock._guard.is_some());
+    }
+
     #[test]
     fn durability_symbol_cache_write_count() {
         let project = tempfile::tempdir().unwrap();

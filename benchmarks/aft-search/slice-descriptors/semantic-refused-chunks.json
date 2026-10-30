@@ -1,0 +1,14 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/semantic_index.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs"
+  ],
+  "slices": [
+    "semantic-refused-chunks"
+  ],
+  "note": "The ranking fence hits semantic_index.rs and semantic_search/. This change neutralizes image data-URI text only in OpenAI-compatible embedding requests, isolates refused chunks with run-wide limits, persists partial coverage, and reports approved chunk wording. Ranking and scoring mechanisms are unchanged. The benchmark fixtures never refuse embedding inputs, so canonical-checkout ranked rows must remain byte-identical to the committed reference."
+}

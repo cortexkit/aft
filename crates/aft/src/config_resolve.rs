@@ -107,6 +107,7 @@ pub struct ResolveResult {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RawAftConfig {
+    pub storage: Option<RawStorage>,
     #[serde(rename = "$schema")]
     pub schema: Option<String>,
     pub edit_mode: Option<RawEditMode>,
@@ -274,6 +275,12 @@ pub struct RawIndexes {
     pub callgraph: Option<bool>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RawStorage {
+    pub cache_dir: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 // Nested objects mirror TS sub-schemas, which are non-strict z.object (unknown
 // keys are silently stripped, the object survives). Only the TOP-LEVEL
@@ -427,6 +434,7 @@ impl<'de> Deserialize<'de> for RawBash {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct RawBashFeatures {
+    pub changed_files: Option<crate::config::BashChangedFiles>,
     /// Runtime gate for bash execution. Absent means on.
     pub enabled: Option<bool>,
     pub rewrite: Option<bool>,
@@ -447,9 +455,17 @@ pub struct RawBashFeatures {
     #[serde(deserialize_with = "deserialize_opt_worker_wait_max_ms")]
     pub worker_wait_max_ms: Option<u64>,
     pub linux_scope: Option<bool>,
+    #[serde(deserialize_with = "deserialize_opt_memory_limit_mib")]
+    pub memory_limit_mib: Option<u64>,
     pub disclaim_privacy: Option<bool>,
     pub powershell_tool: Option<bool>,
     pub env: Option<BTreeMap<String, String>>,
+    /// Project-tier `bash.env` values, carried separately so the user-tier map
+    /// stays user-only. Only `project_safe_bash` fills this field.
+    #[serde(skip)]
+    pub project_env: Option<BTreeMap<String, String>>,
+    /// User-only: `bash.env` names that are also sent to a `runon` job.
+    pub runon_env: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -721,7 +737,7 @@ pub fn resolve_config_for_harness(
         .unwrap_or_default();
     if !errors.is_empty() {
         return ResolveResult {
-            config: Config::default(),
+            config: rejected_cache_config(tiers, Config::default(), &errors),
             dropped,
             warnings,
             errors,
@@ -733,12 +749,16 @@ pub fn resolve_config_for_harness(
         let outcome = match parse_tier(tier, harness, &mut warnings) {
             Ok(outcome) => outcome,
             Err(errors) => {
+                // A rejected candidate still records where caches belong, or
+                // that the user file leaves it unknown, so caches stay off
+                // rather than falling back to the storage root.
+                let config = cache_location_checked_config(tiers, &mut warnings);
                 return ResolveResult {
-                    config: Config::default(),
+                    config: rejected_cache_config(tiers, config, &errors),
                     dropped,
                     warnings,
                     errors,
-                }
+                };
             }
         };
         let (raw, translation) = outcome;
@@ -785,19 +805,30 @@ pub fn resolve_config_for_harness(
         if is_user && raw.disabled_tools.is_none() {
             raw.disabled_tools = Some(default_disabled());
         }
-        apply_harness_override(&mut raw, harness, tier, is_user, &mut warnings);
-        if is_user {
-            if let Some(blocked) = blocked_bash_env_key(&raw) {
-                return ResolveResult {
-                    config: Config::default(),
-                    dropped,
-                    warnings,
-                    errors: vec![format!(
-                        "{} has blocked bash.env key {blocked}; environment startup hooks and protected variables cannot be configured",
-                        tier.source
-                    )],
-                };
-            }
+        let tier_kind = if is_user {
+            crate::bash_env::BashEnvTier::User
+        } else {
+            crate::bash_env::BashEnvTier::Project
+        };
+        let harness_refusal = apply_harness_override(
+            &mut raw,
+            harness,
+            tier,
+            is_user,
+            tier_kind,
+            &mut warnings,
+            &mut dropped,
+        );
+        if let Some(error) =
+            harness_refusal.or_else(|| raw_bash_env_refusal(&raw, tier, tier_kind, None))
+        {
+            let errors = vec![error];
+            return ResolveResult {
+                config: rejected_cache_config(tiers, Config::default(), &errors),
+                dropped,
+                warnings,
+                errors,
+            };
         }
         if let Some(RawEditMode::Unknown(value)) = raw.edit_mode.as_ref() {
             warnings.push(ConfigWarning {
@@ -818,32 +849,127 @@ pub fn resolve_config_for_harness(
         }
     }
 
-    let mut config = Config::default();
+    let mut config = cache_location_checked_config(tiers, &mut warnings);
     if let Err(missing) = apply_resolved_config(&merged, &mut config, &mut warnings) {
         return ResolveResult {
-            config: Config::default(),
+            config: rejected_cache_config(tiers, config, &missing),
             dropped,
             warnings,
             errors: missing,
         };
     }
     config.index = resolve_index_config(merged.index.as_ref(), &mut warnings);
+    if let Some(raw) = merged
+        .storage
+        .as_ref()
+        .and_then(|storage| storage.cache_dir.as_ref())
+    {
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(std::path::PathBuf::from);
+        match crate::config::expand_cache_dir_path(raw, home.as_deref()) {
+            Ok(path) => config.cache_dir = Some(path),
+            Err(error) => {
+                let path = std::path::PathBuf::from(raw);
+                config.cache_dir = Some(path.clone());
+                config.cache_unavailable = Some(error.clone());
+                warnings.push(crate::root_cache::unavailable_warning(&path, &error));
+            }
+        }
+    }
+    config.cache_dir_opt_out = config.cache_dir.is_none()
+        && tiers
+            .iter()
+            .filter(|tier| tier.tier == "user")
+            .any(explicit_null_cache_dir);
     config.idle = resolve_idle_config(merged.idle.as_ref(), &mut warnings);
     let resolved = serde_json::to_value(&config).unwrap_or(Value::Null);
     if let Err(invalid) = feature_config::validate_resolved_config(&resolved) {
         return ResolveResult {
-            config: Config::default(),
+            config: rejected_cache_config(tiers, config, &invalid),
             dropped,
             warnings,
             errors: invalid,
         };
     }
+    let errors = config
+        .cache_config_unknown
+        .as_ref()
+        .filter(|reason| reason.contains("unknown field"))
+        .and_then(|reason| {
+            // The warning retains the source and section. Keep rejection codes
+            // independent of file paths so every config loader agrees on them.
+            let (_, detail) = reason.split_once("unknown field `")?;
+            let key = detail.split('`').next().unwrap_or_default();
+            Some(vec![format!("invalid_cache_config: unknown field `{key}`")])
+        })
+        .unwrap_or_default();
     ResolveResult {
         config,
         dropped,
         warnings,
-        errors: Vec::new(),
+        errors,
     }
+}
+
+/// A default config carrying the user tier's cache-location verdict: when the
+/// user file is unreadable or its storage section invalid, the cache location
+/// is unknown and a `cache_dir_config_unknown` warning says so.
+fn cache_location_checked_config(
+    tiers: &[ConfigTier],
+    warnings: &mut Vec<ConfigWarning>,
+) -> Config {
+    let mut config = Config::default();
+    config.cache_config_unknown = tiers
+        .iter()
+        .filter(|tier| tier.tier == "user")
+        .find_map(cache_location_config_error);
+    if let Some(reason) = &config.cache_config_unknown {
+        warnings.push(ConfigWarning {
+            code: "cache_dir_config_unknown", key: "storage.cache_dir", tier: "user".into(),
+            value: "unknown".into(),
+            message: format!("User configuration is unreadable or invalid ({reason}); AFT is running without its caches until the configuration is valid."),
+        });
+    }
+    config
+}
+
+fn rejected_cache_config(tiers: &[ConfigTier], mut config: Config, errors: &[String]) -> Config {
+    if config.cache_dir.is_none() {
+        // Read only `storage.cache_dir` from the user document itself: the
+        // candidate was rejected, possibly for another section, so the tier
+        // as a whole may not parse.
+        if let Some(raw) = tiers
+            .iter()
+            .filter(|tier| tier.tier == "user")
+            .filter_map(|tier| {
+                serde_json::from_str::<Value>(&strip_jsonc(&tier.doc))
+                    .ok()?
+                    .get("storage")?
+                    .get("cache_dir")?
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .last()
+        {
+            let home = std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(std::path::PathBuf::from);
+            config.cache_dir = Some(
+                crate::config::expand_cache_dir_path(&raw, home.as_deref())
+                    .unwrap_or_else(|_| std::path::PathBuf::from(raw)),
+            );
+        }
+    }
+    config.cache_dir_opt_out = config.cache_dir.is_none()
+        && tiers
+            .iter()
+            .filter(|tier| tier.tier == "user")
+            .any(explicit_null_cache_dir);
+    config
+        .cache_config_unknown
+        .get_or_insert_with(|| format!("configuration rejected: {}", errors.join(", ")));
+    config
 }
 
 /// Resolve raw config tiers into the core-domain config and RESET it onto an
@@ -943,6 +1069,7 @@ fn carry_process_state(base: &Config, resolved: &mut Config) {
     resolved.bash_permissions = base.bash_permissions;
     resolved.search_index_max_file_size = base.search_index_max_file_size;
     resolved.storage_dir = base.storage_dir.clone();
+    resolved.storage_lease = base.storage_lease.clone();
     resolved.lsp_paths_extra = base.lsp_paths_extra.clone();
     resolved.lsp_auto_install_binaries = base.lsp_auto_install_binaries.clone();
     resolved.lsp_inflight_installs = base.lsp_inflight_installs.clone();
@@ -1046,6 +1173,8 @@ fn normalize_config_for_harness(map: &mut Map<String, Value>, harness: Option<&H
     }
 }
 
+// `storage` is deliberately not listed: a malformed `storage.cache_dir` weakens
+// no protection; it turns caches off (`cache_config_unknown`) and warns.
 fn security_config_section(key: &str, harness: Option<&Harness>) -> bool {
     if harness_ignored_config_keys(harness).contains(&key) {
         return false;
@@ -1140,6 +1269,143 @@ fn malformed_security_config_errors(
     errors
 }
 
+/// Whether a user tier sets `storage.cache_dir` to null, the explicit way to
+/// move caches back to the storage root after it used a cache directory.
+fn explicit_null_cache_dir(tier: &ConfigTier) -> bool {
+    serde_json::from_str::<Value>(&strip_jsonc(&tier.doc)).is_ok_and(|value| {
+        value
+            .get("storage")
+            .and_then(|storage| storage.get("cache_dir"))
+            .is_some_and(Value::is_null)
+    })
+}
+
+/// Recognize storage-section typos without making unrelated user keys strict.
+pub(crate) fn storage_like_key(key: &str, value: Option<&Value>) -> bool {
+    // This is a distinct process-state field, not a misspelled cache selector.
+    if key == "storage_dir" {
+        return false;
+    }
+    let normalized: String = key
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    if normalized.starts_with("storage") || matches!(normalized.as_str(), "cachedir" | "cacheroot")
+    {
+        return true;
+    }
+    if value
+        .and_then(Value::as_object)
+        .is_some_and(|fields| fields.contains_key("cache_dir"))
+    {
+        return true;
+    }
+    let target = b"storage";
+    if normalized.len().abs_diff(target.len()) > 2 {
+        return false;
+    }
+    let mut row: Vec<usize> = (0..=target.len()).collect();
+    for (i, byte) in normalized.bytes().enumerate() {
+        let mut next = vec![i + 1];
+        for (j, expected) in target.iter().enumerate() {
+            next.push(
+                (row[j] + usize::from(byte != *expected))
+                    .min(row[j + 1] + 1)
+                    .min(next[j] + 1),
+            );
+        }
+        row = next;
+    }
+    row[target.len()] <= 2
+}
+
+/// Why a user tier leaves its cache location unknown. Storage sections and
+/// storage-like typos fail closed; unrelated unknown keys retain partial parsing.
+pub fn cache_location_config_error(tier: &ConfigTier) -> Option<String> {
+    let stripped = strip_jsonc(&tier.doc);
+    let value = match serde_json::from_str::<Value>(&stripped) {
+        Ok(value) => value,
+        Err(error) => return Some(format!("{} does not parse: {error}", tier.source)),
+    };
+    let Value::Object(map) = value else {
+        return Some(format!("{} is not a JSON object", tier.source));
+    };
+    if let Some(error) = feature_config::removed_config_key_errors(&map)
+        .into_iter()
+        .find(|error| error.contains("storage"))
+    {
+        return Some(format!(
+            "{} has a removed storage setting: {error}",
+            tier.source
+        ));
+    }
+    let unknown_key = |map: &Map<String, Value>| -> Option<String> {
+        let mut map = map.clone();
+        feature_config::translate_document(&mut map, feature_config::DocumentTier::User);
+        map.keys().find_map(|key| {
+            // Validate the name independently of its value: an invalid known
+            // setting must not hide a misspelled storage key later in the file.
+            let field = Map::from_iter([(key.clone(), Value::Null)]);
+            serde_json::from_value::<RawAftConfig>(Value::Object(field))
+                .err()
+                .map(|error| error.to_string())
+                .filter(|error| {
+                    error.starts_with("unknown field") && storage_like_key(key, map.get(key))
+                })
+        })
+    };
+    if let Some(error) = unknown_key(&map) {
+        return Some(format!("{} has an invalid setting: {error}", tier.source));
+    }
+    // Stricter than the resolver's RawStorage: a misspelled key inside
+    // storage (for example `cachedir`) would otherwise leave cache_dir unset
+    // and quietly put caches back on the storage root.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct StrictStorage {
+        cache_dir: Option<String>,
+    }
+    let invalid_storage = |section: &Value| -> Option<String> {
+        if section.is_null() {
+            return None;
+        }
+        if let Some(key) = section
+            .as_object()
+            .and_then(|fields| fields.keys().find(|key| key.as_str() != "cache_dir"))
+        {
+            return Some(format!("unknown field `{key}`, expected `cache_dir`"));
+        }
+        serde_json::from_value::<StrictStorage>(section.clone())
+            .err()
+            .map(|error| error.to_string())
+    };
+    if let Some(error) = map.get("storage").and_then(invalid_storage) {
+        return Some(format!(
+            "{} has an invalid storage section: {error}",
+            tier.source
+        ));
+    }
+    if let Some(Value::Object(harnesses)) = map.get("harnesses") {
+        for (name, block) in harnesses {
+            if let Some(error) = block.as_object().and_then(unknown_key) {
+                return Some(format!(
+                    "{} has an invalid harnesses.{name} setting: {error}",
+                    tier.source
+                ));
+            }
+            if let Some(error) = block.get("storage").and_then(invalid_storage) {
+                return Some(format!(
+                    "{} has an invalid harnesses.{name}.storage section: {error}",
+                    tier.source
+                ));
+            }
+        }
+    }
+    None
+}
+
 /// Return why a tier would be accepted only by the lenient resolver, or
 /// `None` when it passes strict validation.
 ///
@@ -1176,56 +1442,86 @@ pub fn strict_tier_error(tier: &ConfigTier, harness: Option<&Harness>) -> Option
             return Some(format!("{} has an invalid setting: {error}", tier.source));
         }
     };
-    if tier.tier == "user" {
-        if let Some(blocked) = blocked_bash_env_key(&raw) {
-            return Some(format!(
-                "{} has blocked bash.env key {blocked}; environment startup hooks and protected variables cannot be configured",
-                tier.source
-            ));
-        }
-    }
+    // A refused name rejects the candidate at either tier, whether or not a
+    // project is trusted: a silently dropped variable is exactly the failure
+    // mode this list exists to prevent.
+    let tier_kind = if tier.tier == "user" {
+        crate::bash_env::BashEnvTier::User
+    } else {
+        crate::bash_env::BashEnvTier::Project
+    };
     // The block for the active harness is applied on top of this tier, so it
     // must be as valid as the tier itself. Blocks for other harnesses are
     // never applied here and stay unchecked, as at connect.
-    let label = harness?.wire_label();
-    let block = raw.harnesses.as_ref()?.get(&label)?;
-    let Value::Object(block) = block else {
-        return Some(format!(
-            "{} has an invalid harnesses.{label} block: it must be an object",
-            tier.source
-        ));
-    };
-    let mut block = block.clone();
-    // A nested `harnesses` key is ignored with a warning at connect as well.
-    block.remove("harnesses");
-    let parsed_block = match serde_json::from_value::<RawAftConfig>(Value::Object(block)) {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            return Some(format!(
-                "{} has an invalid setting in harnesses.{label}: {error}",
-                tier.source
-            ));
+    let harness_context = harness.map(|harness| {
+        let label = harness.wire_label();
+        let block = raw
+            .harnesses
+            .as_ref()
+            .and_then(|blocks| blocks.get(&label))
+            .cloned();
+        (label, block)
+    });
+    // A refusal written in the applied harness block is the one to report: it
+    // names the block that actually carries the name.
+    let harness_refusal = match harness_context.as_ref() {
+        Some((label, Some(Value::Object(block)))) => {
+            let mut block = block.clone();
+            // A nested `harnesses` key is ignored with a warning at connect.
+            block.remove("harnesses");
+            match serde_json::from_value::<RawAftConfig>(Value::Object(block)) {
+                Ok(parsed) => raw_bash_env_refusal(&parsed, tier, tier_kind, Some(label)),
+                Err(_) => None,
+            }
         }
+        _ => None,
     };
-    if tier.tier == "user" {
-        if let Some(blocked) = blocked_bash_env_key(&parsed_block) {
-            return Some(format!(
-                "{} has blocked bash.env key {blocked} in harnesses.{label}; environment startup hooks and protected variables cannot be configured",
-                tier.source
-            ));
-        }
-    }
-    None
+    let base_refusal = raw_bash_env_refusal(&raw, tier, tier_kind, None);
+    harness_refusal.or(base_refusal)
 }
 
-fn blocked_bash_env_key(raw: &RawAftConfig) -> Option<&str> {
+/// The refusal for a `bash.env` name the tier may not set. The message names
+/// the key so the author can fix the file: this check runs for every tier and
+/// whether or not the project is trusted.
+fn refused_bash_env_error(
+    tier: &ConfigTier,
+    tier_kind: crate::bash_env::BashEnvTier,
+    key: &str,
+    harness_label: Option<&str>,
+) -> String {
+    let where_set = match harness_label {
+        Some(label) => format!(" in harnesses.{label}"),
+        None => String::new(),
+    };
+    let scope = match tier_kind {
+        crate::bash_env::BashEnvTier::User => "cannot be configured",
+        crate::bash_env::BashEnvTier::Project => {
+            "cannot be configured by a project; set it in user config if you need it"
+        }
+    };
+    format!(
+        "{} has blocked bash.env key {key}{where_set}; environment startup hooks, lookup roots, interpreter injectors, Git redirection, AFT controls, sandbox controls and credentials {scope}",
+        tier.source
+    )
+}
+
+/// Refuse a `bash.env` name of the given tier (base block or active harness
+/// block). Project values are validated even when the project is untrusted, so
+/// a bad commit fails for its author at once rather than on the first machine
+/// that trusts it.
+fn raw_bash_env_refusal(
+    raw: &RawAftConfig,
+    tier: &ConfigTier,
+    tier_kind: crate::bash_env::BashEnvTier,
+    harness_label: Option<&str>,
+) -> Option<String> {
     let env = match raw.bash.as_ref() {
         Some(RawBash::Features(features)) => features.env.as_ref(),
         _ => None,
-    }?;
-    env.keys()
-        .find(|key| crate::bash_env::is_blocked_env_key(key))
-        .map(String::as_str)
+    };
+    let found = crate::bash_env::first_refused_env_key(env?, tier_kind);
+    let key = found?;
+    Some(refused_bash_env_error(tier, tier_kind, key, harness_label))
 }
 
 fn parse_config_partially(
@@ -1254,22 +1550,30 @@ fn parse_config_partially(
     partial
 }
 
+/// Apply one tier's harness block on top of its base and return the refusal
+/// for a `bash.env` name the tier may not set in that block.
+///
+/// The block is checked before the project trust boundary strips its map: a
+/// refused name must reject the candidate at the tier it was written at, and a
+/// project harness block must not borrow the user tier's strength.
 fn apply_harness_override(
     raw: &mut RawAftConfig,
     harness: Option<&Harness>,
     tier: &ConfigTier,
     trusted: bool,
+    tier_kind: crate::bash_env::BashEnvTier,
     warnings: &mut Vec<ConfigWarning>,
-) {
+    dropped: &mut Vec<DroppedKey>,
+) -> Option<String> {
     let Some(overrides) = raw.harnesses.take() else {
-        return;
+        return None;
     };
     let Some(harness) = harness else {
-        return;
+        return None;
     };
     let key = harness.wire_label();
     let Some(value) = overrides.get(&key) else {
-        return;
+        return None;
     };
     let Value::Object(mut override_map) = value.clone() else {
         warnings.push(ConfigWarning {
@@ -1280,7 +1584,7 @@ fn apply_harness_override(
             message: "Ignoring non-object harness override; overrides must be config objects"
                 .to_string(),
         });
-        return;
+        return None;
     };
 
     if override_map.remove("harnesses").is_some() {
@@ -1297,8 +1601,26 @@ fn apply_harness_override(
 
     normalize_config_for_harness(&mut override_map, Some(harness));
 
+    // The block is refused at the tier it was written at, whether or not the
+    // project is trusted, and before the trust boundary below strips the map.
+    let refusal = serde_json::from_value::<RawAftConfig>(Value::Object(override_map.clone()))
+        .ok()
+        .and_then(|parsed| raw_bash_env_refusal(&parsed, tier, tier_kind, Some(&key)));
+
     match serde_json::from_value::<RawAftConfig>(Value::Object(override_map)) {
         Ok(mut override_config) => {
+            if override_config
+                .storage
+                .take()
+                .is_some_and(|storage| storage.cache_dir.is_some())
+            {
+                push_drop(
+                    dropped,
+                    "storage.cache_dir",
+                    &tier.tier,
+                    "cache location is storage-wide; only the user-tier base may set it",
+                );
+            }
             // A project harness block, like the project base, may only turn an
             // index off; a user harness block overrides the user base.
             let override_indexes = override_config.indexes.take();
@@ -1314,9 +1636,17 @@ fn apply_harness_override(
                 .to_string(),
         }),
     }
+    refusal
 }
 
 fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) {
+    if override_config
+        .storage
+        .as_ref()
+        .is_some_and(|storage| storage.cache_dir.is_some())
+    {
+        base.storage = override_config.storage;
+    }
     if override_config.harnesses.is_some() {
         base.harnesses = override_config.harnesses.clone();
     }
@@ -1409,7 +1739,14 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
         }
     }
     if override_config.bash.is_some() {
-        base.bash = override_config.bash;
+        // A harness block merges its `bash.env` names into the base block
+        // instead of replacing it, so adding one name under
+        // `harnesses.<name>` cannot silently drop every base name. A project
+        // harness block is only looked at after this tier's own trust boundary,
+        // so a strength reserved for the user tier cannot be borrowed through
+        // `harnesses`. A name the boundary strips is still refused by
+        // `raw_bash_env_refusal` before this merge.
+        base.bash = merge_bash_config(base.bash.take(), override_config.bash);
     }
     if override_config.experimental.is_some() {
         base.experimental = override_config.experimental;
@@ -1482,7 +1819,18 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     base.search = merge_project_search(base.search.take(), project.search);
     base.lsp = merge_lsp_config(base.lsp.take(), project.lsp);
     base.experimental = merge_experimental_config(base.experimental.take(), project.experimental);
-    base.bash = merge_bash_config(base.bash.take(), project_safe_bash(project.bash));
+    let ceiling = base
+        .bash
+        .as_ref()
+        .and_then(|bash| expand_bash_for_merge(bash).memory_limit_mib);
+    let mut project_bash = project_safe_bash(project.bash);
+    if let Some(RawBash::Features(features)) = &mut project_bash {
+        features.memory_limit_mib = match (ceiling, features.memory_limit_mib) {
+            (Some(user), Some(project)) => Some(user.min(project)),
+            (_, value) => value,
+        };
+    }
+    base.bash = merge_bash_config(base.bash.take(), project_bash);
     base.inspect = merge_inspect_config(base.inspect.take(), project.inspect);
     base.idle = merge_idle_config(base.idle.take(), project.idle);
     base.worktree = merge_worktree_config(base.worktree.take(), project.worktree);
@@ -1763,9 +2111,15 @@ fn project_safe_bash(project: Option<RawBash>) -> Option<RawBash> {
     project.map(|bash| match bash {
         RawBash::Bool(enabled) => RawBash::Bool(enabled),
         RawBash::Features(mut features) => {
+            features.changed_files = features
+                .changed_files
+                .filter(|mode| *mode == crate::config::BashChangedFiles::Off);
             features.linux_scope = None;
             features.runon_enabled = None;
-            features.env = None;
+            // `project_env` is carried separately: the resolver never applies a
+            // project's environment, so it must not reach the user-tier map.
+            features.project_env = features.env.take();
+            features.runon_env = None;
             // A repository may tighten privacy, never restore inherited grants.
             features.disclaim_privacy = features.disclaim_privacy.filter(|value| *value);
             RawBash::Features(features)
@@ -1794,6 +2148,65 @@ fn runon_safety_switch_is_user_only_and_defaults_off() {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn bash_memory_limit_parses_and_project_cannot_raise_it() {
+    let resolve = |user: &str, project: &str| {
+        serde_json::to_value(
+            resolve_config(&[
+                ConfigTier {
+                    tier: "user".into(),
+                    source: "user.jsonc".into(),
+                    doc: user.into(),
+                },
+                ConfigTier {
+                    tier: "project".into(),
+                    source: "project.jsonc".into(),
+                    doc: project.into(),
+                },
+            ])
+            .config
+            .bash,
+        )
+        .unwrap()["memory_limit_mib"]
+            .clone()
+    };
+    assert_eq!(
+        resolve(r#"{"bash":{"memory_limit_mib":64}}"#, "{}"),
+        serde_json::json!(64)
+    );
+    assert_eq!(
+        resolve(
+            r#"{"bash":{"memory_limit_mib":64}}"#,
+            r#"{"bash":{"memory_limit_mib":128}}"#
+        ),
+        serde_json::json!(64)
+    );
+    assert_eq!(
+        resolve(
+            r#"{"bash":{"memory_limit_mib":64}}"#,
+            r#"{"bash":{"memory_limit_mib":32}}"#
+        ),
+        serde_json::json!(32)
+    );
+    for project in [r#"{"bash":false}"#, r#"{"bash":{"memory_limit_mib":null}}"#] {
+        assert_eq!(
+            resolve(r#"{"bash":{"memory_limit_mib":64}}"#, project),
+            serde_json::json!(64)
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn bash_memory_limit_rejects_invalid_values() {
+    assert!(resolve_config(&[]).config.bash.memory_limit_mib.is_none());
+    for value in ["0", "-1", "1.5", "true", "\"4GB\"", "4294967296"] {
+        let doc = format!("{{\"bash\":{{\"memory_limit_mib\":{value}}}}}");
+        assert!(serde_json::from_str::<RawAftConfig>(&doc).is_err(), "{doc}");
+    }
+}
+
 fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> Option<RawBash> {
     match (base, override_bash) {
         (None, None) => None,
@@ -1803,6 +2216,7 @@ fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> O
             let base = expand_bash_for_merge(&base);
             let override_features = expand_bash_for_merge(&override_bash);
             Some(RawBash::Features(RawBashFeatures {
+                changed_files: override_features.changed_files.or(base.changed_files),
                 enabled: override_features.enabled.or(base.enabled),
                 rewrite: override_features.rewrite.or(base.rewrite),
                 compress: override_features.compress.or(base.compress),
@@ -1832,10 +2246,30 @@ fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> O
                     .worker_wait_max_ms
                     .or(base.worker_wait_max_ms),
                 linux_scope: override_features.linux_scope.or(base.linux_scope),
+                memory_limit_mib: override_features.memory_limit_mib.or(base.memory_limit_mib),
                 disclaim_privacy: override_features.disclaim_privacy.or(base.disclaim_privacy),
                 powershell_tool: override_features.powershell_tool.or(base.powershell_tool),
-                env: override_features.env.or(base.env),
+                env: merge_env_maps(base.env, override_features.env),
+                project_env: merge_env_maps(base.project_env, override_features.project_env),
+                runon_env: override_features.runon_env.or(base.runon_env),
             }))
+        }
+    }
+}
+
+/// Merge two `bash.env` maps by name: the override adds or replaces single
+/// names and never removes a base name.
+fn merge_env_maps(
+    base: Option<BTreeMap<String, String>>,
+    override_map: Option<BTreeMap<String, String>>,
+) -> Option<BTreeMap<String, String>> {
+    match (base, override_map) {
+        (None, None) => None,
+        (Some(base), None) => Some(base),
+        (None, Some(override_map)) => Some(override_map),
+        (Some(mut base), Some(override_map)) => {
+            base.extend(override_map);
+            Some(base)
         }
     }
 }
@@ -1845,6 +2279,7 @@ fn expand_bash_for_merge(value: &RawBash) -> RawBashFeatures {
         // A boolean expands to its sub-features only. The runtime gate is left
         // unset so a later object tier decides it, matching the TypeScript merge.
         RawBash::Bool(enabled) => RawBashFeatures {
+            changed_files: None,
             enabled: None,
             rewrite: Some(*enabled),
             compress: Some(*enabled),
@@ -1860,9 +2295,12 @@ fn expand_bash_for_merge(value: &RawBash) -> RawBashFeatures {
             watch_sync_max_ms: None,
             worker_wait_max_ms: None,
             linux_scope: None,
+            memory_limit_mib: None,
             disclaim_privacy: None,
             powershell_tool: None,
             env: None,
+            project_env: None,
+            runon_env: None,
         },
         RawBash::Features(features) => features.clone(),
     }
@@ -1994,6 +2432,16 @@ fn record_resource_loosening(
         }
     }
     const REASON: &str = "resource: project settings may only tighten the user budget";
+    let cap = |raw: &RawAftConfig| {
+        raw.bash
+            .as_ref()
+            .and_then(|bash| expand_bash_for_merge(bash).memory_limit_mib)
+    };
+    if let (Some(user), Some(project)) = (cap(base), cap(project)) {
+        if project > user {
+            push_drop(dropped, "bash.memory_limit_mib", tier, REASON);
+        }
+    }
     if let Some(next) = project.lsp.as_ref().and_then(|lsp| lsp.idle_minutes) {
         let floor = base
             .lsp
@@ -2025,6 +2473,13 @@ fn record_resource_loosening(
 }
 
 fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<DroppedKey>) {
+    if raw
+        .storage
+        .as_ref()
+        .is_some_and(|storage| storage.cache_dir.is_some())
+    {
+        push_drop(dropped, "storage.cache_dir", tier, USER_ONLY_REASON);
+    }
     if matches!(&raw.bash, Some(RawBash::Features(features)) if features.disclaim_privacy == Some(false))
     {
         push_drop(
@@ -2037,8 +2492,10 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
     if matches!(&raw.bash, Some(RawBash::Features(features)) if features.runon_enabled.is_some()) {
         push_drop(dropped, "bash.runon_enabled", tier, USER_ONLY_REASON);
     }
-    if matches!(&raw.bash, Some(RawBash::Features(features)) if features.env.is_some()) {
-        push_drop(dropped, "bash.env", tier, USER_ONLY_REASON);
+    // A project's own `bash.env` is not dropped: it is validated and carried in
+    // `project_env`, then applied only while the project is trusted.
+    if matches!(&raw.bash, Some(RawBash::Features(features)) if features.runon_env.is_some()) {
+        push_drop(dropped, "bash.runon_env", tier, USER_ONLY_REASON);
     }
     if raw.restrict_to_project_root.is_some() {
         push_drop(dropped, "restrict_to_project_root", tier, USER_ONLY_REASON);
@@ -2117,6 +2574,11 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
         if sandbox.write_allow.is_some() {
             push_drop(dropped, "sandbox.write_allow", tier, USER_ONLY_REASON);
         }
+    }
+    if raw.bash.as_ref().is_some_and(
+        |bash| matches!(bash, RawBash::Features(features) if features.changed_files.is_some_and(|mode| mode != crate::config::BashChangedFiles::Off)),
+    ) {
+        push_drop(dropped, "bash.changed_files", tier, "a project config may only turn changed-file reporting off");
     }
     if raw.bash.as_ref().is_some_and(
         |bash| matches!(bash, RawBash::Features(features) if features.linux_scope.is_some()),
@@ -2725,8 +3187,16 @@ fn resolve_lsp_config(raw: &RawAftConfig, config: &mut Config) {
     }
 }
 
+/// A validated `bash.env` map together with the tier it was written at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfiguredBashEnv {
+    pub names: BTreeMap<String, String>,
+    pub tier: crate::bash_env::BashEnvTier,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedBashConfig {
+    changed_files: crate::config::BashChangedFiles,
     enabled: bool,
     rewrite: bool,
     compress: bool,
@@ -2742,9 +3212,12 @@ struct ResolvedBashConfig {
     watch_sync_max_ms: u64,
     worker_wait_max_ms: u64,
     linux_scope: bool,
+    memory_limit_mib: Option<u64>,
     disclaim_privacy: bool,
     powershell_tool: bool,
     env: BTreeMap<String, String>,
+    project_env: BTreeMap<String, String>,
+    runon_env: Vec<String>,
 }
 
 fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config, warnings: &mut Vec<ConfigWarning>) {
@@ -2753,6 +3226,7 @@ fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config, warnings: &mut V
     // and merge the same config.
     let _plugin_only = bash.subagent_background;
     config.bash.enabled = bash.enabled;
+    config.bash.changed_files = bash.changed_files;
     config.bash.host_fallback = bash.host_fallback;
     config.bash.runon_enabled = bash.runon_enabled;
     config.bash.detach_on_user_message = bash.detach_on_user_message;
@@ -2760,9 +3234,12 @@ fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config, warnings: &mut V
     config.bash.watch_sync_max_ms = bash.watch_sync_max_ms;
     config.bash.worker_wait_max_ms = bash.worker_wait_max_ms;
     config.bash.linux_scope = bash.linux_scope;
+    config.bash.memory_limit_mib = bash.memory_limit_mib;
     config.bash.disclaim_privacy = bash.disclaim_privacy;
     config.bash.powershell_tool = bash.powershell_tool;
     config.bash.env = bash.env;
+    config.bash.project_env = bash.project_env;
+    config.bash.runon_env = bash.runon_env;
     config.experimental_bash_rewrite = bash.rewrite;
     config.experimental_bash_compress = bash.compress;
     config.experimental_bash_background = bash.background;
@@ -2823,6 +3300,9 @@ fn resolve_bash_config(
         .max(FOREGROUND_WAIT_WINDOW_MIN_MS);
 
     let base = ResolvedBashConfig {
+        changed_files: top_features
+            .and_then(|features| features.changed_files)
+            .unwrap_or_default(),
         enabled: false,
         rewrite: false,
         compress: false,
@@ -2842,11 +3322,14 @@ fn resolve_bash_config(
         watch_sync_max_ms,
         worker_wait_max_ms,
         linux_scope: top_linux_scope,
+        memory_limit_mib: top_features.and_then(|features| features.memory_limit_mib),
         disclaim_privacy: top_features
             .and_then(|features| features.disclaim_privacy)
             .unwrap_or(false),
         powershell_tool: false,
         env: BTreeMap::new(),
+        project_env: BTreeMap::new(),
+        runon_env: Vec::new(),
     };
 
     match top {
@@ -2868,6 +3351,8 @@ fn resolve_bash_config(
             detach_on_user_message: top_detach_on_user_message,
             powershell_tool: top_powershell_tool,
             env: features.env.clone().unwrap_or_default(),
+            project_env: features.project_env.clone().unwrap_or_default(),
+            runon_env: features.runon_env.clone().unwrap_or_default(),
             ..base
         },
         None => {
@@ -3060,6 +3545,19 @@ where
     }
 }
 
+fn deserialize_opt_memory_limit_mib<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<u64>::deserialize(deserializer)?;
+    if value.is_some_and(|value| value == 0 || value > 4_294_967_295) {
+        return Err(serde::de::Error::custom(
+            "expected memory limit in MiB from 1 to 4294967295",
+        ));
+    }
+    Ok(value)
+}
+
 fn deserialize_opt_positive_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
 where
     D: Deserializer<'de>,
@@ -3145,6 +3643,160 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn storage_cache_dir_is_a_recognized_user_setting() {
+        let raw = serde_json::from_str::<super::RawAftConfig>(
+            r#"{"storage":{"cache_dir":"/cache/aft"}}"#,
+        );
+        assert!(raw.is_ok(), "storage.cache_dir must be recognized: {raw:?}");
+    }
+
+    #[test]
+    fn storage_cache_dir_only_user_base_can_select_storage_wide_root() {
+        let result = super::resolve_config_for_harness(&[
+            super::ConfigTier { tier: "user".into(), source: "user".into(), doc: r#"{"storage":{"cache_dir":"/cache/base"},"harnesses":{"pi":{"storage":{"cache_dir":"/cache/pi"}}}}"#.into() },
+            super::ConfigTier { tier: "project".into(), source: "project".into(), doc: r#"{"storage":{"cache_dir":"/evil"},"harnesses":{"pi":{"storage":{"cache_dir":"/evil/pi"}}}}"#.into() },
+        ], Some(&crate::harness::Harness::Pi));
+        assert!(result.errors.is_empty());
+        assert_eq!(
+            result.config.cache_dir,
+            Some(std::path::PathBuf::from("/cache/base"))
+        );
+        assert!(result
+            .dropped
+            .iter()
+            .any(|dropped| dropped.key == "storage.cache_dir"));
+    }
+
+    #[test]
+    fn cache_dir_and_bash_env_keep_distinct_harness_trust_rules() {
+        // `storage.cache_dir` is storage-wide: only the user-tier base may set
+        // it, at either level. `bash.env` has its own per-tier rule: a harness
+        // block merges names, and a project's names are carried for the
+        // per-command trust check instead of being dropped. The two rules must
+        // not borrow from each other.
+        for harness in [
+            crate::harness::Harness::Opencode,
+            crate::harness::Harness::Pi,
+        ] {
+            let result = super::resolve_config_for_harness(
+                &[
+                    tier(
+                        "user",
+                        r#"{
+                        "storage":{"cache_dir":"/cache/base"},
+                        "bash":{"env":{"TZ":"UTC"}},
+                        "harnesses":{
+                            "opencode":{"storage":{"cache_dir":"/cache/override"},"bash":{"env":{"TZ":"Etc/GMT"}}},
+                            "pi":{"storage":{"cache_dir":"/cache/override"},"bash":{"env":{"TZ":"Etc/GMT"}}}
+                        }
+                    }"#,
+                    ),
+                    tier(
+                        "project",
+                        r#"{
+                        "storage":{"cache_dir":"/evil"},
+                        "bash":{"env":{"PROJECT_MARKER":"/evil/marker"}},
+                        "harnesses":{
+                            "opencode":{"storage":{"cache_dir":"/evil/override"},"bash":{"env":{"TZ":"project"}}},
+                            "pi":{"storage":{"cache_dir":"/evil/override"},"bash":{"env":{"TZ":"project"}}}
+                        }
+                    }"#,
+                    ),
+                ],
+                Some(&harness),
+            );
+            assert!(result.errors.is_empty(), "{:?}", result.errors);
+            // Only the user-tier base selects the cache root, at either level.
+            assert_eq!(result.config.cache_dir, Some("/cache/base".into()));
+            assert!(result
+                .dropped
+                .iter()
+                .any(|drop| drop.key == "storage.cache_dir" && drop.tier == "user"));
+            assert!(result
+                .dropped
+                .iter()
+                .any(|drop| drop.key == "storage.cache_dir" && drop.tier == "project"));
+            // The harness block merges its `bash.env` name over the base one.
+            assert_eq!(result.config.bash.env.len(), 1);
+            assert_eq!(result.config.bash.env["TZ"], "Etc/GMT");
+            // The project's names are carried for the per-command trust check,
+            // never merged into the user map and never reported as dropped.
+            assert_eq!(
+                result.config.bash.project_env.get("TZ").map(String::as_str),
+                Some("project")
+            );
+            assert!(result
+                .config
+                .bash
+                .project_env
+                .contains_key("PROJECT_MARKER"));
+            assert!(!result.dropped.iter().any(|drop| drop.key == "bash.env"));
+        }
+    }
+
+    #[test]
+    fn cache_dir_stays_fenced_when_bash_env_rejects_the_user_config() {
+        for in_harness in [false, true] {
+            let mut document = serde_json::json!({"storage":{"cache_dir":"/cache/base"}});
+            let blocked = serde_json::json!({"env":{"BASH_ENV":"/evil/startup"}});
+            if in_harness {
+                document["harnesses"] = serde_json::json!({"pi":{"bash":blocked}});
+            } else {
+                document["bash"] = blocked;
+            }
+            let result = super::resolve_config_for_harness(
+                &[tier("user", &document.to_string())],
+                Some(&crate::harness::Harness::Pi),
+            );
+            assert!(result
+                .errors
+                .iter()
+                .any(|error| error.contains("blocked bash.env key BASH_ENV")));
+            assert_eq!(result.config.cache_dir, Some("/cache/base".into()));
+            assert!(result.config.cache_config_unknown.is_some());
+            assert!(result.config.bash.env.is_empty());
+        }
+    }
+
+    #[test]
+    fn storage_cache_dir_relative_stays_unavailable_without_redirecting() {
+        let result = super::resolve_config(&[super::ConfigTier {
+            tier: "user".into(),
+            source: "user".into(),
+            doc: r#"{"storage":{"cache_dir":"relative"}}"#.into(),
+        }]);
+        assert_eq!(
+            result.config.cache_dir,
+            Some(std::path::PathBuf::from("relative"))
+        );
+        assert!(result.config.cache_unavailable.is_some());
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "cache_dir_unavailable"
+                && warning
+                    .message
+                    .contains("AFT is running without its caches until it is back.")));
+    }
+
+    #[test]
+    fn storage_cache_dir_expands_tilde_before_absolute_validation() {
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(std::path::PathBuf::from)
+            .unwrap();
+        let result = super::resolve_config(&[super::ConfigTier {
+            tier: "user".into(),
+            source: "user".into(),
+            doc: r#"{"storage":{"cache_dir":"~/aft-cache"}}"#.into(),
+        }]);
+        assert_eq!(result.config.cache_dir, Some(home.join("aft-cache")));
+        assert!(!result
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "cache_dir_unavailable"));
+    }
     use super::*;
 
     #[test]
@@ -3821,24 +4473,217 @@ mod tests {
     }
 
     #[test]
-    fn bash_env_is_user_only_and_project_values_are_dropped() {
+    fn bash_env_keeps_user_and_project_maps_apart() {
+        // A project's values are no longer dropped: they are validated and
+        // carried in `project_env`, which `commands/bash.rs` applies only while
+        // the project root is trusted.
         let result = resolve_config(&[
             tier(
                 "user",
-                r#"{"bash":{"env":{"TZ":"UTC","AFT_CONFIG_ENV":"from-user"}}}"#,
+                r#"{"bash":{"env":{"TZ":"UTC","SOME_USER_ENV":"from-user"}}}"#,
             ),
             tier(
                 "project",
-                r#"{"bash":{"env":{"TZ":"Mars","AFT_PROJECT_ENV":"from-project"}}}"#,
+                r#"{"bash":{"env":{"TZ":"Mars","SOME_PROJECT_ENV":"from-project"}}}"#,
             ),
         ]);
 
         assert!(result.errors.is_empty(), "{:?}", result.errors);
-        let serialized = serde_json::to_value(&result.config).unwrap();
-        assert_eq!(serialized["bash"]["env"]["TZ"], "UTC");
-        assert_eq!(serialized["bash"]["env"]["AFT_CONFIG_ENV"], "from-user");
-        assert!(serialized["bash"]["env"].get("AFT_PROJECT_ENV").is_none());
-        assert!(result.dropped.iter().any(|drop| drop.key == "bash.env"));
+        assert_eq!(
+            result.config.bash.env.get("TZ").map(String::as_str),
+            Some("UTC")
+        );
+        assert_eq!(
+            result
+                .config
+                .bash
+                .env
+                .get("SOME_USER_ENV")
+                .map(String::as_str),
+            Some("from-user")
+        );
+        assert!(!result.config.bash.env.contains_key("SOME_PROJECT_ENV"));
+        assert_eq!(
+            result.config.bash.project_env.get("TZ").map(String::as_str),
+            Some("Mars")
+        );
+        assert_eq!(
+            result
+                .config
+                .bash
+                .project_env
+                .get("SOME_PROJECT_ENV")
+                .map(String::as_str),
+            Some("from-project")
+        );
+        assert!(!result.dropped.iter().any(|drop| drop.key == "bash.env"));
+    }
+
+    #[test]
+    fn bash_env_harness_block_merges_names_into_the_base_map() {
+        // A harness block adds or replaces single names; it no longer replaces
+        // the whole map, which used to drop every base name silently.
+        let result = resolve_config_for_harness(
+            &[tier(
+                "user",
+                r#"{
+                  "bash": { "env": { "BASE_NAME": "base", "SHARED_NAME": "base" } },
+                  "harnesses": { "opencode": { "bash": { "env": { "HARNESS_NAME": "harness", "SHARED_NAME": "harness" } } } }
+                }"#,
+            )],
+            Some(&Harness::Opencode),
+        );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let env = &result.config.bash.env;
+        assert_eq!(env.get("BASE_NAME").map(String::as_str), Some("base"));
+        assert_eq!(env.get("HARNESS_NAME").map(String::as_str), Some("harness"));
+        assert_eq!(env.get("SHARED_NAME").map(String::as_str), Some("harness"));
+    }
+
+    #[test]
+    fn bash_runon_env_is_user_only() {
+        let result = resolve_config(&[
+            tier(
+                "user",
+                r#"{"bash":{"env":{"TZ":"UTC"},"runon_env":["TZ"]}}"#,
+            ),
+            tier(
+                "project",
+                r#"{"bash":{"env":{"IBToolNeverDeque":"1"},"runon_env":["IBToolNeverDeque"]}}"#,
+            ),
+        ]);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.config.bash.runon_env, ["TZ"]);
+        assert!(
+            result
+                .dropped
+                .iter()
+                .any(|drop| drop.key == "bash.runon_env"),
+            "{:?}",
+            result.dropped
+        );
+    }
+
+    #[test]
+    fn bash_env_null_value_rejects_the_candidate() {
+        let project = tier("project", r#"{"bash":{"env":{"TZ":null}}}"#);
+        let result = resolve_config(std::slice::from_ref(&project));
+        assert_eq!(result.errors, ["invalid_security_config:bash"]);
+        let strict = strict_tier_error(&project, None).unwrap_or_default();
+        assert!(strict.contains("invalid type: null"), "{strict}");
+    }
+
+    /// One representative name per refused group, at each tier and each place
+    /// a tier can write it. The expectation is a rejected candidate whose error
+    /// names the key.
+    #[test]
+    fn refused_bash_env_names_reject_the_candidate_at_every_tier() {
+        // (name, refused at user tier, refused at project tier)
+        let cases: &[(&str, bool, bool)] = &[
+            ("PATH", true, true),
+            ("LD_PRELOAD", true, true),
+            ("path", true, true),
+            ("HOME", true, true),
+            ("XDG_CONFIG_HOME", true, true),
+            ("NODE_PATH", true, true),
+            ("Git_Config_Count", true, true),
+            ("GIT_DIR", true, true),
+            ("aft_x", true, true),
+            ("SUBC_X", true, true),
+            ("SCCACHE_DIR", true, true),
+            ("RUST_TEST_THREADS", true, true),
+            ("NEXTEST_TEST_THREADS", true, true),
+            ("RUSTC_WRAPPER", true, true),
+            ("AFT_INTERNAL_LINUX_SCOPE", true, true),
+            // Project-tier-only: the user's own file may set them.
+            ("API_KEY", false, true),
+            ("NPM_TOKEN", false, true),
+            ("AWS_PROFILE", false, true),
+            ("GH_HOST", false, true),
+            ("SSH_AUTH_SOCK", false, true),
+            ("HTTPS_PROXY", false, true),
+            ("NODE_EXTRA_CA_CERTS", false, true),
+        ];
+
+        for (name, refused_user, refused_project) in cases {
+            for in_harness in [false, true] {
+                let doc = |name: &str| {
+                    let env = format!(r#""env": {{ "{name}": "value" }}"#);
+                    if in_harness {
+                        format!(r#"{{ "harnesses": {{ "opencode": {{ "bash": {{ {env} }} }} }} }}"#)
+                    } else {
+                        format!(r#"{{ "bash": {{ {env} }} }}"#)
+                    }
+                };
+                for (tier_name, refused) in [("user", *refused_user), ("project", *refused_project)]
+                {
+                    let config_tier = tier(tier_name, &doc(name));
+                    let result = resolve_config_for_harness(
+                        std::slice::from_ref(&config_tier),
+                        Some(&Harness::Opencode),
+                    );
+                    let where_set = if in_harness {
+                        " in harnesses.opencode"
+                    } else {
+                        ""
+                    };
+                    if refused {
+                        assert_eq!(
+                            result.errors.len(),
+                            1,
+                            "{tier_name} {name}{where_set}: {:?}",
+                            result.errors
+                        );
+                        let error = &result.errors[0];
+                        // Whichever block carried the name, the error names it.
+                        assert!(
+                            error.contains(&format!("key {name}")),
+                            "{tier_name} {name}{where_set}: {error}"
+                        );
+                        let strict = strict_tier_error(&config_tier, Some(&Harness::Opencode))
+                            .unwrap_or_default();
+                        if in_harness {
+                            assert!(strict.contains("in harnesses.opencode"), "{strict}");
+                        } else {
+                            assert!(strict.contains(&format!("key {name}")), "{strict}");
+                        }
+                    } else {
+                        assert!(
+                            result.errors.is_empty(),
+                            "{tier_name} {name}{where_set} must be accepted: {:?}",
+                            result.errors
+                        );
+                        let kept = match tier_name {
+                            "user" => result.config.bash.env.contains_key(*name),
+                            _ => result.config.bash.project_env.contains_key(*name),
+                        };
+                        assert!(kept, "{tier_name} {name}{where_set} must be kept");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn refused_project_bash_env_name_rejects_even_though_the_project_is_untrusted() {
+        // Validation is trust-blind: a bad commit fails for its author at once
+        // rather than on the first machine that trusts it.
+        let result = resolve_config(&[
+            tier("user", "{}"),
+            tier("project", r#"{"bash":{"env":{"API_KEY":"x"}}}"#),
+        ]);
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        assert!(result.errors[0].contains("API_KEY"), "{:?}", result.errors);
+    }
+
+    #[test]
+    fn bash_env_names_differing_only_by_case_in_one_tier_are_not_tested_here() {
+        // Two names that differ only by case collapse into one on Windows, so
+        // the maps are keyed by name; this test pins that a single name is
+        // still reported once rather than as a duplicate.
+        let result = resolve_config(&[tier("user", r#"{"bash":{"env":{"TZ":"UTC"}}}"#)]);
+        assert_eq!(result.config.bash.env.len(), 1);
+        assert!(result.config.bash.project_env.is_empty());
     }
 
     #[test]
@@ -5050,7 +5895,7 @@ mod tests {
     }
 
     #[test]
-    fn config_resolve_unknown_top_level_key_is_dropped_but_rest_survives() {
+    fn config_resolve_unrelated_unknown_user_key_keeps_lenient_defaults() {
         let result = resolve_config(&[tier(
             "user",
             r#"{ "not_a_real_key": true, "indexes": { "trigram": true } }"#,
@@ -5058,6 +5903,8 @@ mod tests {
 
         assert!(result.config.indexes.trigram);
         assert!(result.dropped.is_empty());
+        assert!(result.errors.is_empty(), "{result:?}");
+        assert!(result.config.cache_config_unknown.is_none());
     }
 
     #[test]

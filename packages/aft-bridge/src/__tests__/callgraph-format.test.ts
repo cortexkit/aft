@@ -6,16 +6,130 @@ import {
 } from "../callgraph-format.js";
 
 describe("formatCallgraphSections", () => {
+  test("callgraph approved callback count lines preserve singular plural and plain counts", () => {
+    for (const [total, references, callerHeading, impactHeading] of [
+      [1, 0, "1 caller · 1 file group", "1 affected call site · 1 file"],
+      [2, 0, "2 callers · 1 file group", "2 affected call sites · 1 file"],
+      [
+        1,
+        1,
+        "1 caller (1 by callback reference) · 1 file group",
+        "1 affected site (1 by callback reference) · 1 file",
+      ],
+      [
+        2,
+        1,
+        "2 callers (1 by callback reference) · 1 file group",
+        "2 affected sites (1 by callback reference) · 1 file",
+      ],
+      [
+        2,
+        2,
+        "2 callers (2 by callback reference) · 1 file group",
+        "2 affected sites (2 by callback reference) · 1 file",
+      ],
+    ] as const) {
+      const rows = Array.from({ length: total }, (_, index) => ({
+        symbol: `process${index}`,
+        caller_symbol: `process${index}`,
+        caller_file: "main.ts",
+        line: index + 1,
+        relation: index < references ? "callback_reference" : undefined,
+      }));
+      const callback = {
+        callback_dependencies: references,
+        callback_reference_label: " (callback reference)",
+      };
+      expect(
+        formatCallgraphSections("callers", {
+          ...callback,
+          total_callers: total,
+          callers: [{ file: "main.ts", callers: rows }],
+        })[0],
+      ).toBe(callerHeading);
+      expect(
+        formatCallgraphSections("impact", {
+          ...callback,
+          total_affected: total,
+          affected_files: 1,
+          callers: rows,
+        })[0],
+      ).toBe(impactHeading);
+    }
+  });
+  test("callgraph callback dependencies preserve direct and reference rows", () => {
+    const data = {
+      callback_dependencies: 1,
+      callback_reference_label: " (callback reference)",
+      total_callers: 2,
+      callers: [
+        {
+          file: "main.ts",
+          callers: [
+            { symbol: "process", line: 2 },
+            { symbol: "process", line: 2, relation: "callback_reference" },
+          ],
+        },
+      ],
+    };
+    expect(formatCallgraphSections("callers", data).join("\n")).toBe(
+      "2 callers (1 by callback reference) · 1 file group\nmain.ts\n  ↳ process:2\n  ↳ process:2 (callback reference)",
+    );
+    expect(
+      formatCallgraphSections("impact", {
+        callback_dependencies: 1,
+        callback_reference_label: data.callback_reference_label,
+        total_affected: 1,
+        affected_files: 1,
+        callers: [
+          {
+            caller_file: "main.ts",
+            caller_symbol: "process",
+            line: 2,
+            relation: "callback_reference",
+            call_expression: "items.map(transform);",
+          },
+        ],
+      }).join("\n"),
+    ).toBe(
+      "1 affected site (1 by callback reference) · 1 file\nmain.ts:2\n  ↳ process (callback reference)\n  items.map(transform);",
+    );
+  });
+
+  test("callgraph inline test counts and unknown classifications stay visible", () => {
+    for (const op of ["callers", "impact"]) {
+      const data = {
+        hidden_test_callers: 1,
+        total_callers: 2,
+        total_affected: 2,
+        affected_files: 1,
+        test_filter_note:
+          "Test filtering incomplete: AFT could not tell whether 1 caller site is test code, so it is still shown.",
+        callers:
+          op === "callers"
+            ? [{ file: "lib.rs", callers: [{ symbol: "live", line: 2 }] }]
+            : [{ caller_file: "lib.rs", caller_symbol: "live", line: 2 }],
+      };
+      const row =
+        op === "callers"
+          ? "1 caller · 1 file group\nlib.rs\n  ↳ live:2"
+          : "1 affected call site · 1 file\nlib.rs:2\n  ↳ live";
+      expect(formatCallgraphSections(op, data).join("\n")).toBe(
+        `${data.test_filter_note}\n${row}\n1 callers in tests hidden — includeTests: true shows them`,
+      );
+    }
+  });
+
   test("empty callers and impact warn when receiver resolution is incomplete", () => {
     const reason =
-      "Incomplete: 2 unresolved method call sites; use grep before concluding there are no callers";
+      "Incomplete: 2 call sites in the analyzed Rust code could not be resolved, so a dynamic or indirect call may still reach `target`.";
     for (const op of ["callers", "impact"]) {
       const sections = formatCallgraphSections(op, {
         callers: [],
         total_callers: 0,
         total_affected: 0,
         complete: false,
-        unresolved_method_calls: 2,
+        unresolved_call_sites: 2,
         incomplete_reason: reason,
       });
       expect(sections[0]).toBe(reason);

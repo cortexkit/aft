@@ -46,14 +46,15 @@ const RUST_ANALYZER_WORKER_PROCESS_CAP: usize = 2;
 
 #[derive(Debug)]
 pub(crate) struct RustAnalyzerCapacityExhausted {
-    cap: usize,
+    pub(super) cap: usize,
+    pub(super) current: usize,
 }
 
 impl std::fmt::Display for RustAnalyzerCapacityExhausted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f,
-            "rust_analyzer_capacity_exhausted: daemon-wide worker-policy rust-analyzer process cap={} reached; retry after another worker analyzer stops",
-            self.cap)
+            "rust_analyzer_capacity_exhausted: daemon-wide worker-policy rust-analyzer process cap={} reached (current={}); retry after another worker analyzer stops",
+            self.cap, self.current)
     }
 }
 
@@ -72,7 +73,10 @@ impl RustAnalyzerCapacity {
         if *active >= self.cap {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                RustAnalyzerCapacityExhausted { cap: self.cap },
+                RustAnalyzerCapacityExhausted {
+                    cap: self.cap,
+                    current: *active,
+                },
             ));
         }
         *active += 1;
@@ -417,7 +421,80 @@ pub enum ServerState {
     Exited,
 }
 
-/// Events sent from background reader threads into the main loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ServerInstanceId(u64);
+
+impl ServerInstanceId {
+    pub(crate) fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self::allocate(&NEXT)
+    }
+
+    fn allocate(counter: &AtomicU64) -> Self {
+        // Rust 1.92 predates try_update; an explicit CAS loop also avoids the
+        // deprecated fetch_update API on newer toolchains.
+        let mut id = counter.load(Ordering::Relaxed);
+        loop {
+            let next = id
+                .checked_add(1)
+                .expect("LSP server instance ids exhausted");
+            match counter.compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return Self(id),
+                Err(observed) => id = observed,
+            }
+        }
+    }
+}
+
+/// A manager receipt identifies the server instance whose reader produced the
+/// event. Managed readers always stamp it before enqueueing; startup deferral,
+/// replay and runtime dispatch must preserve it so a retired reader cannot
+/// mutate or signal for a replacement. Only manager-local observations and
+/// synthetic test events may omit the instance; public standalone events keep
+/// their payload shape and never enter the manager's channel directly.
+#[derive(Debug, Clone)]
+pub(crate) struct ReceivedLspEvent {
+    pub(crate) event: LspEvent,
+    pub(crate) instance: Option<ServerInstanceId>,
+}
+
+impl From<LspEvent> for ReceivedLspEvent {
+    fn from(event: LspEvent) -> Self {
+        Self {
+            event,
+            instance: None,
+        }
+    }
+}
+
+pub(crate) enum LspEventSender {
+    Standalone(Sender<LspEvent>),
+    Managed {
+        sender: Sender<ReceivedLspEvent>,
+        instance: ServerInstanceId,
+    },
+}
+
+impl LspEventSender {
+    fn send(&self, event: LspEvent) -> Result<(), ()> {
+        match self {
+            Self::Standalone(sender) => sender.send(event).map_err(|_| ()),
+            Self::Managed { sender, instance } => {
+                #[cfg(all(test, unix))]
+                super::manager::instance_regression_tests::pause_reader(*instance);
+                sender
+                    .send(ReceivedLspEvent {
+                        event,
+                        instance: Some(*instance),
+                    })
+                    .map_err(|_| ())
+            }
+        }
+    }
+}
+
+/// Events sent from background reader threads into the main loop. Manager-owned
+/// readers send these payloads inside a private instance-stamped receipt.
 #[derive(Debug, Clone)]
 pub enum LspEvent {
     /// A manager-owned document pull completed; the epoch prevents a later
@@ -691,6 +768,8 @@ fn stderr_tail_for_log(stderr_tail: &str) -> String {
 /// - `workspace_diagnostics` → use `workspace/diagnostic` for directory mode
 ///
 /// Defaults are conservative: `false` means "fall back to push semantics".
+/// Workspace diagnostic `refreshSupport` is advertised by the client, not the
+/// server. Initialize responses therefore cannot populate refresh support here.
 #[derive(Debug, Clone, Default)]
 pub struct ServerDiagnosticCapabilities {
     /// Server supports `textDocument/diagnostic` (LSP 3.17 per-file pull).
@@ -700,10 +779,6 @@ pub struct ServerDiagnosticCapabilities {
     /// `identifier` field from server's diagnosticProvider, if any.
     /// Used to scope previousResultId tracking when multiple servers share a file.
     pub identifier: Option<String>,
-    /// Whether the server requested workspace diagnostic refresh notifications.
-    /// We declare `refreshSupport: false` in our client capabilities so this
-    /// should always be false in practice — kept for completeness.
-    pub refresh_support: bool,
 }
 
 /// rust-analyzer analysis state saved when AFT requests a workspace reload,
@@ -898,6 +973,7 @@ impl WorkDoneAnalysis {
 
 /// A client connected to one language server process.
 pub struct LspClient {
+    pub(crate) instance: ServerInstanceId,
     analysis_progress: WorkDoneAnalysis,
     pub(crate) runtime_note: Option<String>,
     pub(crate) rust_cargo_disabled_for_worker: bool,
@@ -915,6 +991,8 @@ pub struct LspClient {
 
     /// Pending request responses, keyed by request ID.
     pending: Arc<Mutex<PendingMap>>,
+    /// Last outbound request or document open/change/save, not server-pushed traffic.
+    last_used_at: Instant,
     /// Next request ID counter.
     next_id: AtomicI64,
     /// Diagnostic capabilities reported by the server in its initialize response.
@@ -991,11 +1069,6 @@ pub struct LspClient {
     /// Wall-clock rather than `Instant` because it is compared with file
     /// modification times.
     workspace_loaded_at: SystemTime,
-    /// Whether the server advertised static `workspace.didChangeWatchedFiles`
-    /// support during `initialize`. Dynamic registration is tracked separately
-    /// in `watched_file_registrations`; either path permits notifications.
-    /// Intentional default: `false` (conservative — requires server opt-in).
-    supports_watched_files: bool,
     /// Dynamic `workspace/didChangeWatchedFiles` registrations requested by
     /// the server via `client/registerCapability`. Per LSP, the client must
     /// not send watched-file notifications merely because a server mentions
@@ -1040,7 +1113,7 @@ impl LspClient {
             binary,
             args,
             env,
-            event_tx,
+            LspEventSender::Standalone(event_tx),
             child_registry,
             None,
             false,
@@ -1054,7 +1127,7 @@ impl LspClient {
         binary: &Path,
         args: &[String],
         env: &HashMap<String, String>,
-        event_tx: Sender<LspEvent>,
+        event_tx: LspEventSender,
         child_registry: LspChildRegistry,
         reclaim_root: Option<&Path>,
         worker_policy: bool,
@@ -1079,12 +1152,16 @@ impl LspClient {
         binary: &Path,
         args: &[String],
         env: &HashMap<String, String>,
-        event_tx: Sender<LspEvent>,
+        event_tx: LspEventSender,
         child_registry: LspChildRegistry,
         reclaim_root: Option<&Path>,
         worker_policy: bool,
         capacity: &Arc<RustAnalyzerCapacity>,
     ) -> io::Result<Self> {
+        let instance = match &event_tx {
+            LspEventSender::Standalone(_) => ServerInstanceId::next(),
+            LspEventSender::Managed { instance, .. } => *instance,
+        };
         let worker_policy = kind == ServerKind::Rust && worker_policy;
         let rust_analyzer_permit = worker_policy.then(|| capacity.acquire()).transpose()?;
         #[cfg(windows)]
@@ -1279,20 +1356,13 @@ impl LspClient {
                         // we respond. If we don't respond, the server won't send
                         // responses to OUR pending requests → deadlock.
                         //
-                        // Dispatch by method to return correct types:
-                        // - workspace/configuration expects Vec<Value> (one per item)
-                        // - Everything else gets null (safe default for registration/progress)
-                        let response_value = if method == "workspace/configuration" {
-                            workspace_configuration_response(
-                                &reader_kind,
-                                &reader_root,
-                                params.as_ref(),
-                            )
-                        } else {
-                            serde_json::Value::Null
-                        };
-                        let response =
-                            super::jsonrpc::OutgoingResponse::success(id.clone(), response_value);
+                        let response = server_request_response(
+                            &reader_kind,
+                            &reader_root,
+                            id.clone(),
+                            &method,
+                            params.as_ref(),
+                        );
                         if let Ok(payload) = serde_json::to_string(&response) {
                             // The FIFO writer must queue registration acknowledgement
                             // before any caller can queue a diagnostic pull.
@@ -1315,6 +1385,13 @@ impl LspClient {
                             params,
                         });
                     }
+                    Err(error) if transport::is_message_parse_error(&error) => {
+                        // The complete body was consumed, so the next frame is
+                        // still readable. Null-ID parse-error replies also have
+                        // no pending request to satisfy.
+                        reader_writer.note_received();
+                        log::warn!("ignoring invalid LSP message body: {error}");
+                    }
                     terminal @ (Ok(None) | Err(_)) => {
                         if let Ok(mut guard) = reader_pending.lock() {
                             guard.clear();
@@ -1334,6 +1411,7 @@ impl LspClient {
         let rust_analyzer_quiescent = !matches!(&kind, ServerKind::Rust);
         child_registry.mark_client_live(child_pid);
         Ok(Self {
+            instance,
             _rust_analyzer_permit: rust_analyzer_permit,
             rust_cargo_disabled_for_worker: worker_policy,
             runtime_note: None,
@@ -1344,6 +1422,7 @@ impl LspClient {
             child_pid,
             writer,
             pending,
+            last_used_at: Instant::now(),
             next_id: AtomicI64::new(1),
             diagnostic_caps: None,
             diagnostic_registrations,
@@ -1368,7 +1447,6 @@ impl LspClient {
             rust_checks_on_save: false,
             rust_checks_on_load: false,
             workspace_loaded_at,
-            supports_watched_files: false,
             watched_file_registrations,
             child_registry,
             stderr_tail,
@@ -1531,20 +1609,6 @@ impl LspClient {
         let checks = matches!(&self.kind, ServerKind::Rust) && self.save_notification.is_some();
         self.rust_checks_on_save = checks && checks_on_save;
         self.rust_checks_on_load = checks && checks_on_load;
-
-        // Capture initialize-time (static) workspace/didChangeWatchedFiles
-        // support. Runtime client/registerCapability subscriptions are recorded
-        // separately by the reader thread. Missing capability is unsupported by
-        // default; callers must not send notifications unless one of those two
-        // server opt-in paths is present.
-        self.supports_watched_files = caps_value
-            .pointer("/workspace/didChangeWatchedFiles/dynamicRegistration")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-            || caps_value
-                .pointer("/workspace/didChangeWatchedFiles")
-                .map(|v| v.is_object() || v.as_bool() == Some(true))
-                .unwrap_or(false);
 
         self.send_notification::<lsp_types::notification::Initialized>(serde_json::from_value(
             json!({}),
@@ -1917,14 +1981,21 @@ impl LspClient {
     /// published so far describe the files before the save; see
     /// [`Self::rust_check_state`].
     pub(crate) fn record_save_sent(&mut self, uri: &lsp_types::Uri) {
+        self.record_save_sent_at(
+            uri,
+            Instant::now(),
+            self.rust_check_begins_read.load(Ordering::SeqCst),
+        );
+    }
+
+    fn record_save_sent_at(&mut self, uri: &lsp_types::Uri, at: Instant, begins_read: u64) {
         if self.rust_checks_on_save {
-            let now = Instant::now();
             self.rust_save = Some(RustSaveRequest {
                 uri: uri.clone(),
                 due_at: None,
-                last_sent_at: Some(now),
+                last_sent_at: Some(at),
                 sends: 1,
-                begins_read_at_send: Some(self.rust_check_begins_read.load(Ordering::SeqCst)),
+                begins_read_at_send: Some(begins_read),
             });
         }
     }
@@ -2112,11 +2183,10 @@ impl LspClient {
         true
     }
 
-    /// Whether the server advertised initialize-time
-    /// `workspace/didChangeWatchedFiles` support. Dynamic registrations are
-    /// reported by `has_watched_file_registration()`.
+    /// Whether the server has registered for watched-file notifications.
+    /// `didChangeWatchedFiles` is a client capability, not a static server capability.
     pub fn supports_watched_files(&self) -> bool {
-        self.supports_watched_files
+        self.has_watched_file_registration()
     }
 
     /// Whether this server currently has an active dynamic watched-file
@@ -2130,9 +2200,8 @@ impl LspClient {
     }
 
     /// Every watcher from the server's current dynamic registrations, or
-    /// `None` when it holds none. `None` is different from an empty set: a
-    /// server that only advertised initialize-time support never said which
-    /// files it cares about, so the caller chooses a filter for it.
+    /// `None` when it holds none. An empty registered set still represents an
+    /// active subscription, but matches no files.
     pub(crate) fn registered_file_watchers(&self) -> Option<RegisteredFileWatchers> {
         let registrations = self.watched_file_registrations.lock().ok()?;
         if registrations.is_empty() {
@@ -2226,11 +2295,13 @@ impl LspClient {
             pending.insert(id.clone(), tx);
         }
 
+        let received_before_request = self.writer.received_count();
         let request = Request::new(id.clone(), method, Some(serde_json::to_value(params)?));
         if let Err(err) = self.writer.send(serde_json::to_string(&request)?) {
             self.remove_pending(&id);
             return Err(err);
         }
+        self.last_used_at = Instant::now();
         Ok(PendingLspRequest {
             id,
             method,
@@ -2238,7 +2309,41 @@ impl LspClient {
             rx,
             pending: Arc::clone(&self.pending),
             writer: self.writer.clone(),
+            received_before_request,
         })
+    }
+
+    /// Clone the installed writer and rust-analyzer check-begin counter for
+    /// startup replay. The worker captures each save's write time and current
+    /// counter value without waiting for the manager lock.
+    pub(crate) fn startup_notification_writer(
+        &self,
+    ) -> Result<(LspWriter, Arc<AtomicU64>), LspError> {
+        self.ensure_can_send()?;
+        Ok((
+            self.writer.clone(),
+            Arc::clone(&self.rust_check_begins_read),
+        ))
+    }
+
+    pub(crate) fn record_startup_sync(
+        &mut self,
+        uri: &lsp_types::Uri,
+        opened: bool,
+        saved: Option<(Instant, u64)>,
+    ) {
+        self.last_used_at = Instant::now();
+        self.note_analysis_document(
+            if opened {
+                "textDocument/didOpen"
+            } else {
+                "textDocument/didChange"
+            },
+            &json!({"textDocument": {"uri": uri.as_str()}}),
+        );
+        if let Some((at, begins_read)) = saved {
+            self.record_save_sent_at(uri, at, begins_read);
+        }
     }
 
     /// Send a notification (fire-and-forget).
@@ -2251,6 +2356,12 @@ impl LspClient {
         let params = serde_json::to_value(params)?;
         let notification = Notification::new(N::METHOD, Some(params));
         self.writer.send(serde_json::to_string(&notification)?)?;
+        if matches!(
+            N::METHOD,
+            "textDocument/didOpen" | "textDocument/didChange" | "textDocument/didSave"
+        ) {
+            self.last_used_at = Instant::now();
+        }
         self.note_analysis_document(N::METHOD, notification.params.as_ref().unwrap());
         Ok(())
     }
@@ -2258,7 +2369,24 @@ impl LspClient {
     /// Write an already serialized notification.
     fn send_serialized_notification(&mut self, json: &str) -> Result<(), LspError> {
         self.ensure_can_send()?;
-        self.writer.send(json.to_string())
+        self.writer.send(json.to_string())?;
+        self.last_used_at = Instant::now();
+        Ok(())
+    }
+
+    pub(crate) fn last_used_at(&self) -> Instant {
+        self.last_used_at
+    }
+
+    pub(crate) fn has_pending_requests(&self) -> bool {
+        self.pending
+            .lock()
+            .map_or(true, |pending| !pending.is_empty())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_last_used_at_for_test(&mut self, at: Instant) {
+        self.last_used_at = at;
     }
 
     /// Send `textDocument/didChange` carrying the whole document (see
@@ -2626,6 +2754,7 @@ pub(crate) struct PendingLspRequest {
     rx: crossbeam_channel::Receiver<JsonRpcResponse>,
     pending: Arc<Mutex<PendingMap>>,
     writer: LspWriter,
+    received_before_request: u64,
 }
 
 impl PendingLspRequest {
@@ -2640,7 +2769,7 @@ impl PendingLspRequest {
                 let notification =
                     Notification::new("$/cancelRequest", Some(json!({ "id": self.id })));
                 self.writer
-                    .mark_unresponsive_if_silent(self.writer.received_count());
+                    .mark_unresponsive_if_silent(self.received_before_request);
                 self.writer
                     .send_best_effort(serde_json::to_string(&notification)?);
                 return Err(LspError::Timeout(format!(
@@ -2863,6 +2992,36 @@ fn workspace_configuration_response(
     })
 }
 
+fn server_request_response(
+    kind: &ServerKind,
+    root: &Path,
+    id: RequestId,
+    method: &str,
+    params: Option<&Value>,
+) -> Value {
+    let result = match method {
+        "workspace/configuration" => workspace_configuration_response(kind, root, params),
+        "workspace/workspaceFolders" => match path_to_uri(root) {
+            Ok(uri) => json!([{
+                "uri": uri.as_str(),
+                "name": root.file_name().and_then(|name| name.to_str()).unwrap_or("workspace")
+            }]),
+            Err(_) => Value::Null,
+        },
+        "workspace/applyEdit" => json!({ "applied": false }),
+        "window/showDocument" => json!({ "success": false }),
+        "client/registerCapability"
+        | "client/unregisterCapability"
+        | "window/workDoneProgress/create"
+        | "workspace/diagnostic/refresh" => Value::Null,
+        _ => {
+            return json!({ "jsonrpc": "2.0", "id": id,
+            "error": { "code": -32601, "message": "Method not found" } })
+        }
+    };
+    json!({ "jsonrpc": "2.0", "id": id, "result": result })
+}
+
 fn project_python_path(root: &Path) -> Option<PathBuf> {
     [root.join(".venv"), root.join("venv")]
         .into_iter()
@@ -2917,23 +3076,48 @@ fn parse_diagnostic_capabilities(value: &Value) -> ServerDiagnosticCapabilities 
         }
     }
 
-    // Workspace diagnostic refresh (rare — most servers don't request this,
-    // and we declared refreshSupport=false in our client capabilities anyway).
-    if let Some(refresh) = value
-        .get("workspace")
-        .and_then(|w| w.get("diagnostic"))
-        .and_then(|d| d.get("refreshSupport"))
-        .and_then(|r| r.as_bool())
-    {
-        caps.refresh_support = refresh;
-    }
-
     caps
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_capacity_refusal_reports_cap_and_current_count() {
+        let capacity = Arc::new(RustAnalyzerCapacity {
+            cap: 1,
+            active: Mutex::new(0),
+        });
+        let permit = capacity.acquire().unwrap();
+        let error = capacity.acquire().err().unwrap();
+        let refused = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<RustAnalyzerCapacityExhausted>()
+            .unwrap();
+        assert_eq!(refused.cap, 1);
+        assert_eq!(refused.current, 1);
+        assert!(error.to_string().contains("cap=1 reached (current=1)"));
+        drop(permit);
+        assert!(capacity.acquire().is_ok());
+    }
+
+    #[test]
+    fn server_instance_allocator_preserves_the_exhaustion_boundary() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(
+            ServerInstanceId::allocate(&counter),
+            ServerInstanceId(u64::MAX - 1)
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        assert!(std::panic::catch_unwind(|| ServerInstanceId::allocate(&counter)).is_err());
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            u64::MAX,
+            "exhausted ids must never wrap or be reused"
+        );
+    }
 
     #[test]
     fn analysis_progress_end_before_publication_cannot_certify_the_report() {
@@ -3041,6 +3225,47 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     #[test]
+    fn server_requests_receive_protocol_specific_responses() {
+        let root = tempfile::tempdir().unwrap();
+        let response = |method| {
+            server_request_response(
+                &ServerKind::Rust,
+                root.path(),
+                RequestId::Int(42),
+                method,
+                None,
+            )
+        };
+        let folders = response("workspace/workspaceFolders");
+        assert_eq!(
+            folders["result"][0]["uri"],
+            path_to_uri(root.path()).unwrap().as_str()
+        );
+        assert_eq!(
+            response("workspace/applyEdit")["result"],
+            json!({"applied": false})
+        );
+        assert_eq!(
+            response("window/showDocument")["result"],
+            json!({"success": false})
+        );
+        for method in [
+            "client/registerCapability",
+            "client/unregisterCapability",
+            "window/workDoneProgress/create",
+            "workspace/diagnostic/refresh",
+        ] {
+            let response = response(method);
+            assert_eq!(response["result"], Value::Null);
+            assert!(response.get("error").is_none());
+        }
+        let unknown = response("test/unsupported");
+        assert_eq!(unknown["id"], 42);
+        assert_eq!(unknown["error"]["code"], -32601);
+        assert!(unknown.get("result").is_none());
+    }
+
+    #[test]
     fn parse_caps_no_diagnostic_provider() {
         let value = json!({});
         let caps = parse_diagnostic_capabilities(&value);
@@ -3143,7 +3368,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_caps_workspace_refresh_support() {
+    fn server_capability_state_excludes_client_refresh_support() {
         let value = json!({
             "workspace": {
                 "diagnostic": {
@@ -3152,7 +3377,8 @@ mod tests {
             }
         });
         let caps = parse_diagnostic_capabilities(&value);
-        assert!(caps.refresh_support);
+        // refreshSupport belongs to the client, not to server capability state.
+        assert!(!format!("{caps:?}").contains("refresh_support"));
         // No diagnosticProvider → pull still false
         assert!(!caps.pull_diagnostics);
     }
@@ -3304,12 +3530,91 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn reader_recovers_after_consumed_invalid_bodies() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut frames = Vec::new();
+        for body in [
+            "{{{",
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}"#,
+            r#"{"jsonrpc":"2.0","id":1.5,"result":null}"#,
+            r#"{"jsonrpc":"2.0","method":"test/recovered","params":{}}"#,
+        ] {
+            transport::write_message(&mut frames, body).unwrap();
+        }
+        let script = format!(
+            "printf '%s' '{}'; exec sleep 60",
+            String::from_utf8(frames).unwrap()
+        );
+        let client = spawn_long_lived_client(
+            &script,
+            tx,
+            LspChildRegistry::new(),
+            tmp.path().to_path_buf(),
+        );
+        let event = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            matches!(event, LspEvent::Notification { method, .. } if method == "test/recovered"),
+            "consumed parse errors must not terminate the reader"
+        );
+        drop(client);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_timeout_preserves_responsiveness_after_traffic() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut client = spawn_long_lived_client(
+            "exec sleep 60",
+            tx,
+            LspChildRegistry::new(),
+            tmp.path().to_path_buf(),
+        );
+        client.state = ServerState::Ready;
+        let request = client.start_request_value("test/pending", ()).unwrap();
+        client.writer.note_received();
+        assert!(matches!(
+            request.wait(Duration::ZERO),
+            Err(LspError::Timeout(_))
+        ));
+        assert!(
+            !client.writer.is_unresponsive(),
+            "traffic during a request is not silence"
+        );
+        assert!(client.pending.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_timeout_marks_a_silent_server_unresponsive() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut client = spawn_long_lived_client(
+            "exec sleep 60",
+            tx,
+            LspChildRegistry::new(),
+            tmp.path().to_path_buf(),
+        );
+        client.state = ServerState::Ready;
+        let request = client.start_request_value("test/pending", ()).unwrap();
+        assert!(matches!(
+            request.wait(Duration::ZERO),
+            Err(LspError::Timeout(_))
+        ));
+        assert!(client.writer.is_unresponsive());
+        client.writer.note_received();
+        assert!(!client.writer.is_unresponsive());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn reader_emits_read_error_for_malformed_frame() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let registry = LspChildRegistry::new();
         let tmp = tempfile::tempdir().unwrap();
         let client = spawn_long_lived_client(
-            "printf 'Content-Length: 3\r\n\r\n{{{'; exec sleep 60",
+            "printf 'Content-Length: invalid\r\n\r\n'; exec sleep 60",
             tx,
             registry,
             tmp.path().to_path_buf(),
@@ -3345,6 +3650,58 @@ mod tests {
             other => panic!("expected Eof ServerExited, got {other:?}"),
         }
         drop(client);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_reaped_leader_still_cleans_live_descendant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let script = "sh -c \"trap '' TERM; echo \\$$ > desc.pid; touch ready; exec sleep 60\" & while [ ! -f ready ]; do sleep 0.02; done; exit 0";
+        let mut client = spawn_long_lived_client(
+            script,
+            tx,
+            LspChildRegistry::new(),
+            tmp.path().to_path_buf(),
+        );
+        assert!(
+            client.wait_for_exit(Duration::from_secs(5)).is_some(),
+            "leader must be reaped"
+        );
+        let pid: u32 = std::fs::read_to_string(tmp.path().join("desc.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        drop(client);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while crate::bash_background::process::is_process_alive(pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !crate::bash_background::process::is_process_alive(pid),
+            "descendant survived drop"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_reaped_empty_group_does_not_leave_a_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut client = spawn_long_lived_client(
+            "exit 0",
+            tx,
+            LspChildRegistry::new(),
+            tmp.path().to_path_buf(),
+        );
+        let pid = client.child_pid();
+        assert!(
+            client.wait_for_exit(Duration::from_secs(5)).is_some(),
+            "leader must be reaped"
+        );
+        drop(client);
+        assert!(!crate::bash_background::process::is_process_alive(pid));
     }
 
     #[cfg(unix)]

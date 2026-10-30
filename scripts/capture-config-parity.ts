@@ -88,6 +88,9 @@ function goldenParamsFromMerged(
   if (merged.gh_shim !== undefined) {
     params.gh_shim = merged.gh_shim;
   }
+  if (merged.storage?.cache_dir !== undefined) {
+    params.cache_dir = merged.storage.cache_dir;
+  }
   // The OpenCode prompt server is read by the plugin itself and is not a
   // configure param either; it is carried here so the Rust resolver's user-only
   // handling of it is compared against the TypeScript loader's.
@@ -168,6 +171,15 @@ function captureCase(caseDef: ParityCase, savedOpencodeConfigDir: string | undef
   }
 }
 
+// `storage.cache_dir` must be an absolute path, and `/aft-cache` is absolute on
+// macOS and Linux but not on Windows (no drive letter). Fixtures whose cache
+// directory is accepted therefore spell it under this placeholder; the Rust
+// parity test (config_parity_test.rs, `platform_fixture_text`) replaces it
+// with an absolute root for the platform it runs on, in both the tier files
+// and the golden. The TypeScript loader passes the string through unchanged.
+const ABSOLUTE_ROOT = "{ABSOLUTE_ROOT}";
+const USER_CACHE_DIR = `${ABSOLUTE_ROOT}/aft-cache`;
+
 const CASES: ParityCase[] = [
   { name: "pi_active_harness_ignored_auto_update_hardening", harness: "pi", user: { harnesses: { pi: { auto_update: "opaque", sandbox: { profile: { worker: "strict" } } } } } },
   { name: "malformed_security_sandbox", user: { sandbox: { profile: { worker: 5 } } } },
@@ -180,6 +192,53 @@ const CASES: ParityCase[] = [
   { name: "malformed_nonsecurity_inspect_partial", user: { inspect: { categories: { diagnostics: "off" } }, format_on_edit: true } },
   { name: "malformed_config_document", user: "{" },
   { name: "pi_malformed_config_document", harness: "pi", user: "{" },
+  // storage.cache_dir is not a security section: a malformed value turns caches
+  // off with a warning while the rest of the candidate applies.
+  { name: "malformed_storage_cache_dir_number", user: { storage: { cache_dir: 5 }, format_on_edit: true } },
+  { name: "malformed_storage_cache_dir_object", user: { storage: { cache_dir: { path: "/aft-cache" } }, format_on_edit: true } },
+  { name: "pi_malformed_storage_cache_dir_number", harness: "pi", user: { storage: { cache_dir: 5 }, format_on_edit: true } },
+  { name: "malformed_storage_cache_dir_project_dropped", user: { format_on_edit: true }, project: { storage: { cache_dir: 5 } } },
+  ...(["opencode", "pi"] as const).map((harness) => ({
+    name: `cache_dir_bash_env_trust_${harness}`,
+    harness,
+    user: {
+      storage: { cache_dir: USER_CACHE_DIR },
+      bash: { env: { TZ: "UTC" } },
+      harnesses: {
+        [harness]: {
+          storage: { cache_dir: "/ignored-cache" },
+          bash: { env: { TZ: "Etc/GMT" } },
+        },
+      },
+    },
+    project: {
+      storage: { cache_dir: "/evil-cache" },
+      // A project may not set bash.env; BASH_ENV itself is now a malformed
+      // value (#769 rejects the whole candidate), so an ordinary name is used.
+      bash: { env: { TZ: "project-top" } },
+      harnesses: {
+        [harness]: {
+          storage: { cache_dir: "/evil-harness-cache" },
+          bash: { env: { TZ: "project" } },
+        },
+      },
+    },
+  })),
+  ...(["opencode", "pi"] as const).flatMap((harness) => [
+    { name: `cache_dir_unrelated_unknown_${harness}`, harness, user: { future_feature: true, format_on_edit: true } },
+    { name: `cache_dir_unrelated_harness_unknown_${harness}`, harness, user: { harnesses: { [harness]: { future_option: true } } } },
+  ]),
+  ...(["opencode", "pi"] as const).flatMap((harness) => [
+    { name: `cache_dir_typo_section_${harness}`, harness, user: { storge: { cache_dir: "/aft-cache" } } },
+    { name: `cache_dir_typo_key_${harness}`, harness, user: { storage: { cachedir: "/aft-cache" } } },
+    { name: `cache_dir_typo_inactive_harness_${harness}`, harness, user: { harnesses: { future: { storge: { cache_dir: "/aft-cache" } } } } },
+    { name: `cache_dir_typo_harness_storage_${harness}`, harness, user: { harnesses: { future: { storage: { cachedir: "/aft-cache" } } } } },
+  ]),
+  { name: "cache_dir_user", user: { storage: { cache_dir: USER_CACHE_DIR } } },
+  { name: "cache_dir_project_dropped", user: { storage: { cache_dir: USER_CACHE_DIR } }, project: { storage: { cache_dir: "/evil" } } },
+  { name: "cache_dir_project_only_dropped", project: { storage: { cache_dir: "/evil" } } },
+  { name: "cache_dir_harness_attempts_dropped", user: { storage: { cache_dir: USER_CACHE_DIR }, harnesses: { pi: { storage: { cache_dir: "/pi-cache" } } } }, project: { harnesses: { pi: { storage: { cache_dir: "/evil" } } } }, harness: "pi" },
+  { name: "cache_dir_harness_only_dropped", user: { harnesses: { pi: { storage: { cache_dir: "/pi-cache" } } } }, harness: "pi" },
   { name: "privacy_user_on_project_off", user: { bash: { disclaim_privacy: true } }, project: { bash: { disclaim_privacy: false } } },
   { name: "privacy_project_on", user: { bash: { disclaim_privacy: false } }, project: { bash: { disclaim_privacy: true } } },
   { name: "privacy_project_off_dropped", project: { bash: { disclaim_privacy: false } } },
@@ -250,6 +309,27 @@ const CASES: ParityCase[] = [
     name: "bash_watch_sync_project_override",
     user: { bash: { watch_sync_max_ms: 120000 } },
     project: { bash: { watch_sync_max_ms: 1800000 } },
+  },
+  {
+    name: "bash_memory_limit_project_raise",
+    user: { bash: { memory_limit_mib: 64 } },
+    project: { bash: { memory_limit_mib: 128 } },
+  },
+  {
+    name: "bash_memory_limit_project_tighten",
+    harness: "pi",
+    user: { bash: { memory_limit_mib: 64 } },
+    project: { bash: { memory_limit_mib: 32 } },
+  },
+  {
+    name: "bash_memory_limit_harness_override",
+    harness: "opencode",
+    user: { bash: { memory_limit_mib: 64 }, harnesses: { opencode: { bash: { memory_limit_mib: 128 } } } },
+    project: { bash: { memory_limit_mib: 256 }, harnesses: { opencode: { bash: { memory_limit_mib: 192 } } } },
+  },
+  {
+    name: "bash_memory_limit_zero",
+    user: { bash: { memory_limit_mib: 0 } },
   },
   {
     // `bash.worker_wait_max_ms` only changes how long a worker waits, so a
@@ -861,6 +941,13 @@ const CASES: ParityCase[] = [
   // present, github.read wins over the gh_read alias.
   { name: "gh_read_alias_rejected", user: { gh_read: { enabled: false }, github: { read: true } } },
   { name: "bash_true", user: { bash: true } },
+  { name: "bash_changed_files_off", user: { bash: { changed_files: "off" } } },
+  { name: "bash_changed_files_list", user: { bash: { changed_files: "list" } } },
+  { name: "bash_changed_files_diff", user: { bash: { changed_files: "diff" } } },
+  { name: "bash_changed_files_project_off", user: { bash: { changed_files: "diff" } }, project: { bash: { changed_files: "off" } } },
+  { name: "bash_changed_files_project_cannot_enable", project: { bash: { changed_files: "diff" } } },
+  { name: "bash_changed_files_project_cannot_upgrade", user: { bash: { changed_files: "list" } }, project: { bash: { changed_files: "diff" } } },
+  { name: "bash_changed_files_pi", harness: "pi", user: { bash: { changed_files: "diff" } } },
   { name: "bash_false", user: { bash: false } },
   { name: "bash_empty_obj", user: { bash: {} } },
   { name: "bash_partial", user: { bash: { compress: false } } },
@@ -910,12 +997,51 @@ const CASES: ParityCase[] = [
   { name: "bash_db_schema_hints_user_off", user: { bash: { db_schema_hints: false } } },
   {
     name: "bash_env_user_only",
-    user: { bash: { env: { TZ: "UTC", AFT_PARITY_USER_ENV: "user-value" } } },
-    project: { bash: { env: { TZ: "Mars", AFT_PARITY_PROJECT_ENV: "project-value" } } },
+    user: { bash: { env: { TZ: "UTC", PARITY_USER_ENV: "user-value" } } },
+    project: { bash: { env: { TZ: "Mars", PARITY_PROJECT_ENV: "project-value" } } },
   },
   {
-    name: "bash_env_project_only_dropped",
-    project: { bash: { env: { AFT_PARITY_PROJECT_ENV: "project-value" } } },
+    // A project's `bash.env` is carried separately from the user map; the
+    // engine applies it only while the project is trusted.
+    name: "bash_env_project_tier",
+    project: { bash: { env: { PARITY_PROJECT_ENV: "project-value" } } },
+  },
+  {
+    // A harness block merges its `bash.env` names into the base map instead of
+    // replacing it.
+    name: "bash_env_harness_merges_names",
+    harness: "opencode",
+    user: {
+      bash: { env: { PARITY_BASE_ENV: "base" } },
+      harnesses: { opencode: { bash: { env: { PARITY_HARNESS_ENV: "harness" } } } },
+    },
+  },
+  {
+    // Credentials may be set from user config and are refused from project
+    // config.
+    name: "bash_env_project_credential_refused",
+    user: { bash: { env: { PARITY_USER_ENV: "user-value" } } },
+    project: { bash: { env: { PARITY_API_KEY: "project-value" } } },
+  },
+  {
+    name: "bash_env_project_credential_refused_in_harness",
+    harness: "pi",
+    project: { harnesses: { pi: { bash: { env: { PARITY_GITHUB_TOKEN: "x" } } } } },
+  },
+  {
+    name: "bash_env_project_refused_control_name",
+    project: { bash: { env: { AFT_INTERNAL_LINUX_SCOPE: "1" } } },
+  },
+  {
+    // A refused name rejects the candidate at either tier, whether or not the
+    // project is trusted.
+    name: "bash_env_user_refused_lookup_root",
+    user: { bash: { env: { XDG_CONFIG_HOME: "/tmp/elsewhere" } } },
+  },
+  {
+    name: "bash_env_runon_env_user_only",
+    user: { bash: { env: { TZ: "UTC" }, runon_env: ["TZ"] } },
+    project: { bash: { env: { PARITY_PROJECT_ENV: "v" }, runon_env: ["PARITY_PROJECT_ENV"] } },
   },
   {
     name: "idle_user_tier",

@@ -3,6 +3,7 @@ import type { ToolDefinition } from "@opencode-ai/plugin";
 import { Effect, Schema } from "effect";
 
 import { projectV2Tool } from "../tools/definitions/v2.js";
+import { metadataUpdater } from "../tools/metadata.js";
 
 /**
  * The schema the host stores a tool part's metadata under.
@@ -179,4 +180,32 @@ test("flat shell progress reaches the V2 host and rejected progress is handled",
     ),
   );
   expect(progress).toEqual([{ output: "live chunk", description: "build" }]);
+});
+
+test("wrapped shell progress is flattened only at the OpenCode 2 boundary", async () => {
+  const progress: unknown[] = [];
+  const definition = {
+    description: "shell progress probe",
+    args: {},
+    execute: async (
+      _input: unknown,
+      runtime: { metadata(update: Record<string, unknown>): unknown },
+    ) => {
+      await metadataUpdater(runtime)({ output: "hello\n", description: "build" });
+      return "done";
+    },
+  } as unknown as ToolDefinition;
+  const projected = projectV2Tool("bash", definition, { directory: process.cwd() });
+  await Effect.runPromise(
+    projected.execute(
+      {},
+      {
+        progress: (update) =>
+          Effect.sync(() => {
+            progress.push(update);
+          }),
+      },
+    ),
+  );
+  expect(progress).toEqual([{ output: "hello\n", description: "build" }]);
 });

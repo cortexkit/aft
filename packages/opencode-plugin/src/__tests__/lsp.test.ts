@@ -1,5 +1,7 @@
 /// <reference path="../bun-test.d.ts" />
 import { describe, expect, test } from "bun:test";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { LSP_SYMBOL_KIND_MAP, queryLspHints } from "../lsp.js";
 
 /**
@@ -39,6 +41,125 @@ function createMockClient(options: {
 }
 
 describe("queryLspHints", () => {
+  test("roots relative, absolute and URI hints without conflating same-name files", async () => {
+    const root = process.cwd();
+    const target = join(root, "src/left/util file.ts");
+    const client = createMockClient({
+      lspServers: [{ id: "ts", name: "typescript", root, status: "connected" }],
+      symbols: [
+        "src/left/util file.ts",
+        target,
+        pathToFileURL(target).href,
+        "src/right/util file.ts",
+      ].map((uri) => ({
+        name: "handler",
+        kind: 12,
+        location: {
+          uri,
+          range: { start: { line: 1, character: 0 }, end: { line: 5, character: 0 } },
+        },
+      })),
+    });
+    const result = await queryLspHints(client, "handler", root);
+    expect(result?.symbols.map((hint) => hint.file)).toEqual([
+      pathToFileURL(target).href,
+      pathToFileURL(target).href,
+      pathToFileURL(target).href,
+      pathToFileURL(join(root, "src/right/util file.ts")).href,
+    ]);
+  });
+
+  test("omits hints outside the requested root instead of matching their suffix", async () => {
+    const root = process.cwd();
+    const client = createMockClient({
+      lspServers: [{ id: "ts", name: "typescript", root, status: "connected" }],
+      symbols: [
+        "src/left/utils.ts",
+        `${root}-outside/src/left/utils.ts`,
+        `file://${root}-outside/src/left/utils.ts`,
+        "../outside/src/left/utils.ts",
+      ].map((uri) => ({
+        name: "handler",
+        kind: 12,
+        location: {
+          uri,
+          range: { start: { line: 1, character: 0 }, end: { line: 5, character: 0 } },
+        },
+      })),
+    });
+    const result = await queryLspHints(client, "handler", root);
+    expect(result?.symbols.map((hint) => hint.file)).toEqual([
+      pathToFileURL(join(root, "src/left/utils.ts")).href,
+    ]);
+  });
+
+  test("preserves literal percent and Unicode names in file URIs", async () => {
+    const client = createMockClient({
+      lspServers: [{ id: "ts", name: "typescript", root: "/project", status: "connected" }],
+      symbols: ["data %20 café.ts", "file:///project/data%20%2520%20caf%C3%A9.ts"].map((uri) => ({
+        name: "handler",
+        kind: 12,
+        location: {
+          uri,
+          range: { start: { line: 1, character: 0 }, end: { line: 5, character: 0 } },
+        },
+      })),
+    });
+    const result = await queryLspHints(client, "handler", "/project");
+    expect(result?.symbols.map((hint) => hint.file)).toEqual([
+      "file:///project/data%20%2520%20caf%C3%A9.ts",
+      "file:///project/data%20%2520%20caf%C3%A9.ts",
+    ]);
+  });
+
+  test("resolves Windows drive and UNC hints on any host", async () => {
+    for (const [root, files, expected] of [
+      [
+        "C:\\project",
+        ["src/utils.ts", "C:\\project\\src\\utils.ts", "file:///C:/project/src/utils.ts"],
+        "file:///C:/project/src/utils.ts",
+      ],
+      [
+        "\\\\server\\share\\project",
+        [
+          "src/utils.ts",
+          "\\\\server\\share\\project\\src\\utils.ts",
+          "file://server/share/project/src/utils.ts",
+        ],
+        "file://server/share/project/src/utils.ts",
+      ],
+    ] as const) {
+      const client = createMockClient({
+        lspServers: [{ id: "ts", name: "typescript", root, status: "connected" }],
+        symbols: files.map((uri) => ({
+          name: "handler",
+          kind: 12,
+          location: {
+            uri,
+            range: { start: { line: 1, character: 0 }, end: { line: 5, character: 0 } },
+          },
+        })),
+      });
+      const result = await queryLspHints(client, "handler", root);
+      expect(result?.symbols.map((hint) => hint.file)).toEqual([expected, expected, expected]);
+    }
+  });
+
+  test("omits relative hints without a root and non-file URIs", async () => {
+    const client = createMockClient({
+      lspServers: [{ id: "ts", name: "typescript", root: "/project", status: "connected" }],
+      symbols: ["src/utils.ts", "https://example.com/utils.ts"].map((uri) => ({
+        name: "handler",
+        kind: 12,
+        location: {
+          uri,
+          range: { start: { line: 1, character: 0 }, end: { line: 5, character: 0 } },
+        },
+      })),
+    });
+    expect(await queryLspHints(client, "handler")).toBeUndefined();
+  });
+
   test("returns formatted hints when server is connected and symbols found", async () => {
     const client = createMockClient({
       lspServers: [{ id: "ts", name: "typescript", root: "/project", status: "connected" }],
@@ -69,14 +190,14 @@ describe("queryLspHints", () => {
 
     expect(result?.symbols[0]).toEqual({
       name: "processData",
-      file: "/project/src/utils.ts",
+      file: "file:///project/src/utils.ts",
       line: 42,
       kind: "function",
     });
 
     expect(result?.symbols[1]).toEqual({
       name: "processData",
-      file: "/project/src/service.ts",
+      file: "file:///project/src/service.ts",
       line: 10,
       kind: "method",
     });
@@ -127,7 +248,7 @@ describe("queryLspHints", () => {
     expect(result).toBeUndefined();
   });
 
-  test("strips file:// prefix from URIs", async () => {
+  test("preserves absolute file URIs", async () => {
     const client = createMockClient({
       lspServers: [{ id: "ts", name: "typescript", root: "/project", status: "connected" }],
       symbols: [
@@ -144,7 +265,7 @@ describe("queryLspHints", () => {
 
     const result = await queryLspHints(client, "hello");
     expect(result).toBeDefined();
-    expect(result?.symbols[0].file).toBe("/home/user/project/src/main.ts");
+    expect(result?.symbols[0].file).toBe("file:///home/user/project/src/main.ts");
   });
 
   test("handles URIs without file:// prefix", async () => {
@@ -164,7 +285,7 @@ describe("queryLspHints", () => {
 
     const result = await queryLspHints(client, "hello");
     expect(result).toBeDefined();
-    expect(result?.symbols[0].file).toBe("/project/src/main.ts");
+    expect(result?.symbols[0].file).toBe("file:///project/src/main.ts");
   });
 
   test("maps known SymbolKind numbers to AFT kind strings", async () => {
@@ -252,7 +373,7 @@ describe("queryLspHints", () => {
     expect(result).toBeDefined();
     expect(result?.symbols[0].kind).toBeUndefined();
     expect(result?.symbols[0].name).toBe("MY_CONST");
-    expect(result?.symbols[0].file).toBe("/a.ts");
+    expect(result?.symbols[0].file).toBe("file:///a.ts");
     expect(result?.symbols[0].line).toBe(0);
   });
 

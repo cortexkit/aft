@@ -3,7 +3,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 pub(crate) const DIR_MODE: u32 = 0o700;
@@ -11,6 +11,12 @@ pub(crate) const DIR_MODE: u32 = 0o700;
 pub(crate) const FILE_MODE: u32 = 0o600;
 
 pub fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
+    let path = path.as_ref();
+    if let Some(access) = crate::root_cache::pin_cache_path(path)? {
+        access.directory(true)?;
+        return Ok(());
+    }
+    crate::root_cache::refuse_new_durable_cache_entry(path)?;
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -22,6 +28,12 @@ pub fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
 }
 
 pub(crate) fn create_dir(path: &Path) -> io::Result<()> {
+    if let Some(access) = crate::root_cache::pin_cache_path(path)? {
+        let (parent, name) = access.parent()?;
+        let child = parent.repair_create_dir(&name)?;
+        return child.repair_check_boundary(&access.root, &[]);
+    }
+    crate::root_cache::refuse_new_durable_cache_entry(path)?;
     #[allow(unused_mut)]
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
@@ -55,6 +67,16 @@ pub(crate) fn executable_options() -> OpenOptions {
 }
 
 pub(crate) fn write_executable(path: &Path, contents: &[u8]) -> io::Result<()> {
+    if let Some(access) = crate::root_cache::pin_cache_path(path)? {
+        let (parent, name) = access.parent()?;
+        let mut file = parent.repair_create_file(&name)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(DIR_MODE))?;
+        }
+        return file.write_all(contents);
+    }
     executable_options()
         .write(true)
         .create(true)
@@ -64,6 +86,11 @@ pub(crate) fn write_executable(path: &Path, contents: &[u8]) -> io::Result<()> {
 }
 
 pub fn create(path: impl AsRef<Path>) -> io::Result<File> {
+    if let Some(access) = crate::root_cache::pin_cache_path(path.as_ref())? {
+        let (parent, name) = access.parent()?;
+        return parent.repair_create_file(&name);
+    }
+    crate::root_cache::refuse_new_durable_cache_entry(path.as_ref())?;
     options().write(true).create(true).truncate(true).open(path)
 }
 
@@ -74,6 +101,13 @@ pub fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> io::Result<(
 /// std::fs::copy copies source permissions too, which would expose snapshots of
 /// public files. Stream into an owner-only destination instead on Unix.
 pub(crate) fn copy(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<u64> {
+    if let Some(access) = crate::root_cache::pin_cache_path(to.as_ref())? {
+        let (parent, name) = access.parent()?;
+        return io::copy(
+            &mut File::open(from)?,
+            &mut parent.repair_create_file(&name)?,
+        );
+    }
     #[cfg(unix)]
     {
         io::copy(&mut File::open(from)?, &mut create(to)?)
@@ -218,8 +252,77 @@ fn warn_once(path: &Path, error: &io::Error) {
 /// SQLite derives WAL/SHM modes from the database. Reserve the database before
 /// SQLite's first writable open, but never create a file for a read-only open.
 pub(crate) fn prepare_sqlite(path: &Path, flags: rusqlite::OpenFlags) -> rusqlite::Result<()> {
+    // With SQLITE_OPEN_URI, a name starting with `file:` is a URI, not a
+    // filesystem path, so the cache-location checks must look at the file it
+    // names. Handing them the URI text instead skips them on Unix (its
+    // "ancestors" are relative names that do not exist) and fails outright on
+    // Windows, where a name containing `:` or `?` is invalid (os error 123),
+    // not missing.
+    if flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_URI) {
+        match sqlite_uri_target(path) {
+            Some(SqliteUriTarget::File(file)) => return prepare_sqlite_file(&file, flags, true),
+            Some(SqliteUriTarget::NoFile) => return Ok(()),
+            None => {}
+        }
+    }
+    prepare_sqlite_file(path, flags, false)
+}
+
+/// `from_uri` is set when `path` was decoded from a `file:` URI. Such opens
+/// get the cache-location checks but, as before those checks existed, no
+/// reservation or permission repair outside a cache root: the URI callers
+/// prepare the plain path themselves before opening it.
+fn prepare_sqlite_file(
+    path: &Path,
+    flags: rusqlite::OpenFlags,
+    from_uri: bool,
+) -> rusqlite::Result<()> {
+    let access = if flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_MEMORY) {
+        None
+    } else {
+        crate::root_cache::pin_cache_path(path)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
+    };
+    if let Some(access) = access {
+        let result = (|| -> io::Result<()> {
+            access.root.repair_validate_descendants(&access.relative)?;
+            let (parent, name) = access.parent()?;
+            let file = if flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_CREATE) {
+                match parent.repair_new_file(&name) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        parent.repair_read_file(&name)?
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                parent.repair_read_file(&name)?
+            };
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if file.metadata()?.permissions().mode() & 0o077 != 0 {
+                    file.set_permissions(fs::Permissions::from_mode(FILE_MODE))?;
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = file;
+            Ok(())
+        })();
+        return result.map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)));
+    }
+    crate::root_cache::check_cache_access(path)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    if flags.intersects(
+        rusqlite::OpenFlags::SQLITE_OPEN_CREATE | rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+    ) && !flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_MEMORY)
+    {
+        crate::root_cache::refuse_durable_cache_write(path)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    }
     #[cfg(unix)]
-    if !flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_MEMORY)
+    if !from_uri
+        && !flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_MEMORY)
         && !path.as_os_str().is_empty()
         && path != Path::new(":memory:")
         && !path.to_string_lossy().starts_with("file:")
@@ -239,8 +342,99 @@ pub(crate) fn prepare_sqlite(path: &Path, flags: rusqlite::OpenFlags) -> rusqlit
         }
     }
     #[cfg(not(unix))]
-    let _ = (path, flags);
+    let _ = (path, flags, from_uri);
     Ok(())
+}
+
+/// What a SQLite `file:` URI opens (see <https://sqlite.org/uri.html>).
+#[derive(Debug, PartialEq, Eq)]
+enum SqliteUriTarget {
+    /// A database file at this filesystem path.
+    File(PathBuf),
+    /// An in-memory or temporary database: nothing on disk to check.
+    NoFile,
+}
+
+/// Decode a SQLite `file:` URI into the database it opens, or `None` when
+/// `path` is not such a URI. Covers the forms AFT builds for read-only opens
+/// (`file:///C:/...`, `file:///abs/...`, `file:relative`) with percent-encoding
+/// and a query string.
+fn sqlite_uri_target(path: &Path) -> Option<SqliteUriTarget> {
+    let text = path.to_str()?;
+    let rest = text.strip_prefix("file:")?;
+    let end = rest.find(['?', '#']).unwrap_or(rest.len());
+    let (encoded, tail) = rest.split_at(end);
+    let query = tail
+        .strip_prefix('?')
+        .map(|query| query.split('#').next().unwrap_or_default())
+        .unwrap_or_default();
+    if query
+        .split('&')
+        .any(|param| param.eq_ignore_ascii_case("mode=memory"))
+    {
+        return Some(SqliteUriTarget::NoFile);
+    }
+    // `file://authority/path`: SQLite accepts an empty or `localhost`
+    // authority; any other host is kept as a network (UNC) name.
+    let encoded = match encoded.strip_prefix("//") {
+        Some(after) => {
+            let slash = after.find('/').unwrap_or(after.len());
+            let (authority, path) = after.split_at(slash);
+            if authority.is_empty() || authority.eq_ignore_ascii_case("localhost") {
+                path.to_string()
+            } else {
+                format!("//{after}")
+            }
+        }
+        None => encoded.to_string(),
+    };
+    let decoded = percent_decode(&encoded);
+    if decoded.is_empty() || decoded == ":memory:" {
+        return Some(SqliteUriTarget::NoFile);
+    }
+    #[cfg(windows)]
+    let decoded = {
+        // `/C:/dir/db` names drive C:; SQLite drops the leading slash too.
+        let bytes = decoded.as_bytes();
+        let decoded = if bytes.len() >= 3
+            && bytes[0] == b'/'
+            && bytes[1].is_ascii_alphabetic()
+            && bytes[2] == b':'
+        {
+            decoded[1..].to_string()
+        } else if decoded.starts_with(r"/\\") {
+            // `/\\?\C:\...` is a verbatim (`\\?\`) or UNC path whose
+            // backslashes the URI kept percent-encoded, as the call-graph
+            // store's read-only URI spells long and resolved paths. SQLite
+            // drops the leading slash before opening it.
+            decoded[1..].to_string()
+        } else {
+            decoded
+        };
+        // Restore the separators the URI form replaced: a verbatim `\\?\`
+        // path only accepts backslashes.
+        decoded.replace('/', "\\")
+    };
+    Some(SqliteUriTarget::File(PathBuf::from(decoded)))
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let hex = |byte: u8| (byte as char).to_digit(16);
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex(bytes[index + 1]), hex(bytes[index + 2])) {
+                decoded.push((high * 16 + low) as u8);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 /// Repair the one database being opened so newly created sidecars cannot
@@ -345,4 +539,94 @@ pub fn extract_zip(archive: &Path, destination: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod sqlite_uri_tests {
+    use super::{sqlite_uri_target, SqliteUriTarget};
+    use std::path::{Path, PathBuf};
+
+    fn target(uri: &str) -> Option<SqliteUriTarget> {
+        sqlite_uri_target(Path::new(uri))
+    }
+
+    #[test]
+    fn plain_paths_are_not_uris() {
+        assert_eq!(target("/var/aft/callgraph/x.sqlite"), None);
+        assert_eq!(target(r"C:\Users\aft\x.sqlite"), None);
+        assert_eq!(target(":memory:"), None);
+    }
+
+    #[test]
+    fn memory_and_temporary_uris_name_no_file() {
+        assert_eq!(target("file::memory:"), Some(SqliteUriTarget::NoFile));
+        assert_eq!(
+            target("file::memory:?cache=shared"),
+            Some(SqliteUriTarget::NoFile)
+        );
+        assert_eq!(
+            target("file:shared-db?mode=memory&cache=shared"),
+            Some(SqliteUriTarget::NoFile)
+        );
+        assert_eq!(target("file:?mode=ro"), Some(SqliteUriTarget::NoFile));
+    }
+
+    #[test]
+    fn relative_uri_decodes_percent_escapes() {
+        assert_eq!(
+            target("file:dir/name%20with%20space%231.sqlite?mode=ro"),
+            Some(SqliteUriTarget::File(PathBuf::from(if cfg!(windows) {
+                r"dir\name with space#1.sqlite"
+            } else {
+                "dir/name with space#1.sqlite"
+            })))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_unix_uri_names_its_path() {
+        assert_eq!(
+            target("file:///private/var/aft/db%231.sqlite?mode=ro"),
+            Some(SqliteUriTarget::File(PathBuf::from(
+                "/private/var/aft/db#1.sqlite"
+            )))
+        );
+        assert_eq!(
+            target("file://localhost/tmp/x.sqlite"),
+            Some(SqliteUriTarget::File(PathBuf::from("/tmp/x.sqlite")))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_uris_name_drive_verbatim_and_unc_paths() {
+        assert_eq!(
+            target("file:///C:/Users/RUNNER~1/name%20x/db.sqlite?mode=ro"),
+            Some(SqliteUriTarget::File(PathBuf::from(
+                r"C:\Users\RUNNER~1\name x\db.sqlite"
+            )))
+        );
+        // A verbatim path keeps its prefix, spelled with backslashes again.
+        assert_eq!(
+            target("file:////%3F/C:/Users/aft/db.sqlite?mode=ro"),
+            Some(SqliteUriTarget::File(PathBuf::from(
+                r"\\?\C:\Users\aft\db.sqlite"
+            )))
+        );
+        // The call-graph store's read-only URI keeps a verbatim path's
+        // backslashes percent-encoded after one leading slash.
+        assert_eq!(
+            target("file:///%5C%5C%3F%5CC:%5CUsers%5Caft%5Cdb%231.sqlite?mode=ro"),
+            Some(SqliteUriTarget::File(PathBuf::from(
+                r"\\?\C:\Users\aft\db#1.sqlite"
+            )))
+        );
+        assert_eq!(
+            target("file://server/share/db.sqlite"),
+            Some(SqliteUriTarget::File(PathBuf::from(
+                r"\\server\share\db.sqlite"
+            )))
+        );
+    }
 }

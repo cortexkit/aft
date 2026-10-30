@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/search_index.rs"
+  ],
+  "slices": [
+    "rayon-names-and-wait-warnings"
+  ],
+  "note": "The ranking fence hit is crates/aft/src/search_index.rs, where only the search-build worker thread name changes (aft-search-build-N to aft-rayon-search-build-N) so profiles attribute Rayon threads. No search input, routing or ranking changes; ranked rows must remain byte-identical to the committed reference."
+}

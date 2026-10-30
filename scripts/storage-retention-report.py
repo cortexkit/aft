@@ -221,7 +221,7 @@ def census(root):
             directory_count[domain] += 1
         live, protected, current, old, records, owners = directories[identity]
         generation = None
-        match = re.match(r"(?:derived-|manifest-|trigram-)(.+)\.(?:sqlite|json|bin|ref)(?:-(?:wal|shm))?$", path.name)
+        match = re.match(r"(?:derived-|manifest-|trigram-)(.+)\.(?:sqlite|json|keys|bin|ref)(?:-(?:wal|shm))?$", path.name)
         if match:
             generation = match.group(1)
         elif re.match(re.escape(key) + r"\.g.*\.sqlite(?:-(?:wal|shm))?$", path.name):

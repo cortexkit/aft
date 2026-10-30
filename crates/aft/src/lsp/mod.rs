@@ -6,6 +6,7 @@ mod diagnostic_registration;
 pub mod diagnostics;
 pub mod document;
 pub mod environmental;
+pub mod fresh_wait;
 pub mod jsonrpc;
 pub mod manager;
 pub mod pending_changes;

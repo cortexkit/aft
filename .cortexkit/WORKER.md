@@ -18,6 +18,13 @@ A check that prints nothing and exits 0 is not a pass unless this guide says tha
 | Real rust-analyzer | prefix with `AFT_TEST_REQUIRE_RUST_ANALYZER=1` | Without it, real-server tests skip silently. |
 | Full suite | `cargo test -p agent-file-tools`, or `scripts/rust-test-gate.sh` | The gate prints `GATE PASSED` / `GATE FAILED` as its last line. |
 
+### Build server jobs (`runon`)
+
+- **Size the job to the work.** Each vCPU you request holds one of the server's shared slots for the whole job. A filtered test run builds and runs one test binary, which uses about one core, so it uses `linux,2c`. Workers do not run the full suite; your head runs it once when it integrates several deliveries. If a job is refused with `queue_wait_exceeded` while waiting on permits (`waiting_on=permits`, or an older job ahead needs more free permits), resubmit it with fewer vCPUs (down to `linux,1c`) rather than waiting or asking: a smaller job compiles slower but starts. If the refusal says an earlier job still holds your workspace, fewer vCPUs won't help: wait for that job to finish, or stop it with `bash_kill` if it is yours and no longer needed.
+- **Commit first, then submit, in separate steps.** The job snapshots the checkout when it is accepted. A commit sent in the same parallel step can land after the snapshot. Print `git log -1` as the job's first line so the output shows what ran.
+- **Keep gate scripts out of ignored paths.** The job copies tracked and untracked files, but not ignored ones, so a script under `.cortexkit/` or `target/` is missing on the server.
+- **Write long output to a file inside the job and print a summary.** A job that streams tens of megabytes back can lose its connection and come back with an unknown result.
+
 Mandatory when you touch them:
 - A list-cutting site (`.take(`, `truncate(`, a cap): register it, then run `cargo test -p agent-file-tools --test list_envelope`.
 - A new file under the search engine: register its owner, then run `cargo test -p agent-file-tools --test engine`.
@@ -52,12 +59,14 @@ New test files go under `src/__tests__/`. A guard fails the suite on any test fi
 ## Before you report
 - Publication source changes do not need generated docs or alignment commits.
   Run `node scripts/release-gate-v049.mjs --check-inputs` after committing the
-  source (requires the `v0.48.1` tag and the built bridge). It prints six staged
+  source (requires the `v0.48.1` tag and the built bridge). Run it in your
+  worktree, not with `runon`: build-server snapshots carry no git tags, so it
+  always fails there. It prints six staged
   transitions and `release gates passed`; it never runs a native build.
   The reviewed legacy-vocabulary allowlist remains an input: update it explicitly
   only when intentionally changing a reviewed occurrence, never in preflight.
   Release snapshots are automatically prepared and validated by `release.sh`
   and the publish workflow, outside Git. To validate a saved snapshot without
   regenerating it: `node scripts/release-gate-v049.mjs --snapshot-dir <dir> --candidate`.
-- Show a failing test before the fix. Show a mutation check for each fix: revert the fix, name the test that fails and paste the failure, restore, and show `git diff --stat` empty.
+- Test what you changed, and only that. For a bug fix, add a test that fails without the fix. Run the filtered tests for the code you touched in one job, plus the Windows compile when you changed platform-specific code. Do not run the full suite, mutation or break checks (reverting a fix to show a test fails), or repeated runs to prove stability: each one recompiles the whole crate and holds a shared build-server slot. Your head integrates several deliveries and runs the full suite once.
 - If a gate could not run, say which one and why. Do not report it as passed.

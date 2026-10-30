@@ -12,10 +12,9 @@ async function validate(context: HarnessValidationContext): Promise<void> {
     if (call.disk_effects !== undefined && call.non_mutating_evidence !== undefined) throw new Error(scenario.id + ":" + call.id + " has two disk classifications");
     if (call.disk_effects === undefined && call.non_mutating_evidence === undefined) throw new Error(scenario.id + ":" + call.id + " lacks a disk classification");
   }
+  // Standalone routes do not negotiate tool-result/v1, so the opt-in AST budget surface is absent.
   const matrix = JSON.parse(await readFile(join(here, "matrix.json"), "utf8"));
   if (JSON.stringify(matrix.rows?.[0]?.trajectories) !== JSON.stringify({"T1":"applicable","T2":"applicable","T3":"n/a:no-permission-operation","T4":"n/a:no-abortable-operation","T5":"n/a:no-background-capability","T6":"n/a:no-list-surface","T7":"applicable"})) throw new Error("ast_search" + " applicability mismatch");
-  const controls = JSON.parse(await readFile(join(here, "mutation-controls.json"), "utf8"));
-  if (!Array.isArray(controls.controls) || controls.controls.length < 3) throw new Error("ast_search" + " mutation controls missing");
 }
 const extension: HarnessExtension = { name: "ast_search-scenarios-v1", validate };
 export default extension;

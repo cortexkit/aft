@@ -171,7 +171,7 @@ impl ImportState {
         }
     }
 
-    fn parse(value: &str) -> Option<Self> {
+    pub(super) fn parse(value: &str) -> Option<Self> {
         [
             Self::Claimed,
             Self::Staged,
@@ -200,7 +200,7 @@ pub struct ClaimOwner {
 }
 
 impl ClaimOwner {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let me = this_process();
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -237,10 +237,10 @@ fn active_claims() -> &'static Mutex<HashSet<String>> {
 }
 
 /// Marks a claim token live for as long as the import that owns it runs.
-struct ActiveClaim(String);
+pub(super) struct ActiveClaim(String);
 
 impl ActiveClaim {
-    fn register(owner: &ClaimOwner) -> Self {
+    pub(super) fn register(owner: &ClaimOwner) -> Self {
         lock(active_claims()).insert(owner.token.clone());
         Self(owner.token.clone())
     }
@@ -258,7 +258,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn now_ms() -> u64 {
+pub(super) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
@@ -781,18 +781,18 @@ fn status_of(rows: Vec<ImportRow>) -> ImportStatus {
 
 /// One converted file: the manifest facts and the payload stored under `key`.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct BundleEntry {
-    rel_path: RelPath,
-    content: ContentHash,
-    size: u64,
-    key: [u8; 32],
-    payload: Vec<u8>,
+pub(super) struct BundleEntry {
+    pub(super) rel_path: RelPath,
+    pub(super) content: ContentHash,
+    pub(super) size: u64,
+    pub(super) key: [u8; 32],
+    pub(super) payload: Vec<u8>,
 }
 
 /// The staged, canonical conversion of one legacy artifact.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct Bundle {
-    entries: Vec<BundleEntry>,
+pub(super) struct Bundle {
+    pub(super) entries: Vec<BundleEntry>,
 }
 
 impl Bundle {
@@ -868,7 +868,7 @@ fn staged_path(ledger: &ImportLedger, artifact: Artifact, staged_hash: &[u8; 32]
 
 /// Writes `bytes` to `path` through temp + fsync + rename, then syncs the
 /// directory, so `staged` is only recorded for bytes that reached the disk.
-fn write_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(super) fn write_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     crate::private_storage::create_dir_all(parent)?;
     let temporary = path.with_extension(format!("tmp.{}.{}", std::process::id(), now_ms()));
@@ -950,7 +950,7 @@ impl<'a> LeReader<'a> {
 /// failed checksum, a path that is not relative, or a malformed table.
 /// Files without a recorded content hash are left out; the first load's
 /// strict reconciliation adds them from the checkout.
-fn convert_trigram(bytes: &[u8], policy: &TrigramPolicy) -> Result<Bundle, String> {
+pub(super) fn convert_trigram(bytes: &[u8], policy: &TrigramPolicy) -> Result<Bundle, String> {
     let mut reader = LeReader::new(bytes);
     if reader.u32()? != LEGACY_CACHE_MAGIC {
         return Err("not a trigram cache".to_owned());
@@ -1225,6 +1225,21 @@ fn semantic_payload(producer: &SemanticProducer, rows: &[(ChunkShape, Vec<u8>)])
     payload
 }
 
+fn capped_legacy_summary(current: &ChunkShape, legacy: &ChunkShape, budget: usize) -> bool {
+    if budget >= crate::semantic_index::EmbedTextCaps::default().total_chars
+        || current.kind != stored_kind(&crate::symbols::SymbolKind::FileSummary)
+        || legacy.kind != current.kind
+        || current.embed_text.chars().count() != budget
+        || legacy.embed_text.chars().count() <= budget
+        || crate::semantic_index::truncate_chars(&legacy.embed_text, budget) != current.embed_text
+    {
+        return false;
+    }
+    let mut capped = legacy.clone();
+    capped.embed_text = current.embed_text.clone();
+    capped == *current
+}
+
 /// Converts a legacy `semantic.bin` into view payloads under `producer`.
 ///
 /// The snapshot must carry exactly the producer's model fingerprint and the
@@ -1233,105 +1248,155 @@ fn semantic_payload(producer: &SemanticProducer, rows: &[(ChunkShape, Vec<u8>)])
 /// bytes into exactly the snapshot's rows (names, lines, snippets and
 /// embedded texts). Its vectors belong to the same producer and inputs as a
 /// cold fill, though a model invocation need not reproduce their float bytes.
+/// A legacy small-cap summary may instead be the exact uncapped input: keep
+/// that run under its old key so the owner can replace only the summary.
 /// Every other file is left for the plane to embed.
-fn convert_semantic(
+pub(super) fn convert_semantic(
     bytes: &[u8],
     root: &Path,
     producer: &SemanticProducer,
 ) -> Result<(Bundle, usize), String> {
-    let parsed = super::parse_legacy_snapshot(bytes, &producer.model_fingerprint)?;
+    let summary_budget = small_summary_budget(producer);
+    let parsed = match super::parse_legacy_snapshot(bytes, &producer.model_fingerprint) {
+        Ok(parsed) => parsed,
+        Err(error)
+            if summary_budget.is_some() && error == "trailing bytes after semantic snapshot" =>
+        {
+            // The strict producer/version checks above already passed. Fold
+            // committed segments with the owner's normal reader before import.
+            let root = fs::canonicalize(root).map_err(|error| error.to_string())?;
+            let compact =
+                crate::semantic_index::SemanticIndex::from_bytes(bytes, &root)?.to_bytes();
+            super::parse_legacy_snapshot(&compact, &producer.model_fingerprint)?
+        }
+        Err(error) => return Err(error),
+    };
     let root = fs::canonicalize(root).map_err(|error| error.to_string())?;
     let mut entries = Vec::new();
     let mut skipped = 0usize;
     for file in parsed.files {
-        let Some(rel_path) = super::legacy_path_to_rel_path(&file.path, &root) else {
-            skipped += 1;
-            continue;
-        };
-        let Ok(relative) = segment_store::rel_path_to_os(&rel_path) else {
-            skipped += 1;
-            continue;
-        };
-        let absolute = root.join(&relative);
-        let fits = fs::symlink_metadata(&absolute)
-            .is_ok_and(|meta| meta.is_file() && meta.len() <= MAX_SEMANTIC_SOURCE_BYTES);
-        let Some(source) = fits.then(|| fs::read(&absolute).ok()).flatten() else {
-            skipped += 1;
-            continue;
-        };
-        if file.content_hash == [0; 32] || blake3::hash(&source).as_bytes() != &file.content_hash {
-            skipped += 1;
-            continue;
+        match convert_semantic_file(&root, producer, summary_budget, file) {
+            Some(entry) => entries.push(entry),
+            None => skipped += 1,
         }
-        let chunks = match crate::semantic_index::chunk_view_file(
-            &root,
-            &relative,
-            &source,
-            producer.caps,
-        ) {
-            Ok(Some(chunks)) => chunks,
-            _ => {
-                skipped += 1;
-                continue;
-            }
-        };
-        let mut stored: BTreeMap<ChunkShape, Vec<Vec<u8>>> = BTreeMap::new();
-        for entry in file.entries {
-            stored
-                .entry(ChunkShape {
-                    name: entry.name,
-                    qualified_name: entry.qualified_name.unwrap_or_default(),
-                    kind: entry.kind,
-                    start_line: entry.start_line,
-                    end_line: entry.end_line,
-                    exported: entry.exported,
-                    snippet: entry.snippet,
-                    embed_text: entry.embed_text,
-                })
-                .or_default()
-                .push(entry.vector);
-        }
-        let chunk_count = chunks.len();
-        let mut rows = Vec::with_capacity(chunk_count);
-        for chunk in chunks {
-            let shape = ChunkShape {
-                name: chunk.name,
-                qualified_name: chunk.qualified_name.unwrap_or_default(),
-                kind: stored_kind(&chunk.kind),
-                start_line: chunk.start_line,
-                end_line: chunk.end_line,
-                exported: chunk.exported,
-                snippet: chunk.snippet,
-                embed_text: chunk.embed_text,
-            };
-            let Some(vector) = stored.get_mut(&shape).and_then(Vec::pop) else {
-                break;
-            };
-            rows.push((shape, vector));
-        }
-        let all_matched = rows.len() == chunk_count && stored.values().all(Vec::is_empty);
-        if !all_matched {
-            skipped += 1;
-            continue;
-        }
-        entries.push(BundleEntry {
-            content: ContentHash::from_bytes(file.content_hash),
-            size: source.len() as u64,
-            key: *producer.key(&source, &rel_path).as_bytes(),
-            payload: semantic_payload(producer, &rows),
-            rel_path,
-        });
     }
     entries.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
     Ok((Bundle { entries }, skipped))
 }
 
+/// The small text cap a producer's fingerprint records, when it is below the
+/// default: a legacy file summary embedded under that cap may then be the
+/// exact uncapped input of the current one (see [`capped_legacy_summary`]).
+pub(super) fn small_summary_budget(producer: &SemanticProducer) -> Option<usize> {
+    serde_json::from_str::<crate::semantic_index::SemanticIndexFingerprint>(
+        &producer.model_fingerprint,
+    )
+    .ok()
+    .filter(|identity| {
+        identity.embed_text_caps == producer.caps
+            && identity.embed_text_caps.total_chars
+                < crate::semantic_index::EmbedTextCaps::default().total_chars
+    })
+    .map(|identity| identity.embed_text_caps.total_chars)
+}
+
+/// Converts one legacy file's rows under `producer`, or `None` when the file
+/// cannot be imported and is left for the plane to embed: its path is not
+/// under `root`, its bytes changed since the snapshot, or this release chunks
+/// them into other rows than the snapshot holds. `root` is canonical.
+pub(super) fn convert_semantic_file(
+    root: &Path,
+    producer: &SemanticProducer,
+    summary_budget: Option<usize>,
+    file: super::LegacyFile,
+) -> Option<BundleEntry> {
+    let rel_path = super::legacy_path_to_rel_path(&file.path, root)?;
+    let relative = segment_store::rel_path_to_os(&rel_path).ok()?;
+    let absolute = root.join(&relative);
+    let fits = fs::symlink_metadata(&absolute)
+        .is_ok_and(|meta| meta.is_file() && meta.len() <= MAX_SEMANTIC_SOURCE_BYTES);
+    let source = fits.then(|| fs::read(&absolute).ok()).flatten()?;
+    if file.content_hash == [0; 32] || blake3::hash(&source).as_bytes() != &file.content_hash {
+        return None;
+    }
+    let chunks =
+        match crate::semantic_index::chunk_view_file(root, &relative, &source, producer.caps) {
+            Ok(Some(chunks)) => chunks,
+            _ => return None,
+        };
+    let mut stored: BTreeMap<ChunkShape, Vec<Vec<u8>>> = BTreeMap::new();
+    for entry in file.entries {
+        stored
+            .entry(ChunkShape {
+                name: entry.name,
+                qualified_name: entry.qualified_name.unwrap_or_default(),
+                kind: entry.kind,
+                start_line: entry.start_line,
+                end_line: entry.end_line,
+                exported: entry.exported,
+                snippet: entry.snippet,
+                embed_text: entry.embed_text,
+            })
+            .or_default()
+            .push(entry.vector);
+    }
+    let chunk_count = chunks.len();
+    let mut rows = Vec::with_capacity(chunk_count);
+    let mut summary_repair_pending = false;
+    for chunk in chunks {
+        let shape = ChunkShape {
+            name: chunk.name,
+            qualified_name: chunk.qualified_name.unwrap_or_default(),
+            kind: stored_kind(&chunk.kind),
+            start_line: chunk.start_line,
+            end_line: chunk.end_line,
+            exported: chunk.exported,
+            snippet: chunk.snippet,
+            embed_text: chunk.embed_text,
+        };
+        if let Some(vector) = stored.get_mut(&shape).and_then(Vec::pop) {
+            rows.push((shape, vector));
+        } else if let Some(legacy) = summary_budget
+            .and_then(|budget| {
+                stored
+                    .keys()
+                    .find(|legacy| capped_legacy_summary(&shape, legacy, budget))
+            })
+            .cloned()
+        {
+            let Some(vector) = stored.get_mut(&legacy).and_then(Vec::pop) else {
+                break;
+            };
+            rows.push((legacy, vector));
+            summary_repair_pending = true;
+        } else {
+            break;
+        }
+    }
+    let all_matched = rows.len() == chunk_count && stored.values().all(Vec::is_empty);
+    if !all_matched {
+        return None;
+    }
+    let key = if summary_repair_pending {
+        producer.legacy_key(&source, &rel_path)
+    } else {
+        producer.key(&source, &rel_path)
+    };
+    Some(BundleEntry {
+        content: ContentHash::from_bytes(file.content_hash),
+        size: source.len() as u64,
+        key: *key.as_bytes(),
+        payload: semantic_payload(producer, &rows),
+        rel_path,
+    })
+}
 // ---------------------------------------------------------------------------
 // The import
 
 /// What one binder asks the import to produce.
 #[derive(Clone, Debug)]
 pub struct ImportRequest {
+    pub durable_storage: PathBuf,
     pub storage: PathBuf,
     /// The v2 family whose stores receive the imported payloads.
     pub family: String,
@@ -1457,7 +1522,11 @@ pub fn run_import(
     }
     report.outcome = ImportOutcome::Completed;
     let registry = FamilyRegistry::open(&request.storage, &request.family)?;
-    let registration = registry.register_view(&request.scope, &request.root)?;
+    let registration = registry.register_view_with_storage(
+        &request.durable_storage,
+        &request.scope,
+        &request.root,
+    )?;
     let mut run = Run {
         request,
         ledger: &ledger,
@@ -2078,87 +2147,6 @@ pub(crate) fn legacy_semantic_producer(
         fingerprint.as_string(),
         fingerprint.embed_text_caps,
     ))
-}
-
-/// Imports a root's legacy set before its views-on semantic lane loads.
-///
-/// Runs on the lane's own worker thread, after the lane was started and
-/// before it registers its view, so the lane's first load seeds from the
-/// imported generation instead of embedding every file again. While it runs
-/// the root's semantic status names the stage `migrating_legacy_index`. A
-/// root with no legacy artifact, or whose import already finished, returns
-/// at once. Another process importing the same set is waited for with a
-/// bound; past it the lane loads without the import.
-pub(crate) fn import_for_semantic_lane(
-    config: &crate::views::semantic_runtime::WorkerConfig,
-    keep_going: &dyn Fn() -> bool,
-) {
-    const SETTLE_DEADLINE: Duration = Duration::from_secs(10 * 60);
-    const SETTLE_POLL: Duration = Duration::from_secs(1);
-    let (storage, key) = (&config.storage, &config.family);
-    if !has_importable_legacy_artifact(storage, key) {
-        return;
-    }
-    if let Ok(Some(ledger)) = ImportLedger::open_existing(storage, key) {
-        if ledger.status().is_ok_and(|status| status.complete) {
-            return;
-        }
-    }
-    if !keep_going() {
-        return;
-    }
-    *config
-        .status
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-        crate::context::SemanticIndexStatus::Building {
-            stage: "migrating_legacy_index".to_string(),
-            files: None,
-            entries_done: None,
-            entries_total: None,
-        };
-    let Some(_permit) = crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
-        &config.schedule.limiter,
-        "legacy_import",
-        &config.root,
-        keep_going,
-    ) else {
-        return;
-    };
-    let semantic = legacy_semantic_producer(storage, key, &config.semantic);
-    let unregistered = crate::views::semantic_runtime::UNREGISTERED_PRODUCER.to_owned();
-    let request = ImportRequest {
-        storage: storage.clone(),
-        family: config.family.clone(),
-        legacy_key: key.clone(),
-        scope: config.scope.clone(),
-        root: config.root.clone(),
-        producers: Producers {
-            trigram: unregistered.clone(),
-            semantic: semantic.as_ref().map(SemanticProducer::id),
-            callgraph: unregistered,
-        },
-        trigram_policy: None,
-        semantic,
-    };
-    let started = Instant::now();
-    match import_until_settled(&request, SETTLE_DEADLINE, SETTLE_POLL, keep_going) {
-        Ok(report) => crate::slog_info!(
-            "legacy import root={} key={} outcome={:?} semantic_files={} published={} elapsed_ms={}",
-            config.root.display(),
-            key,
-            report.outcome,
-            report.semantic_files,
-            report.published.as_deref().unwrap_or("none"),
-            started.elapsed().as_millis()
-        ),
-        Err(error) => crate::slog_warn!(
-            "legacy import root={} key={} failed: {}",
-            config.root.display(),
-            key,
-            error
-        ),
-    }
 }
 
 #[cfg(test)]

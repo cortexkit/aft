@@ -1,4 +1,4 @@
-import { RotatingLogSink, resolvePluginLogPath } from "@cortexkit/aft-bridge";
+import { type LogMeta, RotatingLogSink, resolvePluginLogPath } from "@cortexkit/aft-bridge";
 
 const TAG = "[aft-pi]";
 
@@ -118,15 +118,22 @@ export async function flushLogs(): Promise<void> {
  * for the shared bridge package.
  */
 export const bridgeLogger = {
-  log(message: string, meta?: { sessionId?: string }) {
+  debug(message: string, meta?: LogMeta) {
+    if (meta?.engineRecord) return;
+    write("DEBUG", message, undefined, meta?.sessionId);
+  },
+  log(message: string, meta?: LogMeta) {
+    if (meta?.engineRecord) return;
     if (meta?.sessionId) sessionLog(meta.sessionId, message);
     else write("INFO", message);
   },
-  warn(message: string, meta?: { sessionId?: string }) {
+  warn(message: string, meta?: LogMeta) {
+    if (meta?.engineRecord) return;
     if (meta?.sessionId) sessionWarn(meta.sessionId, message);
     else write("WARN", message);
   },
-  error(message: string, meta?: { sessionId?: string }) {
+  error(message: string, meta?: LogMeta) {
+    if (meta?.engineRecord) return;
     if (meta?.sessionId) sessionError(meta.sessionId, message);
     else write("ERROR", message);
   },

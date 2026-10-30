@@ -1,8 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-#[cfg(debug_assertions)]
-use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::{Instant, UNIX_EPOCH};
 
@@ -53,7 +51,7 @@ struct TopFileMetric {
 static METRICS_MEMO: OnceLock<Tier1FileMemo<CachedFileMetric>> = OnceLock::new();
 
 #[cfg(debug_assertions)]
-static FILE_READS: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> = OnceLock::new();
+static FILE_READS: super::read_counts::FileReadCounts = super::read_counts::FileReadCounts::new();
 
 pub fn run_metrics_scan(job: &crate::inspect::InspectJob) -> crate::inspect::InspectResult {
     #[cfg(debug_assertions)]
@@ -260,15 +258,8 @@ fn language_key(path: &Path) -> &'static str {
 }
 
 #[cfg(debug_assertions)]
-fn debug_file_reads() -> &'static Mutex<BTreeMap<PathBuf, usize>> {
-    FILE_READS.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-#[cfg(debug_assertions)]
 fn bump_file_read_count(path: &Path) {
-    if let Ok(mut reads) = debug_file_reads().lock() {
-        *reads.entry(path.to_path_buf()).or_default() += 1;
-    }
+    FILE_READS.record(path);
 }
 
 #[cfg(debug_assertions)]
@@ -277,9 +268,7 @@ pub fn reset_file_read_count_for_debug(project_root: &Path) {
     // Normalized like the scanned paths themselves: bare canonicalize is
     // verbatim on Windows and the starts_with filter would miss every entry.
     let project_root = crate::inspect::job::canonicalize_normalized(project_root);
-    if let Ok(mut reads) = debug_file_reads().lock() {
-        reads.retain(|path, _| !path.starts_with(&project_root));
-    }
+    FILE_READS.reset(project_root);
 }
 
 #[cfg(debug_assertions)]
@@ -288,16 +277,7 @@ pub fn file_read_count_for_debug(project_root: &Path) -> usize {
     // Normalized like the scanned paths themselves: bare canonicalize is
     // verbatim on Windows and the starts_with filter would miss every entry.
     let project_root = crate::inspect::job::canonicalize_normalized(project_root);
-    debug_file_reads()
-        .lock()
-        .map(|reads| {
-            reads
-                .iter()
-                .filter(|(path, _)| path.starts_with(&project_root))
-                .map(|(_, count)| *count)
-                .sum()
-        })
-        .unwrap_or_default()
+    FILE_READS.count(&project_root)
 }
 
 #[cfg(all(test, debug_assertions))]
@@ -306,6 +286,18 @@ mod tests {
     use std::sync::{Arc, RwLock};
 
     use super::*;
+
+    #[test]
+    fn audit05_metrics_read_tracking_is_root_opt_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.rs");
+        fs::write(&path, "fn f() {}\n").unwrap();
+        let _ = read_file_bytes(&path);
+        assert_eq!(file_read_count_for_debug(dir.path()), 0);
+        reset_file_read_count_for_debug(dir.path());
+        let _ = read_file_bytes(&path);
+        assert_eq!(file_read_count_for_debug(dir.path()), 1);
+    }
     use crate::config::Config;
     use crate::inspect::{InspectCategory, InspectJob, JobKey, JobScope};
     use crate::parser::SymbolCache;

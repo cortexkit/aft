@@ -351,6 +351,7 @@ export function createInspectTier2IdleScheduler(options: InspectTier2IdleSchedul
         );
       });
     }, delayMs);
+    (timer as { unref?: () => void }).unref?.();
     timers.set(sessionID, timer);
   };
 

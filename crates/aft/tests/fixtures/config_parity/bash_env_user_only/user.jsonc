@@ -2,7 +2,7 @@
   "bash": {
     "env": {
       "TZ": "UTC",
-      "AFT_PARITY_USER_ENV": "user-value"
+      "PARITY_USER_ENV": "user-value"
     }
   }
 }

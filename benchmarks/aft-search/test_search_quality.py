@@ -738,6 +738,15 @@ class EngineUnwiredGateTests(unittest.TestCase):
         self.assertEqual(derive_slice_class(["crates/aft/src/search_b2/router.rs"]), "ranking")
         self.assertEqual(derive_slice_class(["crates/aft/src/search_b2/lane_plan.rs"]), "ranking")
 
+    def test_parser_paths_are_ranking(self) -> None:
+        from search_quality_lib import derive_slice_class
+
+        # parser.rs decides symbol ranges, which become semantic chunk
+        # boundaries, so a parser-only diff can move ranked rows.
+        self.assertEqual(derive_slice_class(["crates/aft/src/parser.rs"]), "ranking")
+        # symbols.rs only defines the Symbol and Range types, so it stays out.
+        self.assertEqual(derive_slice_class(["crates/aft/src/symbols.rs"]), "non_ranking")
+
     def test_engine_unwired_rejects_a_non_ranking_diff_class(self) -> None:
         result = self.gate(self.score, ["scripts/telemetry/cost-gate.sh"])
         self.assertEqual(result.exit_code, 2)

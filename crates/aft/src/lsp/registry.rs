@@ -906,6 +906,28 @@ pub(crate) fn servers_for_file_with_mode(
     config: &Config,
     mode: RootPathMode,
 ) -> Vec<ServerDef> {
+    servers_for_file_selecting(path, config, mode, None)
+}
+
+/// [`servers_for_file`] for a caller that looks up many files in one pass,
+/// such as the configure warnings. `memo` reuses the Biome workspace root and
+/// configuration lookups of files that share folders, so each folder is
+/// probed once per pass. Start a new memo for each pass: it never notices a
+/// configuration created, moved or deleted after it answered.
+pub(crate) fn servers_for_file_in_pass(
+    path: &Path,
+    config: &Config,
+    memo: &mut BiomeSelectionMemo,
+) -> Vec<ServerDef> {
+    servers_for_file_selecting(path, config, RootPathMode::Resolve, Some(memo))
+}
+
+fn servers_for_file_selecting(
+    path: &Path,
+    config: &Config,
+    mode: RootPathMode,
+    mut memo: Option<&mut BiomeSelectionMemo>,
+) -> Vec<ServerDef> {
     let extension = path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -936,7 +958,7 @@ pub(crate) fn servers_for_file_with_mode(
         // the second filter lets `typescript-native` be disabled on its own.
         .map(|server| select_typescript_server(server, path, config, mode))
         .filter(|server| !is_disabled(server, config))
-        .filter(|server| !biome_config_excludes(server, path, mode))
+        .filter(|server| !biome_config_excludes(server, path, mode, memo.as_deref_mut()))
         .collect()
 }
 
@@ -1067,10 +1089,16 @@ impl<'a> WalkServerResolver<'a> {
 /// directory. The search stops at the enclosing repository's root, the same
 /// boundary workspace-root discovery uses. A configuration without
 /// `files.includes`, or one that cannot be read, includes every file.
-fn biome_config_excludes(server: &ServerDef, path: &Path, mode: RootPathMode) -> bool {
-    biome_file_selection(server, path, mode).excludes(path, mode)
+fn biome_config_excludes(
+    server: &ServerDef,
+    path: &Path,
+    mode: RootPathMode,
+    memo: Option<&mut BiomeSelectionMemo>,
+) -> bool {
+    biome_file_selection_in(server, path, mode, memo).excludes(path, mode)
 }
 
+#[derive(Clone)]
 enum BiomeFileSelection {
     Missing,
     All,
@@ -1091,15 +1119,33 @@ impl BiomeFileSelection {
 }
 
 fn biome_file_selection(server: &ServerDef, path: &Path, mode: RootPathMode) -> BiomeFileSelection {
+    biome_file_selection_in(server, path, mode, None)
+}
+
+fn biome_file_selection_in(
+    server: &ServerDef,
+    path: &Path,
+    mode: RootPathMode,
+    memo: Option<&mut BiomeSelectionMemo>,
+) -> BiomeFileSelection {
     if server.kind != ServerKind::Biome {
         return BiomeFileSelection::All;
+    }
+    if let Some(memo) = memo {
+        return memo.selection(server, path, mode);
     }
     let Some(root) = server.workspace_root_with_mode(path, None, mode) else {
         return BiomeFileSelection::Missing;
     };
+    biome_selection_for_config(find_biome_config(&root))
+}
+
+/// The nearest `biome.json` or `biome.jsonc` at or above `root`, searching no
+/// higher than the first directory that holds `.git` (that directory itself
+/// is still searched).
+fn find_biome_config(root: &Path) -> Option<PathBuf> {
     let mut reached_repository_root = false;
-    let Some(config_path) = root
-        .ancestors()
+    root.ancestors()
         .take_while(|dir| {
             let inside = !reached_repository_root;
             reached_repository_root = dir.join(".git").exists();
@@ -1110,7 +1156,10 @@ fn biome_file_selection(server: &ServerDef, path: &Path, mode: RootPathMode) -> 
             super::applicability_cache::observe_path(candidate);
             candidate.is_file()
         })
-    else {
+}
+
+fn biome_selection_for_config(config_path: Option<PathBuf>) -> BiomeFileSelection {
+    let Some(config_path) = config_path else {
         return BiomeFileSelection::Missing;
     };
     let Some(includes) = biome_includes(&config_path) else {
@@ -1121,6 +1170,117 @@ fn biome_file_selection(server: &ServerDef, path: &Path, mode: RootPathMode) -> 
         return BiomeFileSelection::All;
     };
     BiomeFileSelection::Includes(config_dir.to_path_buf(), includes)
+}
+
+/// Biome lookups remembered for one pass over many files.
+///
+/// Finding which Biome configuration governs a file means walking up from
+/// the file to the Biome workspace root and then up from that root to the
+/// configuration, checking for marker and configuration files in every
+/// directory on the way. Files in the same folder get the same answers, so a
+/// pass over a project remembers the workspace root of each starting folder,
+/// the configuration found from each directory, and the parsed selection of
+/// each root. Every directory is then checked once per pass, and every
+/// candidate path is reported to the applicability cache once per pass.
+///
+/// Nothing here notices files changing on disk, so a memo must not outlive
+/// the pass it was created for.
+#[derive(Default)]
+pub(crate) struct BiomeSelectionMemo {
+    /// Workspace root by (root-marker set, resolved starting directory).
+    roots: HashMap<(u64, PathBuf), Option<PathBuf>>,
+    /// The configuration found by searching upward from each directory.
+    configs: HashMap<PathBuf, Option<PathBuf>>,
+    /// The file selection of the configuration governing each workspace root.
+    selections: HashMap<PathBuf, BiomeFileSelection>,
+}
+
+impl BiomeSelectionMemo {
+    fn selection(
+        &mut self,
+        server: &ServerDef,
+        path: &Path,
+        mode: RootPathMode,
+    ) -> BiomeFileSelection {
+        let Some(root) = self.workspace_root(server, path, mode) else {
+            return BiomeFileSelection::Missing;
+        };
+        if let Some(selection) = self.selections.get(&root) {
+            return selection.clone();
+        }
+        let selection = biome_selection_for_config(self.config_from(&root));
+        self.selections.insert(root, selection.clone());
+        selection
+    }
+
+    /// `server.workspace_root_with_mode(path, None, mode)`, computed once per
+    /// starting directory. That walk starts at the resolved file's parent (or
+    /// at the resolved path when it is a directory), so files that resolve
+    /// into the same folder share its answer.
+    fn workspace_root(
+        &mut self,
+        server: &ServerDef,
+        path: &Path,
+        mode: RootPathMode,
+    ) -> Option<PathBuf> {
+        let resolved = mode.resolve(path);
+        let start = if resolved.is_dir() {
+            resolved
+        } else {
+            match resolved.parent() {
+                Some(parent) => parent.to_path_buf(),
+                None => return server.workspace_root_with_mode(path, None, mode),
+            }
+        };
+        let markers = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            server.root_markers.hash(&mut hasher);
+            server.priority_root_markers.hash(&mut hasher);
+            hasher.finish()
+        };
+        self.roots
+            .entry((markers, start))
+            .or_insert_with(|| {
+                #[cfg(test)]
+                BIOME_ROOT_WALKS.with(|walks| walks.set(walks.get() + 1));
+                server.workspace_root_with_mode(path, None, mode)
+            })
+            .clone()
+    }
+
+    /// [`find_biome_config`] from `root`, remembering the answer for every
+    /// directory it passes so a later search from any of them stops there.
+    fn config_from(&mut self, root: &Path) -> Option<PathBuf> {
+        let mut visited = Vec::new();
+        let mut found = None;
+        for dir in root.ancestors() {
+            if let Some(known) = self.configs.get(dir) {
+                found = known.clone();
+                break;
+            }
+            #[cfg(test)]
+            BIOME_CONFIG_DIRECTORY_PROBES.with(|probes| probes.set(probes.get() + 1));
+            visited.push(dir.to_path_buf());
+            let repository_root = dir.join(".git").exists();
+            found = ["biome.json", "biome.jsonc"]
+                .map(|name| dir.join(name))
+                .into_iter()
+                .find(|candidate| {
+                    super::applicability_cache::observe_path(candidate);
+                    candidate.is_file()
+                });
+            if found.is_some() || repository_root {
+                break;
+            }
+        }
+        // Every directory searched found nothing of its own and was below
+        // any `.git`, so the search from each of them ends with the same answer.
+        for dir in visited {
+            self.configs.insert(dir, found.clone());
+        }
+        found
+    }
 }
 
 /// A Biome `files.includes` list: a file is included when a positive pattern
@@ -1196,6 +1356,12 @@ fn biome_includes(config_path: &Path) -> Option<Arc<BiomeIncludes>> {
 thread_local! {
     /// Biome configuration parses made by this thread.
     static BIOME_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Workspace-root walks a [`BiomeSelectionMemo`] made on this thread.
+    pub(crate) static BIOME_ROOT_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Directories a [`BiomeSelectionMemo`] searched for a configuration on
+    /// this thread.
+    pub(crate) static BIOME_CONFIG_DIRECTORY_PROBES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// The identity of a Biome configuration file as `biome_includes` last parsed it.
@@ -1729,6 +1895,9 @@ mod tests {
             assert!(biome_includes(&config_path).is_some());
         }
         assert_eq!(parses() - before, 1, "one parse serves every lookup");
+        let includes = biome_includes(&config_path).unwrap();
+        assert!(includes.includes(Path::new("a/file.ts")));
+        assert!(!includes.includes(Path::new("b/file.ts")));
 
         // Replace the file with same-length content and restore its old
         // modification time: only its identity (Unix) or bytes (Windows) differ.
@@ -1742,7 +1911,9 @@ mod tests {
             .set_modified(modified)
             .unwrap();
         std::fs::rename(&staged, &config_path).unwrap();
-        assert!(biome_includes(&config_path).is_some());
+        let includes = biome_includes(&config_path).unwrap();
+        assert!(!includes.includes(Path::new("a/file.ts")));
+        assert!(includes.includes(Path::new("b/file.ts")));
         assert_eq!(
             parses() - before,
             2,
@@ -1802,6 +1973,166 @@ mod tests {
         assert!(has_biome("packages/app/src/index.ts"));
         assert!(!has_biome("crates/app/schema.json"));
         assert!(!has_biome("packages/gen/out.ts"));
+    }
+
+    /// A Biome definition whose workspace root (`package.json`) can sit below
+    /// its configuration, so the configuration search climbs directories.
+    fn package_rooted_biome() -> ServerDef {
+        let mut biome = builtin_servers()
+            .into_iter()
+            .find(|server| server.kind == ServerKind::Biome)
+            .unwrap();
+        biome.root_markers = vec!["package.json".into()];
+        biome
+    }
+
+    fn describe_selection(selection: &super::BiomeFileSelection, file: &Path) -> String {
+        let kind = match selection {
+            super::BiomeFileSelection::Missing => "missing".to_string(),
+            super::BiomeFileSelection::All => "all".to_string(),
+            super::BiomeFileSelection::Includes(dir, _) => format!("includes {}", dir.display()),
+        };
+        let excluded = selection.excludes(file, super::RootPathMode::Resolve);
+        format!("{kind}, excluded: {excluded}")
+    }
+
+    /// Nested configurations, a `.git` boundary with a configuration above
+    /// it, a workspace without a configuration of its own, and a folder with
+    /// no workspace root: the pass memo answers every file exactly as the
+    /// uncached lookup does.
+    #[test]
+    fn biome_pass_memo_matches_the_uncached_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let top = crate::inspect::job::canonicalize_normalized(temp.path());
+        // Above the repository boundary: never governs files inside `repo`.
+        write_file(&top.join("biome.json"), r#"{"files":{"includes":["**"]}}"#);
+        let repo = top.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        write_file(
+            &repo.join("biome.json"),
+            r#"{"files":{"includes":["pkg/**/*.ts"]}}"#,
+        );
+        write_file(&repo.join("pkg/package.json"), "{}");
+        write_file(&repo.join("pkg/nested/package.json"), "{}");
+        write_file(&repo.join("pkg/nested/biome.jsonc"), "{}");
+        write_file(&repo.join("tools/package.json"), "{}");
+        write_file(&top.join("other/package.json"), "{}");
+        let files: Vec<PathBuf> = [
+            "repo/pkg/src/a.ts",
+            "repo/pkg/src/b.ts",
+            "repo/pkg/src/c.json",
+            "repo/pkg/nested/lib/d.ts",
+            "repo/tools/x.ts",
+            "repo/loose.ts",
+            "other/y.ts",
+        ]
+        .iter()
+        .map(|relative| top.join(relative))
+        .collect();
+        for file in &files {
+            write_file(file, "");
+        }
+
+        let biome = package_rooted_biome();
+        let mut memo = super::BiomeSelectionMemo::default();
+        // Twice over, so later answers come from the memo.
+        for file in files.iter().chain(&files) {
+            let uncached = super::biome_file_selection(&biome, file, super::RootPathMode::Resolve);
+            let remembered = super::biome_file_selection_in(
+                &biome,
+                file,
+                super::RootPathMode::Resolve,
+                Some(&mut memo),
+            );
+            assert_eq!(
+                describe_selection(&remembered, file),
+                describe_selection(&uncached, file),
+                "{}",
+                file.display()
+            );
+        }
+        // Spot-check the fixture means what it claims.
+        let selection = |relative: &str| {
+            let file = top.join(relative);
+            let mut memo = super::BiomeSelectionMemo::default();
+            describe_selection(
+                &memo.selection(&biome, &file, super::RootPathMode::Resolve),
+                &file,
+            )
+        };
+        let includes = |dir: &Path, excluded: bool| {
+            format!("includes {}, excluded: {excluded}", dir.display())
+        };
+        assert_eq!(selection("repo/pkg/src/a.ts"), includes(&repo, false));
+        assert_eq!(selection("repo/pkg/src/c.json"), includes(&repo, true));
+        assert_eq!(
+            selection("repo/pkg/nested/lib/d.ts"),
+            "all, excluded: false"
+        );
+        assert_eq!(selection("repo/tools/x.ts"), includes(&repo, true));
+        assert_eq!(selection("other/y.ts"), includes(&top, false));
+
+        // The default definitions agree file by file too.
+        let config = Config::default();
+        let mut memo = super::BiomeSelectionMemo::default();
+        for file in files.iter().chain(&files) {
+            let kinds = |servers: Vec<ServerDef>| {
+                servers
+                    .into_iter()
+                    .map(|server| server.kind)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                kinds(super::servers_for_file_in_pass(file, &config, &mut memo)),
+                kinds(servers_for_file(file, &config)),
+                "{}",
+                file.display()
+            );
+        }
+    }
+
+    /// A pass over many files in one folder resolves that folder's workspace
+    /// root once and searches each directory for a configuration once.
+    #[test]
+    fn biome_pass_memo_probes_each_directory_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = crate::inspect::job::canonicalize_normalized(temp.path());
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        write_file(&repo.join("biome.json"), "{}");
+        write_file(&repo.join("pkg/package.json"), "{}");
+        write_file(&repo.join("tools/package.json"), "{}");
+        let files: Vec<PathBuf> = (0..40)
+            .map(|index| repo.join(format!("pkg/src/file{index}.ts")))
+            .collect();
+        for file in &files {
+            write_file(file, "");
+        }
+        let walks = || super::BIOME_ROOT_WALKS.with(std::cell::Cell::get);
+        let probes = || super::BIOME_CONFIG_DIRECTORY_PROBES.with(std::cell::Cell::get);
+        let (walks_before, probes_before) = (walks(), probes());
+
+        let biome = package_rooted_biome();
+        let mut memo = super::BiomeSelectionMemo::default();
+        for file in &files {
+            memo.selection(&biome, file, super::RootPathMode::Resolve);
+        }
+        assert_eq!(walks() - walks_before, 1, "one root walk for pkg/src");
+        // `pkg` holds no configuration; `repo` holds one.
+        assert_eq!(probes() - probes_before, 2, "pkg and repo searched once");
+
+        // Another workspace reuses what the search already learned about
+        // `repo`; only its own directory is new.
+        let tool = repo.join("tools/run.ts");
+        write_file(&tool, "");
+        memo.selection(&biome, &tool, super::RootPathMode::Resolve);
+        assert_eq!(walks() - walks_before, 2);
+        assert_eq!(probes() - probes_before, 3);
+
+        // A new pass looks again, so configuration edits are seen.
+        let mut next = super::BiomeSelectionMemo::default();
+        next.selection(&biome, &files[0], super::RootPathMode::Resolve);
+        assert_eq!(walks() - walks_before, 3);
+        assert_eq!(probes() - probes_before, 5);
     }
 
     /// A Python script with no project file above it is served from the

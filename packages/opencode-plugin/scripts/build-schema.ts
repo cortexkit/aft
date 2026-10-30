@@ -98,6 +98,19 @@ function buildSchema(): Record<string, unknown> {
     type: "object",
     properties: {
       $schema: { type: "string" },
+      storage: {
+        type: "object",
+        additionalProperties: false,
+        description:
+          "Storage-wide settings from the user config base only. Project values and every harness override are ignored.",
+        properties: {
+          cache_dir: {
+            type: ["string", "null"],
+            description:
+              "Existing absolute cache parent (~ is expanded); AFT creates only its marked aft/ namespace. A path through symlinks is resolved once when first used and pinned by device and inode; if it later names a different directory, or is missing, unwritable or identity-changed, all disk caches turn off with cache_dir_unavailable and never fall back to storage. Rechecked on binds and at most once a minute. First enrollment requires a different device from durable storage; cache_dir_on_storage_device refuses main-disk mount stubs on every platform. Once a storage root has used a cache directory, removing this key keeps caches off; set it to null to move caches back to the storage root. Only the user config base may set this; harness/project overrides are dropped. Old caches are not migrated; doctor --fix reclaims only identity- and ownership-verified inactive cache domains.",
+          },
+        },
+      },
 
       edit_mode: {
         type: "string",
@@ -427,6 +440,13 @@ function buildSchema(): Record<string, unknown> {
                 description:
                   "Detach a `wait: true` bash call when a new user message arrives. Default true. Set false to keep the wait blocking; a message containing the literal `&detach` still forces detachment, the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Project-safe.",
               },
+              changed_files: {
+                type: "string",
+                enum: ["off", "list", "diff"],
+                default: "off",
+                description:
+                  "Report watcher-observed project changes after bash commands. User opt-in; projects may only set off. Diff mode uses clean git before-images and bounded output.",
+              },
               db_schema_hints: {
                 type: "boolean",
                 default: true,
@@ -447,6 +467,13 @@ function buildSchema(): Record<string, unknown> {
                 default: 1800000,
                 description:
                   "Longest a delegated worker (subagent) waits on one command before control returns to it, in milliseconds: a bash_watch without a timeout, or a bash call that blocks until the command finishes (wait: true, or every foreground call when subagent_background is false). The command keeps running in the background; the worker is told it is still running and can wait again or kill it. While a worker keeps waiting, the command's default 30-minute hard kill is pushed back by this much. Default 1800000 (30 minutes); values below 60000 are a config error. Project-safe.",
+              },
+              memory_limit_mib: {
+                type: "integer",
+                minimum: 1,
+                maximum: 4294967295,
+                description:
+                  "Optional aggregate local-command memory cap in MiB. Off by default; projects may only lower a user cap. Remote runon jobs use server limits.",
               },
               linux_scope: {
                 type: "boolean",
@@ -490,7 +517,13 @@ function buildSchema(): Record<string, unknown> {
                 type: "object",
                 additionalProperties: { type: "string" },
                 description:
-                  "Fixed shell environment variables from user config only. Project config cannot set this map; per-call env values override it. Loader, shell/interpreter startup hooks, PATH, and other protected keys are rejected.",
+                  "Fixed environment variables for local shell commands, at either tier. A project's names apply only while the project is trusted (aft doctor filters trust; a linked worktree inherits its main checkout); a user value wins when both tiers set the same name, and the first bash reply in a session names each applied variable with its tier, never its value. Per-call env values and the command's own export both override these. Names that hijack startup, redirect lookup roots, inject into interpreters or Git, or drive AFT, the sandbox, or a build worker are rejected at every tier; credentials, identity, proxy, and TLS-trust names are rejected at the project tier. These values never reach a runon build-server job unless a user name is listed in bash.runon_env.",
+              },
+              runon_env: {
+                type: "array",
+                items: { type: "string", minLength: 1 },
+                description:
+                  "User-only list of bash.env names that are also sent to a runon build-server job. Every other bash.env value applies to local commands only; a project's values are never sent, even when their name is listed. Unlisted names appear in the job's \"does not receive\" disclosure.",
               },
             },
             additionalProperties: false,
@@ -886,7 +919,7 @@ function buildSchema(): Record<string, unknown> {
   configProperties.harnesses = {
     type: "object",
     description:
-      "Per-harness overrides. The active harness applies its override after the base config within each tier: user base, user override, project base, project override. Nested harnesses are ignored; unknown harness names are reserved for forward compatibility.",
+      "Per-harness overrides. The active harness applies its override after the base config within each tier: user base, user override, project base, project override. storage.cache_dir is storage-wide and cannot be overridden here. Nested harnesses are ignored; unknown harness names are reserved for forward compatibility.",
     additionalProperties: {
       type: "object",
       properties: { ...configProperties },

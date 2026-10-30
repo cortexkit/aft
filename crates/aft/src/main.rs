@@ -76,15 +76,114 @@ fn parse_subc_arg(
     None
 }
 
-/// Upper bound on how long an exit waits for the durable log to catch up.
+fn uses_subc_stderr(first_arg: Option<&str>, has_connection_file: bool) -> bool {
+    has_connection_file && !matches!(first_arg, Some("profile" | "warmup"))
+}
+
+#[cfg(test)]
+mod stderr_mode_tests {
+    use super::uses_subc_stderr;
+
+    #[test]
+    fn logger_mode_follows_transport_and_preserves_early_cli_precedence() {
+        assert!(uses_subc_stderr(Some("--subc"), true));
+        assert!(uses_subc_stderr(Some("--subc=connection.json"), true));
+        assert!(!uses_subc_stderr(None, false));
+        assert!(!uses_subc_stderr(Some("profile"), true));
+        assert!(!uses_subc_stderr(Some("warmup"), true));
+    }
+}
+
+/// Shared wait budget for durable-file and stderr flushing on error exits.
 const DURABLE_LOG_EXIT_FLUSH: Duration = Duration::from_secs(2);
 
-/// Flush the durable log before `process::exit`, which skips every destructor
+/// Flush the logs before `process::exit`, which skips every destructor
 /// and would otherwise drop the lines still queued for the log writer: the
 /// ones that explain the exit.
 fn exit_after_log_flush(code: i32) -> i32 {
+    let started = Instant::now();
     aft::logging::flush_durable_log(DURABLE_LOG_EXIT_FLUSH);
+    aft::logging::flush_stderr_on_exit(DURABLE_LOG_EXIT_FLUSH.saturating_sub(started.elapsed()));
+    aft::pinned_executable::cleanup_at_exit();
     code
+}
+
+fn hold_process_storage_lease() -> Arc<aft::root_cache::ProcessStorageLease> {
+    let storage = aft::bash_background::storage_dir(None);
+    aft::root_cache::acquire_daemon_storage_lease(&storage).unwrap_or_else(|error| {
+        eprintln!(
+            "cannot acquire storage lease for {}: {error}",
+            storage.display()
+        );
+        std::process::exit(1);
+    })
+}
+
+#[cfg(debug_assertions)]
+fn storage_lease_exit_probe() {
+    let Some(path) =
+        std::env::var_os("AFT_TEST_STORAGE_LEASE_EXIT_PROBE").map(std::path::PathBuf::from)
+    else {
+        return;
+    };
+    std::fs::write(&path, b"exit tail").expect("write storage lease exit probe");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !path.with_extension("release").is_file() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn initialize_global_rayon_pool() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        // Names only help profiling, so never fail startup over them: if
+        // something already used Rayon, its unnamed pool keeps working.
+        if let Err(error) = rayon::ThreadPoolBuilder::new()
+            .thread_name(|index| format!("aft-rayon-{index}"))
+            .build_global()
+        {
+            eprintln!("aft: Rayon pool already started; its threads stay unnamed: {error}");
+        }
+    });
+}
+
+#[cfg(test)]
+mod rayon_thread_tests {
+    #[test]
+    fn global_rayon_worker_names() {
+        const CHILD: &str = "AFT_RAYON_NAME_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            super::initialize_global_rayon_pool();
+            super::initialize_global_rayon_pool();
+            let names = rayon::broadcast(|_| {
+                assert!(rayon::current_thread_index().is_some());
+                std::thread::current().name().unwrap_or("").to_owned()
+            });
+            assert!(!names.is_empty());
+            for name in names {
+                assert!(name.starts_with("aft-rayon-"), "worker name: {name:?}");
+            }
+            return;
+        }
+
+        // Rayon cannot reset a process-global pool, so other parallel tests
+        // must not be able to initialize it before the startup hook is tested.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "rayon_thread_tests::global_rayon_worker_names",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 fn main() {
@@ -95,8 +194,10 @@ fn main() {
     // variables are removed before any child (the login-shell PATH probe
     // below included) could inherit them. Standalone mode has no nonce and
     // never touches the descriptor.
-    if parse_subc_arg(std::env::args_os().skip(1)).is_some() {
+    let subc_connection_file = parse_subc_arg(std::env::args_os().skip(1));
+    if subc_connection_file.is_some() {
         aft::launch_nonce::capture_at_startup();
+        aft::pinned_executable::capture_at_startup();
     }
 
     // Only the binary embeds the per-commit revision. Declare it before CLI
@@ -188,7 +289,11 @@ fn main() {
     // snapshot and exits before logging, the App, runtime registry, or subc
     // scheduler can establish any standing actor or future maintenance work.
     if std::env::args().nth(1).as_deref() == Some("index") {
+        let _process_storage_lease = hold_process_storage_lease();
         let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        // Offline semantic collection can use Rayon. This branch exits without
+        // running the server's later process-environment mutations.
+        initialize_global_rayon_pool();
         match cli::index::run(args) {
             Ok(cli::index::IndexExit::Success) => return,
             Ok(exit) => std::process::exit(exit.code()),
@@ -218,6 +323,11 @@ fn main() {
         let args = std::env::args_os().skip(2).collect::<Vec<_>>();
         std::process::exit(cli::fix_config::run(args));
     }
+    if std::env::args().nth(1).as_deref() == Some("clean-old-caches") {
+        std::process::exit(cli::clean_old_caches::run(
+            std::env::args_os().skip(2).collect(),
+        ));
+    }
 
     // `aft backups purge` removes undo backups early. It runs before logging
     // and the application start: it either hands the purge to the running
@@ -241,6 +351,21 @@ fn main() {
         std::process::exit(cli::prune_legacy::run(args));
     }
 
+    // Keep the lease outside every context and module-loop lifetime. It is
+    // acquired before any cache can be prepared and remains held until process
+    // exit; process::exit releases its kernel handle even when Rust skips Drop.
+    let _process_storage_lease = hold_process_storage_lease();
+
+    // Only the daemon's fixed deployment path can be replaced while it runs.
+    // Standalone hosts use versioned paths and need no persistent image copy.
+    // Pin before PATH discovery or application startup can launch children.
+    if subc_connection_file.is_some() {
+        if let Err(error) = aft::pinned_executable::initialize() {
+            eprintln!("cannot pin the running AFT executable: {error}");
+            std::process::exit(1);
+        }
+    }
+
     // Daemon launches can miss user shell PATH entries. Initialize before any
     // AFT threads or executors start so all subprocesses inherit one PATH.
     aft::effective_path::initialize_process_path();
@@ -252,7 +377,18 @@ fn main() {
     // keeps its legitimate read of these markers.
     aft::agent_child_env::scrub_inherited_process_markers();
 
-    aft::logging::init();
+    // Environment capture and scrubbing must precede worker creation, while
+    // the named global pool must precede context construction and index work.
+    initialize_global_rayon_pool();
+
+    if uses_subc_stderr(
+        std::env::args().nth(1).as_deref(),
+        subc_connection_file.is_some(),
+    ) {
+        aft::logging::init_subc();
+    } else {
+        aft::logging::init();
+    }
     aft::effective_path::log_startup_probe_result();
 
     if std::env::args().nth(1).as_deref() == Some("profile") {
@@ -286,7 +422,7 @@ fn main() {
     // Presence of --subc => subc mode; absence => standalone (the dormancy gate).
     // Fail-loud on connect/auth failure — never silently downgrade to standalone
     // (split-brain index state). tokio runs ONLY inside run_subc_mode.
-    if let Some(connection_file) = parse_subc_arg(std::env::args_os().skip(1)) {
+    if let Some(connection_file) = subc_connection_file {
         aft::slog_info!("subc mode, pid {}", std::process::id());
         aft::launch_nonce::log_capture_outcome();
         // The supervised module holds the secret it authenticates to the
@@ -342,6 +478,14 @@ fn main() {
                     aft::subc::exit_elapsed().as_millis()
                 );
                 let flushed = aft::logging::flush_durable_log(flush_wait);
+                // AFT_TEST_STDERR_EXIT_HOLD keeps every stderr line from here
+                // on queued until the stderr exit fence below starts, so a test
+                // can prove the fence delivers them rather than rely on the
+                // mirror thread happening to run first. Release builds ignore it.
+                #[cfg(debug_assertions)]
+                if std::env::var_os("AFT_TEST_STDERR_EXIT_HOLD").is_some() {
+                    aft::logging::hold_stderr_mirror_until_exit_fence();
+                }
                 aft::slog_info!(
                     "subc exit phase=log_flush_done flushed={} elapsed_ms={}",
                     flushed,
@@ -360,8 +504,16 @@ fn main() {
                     aft::subc::exit_elapsed().as_millis()
                 );
                 if let Err(error) = aft::logging::write_terminal_log_sync(&terminal) {
-                    eprintln!("[aft] terminal log persistence failed: {error}; {terminal}");
+                    aft::logging::write_stderr_diagnostic(&format!(
+                        "[aft] terminal log persistence failed: {error}; {terminal}\n"
+                    ));
                 }
+                #[cfg(debug_assertions)]
+                storage_lease_exit_probe();
+                // The stderr mirror has its own queue: a durable-file flush does
+                // not deliver the shutdown reason to redirected module stderr.
+                aft::logging::flush_stderr_on_exit(aft::subc::exit_log_flush_wait());
+                aft::pinned_executable::cleanup_at_exit();
                 if !native_idle {
                     aft::ort_lifecycle::exit_without_native_teardown(0);
                 }
@@ -617,8 +769,9 @@ fn main() {
         }
 
         let mut shutdown_after_response = false;
-        let response = match serde_json::from_str::<RawRequest>(trimmed) {
-            Ok(req) => {
+        let mut progress_request_id = None;
+        let response = match parse_transport_request(trimmed) {
+            Ok((req, handles_progress)) => {
                 if let Some(response) = duplicate_pending_response(&req, &pending) {
                     Some(response)
                 } else {
@@ -659,6 +812,10 @@ fn main() {
                     // has no separate root selector, so do not infer a runtime from
                     // a file path inside an individual tool's arguments.
                     let runtime = registry.current();
+                    if handles_progress {
+                        runtime.record_request_handles_progress(&request_id);
+                    }
+                    progress_request_id = Some(request_id.clone());
                     runtime.note_request();
                     // Keep the request's configuration snapshot pinned through
                     // standalone response finalization.
@@ -729,7 +886,13 @@ fn main() {
         };
 
         if let Some(response) = response {
-            if let Err(e) = write_response(registry.current(), &response) {
+            let result = write_response(registry.current(), &response);
+            if let Some(request_id) = progress_request_id {
+                registry
+                    .current()
+                    .clear_request_handles_progress(&request_id);
+            }
+            if let Err(e) = result {
                 aft::slog_error!("stdout write error: {}", e);
                 break;
             }
@@ -786,6 +949,9 @@ fn main() {
         if let Err(error) = write_response(registry.current(), &resolved.response) {
             aft::slog_error!("stdout write error while emitting shutdown terminal: {error}");
         }
+        registry
+            .current()
+            .clear_request_handles_progress(&resolved.response.id);
     });
     aft::slog_info!("shutdown phase=pending_responses_drained");
     // Everything from here to exit fits in the exit budget measured from this
@@ -1053,7 +1219,9 @@ fn finalize_ready_pending(
             &resolved.session_id,
             &resolved.attach_command,
         );
-        write(&resolved.response)
+        let result = write(&resolved.response);
+        ctx.clear_request_handles_progress(&resolved.response.id);
+        result
     })
 }
 
@@ -1320,7 +1488,7 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
 
 fn dispatch_on_route(req: RawRequest, ctx: &AppContext) -> Response {
     if req.worker_session() {
-        ctx.lsp().disable_rust_cargo_for_worker();
+        ctx.disable_rust_cargo_for_worker();
     }
     if ctx.claim_database_runtime_retry(&req.command) {
         ctx.retry_database_runtime();
@@ -1452,6 +1620,7 @@ fn dispatch_command(req: RawRequest, ctx: &AppContext) -> Response {
         "remove_import" => aft::commands::remove_import::handle_remove_import(&req, ctx),
         "organize_imports" => aft::commands::organize_imports::handle_organize_imports(&req, ctx),
         "configure" => aft::commands::configure::handle_configure(&req, ctx),
+        "view_token" => aft::commands::view_token::handle_view_token(&req, ctx),
         "glob" => aft::commands::glob::handle_glob(&req, ctx),
         "grep" => aft::commands::grep::handle_grep(&req, ctx),
         "semantic_search" => {
@@ -1686,7 +1855,7 @@ fn dispatch_outcome(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
 
 fn dispatch_outcome_on_route(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
     if req.worker_session() {
-        ctx.lsp().disable_rust_cargo_for_worker();
+        ctx.disable_rust_cargo_for_worker();
     }
     // The request is admitted here: pin the published config so every handler
     // below, and every worker thread a deferred handler starts, uses this
@@ -2071,6 +2240,17 @@ fn write_response_to_writer(writer: &mut impl Write, response: &Response) -> io:
     writer.write_all(b"\n")?;
     writer.flush()?;
     Ok(())
+}
+
+fn parse_transport_request(line: &str) -> serde_json::Result<(RawRequest, bool)> {
+    let mut raw: serde_json::Value = serde_json::from_str(line)?;
+    let handles_progress = raw
+        .as_object_mut()
+        .and_then(|body| body.remove("handles_progress"))
+        .map(serde_json::from_value::<bool>)
+        .transpose()?
+        .unwrap_or(false);
+    serde_json::from_value(raw).map(|req| (req, handles_progress))
 }
 
 fn parse_error_request_id(line: &str) -> String {
@@ -3046,6 +3226,32 @@ mod deferred_semantic_search_tests {
         }
     }
 
+    #[test]
+    fn view_token_management_dispatch_reaches_the_default_off_guard() {
+        let storage = tempfile::tempdir().unwrap();
+        let context = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.path().to_owned()),
+                ..Default::default()
+            },
+        );
+        let response = super::dispatch_command(
+            request(
+                "token",
+                "view_token",
+                serde_json::json!({
+                    "root": storage.path().join("future"), "expected_tree": "a".repeat(40),
+                }),
+            ),
+            &context,
+        );
+        let wire = serde_json::to_value(response).unwrap();
+        assert_eq!(wire["success"], false);
+        assert_eq!(wire["code"], "VIEW_TOKEN");
+        assert!(!storage.path().join("blobs").exists());
+    }
+
     fn slow_search_request(id: &str) -> RawRequest {
         request(
             id,
@@ -3836,6 +4042,7 @@ mod graceful_shutdown_search_index_tests {
         assert_eq!(
             restored
                 .grep("new shutdown token", true, &[], &[], &canonical_root, 10)
+                .unwrap()
                 .matches
                 .len(),
             1,
@@ -3844,6 +4051,7 @@ mod graceful_shutdown_search_index_tests {
         assert!(
             restored
                 .grep("old shutdown token", true, &[], &[], &canonical_root, 10)
+                .unwrap()
                 .matches
                 .is_empty(),
             "without the shutdown flush this test goes red because disk still holds the old base"
@@ -3907,6 +4115,7 @@ mod graceful_shutdown_search_index_tests {
                 &canonical_root,
                 10,
             )
+            .unwrap()
             .matches
             .len();
         let old_matches = restored
@@ -3918,6 +4127,7 @@ mod graceful_shutdown_search_index_tests {
                 &canonical_root,
                 10,
             )
+            .unwrap()
             .matches
             .len();
         wait_for_search_index_build_to_finish(ctx);
@@ -5278,7 +5488,7 @@ mod watcher_filter_tests {
             .collect::<std::collections::BTreeSet<_>>();
         aft::callgraph_store::set_callgraph_refresh_worker_test_seam(
             root.clone(),
-            Duration::from_millis(350),
+            Duration::ZERO,
             false,
         );
         let watcher_tx = install_watcher_rx(&ctx);
@@ -5333,6 +5543,7 @@ mod watcher_filter_tests {
             );
             search_index
                 .grep("switchedFile0", true, &[], &[], &root, 10)
+                .unwrap()
                 .matches
                 .len()
         };
@@ -5341,7 +5552,7 @@ mod watcher_filter_tests {
             "search must expose content refreshed through a non-canonical watcher path"
         );
         match request_rx
-            .recv_timeout(RECV_DISPATCH_TIMEOUT)
+            .recv_timeout(Duration::from_secs(30))
             .expect("semantic file refresh request")
         {
             SemanticRefreshRequest::Files { paths } => {
@@ -5359,19 +5570,21 @@ mod watcher_filter_tests {
         assert!(
             aft::callgraph_store::wait_for_process_callgraph_refresh_for_test(
                 &root,
-                Duration::from_secs(10)
+                Duration::from_secs(30)
             ),
             "oversized callgraph refresh should finish"
         );
         assert_eq!(
             aft::callgraph_store::callgraph_refresh_worker_test_paths(&root),
             expected_paths,
-            "the callgraph refresh worker must receive every changed path exactly once"
+            "the callgraph refresh worker must cover every changed path"
         );
-        assert_eq!(
-            aft::callgraph_store::callgraph_refresh_worker_test_counts(&root).0,
-            1,
-            "one watcher event should produce one coalesced refresh_files call"
+        // A time-sliced drain can enqueue more paths after the worker starts.
+        // Coalescing is opportunistic: coverage and store identity, not batch
+        // count, prove that all indexes were refreshed incrementally.
+        assert!(
+            aft::callgraph_store::callgraph_refresh_worker_test_counts(&root).0 > 0,
+            "watcher paths must reach refresh_files rather than a corpus rebuild"
         );
         let installed_after_refresh = ctx
             .callgraph_store()
@@ -5745,6 +5958,7 @@ mod watcher_filter_tests {
             event_tx
                 .send(SemanticRefreshEvent::Completed {
                     refused_rows: Default::default(),
+                    context_skipped: Default::default(),
                     added_entries: Vec::new(),
                     updated_metadata: Vec::new(),
                     completed_paths: vec![files[BREAKER_TRIP_THRESHOLD - 1].clone()],

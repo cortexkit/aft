@@ -22,7 +22,8 @@ use crate::context::{
 use crate::harness::Harness;
 use crate::log_ctx;
 use crate::lsp::registry::{
-    resolve_lsp_binary, resolve_server_binary, servers_for_file, ServerKind,
+    resolve_lsp_binary, resolve_server_binary, servers_for_file_in_pass, BiomeSelectionMemo,
+    ServerKind,
 };
 use crate::parser::{detect_language, LangId, SharedSymbolCache};
 use crate::protocol::{RawRequest, Response};
@@ -312,6 +313,32 @@ fn artifact_load_root_key(root: &Path) -> PathBuf {
     std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
 }
 
+#[cfg(test)]
+type ReadOnlyQueryWarmupHook =
+    Box<dyn FnOnce() -> Result<crate::semantic_index::EmbeddingModel, String> + Send>;
+
+#[cfg(test)]
+static READ_ONLY_QUERY_WARMUP_HOOKS: Mutex<Option<HashMap<PathBuf, ReadOnlyQueryWarmupHook>>> =
+    Mutex::new(None);
+
+fn warm_read_only_query_model(
+    _root: &Path,
+    config: &SemanticBackendConfig,
+) -> Result<crate::semantic_index::EmbeddingModel, String> {
+    #[cfg(test)]
+    {
+        let hook = READ_ONLY_QUERY_WARMUP_HOOKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .and_then(|hooks| hooks.remove(&artifact_load_root_key(_root)));
+        if let Some(hook) = hook {
+            return hook();
+        }
+    }
+    crate::semantic_index::EmbeddingModel::from_config_for_query(config)
+}
+
 fn note_configure_artifact_load_attempt(root: &Path) {
     CONFIGURE_ARTIFACT_LOAD_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
     let mut by_root = CONFIGURE_ARTIFACT_LOAD_ATTEMPTS_BY_ROOT
@@ -452,14 +479,13 @@ fn wait_for_semantic_stale_generation_discard_for_test(timeout: Duration) -> boo
     !result.timed_out() || semantic_stale_generation_discards_for_test() > 0
 }
 
-// The watcher already coalesces filesystem events for 250 ms. Keep a short
-// worker window for corpus-build replay bursts without adding a second full debounce.
 // Quiet window before a semantic re-embed batch runs. Embedding costs ~1-2s
 // per collect under load, and nobody semantically searches a file within
 // seconds of editing it — a long window coalesces an agent's whole edit burst
 // into one collect instead of one per save. Freshness is preserved where it
 // matters: unembedded changed files are already excluded from results by the
-// stale-file mask, and grep/read see changes instantly.
+// stale-file mask, and grep/read see changes instantly. A batch is admitted
+// after at most four quiet windows even if requests keep arriving.
 const SEMANTIC_REFRESH_QUIET_WINDOW_MS: u64 = 15_000;
 
 /// Test seam: rigs that assert on semantic refresh timing override the quiet
@@ -805,6 +831,25 @@ fn start_project_watcher_with<W, E, F>(
         + Send
         + 'static,
 {
+    start_project_watcher_with_spawn(ctx, root_path, extra_watch_paths, attach, |builder, job| {
+        builder.spawn(job)
+    });
+}
+
+fn start_project_watcher_with_spawn<W, E, F, S>(
+    ctx: &AppContext,
+    root_path: &Path,
+    extra_watch_paths: Vec<PathBuf>,
+    attach: F,
+    spawn: S,
+) where
+    W: Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+    F: FnOnce(PathBuf, Vec<PathBuf>, mpsc::Sender<notify::Result<notify::Event>>) -> Result<W, E>
+        + Send
+        + 'static,
+    S: FnOnce(thread::Builder, Box<dyn FnOnce() + Send>) -> std::io::Result<thread::JoinHandle<()>>,
+{
     let generation = WATCHER_GENERATION
         .fetch_add(1, Ordering::SeqCst)
         .wrapping_add(1);
@@ -826,9 +871,9 @@ fn start_project_watcher_with<W, E, F>(
     let (start_tx, start_rx) = mpsc::channel::<Result<(), String>>();
     let start_tx = sync_start.then_some(start_tx);
 
-    let join = thread::Builder::new()
-        .name("aft-watcher-filter".to_string())
-        .spawn(move || {
+    let join = spawn(
+        thread::Builder::new().name("aft-watcher-filter".to_string()),
+        Box::new(move || {
             log_ctx::with_session(session_id_for_bg, || {
                 let attach_with_start =
                     move |root: PathBuf,
@@ -855,8 +900,17 @@ fn start_project_watcher_with<W, E, F>(
                     attach_with_start,
                 );
             });
-        })
-        .expect("spawn watcher filter thread");
+        }),
+    );
+    let join = match join {
+        Ok(join) => join,
+        Err(error) => {
+            slog_warn!(
+                "watcher filter thread could not start for generation {generation}: {error}"
+            );
+            return;
+        }
+    };
 
     let watcher_thread_id = join.thread().id();
     ctx.install_watcher_runtime_with_thread_id(
@@ -1022,11 +1076,23 @@ fn open_semantic_view_blob_store(
     source: Option<SemanticViewBlobSource>,
 ) -> Option<crate::blob_store::BlobStore> {
     let source = source?;
-    match crate::blob_store::BlobStore::open(
+    #[cfg(test)]
+    let observed_family = source.family.clone();
+    let opened = crate::blob_store::BlobStore::open(
         &source.storage,
         source.family,
         crate::blob_store::BlobPlane::Semantic,
-    ) {
+    );
+    #[cfg(test)]
+    if let Some(sender) = SEMANTIC_BLOB_OPEN_OBSERVERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .remove(&observed_family)
+    {
+        let _ = sender.send((source.storage.clone(), opened.is_ok()));
+    }
+    match opened {
         Ok(store) => Some(store),
         Err(error) => {
             slog_warn!("semantic view blob reuse unavailable: {}", error);
@@ -1034,6 +1100,11 @@ fn open_semantic_view_blob_store(
         }
     }
 }
+
+#[cfg(test)]
+static SEMANTIC_BLOB_OPEN_OBSERVERS: std::sync::OnceLock<
+    Mutex<std::collections::HashMap<String, crossbeam_channel::Sender<(PathBuf, bool)>>>,
+> = std::sync::OnceLock::new();
 
 fn semantic_view_blob_for_path(
     store: Option<&crate::blob_store::BlobStore>,
@@ -1122,6 +1193,31 @@ fn semantic_quiet_gate_held() -> bool {
     true
 }
 
+struct SemanticRefreshDebounce {
+    quiet_window: Duration,
+    quiet_deadline: Instant,
+    batch_deadline: Instant,
+}
+
+impl SemanticRefreshDebounce {
+    fn new(now: Instant, quiet_window: Duration) -> Self {
+        Self {
+            quiet_window,
+            quiet_deadline: now + quiet_window,
+            // Allow save/format bursts to settle without postponing embedding forever.
+            batch_deadline: now + quiet_window.saturating_mul(4),
+        }
+    }
+
+    fn extend(&mut self, now: Instant) {
+        self.quiet_deadline = now + self.quiet_window;
+    }
+
+    fn deadline(&self) -> Instant {
+        self.quiet_deadline.min(self.batch_deadline)
+    }
+}
+
 fn spawn_semantic_refresh_worker(
     project_root: PathBuf,
     mut index: SemanticIndex,
@@ -1177,7 +1273,7 @@ fn spawn_semantic_refresh_worker(
                     SemanticRefreshRequest::Corpus => continue,
                 }
 
-                let mut deadline = Instant::now() + quiet_window;
+                let mut debounce = SemanticRefreshDebounce::new(Instant::now(), quiet_window);
                 #[cfg(any(test, feature = "test-timing-hooks"))]
                 let mut gate_was_held = false;
 
@@ -1185,9 +1281,12 @@ fn spawn_semantic_refresh_worker(
                     #[cfg(any(test, feature = "test-timing-hooks"))]
                     if semantic_quiet_gate_held() {
                         gate_was_held = true;
-                        deadline = Instant::now() + quiet_window;
+                        // Explicit test holds suspend admission and reset both clocks.
+                        debounce = SemanticRefreshDebounce::new(Instant::now(), quiet_window);
                     }
-                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    let Some(remaining) =
+                        debounce.deadline().checked_duration_since(Instant::now())
+                    else {
                         break;
                     };
                     #[cfg(any(test, feature = "test-timing-hooks"))]
@@ -1203,12 +1302,12 @@ fn spawn_semantic_refresh_worker(
                             if !corpus_requested {
                                 paths.extend(request_paths);
                             }
-                            deadline = Instant::now() + quiet_window;
+                            debounce.extend(Instant::now());
                         }
                         Ok(SemanticRefreshRequest::Corpus) if corpus_refresh_allowed => {
                             paths.clear();
                             corpus_requested = true;
-                            deadline = Instant::now() + quiet_window;
+                            debounce.extend(Instant::now());
                         }
                         Ok(SemanticRefreshRequest::Corpus) => {}
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -1363,6 +1462,7 @@ fn spawn_semantic_refresh_worker(
                                 })
                             })
                             .ok_or_else(|| SUPERSEDED_SEMANTIC_BUILD.to_string())?;
+                        index.repair_legacy_file_summaries(&mut embed, max_batch_size)?;
                         index.refresh_stale_files_with_strategy_and_blob_reuse(
                             &project_root,
                             &current_files,
@@ -1542,6 +1642,8 @@ fn spawn_semantic_refresh_worker(
                         if event_tx
                             .send(SemanticRefreshEvent::Completed {
                                 refused_rows: index.refused_rows_for_paths(&update.completed_paths),
+                                context_skipped: index
+                                    .context_skipped_for_paths(&update.completed_paths),
                                 added_entries: update.added_entries,
                                 updated_metadata: update.updated_metadata,
                                 completed_paths: update.completed_paths,
@@ -1618,8 +1720,7 @@ pub(crate) fn ensure_ready_semantic_refresh_worker(ctx: &AppContext) -> bool {
                 .map(SemanticViewBlobSource::from)
                 .or_else(|| {
                     runtime_config
-                        .storage_dir
-                        .clone()
+                        .cache_storage_dir()
                         .map(|storage| SemanticViewBlobSource {
                             storage,
                             family: ctx.memoized_artifact_cache_key(&project_root),
@@ -2016,12 +2117,16 @@ fn configured_lsp_binary_resolves(
     configured: &crate::config::UserServerDef,
     files: &[PathBuf],
     config: &crate::config::Config,
+    memo: &mut BiomeSelectionMemo,
 ) -> bool {
     let project_root = config.project_root.as_deref();
     for file in files {
-        if let Some(server) = servers_for_file(file, config).into_iter().find(|server| {
-            server.kind.id_str() == configured.id && server.binary == configured.binary
-        }) {
+        if let Some(server) = servers_for_file_in_pass(file, config, memo)
+            .into_iter()
+            .find(|server| {
+                server.kind.id_str() == configured.id && server.binary == configured.binary
+            })
+        {
             let workspace_root = if matches!(server.kind, ServerKind::Python | ServerKind::Ty) {
                 server.workspace_root_for_file_with_project_root(file, project_root)
             } else {
@@ -2081,17 +2186,42 @@ fn has_project_config(project_root: Option<&Path>, filenames: &[&str]) -> bool {
     filenames.iter().any(|file| root.join(file).exists())
 }
 
+fn read_pyproject(project_root: Option<&Path>) -> Option<toml::Value> {
+    let content = std::fs::read_to_string(project_root?.join("pyproject.toml")).ok()?;
+    toml::from_str(&content).ok()
+}
+
+fn pyproject_has_tool(pyproject: Option<&toml::Value>, tool_name: &str) -> bool {
+    pyproject
+        .and_then(|value| value.get("tool"))
+        .and_then(|tools| tools.get(tool_name))
+        .is_some_and(toml::Value::is_table)
+}
+
+#[cfg(test)]
 fn has_pyproject_tool(project_root: Option<&Path>, tool_name: &str) -> bool {
-    let Some(root) = project_root else {
-        return false;
-    };
-    let pyproject = root.join("pyproject.toml");
-    if !pyproject.exists() {
-        return false;
+    pyproject_has_tool(read_pyproject(project_root).as_ref(), tool_name)
+}
+
+#[cfg(test)]
+#[test]
+fn audit01_pyproject_configuration_not_raw_markers() {
+    let root = tempfile::tempdir().unwrap();
+    for (text, expected) in [
+        ("[tool.ruff]\n", true),
+        ("[tool.ruff.lint]\nselect = ['E']\n", true),
+        ("[tool.\"ruff\"]\n", true),
+        ("# [tool.ruff]\n", false),
+        ("description = '[tool.ruff]'\n", false),
+        ("[tool.ruff]\ninvalid = [\n", false),
+    ] {
+        std::fs::write(root.path().join("pyproject.toml"), text).unwrap();
+        assert_eq!(
+            has_pyproject_tool(Some(root.path()), "ruff"),
+            expected,
+            "{text}"
+        );
     }
-    std::fs::read_to_string(pyproject)
-        .map(|content| content.contains(&format!("[tool.{tool_name}]")))
-        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone)]
@@ -2130,9 +2260,22 @@ fn explicit_checker_candidate(name: &str) -> Vec<ConfigureToolCandidate> {
     }
 }
 
+#[cfg(test)]
 fn formatter_candidates(
     lang: LangId,
     config: &crate::config::Config,
+) -> Vec<ConfigureToolCandidate> {
+    formatter_candidates_with_pyproject(
+        lang,
+        config,
+        read_pyproject(config.project_root.as_deref()).as_ref(),
+    )
+}
+
+fn formatter_candidates_with_pyproject(
+    lang: LangId,
+    config: &crate::config::Config,
+    pyproject: Option<&toml::Value>,
 ) -> Vec<ConfigureToolCandidate> {
     let project_root = config.project_root.as_deref();
     if let Some(preferred) = config.formatter.get(lang_key(lang)) {
@@ -2177,10 +2320,10 @@ fn formatter_candidates(
         }
         LangId::Python => {
             if has_project_config(project_root, &["ruff.toml", ".ruff.toml"])
-                || has_pyproject_tool(project_root, "ruff")
+                || pyproject_has_tool(pyproject, "ruff")
             {
                 vec![configure_tool_candidate("ruff", "ruff config", true)]
-            } else if has_pyproject_tool(project_root, "black") {
+            } else if pyproject_has_tool(pyproject, "black") {
                 vec![configure_tool_candidate("black", "pyproject.toml", true)]
             } else {
                 Vec::new()
@@ -2231,7 +2374,11 @@ fn formatter_candidates(
     }
 }
 
-fn checker_candidates(lang: LangId, config: &crate::config::Config) -> Vec<ConfigureToolCandidate> {
+fn checker_candidates(
+    lang: LangId,
+    config: &crate::config::Config,
+    pyproject: Option<&toml::Value>,
+) -> Vec<ConfigureToolCandidate> {
     let project_root = config.project_root.as_deref();
     if let Some(preferred) = config.checker.get(lang_key(lang)) {
         return explicit_checker_candidate(preferred);
@@ -2249,11 +2396,11 @@ fn checker_candidates(lang: LangId, config: &crate::config::Config) -> Vec<Confi
         }
         LangId::Python => {
             if has_project_config(project_root, &["pyrightconfig.json"])
-                || has_pyproject_tool(project_root, "pyright")
+                || pyproject_has_tool(pyproject, "pyright")
             {
                 vec![configure_tool_candidate("pyright", "pyright config", true)]
             } else if has_project_config(project_root, &["ruff.toml", ".ruff.toml"])
-                || has_pyproject_tool(project_root, "ruff")
+                || pyproject_has_tool(pyproject, "ruff")
             {
                 vec![configure_tool_candidate("ruff", "ruff config", true)]
             } else {
@@ -2369,16 +2516,33 @@ fn detect_missing_tools_for_languages(
 fn detect_missing_tools_with_cache(
     languages: &HashSet<LangId>,
     config: &crate::config::Config,
+    tool_cache: HashMap<String, bool>,
+) -> Vec<crate::format::MissingTool> {
+    detect_missing_tools_with_loader(languages, config, tool_cache, read_pyproject)
+}
+
+fn detect_missing_tools_with_loader(
+    languages: &HashSet<LangId>,
+    config: &crate::config::Config,
     mut tool_cache: HashMap<String, bool>,
+    load: impl FnOnce(Option<&Path>) -> Option<toml::Value>,
 ) -> Vec<crate::format::MissingTool> {
     let mut warnings = Vec::new();
     let mut seen = HashSet::new();
+    // Formatter and checker selection must agree on one parsed Python snapshot.
+    // Invalid pyproject.toml contributes no candidates; separate tool config files
+    // and explicit formatter/checker settings are still considered.
+    let pyproject = if languages.contains(&LangId::Python) {
+        load(config.project_root.as_deref())
+    } else {
+        None
+    };
 
     for &lang in languages {
         let language = lang_key(lang);
 
         if should_warn_missing_formatters(config, lang) {
-            for candidate in formatter_candidates(lang, config) {
+            for candidate in formatter_candidates_with_pyproject(lang, config, pyproject.as_ref()) {
                 if let Some(warning) = missing_tool_warning(
                     "formatter_not_installed",
                     language,
@@ -2398,7 +2562,7 @@ fn detect_missing_tools_with_cache(
         }
 
         if should_warn_missing_checkers(config, lang) {
-            for candidate in checker_candidates(lang, config) {
+            for candidate in checker_candidates(lang, config, pyproject.as_ref()) {
                 if let Some(warning) = missing_tool_warning(
                     "checker_not_installed",
                     language,
@@ -2424,6 +2588,38 @@ fn detect_missing_tools_with_cache(
     warnings
 }
 
+#[cfg(test)]
+#[test]
+fn audit01_python_warning_collection_uses_one_snapshot() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config {
+        project_root: Some(root.path().to_path_buf()),
+        format_on_edit: true,
+        validate_on_edit: Some("syntax".to_string()),
+        ..Default::default()
+    };
+    let mut calls = 0;
+    let warnings = detect_missing_tools_with_loader(
+        &HashSet::from([LangId::Python]),
+        &config,
+        HashMap::from([("ruff".to_string(), false), ("pyright".to_string(), false)]),
+        |_| {
+            calls += 1;
+            Some(toml::from_str("[tool.ruff.lint]\nselect = ['E']\n[tool.pyright]\ntypeCheckingMode = 'strict'\n").unwrap())
+        },
+    );
+    assert_eq!(calls, 1);
+    assert_eq!(warnings.len(), 2);
+    assert!(warnings.iter().any(|warning| warning.tool == "ruff"));
+    assert!(warnings.iter().any(|warning| warning.tool == "pyright"));
+    detect_missing_tools_with_loader(
+        &HashSet::from([LangId::TypeScript]),
+        &config,
+        HashMap::new(),
+        |_| panic!("non-Python discovery must not load pyproject"),
+    );
+}
+
 fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config) -> Vec<Value> {
     let mut warnings = Vec::new();
     let mut seen_resolutions = HashSet::new();
@@ -2432,9 +2628,12 @@ fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config
     let mut warned_binaries = HashSet::new();
 
     let project_root = config.project_root.as_deref();
+    // One memo for the whole pass: files that share folders share their Biome
+    // root and configuration lookups. A fresh one each pass sees config edits.
+    let mut biome_memo = BiomeSelectionMemo::default();
 
     for file in files {
-        for server in servers_for_file(&file, config) {
+        for server in servers_for_file_in_pass(file, config, &mut biome_memo) {
             let workspace_root = if matches!(server.kind, ServerKind::Python | ServerKind::Ty) {
                 server.workspace_root_for_file_with_project_root(file, project_root)
             } else {
@@ -2494,7 +2693,7 @@ fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config
             continue;
         }
 
-        if !configured_lsp_binary_resolves(server, files, config)
+        if !configured_lsp_binary_resolves(server, files, config, &mut biome_memo)
             && warned_binaries.insert(server.binary.clone())
         {
             warnings.push(json!({
@@ -2510,24 +2709,287 @@ fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config
     warnings
 }
 
-type SearchIndexSymbolFile = (PathBuf, SystemTime);
-
-fn search_index_symbol_files(index: &SearchIndex) -> Vec<SearchIndexSymbolFile> {
-    index
-        .files
-        .iter()
-        .filter(|entry| !entry.path.as_os_str().is_empty())
-        .map(|entry| (entry.path.clone(), entry.modified))
-        .collect()
+#[cfg(test)]
+#[test]
+fn lsp_warnings_probe_each_biome_folder_once_per_pass() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join("biome.json"), "{}").unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let files: Vec<PathBuf> = (0..25)
+        .map(|index| {
+            let file = root.join(format!("src/file{index}.ts"));
+            std::fs::write(&file, "").unwrap();
+            file
+        })
+        .collect();
+    let config = Config {
+        project_root: Some(root.clone()),
+        ..Default::default()
+    };
+    let walks = || crate::lsp::registry::BIOME_ROOT_WALKS.with(std::cell::Cell::get);
+    let probes = || crate::lsp::registry::BIOME_CONFIG_DIRECTORY_PROBES.with(std::cell::Cell::get);
+    let (walks_before, probes_before) = (walks(), probes());
+    detect_missing_lsp_binaries(&files, &config);
+    assert_eq!(
+        walks() - walks_before,
+        1,
+        "src resolved its Biome root once"
+    );
+    assert_eq!(
+        probes() - probes_before,
+        1,
+        "the root was searched for a configuration once"
+    );
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WarningBoundary {
+    Discovery,
+    Walking,
+    Tools,
+    ParsingTools,
+    Lsp,
+    ResolvingLsp,
+    Publication,
+}
+
+struct ConfigureWarningWork {
+    root: PathBuf,
+    config: Arc<Config>,
+    generation_flag: Arc<AtomicU64>,
+    generation: u64,
+    tx: crossbeam_channel::Sender<(u64, crate::protocol::ConfigureWarningsFrame)>,
+    session_id: Option<String>,
+}
+
+impl ConfigureWarningWork {
+    // Per-call observers let tests supersede a worker at real work boundaries;
+    // production supplies a no-op observer rather than a process-wide delay.
+    fn run(self, mut boundary: impl FnMut(WarningBoundary)) {
+        let current = || self.generation_flag.load(Ordering::SeqCst) == self.generation;
+        boundary(WarningBoundary::Discovery);
+        if !current() {
+            return;
+        }
+        boundary(WarningBoundary::Walking);
+        signal_configure_deferred_walk_start_for_test();
+        let flag = self.generation_flag.clone();
+        let generation = self.generation;
+        let source_files: Vec<PathBuf> =
+            crate::callgraph::walk_project_files_while(&self.root, move || {
+                flag.load(Ordering::SeqCst) == generation
+            })
+            .collect();
+        boundary(WarningBoundary::Tools);
+        if !current() {
+            return;
+        }
+        boundary(WarningBoundary::ParsingTools);
+        let languages: HashSet<LangId> = source_files
+            .iter()
+            .filter_map(|path| detect_language(path))
+            .collect();
+        let mut warnings = detect_missing_tools_for_languages(&languages, &self.config)
+            .into_iter()
+            .map(|warning| json!(warning))
+            .collect::<Vec<_>>();
+        boundary(WarningBoundary::Lsp);
+        if !current() {
+            return;
+        }
+        boundary(WarningBoundary::ResolvingLsp);
+        warnings.extend(detect_missing_lsp_binaries(&source_files, &self.config));
+        boundary(WarningBoundary::Publication);
+        // The consumer still filters the check/send race; obsolete discovery
+        // must not knowingly queue a frame.
+        if !current() {
+            return;
+        }
+        let frame = crate::protocol::ConfigureWarningsFrame::new_with_session_id(
+            self.session_id,
+            self.root.display().to_string(),
+            warnings,
+        );
+        let _ = self.tx.send((self.generation, frame));
+    }
+}
+
+#[cfg(test)]
+fn assert_warning_superseded_at(phase: WarningBoundary) {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("one.rs"), "fn fixture() {}\n").unwrap();
+    let flag = Arc::new(AtomicU64::new(1));
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let mut observed = Vec::new();
+    ConfigureWarningWork {
+        root: root.path().to_path_buf(),
+        config: Arc::new(Config::default()),
+        generation_flag: flag.clone(),
+        generation: 1,
+        tx,
+        session_id: None,
+    }
+    .run(|at| {
+        observed.push(at);
+        if at == phase {
+            flag.store(2, Ordering::SeqCst);
+        }
+    });
+    assert_eq!(
+        observed.contains(&WarningBoundary::Walking),
+        phase != WarningBoundary::Discovery
+    );
+    assert_eq!(
+        observed.contains(&WarningBoundary::ParsingTools),
+        matches!(phase, WarningBoundary::Lsp | WarningBoundary::Publication)
+    );
+    assert_eq!(
+        observed.contains(&WarningBoundary::ResolvingLsp),
+        phase == WarningBoundary::Publication
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "superseded worker queued a stale raw frame"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn audit01_warning_discovery_guard() {
+    assert_warning_superseded_at(WarningBoundary::Discovery);
+}
+#[cfg(test)]
+#[test]
+fn audit01_warning_walk_guard() {
+    assert_warning_superseded_at(WarningBoundary::Walking);
+}
+#[cfg(test)]
+#[test]
+fn audit01_warning_tool_guard() {
+    assert_warning_superseded_at(WarningBoundary::Tools);
+}
+#[cfg(test)]
+#[test]
+fn audit01_warning_lsp_guard() {
+    assert_warning_superseded_at(WarningBoundary::Lsp);
+}
+#[cfg(test)]
+#[test]
+fn audit01_warning_publication_guard() {
+    assert_warning_superseded_at(WarningBoundary::Publication);
+}
+
+#[cfg(test)]
+#[test]
+fn audit01_warning_current_generation_publishes() {
+    let root = tempfile::tempdir().unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    ConfigureWarningWork {
+        root: root.path().to_path_buf(),
+        config: Arc::new(Config::default()),
+        generation_flag: Arc::new(AtomicU64::new(2)),
+        generation: 2,
+        tx,
+        session_id: None,
+    }
+    .run(|_| {});
+    assert_eq!(rx.try_recv().unwrap().0, 2);
+}
+
+/// What persisting a freshly loaded search index did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchIndexPersist {
+    /// The cache this index last wrote itself (after a cold build or an
+    /// earlier write) still matches its current state, so a rewrite would
+    /// only produce the same bytes again.
+    AlreadyCurrent,
+    Written,
+    Failed,
+}
+
+impl SearchIndexPersist {
+    fn succeeded(self) -> bool {
+        !matches!(self, Self::Failed)
+    }
+}
+
+/// Persist the index configure loaded. A cold build has already written
+/// `cache.bin`; rewriting it right away cost a second full publish (another
+/// copy of the file table and every posting streamed back through), so that
+/// write is skipped unless something changed since the build.
+fn persist_loaded_search_index(
+    index: &mut SearchIndex,
+    cache_dir: &Path,
+    git_head: Option<&str>,
+) -> SearchIndexPersist {
+    if index.disk_cache_is_current(cache_dir, git_head) {
+        return SearchIndexPersist::AlreadyCurrent;
+    }
+    if index.write_to_disk(cache_dir, git_head) {
+        SearchIndexPersist::Written
+    } else {
+        SearchIndexPersist::Failed
+    }
+}
+
+/// The index's file table, shared with the prewarm instead of copied. Entries
+/// with an empty path are files removed since the build and are skipped.
+type SearchIndexSymbolFiles = Arc<Vec<crate::search_index::FileEntry>>;
+
+fn search_index_symbol_files(index: &SearchIndex) -> SearchIndexSymbolFiles {
+    Arc::clone(&index.files)
+}
+
+/// When a symbol-cache prewarm should give up before visiting every file.
+/// The prewarm can run for a long time on a large root, so it stops between
+/// files when its configuration is replaced or its root has been unbound past
+/// the abandon grace. Idle eviction resets the symbol cache to a new
+/// generation, which the prewarm checks on every file as well.
+#[derive(Clone)]
+struct SymbolPrewarmStop {
+    lifecycle: crate::context::SubcLifecycleAdmission,
+    content_generation_flag: Arc<AtomicU64>,
+    content_generation: u64,
+}
+
+impl SymbolPrewarmStop {
+    fn requested(&self) -> bool {
+        if self.content_generation_flag.load(Ordering::SeqCst) != self.content_generation {
+            return true;
+        }
+        let mut abandoned = false;
+        self.lifecycle.cancel_if_abandoned(|| abandoned = true);
+        abandoned
+    }
+
+    #[cfg(test)]
+    fn never() -> Self {
+        Self {
+            lifecycle: crate::context::SubcLifecycleAdmission::default(),
+            content_generation_flag: Arc::new(AtomicU64::new(0)),
+            content_generation: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Called with the number of files visited so far, after each prewarm file.
+    static SYMBOL_PREWARM_AFTER_FILE: std::cell::RefCell<Option<Box<dyn FnMut(usize)>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_symbol_cache_prewarm(
     root: PathBuf,
     symbol_cache: SharedSymbolCache,
     symbol_storage: Option<PathBuf>,
     symbol_project_key: String,
     symbol_cache_generation: u64,
-    symbol_files: Vec<SearchIndexSymbolFile>,
+    symbol_files: SearchIndexSymbolFiles,
+    stop: SymbolPrewarmStop,
     is_worktree_bridge: bool,
     session_id: Option<String>,
 ) {
@@ -2540,6 +3002,7 @@ fn spawn_symbol_cache_prewarm(
                 symbol_project_key,
                 symbol_cache_generation,
                 symbol_files,
+                &stop,
                 is_worktree_bridge,
             );
         });
@@ -2555,13 +3018,15 @@ fn prewarm_symbol_cache_file(
     result.map(|(_, cache_changed)| cache_changed)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prewarm_symbol_cache_from_search_files(
     root: PathBuf,
     symbol_cache: SharedSymbolCache,
     symbol_storage: Option<PathBuf>,
     symbol_project_key: String,
     symbol_cache_generation: u64,
-    symbol_files: Vec<SearchIndexSymbolFile>,
+    symbol_files: SearchIndexSymbolFiles,
+    stop: &SymbolPrewarmStop,
     is_worktree_bridge: bool,
 ) {
     #[cfg(debug_assertions)]
@@ -2597,20 +3062,52 @@ fn prewarm_symbol_cache_from_search_files(
         symbol_cache.clone(),
         Some(symbol_cache_generation),
     );
-    for (path, modified) in &symbol_files {
-        let cached = symbol_cache
-            .read()
-            .map(|cache| cache.contains_path_with_mtime(path, *modified))
-            .unwrap_or(false);
-        if cached {
-            skipped_files += 1;
+    let mut stopped = false;
+    let mut visited = 0usize;
+    for entry in symbol_files.iter() {
+        if entry.path.as_os_str().is_empty() {
             continue;
         }
-        match prewarm_symbol_cache_file(&mut parser, path) {
-            Ok(true) => warmed_files += 1,
-            Ok(false) => skipped_files += 1,
-            Err(_) => {}
+        if stop.requested() {
+            stopped = true;
+            break;
         }
+        let cached = match symbol_cache.read() {
+            Ok(cache) if cache.generation() == symbol_cache_generation => {
+                cache.contains_path_with_mtime(&entry.path, entry.modified)
+            }
+            // A reset (idle eviction or a newer configure) replaced the
+            // cache this prewarm was filling; nothing it warms is kept.
+            _ => {
+                stopped = true;
+                break;
+            }
+        };
+        if cached {
+            skipped_files += 1;
+        } else {
+            match prewarm_symbol_cache_file(&mut parser, &entry.path) {
+                Ok(true) => warmed_files += 1,
+                Ok(false) => skipped_files += 1,
+                Err(_) => {}
+            }
+        }
+        visited += 1;
+        #[cfg(test)]
+        SYMBOL_PREWARM_AFTER_FILE.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(visited);
+            }
+        });
+    }
+    // The file table can be the largest thing a large root holds; let it go
+    // as soon as the prewarm stops reading it, not after persistence.
+    drop(symbol_files);
+    if stopped {
+        slog_info!(
+            "symbol cache prewarm stopped after {} files: its root was released or reconfigured",
+            visited
+        );
     }
 
     let total_files = symbol_cache.read().map(|cache| cache.len()).unwrap_or(0);
@@ -2694,12 +3191,217 @@ fn delay_symbol_prewarm_for_debug() {
     thread::sleep(Duration::from_millis(delay_ms));
 }
 
+/// What one views-routed symbol prewarm did with the files it was given.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SymbolViewPrewarm {
+    /// Already in the symbol cache for the file's current modification time.
+    cached: u64,
+    /// Served from rows the family's v3 symbol plane already held.
+    reused: u64,
+    /// Parsed here and stored into the v3 symbol plane.
+    stored: u64,
+    /// Left for an ordinary on-demand parse: unreadable, changed since the
+    /// lexical view verified it, or not parseable.
+    skipped: u64,
+}
+
+/// Pre-warms the symbol cache of a views-routed root from the files its
+/// lexical v3 view verified, on a background thread. Symbols come from the
+/// family's v3 symbol plane, keyed by content, so a file another checkout of
+/// the family already parsed is not parsed again; only misses are parsed and
+/// then stored for every checkout. The legacy symbol cache file is neither
+/// read nor written.
+fn spawn_symbol_view_prewarm(
+    ctx: &AppContext,
+    snapshot: &crate::search_index::SearchIndexSnapshot,
+) {
+    let files = snapshot.file_entries().to_vec();
+    let symbol_cache = ctx.symbol_cache();
+    let generation = symbol_cache
+        .read()
+        .map(|cache| cache.generation())
+        .unwrap_or_default();
+    let storage = ctx.storage_paths().artifacts;
+    let root = ctx.canonical_cache_root();
+    let family = ctx.memoized_artifact_cache_key(&root);
+    let routes = ctx.symbol_view_route_counter();
+    let session_id = log_ctx::current_session();
+    let spawned = thread::Builder::new()
+        .name("aft-symbol-view-prewarm".to_owned())
+        .spawn(move || {
+            log_ctx::with_session(session_id, || {
+                #[cfg(debug_assertions)]
+                delay_symbol_prewarm_for_debug();
+                let report = prewarm_symbol_cache_from_view(
+                    &storage,
+                    &family,
+                    &symbol_cache,
+                    generation,
+                    &files,
+                );
+                routes.fetch_add(report.reused + report.stored, Ordering::Relaxed);
+                slog_info!(
+                    "pre-warmed symbol cache from the v3 symbol plane: {} reused, {} stored, {} cached, {} skipped root={}",
+                    report.reused,
+                    report.stored,
+                    report.cached,
+                    report.skipped,
+                    root.display()
+                );
+            });
+        });
+    if let Err(error) = spawned {
+        slog_warn!("symbol view prewarm thread failed to start: {}", error);
+    }
+}
+
+fn prewarm_symbol_cache_from_view(
+    storage: &Path,
+    family: &str,
+    symbol_cache: &SharedSymbolCache,
+    generation: u64,
+    files: &[crate::search_index::FileEntry],
+) -> SymbolViewPrewarm {
+    use crate::views::symbol_store;
+    let mut report = SymbolViewPrewarm::default();
+    let producer = symbol_store::SymbolProducer::current();
+    let mut rows = Vec::new();
+    // False once a newer configure reset the cache; that configure runs its
+    // own prewarm.
+    let insert = |file: &crate::search_index::FileEntry, symbols: Vec<crate::symbols::Symbol>| {
+        let Ok(mut cache) = symbol_cache.write() else {
+            return false;
+        };
+        if cache.generation() != generation {
+            return false;
+        }
+        cache.insert_for_generation(
+            generation,
+            file.path.clone(),
+            file.modified,
+            file.size,
+            file.content_hash,
+            symbols,
+        );
+        true
+    };
+    for file in files {
+        if symbol_cache
+            .read()
+            .is_ok_and(|cache| cache.contains_path_with_mtime(&file.path, file.modified))
+        {
+            report.cached += 1;
+            continue;
+        }
+        let Some(lang) = crate::parser::detect_language(&file.path) else {
+            continue;
+        };
+        let content = crate::blob_store::v2::ContentHash::from_bytes(*file.content_hash.as_bytes());
+        match symbol_store::lookup(storage, family, content, &file.path) {
+            Ok(Some(symbols)) => {
+                if !insert(file, symbols.as_ref().clone()) {
+                    break;
+                }
+                report.reused += 1;
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                slog_debug!(
+                    "v3 symbol lookup failed path={}: {}",
+                    file.path.display(),
+                    error
+                );
+            }
+        }
+        // Only the bytes the lexical view verified may be stored under its
+        // content hash; a file that moved on is left for an on-demand parse.
+        let source = match crate::parser::read_source(&file.path) {
+            Ok(source) if blake3::hash(source.as_bytes()) == file.content_hash => source,
+            _ => {
+                report.skipped += 1;
+                continue;
+            }
+        };
+        let symbols = crate::parser::parse_source_with_cached_parser(&file.path, &source, lang)
+            .and_then(|tree| crate::parser::extract_symbols_from_tree(&source, &tree, lang));
+        let Ok(symbols) = symbols else {
+            report.skipped += 1;
+            continue;
+        };
+        let language = symbol_store::language_id(lang);
+        let key = symbol_store::SymbolKey {
+            content,
+            language: language.clone(),
+            producer,
+        }
+        .family_key();
+        rows.push((
+            key,
+            symbol_store::encode_payload(&producer, &language, &symbols),
+        ));
+        if !insert(file, symbols) {
+            break;
+        }
+        report.stored += 1;
+    }
+    if !rows.is_empty() {
+        if let Err(error) = symbol_store::put(storage, family, &rows) {
+            slog_warn!(
+                "storing prewarmed symbols in the v3 symbol plane failed: {}",
+                error
+            );
+            report.skipped += report.stored;
+            report.stored = 0;
+        }
+    }
+    report
+}
+
 fn walk_semantic_project_files_bounded(
     root: &Path,
     max_files: usize,
 ) -> Result<Vec<PathBuf>, usize> {
     let filters = build_path_filters(&[], &[]).unwrap_or_default();
     walk_project_files_bounded_matching(root, &filters, max_files, is_semantic_indexed_extension)
+}
+
+#[cfg(test)]
+mod nested_worktree_semantic_tests {
+    use super::*;
+
+    #[test]
+    fn semantic_enumeration_skips_nested_linked_worktrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture =
+            crate::git_probe::init_repo_with_nested_worktree_for_test(dir.path(), "semantic");
+        let files = walk_semantic_project_files_bounded(&fixture.root, 1000)
+            .expect("fixture walk must complete")
+            .into_iter()
+            .map(|path| {
+                path.strip_prefix(&fixture.root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            files.contains("src/main.rs"),
+            "missing main file: {files:?}"
+        );
+        assert!(
+            files.contains("vendor/independent/inner.rs"),
+            "nested independent repository must still be walked: {files:?}"
+        );
+        assert!(
+            files.contains("submod/code.rs"),
+            "submodule-style checkout must still be walked: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|path| path.starts_with("linked/")),
+            "nested linked worktree files were enumerated: {files:?}"
+        );
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -2855,7 +3557,7 @@ fn configure_warm_key(
     format!(
         "root={:?};storage={:?};home={};worktree={};readonly={};search={}:{};semantic={}:{:?};views={};callgraph={}",
         canonical_root,
-        config.storage_dir,
+        (config.cache_storage_dir(), config.cache_epoch),
         root_too_broad,
         is_worktree_bridge,
         shared_artifacts_read_only,
@@ -2881,7 +3583,7 @@ fn configure_callgraph_build_key(
     format!(
         "root={:?};storage={:?};home={};worktree={};readonly={};enabled={}",
         canonical_root,
-        config.storage_dir,
+        (config.cache_storage_dir(), config.cache_epoch),
         root_too_broad,
         is_worktree_bridge,
         shared_artifacts_read_only,
@@ -2971,7 +3673,12 @@ fn configure_retention_timeout_is_retryable_and_names_lock() {
     assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     assert!(error.to_string().contains("publication round"));
     assert!(!storage.path().join("retention/roots").exists());
-    crate::storage_retention::record_bind(storage.path(), &root, "0123456789abcdef").unwrap();
+    crate::storage_retention::record_bind(
+        &crate::root_cache::StoragePaths::same(storage.path()),
+        &root,
+        "0123456789abcdef",
+    )
+    .unwrap();
     assert!(storage.path().join("retention/roots").is_dir());
 
     let response = retention_binding_failure(
@@ -3159,21 +3866,92 @@ fn log_artifact_owner_note(note: &str) {
 /// Stderr log: `[aft] project root set: <path>`
 /// Stderr log: `[aft] watcher started: <path>`
 pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
+    handle_configure_prepared(req, ctx, None)
+}
+
+fn prepared_cache_matches(prepared: &Config, candidate: &Config) -> bool {
+    prepared.cache_dir == candidate.cache_dir
+        && prepared.storage_dir == candidate.storage_dir
+        && prepared.cache_config_unknown == candidate.cache_config_unknown
+        && prepared.cache_dir_opt_out == candidate.cache_dir_opt_out
+}
+
+fn prepared_cache_warning(
+    prepared: &Config,
+    storage: &Path,
+) -> Option<crate::config_resolve::ConfigWarning> {
+    prepared.cache_unavailable.as_ref().map(|reason| {
+        crate::root_cache::unavailable_warning(
+            prepared.cache_dir.as_deref().unwrap_or(storage),
+            reason,
+        )
+    })
+}
+
+/// Re-run the session's retained connect request after the standing probe saw
+/// its cache volume change state, with `prepared` carrying the fresh volume
+/// check. Unlike a connect it re-resolves no config file: the session keeps
+/// the configuration it is running with (see `handle_configure_inner`).
+/// Re-run the connect request `req` to recheck the cache location, unless a
+/// connect started after `req` was retained (`connect_generation` changed).
+/// The newer connect's settings stand, and the next probe checks them; an old
+/// request re-run over them would restore its storage root, harness and other
+/// process settings.
+pub(crate) fn handle_cache_recovery(
+    req: &RawRequest,
+    connect_generation: u64,
+    ctx: &AppContext,
+    prepared: &Config,
+) -> Response {
+    if ctx.connect_generation() != connect_generation {
+        return Response::success(
+            &req.id,
+            json!({"cache_recovery": "dropped", "reason": "a newer connect replaced the request"}),
+        );
+    }
+    handle_configure_prepared(req, ctx, Some(prepared))
+}
+
+fn handle_configure_prepared(
+    req: &RawRequest,
+    ctx: &AppContext,
+    prepared: Option<&Config>,
+) -> Response {
+    // The configuration active before a connect, kept only to recognise a
+    // refused connect that left it in place.
+    let active_before = prepared.is_none().then(|| ctx.config_unpinned());
+    if prepared.is_none() {
+        ctx.config_live().clear_applied_bind_snapshot();
+        ctx.note_connect_started();
+    }
     let _sources_scope = crate::config_live::configure_sources_scope();
     // Configure can change the project root, search paths or server
     // overrides, and follows installs the file watcher may not report, so the
     // memoized TypeScript server choices are recomputed.
     crate::lsp::typescript_project::clear_typescript_selection();
-    let response = handle_configure_inner(req, ctx);
+    let response = handle_configure_inner(req, ctx, prepared);
     crate::provisional_identity_retry::note_configure_outcome(ctx, req, response.success);
     // A successful configure applied the files it read; record them so a live
     // config reload can tell later edits apart and knows what is deferred.
     ctx.begin_configure_ack_step("finish_configure");
     crate::config_live::finish_configure(ctx, response.success);
+    if response.success {
+        ctx.retain_cache_recovery_request(req);
+    } else if active_before.is_some_and(|before| Arc::ptr_eq(&before, &ctx.config_unpinned())) {
+        // The refused connect published nothing, so the earlier connect's
+        // request still describes the active configuration. Without a new
+        // stamp every later cache recovery would be dropped as stale and
+        // caches would not restart when their volume returns.
+        ctx.restamp_cache_recovery_request();
+    }
     response
 }
 
-fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
+fn handle_configure_inner(
+    req: &RawRequest,
+    ctx: &AppContext,
+    prepared: Option<&Config>,
+) -> Response {
     let prefix_started_at = Instant::now();
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
@@ -3262,19 +4040,50 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
     }
+    // A cache recovery (`prepared` is set) re-runs this configure only to
+    // re-check the cache volume and restart what depends on it. It keeps the
+    // configuration the session is running with, including keys live reload
+    // applied since, and reads no config file: an edit live reload reported as
+    // deferred until the next connect must stay deferred. The running config
+    // already holds this request's resolved tiers, so nothing is re-resolved
+    // and the recorded config sources are left as they are.
+    let recovery = prepared.is_some();
+    let bind_config = if recovery {
+        None
+    } else {
+        crate::subc_config::current_prepared_bind_config()
+    };
+    if bind_config
+        .as_ref()
+        .is_some_and(|snapshot| !snapshot.matches(&root_path, &harness))
+    {
+        return Response::error(
+            &req.id,
+            "config_unknown",
+            "prepared local configuration does not match this bind's root and harness",
+        );
+    }
     ctx.begin_configure_ack_step("tier_file_reads");
-    let (tiers, user_config_migration) =
+    let (tiers, user_config_migration) = if recovery {
+        (Vec::new(), None)
+    } else if let Some(snapshot) = bind_config.as_ref() {
+        (snapshot.tiers().to_vec(), snapshot.migration())
+    } else {
         match resolve_config_tiers_for_configure(params, &root_path, Some(&harness)) {
             Ok(read) => read,
             Err(error) => return Response::error(&req.id, "invalid_request", error),
-        };
+        }
+    };
     ctx.begin_configure_ack_step("tier_merge");
-    let config_diagnostics =
+    let config_diagnostics = if recovery {
+        crate::config_resolve::ResolveDiagnostics::default()
+    } else {
         crate::config_resolve::resolve_config_onto_with_diagnostics_for_harness(
             &tiers,
             Some(&harness),
             &mut next_config,
-        );
+        )
+    };
     let config_dropped_keys = config_diagnostics.dropped;
     if !config_diagnostics.errors.is_empty() {
         // The whole candidate is rejected before anything is published or any
@@ -3289,12 +4098,19 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
     ctx.begin_configure_ack_step("source_tracking");
-    crate::config_live::stage_configure_sources(crate::config_live::ConfigSources::from_configure(
-        parse_cortexkit_user_config_path(params).ok().flatten(),
-        &root_path,
-        &tiers,
-        &next_config,
-    ));
+    if !recovery {
+        let sources = if let Some(snapshot) = bind_config.as_ref() {
+            snapshot.sources(&next_config)
+        } else {
+            crate::config_live::ConfigSources::from_configure(
+                parse_cortexkit_user_config_path(params).ok().flatten(),
+                &root_path,
+                &tiers,
+                &next_config,
+            )
+        };
+        crate::config_live::stage_configure_sources(sources);
+    }
     ctx.begin_configure_ack_step("validate_params");
     let mut configure_warnings = config_diagnostics
         .warnings
@@ -3324,22 +4140,27 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             "message": migration.notice(),
         }));
     }
-    if let Some(project) = find_config_tier(&tiers, "project") {
-        if let Some(notice) = crate::subc_config::legacy_project_config_location_notice(
-            &root_path,
-            Path::new(&project.source),
-        )
-        .filter(|_| {
-            crate::subc_config::project_config_read_path(&root_path, Some(&harness))
-                == Path::new(&project.source)
-        }) {
-            configure_warnings.push(json!({
-                "code": "legacy_project_config_location",
-                "tier": "project",
-                "hint": notice,
-                "message": notice,
-            }));
-        }
+    let legacy_notice = if let Some(snapshot) = bind_config.as_ref() {
+        snapshot.legacy_notice()
+    } else {
+        find_config_tier(&tiers, "project").and_then(|project| {
+            crate::subc_config::legacy_project_config_location_notice(
+                &root_path,
+                Path::new(&project.source),
+            )
+            .filter(|_| {
+                crate::subc_config::project_config_read_path(&root_path, Some(&harness))
+                    == Path::new(&project.source)
+            })
+        })
+    };
+    if let Some(notice) = legacy_notice {
+        configure_warnings.push(json!({
+            "code": "legacy_project_config_location",
+            "tier": "project",
+            "hint": notice,
+            "message": notice,
+        }));
     }
 
     // NO configure-time SSRF guard on semantic.base_url — deliberate (config
@@ -3423,6 +4244,38 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     ctx.begin_configure_ack_step("storage_root");
     let resolved_storage_dir =
         crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    if resolved_storage_dir.exists() {
+        crate::reader_floor::prepare(&resolved_storage_dir);
+    }
+    next_config.storage_dir = Some(resolved_storage_dir.clone());
+    if let Err(error) = crate::root_cache::ensure_config_storage_lease(&mut next_config) {
+        return Response::error(&req.id, "storage_in_use", error.to_string());
+    }
+    let warning = if let Some(prepared) =
+        prepared.filter(|prepared| prepared_cache_matches(prepared, &next_config))
+    {
+        next_config.cache_unavailable = prepared.cache_unavailable.clone();
+        next_config.cache_epoch = prepared.cache_epoch;
+        next_config.cache_lease = prepared.cache_lease.clone();
+        next_config.semantic.local_cache_dir = prepared.semantic.local_cache_dir.clone();
+        prepared_cache_warning(prepared, &resolved_storage_dir)
+    } else {
+        crate::root_cache::prepare_cache_root(&mut next_config)
+    };
+    if let Some(warning) = warning {
+        if next_config
+            .cache_dir
+            .as_ref()
+            .is_some_and(|parent| !parent.exists() && resolved_storage_dir.starts_with(parent))
+        {
+            return Response::error(
+                &req.id,
+                crate::root_cache::CACHE_DIR_UNAVAILABLE,
+                warning.message,
+            );
+        }
+        configure_warnings.push(json!({"code": warning.code, "key": warning.key, "tier": warning.tier, "value": warning.value, "message": warning.message}));
+    }
     if let Err(error) = crate::private_storage::open_root(&resolved_storage_dir) {
         log::warn!(
             "could not open private storage {}: {error}",
@@ -3558,6 +4411,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                         .unwrap_or_default(),
                     harness: harness.clone(),
                     storage_root: storage_root.clone(),
+                    artifact_root: crate::root_cache::cache_root(&next_config),
                     harness_dir: storage_root.join(harness.storage_segment()),
                     session_id: req.session().to_string(),
                     root_too_broad: ctx.root_too_broad(),
@@ -3835,6 +4689,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                     .unwrap_or_default(),
                 harness: harness.clone(),
                 storage_root: storage_root.clone(),
+                artifact_root: crate::root_cache::cache_root(&next_config),
                 harness_dir: storage_root.join(harness.storage_segment()),
                 session_id: req.session().to_string(),
                 root_too_broad,
@@ -3941,10 +4796,17 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // the project binary here: configure/warm paths are existence-only by design.
     let format_tool_cache_clear_needed = effective_configure_changed;
 
-    let storage_root = crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    let storage_root = crate::root_cache::cache_root(&next_config);
+    let durable_root = crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    let cache_reason = crate::root_cache::cache_unavailable(&next_config);
+    let cache_available = cache_reason.is_none();
+    if let Some(reason) = cache_reason {
+        degraded_reasons.push(crate::root_cache::cache_status_code(&reason).into());
+    }
     // Choose a durable identity at the first bind that needs an artifact key.
     // With indexes and views off, keep the no-key, no-Git-probe fast path.
-    let artifact_key_needed = !root_too_broad
+    let artifact_key_needed = cache_available
+        && !root_too_broad
         && (next_config.indexes.trigram
             || next_config.indexes.semantic
             || next_config.indexes.callgraph
@@ -3959,7 +4821,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         ctx.memoized_artifact_cache_key_for_configure_profiled(
             &root_path,
             &canonical_cache_root,
-            &storage_root,
+            &durable_root,
             git_common_dir.as_deref(),
             &mut cache_key_profile.key,
         )
@@ -4010,14 +4872,14 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let project_scope_key = crate::path_identity::project_scope_key(&canonical_cache_root);
     ctx.begin_configure_ack_step("retention_bind");
     let retention_started = Instant::now();
-    let retention_result = if identity_provisional {
-        Ok(())
-    } else {
+    let retention_result = if cache_available && !identity_provisional {
         crate::storage_retention::record_bind(
-            &storage_root,
+            &crate::root_cache::StoragePaths::new(durable_root.clone(), storage_root.clone()),
             &canonical_cache_root,
             project_key.as_deref().unwrap_or_default(),
         )
+    } else {
+        Ok(())
     };
     cache_key_profile.retention_bind = retention_started.elapsed();
     if let Err(error) = retention_result {
@@ -4030,7 +4892,11 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         // written by a newer build is refused by name from the start instead
         // of being discovered halfway through a rebuild.
         let preflight_started = Instant::now();
-        crate::persisted_format::preflight_project_artifacts(&storage_root, project_key);
+        crate::persisted_format::preflight_project_artifacts(
+            &durable_root,
+            &storage_root,
+            project_key,
+        );
         cache_key_profile.format_preflight = preflight_started.elapsed();
     }
     drop(cache_key_profile);
@@ -4040,7 +4906,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     }
     let artifact_owner_claim = if let Some(project_key) = project_key.as_ref() {
         match crate::artifact_owner::claim_or_open_read_only(
-            next_config.storage_dir.as_deref(),
+            Some(&durable_root),
             &canonical_cache_root,
             project_key,
             &project_scope_key,
@@ -4079,26 +4945,27 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
     }
-    let root_cache_storage_ok = match crate::root_cache::storage_allows_root_keyed(&storage_root) {
-        Ok(true) => true,
-        Ok(false) => {
-            degraded_reasons.push("root_cache_network_fs".to_string());
-            slog_warn!(
+    let root_cache_storage_ok = cache_available
+        && match crate::root_cache::storage_allows_root_keyed(&storage_root) {
+            Ok(true) => true,
+            Ok(false) => {
+                degraded_reasons.push("root_cache_network_fs".to_string());
+                slog_warn!(
                 "root-keyed callgraph/inspect writers disabled: storage directory appears to be on a network filesystem ({})",
                 storage_root.display()
             );
-            false
-        }
-        Err(error) => {
-            degraded_reasons.push("root_cache_fs_probe_failed".to_string());
-            slog_warn!(
+                false
+            }
+            Err(error) => {
+                degraded_reasons.push("root_cache_fs_probe_failed".to_string());
+                slog_warn!(
                 "root-keyed callgraph/inspect writers disabled: failed to probe storage filesystem {}: {}",
                 storage_root.display(),
                 error
             );
-            false
-        }
-    };
+                false
+            }
+        };
     let callgraph_writer_capability = root_cache_storage_ok
         && !is_worktree_bridge
         && !artifact_owner_read_only
@@ -4108,7 +4975,8 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // itself; its children are served from their own sessions' results.
     let inspect_writer_capability =
         root_cache_storage_ok && !root_too_broad && !parent_folder && !identity_provisional;
-    let heavy_root_work_allowed = !root_too_broad
+    let heavy_root_work_allowed = cache_available
+        && !root_too_broad
         && !parent_folder
         && !identity_provisional
         && !degraded_reasons.iter().any(|reason| reason == "home_root");
@@ -4241,7 +5109,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // first request after this bind is already answered by it. Starting only
     // spawns its worker.
     ctx.begin_configure_ack_step("views_parent");
-    if !root_too_broad && !identity_provisional {
+    if cache_available && !root_too_broad && !identity_provisional {
         crate::views::parent::activate(ctx, &canonical_cache_root, &storage_root, &parent_semantic);
     }
     ctx.begin_configure_ack_step("warm_key");
@@ -4255,7 +5123,8 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let semantic_build_inputs_changed = project_root_changed
         || previous_config.indexes.semantic != next_config.indexes.semantic
         || semantic_fingerprint_config_changed(&previous_config.semantic, &next_config.semantic)
-        || previous_config.semantic.max_files != next_config.semantic.max_files;
+        || previous_config.semantic.max_files != next_config.semantic.max_files
+        || previous_config.cache_epoch != next_config.cache_epoch;
     let (configure_generation, equivalent_warm_config) =
         ctx.note_configure_warm_key(warm_key, semantic_build_inputs_changed);
     release_callgraph_start_waiters_for_generation_change(
@@ -4274,8 +5143,10 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     ctx.begin_configure_ack_step("build_state");
     let callgraph_build_in_progress = ctx.callgraph_store_rx().lock().is_some();
     let semantic_build_in_progress = ctx.semantic_index_rx().lock().is_some();
-    let semantic_build_adopted =
-        !equivalent_warm_config && semantic_build_in_progress && !semantic_build_inputs_changed;
+    let semantic_build_adopted = cache_available
+        && !equivalent_warm_config
+        && semantic_build_in_progress
+        && !semantic_build_inputs_changed;
     let first_session_bind =
         ctx.note_configure_session_binding(canonical_cache_root.clone(), req.session().to_string());
     // An interactive session binding this root opens it for semantic indexing
@@ -4294,7 +5165,8 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             ctx.reset_semantic_cold_seed_gate_for_configure();
             // The cold-seed gate holds Tier-2 work until a semantic build
             // finishes; a root that will not build must not hold it.
-            if next_config.indexes.semantic
+            if cache_available
+                && next_config.indexes.semantic
                 && !ctx.shared_artifacts_read_only()
                 && !root_too_broad
                 && semantic_admitted
@@ -4322,7 +5194,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             &canonical_cache_root,
         ));
     ctx.begin_configure_ack_phase("index_loading_state");
-    let search_index = ctx.config().indexes.trigram;
+    let search_index = ctx.config().indexes.trigram && !ctx.config().views.enabled;
     let semantic_search = ctx.config().indexes.semantic;
     let mut search_index_cache_reused = false;
 
@@ -4414,17 +5286,23 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
 
         // A change to another lane's settings does not invalidate the serving
         // trigram generation. Root and corpus-limit changes still require a reset.
-        let retain_search = !project_root_changed
+        let retain_search = cache_available
+            && !project_root_changed
             && search_index
             && previous_config.search_index_max_file_size == next_config.search_index_max_file_size
-            && previous_config.storage_dir == next_config.storage_dir;
+            && previous_config.storage_dir == next_config.storage_dir
+            && previous_config.cache_dir == next_config.cache_dir
+            && previous_config.cache_epoch == next_config.cache_epoch;
         if !retain_search {
             *ctx.search_index()
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         }
-        let retain_semantic = !semantic_build_inputs_changed
-            && previous_config.storage_dir == next_config.storage_dir;
+        let retain_semantic = cache_available
+            && !semantic_build_inputs_changed
+            && previous_config.storage_dir == next_config.storage_dir
+            && previous_config.cache_dir == next_config.cache_dir
+            && previous_config.cache_epoch == next_config.cache_epoch;
         ctx.retire_search_index_rx("a reconfigure with different settings superseded it");
         if semantic_build_adopted {
             let adopted = ctx.adopt_semantic_index_rx_generation(configure_generation);
@@ -4523,6 +5401,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         project_key: project_key.clone(),
         harness: harness.clone(),
         storage_root,
+        artifact_root: crate::root_cache::cache_root(&next_config),
         harness_dir: ctx.harness_dir(),
         session_id: req.session().to_string(),
         root_too_broad,
@@ -4562,41 +5441,28 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let warnings_pending = !root_too_broad && ctx.progress_sender_handle().is_some();
     if warnings_pending {
         let warning_tx = ctx.configure_warnings_sender();
-        let warning_generation = configure_generation;
-        let walk_root = root_path.clone();
-        let project_root_display = root_path.display().to_string();
-        let config_for_bg = config_snapshot.clone();
         let session_id_for_bg = log_ctx::current_session();
-        let session_id_for_frame = session_id_for_bg.clone();
+        let work = ConfigureWarningWork {
+            root: root_path.clone(),
+            config: config_snapshot.clone(),
+            generation_flag: ctx.configure_generation_flag(),
+            generation: configure_generation,
+            tx: warning_tx,
+            session_id: session_id_for_bg.clone(),
+        };
         let run_deferred_walk = move || {
             log_ctx::with_session(session_id_for_bg, || {
                 delay_configure_deferred_walk_for_test();
-                signal_configure_deferred_walk_start_for_test();
-                let source_files: Vec<PathBuf> =
-                    crate::callgraph::walk_project_files(&walk_root).collect();
-                let detected_languages: HashSet<LangId> = source_files
-                    .iter()
-                    .filter_map(|path| detect_language(path))
-                    .collect();
-                let mut warnings =
-                    detect_missing_tools_for_languages(&detected_languages, &config_for_bg)
-                        .into_iter()
-                        .map(|warning| json!(warning))
-                        .collect::<Vec<_>>();
-                warnings.extend(detect_missing_lsp_binaries(&source_files, &config_for_bg));
-
-                let frame = crate::protocol::ConfigureWarningsFrame::new_with_session_id(
-                    session_id_for_frame,
-                    project_root_display,
-                    warnings,
-                );
-                let _ = warning_tx.send((warning_generation, frame));
+                work.run(|_| {});
             });
         };
         if run_configure_deferred_walk_synchronously_for_test() {
             run_deferred_walk();
         } else {
-            thread::spawn(run_deferred_walk);
+            thread::Builder::new()
+                .name("aft-configure-warnings".to_string())
+                .spawn(run_deferred_walk)
+                .expect("failed to spawn thread");
         }
     }
 
@@ -4673,6 +5539,7 @@ fn adopt_resident_semantic_index_if_available(
             return true;
         }
     };
+    index.note_borrowed_summary_format();
     index.invalidate_files(&refresh_paths);
     *ctx.semantic_index()
         .write()
@@ -4738,7 +5605,7 @@ fn semantic_status_is_not_opened(ctx: &AppContext) -> bool {
 
 fn missing_artifact_loads(ctx: &AppContext) -> ArtifactLoadNeeds {
     let config = ctx.config();
-    let search_enabled = config.indexes.trigram;
+    let search_enabled = config.indexes.trigram && !config.views.enabled;
     let semantic_enabled = config.indexes.semantic;
     drop(config);
     let semantic_admitted = semantic_enabled && semantic_work_admitted(ctx);
@@ -4874,6 +5741,9 @@ fn start_artifact_loads(starts: ArtifactLoadStarts) -> bool {
 /// dropped. Without the overlay, a read-only root serves the shared snapshot
 /// as-is.
 pub(crate) fn trigger_search_index_reload_if_evicted(ctx: &AppContext) -> bool {
+    if ctx.config().views.enabled {
+        return false;
+    }
     if ctx.canonical_cache_root_opt().is_none() || !ctx.search_index_query_reload_allowed() {
         return false;
     }
@@ -5126,9 +5996,20 @@ fn schedule_artifact_loads_admitted(
     load_semantic: bool,
     semantic_view_work_allowed: bool,
 ) -> ArtifactLoadStarts {
+    // With views enabled, skip both loading another checkout's SearchIndex
+    // cache and building a new legacy search cache.
+    let load_search = load_search && !ctx.config().views.enabled;
+    if let Some(reason) = ctx.cache_unavailable_reason() {
+        let code = crate::root_cache::cache_status_code(&reason);
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            SemanticIndexStatus::Failed(format!("{code}: {reason}"));
+        return (None, None);
+    }
     let canonical_cache_root = ctx.canonical_cache_root();
     let config = ctx.config();
-    let storage_dir = config.storage_dir.clone();
+    let storage_dir = config.cache_storage_dir();
     let search_index_max_file_size = config.search_index_max_file_size;
     let semantic_config = config.semantic.clone();
     let views_enabled = config.views.enabled;
@@ -5211,6 +6092,7 @@ fn schedule_artifact_loads_admitted(
         let search_rx_terminal_guard = ctx.search_index_rx_terminal_guard(search_rx_epoch);
         let search_pending_install = ctx.search_pending_install();
         let search_persist_epoch_flag = ctx.search_persist_epoch_flag();
+        let search_publication_gate = ctx.legacy_search_publication_gate();
         let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
         search_artifact_load_start = Some(start_tx);
 
@@ -5218,6 +6100,7 @@ fn schedule_artifact_loads_admitted(
         mark_search_rebuild_spawn_for_debug();
         thread::spawn(move || {
             let _terminal_guard = search_rx_terminal_guard;
+            let _publication = search_publication_gate.install();
             if start_rx.recv().is_err() {
                 #[cfg(test)]
                 note_configure_artifact_load_cancellation_for_test();
@@ -5292,6 +6175,11 @@ fn schedule_artifact_loads_admitted(
                         }
                     }
                     let symbol_files = search_index_symbol_files(&index);
+                    let prewarm_stop = SymbolPrewarmStop {
+                        lifecycle: search_lifecycle.clone(),
+                        content_generation_flag: Arc::clone(&search_content_generation_flag),
+                        content_generation: search_content_generation,
+                    };
                     let pending_bytes = index.estimated_memory().estimated_bytes.unwrap_or(0);
                     let root_for_log = root_for_search.clone();
                     let published = search_lifecycle.run_if_current(
@@ -5306,6 +6194,7 @@ fn schedule_artifact_loads_admitted(
                                 symbol_project_key,
                                 symbol_cache_generation,
                                 symbol_files,
+                                prewarm_stop,
                                 true,
                                 log_ctx::current_session(),
                             );
@@ -5446,14 +6335,14 @@ fn schedule_artifact_loads_admitted(
                     if search_persist_epoch_flag.current() != search_persist_epoch {
                         return;
                     }
-                    let index = SearchIndex::rebuild_or_refresh_with_strategy(
+                    let Some(index) = SearchIndex::build_with_limit_to_cache_dir_cancellable(
                         &root_for_search,
                         search_index_max_file_size,
-                        current_head,
-                        None,
-                        Some(&cache_dir),
-                        VerifyStrategy::StatFirst,
-                    );
+                        &cache_dir,
+                        &|| search_publication_gate.allowed(),
+                    ) else {
+                        return;
+                    };
                     delay_search_rebuild_publish_for_debug();
                     index
                 };
@@ -5473,7 +6362,8 @@ fn schedule_artifact_loads_admitted(
                     let published =
                         search_persist_epoch_flag.run_if_current(search_persist_epoch, || {
                             let head = index.stored_git_head().map(str::to_owned);
-                            index.write_to_disk(&cache_dir, head.as_deref())
+                            persist_loaded_search_index(&mut index, &cache_dir, head.as_deref())
+                                .succeeded()
                         });
                     persistence_succeeded = published == Some(true);
                     if published.is_none() {
@@ -5492,6 +6382,11 @@ fn schedule_artifact_loads_admitted(
                     );
                 }
                 let symbol_files = search_index_symbol_files(&index);
+                let prewarm_stop = SymbolPrewarmStop {
+                    lifecycle: search_lifecycle.clone(),
+                    content_generation_flag: Arc::clone(&search_content_generation_flag),
+                    content_generation: search_content_generation,
+                };
                 let pending_bytes = index.estimated_memory().estimated_bytes.unwrap_or(0);
                 let root_for_log = root_for_search.clone();
                 let published = search_lifecycle.run_if_current(
@@ -5506,6 +6401,7 @@ fn schedule_artifact_loads_admitted(
                             symbol_project_key,
                             symbol_cache_generation,
                             symbol_files,
+                            prewarm_stop,
                             false,
                             log_ctx::current_session(),
                         );
@@ -5534,7 +6430,6 @@ fn schedule_artifact_loads_admitted(
                 ctx,
                 &canonical_cache_root,
                 &project_key,
-                storage_dir.as_deref(),
                 semantic_config.clone(),
             ));
             false
@@ -5571,9 +6466,16 @@ fn schedule_artifact_loads_admitted(
         semantic_artifact_load_start = Some(start_tx);
         let semantic_root = canonical_cache_root.clone();
         let semantic_storage = storage_dir.clone();
+        // Open the snapshot under the key configure already resolved. Deriving
+        // it again here would re-run the Git probe, and when that probe fails
+        // it falls back to a path-based key, so a linked worktree would look
+        // in its own folder and miss the owner checkout's shared snapshot.
+        let semantic_project_key = project_key.clone();
         let semantic_load_generation = configure_generation;
         let semantic_load_generation_flag = ctx.configure_generation_flag();
         let semantic_load_lifecycle = subc_lifecycle.clone();
+        let semantic_query_slot = ctx.semantic_embedding_model_slot();
+        let semantic_query_config = semantic_config.clone();
         let session_id = log_ctx::current_session();
         thread::spawn(move || {
             let _terminal_guard = semantic_rx_terminal_guard;
@@ -5593,9 +6495,10 @@ fn schedule_artifact_loads_admitted(
             }
             log_ctx::with_session(session_id, || {
                 note_configure_artifact_load_attempt(&semantic_root);
-                let event = match crate::readonly_artifacts::open_semantic_index_read_only(
+                let event = match crate::readonly_artifacts::open_semantic_index_read_only_with_key(
                     &semantic_root,
                     semantic_storage.as_deref(),
+                    &semantic_project_key,
                 ) {
                     crate::readonly_artifacts::ReadOnlyArtifact::Fresh(index) => {
                         SemanticIndexEvent::Ready(index)
@@ -5651,6 +6554,56 @@ fn schedule_artifact_loads_admitted(
                         semantic_rx_epoch,
                         bytes,
                     );
+                }
+                // A saved index is usable with a parent-supplied vector even
+                // when no local model is cached. Publish it before optional
+                // warmup, which may download weights or fail independently.
+                if published == Some(true)
+                    && finished_bytes.is_some()
+                    && semantic_query_config.backend == crate::config::SemanticBackend::Fastembed
+                {
+                    let warmup_session = log_ctx::current_session();
+                    let spawned = thread::Builder::new()
+                        .name("aft-readonly-query-warmup".into())
+                        .spawn(move || {
+                            log_ctx::with_session(warmup_session, || {
+                                if !semantic_load_lifecycle.is_current(
+                                    semantic_load_generation_flag.as_ref(),
+                                    semantic_load_generation,
+                                ) {
+                                    return;
+                                }
+                                let model = match warm_read_only_query_model(
+                                    &semantic_root,
+                                    &semantic_query_config,
+                                ) {
+                                    Ok(model) => model,
+                                    Err(error) => {
+                                        slog_warn!(
+                                            "read-only semantic query model warmup failed: {}",
+                                            error
+                                        );
+                                        return;
+                                    }
+                                };
+                                // Model loading cannot hold the lifecycle gate. A
+                                // reconfigure or unbind during it discards the result.
+                                let _ = semantic_load_lifecycle.run_if_current(
+                                    semantic_load_generation_flag.as_ref(),
+                                    semantic_load_generation,
+                                    || {
+                                        if let Some(mut slot) = semantic_query_slot.try_lock() {
+                                            if slot.is_none() {
+                                                *slot = Some(model);
+                                            }
+                                        }
+                                    },
+                                );
+                            })
+                        });
+                    if let Err(error) = spawned {
+                        slog_warn!("read-only semantic query warmup could not start: {}", error);
+                    }
                 }
             });
         });
@@ -5846,13 +6799,28 @@ fn schedule_artifact_loads_admitted(
                             VerifyArtifact::Semantic,
                             verified_artifact_generation,
                         );
-                        if let Some(cached) = SemanticIndex::read_from_disk(
-                            dir,
-                            &semantic_project_key,
-                            &root_clone,
-                            is_worktree_bridge_for_semantic,
-                            Some(&fingerprint_key),
-                        ) {
+                        let cached = {
+                            let mut repair = |texts| {
+                                let Some(_permit) = crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
+                                    &semantic_cold_build_limiter,
+                                    SEMANTIC_REFRESH_LIMITER_KIND,
+                                    &root_clone,
+                                    || semantic_lifecycle.is_current(semantic_generation_flag.as_ref(), semantic_generation)
+                                        && semantic_build_epoch_flag.load(Ordering::SeqCst) == semantic_build_epoch,
+                                ) else { return Err(SUPERSEDED_SEMANTIC_BUILD.to_string()); };
+                                model.embed(texts)
+                            };
+                            SemanticIndex::read_from_disk_with_summary_repair(
+                                dir,
+                                &semantic_project_key,
+                                &root_clone,
+                                is_worktree_bridge_for_semantic,
+                                Some(&fingerprint_key),
+                                &mut repair,
+                                semantic_config.max_batch_size.max(1),
+                            )?
+                        };
+                        if let Some((cached, summaries_repaired)) = cached {
                             clear_cold_seed_gate_and_notify();
                             if verify_plan == WarmVerifyPlan::Skip {
                                 slog_info!(
@@ -5862,7 +6830,7 @@ fn schedule_artifact_loads_admitted(
                                 return Ok(SemanticBuildReady {
                                     index: cached,
                                     model,
-                                    persist_to_disk: false,
+                                    persist_to_disk: summaries_repaired,
                                     record_verify_completion: false,
                                     verified_artifact_generation,
                                 });
@@ -6036,7 +7004,7 @@ fn schedule_artifact_loads_admitted(
                                         );
                                         cached.set_fingerprint(fingerprint);
                                     }
-                                    let persist_to_disk = !summary.is_noop();
+                                    let persist_to_disk = summaries_repaired || !summary.is_noop();
                                     let _ = tx_progress.send(SemanticIndexEvent::Progress {
                                         stage: "loaded_cached_index".to_string(),
                                         files: None,
@@ -6085,7 +7053,7 @@ fn schedule_artifact_loads_admitted(
                                         return Ok(SemanticBuildReady {
                                             index: cached,
                                             model,
-                                            persist_to_disk: false,
+                                            persist_to_disk: summaries_repaired,
                                             record_verify_completion: false,
                                             verified_artifact_generation,
                                         });
@@ -6620,7 +7588,6 @@ fn start_checkout_semantic_lane(
     ctx: &AppContext,
     root: &Path,
     family: &str,
-    storage_dir: Option<&Path>,
     semantic: SemanticBackendConfig,
 ) -> crossbeam_channel::Sender<()> {
     let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
@@ -6629,7 +7596,7 @@ fn start_checkout_semantic_lane(
     *ctx.semantic_index_status()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
-        stage: "loading_checkout_view".to_string(),
+        stage: crate::views::semantic_runtime::CHECKOUT_VIEW_LOADING_STAGE.to_string(),
         files: None,
         entries_done: None,
         entries_total: None,
@@ -6638,7 +7605,7 @@ fn start_checkout_semantic_lane(
     let strict_lifecycle = lifecycle.clone();
     let config = crate::views::semantic_runtime::WorkerConfig {
         root: root.to_path_buf(),
-        storage: crate::bash_background::storage_dir(storage_dir),
+        storage: ctx.storage_paths(),
         family: family.to_owned(),
         scope: crate::path_identity::project_scope_key(root),
         status: ctx.semantic_index_status_handle(),
@@ -6653,6 +7620,9 @@ fn start_checkout_semantic_lane(
             max_batch: semantic.max_batch_size,
         },
         semantic,
+        trigram_policy: crate::blob_store::v2::TrigramPolicy {
+            max_file_size: ctx.config().search_index_max_file_size,
+        },
     };
     let weak_slot = Arc::downgrade(slot);
     let session_id = log_ctx::current_session();
@@ -6667,13 +7637,14 @@ fn start_checkout_semantic_lane(
                 // replaces it through the epoch check.
                 let _ = wait_for_semantic_artifact_start(&start_rx, &gate_root);
                 // A legacy (pre-view) set for this root is imported first, on
-                // this background thread, so the lane's first load seeds from
-                // it rather than embedding every file again.
+                // this background thread, into the family's v3 planes only, so
+                // the lane's fills find its vectors stored rather than
+                // embedding every file again.
                 let current = {
                     let slot = weak_slot.clone();
                     move || slot.upgrade().is_some_and(|slot| slot.is_current(epoch))
                 };
-                crate::migration::per_checkout::import_for_semantic_lane(&config, &current);
+                import_legacy_set_into_v3(&config, &current);
                 let _pause_currency = crate::semantic_index::PauseRetryScope::new(
                     config.schedule.retry_initial,
                     config.schedule.retry_max,
@@ -6691,6 +7662,64 @@ fn start_checkout_semantic_lane(
             SemanticIndexStatus::Failed(format!("semantic: unavailable: worker thread: {error}"));
     }
     start_tx
+}
+
+/// Imports a root's legacy (pre-view) set into the family's v3 planes before
+/// its views-on semantic lane fills, through the v3 import ledger. Nothing is
+/// written to the v2 view registry or the v2 stores. A root with no legacy
+/// artifact, or whose v3 import already finished, returns at once; another
+/// process importing the same set is not waited for.
+fn import_legacy_set_into_v3(
+    config: &crate::views::semantic_runtime::WorkerConfig,
+    keep_going: &dyn Fn() -> bool,
+) {
+    let (storage, key) = (&config.storage.artifacts, &config.family);
+    if !crate::migration::per_checkout::has_importable_legacy_artifact(storage, key)
+        || !keep_going()
+    {
+        return;
+    }
+    *config
+        .status
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
+        stage: "migrating_legacy_index".to_string(),
+        files: None,
+        entries_done: None,
+        entries_total: None,
+    };
+    let Some(_permit) = crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
+        &config.schedule.limiter,
+        "legacy_import",
+        &config.root,
+        keep_going,
+    ) else {
+        return;
+    };
+    let request = crate::migration::v3_ledger::V3ImportRequest::full_plane(
+        storage.clone(),
+        key.clone(),
+        key.clone(),
+        config.root.clone(),
+        config.trigram_policy,
+        crate::migration::per_checkout::legacy_semantic_producer(storage, key, &config.semantic),
+    );
+    let started = Instant::now();
+    match crate::migration::v3_ledger::run_v3_import(&request, None) {
+        Ok(report) => slog_info!(
+            "legacy v3 import root={} key={} outcomes={:?} elapsed_ms={}",
+            config.root.display(),
+            key,
+            report.outcomes,
+            started.elapsed().as_millis()
+        ),
+        Err(error) => slog_warn!(
+            "legacy v3 import root={} key={} failed: {}",
+            config.root.display(),
+            key,
+            error
+        ),
+    }
 }
 
 /// Account for a finished artifact load at its hand-off to the receiver.
@@ -6884,19 +7913,50 @@ pub(crate) fn open_database_runtime(
     }
 }
 
-fn replay_configure_session(ctx: &AppContext, job: &ConfigureMaintenanceJob) {
+fn claim_configure_replay_batch<'a>(
+    ctx: &'a AppContext,
+    job: &ConfigureMaintenanceJob,
+) -> Result<crate::bash_background::registry::ProjectReplayBatch<'a>, ConfigureMaintenanceUnitResult>
+{
+    wait_on_configure_replay_gate_for_test(&job.canonical_cache_root, "replay_claim");
+    // Admit exactly one replay call, not the remaining cursor. Disk scans,
+    // legacy repair and recovery must never hold up the unbind transition.
+    match ctx.run_if_subc_bound_generation(job.generation, || {
+        ctx.bash_background().claim_project_replay_batch()
+    }) {
+        Some(Some(batch)) => {
+            wait_on_configure_replay_gate_for_test(&job.canonical_cache_root, "replay_claimed");
+            Ok(batch)
+        }
+        Some(None) => Err(ConfigureMaintenanceUnitResult::Continue),
+        None if ctx.subc_unbound_quiesced() => Err(ConfigureMaintenanceUnitResult::CancelAll),
+        None => {
+            forget_configure_job_binding(ctx, job);
+            Err(ConfigureMaintenanceUnitResult::Complete)
+        }
+    }
+}
+
+fn replay_configure_session(
+    ctx: &AppContext,
+    job: &ConfigureMaintenanceJob,
+) -> Result<(), ConfigureMaintenanceUnitResult> {
+    let batch = claim_configure_replay_batch(ctx, job)?;
     replay_configure_session_parts(
         ctx,
+        batch,
         &job.storage_root,
         job.harness.clone(),
         &job.harness_dir,
         &job.session_id,
         &job.root_path,
     );
+    Ok(())
 }
 
 fn replay_configure_session_parts(
     ctx: &AppContext,
+    batch: crate::bash_background::registry::ProjectReplayBatch<'_>,
     storage_root: &Path,
     harness: Harness,
     harness_dir: &Path,
@@ -6913,10 +7973,7 @@ fn replay_configure_session_parts(
         ));
     #[cfg(test)]
     CONFIGURE_REPLAY_SESSION_CALLS.fetch_add(1, Ordering::SeqCst);
-    if let Err(error) =
-        ctx.bash_background()
-            .replay_session_for_project(harness_dir, session_id, root_path)
-    {
+    if let Err(error) = batch.replay_session_for_project(harness_dir, session_id, root_path) {
         slog_warn!("failed to replay background bash tasks: {error}");
     }
 }
@@ -6943,7 +8000,7 @@ fn cancel_unbound_configure_jobs(
 }
 
 pub(crate) fn cancel_deferred_configure_maintenance(ctx: &AppContext) -> usize {
-    // An unbound root does no indexing, so it stops retrying its identity too.
+    // An unbound or quiesced root stops both identity and cache recovery.
     crate::provisional_identity_retry::cancel(ctx);
     let parked = ctx
         .take_parked_configure_tail()
@@ -7038,6 +8095,8 @@ struct ConfigureMaintenanceContinuation {
     semantic_waits_for_callgraph_start: bool,
     view_load: Option<crossbeam_channel::Receiver<Result<PreparedConfigureView, String>>>,
     replay_retry_at: Option<Instant>,
+    lexical_bind_retry_at: Option<Instant>,
+    lexical_bind_retry_delay: Duration,
     callgraph_upgrade_retry_at: Option<Instant>,
     replay_error_logged: bool,
 }
@@ -7051,13 +8110,23 @@ impl ConfigureMaintenanceContinuation {
             semantic_waits_for_callgraph_start: false,
             view_load: None,
             replay_retry_at: None,
+            lexical_bind_retry_at: None,
+            lexical_bind_retry_delay: Duration::from_secs(1),
             callgraph_upgrade_retry_at: None,
             replay_error_logged: false,
         }
     }
 
     fn retry_at(&self) -> Option<Instant> {
-        self.callgraph_upgrade_retry_at.or(self.replay_retry_at)
+        self.callgraph_upgrade_retry_at
+            .or(self.lexical_bind_retry_at)
+            .or(self.replay_retry_at)
+    }
+
+    fn defer_lexical_bind(&mut self, now: Instant) {
+        self.lexical_bind_retry_at = Some(now + self.lexical_bind_retry_delay);
+        self.lexical_bind_retry_delay =
+            (self.lexical_bind_retry_delay * 2).min(Duration::from_secs(30));
     }
 }
 
@@ -7403,6 +8472,9 @@ fn import_legacy_view_once(
     job: &ConfigureMaintenanceJob,
     view: &ViewRuntimeSnapshot,
 ) -> Result<bool, String> {
+    if job.storage_root != job.artifact_root {
+        return Ok(true);
+    }
     if input.read_only {
         return Ok(true);
     }
@@ -7449,7 +8521,7 @@ fn import_legacy_view_once(
     Ok(true)
 }
 
-fn run_configure_view_sweep(view: &ViewRuntimeSnapshot) {
+fn run_configure_view_sweep(view: &ViewRuntimeSnapshot, durable_storage: &Path) {
     if !crate::storage_retention::startup_sweeps_ready(&view.storage) {
         return;
     }
@@ -7510,6 +8582,7 @@ fn run_configure_view_sweep(view: &ViewRuntimeSnapshot) {
         .unwrap_or_default()
         .as_millis() as u64;
     if let Err(error) = crate::gc::sweep(crate::gc::SweepRequest {
+        durable_storage,
         storage: &view.storage,
         family: &view.family,
         view_dir: &view.view_dir,
@@ -7674,6 +8747,14 @@ fn wait_on_configure_tail_gate_for_test(root: &Path, label: &str, test_release_o
 #[cfg(not(test))]
 fn wait_on_configure_tail_stage_gate_for_test(_root: &Path, _stage: ConfigureMaintenanceStage) {}
 
+#[cfg(test)]
+fn wait_on_configure_replay_gate_for_test(root: &Path, label: &str) {
+    wait_on_configure_tail_gate_for_test(root, label, false);
+}
+
+#[cfg(not(test))]
+fn wait_on_configure_replay_gate_for_test(_root: &Path, _label: &str) {}
+
 /// One finished configure-tail unit, as recorded for tests: the job's root and
 /// generation, the stage that ran, and when it finished.
 #[cfg(test)]
@@ -7764,7 +8845,9 @@ fn run_configure_maintenance_unit_inner(
                     forget_configure_job_binding(ctx, job);
                     return ConfigureMaintenanceUnitResult::Complete;
                 }
-                replay_configure_session(ctx, job);
+                if let Err(result) = replay_configure_session(ctx, job) {
+                    return result;
+                }
                 if ctx
                     .bash_background()
                     .project_replay_pending(&job.harness_dir, &job.root_path)
@@ -7847,7 +8930,9 @@ fn run_configure_maintenance_unit_inner(
         }
         ConfigureMaintenanceStage::SessionReplay => {
             if job.run_bash_replay {
-                replay_configure_session(ctx, job);
+                if let Err(result) = replay_configure_session(ctx, job) {
+                    return result;
+                }
             }
             continuation.stage = ConfigureMaintenanceStage::BashRuntime;
         }
@@ -7916,22 +9001,65 @@ fn run_configure_maintenance_unit_inner(
             continuation.stage = ConfigureMaintenanceStage::ViewLoad;
         }
         ConfigureMaintenanceStage::ViewLoad => {
+            let retrying = continuation.lexical_bind_retry_at.take().is_some();
             if crate::views::parent::held_by(ctx, &job.canonical_cache_root) {
                 // A parent folder owns no view; its session reads the children's.
                 ctx.clear_view_runtime();
-            } else if ctx.config().views.enabled && !job.root_too_broad {
-                finish_configure_view_load(
-                    ctx,
-                    prepare_configure_view(&ConfigureViewInput::capture(ctx, job), job),
-                );
+            } else if ctx.cache_unavailable_reason().is_none()
+                && ctx.config().views.enabled
+                && !job.root_too_broad
+            {
+                if ctx.views_route_root() {
+                    // Every read of this root goes through its v3 checkout
+                    // views; the v1 view is neither opened, imported into
+                    // nor published.
+                    ctx.drop_v1_view_runtime();
+                } else if ctx.config().indexes.semantic || ctx.config().indexes.callgraph {
+                    finish_configure_view_load(
+                        ctx,
+                        prepare_configure_view(&ConfigureViewInput::capture(ctx, job), job),
+                    );
+                } else {
+                    ctx.clear_view_runtime();
+                }
+                match ctx.lexical_view_snapshot("bind") {
+                    Some(Err(error)) if crate::views::trigram::bind_is_busy(&error) => {
+                        if !retrying {
+                            slog_warn!(
+                                "lexical checkout view busy; configure maintenance will retry: {}",
+                                error
+                            );
+                        }
+                        // A parent only reads child publications; it cannot
+                        // recover a dropped child bind by querying that child.
+                        continuation.defer_lexical_bind(Instant::now());
+                        return ConfigureMaintenanceUnitResult::Continue;
+                    }
+                    Some(Err(error)) => {
+                        slog_warn!("lexical checkout view unavailable: {}", error);
+                    }
+                    // The symbol prewarm follows the files the view verified.
+                    Some(Ok(snapshot)) if ctx.views_route_root() => {
+                        spawn_symbol_view_prewarm(ctx, &snapshot);
+                    }
+                    _ => {}
+                }
+                continuation.lexical_bind_retry_delay = Duration::from_secs(1);
             } else {
                 ctx.clear_view_runtime();
             }
             continuation.stage = ConfigureMaintenanceStage::StorageSweeps;
         }
         ConfigureMaintenanceStage::StorageSweeps => {
+            if ctx.cache_unavailable_reason().is_some() {
+                continuation.stage = ConfigureMaintenanceStage::ProcessFlags;
+                return ConfigureMaintenanceUnitResult::Continue;
+            }
             crate::storage_retention::schedule(
-                job.storage_root.clone(),
+                crate::root_cache::StoragePaths::new(
+                    job.storage_root.clone(),
+                    job.artifact_root.clone(),
+                ),
                 ctx.subc_lifecycle_admission(),
                 ctx.configure_generation_flag(),
                 job.generation,
@@ -8067,8 +9195,12 @@ fn run_configure_maintenance_unit_inner(
         ConfigureMaintenanceStage::Status => {
             // The cursor belongs to the root, not one configure generation.
             // A newer tail also finishes a scan started by a superseded tail.
+            let batch = match claim_configure_replay_batch(ctx, job) {
+                Ok(batch) => batch,
+                Err(result) => return result,
+            };
             let retry_due_failures = continuation.replay_retry_at.take().is_some();
-            match ctx.bash_background().continue_project_replay(
+            match batch.continue_project_replay(
                 &job.harness_dir,
                 &job.session_id,
                 &job.root_path,
@@ -8368,21 +9500,21 @@ fn open_view_runtime_for_configure(
         return Err("view requires a settled artifact identity".to_string());
     }
     let scope = crate::path_identity::project_scope_key(&job.canonical_cache_root);
-    let view = crate::views::ViewStore::open(&job.storage_root, &scope)
+    let view = crate::views::ViewStore::open(&job.artifact_root, &scope)
         .map_err(|error| error.to_string())?;
     let semantic_store = crate::blob_store::BlobStore::open(
-        &job.storage_root,
+        &job.artifact_root,
         family.clone(),
         crate::blob_store::BlobPlane::Semantic,
     )
     .map_err(|error| error.to_string())?;
     let callgraph_store = crate::blob_store::BlobStore::open(
-        &job.storage_root,
+        &job.artifact_root,
         family.clone(),
         crate::blob_store::BlobPlane::Callgraph,
     )
     .map_err(|error| error.to_string())?;
-    let alias_store = crate::alias::AliasStore::open(&job.storage_root, &family)
+    let alias_store = crate::alias::AliasStore::open(&job.artifact_root, &family)
         .map_err(|error| error.to_string())?;
 
     let head_entries = crate::alias::head_tree_entries(&job.canonical_cache_root)
@@ -8614,7 +9746,7 @@ fn open_view_runtime_for_configure(
     Ok(PreparedConfigureView {
         snapshot: ViewRuntimeSnapshot {
             query_pin: None,
-            storage: job.storage_root.clone(),
+            storage: job.artifact_root.clone(),
             family,
             scope,
             view_dir: view.view_dir().to_path_buf(),
@@ -8678,7 +9810,7 @@ fn prepare_configure_view(
     // An import may have published the first generation. Re-read only in that
     // case, so the installed pin and manifest refer to the imported generation.
     if import_ready && prepared.snapshot.generation.is_none() {
-        let store = crate::views::ViewStore::open(&job.storage_root, &prepared.snapshot.scope)
+        let store = crate::views::ViewStore::open(&job.artifact_root, &prepared.snapshot.scope)
             .map_err(|error| error.to_string())?;
         if store
             .current_generation()
@@ -8729,6 +9861,8 @@ fn spawn_configure_storage_sweeps(
     // finishes. The worker owns only immutable sweep inputs, never the actor
     // gate or lifecycle admission; the view snapshot keeps its query pin live.
     let storage_root = job.storage_root.clone();
+    let sweep_paths =
+        crate::root_cache::StoragePaths::new(job.storage_root.clone(), job.artifact_root.clone());
     let root = job.canonical_cache_root.clone();
     let harness = job.harness.clone();
     let session = Some(job.session_id.clone());
@@ -8742,9 +9876,9 @@ fn spawn_configure_storage_sweeps(
                 ConfigureMaintenanceStage::StorageSweeps,
             );
             delay_configure_storage_sweeps_for_debug();
-            run_configure_storage_sweeps(&storage_root, harness);
+            run_configure_storage_sweeps(&sweep_paths, harness);
             if let Some(view) = view {
-                run_configure_view_sweep(&view);
+                run_configure_view_sweep(&view, &storage_root);
             }
         });
         #[cfg(test)]
@@ -8771,13 +9905,27 @@ fn spawn_configure_storage_sweeps(
     }
 }
 
-fn run_configure_storage_sweeps(storage_root: &Path, harness: Harness) {
-    match crate::url_fetch::cleanup_url_cache(storage_root) {
-        Ok(0) => {}
-        Ok(n) => slog_info!("URL cache cleanup: removed {} stale entries", n),
-        Err(err) => slog_warn!("URL cache cleanup failed: {}", err),
+/// `paths.artifacts` is where rebuildable caches live (the `storage.cache_dir`
+/// volume when one is configured); `paths.durable` holds locks, ownership
+/// records and migration state. Each sweep runs where its data is written.
+fn run_configure_storage_sweeps(paths: &crate::root_cache::StoragePaths, harness: Harness) {
+    let storage_root = paths.durable.as_path();
+    // Rebuildable data is written under the cache root (URL downloads through
+    // `AppContext::cache_dir`, cache-domain locks beside their caches). Data
+    // written before `storage.cache_dir` was set stays under the durable root,
+    // so that root is swept too.
+    let mut cache_sweep_roots = vec![paths.artifacts.as_path()];
+    if paths.durable != paths.artifacts {
+        cache_sweep_roots.push(storage_root);
     }
-    match crate::fs_lock::sweep_stale_reclaim_tokens(storage_root) {
+    for url_root in &cache_sweep_roots {
+        match crate::url_fetch::cleanup_url_cache(url_root) {
+            Ok(0) => {}
+            Ok(n) => slog_info!("URL cache cleanup: removed {} stale entries", n),
+            Err(err) => slog_warn!("URL cache cleanup failed: {}", err),
+        }
+    }
+    match crate::fs_lock::sweep_stale_reclaim_tokens(&cache_sweep_roots) {
         Ok(None | Some(0)) => {}
         Ok(Some(n)) => slog_info!(
             "filesystem lock cleanup: removed {} stale reclaim tokens",
@@ -8860,6 +10008,129 @@ fn callgraph_store_upgrade_required(ctx: &AppContext) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn issue1007_configure_skips_second_publish_only_when_nothing_pending() {
+        use super::{persist_loaded_search_index, SearchIndex, SearchIndexPersist};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("lib.rs"), "fn configured_marker() {}\n").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut index =
+            SearchIndex::build_with_limit_to_cache_dir(&root, 1024 * 1024, cache.path());
+        let head = index.stored_git_head().map(str::to_owned);
+        let written = std::fs::read(cache.path().join("cache.bin")).unwrap();
+
+        // Straight after a cold build the cache already holds this index.
+        assert_eq!(
+            persist_loaded_search_index(&mut index, cache.path(), head.as_deref()),
+            SearchIndexPersist::AlreadyCurrent
+        );
+        assert_eq!(
+            std::fs::read(cache.path().join("cache.bin")).unwrap(),
+            written
+        );
+
+        // A pending change is written, and only then is the cache current.
+        std::fs::write(root.join("added.rs"), "fn added_marker() {}\n").unwrap();
+        index.update_file(&root.join("added.rs"));
+        assert_eq!(
+            persist_loaded_search_index(&mut index, cache.path(), head.as_deref()),
+            SearchIndexPersist::Written
+        );
+        assert_ne!(
+            std::fs::read(cache.path().join("cache.bin")).unwrap(),
+            written
+        );
+        assert_eq!(
+            persist_loaded_search_index(&mut index, cache.path(), head.as_deref()),
+            SearchIndexPersist::AlreadyCurrent
+        );
+
+        // An index read back from disk did not write the cache, so it keeps
+        // the existing write.
+        let mut reloaded = SearchIndex::read_from_disk(cache.path(), &root).unwrap();
+        assert_eq!(
+            persist_loaded_search_index(&mut reloaded, cache.path(), head.as_deref()),
+            SearchIndexPersist::Written
+        );
+    }
+
+    #[test]
+    fn semantic_refresh_debounce_caps_sustained_requests() {
+        let started = std::time::Instant::now();
+        let mut debounce =
+            super::SemanticRefreshDebounce::new(started, std::time::Duration::from_secs(15));
+        for seconds in [14, 28, 42, 56] {
+            debounce.extend(started + std::time::Duration::from_secs(seconds));
+        }
+        assert_eq!(
+            debounce.deadline(),
+            started + std::time::Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn semantic_refresh_debounce_retains_trailing_quiet_window() {
+        let started = std::time::Instant::now();
+        let quiet = std::time::Duration::from_secs(15);
+        let mut debounce = super::SemanticRefreshDebounce::new(started, quiet);
+        debounce.extend(started + std::time::Duration::from_secs(3));
+        assert_eq!(
+            debounce.deadline(),
+            started + std::time::Duration::from_secs(18)
+        );
+        debounce = super::SemanticRefreshDebounce::new(
+            started + std::time::Duration::from_secs(90),
+            quiet,
+        );
+        assert_eq!(
+            debounce.deadline(),
+            started + std::time::Duration::from_secs(105)
+        );
+    }
+
+    #[test]
+    fn watcher_spawn_failure_leaves_runtime_uninstalled() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        super::start_project_watcher_with_spawn(
+            &ctx,
+            root.path(),
+            Vec::new(),
+            |_root, _extra, _tx| -> Result<(), &'static str> {
+                panic!("attachment must not run without a worker thread")
+            },
+            |_builder, _job| Err(std::io::Error::other("injected thread exhaustion")),
+        );
+        assert!(!ctx.watcher_runtime_active());
+        assert!(ctx.watcher_rx().lock().is_none());
+        assert!(ctx.watcher().lock().is_none());
+    }
+    #[test]
+    fn prepared_cache_reuse_preserves_unknown_and_opt_out_intent() {
+        let candidate = crate::config::Config::default();
+        let mut prepared = candidate.clone();
+        assert!(super::prepared_cache_matches(&prepared, &candidate));
+        prepared.cache_config_unknown = Some("invalid user file".into());
+        assert!(!super::prepared_cache_matches(&prepared, &candidate));
+        prepared.cache_config_unknown = None;
+        prepared.cache_dir_opt_out = true;
+        assert!(!super::prepared_cache_matches(&prepared, &candidate));
+    }
+
+    #[test]
+    fn prepared_cache_warning_accepts_an_absent_cache_directory() {
+        let prepared = crate::config::Config {
+            cache_unavailable: Some("cache location is unknown".into()),
+            ..Default::default()
+        };
+        let storage = std::env::temp_dir().join("durable-warning-root");
+        let warning = super::prepared_cache_warning(&prepared, &storage).unwrap();
+        assert_eq!(warning.value, storage.display().to_string());
+    }
     use serde_json::{json, Value};
 
     #[test]
@@ -9411,6 +10682,168 @@ mod tests {
         );
     }
 
+    fn assert_replay_racing_unbind_is_rejected(stage: ConfigureMaintenanceStage) {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_project, ctx, mut state, task_ids) = bash_background_replay_fixture(40, Some(8));
+        let continuation = state.jobs.front_mut().unwrap();
+        continuation.stage = stage;
+        if stage == ConfigureMaintenanceStage::Admission {
+            // Exercise the equivalent-bind shortcut, which replays a new
+            // session without running the root's other configure stages.
+            let job = &mut continuation.job;
+            job.configure_database_runtime = false;
+            job.format_tool_cache_clear_needed = false;
+            job.refresh_project_runtime = false;
+            job.sync_bash_compress_flag = false;
+            job.reset_filter_registry = false;
+            job.clear_failed_spawns = false;
+            job.warm_callgraph_store = false;
+            job.search_artifact_load_start = None;
+            job.semantic_artifact_load_start = None;
+        }
+        assert!(continuation.job.run_bash_replay);
+        let registry = ctx.bash_background();
+        let before = registry.project_replay_scan_total_examined_for_test();
+        assert!(before.is_some_and(|examined| examined > 0));
+        let recovered_before = task_ids
+            .iter()
+            .filter(|id| registry.task_for_test(id).is_some())
+            .count();
+        assert!(recovered_before < task_ids.len());
+        let (_gate, reached, release) =
+            super::gate_configure_tail_stage_for_test(ctx.canonical_cache_root(), "replay_claim");
+        let ctx_ref = &*ctx;
+        let state = std::thread::scope(|scope| {
+            let worker = scope.spawn(move || {
+                super::drain_deferred_configure_maintenance_unit(ctx_ref, &mut state);
+                state
+            });
+            reached.recv_timeout(Duration::from_secs(10)).unwrap();
+            // The drain already passed its quiescence check. Finish the
+            // unbind before allowing the replay call to claim any work.
+            ctx.mark_subc_unbound();
+            release.send(()).unwrap();
+            worker.join().unwrap()
+        });
+        assert_eq!(
+            registry.project_replay_scan_total_examined_for_test(),
+            before,
+            "replay scanned after unbind won the admission race at {stage:?}"
+        );
+        assert_eq!(
+            task_ids
+                .iter()
+                .filter(|id| registry.task_for_test(id).is_some())
+                .count(),
+            recovered_before,
+            "unadmitted replay recovered another task"
+        );
+        assert!(
+            state.jobs.is_empty(),
+            "unbound maintenance must be cancelled"
+        );
+    }
+
+    #[test]
+    fn bash_background_replay_racing_unbind_rejects_session_only_batch() {
+        assert_replay_racing_unbind_is_rejected(ConfigureMaintenanceStage::Admission);
+    }
+
+    #[test]
+    fn bash_background_replay_racing_unbind_rejects_initial_batch() {
+        assert_replay_racing_unbind_is_rejected(ConfigureMaintenanceStage::SessionReplay);
+    }
+
+    #[test]
+    fn bash_background_replay_racing_unbind_rejects_continuation_batch() {
+        assert_replay_racing_unbind_is_rejected(ConfigureMaintenanceStage::Status);
+    }
+
+    fn assert_admitted_replay_finishes_after_unbind(stage: ConfigureMaintenanceStage) {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_project, ctx, mut state, _task_ids) = bash_background_replay_fixture(40, Some(8));
+        state.jobs.front_mut().unwrap().stage = stage;
+        let registry = ctx.bash_background();
+        let before = registry
+            .project_replay_scan_total_examined_for_test()
+            .unwrap();
+        let (gate, reached, release) =
+            super::gate_configure_tail_stage_for_test(ctx.canonical_cache_root(), "replay_claimed");
+        let ctx_ref = &*ctx;
+        let (mut state, unbound) = std::thread::scope(|scope| {
+            let worker = scope.spawn(move || {
+                super::drain_deferred_configure_maintenance_unit(ctx_ref, &mut state);
+                state
+            });
+            reached.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert!(
+                registry.claim_project_replay_batch().is_none(),
+                "the admitted batch must own the registry's replay reservation"
+            );
+            let (unbound_tx, unbound_rx) = mpsc::channel();
+            scope.spawn(move || {
+                ctx_ref.mark_subc_unbound();
+                unbound_tx.send(()).unwrap();
+            });
+            // Unbind must finish while disk/recovery work is still held. Release
+            // the worker even on timeout so a bad lock boundary fails, not hangs.
+            let unbound = unbound_rx.recv_timeout(Duration::from_secs(10));
+            release.send(()).unwrap();
+            (worker.join().unwrap(), unbound)
+        });
+        drop(gate);
+        unbound.expect("replay disk work held the lifecycle mutex");
+        let after = registry
+            .project_replay_scan_total_examined_for_test()
+            .unwrap();
+        assert!(after > before, "an already admitted batch may finish");
+        assert!(after <= before + 8, "only one bounded scan was admitted");
+        assert!(registry.claim_project_replay_batch().is_some());
+        assert!(!super::drain_deferred_configure_maintenance_unit(
+            &ctx, &mut state
+        ));
+        assert_eq!(
+            registry.project_replay_scan_total_examined_for_test(),
+            Some(after),
+            "the next batch needs fresh lifecycle admission"
+        );
+    }
+
+    #[test]
+    fn bash_background_admitted_initial_replay_finishes_without_blocking_unbind() {
+        assert_admitted_replay_finishes_after_unbind(ConfigureMaintenanceStage::SessionReplay);
+    }
+
+    #[test]
+    fn bash_background_admitted_continuation_replay_finishes_without_blocking_unbind() {
+        assert_admitted_replay_finishes_after_unbind(ConfigureMaintenanceStage::Status);
+    }
+
+    #[test]
+    fn bash_background_replay_busy_claim_yields_without_scanning() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_project, ctx, mut state, _task_ids) = bash_background_replay_fixture(40, Some(8));
+        let registry = ctx.bash_background();
+        let before = registry.project_replay_scan_total_examined_for_test();
+        let batch = registry.claim_project_replay_batch().unwrap();
+        assert!(super::drain_deferred_configure_maintenance_unit(
+            &ctx, &mut state
+        ));
+        assert_eq!(
+            registry.project_replay_scan_total_examined_for_test(),
+            before
+        );
+        assert_eq!(
+            state.jobs.front().unwrap().stage,
+            ConfigureMaintenanceStage::Status
+        );
+        drop(batch);
+        assert!(super::drain_deferred_configure_maintenance_unit(
+            &ctx, &mut state
+        ));
+        assert!(registry.project_replay_scan_total_examined_for_test() > before);
+    }
+
     fn identical_bind_repairs_evicted_artifact_beside_reader(early_fast_path: bool) {
         use crate::executor::{Executor, ExecutorConfig, Lane};
         use crate::path_identity::ProjectRootId;
@@ -9555,12 +10988,17 @@ mod tests {
             .expect("persist symbol cache fixture");
     }
 
-    fn symbol_file(path: &std::path::Path) -> super::SearchIndexSymbolFile {
+    fn symbol_file(path: &std::path::Path) -> crate::search_index::FileEntry {
         let modified = std::fs::metadata(path)
             .expect("stat source")
             .modified()
             .expect("source mtime");
-        (path.to_path_buf(), modified)
+        crate::search_index::FileEntry {
+            path: path.to_path_buf(),
+            size: 0,
+            modified,
+            content_hash: crate::cache_freshness::zero_hash(),
+        }
     }
 
     #[test]
@@ -9638,7 +11076,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let root = project.path().to_path_buf();
         let storage_dir = storage.path().to_path_buf();
-        let files = vec![symbol_file(&source)];
+        let files = Arc::new(vec![symbol_file(&source)]);
         let writer_cache = shared.clone();
         let writer = std::thread::spawn(move || {
             crate::symbol_cache_disk::observe_next_lock_acquisition(waiting_tx);
@@ -9649,6 +11087,7 @@ mod tests {
                 project_key.to_string(),
                 0,
                 files,
+                &super::SymbolPrewarmStop::never(),
                 false,
             );
             done_tx.send(()).expect("report prewarm completion");
@@ -9752,7 +11191,8 @@ mod tests {
             Some(storage.path().to_path_buf()),
             project_key.to_string(),
             0,
-            vec![symbol_file(&source)],
+            Arc::new(vec![symbol_file(&source)]),
+            &super::SymbolPrewarmStop::never(),
             false,
         );
 
@@ -9788,7 +11228,8 @@ mod tests {
             Some(storage.path().to_path_buf()),
             project_key.to_string(),
             0,
-            vec![symbol_file(&existing), symbol_file(&added)],
+            Arc::new(vec![symbol_file(&existing), symbol_file(&added)]),
+            &super::SymbolPrewarmStop::never(),
             false,
         );
 
@@ -9826,7 +11267,8 @@ mod tests {
             Some(storage.path().to_path_buf()),
             project_key.to_string(),
             0,
-            Vec::new(),
+            Arc::new(Vec::new()),
+            &super::SymbolPrewarmStop::never(),
             false,
         );
 
@@ -9834,6 +11276,119 @@ mod tests {
         let disk = crate::symbol_cache_disk::read_from_disk(storage.path(), project_key)
             .expect("read compacted cache");
         assert!(disk.is_empty());
+    }
+
+    #[test]
+    fn issue1007_symbol_prewarm_stops_between_files_and_releases_file_table() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::sync::atomic::AtomicU64;
+
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Trigger {
+            Nothing,
+            Reconfigure,
+            AbandonPastGrace,
+            IdleEviction,
+        }
+        const FILES: usize = 24;
+        const STOP_AFTER: usize = 3;
+
+        let _guard = symbol_cache_prewarm_test_mutex()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let project = tempfile::tempdir().expect("create project dir");
+        let sources: Vec<_> = (0..FILES)
+            .map(|index| {
+                write_symbol_cache_source(
+                    project.path(),
+                    &format!("src/file_{index:02}.rs"),
+                    &format!("pub fn prewarmed_{index}() {{}}\n"),
+                )
+            })
+            .collect();
+
+        for trigger in [
+            Trigger::Nothing,
+            Trigger::Reconfigure,
+            Trigger::AbandonPastGrace,
+            Trigger::IdleEviction,
+        ] {
+            let ctx = Rc::new(AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                Config::default(),
+            ));
+            // With no grace, an unbind is already past it when the prewarm
+            // next checks.
+            ctx.set_unbound_build_abandon_grace_for_test(Duration::ZERO);
+            let generation = ctx.reset_symbol_cache();
+            let content_generation = Arc::new(AtomicU64::new(7));
+            let stop = super::SymbolPrewarmStop {
+                lifecycle: ctx.subc_lifecycle_admission(),
+                content_generation_flag: Arc::clone(&content_generation),
+                content_generation: 7,
+            };
+            let files = Arc::new(sources.iter().map(|path| symbol_file(path)).collect());
+            let file_table = Arc::downgrade(&files);
+
+            let visited = Rc::new(Cell::new(0usize));
+            let hook_visited = Rc::clone(&visited);
+            let hook_ctx = Rc::clone(&ctx);
+            super::SYMBOL_PREWARM_AFTER_FILE.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |count| {
+                    hook_visited.set(count);
+                    if count != STOP_AFTER {
+                        return;
+                    }
+                    match trigger {
+                        Trigger::Nothing => {}
+                        // A configure with different settings.
+                        Trigger::Reconfigure => {
+                            content_generation.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Trigger::AbandonPastGrace => hook_ctx.mark_subc_unbound(),
+                        // Idle eviction drops the root's artifacts by
+                        // resetting the symbol cache to a new generation.
+                        Trigger::IdleEviction => {
+                            hook_ctx.reset_symbol_cache();
+                        }
+                    }
+                }));
+            });
+            super::prewarm_symbol_cache_from_search_files(
+                project.path().to_path_buf(),
+                ctx.symbol_cache(),
+                None,
+                "prewarm-stop".to_string(),
+                generation,
+                files,
+                &stop,
+                true,
+            );
+            super::SYMBOL_PREWARM_AFTER_FILE.with(|hook| *hook.borrow_mut() = None);
+
+            let expected_visits = if trigger == Trigger::Nothing {
+                FILES
+            } else {
+                STOP_AFTER
+            };
+            assert_eq!(
+                visited.get(),
+                expected_visits,
+                "{trigger:?}: the prewarm must stop before the next file"
+            );
+            assert!(
+                file_table.upgrade().is_none(),
+                "{trigger:?}: the prewarm must release the shared file table"
+            );
+            let cached = ctx.symbol_cache().read().unwrap().len();
+            let expected_cached = match trigger {
+                Trigger::Nothing => FILES,
+                Trigger::IdleEviction => 0,
+                Trigger::Reconfigure | Trigger::AbandonPastGrace => STOP_AFTER,
+            };
+            assert_eq!(cached, expected_cached, "{trigger:?}");
+        }
     }
 
     struct EnvVarGuard {
@@ -10027,36 +11582,6 @@ mod tests {
             .status()
             .unwrap()
             .success());
-    }
-
-    fn write_legacy_semantic_fixture(path: &Path, fingerprint: &str, source: &[u8]) {
-        fn put_field(bytes: &mut Vec<u8>, value: &[u8]) {
-            bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
-            bytes.extend_from_slice(value);
-        }
-        let mut bytes = vec![7];
-        bytes.extend_from_slice(&2_u32.to_le_bytes());
-        bytes.extend_from_slice(&1_u32.to_le_bytes());
-        put_field(&mut bytes, fingerprint.as_bytes());
-        bytes.extend_from_slice(&1_u32.to_le_bytes());
-        put_field(&mut bytes, b"tracked.rs");
-        bytes.extend_from_slice(&0_u64.to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&(source.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(blake3::hash(source).as_bytes());
-        put_field(&mut bytes, b"tracked.rs");
-        put_field(&mut bytes, b"tracked");
-        put_field(&mut bytes, b"");
-        bytes.push(0);
-        bytes.extend_from_slice(&1_u32.to_le_bytes());
-        bytes.extend_from_slice(&1_u32.to_le_bytes());
-        bytes.push(0);
-        put_field(&mut bytes, b"fn tracked() {}");
-        put_field(&mut bytes, b"tracked function");
-        bytes.extend_from_slice(&1.0_f32.to_le_bytes());
-        bytes.extend_from_slice(&0.0_f32.to_le_bytes());
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, bytes).unwrap();
     }
 
     #[test]
@@ -10446,353 +11971,6 @@ mod tests {
         assert!(!ctx.configure_tail_has_work());
     }
 
-    #[test]
-    fn busy_readiness_defers_revalidation_without_a_cold_rebuild() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let project = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        init_git_fixture(project.path());
-        let ctx = test_context();
-        let params = json!({
-            "project_root": project.path(), "storage_dir": storage.path(), "harness": "opencode",
-            "config": [user_tier(json!({ "views": { "enabled": true },
-                "indexes": { "trigram": false, "semantic": false, "callgraph": true } }))]
-        });
-        let root = project.path().canonicalize().unwrap();
-        let scope = crate::path_identity::project_scope_key(&root);
-        crate::views::assembly::publish_checkout(&crate::views::assembly::AssemblyRequest {
-            storage: storage.path().to_owned(),
-            family: crate::search_index::artifact_cache_key(&root),
-            scope: scope.clone(),
-            desired_head: crate::views::assembly::head_tree_fingerprint(
-                &crate::alias::head_tree_entries(&root).unwrap(),
-            ),
-            project_root: root.clone(),
-            changed_paths: BTreeSet::new(),
-            semantic_keys: Default::default(),
-            require_semantic: false,
-            allow_blob_put: true,
-            callgraph: true,
-        })
-        .unwrap();
-        let view = crate::views::ViewStore::open(storage.path(), &scope).unwrap();
-        let initial = view.current_generation().unwrap();
-        let derived = view.derived_path(initial.as_deref().unwrap()).unwrap();
-        crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
-        let writer = crate::db::file_identity::IdentityConnection::open(
-            &derived,
-            "busy_configure_readiness_test",
-        )
-        .unwrap();
-        writer
-            .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
-            .unwrap();
-
-        assert!(
-            handle_configure_for_test(
-                &configure_request_with_session(params.clone(), "while-locked"),
-                &ctx
-            )
-            .success
-        );
-        super::drain_deferred_configure_maintenance(&ctx);
-        let pending = ctx.view_runtime_snapshot().unwrap();
-        assert!(!pending.pending_paths.is_empty());
-        assert!(pending
-            .pending_inputs
-            .values()
-            .any(|input| { input.reason == crate::views::read::CALLGRAPH_READINESS_BUSY }));
-        assert!(matches!(
-            ctx.callgraph_store_for_ops(),
-            CallgraphStoreAccess::Building
-        ));
-        let health = ctx.view_health_snapshot().unwrap();
-        assert_eq!(
-            health.callgraph_readiness_deferred,
-            Some(crate::views::read::CALLGRAPH_READINESS_BUSY)
-        );
-        let failure = health.publication_failure.expect("publication will retry");
-        assert_eq!(failure.reason, "publication_failed");
-        assert!(failure.next_retry_ms.is_some(), "{failure:?}");
-        assert_eq!(view.current_generation().unwrap(), initial);
-        assert_eq!(
-            crate::views::assembly::cold_build_counts(view.view_dir()),
-            Default::default()
-        );
-        writer.execute_batch("ROLLBACK").unwrap();
-        drop(writer);
-
-        // Drive the retry without waiting for its one-second backoff. The
-        // invariant here is reuse of the healthy graph, not timer scheduling.
-        ctx.view_publication_retry().lock().reset(&root);
-        crate::executor::view_publication::schedule(&ctx, BTreeSet::new(), true).unwrap();
-
-        assert!(
-            handle_configure_for_test(
-                &configure_request_with_session(params, "after-unlock"),
-                &ctx
-            )
-            .success
-        );
-        super::drain_deferred_configure_maintenance(&ctx);
-        assert_eq!(view.current_generation().unwrap(), initial);
-        assert!(matches!(
-            ctx.callgraph_store_for_ops(),
-            CallgraphStoreAccess::Ready(_)
-        ));
-    }
-
-    #[test]
-    fn views_owner_rebuilds_stale_callgraph_with_multiple_sessions_and_linked_worktrees() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let temp = tempfile::tempdir().unwrap();
-        let main = temp.path().join("main");
-        let storage = temp.path().join("storage");
-        init_git_fixture(&main);
-        let main = main.canonicalize().unwrap();
-        for name in ["linked-one", "linked-two"] {
-            assert!(git_command(&main)
-                .args(["worktree", "add", "--detach", "--quiet"])
-                .arg(temp.path().join(name))
-                .arg("HEAD")
-                .status()
-                .unwrap()
-                .success());
-        }
-        let family = crate::search_index::artifact_cache_key(&main);
-        let scope = crate::path_identity::project_scope_key(&main);
-        let head = crate::views::assembly::head_tree_fingerprint(
-            &crate::alias::head_tree_entries(&main).unwrap(),
-        );
-        let seeded =
-            crate::views::assembly::publish_checkout(&crate::views::assembly::AssemblyRequest {
-                storage: storage.clone(),
-                project_root: main.clone(),
-                family: family.clone(),
-                scope: scope.clone(),
-                desired_head: head,
-                changed_paths: BTreeSet::new(),
-                semantic_keys: Default::default(),
-                require_semantic: false,
-                allow_blob_put: true,
-                callgraph: true,
-            })
-            .unwrap();
-        let generation = seeded.generation.unwrap();
-        let view = crate::views::ViewStore::open(&storage, &scope).unwrap();
-        let derived = view.derived_path(&generation).unwrap();
-        crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
-        // An older binary published the same HEAD with callgraph keys, but its
-        // extraction producer and derived build output are no longer readable.
-        let source = fs::read_to_string(main.join("tracked.rs")).unwrap();
-        let old_producer = "ruled-callgraph-v2";
-        let old_key =
-            crate::blob_store::CallgraphKey::from_bytes(source.as_bytes(), "rust", old_producer)
-                .full_key();
-        let old_blob =
-            crate::callgraph_store::join::CallgraphBlob::extract(&source, "rust", old_producer)
-                .unwrap();
-        let mut blobs = crate::blob_store::BlobStore::open(
-            &storage,
-            &family,
-            crate::blob_store::BlobPlane::Callgraph,
-        )
-        .unwrap();
-        blobs.put(&old_key, &old_blob.to_bytes().unwrap()).unwrap();
-        // Leave only old-producer payloads: the owner must extract current
-        // blobs before a read-only worktree can assemble its own graph.
-        let connection = rusqlite::Connection::open(blobs.path()).unwrap();
-        connection
-            .execute(
-                "DELETE FROM blob_payloads WHERE full_key != ?1",
-                [old_key.as_bytes().as_slice()],
-            )
-            .unwrap();
-        drop(connection);
-        let old_manifest =
-            crate::views::Manifest::new(view.load_manifest(&generation).unwrap().entries().map(
-                |(path, entry)| {
-                    let mut entry = entry.clone();
-                    if let crate::views::ManifestEntry::Regular { planes, .. } = &mut entry {
-                        planes.callgraph = Some(old_key.to_hex());
-                    }
-                    (path.clone(), entry)
-                },
-            ))
-            .unwrap();
-        fs::write(
-            view.manifest_path(&generation).unwrap(),
-            old_manifest.to_json_bytes().unwrap(),
-        )
-        .unwrap();
-        let connection = rusqlite::Connection::open(&derived).unwrap();
-        connection.execute("UPDATE meta SET v = '9e904a6dac7809c1250e41cc0eb9c1811afc33f707da25d3938c095b6e3bca2c' WHERE k = 'fingerprint'", []).unwrap();
-        drop(connection);
-
-        let params = |root: &Path| {
-            json!({
-                "project_root": root, "storage_dir": storage, "harness": "opencode",
-                "config": [user_tier(json!({ "views": { "enabled": true },
-                    "indexes": { "trigram": false, "semantic": false, "callgraph": true } }))]
-            })
-        };
-        let owner = test_context();
-        for session in ["owner-one", "owner-two", "owner-three"] {
-            let response = handle_configure_for_test(
-                &configure_request_with_session(params(&main), session),
-                &owner,
-            );
-            assert!(response.success, "{}", response.data);
-            assert_eq!(response.data["artifact_owner"]["mode"], "owner");
-        }
-        assert!(owner.callgraph_writer());
-        super::drain_deferred_configure_maintenance(&owner);
-        crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
-        match owner.callgraph_store_for_ops() {
-            CallgraphStoreAccess::Ready(store) => {
-                assert_eq!(store.reader_kind(), "view");
-                assert!(crate::callgraph_store::CallGraphRead::node_for(
-                    &store,
-                    Path::new("tracked.rs"),
-                    "tracked"
-                )
-                .is_ok());
-            }
-            CallgraphStoreAccess::Error(error) => {
-                panic!("bound owner did not rebuild its stale view: {error}")
-            }
-            _ => panic!("bound owner did not rebuild its stale view"),
-        }
-        assert_ne!(
-            view.current_generation().unwrap().as_deref(),
-            Some(generation.as_str())
-        );
-        // Rebinding a ready owner must not manufacture redundant generations.
-        let ready_generation = view.current_generation().unwrap();
-        assert!(
-            handle_configure_for_test(
-                &configure_request_with_session(params(&main), "owner-four"),
-                &owner
-            )
-            .success
-        );
-        super::drain_deferred_configure_maintenance(&owner);
-        assert_eq!(view.current_generation().unwrap(), ready_generation);
-        for name in ["linked-one", "linked-two"] {
-            let linked = temp.path().join(name);
-            let borrower = test_context();
-            let response = handle_configure_for_test(
-                &configure_request_with_session(params(&linked), name),
-                &borrower,
-            );
-            assert!(response.success, "{}", response.data);
-            assert_eq!(response.data["artifact_owner"]["mode"], "read_only");
-            assert!(!borrower.callgraph_writer());
-            super::drain_deferred_configure_maintenance(&borrower);
-            crate::views::wait_for_derived_checkpoint_for_test(&lazy_view_dir(&storage, &linked));
-            match borrower.callgraph_store_for_ops() {
-                CallgraphStoreAccess::Ready(store) => {
-                    assert_eq!(store.reader_kind(), "view");
-                    assert!(crate::callgraph_store::CallGraphRead::node_for(
-                        &store,
-                        Path::new("tracked.rs"),
-                        "tracked"
-                    )
-                    .is_ok());
-                }
-                CallgraphStoreAccess::Error(error) => {
-                    panic!("linked worktree could not read the rebuilt graph: {error}")
-                }
-                _ => panic!("linked worktree could not read the rebuilt graph"),
-            }
-            let request = RawRequest {
-                id: "linked-callers".into(),
-                command: "callers".into(),
-                session_id: Some(name.into()),
-                lsp_hints: None,
-                params: json!({ "file": linked.join("tracked.rs"), "symbol": "tracked" }),
-            };
-            let answer = crate::commands::callers::handle_callers(&request, &borrower);
-            assert!(answer.success, "{}", answer.data);
-        }
-    }
-
-    #[test]
-    fn s4_upgrade_same_head_configure_recovers_old_view_identities() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let temp = tempfile::tempdir().unwrap();
-        let main = temp.path().join("main");
-        let storage = temp.path().join("storage");
-        init_git_fixture(&main);
-        fs::write(main.join("tracked.rs"), "pub struct C; impl C { pub fn unique(&self) {} }\npub fn tracked(x: &C) { x.unique(); }\n").unwrap();
-        let main = main.canonicalize().unwrap();
-        let family = crate::search_index::artifact_cache_key(&main);
-        let scope = crate::path_identity::project_scope_key(&main);
-        let head = crate::views::assembly::head_tree_fingerprint(
-            &crate::alias::head_tree_entries(&main).unwrap(),
-        );
-        let request = crate::views::assembly::AssemblyRequest {
-            storage: storage.clone(),
-            project_root: main.clone(),
-            family: family.clone(),
-            scope: scope.clone(),
-            desired_head: head.clone(),
-            changed_paths: BTreeSet::new(),
-            semantic_keys: Default::default(),
-            require_semantic: false,
-            allow_blob_put: true,
-            callgraph: true,
-        };
-        let seeded = crate::callgraph_store::position_identity_tests::with_pre_s4_output(|| {
-            crate::views::assembly::publish_checkout(&request)
-        })
-        .unwrap();
-        let view = crate::views::ViewStore::open(&storage, &scope).unwrap();
-        let old = view
-            .derived_path(seeded.generation.as_deref().unwrap())
-            .unwrap();
-        crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
-        {
-            let conn = rusqlite::Connection::open(&old).unwrap();
-            crate::callgraph_store::position_identity_tests::seed_old_dispatch_hint(&conn);
-            crate::callgraph_store::position_identity_tests::stamp_pre_s4(&conn, true);
-        }
-        let owner = test_context();
-        let params = json!({"project_root":main,"storage_dir":storage,"harness":"opencode","config":[user_tier(json!({"views":{"enabled":true},"indexes":{"trigram":false,"semantic":false,"callgraph":true}}))]});
-        let response =
-            handle_configure_for_test(&configure_request_with_session(params, "s4-owner"), &owner);
-        assert!(response.success, "{}", response.data);
-        super::drain_deferred_configure_maintenance(&owner);
-        crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
-        match owner.callgraph_store_for_ops() {
-            CallgraphStoreAccess::Ready(store) => assert!(
-                !crate::callgraph_store::CallGraphRead::edge_snapshot(&store)
-                    .unwrap()
-                    .is_empty()
-            ),
-            _ => panic!("same-HEAD configure must recover a ready view"),
-        }
-        assert_eq!(
-            head,
-            crate::views::assembly::head_tree_fingerprint(
-                &crate::alias::head_tree_entries(&main).unwrap()
-            )
-        );
-        let current = view.current_generation().unwrap().unwrap();
-        assert_ne!(Some(current.as_str()), seeded.generation.as_deref());
-        let database = view.derived_path(&current).unwrap();
-        crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
-        crate::callgraph_store::position_identity_tests::assert_current_graph(
-            &rusqlite::Connection::open(&database).unwrap(),
-        );
-    }
-
     /// `lib.rs` of the on-demand call-graph fixtures: one caller, one callee
     /// and one function nothing calls, so callers, impact and dead code all
     /// have something to report.
@@ -10803,8 +11981,9 @@ mod tests {
         main: PathBuf,
         linked: PathBuf,
         storage: PathBuf,
-        /// `None` when the main checkout was never bound in this process.
-        owner: Option<Arc<AppContext>>,
+        /// The main checkout's context, kept alive for the fixture's
+        /// lifetime; `None` when it was never bound in this process.
+        _owner: Option<Arc<AppContext>>,
         borrower: Arc<AppContext>,
     }
 
@@ -10877,7 +12056,7 @@ mod tests {
             main,
             linked,
             storage,
-            owner,
+            _owner: owner,
             borrower,
         }
     }
@@ -10932,17 +12111,6 @@ mod tests {
         storage
             .join("views")
             .join(crate::path_identity::project_scope_key(root))
-    }
-
-    /// Derived call-graph files of a view: databases and ownership references.
-    fn lazy_derived_files(view_dir: &Path) -> Vec<String> {
-        let mut names = fs::read_dir(view_dir)
-            .unwrap()
-            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-            .filter(|name| name.starts_with("derived-"))
-            .collect::<Vec<_>>();
-        names.sort();
-        names
     }
 
     fn lazy_ready(
@@ -11043,31 +12211,6 @@ mod tests {
         assert_eq!(projected, dead_code(cold));
     }
 
-    /// Wait for the publication that builds the worktree's own graph.
-    fn lazy_wait_for_own_graph(ctx: &AppContext) {
-        let deadline = Instant::now() + Duration::from_secs(180);
-        loop {
-            let built = ctx
-                .view_runtime_snapshot()
-                .and_then(|view| {
-                    let generation = view.generation?;
-                    Some(crate::views::read::derived_built(
-                        &view.view_dir,
-                        &generation,
-                    ))
-                })
-                .unwrap_or(false);
-            if built && !crate::executor::view_publication::running_for(ctx) {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the on-demand call-graph build did not finish"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-
     /// Edit `lib.rs` in the worktree and deliver the change through the
     /// watcher drain, without publishing it yet.
     fn lazy_edit_through_watcher(fixture: &LazyWorktree, contents: &str) {
@@ -11081,429 +12224,6 @@ mod tests {
         .unwrap();
         let outcome = crate::runtime_drain::drain_watcher_events_bounded(&fixture.borrower, 1);
         assert_eq!(outcome.processed, 1);
-    }
-
-    /// A views-on checkout whose call graph an operator removes while the
-    /// daemon is stopped: `blobs/<family>/callgraph.sqlite` and its `-wal` and
-    /// `-shm` files are deleted, while `oid-alias.sqlite` and
-    /// `semantic.sqlite` beside them are kept.
-    struct BlobRemovalFixture {
-        _temp: tempfile::TempDir,
-        root: PathBuf,
-        storage: PathBuf,
-        family: String,
-        /// `callers` of `target` and `call_tree` of `caller`, Debug-formatted,
-        /// as the daemon answered before the store was removed.
-        callers_before: String,
-        call_tree_before: String,
-        generation_before: String,
-    }
-
-    const BLOB_REMOVAL_EDITED_LIB: &str =
-        "pub fn caller() { target(); }\npub fn second() { target(); }\npub fn target() {}\nfn unused() {}\n";
-
-    fn blob_removal_callgraph_db(storage: &Path, family: &str) -> PathBuf {
-        storage.join("blobs").join(family).join("callgraph.sqlite")
-    }
-
-    fn blob_removal_payload_rows(storage: &Path, family: &str) -> u64 {
-        let connection =
-            rusqlite::Connection::open(blob_removal_callgraph_db(storage, family)).unwrap();
-        connection
-            .query_row("SELECT COUNT(*) FROM blob_payloads", [], |row| row.get(0))
-            .unwrap()
-    }
-
-    fn blob_removal_answers(ctx: &AppContext) -> (String, String) {
-        let view = ctx.view_runtime_snapshot().expect("published fixture view");
-        // Wait for the detached checkpoint to finish before reading: it can
-        // still lock the database after publication. A live query can instead
-        // return the retryable callgraph_building response.
-        crate::views::wait_for_derived_checkpoint_for_test(&view.view_dir);
-        let store = lazy_ready(ctx.callgraph_store_for_ops());
-        let lib = Path::new("lib.rs");
-        (
-            format!("{:?}", store.callers_of(lib, "target", 3).unwrap()),
-            format!("{:?}", store.call_tree(lib, "caller", 3).unwrap()),
-        )
-    }
-
-    fn blob_removal_generation(storage: &Path, root: &Path) -> Option<String> {
-        crate::views::ViewStore::open(storage, &crate::path_identity::project_scope_key(root))
-            .unwrap()
-            .current_generation()
-            .unwrap()
-    }
-
-    #[test]
-    fn configure_busy_callgraph_readiness_revalidates_after_unlock() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("main");
-        let storage = temp.path().join("storage");
-        init_git_fixture(&root);
-        lazy_commit(&root, LAZY_LIB, "lib");
-        let root = root.canonicalize().unwrap();
-        let first = lazy_bind(&root, &storage, "before-lock");
-        let view_dir = lazy_view_dir(&storage, &root);
-        crate::views::wait_for_derived_checkpoint_for_test(&view_dir);
-        let generation = blob_removal_generation(&storage, &root).unwrap();
-        drop(first);
-        let database = crate::views::resolve_derived_path(&view_dir, &generation).unwrap();
-        let writer = crate::db::file_identity::IdentityConnection::open(
-            &database,
-            "busy configure readiness fixture",
-        )
-        .unwrap();
-        writer
-            .execute(
-                "UPDATE meta SET v = 'stale-build-output' WHERE k = 'fingerprint'",
-                [],
-            )
-            .unwrap();
-        let journal: String = writer
-            .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(journal, "delete");
-        writer.execute_batch("BEGIN EXCLUSIVE;").unwrap();
-        let probe = crate::callgraph_store::manifest_view_database_ready(
-            &view_dir,
-            &generation,
-            Instant::now() + crate::db::TOOL_RETRY_BUSY_WAIT,
-        )
-        .unwrap_err();
-        assert!(probe.is_transient_lock_contention(), "{probe}");
-
-        let owner = test_context();
-        let params = json!({
-            "project_root": root, "storage_dir": storage, "harness": "opencode",
-            "config": [user_tier(json!({"views":{"enabled":true},
-                "indexes":{"trigram":false,"semantic":false,"callgraph":true}}))]
-        });
-        assert!(
-            handle_configure_for_test(
-                &configure_request_with_session(params, "after-lock"),
-                &owner,
-            )
-            .success
-        );
-        let (gate, probe_done, release) =
-            super::gate_configure_tail_stage_for_test(root.clone(), "view_payload_check");
-        std::thread::scope(|scope| {
-            let tail = scope.spawn(|| super::drain_deferred_configure_maintenance(&owner));
-            probe_done.recv_timeout(Duration::from_secs(30)).unwrap();
-            writer
-                .execute_batch("ROLLBACK; PRAGMA journal_mode=WAL;")
-                .unwrap();
-            drop(writer);
-            drop(gate);
-            release.send(()).unwrap();
-            tail.join().unwrap();
-        });
-        crate::views::wait_for_derived_checkpoint_for_test(&view_dir);
-        let store = lazy_ready(owner.callgraph_store_for_ops());
-        assert_eq!(store.reader_kind(), "view");
-        assert_ne!(
-            blob_removal_generation(&storage, &root).as_deref(),
-            Some(generation.as_str())
-        );
-        assert!(owner
-            .view_runtime_snapshot()
-            .unwrap()
-            .pending_paths
-            .is_empty());
-        assert!(format!(
-            "{:?}",
-            store.callers_of(Path::new("lib.rs"), "target", 3).unwrap()
-        )
-        .contains("caller"));
-    }
-
-    /// Models a stopped daemon before the store is removed: once this returns,
-    /// no tracked database connection under `storage` is open in this process.
-    /// Deleting a file that a connection still holds would leave that
-    /// connection reading the unlinked file on Unix, which would hide the effect
-    /// being tested, and fails on Windows.
-    ///
-    /// Dropping the last context closes the connections it owns. The view
-    /// publication, however, handed its keeper connection on the new
-    /// `derived-*.sqlite` to the detached `aft-view-checkpoint` worker (see
-    /// `views::generation::schedule_derived_checkpoint`). The context does not
-    /// own that worker; it waits at least 250 ms, attempts a checkpoint unless
-    /// a later publication superseded it, then closes the connection either
-    /// way. Wait for it here. A real daemon stop ends the process, which closes
-    /// that handle as well.
-    fn blob_removal_stop(ctx: Arc<AppContext>, storage: &Path, root: &Path) {
-        let Ok(ctx) = Arc::try_unwrap(ctx) else {
-            panic!("another owner kept the context alive past the stop");
-        };
-        drop(ctx);
-        crate::views::wait_for_derived_checkpoint_for_test(&lazy_view_dir(storage, root));
-        let held = crate::db::file_identity::open_connections_under_for_test(storage);
-        assert!(
-            held.is_empty(),
-            "connections outlived the stopped context: {held:#?}"
-        );
-    }
-
-    /// Removes the family's call-graph blob store and asserts that the alias and
-    /// semantic stores beside it are left in place.
-    fn blob_removal_delete_store(storage: &Path, family: &str) {
-        let database = blob_removal_callgraph_db(storage, family);
-        assert!(database.is_file());
-        for suffix in ["", "-wal", "-shm"] {
-            let path = PathBuf::from(format!("{}{suffix}", database.display()));
-            match fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => panic!("removing {}: {error}", path.display()),
-            }
-        }
-        let family_dir = storage.join("blobs").join(family);
-        assert!(!database.exists());
-        assert!(family_dir.join("oid-alias.sqlite").is_file());
-        assert!(family_dir.join("semantic.sqlite").is_file());
-    }
-
-    /// Binds a committed checkout with views and the call graph on, records the
-    /// answers the daemon gives, stops it and removes the call-graph blob store.
-    fn blob_removal_fixture() -> BlobRemovalFixture {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("main");
-        init_git_fixture(&root);
-        lazy_commit(&root, LAZY_LIB, "lib");
-        let root = root.canonicalize().unwrap();
-        let storage = temp.path().join("storage");
-        let family = crate::search_index::artifact_cache_key(&root);
-
-        let ctx = lazy_bind(&root, &storage, "before-removal");
-        let (callers_before, call_tree_before) = blob_removal_answers(&ctx);
-        assert!(callers_before.contains("caller"), "{callers_before}");
-        assert!(call_tree_before.contains("target"), "{call_tree_before}");
-        let generation_before = blob_removal_generation(&storage, &root).unwrap();
-        assert!(crate::views::read::derived_built(
-            &lazy_view_dir(&storage, &root),
-            &generation_before
-        ));
-        // lib.rs and tracked.rs each have one extracted payload.
-        assert_eq!(blob_removal_payload_rows(&storage, &family), 2);
-
-        blob_removal_stop(ctx, &storage, &root);
-        blob_removal_delete_store(&storage, &family);
-        BlobRemovalFixture {
-            _temp: temp,
-            root,
-            storage,
-            family,
-            callers_before,
-            call_tree_before,
-            generation_before,
-        }
-    }
-
-    /// Removing only the blob store used to freeze the view: nothing extracted
-    /// the deleted payloads again, the first edit's closure check found the
-    /// unchanged file's payload missing, and every retry failed the same way.
-    /// A missing payload is now extracted again from the working tree, so the
-    /// restarted daemon keeps answering and the next edit publishes.
-    #[test]
-    fn views_removed_callgraph_blob_store_heals_and_the_next_edit_publishes() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let fixture = blob_removal_fixture();
-        let (root, storage, family) = (&fixture.root, &fixture.storage, &fixture.family);
-
-        let ctx = lazy_bind(root, storage, "after-removal");
-        assert_eq!(
-            blob_removal_answers(&ctx),
-            (
-                fixture.callers_before.clone(),
-                fixture.call_tree_before.clone()
-            ),
-            "the restarted daemon answers from the surviving derived database"
-        );
-
-        fs::write(root.join("lib.rs"), BLOB_REMOVAL_EDITED_LIB).unwrap();
-        let report = ctx
-            .publish_view_paths(BTreeSet::from([b"lib.rs".to_vec()]), false)
-            .expect("the edit publishes although the blob store was removed");
-        assert!(report.published, "{report:?}");
-        assert!(report.pending_paths.is_empty(), "{report:?}");
-        assert_ne!(
-            blob_removal_generation(storage, root).as_deref(),
-            Some(fixture.generation_before.as_str()),
-            "the edit's generation is current"
-        );
-        let (callers_after_edit, _) = blob_removal_answers(&ctx);
-        assert!(
-            callers_after_edit.contains("second"),
-            "the edit's new caller is served: {callers_after_edit}"
-        );
-        // The unchanged file's payload was extracted again, beside the edit's.
-        assert!(blob_removal_has_payload(
-            storage,
-            family,
-            &blob_removal_key(&root.join("tracked.rs"))
-        ));
-        assert!(blob_removal_has_payload(
-            storage,
-            family,
-            &blob_removal_key(&root.join("lib.rs"))
-        ));
-    }
-
-    /// The callgraph key of a file's current bytes, as assembly computes it.
-    fn blob_removal_key(path: &Path) -> String {
-        crate::blob_store::CallgraphKey::from_bytes(
-            &fs::read(path).unwrap(),
-            "rust",
-            crate::views::callgraph::PRODUCER,
-        )
-        .full_key()
-        .to_hex()
-    }
-
-    fn blob_removal_has_payload(storage: &Path, family: &str, key: &str) -> bool {
-        let connection =
-            rusqlite::Connection::open(blob_removal_callgraph_db(storage, family)).unwrap();
-        let key = crate::blob_store::v2::parse_hex32(key).unwrap();
-        connection
-            .query_row(
-                "SELECT COUNT(*) FROM blob_payloads WHERE full_key = ?1",
-                [key.as_slice()],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap()
-            == 1
-    }
-
-    /// Deletes every payload row of the family's call-graph store, keeping the
-    /// file, as a lost or truncated store would leave it.
-    fn blob_removal_clear_rows(storage: &Path, family: &str) {
-        let connection =
-            rusqlite::Connection::open(blob_removal_callgraph_db(storage, family)).unwrap();
-        connection
-            .execute_batch("DELETE FROM blob_payloads")
-            .unwrap();
-        drop(connection);
-        assert_eq!(blob_removal_payload_rows(storage, family), 0);
-    }
-
-    fn blob_removal_manifest_key(storage: &Path, root: &Path, path: &str) -> Option<String> {
-        let view =
-            crate::views::ViewStore::open(storage, &crate::path_identity::project_scope_key(root))
-                .unwrap();
-        let generation = view.current_generation().unwrap().unwrap();
-        let manifest = view.load_manifest(&generation).unwrap();
-        match manifest.get(&crate::views::RelPath::new(path.as_bytes().to_vec()).unwrap())? {
-            crate::views::ManifestEntry::Regular { planes, .. } => planes.callgraph.clone(),
-            _ => None,
-        }
-    }
-
-    /// A bound checkout whose call-graph store loses its rows while the daemon
-    /// runs. Returns the live context.
-    fn blob_heal_running_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, String, Arc<AppContext>)
-    {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("main");
-        init_git_fixture(&root);
-        lazy_commit(&root, LAZY_LIB, "lib");
-        let root = root.canonicalize().unwrap();
-        let storage = temp.path().join("storage");
-        let family = crate::search_index::artifact_cache_key(&root);
-        let ctx = lazy_bind(&root, &storage, "running-heal");
-        assert_eq!(blob_removal_payload_rows(&storage, &family), 2);
-        blob_removal_clear_rows(&storage, &family);
-        (temp, root, storage, family, ctx)
-    }
-
-    /// A store SQLite cannot read is moved aside and recreated empty when it
-    /// is opened. The view keeps naming the old payloads; they are extracted
-    /// again, and the next edit publishes.
-    #[test]
-    fn views_corrupt_callgraph_blob_store_is_moved_aside_and_heals() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let fixture = blob_removal_fixture();
-        let (root, storage, family) = (&fixture.root, &fixture.storage, &fixture.family);
-        let database = blob_removal_callgraph_db(storage, family);
-        fs::write(&database, b"this is not a SQLite database\n".repeat(256)).unwrap();
-
-        let ctx = lazy_bind(root, storage, "after-corruption");
-        let family_dir = storage.join("blobs").join(family);
-        let moved_aside = fs::read_dir(&family_dir)
-            .unwrap()
-            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-            .filter(|name| name.starts_with("callgraph.sqlite.corrupt-"))
-            .count();
-        assert_eq!(moved_aside, 1, "the corrupt store was moved aside");
-        assert_eq!(
-            blob_removal_answers(&ctx),
-            (
-                fixture.callers_before.clone(),
-                fixture.call_tree_before.clone()
-            ),
-        );
-
-        fs::write(root.join("lib.rs"), BLOB_REMOVAL_EDITED_LIB).unwrap();
-        let report = ctx
-            .publish_view_paths(BTreeSet::from([b"lib.rs".to_vec()]), false)
-            .expect("the edit publishes after the corrupt store was replaced");
-        assert!(report.published, "{report:?}");
-        let (callers_after_edit, _) = blob_removal_answers(&ctx);
-        assert!(
-            callers_after_edit.contains("second"),
-            "{callers_after_edit}"
-        );
-        assert!(blob_removal_has_payload(
-            storage,
-            family,
-            &blob_removal_key(&root.join("tracked.rs"))
-        ));
-    }
-
-    /// Bind finds the current generation's missing payloads before any edit
-    /// and schedules the publication that extracts them again.
-    #[test]
-    fn views_emptied_callgraph_blob_store_is_healed_at_bind() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let fixture = blob_removal_fixture();
-        let (root, storage, family) = (&fixture.root, &fixture.storage, &fixture.family);
-
-        let ctx = lazy_bind(root, storage, "after-emptying");
-        assert_eq!(
-            blob_removal_payload_rows(storage, family),
-            2,
-            "bind extracted both payloads again without an edit"
-        );
-        assert_eq!(
-            blob_removal_generation(storage, root).as_deref(),
-            Some(fixture.generation_before.as_str()),
-            "the repair changed no content, so the generation is unchanged"
-        );
-        assert!(ctx
-            .view_runtime_snapshot()
-            .is_some_and(|view| view.pending_paths.is_empty()));
-        assert_eq!(
-            blob_removal_answers(&ctx),
-            (
-                fixture.callers_before.clone(),
-                fixture.call_tree_before.clone()
-            ),
-        );
-        let (_cold_storage, cold) = lazy_cold_store(root);
-        let store = lazy_ready(ctx.callgraph_store_for_ops());
-        assert_eq!(
-            store.edge_snapshot().unwrap(),
-            cold.edge_snapshot().unwrap()
-        );
     }
 
     /// Measures, on a checkout of about AFT's size with both payload planes
@@ -11702,347 +12422,8 @@ mod tests {
         }
     }
 
-    /// A missing payload whose file changed since the view was published is
-    /// extracted from the file's current content, under its new key.
     #[test]
-    fn views_missing_payload_of_a_changed_file_is_extracted_under_its_new_key() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let (_temp, root, storage, family, ctx) = blob_heal_running_fixture();
-        let old_tracked_key = blob_removal_key(&root.join("tracked.rs"));
-        assert_eq!(
-            blob_removal_manifest_key(&storage, &root, "tracked.rs").as_deref(),
-            Some(old_tracked_key.as_str())
-        );
-        // Nothing reports this change: only lib.rs is published below.
-        fs::write(
-            root.join("tracked.rs"),
-            "fn tracked() { crate::target(); }\n",
-        )
-        .unwrap();
-        let new_tracked_key = blob_removal_key(&root.join("tracked.rs"));
-
-        fs::write(root.join("lib.rs"), BLOB_REMOVAL_EDITED_LIB).unwrap();
-        let report = ctx
-            .publish_view_paths(BTreeSet::from([b"lib.rs".to_vec()]), false)
-            .expect("the edit publishes");
-        assert!(report.published, "{report:?}");
-        assert_eq!(
-            blob_removal_manifest_key(&storage, &root, "tracked.rs").as_deref(),
-            Some(new_tracked_key.as_str()),
-            "the changed file is published under its current content's key"
-        );
-        assert!(blob_removal_has_payload(
-            &storage,
-            &family,
-            &new_tracked_key
-        ));
-        assert!(!blob_removal_has_payload(
-            &storage,
-            &family,
-            &old_tracked_key
-        ));
-        let (callers_after_edit, _) = blob_removal_answers(&ctx);
-        assert!(
-            callers_after_edit.contains("second"),
-            "{callers_after_edit}"
-        );
-    }
-
-    /// The bind check reads keys, not payloads, and an exhausted budget is
-    /// reported as incomplete rather than as a store with nothing missing.
-    #[test]
-    fn views_payload_check_names_missing_paths_and_reports_an_exhausted_budget() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let (_temp, root, storage, family, _ctx) = blob_heal_running_fixture();
-        let view = crate::views::ViewStore::open(
-            &storage,
-            &crate::path_identity::project_scope_key(&root),
-        )
-        .unwrap();
-        let manifest = view
-            .load_manifest(&view.current_generation().unwrap().unwrap())
-            .unwrap();
-        let callgraph = crate::blob_store::BlobStore::open(
-            &storage,
-            family.clone(),
-            crate::blob_store::BlobPlane::Callgraph,
-        )
-        .unwrap();
-        let semantic = crate::blob_store::BlobStore::open(
-            &storage,
-            family.clone(),
-            crate::blob_store::BlobPlane::Semantic,
-        )
-        .unwrap();
-
-        let check = super::view_payload_check(
-            &manifest,
-            &callgraph,
-            &semantic,
-            Instant::now() + Duration::from_secs(60),
-        )
-        .unwrap();
-        assert!(check.complete());
-        assert_eq!(
-            check.missing.keys().cloned().collect::<Vec<_>>(),
-            vec![b"lib.rs".to_vec(), b"tracked.rs".to_vec()]
-        );
-        assert!(check
-            .missing
-            .values()
-            .all(|input| input.plane == "callgraph"));
-
-        let exhausted = super::view_payload_check(
-            &manifest,
-            &callgraph,
-            &semantic,
-            Instant::now()
-                .checked_sub(Duration::from_millis(1))
-                .unwrap_or_else(Instant::now),
-        )
-        .unwrap();
-        assert!(!exhausted.complete());
-        assert!(exhausted.missing.is_empty());
-    }
-
-    /// A missing payload whose file cannot be read leaves that path out of the
-    /// generation with a failed status; the rest of the publication lands.
-    #[test]
-    fn views_missing_payload_of_an_unreadable_file_fails_only_that_path() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let (_temp, root, storage, _family, ctx) = blob_heal_running_fixture();
-        // A directory where the tracked file was: the path still exists, but
-        // reading it as a file fails.
-        fs::remove_file(root.join("tracked.rs")).unwrap();
-        fs::create_dir(root.join("tracked.rs")).unwrap();
-
-        fs::write(root.join("lib.rs"), BLOB_REMOVAL_EDITED_LIB).unwrap();
-        let report = ctx
-            .publish_view_paths(BTreeSet::from([b"lib.rs".to_vec()]), false)
-            .expect("one unreadable path does not fail the publication");
-        assert!(report.published, "{report:?}");
-        assert!(
-            blob_removal_manifest_key(&storage, &root, "tracked.rs").is_none(),
-            "the unreadable path is not published with a missing payload"
-        );
-        let status = crate::path_status::PathStatusStore::open(&lazy_view_dir(&storage, &root))
-            .unwrap()
-            .status_for(b"tracked.rs")
-            .unwrap()
-            .expect("the unreadable path has a status");
-        assert_eq!(status.state, crate::path_status::PathState::Failed);
-        assert_eq!(
-            status.reason,
-            crate::views::assembly::MISSING_PAYLOAD_SOURCE_UNREADABLE
-        );
-        let (callers_after_edit, _) = blob_removal_answers(&ctx);
-        assert!(
-            callers_after_edit.contains("second"),
-            "{callers_after_edit}"
-        );
-    }
-
-    /// Removing the checkout's view directory together with the blob store
-    /// makes the next bind publish from scratch: every file is extracted
-    /// again, and the rebuilt graph answers as before and takes later edits.
-    #[test]
-    fn views_removed_callgraph_blob_store_and_view_rebuild_on_restart() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let fixture = blob_removal_fixture();
-        let (root, storage, family) = (&fixture.root, &fixture.storage, &fixture.family);
-        let view_dir = lazy_view_dir(storage, root);
-        fs::remove_dir_all(&view_dir).unwrap();
-
-        // Pause checkpoint completion with a real SQLite writer on its file.
-        // An exclusive rollback-journal transaction makes short-lived lock
-        // contention observable without racing the scheduler.
-        enum CheckpointObservation {
-            Waiting,
-            Answer(std::thread::Result<(String, String)>),
-        }
-        let (begin_tx, begin_rx) = std::sync::mpsc::channel();
-        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let (observation_tx, observation_rx) = std::sync::mpsc::channel();
-        let waiting_tx = observation_tx.clone();
-        crate::views::checkpoint_test_hooks()
-            .lock()
-            .unwrap()
-            .insert(
-                view_dir.clone(),
-                crate::views::CheckpointTestHooks {
-                    before_settled: Some(Box::new(move |path| {
-                        begin_rx.recv_timeout(Duration::from_secs(60)).unwrap();
-                        let connection = crate::db::file_identity::IdentityConnection::open(
-                            path,
-                            "checkpoint contention fixture",
-                        )
-                        .unwrap();
-                        let journal: String = connection
-                            .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
-                            .unwrap();
-                        assert_eq!(journal, "delete");
-                        connection.execute_batch("BEGIN EXCLUSIVE;").unwrap();
-                        locked_tx.send(path.to_path_buf()).unwrap();
-                        let _ = release_rx.recv_timeout(Duration::from_secs(60));
-                        connection
-                            .execute_batch("ROLLBACK; PRAGMA journal_mode=WAL;")
-                            .unwrap();
-                    })),
-                    before_wait: Some(Box::new(move || {
-                        waiting_tx.send(CheckpointObservation::Waiting).unwrap();
-                    })),
-                },
-            );
-        let ctx = lazy_bind(root, storage, "after-removal");
-        let generation = blob_removal_generation(storage, root).expect("republished at bind");
-        assert!(crate::views::read::derived_built(&view_dir, &generation));
-        assert!(ctx
-            .view_runtime_snapshot()
-            .is_some_and(|view| view.pending_paths.is_empty()));
-        assert_eq!(
-            blob_removal_payload_rows(storage, family),
-            2,
-            "both files were extracted again"
-        );
-        begin_tx.send(()).unwrap();
-        let locked_path = locked_rx.recv_timeout(Duration::from_secs(60)).unwrap();
-        assert_eq!(
-            locked_path,
-            crate::views::resolve_derived_path(&view_dir, &generation).unwrap()
-        );
-        let request: RawRequest = serde_json::from_value(serde_json::json!({
-            "id": "checkpoint-busy", "command": "callers", "session_id": "after-removal",
-            "file": "lib.rs", "symbol": "target"
-        }))
-        .unwrap();
-        let busy = crate::commands::callers::handle_callers(&request, &ctx);
-        assert!(!busy.success, "{busy:?}");
-        assert_eq!(busy.data["code"], "callgraph_building", "{busy:?}");
-        let reader_ctx = Arc::clone(&ctx);
-        let reader = std::thread::spawn(move || {
-            let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                blob_removal_answers(&reader_ctx)
-            }));
-            observation_tx
-                .send(CheckpointObservation::Answer(answer))
-                .unwrap();
-        });
-        assert!(
-            matches!(
-                observation_rx
-                    .recv_timeout(Duration::from_secs(60))
-                    .unwrap(),
-                CheckpointObservation::Waiting
-            ),
-            "the fixture read before the checkpoint completion event"
-        );
-        release_tx.send(()).unwrap();
-        let CheckpointObservation::Answer(answer) = observation_rx
-            .recv_timeout(Duration::from_secs(60))
-            .unwrap()
-        else {
-            panic!("checkpoint waiter did not answer");
-        };
-        reader.join().unwrap();
-        crate::views::checkpoint_test_hooks()
-            .lock()
-            .unwrap()
-            .remove(&view_dir);
-        assert_eq!(
-            answer.unwrap(),
-            (
-                fixture.callers_before.clone(),
-                fixture.call_tree_before.clone()
-            ),
-        );
-        let (_cold_storage, cold) = lazy_cold_store(root);
-        let store = lazy_ready(ctx.callgraph_store_for_ops());
-        assert_eq!(
-            store.edge_snapshot().unwrap(),
-            cold.edge_snapshot().unwrap()
-        );
-        drop(store);
-
-        fs::write(root.join("lib.rs"), BLOB_REMOVAL_EDITED_LIB).unwrap();
-        let report = ctx
-            .publish_view_paths(BTreeSet::from([b"lib.rs".to_vec()]), false)
-            .unwrap();
-        assert!(report.published, "{report:?}");
-        assert!(report.pending_paths.is_empty(), "{report:?}");
-        let (callers_after_edit, _) = blob_removal_answers(&ctx);
-        assert!(
-            callers_after_edit.contains("second"),
-            "{callers_after_edit}"
-        );
-    }
-
-    #[test]
-    fn linked_worktree_answers_from_main_graph_without_building_its_own() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let fixture = lazy_worktree(true);
-        let view_dir = lazy_view_dir(&fixture.storage, &fixture.linked);
-        let view = crate::views::ViewStore::open(
-            &fixture.storage,
-            &crate::path_identity::project_scope_key(&fixture.linked),
-        )
-        .unwrap();
-        assert!(
-            view.current_generation().unwrap().is_some(),
-            "the worktree's view is still published at bind"
-        );
-        assert_eq!(lazy_derived_files(&view_dir), Vec::<String>::new());
-
-        let store = lazy_ready(fixture.borrower.callgraph_store_for_ops());
-        assert!(
-            store
-                .sqlite_path()
-                .starts_with(lazy_view_dir(&fixture.storage, &fixture.main)),
-            "answered from {:?}, not the main checkout's graph",
-            store.sqlite_path()
-        );
-        let (_cold_storage, cold) = lazy_cold_store(&fixture.linked);
-        lazy_assert_same_graph(&store, &cold);
-        // Inspect's Tier-2 categories, such as dead code, also read the main
-        // checkout's graph for this worktree.
-        let (inspect_store, _) = crate::inspect::current_view_projection_store_for_test(
-            &fixture.linked,
-            &fixture.borrower.config(),
-        )
-        .expect("inspect reads the main checkout's graph for the worktree");
-        lazy_assert_same_graph(&inspect_store, &cold);
-        let answer = crate::commands::callers::handle_callers(
-            &RawRequest {
-                id: "lazy-callers".into(),
-                command: "callers".into(),
-                session_id: Some("lazy-linked".into()),
-                lsp_hints: None,
-                params: json!({ "file": fixture.linked.join("lib.rs"), "symbol": "target" }),
-            },
-            &fixture.borrower,
-        );
-        assert!(answer.success, "{}", answer.data);
-        assert_eq!(answer.data["total_callers"], 1, "{}", answer.data);
-
-        assert_eq!(lazy_derived_files(&view_dir), Vec::<String>::new());
-        assert_eq!(
-            fixture.borrower.lazy_callgraph_builds_scheduled_for_test(),
-            0
-        );
-    }
-
-    #[test]
-    fn linked_worktree_edit_reports_building_then_answers_from_its_own_graph() {
+    fn linked_worktree_edit_answers_from_its_own_view_at_once() {
         let _artifact_guard = artifact_owner_test_lock();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
@@ -12052,26 +12433,8 @@ mod tests {
             "pub fn caller() { target(); }\npub fn edited_caller() { target(); }\npub fn target() {}\nfn unused() {}\n",
         );
 
-        // The edit is not published yet, but main's graph no longer answers.
-        let access = {
-            let _scope = crate::executor::install_standalone_scope(Arc::clone(&fixture.borrower));
-            fixture.borrower.callgraph_store_for_ops()
-        };
-        assert!(matches!(access, CallgraphStoreAccess::Building));
-        assert_eq!(
-            fixture.borrower.lazy_callgraph_builds_scheduled_for_test(),
-            1
-        );
-        lazy_wait_for_own_graph(&fixture.borrower);
-
-        let store = lazy_ready(fixture.borrower.callgraph_store_for_ops());
-        assert!(
-            store
-                .sqlite_path()
-                .starts_with(lazy_view_dir(&fixture.storage, &fixture.linked)),
-            "answered from {:?}, not the worktree's own graph",
-            store.sqlite_path()
-        );
+        // The edit is not published yet; the worktree's own view answers with it.
+        let store = lazy_query_builds_own_graph(&fixture);
         let (_cold_storage, cold) = lazy_cold_store(&fixture.linked);
         lazy_assert_same_graph(&store, &cold);
         assert!(crate::callgraph_store::CallGraphRead::node_for(
@@ -12080,96 +12443,6 @@ mod tests {
             "edited_caller"
         )
         .is_ok());
-        assert_eq!(
-            fixture.borrower.lazy_callgraph_builds_scheduled_for_test(),
-            1
-        );
-    }
-
-    #[test]
-    fn linked_worktree_that_never_queries_never_builds_a_call_graph() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let fixture = lazy_worktree(true);
-        let view_dir = lazy_view_dir(&fixture.storage, &fixture.linked);
-        let view = crate::views::ViewStore::open(
-            &fixture.storage,
-            &crate::path_identity::project_scope_key(&fixture.linked),
-        )
-        .unwrap();
-        let first = view.current_generation().unwrap();
-        lazy_edit_through_watcher(
-            &fixture,
-            "pub fn caller() { target(); }\npub fn target() {}\nfn unused() { caller(); }\n",
-        );
-        let mut state = fixture
-            .borrower
-            .watcher_drain_slice()
-            .lock()
-            .take()
-            .unwrap();
-        state.view_publication_due = Some(Instant::now());
-        crate::runtime_drain::publish_view_if_quiet(&fixture.borrower, &mut state);
-        assert!(state.view_publication_due.is_none());
-        let edited = view.current_generation().unwrap();
-        assert!(edited.is_some() && edited != first, "the edit is published");
-        // Rebinding the unchanged worktree neither rebuilds nor republishes.
-        let rebound = handle_configure_for_test(
-            &configure_request_with_session(
-                json!({
-                    "project_root": fixture.linked, "storage_dir": fixture.storage,
-                    "harness": "opencode",
-                    "config": [user_tier(json!({ "views": { "enabled": true },
-                        "indexes": { "trigram": false, "semantic": false, "callgraph": true } }))]
-                }),
-                "lazy-linked-again",
-            ),
-            &fixture.borrower,
-        );
-        assert!(rebound.success, "{}", rebound.data);
-        super::drain_deferred_configure_maintenance(&fixture.borrower);
-        assert_eq!(view.current_generation().unwrap(), edited);
-
-        assert_eq!(lazy_derived_files(&view_dir), Vec::<String>::new());
-        assert_eq!(
-            fixture.borrower.lazy_callgraph_builds_scheduled_for_test(),
-            0
-        );
-        // Sweeping removes the superseded generation's manifest even though
-        // this worktree has no derived call-graph files to delete.
-        view.sweep_generations().unwrap();
-        assert!(!view
-            .manifest_path(first.as_deref().unwrap())
-            .unwrap()
-            .exists());
-        assert_eq!(lazy_derived_files(&view_dir), Vec::<String>::new());
-    }
-
-    #[test]
-    fn main_checkout_still_builds_its_call_graph_at_bind() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let fixture = lazy_worktree(false);
-        let view_dir = lazy_view_dir(&fixture.storage, &fixture.main);
-        let generation = crate::views::ViewStore::open(
-            &fixture.storage,
-            &crate::path_identity::project_scope_key(&fixture.main),
-        )
-        .unwrap()
-        .current_generation()
-        .unwrap()
-        .unwrap();
-        assert!(
-            crate::views::read::derived_built(&view_dir, &generation),
-            "the main checkout's graph is built at bind, before any query: {:?}",
-            lazy_derived_files(&view_dir)
-        );
-        let owner = fixture.owner.as_ref().unwrap();
-        assert_eq!(owner.lazy_callgraph_builds_scheduled_for_test(), 0);
-        let store = lazy_ready(owner.callgraph_store_for_ops());
-        assert!(store.sqlite_path().starts_with(&view_dir));
     }
 
     #[test]
@@ -12178,8 +12451,8 @@ mod tests {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
         let fixture = lazy_worktree(true);
-        // A change the watcher saw means main's graph cannot answer.
-        fixture.borrower.note_checkout_changed_for_callgraph();
+        // Concurrent first queries are serialized on the checkout view: both
+        // answer, and the shared base graph is built and sealed only once.
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let queries = (0..2)
             .map(|_| {
@@ -12190,32 +12463,28 @@ mod tests {
                     barrier.wait();
                     matches!(
                         ctx.callgraph_store_for_ops(),
-                        CallgraphStoreAccess::Building
+                        CallgraphStoreAccess::Ready(_)
                     )
                 })
             })
             .collect::<Vec<_>>();
         for query in queries {
-            assert!(query.join().unwrap(), "a first query must report building");
+            assert!(query.join().unwrap(), "a first query must answer");
         }
-        assert_eq!(
-            fixture.borrower.lazy_callgraph_builds_scheduled_for_test(),
-            1
-        );
-        lazy_wait_for_own_graph(&fixture.borrower);
-        assert_eq!(
-            fixture.borrower.lazy_callgraph_builds_scheduled_for_test(),
-            1
-        );
+        let sealed = crate::views::donor::events_under(&fixture.storage)
+            .into_iter()
+            .filter(|event| *event == crate::views::donor::DonorEvent::Sealed)
+            .count();
+        assert_eq!(sealed, 1, "one base graph build for both queries");
         let store = lazy_ready(fixture.borrower.callgraph_store_for_ops());
-        assert!(store
-            .sqlite_path()
-            .starts_with(lazy_view_dir(&fixture.storage, &fixture.linked)));
+        assert_eq!(store.reader_kind(), "view");
+        let (_cold_storage, cold) = lazy_cold_store(&fixture.linked);
+        lazy_assert_same_graph(&store, &cold);
     }
 
     /// Query the worktree's call graph under a publication scope, as a daemon
-    /// request does: it must report building, never main's rows. Then wait for
-    /// the build and return the worktree's own graph.
+    /// request does. With views on it answers at once from the worktree's own
+    /// checkout view (its own v3 member), never from main's graph.
     fn lazy_query_builds_own_graph(
         fixture: &LazyWorktree,
     ) -> Arc<crate::callgraph_store::ReadonlyCallGraphStore> {
@@ -12223,20 +12492,14 @@ mod tests {
             let _scope = crate::executor::install_standalone_scope(Arc::clone(&fixture.borrower));
             fixture.borrower.callgraph_store_for_ops()
         };
-        if let CallgraphStoreAccess::Ready(store) = &access {
-            panic!(
-                "the first query answered before any build, from {:?}",
-                store.sqlite_path()
-            );
-        }
-        assert!(matches!(access, CallgraphStoreAccess::Building));
-        lazy_wait_for_own_graph(&fixture.borrower);
-        let store = lazy_ready(fixture.borrower.callgraph_store_for_ops());
+        let store = lazy_ready(access);
+        assert_eq!(store.reader_kind(), "view");
+        assert_eq!(store.project_root(), fixture.linked);
         assert!(
-            store
+            !store
                 .sqlite_path()
-                .starts_with(lazy_view_dir(&fixture.storage, &fixture.linked)),
-            "answered from {:?}, not the worktree's own graph",
+                .starts_with(lazy_view_dir(&fixture.storage, &fixture.main)),
+            "answered from main's graph {:?}",
             store.sqlite_path()
         );
         store
@@ -12265,14 +12528,6 @@ mod tests {
             "branch_caller"
         )
         .is_ok());
-        // aft_inspect's dead-code check must also read the worktree's own view, not main's graph.
-        assert!(crate::inspect::current_view_projection_store_for_test(
-            &fixture.linked,
-            &fixture.borrower.config(),
-        )
-        .is_some_and(|(store, _)| store
-            .sqlite_path()
-            .starts_with(lazy_view_dir(&fixture.storage, &fixture.linked))));
     }
 
     #[test]
@@ -12281,13 +12536,8 @@ mod tests {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
         let fixture = lazy_worktree(true);
-        // The worktree matches main's generation, so main answers and that
-        // verdict is cached.
-        let store = lazy_ready(fixture.borrower.callgraph_store_for_ops());
-        assert!(store
-            .sqlite_path()
-            .starts_with(lazy_view_dir(&fixture.storage, &fixture.main)));
-        drop(store);
+        // The worktree matches main's generation and answers from its own view.
+        drop(lazy_query_builds_own_graph(&fixture));
         // Main moves on: a new commit removes the caller and main publishes a
         // generation with different inputs.
         lazy_commit(
@@ -12306,142 +12556,6 @@ mod tests {
             "caller"
         )
         .is_ok());
-    }
-
-    /// The current generation of `root`'s view and whether it has a derived
-    /// call-graph database.
-    fn lazy_current_generation(storage: &Path, root: &Path) -> (String, bool) {
-        let view_dir = lazy_view_dir(storage, root);
-        let generation =
-            crate::views::ViewStore::open(storage, &crate::path_identity::project_scope_key(root))
-                .unwrap()
-                .current_generation()
-                .unwrap()
-                .expect("published view");
-        let built = crate::views::read::derived_built(&view_dir, &generation);
-        (generation, built)
-    }
-
-    #[test]
-    fn linked_worktree_with_a_graph_from_an_earlier_process_defers_its_next_publication() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        // An earlier daemon built this worktree's graph (the eager behaviour
-        // before graphs were built on first use, or a process that queried it).
-        // Then the worker committed, so this bind has a publication to make.
-        let mut earlier = None;
-        let fixture = lazy_worktree_with(true, true, |linked, storage| {
-            lazy_publish(linked, storage);
-            earlier = Some(lazy_current_generation(storage, linked));
-            lazy_commit(
-                linked,
-                "pub fn caller() { target(); }\npub fn branch_caller() { target(); }\npub fn target() {}\nfn unused() {}\n",
-                "branch caller",
-            );
-        });
-        let (earlier, earlier_built) = earlier.unwrap();
-        assert!(earlier_built, "the earlier process built a derived graph");
-        let (current, built) = lazy_current_generation(&fixture.storage, &fixture.linked);
-        assert_ne!(current, earlier, "the bind published the new commit");
-        assert!(
-            !built,
-            "no query needed the graph in this process, so the publication must not patch or rebuild it: {:?}",
-            lazy_derived_files(&lazy_view_dir(&fixture.storage, &fixture.linked))
-        );
-        assert_eq!(
-            fixture.borrower.lazy_callgraph_builds_scheduled_for_test(),
-            0
-        );
-        // The first query builds it, and the result equals a cold build.
-        let store = lazy_query_builds_own_graph(&fixture);
-        let (_cold_storage, cold) = lazy_cold_store(&fixture.linked);
-        lazy_assert_same_graph(&store, &cold);
-    }
-
-    #[test]
-    fn linked_worktree_defers_and_builds_on_first_query_when_main_is_not_bound() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        // Main is neither bound in this process nor published, so its graph
-        // cannot answer; the worktree still defers until a query needs it.
-        let fixture = lazy_worktree_with(false, false, |_, _| {});
-        assert!(fixture.owner.is_none());
-        let (_, built) = lazy_current_generation(&fixture.storage, &fixture.linked);
-        assert!(!built);
-        assert_eq!(
-            lazy_derived_files(&lazy_view_dir(&fixture.storage, &fixture.linked)),
-            Vec::<String>::new()
-        );
-        let store = lazy_query_builds_own_graph(&fixture);
-        let (_cold_storage, cold) = lazy_cold_store(&fixture.linked);
-        lazy_assert_same_graph(&store, &cold);
-    }
-
-    /// Hold an exclusive write transaction on `root`'s current derived
-    /// call-graph database, so a reader without a busy wait gets
-    /// "database is locked" until the returned connection rolls back.
-    fn lazy_lock_derived(
-        storage: &Path,
-        root: &Path,
-    ) -> crate::db::file_identity::IdentityConnection {
-        let (generation, built) = lazy_current_generation(storage, root);
-        assert!(built, "{root:?} has a derived call graph to lock");
-        let view =
-            crate::views::ViewStore::open(storage, &crate::path_identity::project_scope_key(root))
-                .unwrap();
-        crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
-        let writer = crate::db::file_identity::IdentityConnection::open(
-            &view.derived_path(&generation).unwrap(),
-            "lazy_callgraph_lock_test",
-        )
-        .unwrap();
-        // In WAL mode a writer never blocks readers; the rollback journal makes
-        // the exclusive lock visible to them, as a checkpoint resetting the WAL
-        // or the last connection closing it is.
-        writer
-            .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
-            .unwrap();
-        writer
-    }
-
-    #[test]
-    fn linked_worktree_waits_for_a_locked_main_graph_instead_of_building() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let fixture = lazy_worktree(true);
-        // Main's publication holds its derived database while the worktree,
-        // whose files match main's, asks for callers.
-        let writer = lazy_lock_derived(&fixture.storage, &fixture.main);
-        match fixture.borrower.callgraph_store_for_ops() {
-            CallgraphStoreAccess::Building => {}
-            CallgraphStoreAccess::Ready(store) => panic!(
-                "a locked main graph must report building, not answer from {:?}",
-                store.sqlite_path()
-            ),
-            CallgraphStoreAccess::Error(error) => {
-                panic!("a locked main graph failed the query: {error}")
-            }
-            _ => panic!("a locked main graph must report building"),
-        }
-        // A lock is no verdict: no build started, and main answers once free.
-        assert!(fixture.borrower.defer_callgraph_build());
-        assert_eq!(
-            fixture.borrower.lazy_callgraph_builds_scheduled_for_test(),
-            0
-        );
-        assert_eq!(
-            lazy_derived_files(&lazy_view_dir(&fixture.storage, &fixture.linked)),
-            Vec::<String>::new()
-        );
-        writer.execute_batch("ROLLBACK").unwrap();
-        drop(writer);
-        let store = lazy_ready(fixture.borrower.callgraph_store_for_ops());
-        assert!(store
-            .sqlite_path()
-            .starts_with(lazy_view_dir(&fixture.storage, &fixture.main)));
     }
 
     #[test]
@@ -12548,7 +12662,7 @@ mod tests {
     }
 
     #[test]
-    fn views_restart_dirty_source_reports_working_tree_refresh_until_publication() {
+    fn views_restart_dirty_source_answers_the_working_tree_at_once() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
         let project = tempfile::tempdir().unwrap();
@@ -12608,88 +12722,10 @@ mod tests {
             params: json!({"file": root.join("tracked.rs"), "symbol": "dirty"}),
         };
         let response = crate::commands::callers::handle_callers(&request, &ctx);
-        assert_eq!(response.data["code"], "callgraph_building", "{response:?}");
-        assert_eq!(response.data["progress"]["phase"], "working_tree_refresh");
-        assert_eq!(response.data["progress"]["pending_paths"], 1);
-        assert!(response.data["progress"]["waiting_on"]
-            .to_string()
-            .contains("view publication"));
-        assert!(
-            ctx.publish_view_paths(BTreeSet::new(), true)
-                .unwrap()
-                .published
-        );
-        let response = crate::commands::callers::handle_callers(&request, &ctx);
+        // The checkout view verifies the working tree for the query itself, so
+        // the dirty source answers at once, without waiting for publication.
         assert!(response.success, "{response:?}");
         assert_eq!(response.data["total_callers"], 1);
-    }
-
-    #[test]
-    fn views_clean_thousand_file_configure_hashes_zero_source_files() {
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let project = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        init_git_fixture(project.path());
-        for index in 0..999 {
-            std::fs::write(
-                project.path().join(format!("file_{index:04}.rs")),
-                "pub fn clean() {}\n",
-            )
-            .unwrap();
-        }
-        assert!(git_command(project.path())
-            .args(["add", "."])
-            .status()
-            .unwrap()
-            .success());
-        assert!(git_command(project.path())
-            .args([
-                "-c",
-                "user.name=AFT Tests",
-                "-c",
-                "user.email=aft-tests@example.com",
-                "commit",
-                "--quiet",
-                "-m",
-                "thousand files"
-            ])
-            .status()
-            .unwrap()
-            .success());
-        let root = std::fs::canonicalize(project.path()).unwrap();
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
-        let configure = configure_request_with_params(json!({
-            "project_root": root, "storage_dir": storage.path(), "harness": "opencode",
-            "config": [user_tier(json!({
-                "views": {"enabled": true},
-                "indexes": {"trigram": false, "semantic": false, "callgraph": true}
-            }))]
-        }));
-        assert!(handle_configure_for_test(&configure, &ctx).success);
-        super::drain_deferred_configure_maintenance(&ctx);
-        assert_eq!(
-            ctx.view_runtime_snapshot()
-                .unwrap()
-                .manifest
-                .unwrap()
-                .entries()
-                .count(),
-            1000
-        );
-        drop(ctx);
-
-        let restarted = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
-        assert!(handle_configure_for_test(&configure, &restarted).success);
-        let mut state = super::ConfigureMaintenanceState::default();
-        state.absorb_enqueued(&restarted);
-        let job = &state.jobs.front().unwrap().job;
-        let input = super::ConfigureViewInput::capture(&restarted, job);
-        super::VIEW_WORKING_TREE_HASHES.with(|count| count.set(0));
-        let prepared = super::open_view_runtime_for_configure(&input, job).unwrap();
-        assert!(prepared.snapshot.pending_paths.is_empty());
-        super::VIEW_WORKING_TREE_HASHES
-            .with(|count| assert_eq!(count.get(), 0, "clean configure must not hash source files"));
     }
 
     #[test]
@@ -12854,230 +12890,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn views_gate_on_opens_family_stores_after_ack_and_schedules_fresh_head() {
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let project = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        init_git_fixture(project.path());
-        let canonical_root = std::fs::canonicalize(project.path()).unwrap();
-        let family = crate::search_index::artifact_cache_key(&canonical_root);
-        let scope = crate::path_identity::project_scope_key(&canonical_root);
-        let ctx = AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            Config {
-                storage_dir: Some(storage.path().to_path_buf()),
-                ..Config::default()
-            },
-        );
-        let response = handle_configure_for_test(
-            &configure_request_with_params(json!({
-                "project_root": canonical_root,
-                "storage_dir": storage.path(),
-                "harness": "opencode",
-                "config": [user_tier(json!({
-                    "views": { "enabled": true },
-                    "indexes": { "trigram": false, "semantic": false, "callgraph": true }
-                }))]
-            })),
-            &ctx,
-        );
-        assert!(response.success, "{}", response.data);
-        assert!(!storage.path().join("views").exists());
-
-        super::drain_deferred_configure_maintenance(&ctx);
-
-        let view = ctx.view_runtime_snapshot().expect("view runtime");
-        assert_eq!(view.family, family);
-        assert_eq!(view.scope, scope);
-        assert!(view
-            .generation
-            .as_deref()
-            .is_some_and(|generation| generation.starts_with("1-")));
-        assert!(view.pending_paths.is_empty());
-        assert!(view.manifest.is_some());
-        assert!(storage
-            .path()
-            .join("blobs")
-            .join(&family)
-            .join("semantic.sqlite")
-            .is_file());
-        assert!(storage
-            .path()
-            .join("blobs")
-            .join(&family)
-            .join("callgraph.sqlite")
-            .is_file());
-        assert!(storage.path().join("views").join(scope).is_dir());
-        let health = ctx.view_health_snapshot().expect("view health");
-        assert_eq!(health.generation, 1);
-        assert!(health.pinned);
-        let digest_request: RawRequest = serde_json::from_value(json!({
-            "id": "digest-1",
-            "command": "health.digest"
-        }))
-        .unwrap();
-        let digest = crate::commands::health_digest::handle_health_digest(&digest_request, &ctx);
-        let digest = serde_json::to_value(digest).unwrap();
-        assert_eq!(digest["views"]["ticket"]["generation"], json!(1));
-
-        match ctx.callgraph_store_for_ops() {
-            CallgraphStoreAccess::Ready(store) => {
-                assert_eq!(store.reader_kind(), "view");
-                assert!(crate::callgraph_store::CallGraphRead::node_for(
-                    &store,
-                    Path::new("tracked.rs"),
-                    "tracked",
-                )
-                .is_ok());
-            }
-            _ => panic!("expected view callgraph reader"),
-        }
-
-        fs::write(project.path().join("next.rs"), "pub fn next() {}\n").unwrap();
-        assert!(git_command(project.path())
-            .args(["add", "next.rs"])
-            .status()
-            .unwrap()
-            .success());
-        // The hermetic git env has no identity of its own; a CI runner has none
-        // either, so the commit must carry it the way the fixture's first one does.
-        assert!(git_command(project.path())
-            .args([
-                "-c",
-                "user.name=AFT Tests",
-                "-c",
-                "user.email=aft-tests@example.com",
-                "commit",
-                "--quiet",
-                "-m",
-                "next",
-            ])
-            .status()
-            .unwrap()
-            .success());
-        ctx.publish_view_paths(BTreeSet::from([b"next.rs".to_vec()]), true)
-            .unwrap();
-        let digest_request: RawRequest = serde_json::from_value(json!({
-            "id": "digest-2",
-            "command": "health.digest"
-        }))
-        .unwrap();
-        let digest = crate::commands::health_digest::handle_health_digest(&digest_request, &ctx);
-        let digest = serde_json::to_value(digest).unwrap();
-        assert_eq!(digest["views"]["ticket"]["generation"], json!(2));
-    }
-
-    /// Every HEAD path a first views-on configure schedules must leave the
-    /// pending ledger once the publication finishes, including paths the
-    /// publication does not make view members: tracked files deleted from the
-    /// checkout (binary assets here, as a copy of a tree can leave them out),
-    /// tracked files the project content rules exclude, and tracked symlinks
-    /// deleted from the checkout. A path left pending here is never revisited,
-    /// so status would report it pending for the life of the view.
-    #[test]
-    fn views_first_publication_leaves_no_path_pending_for_non_member_head_paths() {
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let project = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let root = project.path();
-        // Binary content present in the checkout: an ordinary member.
-        std::fs::create_dir_all(root.join("assets")).unwrap();
-        std::fs::write(root.join("assets/present.png"), [0x89, b'P', 0xff, 0xfe, 0]).unwrap();
-        // Binary content committed and then removed from the checkout.
-        std::fs::write(root.join("assets/banner.jpeg"), [0xff, 0xd8, 0xff, 0xe0, 0]).unwrap();
-        std::fs::create_dir_all(root.join("fixtures")).unwrap();
-        std::fs::write(root.join("fixtures/binary.bin"), [0, 0xff, 0xfe, 1]).unwrap();
-        // A tracked database file, which project content rules always exclude.
-        std::fs::write(root.join("fixtures/model.db"), b"SQLite format 3\0").unwrap();
-        #[cfg(unix)]
-        {
-            // A dangling symlink present in the checkout is still a member;
-            // one deleted from the checkout is not.
-            std::os::unix::fs::symlink("missing.rs", root.join("dangling.rs")).unwrap();
-            std::os::unix::fs::symlink("tracked.rs", root.join("removed_link.rs")).unwrap();
-        }
-        init_git_fixture(root);
-        std::fs::remove_file(root.join("assets/banner.jpeg")).unwrap();
-        std::fs::remove_file(root.join("fixtures/binary.bin")).unwrap();
-        #[cfg(unix)]
-        std::fs::remove_file(root.join("removed_link.rs")).unwrap();
-        let canonical_root = std::fs::canonicalize(root).unwrap();
-        let ctx = AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            Config {
-                storage_dir: Some(storage.path().to_path_buf()),
-                ..Config::default()
-            },
-        );
-        let response = handle_configure_for_test(
-            &configure_request_with_params(json!({
-                "project_root": canonical_root,
-                "storage_dir": storage.path(),
-                "harness": "opencode",
-                "config": [user_tier(json!({
-                    "views": { "enabled": true },
-                    "indexes": { "trigram": false, "semantic": false, "callgraph": true }
-                }))]
-            })),
-            &ctx,
-        );
-        assert!(response.success, "{}", response.data);
-
-        super::drain_deferred_configure_maintenance(&ctx);
-
-        let view = ctx.view_runtime_snapshot().expect("view runtime");
-        let manifest = view.manifest.as_ref().expect("published manifest");
-        let members = manifest
-            .entries()
-            .map(|(path, _)| String::from_utf8_lossy(path.as_bytes()).into_owned())
-            .collect::<BTreeSet<_>>();
-        assert!(members.contains("assets/present.png"), "{members:?}");
-        assert!(!members.contains("assets/banner.jpeg"), "{members:?}");
-        assert!(!members.contains("fixtures/binary.bin"), "{members:?}");
-        assert!(!members.contains("fixtures/model.db"), "{members:?}");
-        #[cfg(unix)]
-        {
-            assert!(members.contains("dangling.rs"), "{members:?}");
-            assert!(!members.contains("removed_link.rs"), "{members:?}");
-        }
-
-        let ledger = crate::path_status::PathStatusStore::open(&view.view_dir)
-            .unwrap()
-            .summary()
-            .unwrap();
-        let annotated = ledger
-            .paths
-            .iter()
-            .map(|status| {
-                format!(
-                    "{} {} ({})",
-                    String::from_utf8_lossy(&status.rel_path),
-                    status.state.as_str(),
-                    status.reason
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            (ledger.pending_count, ledger.failed_count),
-            (0, 0),
-            "paths left annotated after a complete publication: {annotated:?}"
-        );
-        let health = ctx.view_health_snapshot().expect("view health");
-        assert_eq!(health.generation, 1);
-        assert!(health.pinned);
-        assert_eq!((health.pending_paths, health.failed_paths), (0, 0));
-    }
-
     /// A tracked source in a call-graph language that is not valid UTF-8 can
-    /// never be parsed. It must not fail the publication (which would leave
-    /// every HEAD path pending forever): it joins the generation with an
-    /// empty call graph and is reported as skipped, apart from pending and
-    /// failed, while every other file keeps its call graph.
+    /// never be parsed. It must not fail the root's call-graph view: it joins
+    /// with an empty call graph while every other file keeps its call graph,
+    /// and once it decodes, its symbols join too.
     #[test]
-    fn views_publication_skips_a_non_utf8_callgraph_source_and_completes() {
+    fn views_callgraph_view_skips_a_non_utf8_callgraph_source_and_answers() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
         let project = tempfile::tempdir().unwrap();
@@ -13110,56 +12928,29 @@ mod tests {
         assert!(response.success, "{}", response.data);
 
         super::drain_deferred_configure_maintenance(&ctx);
-
-        let health = ctx.view_health_snapshot().expect("view health");
-        assert_eq!(health.generation, 1, "{health:?}");
-        assert!(health.pinned, "{health:?}");
-        assert_eq!((health.pending_paths, health.failed_paths), (0, 0));
-        assert_eq!(
-            health.skipped_paths,
-            std::collections::BTreeMap::from([("non_utf8_source".to_string(), 1)])
-        );
-        let status = serde_json::to_value(&health).unwrap();
-        assert_eq!(status["skipped_paths"]["non_utf8_source"], json!(1));
-        assert_eq!(
-            status["skipped_path_sample"],
-            json!([{ "path": "latin1.py", "reason": "non_utf8_source" }])
-        );
-        let view = ctx.view_runtime_snapshot().expect("view runtime");
-        let manifest = view.manifest.as_ref().expect("published manifest");
-        assert!(manifest
-            .entries()
-            .any(|(path, _)| path.as_bytes() == b"latin1.py"));
-        match ctx.callgraph_store_for_ops() {
+        assert!(ctx.views_route_root());
+        let graph_has = |file: &str, symbol: &str| match ctx.callgraph_store_for_ops() {
             CallgraphStoreAccess::Ready(store) => {
-                assert_eq!(store.reader_kind(), "view");
-                for (file, symbol) in [("tracked.rs", "tracked"), ("util.py", "helper")] {
-                    assert!(
-                        crate::callgraph_store::CallGraphRead::node_for(
-                            &store,
-                            Path::new(file),
-                            symbol,
-                        )
-                        .is_ok(),
-                        "{file}:{symbol} left the call graph"
-                    );
-                }
+                crate::callgraph_store::CallGraphRead::node_for(&store, Path::new(file), symbol)
+                    .is_ok()
             }
-            _ => panic!("expected view callgraph reader"),
+            CallgraphStoreAccess::Error(error) => panic!("call-graph view refused: {error}"),
+            _ => panic!("expected the call-graph view reader"),
+        };
+        for (file, symbol) in [("tracked.rs", "tracked"), ("util.py", "helper")] {
+            assert!(
+                graph_has(file, symbol),
+                "{file}:{symbol} left the call graph"
+            );
         }
+        assert!(!graph_has("latin1.py", "caf\u{e9}"));
 
-        // Once the file decodes, its skip is cleared by the next publication.
+        // Once the file decodes, the next read of the view includes it.
         std::fs::write(root.join("latin1.py"), "def cafe():\n    pass\n").unwrap();
-        ctx.publish_view_paths(BTreeSet::from([b"latin1.py".to_vec()]), true)
-            .unwrap();
-        // Read the ledger directly: status caches its summary between reads.
-        let ledger = crate::path_status::PathStatusStore::open(&view.view_dir)
-            .unwrap()
-            .summary()
-            .unwrap();
-        assert!(ledger.skipped_by_reason.is_empty(), "{ledger:?}");
-        assert!(ledger.skipped_sample.is_empty(), "{ledger:?}");
-        assert_eq!((ledger.pending_count, ledger.failed_count), (0, 0));
+        ctx.record_checkout_watcher_change(&canonical_root.join("latin1.py"));
+        assert!(graph_has("latin1.py", "cafe"));
+        assert!(graph_has("util.py", "helper"));
+        assert!(ctx.view_runtime_snapshot().is_none());
     }
 
     /// While a views-on root is unbound past the grace window its semantic
@@ -13167,6 +12958,15 @@ mod tests {
     /// only what changed, reusing every stored vector.
     #[test]
     fn semantic_view_pauses_while_unbound_and_resumes_after_rebind() {
+        semantic_view_reconnect_grace(false);
+    }
+
+    #[test]
+    fn semantic_view_retries_transient_backend_failure_inside_reconnect_grace() {
+        semantic_view_reconnect_grace(true);
+    }
+
+    fn semantic_view_reconnect_grace(transient_backend_failure: bool) {
         let _artifact_guard = artifact_owner_test_lock();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
@@ -13202,7 +13002,7 @@ mod tests {
                     .is_ok_and(|answer| answer.complete())
             })
         };
-        assert_eq!(fills.next(), "settled");
+        fills.wait_until_settled(Duration::from_secs(60)).unwrap();
         assert!(complete(&ctx), "the semantic view never filled");
         let stored = server.non_probe_input_count();
         assert!(stored >= 6);
@@ -13212,6 +13012,9 @@ mod tests {
         // a wait after a `lane_paused` refusal uses the immediate-unbind check.
         ctx.set_unbound_build_abandon_grace_for_test(Duration::from_secs(300));
         ctx.mark_subc_unbound();
+        server
+            .fail_summaries
+            .store(transient_backend_failure, Ordering::SeqCst);
         let during_grace = root.join("module_1.rs");
         fs::write(
             &during_grace,
@@ -13220,16 +13023,32 @@ mod tests {
         .unwrap();
         ctx.record_checkout_watcher_change(&during_grace);
         assert_eq!(fills.next(), "wake");
-        assert_eq!(
-            fills.next(),
-            "settled",
-            "healthy view work stopped inside reconnect grace"
-        );
+        if transient_backend_failure {
+            let runtime = ctx.checkout_semantic_runtime().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let reason = loop {
+                if let Some(reason) = runtime.unavailable_reason() {
+                    break reason;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the backend failure was not observed"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert!(reason.contains("503"), "unexpected retry: {reason}");
+            assert!(!complete(&ctx));
+            server.fail_summaries.store(false, Ordering::SeqCst);
+        }
+        // Transient backend or checkout contention can retry without stopping
+        // the lane. Require settlement within one deadline, without rebinding
+        // or sending another wake to rescue work inside reconnect grace.
+        fills.wait_until_settled(Duration::from_secs(60)).unwrap();
         assert!(complete(&ctx));
         assert!(server.non_probe_input_count() > stored);
         ctx.mark_subc_bound();
         assert_eq!(fills.next(), "wake");
-        assert_eq!(fills.next(), "settled");
+        fills.wait_until_settled(Duration::from_secs(60)).unwrap();
         let stored = server.non_probe_input_count();
 
         ctx.set_unbound_build_abandon_grace_for_test(Duration::ZERO);
@@ -13256,7 +13075,7 @@ mod tests {
         // the transient-retry timer, then wait for that fill to finish.
         ctx.mark_subc_bound();
         assert_eq!(fills.next(), "wake");
-        assert_eq!(fills.next(), "settled");
+        fills.wait_until_settled(Duration::from_secs(60)).unwrap();
         let names = |ctx: &AppContext| {
             ctx.checkout_semantic_runtime()
                 .unwrap()
@@ -13424,183 +13243,6 @@ mod tests {
         );
     }
 
-    /// Callgraph view publication never waits on semantic embedding. With
-    /// views enabled, semantic vectors belong to the root's per-checkout
-    /// semantic view, so the older view publishes callgraph data with no
-    /// semantic plane at all, even while the semantic view's first fill is
-    /// stuck at the embedding server.
-    #[test]
-    fn callgraph_view_publishes_while_semantic_view_fill_is_held() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let _quiet_window = EnvVarGuard::set("AFT_SEMANTIC_QUIET_WINDOW_MS", "50");
-        let server = CountingEmbeddingServer::start();
-        let project = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        init_git_fixture(project.path());
-        let canonical_root = project.path().canonicalize().unwrap();
-        let source = canonical_root.join("tracked.rs");
-        let ctx = AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            Config {
-                storage_dir: Some(storage.path().to_path_buf()),
-                ..Config::default()
-            },
-        );
-        let request = configure_semantic_views(&canonical_root, storage.path(), &server.base_url);
-        assert!(handle_configure_for_test(&request, &ctx).success);
-        super::drain_deferred_configure_maintenance(&ctx);
-        // The non-probe request proves the fill reached the server's response
-        // gate. Draining maintenance only releases the worker: model startup,
-        // view loading and cold-build admission can still be queued. Allow a
-        // 60-second hang guard rather than imposing a startup latency budget.
-        assert!(
-            server.wait_for_non_probe_request_count(1, Duration::from_secs(60)),
-            "the semantic view's first fill did not reach the embedding server: {}",
-            ctx.checkout_semantic().describe()
-        );
-        assert!(
-            ctx.semantic_index()
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_none(),
-            "a views-on root must not build the legacy semantic index"
-        );
-
-        let second_source =
-            "pub fn newly_visible() {}\npub fn invokes_new() { newly_visible(); }\n";
-        fs::write(&source, second_source).unwrap();
-        assert!(git_command(project.path())
-            .args(["add", "tracked.rs"])
-            .status()
-            .unwrap()
-            .success());
-        assert!(git_command(project.path())
-            .args([
-                "-c",
-                "user.name=AFT Tests",
-                "-c",
-                "user.email=aft-tests@example.com",
-                "commit",
-                "--quiet",
-                "-m",
-                "callgraph change while semantic is held",
-            ])
-            .status()
-            .unwrap()
-            .success());
-        ctx.update_config(|config| config.indexes.callgraph = true);
-        let callgraph_report = ctx
-            .publish_view_paths(BTreeSet::from([b"tracked.rs".to_vec()]), true)
-            .unwrap();
-        assert!(callgraph_report.published);
-        assert!(
-            callgraph_report.pending_paths.is_empty(),
-            "the older view must not wait for semantic vectors it no longer carries"
-        );
-        match ctx.callgraph_store_for_ops() {
-            CallgraphStoreAccess::Ready(store) => {
-                assert_eq!(store.reader_kind(), "view");
-                assert!(crate::callgraph_store::CallGraphRead::node_for(
-                    &store,
-                    Path::new("tracked.rs"),
-                    "newly_visible",
-                )
-                .is_ok());
-            }
-            _ => panic!("callgraph plane was not readable while embedding was held"),
-        }
-
-        server.release_responses();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let mut polls = 0u32;
-        while !ctx.checkout_semantic_runtime().is_some_and(|runtime| {
-            runtime
-                .search(&[1.0, 0.0, 0.0], 10, &|_| true)
-                .is_ok_and(|answer| answer.complete())
-        }) {
-            assert!(
-                Instant::now() < deadline,
-                "the semantic view never finished after the held fill was released"
-            );
-            // A fill that timed out while held waits for the next wake; wake
-            // it now and then, never so often that its quiet window restarts
-            // before it ends.
-            polls += 1;
-            if polls % 20 == 0 {
-                ctx.checkout_semantic().wake();
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    #[test]
-    fn legacy_semantic_import_runs_once_and_records_its_outcome() {
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let project = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        init_git_fixture(project.path());
-        let canonical_root = std::fs::canonicalize(project.path()).unwrap();
-        let family = crate::search_index::artifact_cache_key(&canonical_root);
-        let scope = crate::path_identity::project_scope_key(&canonical_root);
-        let fingerprint =
-            SemanticIndexFingerprint::for_config_dimension(&Config::default().semantic, 2)
-                .as_string();
-        let semantic_path = storage
-            .path()
-            .join("semantic")
-            .join(&family)
-            .join("semantic.bin");
-        let source = fs::read(canonical_root.join("tracked.rs")).unwrap();
-        write_legacy_semantic_fixture(&semantic_path, &fingerprint, &source);
-        let ctx = AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            Config {
-                storage_dir: Some(storage.path().to_path_buf()),
-                ..Config::default()
-            },
-        );
-        let params = json!({
-            "project_root": canonical_root,
-            "storage_dir": storage.path(),
-            "harness": "opencode",
-            "config": [user_tier(json!({
-                "views": { "enabled": true },
-                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
-            }))]
-        });
-
-        let response =
-            handle_configure_for_test(&configure_request_with_params(params.clone()), &ctx);
-        assert!(response.success, "{}", response.data);
-        super::drain_deferred_configure_maintenance(&ctx);
-        let status =
-            crate::path_status::PathStatusStore::open(&storage.path().join("views").join(&scope))
-                .unwrap();
-        let first = status
-            .maintenance_outcome("legacy_semantic_import")
-            .unwrap()
-            .expect("import outcome");
-        assert!(first.0.contains("Imported"));
-        fs::write(&semantic_path, [99]).unwrap();
-
-        let response = handle_configure_for_test(&configure_request_with_params(params), &ctx);
-        assert!(response.success, "{}", response.data);
-        super::drain_deferred_configure_maintenance(&ctx);
-        let status =
-            crate::path_status::PathStatusStore::open(&storage.path().join("views").join(&scope))
-                .unwrap();
-        assert_eq!(
-            status
-                .maintenance_outcome("legacy_semantic_import")
-                .unwrap()
-                .expect("persisted import outcome"),
-            first
-        );
-    }
-
     #[test]
     fn configure_without_storage_dir_defaults_to_shared_storage_root() {
         let _env_guard = home_env_mutex();
@@ -13651,6 +13293,699 @@ mod tests {
     }
 
     #[test]
+    fn standalone_cache_dir_number_fails_closed() {
+        cache_tier_failure("standalone", "number");
+    }
+    #[test]
+    fn standalone_cache_file_missing_fails_closed() {
+        cache_tier_failure("standalone", "missing");
+    }
+    #[test]
+    fn standalone_cache_file_unparseable_fails_closed() {
+        cache_tier_failure("standalone", "unparseable");
+    }
+    #[test]
+    fn standalone_cache_file_unreadable_fails_closed() {
+        cache_tier_failure("standalone", "unreadable");
+    }
+    #[test]
+    fn subc_local_cache_dir_number_fails_closed() {
+        cache_tier_failure("subc", "number");
+    }
+    #[test]
+    fn subc_local_cache_file_missing_fails_closed() {
+        cache_tier_failure("subc", "missing");
+    }
+    #[test]
+    fn subc_local_cache_file_unparseable_fails_closed() {
+        cache_tier_failure("subc", "unparseable");
+    }
+    #[test]
+    fn subc_local_cache_file_unreadable_fails_closed() {
+        cache_tier_failure("subc", "unreadable");
+    }
+
+    fn cache_tier_failure(transport: &str, failure: &str) {
+        // Tests elsewhere set AFT_STORAGE_DIR process-wide, which outranks the
+        // storage_dir this fixture configures; hold the shared env lock without it.
+        let _storage_env = crate::test_env::without_storage_override();
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let storage = temp.path().join("storage");
+        let cache = temp.path().join("cache-volume");
+        let user = temp.path().join("user.jsonc");
+        fs::create_dir(&project).unwrap();
+        fs::create_dir(&cache).unwrap();
+        init_git_fixture(&project);
+        fs::create_dir_all(project.join(".cortexkit")).unwrap();
+        fs::write(
+            project.join(".cortexkit/aft.jsonc"),
+            r#"{"indexes":{"semantic":false,"callgraph":false}}"#,
+        )
+        .unwrap();
+        fs::write(project.join("needle.rs"), "fn cache_guard_needle() {}\n").unwrap();
+        let mut split = Config {
+            storage_dir: Some(storage.clone()),
+            cache_dir: Some(cache),
+            ..Default::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut split).is_none());
+        drop(split);
+        match failure {
+            "number" => fs::write(
+                &user,
+                r#"{"storage":{"cache_dir":123},"indexes":{"semantic":false,"callgraph":false}}"#,
+            )
+            .unwrap(),
+            "unparseable" => fs::write(&user, "{").unwrap(),
+            "unreadable" => fs::create_dir(&user).unwrap(),
+            "missing" => {}
+            _ => unreachable!(),
+        }
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let mut params = json!({"project_root":project,"storage_dir":storage,"harness":"opencode"});
+        if transport == "standalone" {
+            // Plugins relay the raw document and its path, not their lenient
+            // merged defaults. Native re-reading also detects unreadable files.
+            params["cortexkit_user_config_path"] = json!(user);
+            params["config"] = match fs::read_to_string(&user) {
+                Ok(doc) => json!([{"tier":"user","source":user,"doc":doc}]),
+                Err(_) => json!([]),
+            };
+        } else {
+            let tiers =
+                crate::subc_config::read_local_cortexkit_config_tiers(Some(&user), &project);
+            params["config"] = json!(tiers
+                .iter()
+                .map(|tier| json!({"tier":tier.tier,"source":tier.source,"doc":tier.doc}))
+                .collect::<Vec<_>>());
+        }
+        let response = handle_configure_for_test(&configure_request_with_params(params), &ctx);
+        if matches!(failure, "unparseable" | "unreadable") {
+            // A user document that cannot be read or parsed rejects the whole
+            // candidate: nothing is published, so no default settings and no
+            // cache location replace the last good configuration.
+            assert!(!response.success, "{response:?}");
+            assert_eq!(response.data["code"], "config_rejected", "{response:?}");
+            assert!(
+                response.data["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("invalid_config_document")),
+                "{response:?}"
+            );
+        } else {
+            assert!(response.success, "{response:?}");
+            super::drain_deferred_configure_maintenance(&ctx);
+            let expected = if failure == "missing" {
+                "cache_dir_unavailable"
+            } else {
+                "cache_dir_config_unknown"
+            };
+            assert!(
+                ctx.cache_unavailable_reason()
+                    .is_some_and(|reason| reason.contains(expected)),
+                "{response:?}"
+            );
+        }
+        for domain in crate::root_cache::CACHE_DOMAINS {
+            assert!(
+                !storage.join(domain).exists(),
+                "{transport}/{failure} wrote {domain} on primary storage"
+            );
+        }
+    }
+
+    /// A configured context whose user file later becomes unreadable or
+    /// unparseable keeps its last good settings on the next configure, as for
+    /// every other key: the rejected candidate changes nothing, including the
+    /// cache location and its availability.
+    #[test]
+    fn configure_rejected_user_document_keeps_the_last_good_cache_location() {
+        for failure in ["unparseable", "unreadable"] {
+            let _storage_env = crate::test_env::without_storage_override();
+            let temp = tempfile::tempdir().unwrap();
+            let project = temp.path().join("project");
+            let storage = temp.path().join("storage");
+            let cache = temp.path().join("cache-volume");
+            let user = temp.path().join("user.jsonc");
+            fs::create_dir(&project).unwrap();
+            fs::create_dir(&cache).unwrap();
+            let _volume = crate::walk_boundary::simulated_volumes::simulate(&cache, u64::MAX - 17);
+            init_git_fixture(&project);
+            fs::write(project.join("needle.rs"), "fn last_good_needle() {}\n").unwrap();
+            fs::write(
+                &user,
+                json!({
+                    "storage": {"cache_dir": cache},
+                    "format_on_edit": true,
+                    "indexes": {"trigram": false, "semantic": false, "callgraph": false},
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+            let request = |id: &str| {
+                let tiers =
+                    crate::subc_config::read_local_cortexkit_config_tiers(Some(&user), &project);
+                let mut request = configure_request_with_params(json!({
+                    "project_root": project, "storage_dir": storage, "harness": "opencode",
+                    "config": tiers
+                        .iter()
+                        .map(|tier| json!({"tier":tier.tier,"source":tier.source,"doc":tier.doc}))
+                        .collect::<Vec<_>>(),
+                }));
+                request.id = id.to_owned();
+                request
+            };
+            let first = handle_configure_for_test(&request("first"), &ctx);
+            assert!(first.success, "{first:?}");
+            super::drain_deferred_configure_maintenance(&ctx);
+            let good = ctx.config();
+            assert!(good.cache_dir.is_some() && good.format_on_edit);
+            assert!(ctx.cache_unavailable_reason().is_none());
+
+            match failure {
+                "unparseable" => fs::write(&user, "{").unwrap(),
+                _ => {
+                    fs::remove_file(&user).unwrap();
+                    fs::create_dir(&user).unwrap();
+                }
+            }
+            let rejected = handle_configure_for_test(&request("rejected"), &ctx);
+            assert_eq!(
+                rejected.data["code"], "config_rejected",
+                "{failure}: {rejected:?}"
+            );
+            let after = ctx.config();
+            assert_eq!(after.cache_dir, good.cache_dir, "{failure}");
+            assert_eq!(after.cache_epoch, good.cache_epoch, "{failure}");
+            assert!(after.format_on_edit, "{failure}");
+            assert!(
+                ctx.cache_unavailable_reason().is_none(),
+                "{failure}: {:?}",
+                ctx.cache_unavailable_reason()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn cache_retry_fixture() -> (tempfile::TempDir, PathBuf, AppContext, RawRequest) {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let storage = temp.path().join("storage");
+        fs::create_dir(&project).unwrap();
+        init_git_fixture(&project);
+        fs::write(project.join("needle.rs"), "fn cache_retry_needle() {}\n").unwrap();
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let request = configure_request_with_params(json!({
+            "project_root": project, "storage_dir": storage, "harness": "opencode",
+            "config": [user_tier(json!({"indexes": {"trigram": true, "semantic": false, "callgraph": false}}))],
+        }));
+        (temp, project, ctx, request)
+    }
+
+    #[cfg(unix)]
+    fn force_cache_coordination_busy(
+        _: std::os::fd::RawFd,
+        name: &std::ffi::OsStr,
+        _: i32,
+    ) -> Option<std::io::Result<std::fs::File>> {
+        (name == std::ffi::OsStr::new(".aft-in-use.lock"))
+            .then(|| Err(std::io::Error::from_raw_os_error(libc::ENOENT)))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_cache_coordination_busy_twice_then_free_retries_three_attempts() {
+        use crate::provisional_identity_retry::{
+            advance_clock_for_test, drain_inline, with_clock_for_test,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _storage_override = crate::test_env::without_storage_override();
+        with_clock_for_test(|| {
+            let (_temp, project, ctx, request) = cache_retry_fixture();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&calls);
+            crate::bash_background::persistence::with_openat_file_hook(
+                Box::new(move |_, name, _| {
+                    if name != std::ffi::OsStr::new(".aft-in-use.lock") {
+                        return None;
+                    }
+                    // Each busy preparation exhausts six immediate syscall attempts.
+                    // The third preparation is allowed to use the real opener.
+                    (observed.fetch_add(1, Ordering::SeqCst) < 12)
+                        .then(|| Err(std::io::Error::from_raw_os_error(libc::ENOENT)))
+                }),
+                || {
+                    let response = handle_configure_for_test(&request, &ctx);
+                    assert!(response.success, "{response:?}");
+                    assert!(response.data["warnings"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|warning| warning["message"]
+                            == crate::root_cache::CACHE_DIR_BUSY_MESSAGE));
+                    assert_eq!(calls.load(Ordering::SeqCst), 6);
+                    assert!(ctx
+                        .cache_unavailable_reason()
+                        .unwrap()
+                        .contains(crate::root_cache::CACHE_DIR_BUSY_MESSAGE));
+                    assert!(!drain_inline(&ctx), "first retry waits one second");
+
+                    advance_clock_for_test(Duration::from_secs(1));
+                    assert!(drain_inline(&ctx), "second preparation remains busy");
+                    assert_eq!(calls.load(Ordering::SeqCst), 12);
+                    assert!(ctx.provisional_identity_retry().is_armed());
+                    assert_eq!(
+                        ctx.provisional_identity_retry().attempts_for_test(),
+                        Some(1)
+                    );
+                    assert!(ctx
+                        .cache_unavailable_reason()
+                        .unwrap()
+                        .contains(crate::root_cache::CACHE_DIR_BUSY_MESSAGE));
+                    advance_clock_for_test(Duration::from_secs(1));
+                    assert!(
+                        !drain_inline(&ctx),
+                        "failed retry backs off for two seconds"
+                    );
+                    advance_clock_for_test(Duration::from_secs(1));
+                    assert!(drain_inline(&ctx), "third preparation recovers");
+                    assert_eq!(calls.load(Ordering::SeqCst), 13);
+                    assert!(ctx.cache_unavailable_reason().is_none());
+                    assert!(!ctx
+                        .degraded_reasons()
+                        .iter()
+                        .any(|reason| reason == crate::root_cache::CACHE_DIR_BUSY));
+                    assert!(ctx
+                        .cached_artifact_cache_key(&fs::canonicalize(project).unwrap())
+                        .is_some());
+                    assert!(!ctx.provisional_identity_retry().is_armed());
+                    advance_clock_for_test(Duration::from_secs(3600));
+                    assert!(
+                        !drain_inline(&ctx),
+                        "there is no fourth preparation after success"
+                    );
+                    assert_eq!(calls.load(Ordering::SeqCst), 13);
+                },
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_cache_coordination_unbind_mid_backoff_cancels_retry() {
+        use crate::provisional_identity_retry::{
+            advance_clock_for_test, drain_inline, with_clock_for_test,
+        };
+
+        let _storage_override = crate::test_env::without_storage_override();
+        with_clock_for_test(|| {
+            let (_temp, project, ctx, request) = cache_retry_fixture();
+            crate::bash_background::persistence::with_openat_file_hook(
+                Box::new(force_cache_coordination_busy),
+                || {
+                    assert!(handle_configure_for_test(&request, &ctx).success);
+                    advance_clock_for_test(Duration::from_secs(1));
+                    assert!(drain_inline(&ctx));
+                },
+            );
+            advance_clock_for_test(Duration::from_secs(1));
+            assert!(ctx.provisional_identity_retry().is_armed());
+            assert!(!ctx.provisional_identity_retry().is_due());
+            assert!(ctx
+                .cache_unavailable_reason()
+                .unwrap()
+                .contains(crate::root_cache::CACHE_DIR_BUSY_MESSAGE));
+            ctx.mark_subc_unbound();
+            assert!(!ctx.provisional_identity_retry().is_armed());
+            assert!(!ctx
+                .cache_unavailable_reason()
+                .unwrap()
+                .contains(crate::root_cache::CACHE_DIR_BUSY_MESSAGE));
+            advance_clock_for_test(Duration::from_secs(3600));
+            assert!(!drain_inline(&ctx));
+            assert!(!ctx.provisional_identity_retry().is_due());
+            assert!(ctx
+                .cached_artifact_cache_key(&fs::canonicalize(project).unwrap())
+                .is_none());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_cache_coordination_two_busy_roots_retry_independently() {
+        use crate::provisional_identity_retry::{
+            advance_clock_for_test, drain_inline, with_clock_for_test,
+        };
+
+        let _storage_override = crate::test_env::without_storage_override();
+        with_clock_for_test(|| {
+            let (_first_temp, _, first, first_request) = cache_retry_fixture();
+            let (_second_temp, _, second, second_request) = cache_retry_fixture();
+            crate::bash_background::persistence::with_openat_file_hook(
+                Box::new(force_cache_coordination_busy),
+                || {
+                    assert!(handle_configure_for_test(&first_request, &first).success);
+                    assert!(handle_configure_for_test(&second_request, &second).success);
+                },
+            );
+            advance_clock_for_test(Duration::from_secs(1));
+            assert!(drain_inline(&first));
+            assert!(first.cache_unavailable_reason().is_none());
+            assert!(!first.provisional_identity_retry().is_armed());
+            crate::bash_background::persistence::with_openat_file_hook(
+                Box::new(force_cache_coordination_busy),
+                || assert!(drain_inline(&second)),
+            );
+            assert!(second.provisional_identity_retry().is_armed());
+            assert!(!second.provisional_identity_retry().is_due());
+            assert!(!drain_inline(&first));
+            // Cache recovery does not inherit the identity retry's five-minute give-up.
+            advance_clock_for_test(Duration::from_secs(600));
+            crate::bash_background::persistence::with_openat_file_hook(
+                Box::new(force_cache_coordination_busy),
+                || assert!(drain_inline(&second)),
+            );
+            assert_eq!(
+                second.provisional_identity_retry().attempts_for_test(),
+                Some(2)
+            );
+            assert!(second
+                .cache_unavailable_reason()
+                .unwrap()
+                .contains(crate::root_cache::CACHE_DIR_BUSY_MESSAGE));
+            assert!(first.cache_unavailable_reason().is_none());
+            advance_clock_for_test(Duration::from_secs(3));
+            assert!(
+                !drain_inline(&second),
+                "only the second root waits for its four-second backoff"
+            );
+            advance_clock_for_test(Duration::from_secs(1));
+            assert!(drain_inline(&second));
+            assert!(second.cache_unavailable_reason().is_none());
+            assert!(!second.provisional_identity_retry().is_armed());
+            assert!(!drain_inline(&first));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_cache_coordination_message_requires_pending_or_due_retry() {
+        use crate::provisional_identity_retry::{
+            advance_clock_for_test, drain_inline, poll, with_clock_for_test,
+        };
+
+        let _storage_override = crate::test_env::without_storage_override();
+        with_clock_for_test(|| {
+            let (_temp, _, ctx, request) = cache_retry_fixture();
+            crate::bash_background::persistence::with_openat_file_hook(
+                Box::new(force_cache_coordination_busy),
+                || assert!(handle_configure_for_test(&request, &ctx).success),
+            );
+            assert!(ctx
+                .cache_unavailable_reason()
+                .unwrap()
+                .contains(crate::root_cache::CACHE_DIR_BUSY_MESSAGE));
+            assert!(!ctx.provisional_identity_retry().is_due());
+            advance_clock_for_test(Duration::from_secs(1));
+            assert!(ctx.provisional_identity_retry().is_due());
+            let replay = poll(&ctx).unwrap();
+            assert!(poll(&ctx).is_none(), "one prepared replay per root");
+            assert!(ctx
+                .cache_unavailable_reason()
+                .unwrap()
+                .contains(crate::root_cache::CACHE_DIR_BUSY_MESSAGE));
+            // Dropping an unadmitted replay leaves a bounded deadline, not a lost retry.
+            drop(replay);
+            assert!(!ctx.provisional_identity_retry().is_due());
+            advance_clock_for_test(Duration::from_secs(2));
+            assert!(drain_inline(&ctx));
+            assert!(ctx.cache_unavailable_reason().is_none());
+
+            let (_cancel_temp, _, ctx, request) = cache_retry_fixture();
+            crate::bash_background::persistence::with_openat_file_hook(
+                Box::new(force_cache_coordination_busy),
+                || assert!(handle_configure_for_test(&request, &ctx).success),
+            );
+            assert!(ctx
+                .cache_unavailable_reason()
+                .unwrap()
+                .contains(crate::root_cache::CACHE_DIR_BUSY_MESSAGE));
+            super::cancel_deferred_configure_maintenance(&ctx);
+            assert!(!ctx.provisional_identity_retry().is_armed());
+            assert!(!ctx
+                .cache_unavailable_reason()
+                .unwrap()
+                .contains(crate::root_cache::CACHE_DIR_BUSY_MESSAGE));
+            advance_clock_for_test(Duration::from_secs(3600));
+            assert!(!drain_inline(&ctx));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_cache_coordination_busy_bind_retries_once_while_bound() {
+        let _storage_override = crate::test_env::without_storage_override();
+        fn inject_busy(
+            _: std::os::fd::RawFd,
+            name: &std::ffi::OsStr,
+            _: i32,
+        ) -> Option<std::io::Result<std::fs::File>> {
+            (name == std::ffi::OsStr::new(".aft-in-use.lock"))
+                .then(|| Err(std::io::Error::from_raw_os_error(libc::ENOENT)))
+        }
+        for outcome in ["recover", "edited", "unbound", "unbound_after_poll"] {
+            crate::provisional_identity_retry::with_timing_for_test(
+                Duration::ZERO,
+                Duration::from_secs(1),
+                || {
+                    let temp = tempfile::tempdir().unwrap();
+                    let project = temp.path().join("project");
+                    let storage = temp.path().join("storage");
+                    fs::create_dir(&project).unwrap();
+                    init_git_fixture(&project);
+                    fs::write(project.join("needle.rs"), "fn contention_needle() {}\n").unwrap();
+                    let ctx =
+                        AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+                    let request = configure_request_with_params(json!({
+                        "project_root": project, "storage_dir": storage, "harness": "opencode",
+                        "config": [user_tier(json!({"indexes": {"trigram": true, "semantic": false, "callgraph": false}}))],
+                    }));
+                    let response = crate::bash_background::persistence::with_openat_file_hook(
+                        Box::new(inject_busy),
+                        || handle_configure_for_test(&request, &ctx),
+                    );
+                    assert!(response.success, "{response:?}");
+                    assert!(ctx
+                        .degraded_reasons()
+                        .iter()
+                        .any(|reason| reason == crate::root_cache::CACHE_DIR_BUSY));
+                    assert!(!ctx
+                        .degraded_reasons()
+                        .iter()
+                        .any(|reason| reason == "cache_dir_unavailable"));
+                    let search: RawRequest = serde_json::from_value(json!({
+                        "id": "busy-search", "command": "semantic_search", "query": "contention_needle"
+                    })).unwrap();
+                    let search =
+                        crate::commands::semantic_search::handle_semantic_search(&search, &ctx);
+                    assert!(search.success, "{search:?}");
+                    assert_eq!(
+                        search.data["cache_unavailable_reason"],
+                        crate::root_cache::CACHE_DIR_BUSY
+                    );
+                    assert_eq!(
+                        ctx.try_health_snapshot(&project).cache_unavailable_reason,
+                        Some(crate::root_cache::CACHE_DIR_BUSY)
+                    );
+                    for plane in [
+                        crate::feature_status::IndexPlane::Trigram,
+                        crate::feature_status::IndexPlane::Semantic,
+                        crate::feature_status::IndexPlane::Callgraph,
+                    ] {
+                        assert_eq!(
+                            crate::feature_status::observed_index_status(&ctx, plane)
+                                .unavailable_reason
+                                .as_deref(),
+                            Some(crate::root_cache::CACHE_DIR_BUSY)
+                        );
+                    }
+                    assert!(ctx.provisional_identity_retry().is_armed());
+                    let root = fs::canonicalize(&project).unwrap();
+                    assert!(ctx.cached_artifact_cache_key(&root).is_none());
+
+                    if outcome == "edited" {
+                        ctx.update_config(|config| config.indexes.trigram = false);
+                    }
+                    if outcome == "unbound_after_poll" {
+                        let replay = crate::provisional_identity_retry::poll(&ctx).unwrap();
+                        ctx.mark_subc_unbound();
+                        let response =
+                            replay.run(&ctx, |_| panic!("unbound root must not hand off or index"));
+                        assert!(response.success);
+                    } else if outcome == "unbound" {
+                        ctx.mark_subc_unbound();
+                        assert!(!crate::provisional_identity_retry::drain_inline(&ctx));
+                    } else {
+                        assert!(crate::provisional_identity_retry::drain_inline(&ctx));
+                    }
+                    assert!(
+                        !ctx.provisional_identity_retry().is_armed(),
+                        "settled or unbound roots must have no retry"
+                    );
+                    assert!(!crate::provisional_identity_retry::drain_inline(&ctx));
+                    if outcome == "recover" || outcome == "edited" {
+                        assert!(ctx.cache_unavailable_reason().is_none());
+                        assert!(!ctx
+                            .degraded_reasons()
+                            .iter()
+                            .any(|reason| reason == crate::root_cache::CACHE_DIR_BUSY));
+                        assert_eq!(ctx.config().indexes.trigram, outcome == "recover");
+                        assert_eq!(
+                            ctx.cached_artifact_cache_key(&root).is_some(),
+                            outcome == "recover"
+                        );
+                    } else {
+                        assert!(ctx.cached_artifact_cache_key(&root).is_none());
+                        assert!(ctx
+                            .cache_unavailable_reason()
+                            .unwrap()
+                            .starts_with(crate::root_cache::CACHE_DIR_BUSY));
+                    }
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn configure_cache_unavailable_walks_without_caches_and_recovers_on_bind() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let storage = temp.path().join("storage");
+        let cache = temp.path().join("offline-volume");
+        fs::create_dir(&project).unwrap();
+        init_git_fixture(&project);
+        fs::write(project.join("needle.rs"), "fn cache_offline_needle() {}\n").unwrap();
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let request = configure_request_with_params(json!({
+            "project_root": project, "storage_dir": storage, "harness": "opencode",
+            "config": [user_tier(json!({"storage": {"cache_dir": cache}, "views": {"enabled": true}, "indexes": {"trigram": true, "semantic": false, "callgraph": true}}))],
+        }));
+        let response = handle_configure_for_test(&request, &ctx);
+        assert!(response.success, "{response:?}");
+        assert!(response.data["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning["code"] == "cache_dir_unavailable"
+                && warning["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("AFT is running without its caches until it is back.")));
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert!(ctx.cache_unavailable_reason().is_some());
+        assert_eq!(
+            ctx.try_health_snapshot(&project).cache_unavailable_reason,
+            Some(crate::root_cache::CACHE_DIR_UNAVAILABLE)
+        );
+        for plane in [
+            crate::feature_status::IndexPlane::Trigram,
+            crate::feature_status::IndexPlane::Semantic,
+            crate::feature_status::IndexPlane::Callgraph,
+        ] {
+            assert_eq!(
+                crate::feature_status::observed_index_status(&ctx, plane)
+                    .unavailable_reason
+                    .as_deref(),
+                Some("cache_dir_unavailable")
+            );
+        }
+        let search: RawRequest = serde_json::from_value(json!({"id":"offline-search", "command":"semantic_search", "query":"cache_offline_needle"})).unwrap();
+        let response = crate::commands::semantic_search::handle_semantic_search(&search, &ctx);
+        assert!(response.success, "{response:?}");
+        assert_eq!(
+            response.data["cache_unavailable_reason"],
+            "cache_dir_unavailable"
+        );
+        let output = response.data["text"]
+            .as_str()
+            .expect("rendered bounded search response");
+        assert!(output.contains("cache_offline_needle"), "{output}");
+        assert!(
+            output.contains("walk") || output.contains("scan"),
+            "bounded fallback must be disclosed: {output}"
+        );
+        assert!(!cache.exists());
+        for domain in crate::root_cache::CACHE_DOMAINS {
+            assert!(
+                !storage.join(domain).exists(),
+                "cache domain {domain} leaked into storage"
+            );
+        }
+        fs::create_dir(&cache).unwrap();
+        let _mounted_volume =
+            crate::walk_boundary::simulated_volumes::simulate(&cache, u64::MAX - 17);
+        let response = handle_configure_for_test(&request, &ctx);
+        assert!(response.success, "{response:?}");
+        assert!(response.data["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|warning| warning["code"] != "cache_dir_unavailable"));
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert!(ctx.cache_unavailable_reason().is_none());
+        assert!(ctx.cache_dir().ends_with("offline-volume/aft"));
+        let _ = ctx.flush_search_index_on_graceful_shutdown();
+        // With views on, the legacy search index is never built or written:
+        // the checkout's lexical view is the trigram cache, and it must be
+        // usable and persisted under the recovered cache directory.
+        let lexical = ctx.lexical_view_snapshot("grep");
+        assert!(
+            matches!(lexical, Some(Ok(_))),
+            "{:?}",
+            lexical.map(|result| result.err())
+        );
+        let key = ctx.memoized_artifact_cache_key(&ctx.canonical_cache_root());
+        assert!(
+            ctx.cache_dir()
+                .join("blobs/v3")
+                .join(&key)
+                .join("trigram.sqlite")
+                .is_file(),
+            "normal cold initialization must persist the recovered trigram cache"
+        );
+        assert!(!ctx
+            .cache_dir()
+            .join("index")
+            .join(key)
+            .join("cache.bin")
+            .exists());
+        assert_eq!(
+            ctx.try_health_snapshot(&project).cache_unavailable_reason,
+            None
+        );
+    }
+
+    #[test]
+    fn configure_flat_cache_dir_parameter_cannot_bypass_tier_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let evil = temp.path().join("wire-cache");
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let request = configure_request_with_params(
+            json!({"project_root":project,"harness":"opencode","storage_dir":temp.path().join("storage"),"cache_dir":evil,"config":[user_tier(json!({"indexes":{"trigram":false,"semantic":false,"callgraph":false}}))]}),
+        );
+        let response = handle_configure_for_test(&request, &ctx);
+        assert!(response.success, "{response:?}");
+        assert!(ctx.config().cache_dir.is_none());
+        assert_eq!(ctx.cache_dir(), ctx.storage_dir());
+        assert!(!evil.exists());
+    }
+
+    #[test]
     fn configure_writes_cache_key_memo_to_explicit_storage_only() {
         let _env_guard = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
@@ -13687,6 +14022,1377 @@ mod tests {
             "storage_dir": storage,
             "config": [user_tier(json!({ "indexes": { "trigram": true, "semantic": false } }))],
         }))
+    }
+
+    fn configure_lexical_views(root: &Path, storage: &Path) -> RawRequest {
+        configure_request_with_params(json!({
+            "project_root": root, "harness": "opencode", "storage_dir": storage,
+            "config": [user_tier(json!({
+                "views": { "enabled": true },
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false }
+            }))]
+        }))
+    }
+
+    fn lexical_views_oracle(root: &Path) -> TestContext {
+        let oracle = test_context();
+        oracle.update_config(|config| {
+            config.project_root = Some(root.to_path_buf());
+            config.views.enabled = false;
+            config.indexes.trigram = true;
+            config.indexes.semantic = false;
+            config.indexes.callgraph = false;
+        });
+        oracle.set_canonical_cache_root(root.to_path_buf());
+        *oracle.search_index().write().unwrap() = Some(SearchIndex::build_with_limit_serial(
+            root,
+            oracle.config().search_index_max_file_size,
+        ));
+        oracle
+    }
+
+    fn lexical_views_assert_public_parity(ctx: &AppContext, root: &Path) {
+        let oracle = lexical_views_oracle(root);
+        for (command, params, field) in [
+            (
+                "grep",
+                json!({"pattern": "TOKEN|needle", "include": "**/*.ts"}),
+                "matches",
+            ),
+            ("glob", json!({"pattern": "**/*.ts"}), "files"),
+            (
+                "semantic_search",
+                json!({"query": "OLDER_COMMIT_TOKEN"}),
+                "results",
+            ),
+            (
+                "semantic_search",
+                json!({"query": "needle alpha"}),
+                "results",
+            ),
+            (
+                "semantic_search",
+                json!({"query": "unfindable_token"}),
+                "results",
+            ),
+            (
+                "semantic_search",
+                json!({"pattern": "TOKEN|needle"}),
+                "results",
+            ),
+            (
+                "semantic_search",
+                json!({"query": "needle", "pattern": "TOKEN|needle"}),
+                "results",
+            ),
+        ] {
+            let request = RawRequest {
+                id: format!("lexical-views-{command}"),
+                command: command.into(),
+                lsp_hints: None,
+                session_id: None,
+                params,
+            };
+            let run = |ctx: &AppContext| match command {
+                "grep" => crate::commands::grep::handle_grep(&request, ctx),
+                "glob" => crate::commands::glob::handle_glob(&request, ctx),
+                _ => crate::commands::semantic_search::handle_semantic_search(&request, ctx),
+            };
+            let expected = run(&oracle);
+            let actual = run(ctx);
+            assert!(expected.success, "oracle {command}: {:?}", expected.data);
+            assert!(actual.success, "view {command}: {:?}", actual.data);
+            assert!(
+                expected.data[field].is_array(),
+                "{command}: {:?}",
+                expected.data
+            );
+            assert_eq!(
+                actual.data[field], expected.data[field],
+                "{command} {field}"
+            );
+            assert_eq!(actual.data["text"], expected.data["text"], "{command} text");
+        }
+        assert!(ctx
+            .lexical_view_route_counts()
+            .iter()
+            .all(|count| *count > 0));
+        assert_eq!(oracle.lexical_view_route_counts(), [0; 3]);
+    }
+
+    fn lexical_views_public_checkout(kind: OlderCheckoutKind) {
+        // Holds the process environment lock for the whole test. These views
+        // resolve their storage root and verify the Git conversion policy on
+        // every query, and both read process state other tests change while
+        // holding this lock: AFT_STORAGE_DIR overrides every configured
+        // storage root, and HOME decides the path `git var GIT_ATTR_GLOBAL`
+        // reports.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let (owner, root, storage) = older_checkout_beside_live_owner(temp.path(), kind);
+        let root = std::fs::canonicalize(root).unwrap();
+        let cache = crate::search_index::resolve_cache_dir_with_key(
+            &owner.memoized_artifact_cache_key(&owner.canonical_cache_root()),
+            Some(&storage),
+        );
+        let owner_cache = std::fs::read(cache.join("cache.bin")).unwrap();
+        let builds = crate::write_ledger::register(
+            crate::write_ledger::Domain::SearchIndexBuild,
+            root.display().to_string(),
+        );
+        let deltas = crate::write_ledger::register(
+            crate::write_ledger::Domain::SearchIndexDelta,
+            root.display().to_string(),
+        );
+        let before = (
+            builds.physical_total_for_test(),
+            deltas.physical_total_for_test(),
+        );
+        let ctx = test_context();
+        let bound = handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx);
+        assert!(bound.success, "{:?}", bound.data);
+        assert!(ctx.search_index().read().unwrap().is_none());
+        assert!(ctx.search_index_rx().read().unwrap().is_none());
+        lexical_views_assert_public_parity(&ctx, &root);
+
+        std::fs::write(
+            root.join("shared.ts"),
+            "export const OLDER_COMMIT_TOKEN = 4;\nneedle alpha\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("new.ts"), "needle alpha beta\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "new.ts\n").unwrap();
+        ctx.record_checkout_watcher_change(&root.join("shared.ts"));
+        lexical_views_assert_public_parity(&ctx, &root);
+        let stamp = filetime::FileTime::from_last_modification_time(
+            &std::fs::metadata(root.join("shared.ts")).unwrap(),
+        );
+        std::fs::write(
+            root.join("shared.ts"),
+            "export const OLDER_COMMIT_TOKEN = 5;\nneedle alpha\n",
+        )
+        .unwrap();
+        filetime::set_file_mtime(root.join("shared.ts"), stamp).unwrap();
+        lexical_views_assert_public_parity(&ctx, &root);
+        std::fs::remove_file(root.join("shared.ts")).unwrap();
+        std::fs::write(root.join(".gitignore"), "").unwrap();
+        lexical_views_assert_public_parity(&ctx, &root);
+        std::fs::rename(root.join("new.ts"), root.join("moved.ts")).unwrap();
+        lexical_views_assert_public_parity(&ctx, &root);
+        ctx.record_checkout_watcher_overflow();
+        std::fs::write(root.join("moved.ts"), "needle alpha after overflow\n").unwrap();
+        lexical_views_assert_public_parity(&ctx, &root);
+
+        crate::runtime_drain::spawn_search_corpus_refresh(&ctx, root.clone(), ctx.config());
+        crate::runtime_drain::refresh_search_index_after_write(&ctx, &root.join("moved.ts"));
+        assert!(ctx.search_index_rx().read().unwrap().is_none());
+        ctx.flush_search_index_on_graceful_shutdown();
+        assert_eq!(
+            (
+                builds.physical_total_for_test(),
+                deltas.physical_total_for_test()
+            ),
+            before
+        );
+        // The owner fixture already wrote a cache. A routed checkout must not
+        // replace it with its own content, even after refresh and shutdown.
+        assert_eq!(std::fs::read(cache.join("cache.bin")).unwrap(), owner_cache);
+        assert!(!storage.join("blobs/v2").exists());
+        ctx.mark_subc_unbound();
+        ctx.cancel_unbound_artifact_work();
+        drop(ctx);
+        let restarted = test_context();
+        assert!(
+            handle_configure_for_test(&configure_lexical_views(&root, &storage), &restarted)
+                .success
+        );
+        lexical_views_assert_public_parity(&restarted, &root);
+        assert_eq!(std::fs::read(cache.join("cache.bin")).unwrap(), owner_cache);
+    }
+
+    #[test]
+    fn lexical_views_public_linked_worktree_parity_edits_restart_and_writer_stop() {
+        lexical_views_public_checkout(OlderCheckoutKind::LinkedWorktree);
+    }
+
+    #[test]
+    fn lexical_views_public_plain_clone_parity_edits_restart_and_writer_stop() {
+        lexical_views_public_checkout(OlderCheckoutKind::PlainClone);
+    }
+
+    #[test]
+    fn lexical_views_public_empty_generation_and_live_only_addition_match_legacy() {
+        // Holds the process environment lock for the whole test. These views
+        // resolve their storage root and verify the Git conversion policy on
+        // every query, and both read process state other tests change while
+        // holding this lock: AFT_STORAGE_DIR overrides every configured
+        // storage root, and HOME decides the path `git var GIT_ATTR_GLOBAL`
+        // reports.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let storage = temp.path().join("storage");
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = test_context();
+        assert!(handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx).success);
+        lexical_views_assert_public_parity(&ctx, &root);
+        std::fs::write(
+            root.join("new.ts"),
+            "export const OLDER_COMMIT_TOKEN = 1;\nneedle alpha\n",
+        )
+        .unwrap();
+        lexical_views_assert_public_parity(&ctx, &root);
+        assert!(!storage.join("blobs/v2").exists());
+    }
+
+    #[test]
+    fn lexical_views_public_late_legacy_completion_and_views_off_boundary() {
+        // Holds the process environment lock for the whole test. These views
+        // resolve their storage root and verify the Git conversion policy on
+        // every query, and both read process state other tests change while
+        // holding this lock: AFT_STORAGE_DIR overrides every configured
+        // storage root, and HOME decides the path `git var GIT_ATTR_GLOBAL`
+        // reports.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        assert!(handle_configure_for_test(&configure_with_storage(&root, &storage), &ctx).success);
+        wait_for_search_index_ready(&ctx, Duration::from_secs(10));
+        assert_eq!(ctx.lexical_view_route_counts(), [0; 3]);
+        let floor = std::fs::read(storage.join("reader-floor.json")).ok();
+        assert!(crate::commands::grep::handle_grep(&grep_request("needle"), &ctx).success);
+        let off_glob: RawRequest = serde_json::from_value(json!({
+            "id": "lexical-off-glob", "command": "glob", "pattern": "**/*"
+        }))
+        .unwrap();
+        assert!(crate::commands::glob::handle_glob(&off_glob, &ctx).success);
+        assert!(
+            crate::commands::semantic_search::handle_semantic_search(
+                &semantic_search_request("needle"),
+                &ctx
+            )
+            .success
+        );
+        assert_eq!(std::fs::read(storage.join("reader-floor.json")).ok(), floor);
+        assert_eq!(ctx.lexical_view_route_counts(), [0; 3]);
+        assert!(!storage.join("blobs/v3").exists());
+        let stale =
+            SearchIndex::build_with_limit_serial(&root, ctx.config().search_index_max_file_size);
+        std::fs::write(
+            root.join("shared.ts"),
+            "export const OLDER_COMMIT_TOKEN = 7;\nneedle alpha\n",
+        )
+        .unwrap();
+        assert!(handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx).success);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        ctx.install_search_index_rx(rx, ctx.configure_generation());
+        tx.send(stale).unwrap();
+        crate::runtime_drain::drain_search_index_events(&ctx);
+        assert!(ctx.search_index().read().unwrap().is_none());
+        assert!(ctx.search_index_rx().read().unwrap().is_none());
+        lexical_views_assert_public_parity(&ctx, &root);
+        assert!(!storage.join("blobs/v2").exists());
+    }
+
+    #[test]
+    fn lexical_views_public_acquisition_failure_never_uses_legacy_index() {
+        // Holds the process environment lock for the whole test. These views
+        // resolve their storage root and verify the Git conversion policy on
+        // every query, and both read process state other tests change while
+        // holding this lock: AFT_STORAGE_DIR overrides every configured
+        // storage root, and HOME decides the path `git var GIT_ATTR_GLOBAL`
+        // reports.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        struct Refused;
+        impl crate::views::trigram::LexicalSnapshotSource for Refused {
+            fn acquire(&self) -> Result<crate::views::snapshot::Snapshot, String> {
+                Err("lexical source deliberately refused".into())
+            }
+            fn record_change(&self, _: &Path) {}
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(root.join("visible.ts"), "needle\n").unwrap();
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(
+                &configure_lexical_views(&root, &temp.path().join("storage")),
+                &ctx
+            )
+            .success
+        );
+        ctx.install_lexical_source_for_test(Arc::new(Refused));
+        *ctx.search_index().write().unwrap() = Some(SearchIndex::empty_ready_for_root(&root));
+        let grep = crate::commands::grep::handle_grep(&grep_request("needle"), &ctx);
+        assert!(
+            !grep.success && grep.data.to_string().contains("deliberately refused"),
+            "{:?}",
+            grep.data
+        );
+        let search = crate::commands::semantic_search::handle_semantic_search(
+            &semantic_search_request("needle"),
+            &ctx,
+        );
+        assert!(
+            !search.success && search.data.to_string().contains("deliberately refused"),
+            "{:?}",
+            search.data
+        );
+        // A refused view fails the call, like grep and aft_search: glob must
+        // not answer from a fallback walk while the checkout view is down.
+        let glob = crate::commands::glob::handle_glob(
+            &RawRequest {
+                id: "lexical-refused-glob".into(),
+                command: "glob".into(),
+                lsp_hints: None,
+                session_id: None,
+                params: json!({"pattern":"**/*.ts"}),
+            },
+            &ctx,
+        );
+        assert!(
+            !glob.success && glob.data.to_string().contains("deliberately refused"),
+            "{:?}",
+            glob.data
+        );
+        assert_eq!(ctx.lexical_view_route_counts(), [0; 3]);
+    }
+
+    #[test]
+    fn lexical_view_load_failure_counts_and_degrades_until_recovery() {
+        let reporting_suffix = "\nThis is an AFT bug: tell the user to report it with `npx @cortexkit/aft doctor --issue`; don't run it yourself.";
+        // Holds the process environment lock for the whole test, like the
+        // other lexical views tests above.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        struct Refused(String);
+        impl crate::views::trigram::LexicalSnapshotSource for Refused {
+            fn acquire(&self) -> Result<crate::views::snapshot::Snapshot, String> {
+                Err(self.0.clone())
+            }
+            fn record_change(&self, _: &Path) {}
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("visible.ts"),
+            "export function outlined() { return \"needle\"; }\n",
+        )
+        .unwrap();
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(
+                &configure_lexical_views(&root, &temp.path().join("storage")),
+                &ctx
+            )
+            .success
+        );
+        let degraded = || {
+            ctx.degraded_reasons()
+                .contains(&crate::context::VIEW_LOAD_DEGRADED_REASON.to_string())
+        };
+        assert!(!degraded());
+        // Keep the working source: recovery reinstalls it, proving the next
+        // successful load clears the degraded flag.
+        let initialized = ctx
+            .lexical_view_snapshot("bind")
+            .expect("bind loads a snapshot");
+        assert!(initialized.is_ok(), "{:?}", initialized.err());
+        let working = ctx.lexical_source_for_test();
+        let failed_file = root.join("visible.ts");
+        let load_error = format!(
+            "view I/O failed reading {}: Permission denied",
+            failed_file.display()
+        );
+        ctx.install_lexical_source_for_test(Arc::new(Refused(load_error.clone())));
+
+        // Every lexical lane fails with the view error, never an empty
+        // success and never a fallback walk.
+        let grep = crate::commands::grep::handle_grep(&grep_request("needle"), &ctx);
+        assert!(
+            !grep.success
+                && grep.data["message"].as_str().is_some_and(|message| {
+                    message.contains(&load_error) && message.ends_with(reporting_suffix)
+                }),
+            "{:?}",
+            grep.data
+        );
+        let search = crate::commands::semantic_search::handle_semantic_search(
+            &semantic_search_request("needle"),
+            &ctx,
+        );
+        assert!(
+            !search.success
+                && search.data["message"].as_str().is_some_and(|message| {
+                    message.contains(&load_error) && message.ends_with(reporting_suffix)
+                }),
+            "{:?}",
+            search.data
+        );
+        let glob = crate::commands::glob::handle_glob(
+            &RawRequest {
+                id: "lexical-refused-glob-health".into(),
+                command: "glob".into(),
+                lsp_hints: None,
+                session_id: None,
+                params: json!({"pattern":"**/*.ts"}),
+            },
+            &ctx,
+        );
+        assert!(
+            !glob.success
+                && glob.data["message"].as_str().is_some_and(|message| {
+                    message.contains(&load_error) && message.ends_with(reporting_suffix)
+                }),
+            "{:?}",
+            glob.data
+        );
+
+        let missing_path = crate::commands::glob::handle_glob(
+            &RawRequest {
+                id: "lexical-refused-glob-missing-path".into(),
+                command: "glob".into(),
+                lsp_hints: None,
+                session_id: None,
+                params: json!({"pattern":"**/*.ts", "path":root.join("missing")}),
+            },
+            &ctx,
+        );
+        assert!(!missing_path.success, "{:?}", missing_path.data);
+        assert_eq!(missing_path.data["code"], "path_not_found");
+        assert!(!missing_path.data["message"]
+            .as_str()
+            .unwrap()
+            .contains(reporting_suffix.trim_start_matches('\n')));
+
+        // Outline parses the file itself and never loads the view.
+        let outline = crate::commands::outline::handle_outline(
+            &serde_json::from_value(json!({
+                "id": "lexical-refused-outline",
+                "command": "outline",
+                "file": root.join("visible.ts"),
+            }))
+            .unwrap(),
+            &ctx,
+        );
+        assert!(outline.success, "{:?}", outline.data);
+        assert!(
+            outline.data["text"].as_str().unwrap().contains("outlined"),
+            "{:?}",
+            outline.data
+        );
+
+        // Health counts every failed load by plane and cause, keeps the last
+        // error, and marks the project degraded.
+        let health = ctx.try_health_snapshot(&root);
+        assert_eq!(health.view_load_failures.get("trigram:io"), Some(&3));
+        let last = health.view_load_failure_last.expect("last failure kept");
+        assert_eq!(
+            (last.plane.as_str(), last.cause.as_str()),
+            ("trigram", "io")
+        );
+        assert_eq!((last.count, last.total), (3, 3));
+        assert_eq!(last.error, load_error);
+        assert!(degraded());
+
+        // Recovery: the next successful load clears the degraded flag but
+        // keeps the history count.
+        ctx.install_lexical_source_for_test(working);
+        let recovered = crate::commands::grep::handle_grep(&grep_request("needle"), &ctx);
+        assert!(recovered.success, "{:?}", recovered.data);
+        assert!(!degraded());
+        let health = ctx.try_health_snapshot(&root);
+        assert_eq!(health.view_load_failures.get("trigram:io"), Some(&3));
+        assert!(health
+            .view_load_failure_last
+            .is_some_and(|last| last.error == load_error));
+    }
+
+    #[test]
+    fn lexical_views_public_search_pins_one_snapshot_for_all_lexical_lanes() {
+        // Holds the process environment lock for the whole test. These views
+        // resolve their storage root and verify the Git conversion policy on
+        // every query, and both read process state other tests change while
+        // holding this lock: AFT_STORAGE_DIR overrides every configured
+        // storage root, and HOME decides the path `git var GIT_ATTR_GLOBAL`
+        // reports.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        struct Counted {
+            source: Arc<dyn crate::views::trigram::LexicalSnapshotSource>,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl crate::views::trigram::LexicalSnapshotSource for Counted {
+            fn acquire(&self) -> Result<crate::views::snapshot::Snapshot, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                crate::views::trigram::LexicalSnapshotSource::acquire(self.source.as_ref())
+            }
+            fn record_change(&self, path: &Path) {
+                crate::views::trigram::LexicalSnapshotSource::record_change(
+                    self.source.as_ref(),
+                    path,
+                );
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("shared.ts"),
+            "export const OLDER_COMMIT_TOKEN = 1;\n",
+        )
+        .unwrap();
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(
+                &configure_lexical_views(&root, &temp.path().join("storage")),
+                &ctx
+            )
+            .success
+        );
+        let initialized = ctx.lexical_view_snapshot("bind").unwrap();
+        assert!(initialized.is_ok(), "{:?}", initialized.err());
+        let source = ctx.lexical_source_for_test();
+        let counted = Arc::new(Counted {
+            source,
+            calls: Default::default(),
+        });
+        ctx.install_lexical_source_for_test(counted.clone());
+        let response = crate::commands::semantic_search::handle_semantic_search(
+            &semantic_search_request("OLDER_COMMIT_TOKEN"),
+            &ctx,
+        );
+        assert!(response.success, "{:?}", response.data);
+        assert!(!response.data["results"].as_array().unwrap().is_empty());
+        assert_eq!(counted.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ctx.lexical_view_route_counts(), [0, 0, 1]);
+    }
+
+    /// A grep whose lexical view takes longer to bind than the request's whole
+    /// filesystem deadline still reads and answers: the bind is shared view
+    /// work, not the request's read. On a loaded Windows runner the first grep
+    /// after configure spent its deadline waiting for the bind and was refused
+    /// with `read_deadline_exceeded` before reading anything.
+    #[test]
+    fn lexical_views_grep_after_a_bind_longer_than_its_deadline_still_reads() {
+        // Holds the process environment lock for the whole test, as the other
+        // lexical views tests do.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        struct Slow {
+            source: Arc<dyn crate::views::trigram::LexicalSnapshotSource>,
+            delay: Duration,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl crate::views::trigram::LexicalSnapshotSource for Slow {
+            fn acquire(&self) -> Result<crate::views::snapshot::Snapshot, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(self.delay);
+                crate::views::trigram::LexicalSnapshotSource::acquire(self.source.as_ref())
+            }
+            fn record_change(&self, path: &Path) {
+                crate::views::trigram::LexicalSnapshotSource::record_change(
+                    self.source.as_ref(),
+                    path,
+                );
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("shared.ts"),
+            "export const OLDER_COMMIT_TOKEN = 1;\nneedle alpha\n",
+        )
+        .unwrap();
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(
+                &configure_lexical_views(&root, &temp.path().join("storage")),
+                &ctx
+            )
+            .success
+        );
+        let initialized = ctx.lexical_view_snapshot("bind").unwrap();
+        assert!(initialized.is_ok(), "{:?}", initialized.err());
+        let request = RawRequest {
+            id: "lexical-views-slow-bind".into(),
+            command: "grep".into(),
+            lsp_hints: None,
+            session_id: None,
+            params: json!({"pattern": "TOKEN|needle", "include": "**/*.ts"}),
+        };
+        let expected = crate::commands::grep::handle_grep(&request, &ctx);
+        assert!(expected.success, "{:?}", expected.data);
+        assert!(!expected.data["matches"].as_array().unwrap().is_empty());
+        let slow = Arc::new(Slow {
+            source: ctx.lexical_source_for_test(),
+            delay: Duration::from_millis(1500),
+            calls: Default::default(),
+        });
+        ctx.install_lexical_source_for_test(slow.clone());
+        // The request's filesystem deadline (1 s) is shorter than the bind.
+        let actual = crate::bounded_io::with_budget(
+            Some(crate::bounded_io::Budget::after(Duration::from_secs(1))),
+            || crate::commands::grep::handle_grep(&request, &ctx),
+        );
+        assert_eq!(slow.calls.load(Ordering::SeqCst), 1);
+        assert!(actual.success, "{:?}", actual.data);
+        assert_eq!(actual.data["matches"], expected.data["matches"]);
+        assert_eq!(actual.data["text"], expected.data["text"]);
+    }
+
+    #[test]
+    fn lexical_views_public_kill_child() {
+        // Holds the process environment lock for the whole test. These views
+        // resolve their storage root and verify the Git conversion policy on
+        // every query, and both read process state other tests change while
+        // holding this lock: AFT_STORAGE_DIR overrides every configured
+        // storage root, and HOME decides the path `git var GIT_ATTR_GLOBAL`
+        // reports.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let Some(root) = std::env::var_os("AFT_LEXICAL_KILL_ROOT") else {
+            return;
+        };
+        let storage = PathBuf::from(std::env::var_os("AFT_LEXICAL_KILL_STORAGE").unwrap());
+        let root = PathBuf::from(root);
+        let ctx = test_context();
+        assert!(handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx).success);
+        lexical_views_assert_public_parity(&ctx, &root);
+        println!("LEXICAL_VIEW_PUBLISHED");
+        use std::io::{Read, Write};
+        std::io::stdout().flush().unwrap();
+        let _ = std::io::stdin().read(&mut [0u8; 1]);
+    }
+
+    #[test]
+    fn lexical_views_public_forced_kill_reopens_current_tree() {
+        // Holds the process environment lock for the whole test. These views
+        // resolve their storage root and verify the Git conversion policy on
+        // every query, and both read process state other tests change while
+        // holding this lock: AFT_STORAGE_DIR overrides every configured
+        // storage root, and HOME decides the path `git var GIT_ATTR_GLOBAL`
+        // reports.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        use std::io::BufRead;
+        use std::process::Stdio;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("shared.ts"),
+            "export const OLDER_COMMIT_TOKEN = 1;\nneedle alpha\n",
+        )
+        .unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let storage = temp.path().join("storage");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::configure::tests::lexical_views_public_kill_child",
+                "--nocapture",
+            ])
+            .env("AFT_LEXICAL_KILL_ROOT", &root)
+            .env("AFT_LEXICAL_KILL_STORAGE", &storage)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = child.stdout.take().unwrap();
+        let mut published = false;
+        for line in std::io::BufReader::new(output).lines() {
+            if line.unwrap().contains("LEXICAL_VIEW_PUBLISHED") {
+                published = true;
+                break;
+            }
+        }
+        if !published {
+            let status = child.wait().unwrap();
+            panic!("child exited before publication handshake: {status}");
+        }
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
+        std::fs::write(
+            root.join("shared.ts"),
+            "export const OLDER_COMMIT_TOKEN = 2;\nneedle alpha changed\n",
+        )
+        .unwrap();
+        let ctx = test_context();
+        assert!(handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx).success);
+        lexical_views_assert_public_parity(&ctx, &root);
+    }
+
+    fn configure_callgraph_views(root: &Path, storage: &Path, views: bool) -> RawRequest {
+        configure_request_with_params(json!({
+            "project_root": root, "harness": "opencode", "storage_dir": storage,
+            "config": [user_tier(json!({
+                "views": { "enabled": views },
+                "indexes": { "trigram": true, "semantic": false, "callgraph": true }
+            }))]
+        }))
+    }
+
+    /// The navigation answers whose output the views route must reproduce.
+    fn callgraph_views_answers(ctx: &AppContext, root: &Path) -> Vec<(String, Response)> {
+        let requests = [
+            ("callers", "a.ts", "target", 2),
+            ("impact", "a.ts", "target", 3),
+            ("call_tree", "c.ts", "top", 3),
+            ("trace_to", "a.ts", "target", 5),
+            ("callers", "b.ts", "caller", 1),
+        ];
+        requests
+            .into_iter()
+            .map(|(command, file, symbol, depth)| {
+                let request = RawRequest {
+                    id: format!("callgraph-views-{command}"),
+                    command: command.into(),
+                    lsp_hints: None,
+                    session_id: None,
+                    params: json!({"file": root.join(file), "symbol": symbol, "depth": depth}),
+                };
+                let response = match command {
+                    "callers" => crate::commands::callers::handle_callers(&request, ctx),
+                    "impact" => crate::commands::impact::handle_impact(&request, ctx),
+                    "call_tree" => crate::commands::call_tree::handle_call_tree(&request, ctx),
+                    _ => crate::commands::trace_to::handle_trace_to(&request, ctx),
+                };
+                (format!("{command} {file} {symbol}"), response)
+            })
+            .collect()
+    }
+
+    /// Compares the views route with the legacy store over the same files,
+    /// built cold by a views-off context in separate storage. The legacy
+    /// store serves no linked worktree, so it reads a plain copy of the
+    /// checkout's files, and both sides render their root as `<root>`.
+    fn callgraph_views_assert_parity(ctx: &AppContext, root: &Path) {
+        let storage = tempfile::tempdir().unwrap();
+        let copy = tempfile::tempdir().unwrap();
+        let copy_root = std::fs::canonicalize(copy.path()).unwrap();
+        for entry in std::fs::read_dir(root).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() && entry.file_name() != ".git" {
+                std::fs::copy(entry.path(), copy_root.join(entry.file_name())).unwrap();
+            }
+        }
+        let oracle = test_context();
+        assert!(
+            handle_configure_for_test(
+                &configure_callgraph_views(&copy_root, storage.path(), false),
+                &oracle
+            )
+            .success
+        );
+        {
+            let _wait = crate::context::override_callgraph_build_wait_ms_for_test(&oracle, 60_000);
+            let legacy = lazy_ready(oracle.callgraph_store_for_ops());
+            assert_eq!(legacy.reader_kind(), "legacy");
+        }
+        let normalized = |data: &serde_json::Value, root: &Path| {
+            data.to_string()
+                .replace(&root.display().to_string(), "<root>")
+        };
+        let before = ctx.callgraph_view_route_count();
+        let expected = callgraph_views_answers(&oracle, &copy_root);
+        let actual = callgraph_views_answers(ctx, root);
+        for ((label, expected), (_, actual)) in expected.iter().zip(&actual) {
+            assert!(expected.success, "legacy {label}: {:?}", expected.data);
+            assert!(actual.success, "view {label}: {:?}", actual.data);
+            assert_eq!(
+                normalized(&actual.data, root),
+                normalized(&expected.data, &copy_root),
+                "{label}"
+            );
+        }
+        assert!(ctx.callgraph_view_route_count() > before);
+        assert_eq!(oracle.callgraph_view_route_count(), 0);
+        assert!(ctx.callgraph_store().read().unwrap().is_none());
+    }
+
+    fn callgraph_views_checkout(kind: OlderCheckoutKind) {
+        // Holds the process environment lock for the whole test. These views
+        // resolve their storage root and verify the Git conversion policy on
+        // every query, and both read process state other tests change while
+        // holding this lock: AFT_STORAGE_DIR overrides every configured
+        // storage root, and HOME decides the path `git var GIT_ATTR_GLOBAL`
+        // reports.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let live = temp.path().join("live");
+        init_git_fixture(&live);
+        for (name, text) in [
+            ("a.ts", "export function target() { return 1; }\n"),
+            (
+                "b.ts",
+                "import { target } from './a';\nexport function caller() { return target(); }\n",
+            ),
+            (
+                "c.ts",
+                "import { caller } from './b';\nexport function top() { return caller(); }\n",
+            ),
+        ] {
+            std::fs::write(live.join(name), text).unwrap();
+        }
+        git_commit_all(&live, "graph");
+        let scratch = temp.path().join("scratch");
+        match kind {
+            OlderCheckoutKind::LinkedWorktree => git_ok(
+                &live,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "--detach",
+                    scratch.to_str().unwrap(),
+                    "HEAD",
+                ],
+            ),
+            _ => git_ok(temp.path(), &["clone", "--quiet", "live", "scratch"]),
+        }
+        let root = std::fs::canonicalize(&scratch).unwrap();
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
+                .success
+        );
+        callgraph_views_assert_parity(&ctx, &root);
+
+        // Edits: a new caller, a changed callee file and a deletion.
+        std::fs::write(
+            root.join("d.ts"),
+            "import { target } from './a';\nexport function second() { return target(); }\n",
+        )
+        .unwrap();
+        ctx.record_checkout_watcher_change(&root.join("d.ts"));
+        callgraph_views_assert_parity(&ctx, &root);
+        std::fs::write(
+            root.join("b.ts"),
+            "import { target } from './a';\nexport function caller() { return target() + target(); }\n",
+        )
+        .unwrap();
+        ctx.record_checkout_watcher_change(&root.join("b.ts"));
+        callgraph_views_assert_parity(&ctx, &root);
+        std::fs::remove_file(root.join("d.ts")).unwrap();
+        ctx.record_checkout_watcher_overflow();
+        callgraph_views_assert_parity(&ctx, &root);
+        assert!(!storage.join("blobs/v2").exists());
+
+        // Restart: a new context reopens the published view.
+        ctx.mark_subc_unbound();
+        ctx.cancel_unbound_artifact_work();
+        drop(ctx);
+        let restarted = test_context();
+        assert!(
+            handle_configure_for_test(
+                &configure_callgraph_views(&root, &storage, true),
+                &restarted
+            )
+            .success
+        );
+        callgraph_views_assert_parity(&restarted, &root);
+    }
+
+    #[test]
+    fn callgraph_views_public_linked_worktree_parity_across_edits_and_restart() {
+        callgraph_views_checkout(OlderCheckoutKind::LinkedWorktree);
+    }
+
+    #[test]
+    fn callgraph_views_public_plain_clone_parity_across_edits_and_restart() {
+        callgraph_views_checkout(OlderCheckoutKind::PlainClone);
+    }
+
+    #[test]
+    fn callgraph_views_acquisition_failure_never_uses_the_legacy_store() {
+        // Holds the process environment lock for the whole test. These views
+        // resolve their storage root and verify the Git conversion policy on
+        // every query, and both read process state other tests change while
+        // holding this lock: AFT_STORAGE_DIR overrides every configured
+        // storage root, and HOME decides the path `git var GIT_ATTR_GLOBAL`
+        // reports.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        struct Refused(std::sync::atomic::AtomicUsize);
+        impl crate::views::callgraph::CallgraphReaderSource for Refused {
+            fn acquire(
+                &self,
+            ) -> Result<
+                Arc<crate::callgraph_store::ReadonlyCallGraphStore>,
+                crate::views::callgraph::CallgraphViewError,
+            > {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err("callgraph source deliberately refused".into())
+            }
+            fn record_change(&self, _: &Path) {}
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("a.ts"),
+            "export function target() { return 1; }\nexport function caller() { return target(); }\n",
+        )
+        .unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let storage = temp.path().join("storage");
+        // A legacy store built for this very root must not answer either.
+        let legacy = test_context();
+        assert!(
+            handle_configure_for_test(&configure_callgraph_views(&root, &storage, false), &legacy)
+                .success
+        );
+        let legacy_store = {
+            let _wait = crate::context::override_callgraph_build_wait_ms_for_test(&legacy, 60_000);
+            lazy_ready(legacy.callgraph_store_for_ops())
+        };
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
+                .success
+        );
+        *ctx.callgraph_store().write().unwrap() = Some(legacy_store);
+        let refused = Arc::new(Refused(Default::default()));
+        ctx.install_callgraph_source_for_test(refused.clone());
+        let _pin = ctx.pin_config();
+        let answers = callgraph_views_answers(&ctx, &root);
+        for (label, answer) in &answers {
+            assert!(!answer.success, "{label}: {:?}", answer.data);
+            assert!(
+                answer.data.to_string().contains("deliberately refused"),
+                "{label}: {:?}",
+                answer.data
+            );
+        }
+        // One pinned request acquires once and keeps its refusal.
+        let inspect_access = ctx.callgraph_store_for_query_without_wait();
+        assert!(matches!(
+            inspect_access,
+            CallgraphStoreAccess::Error(ref error) if error.to_string().contains("deliberately refused")
+        ));
+        assert_eq!(refused.0.load(Ordering::SeqCst), 1);
+        assert_eq!(ctx.callgraph_view_route_count(), 0);
+        // Views off keeps the legacy store exactly as before.
+        assert_eq!(legacy.callgraph_view_route_count(), 0);
+        let legacy_answers = callgraph_views_answers(&legacy, &root);
+        assert!(
+            legacy_answers[0].1.success,
+            "{:?}",
+            legacy_answers[0].1.data
+        );
+    }
+
+    #[test]
+    fn callgraph_view_load_failure_fails_every_graph_op_and_counts() {
+        let reporting_suffix = "\nThis is an AFT bug: tell the user to report it with `npx @cortexkit/aft doctor --issue`; don't run it yourself.";
+        // Holds the process environment lock for the whole test, like the
+        // other callgraph views tests above.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        struct Refused(String);
+        impl crate::views::callgraph::CallgraphReaderSource for Refused {
+            fn acquire(
+                &self,
+            ) -> Result<
+                Arc<crate::callgraph_store::ReadonlyCallGraphStore>,
+                crate::views::callgraph::CallgraphViewError,
+            > {
+                Err(self.0.clone().into())
+            }
+            fn record_change(&self, _: &Path) {}
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("a.ts"),
+            "export function target() { return 1; }\nexport function caller() { return target(); }\n",
+        )
+        .unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
+                .success
+        );
+        let failed_file = root.join("a.ts");
+        let load_error = format!(
+            "view I/O failed opening {}: Permission denied",
+            failed_file.display()
+        );
+        ctx.install_callgraph_source_for_test(Arc::new(Refused(load_error.clone())));
+
+        // Every graph operation fails with the view error, never an empty
+        // success and never another store's answer.
+        let file = root.join("a.ts").to_string_lossy().into_owned();
+        let ops: Vec<(
+            &str,
+            serde_json::Value,
+            fn(&RawRequest, &AppContext) -> Response,
+        )> = vec![
+            (
+                "callers",
+                json!({"file": file, "symbol": "target", "depth": 1}),
+                crate::commands::callers::handle_callers,
+            ),
+            (
+                "impact",
+                json!({"file": file, "symbol": "target", "depth": 1}),
+                crate::commands::impact::handle_impact,
+            ),
+            (
+                "call_tree",
+                json!({"file": file, "symbol": "target", "depth": 1}),
+                crate::commands::call_tree::handle_call_tree,
+            ),
+            (
+                "trace_to",
+                json!({"file": file, "symbol": "target", "depth": 1}),
+                crate::commands::trace_to::handle_trace_to,
+            ),
+            (
+                "trace_to_symbol",
+                json!({"file": file, "symbol": "target", "toSymbol": "caller"}),
+                crate::commands::trace_to_symbol::handle_trace_to_symbol,
+            ),
+            (
+                "trace_data",
+                json!({"file": file, "symbol": "caller", "expression": "target"}),
+                crate::commands::trace_data::handle_trace_data,
+            ),
+        ];
+        for (command, params, handle) in &ops {
+            let request: RawRequest = serde_json::from_value(json!({
+                "id": format!("callgraph-refused-{command}"),
+                "command": *command,
+            }))
+            .unwrap();
+            let mut request = request;
+            request.params = params.clone();
+            let answer = handle(&request, &ctx);
+            assert!(
+                !answer.success
+                    && answer.data["message"].as_str().is_some_and(|message| {
+                        message.contains(&load_error) && message.ends_with(reporting_suffix)
+                    }),
+                "{command}: {:?}",
+                answer.data
+            );
+        }
+
+        // Zoom keeps its file-local answer but names the view failure in its
+        // explicit callgraph field; without callgraph:true it needs no view.
+        let zoom_with_graph = crate::commands::zoom::handle_zoom(
+            &serde_json::from_value(json!({
+                "id": "callgraph-refused-zoom",
+                "command": "zoom",
+                "file": file,
+                "symbols": ["target"],
+                "callgraph": true,
+            }))
+            .unwrap(),
+            &ctx,
+        );
+        assert!(zoom_with_graph.success, "{:?}", zoom_with_graph.data);
+        assert_eq!(
+            zoom_with_graph.data["callgraph"]["code"],
+            "callgraph_unavailable"
+        );
+        assert_eq!(
+            zoom_with_graph.data["callgraph"]["index"]["reason"],
+            format!("callgraph store unavailable: callgraph view unavailable: {load_error}{reporting_suffix}")
+        );
+        let zoom_local = crate::commands::zoom::handle_zoom(
+            &serde_json::from_value(json!({
+                "id": "callgraph-refused-zoom-local",
+                "command": "zoom",
+                "file": file,
+                "symbols": ["target"],
+            }))
+            .unwrap(),
+            &ctx,
+        );
+        assert!(zoom_local.success, "{:?}", zoom_local.data);
+        assert!(zoom_local.data.get("callgraph").is_none());
+
+        // Health counts every failed load by plane and cause and marks the
+        // project degraded.
+        let health = ctx.try_health_snapshot(&root);
+        assert_eq!(
+            health.view_load_failures.get("callgraph:io"),
+            Some(&(ops.len() as u64 + 1))
+        );
+        let last = health.view_load_failure_last.expect("last failure kept");
+        assert_eq!(
+            (last.plane.as_str(), last.cause.as_str()),
+            ("callgraph", "io")
+        );
+        assert_eq!(last.error, load_error);
+        assert!(ctx
+            .degraded_reasons()
+            .contains(&crate::context::VIEW_LOAD_DEGRADED_REASON.to_string()));
+    }
+
+    /// What a root's storage holds outside the v3 namespace: content-addressed
+    /// v1 views and v1/v2 blob stores, plus the legacy symbol cache file.
+    fn legacy_views_on_writes(storage: &Path) -> Vec<String> {
+        let mut found = Vec::new();
+        for (dir, keep) in [("blobs", Some("v3")), ("views", None), ("symbols", None)] {
+            if let Ok(entries) = std::fs::read_dir(storage.join(dir)) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if keep != Some(name.as_str()) {
+                        found.push(format!("{dir}/{name}"));
+                    }
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn views_routed_root_publishes_no_v1_view_and_puts_no_legacy_blobs() {
+        // Holds the process environment lock for the whole test. These views
+        // resolve their storage root and verify the Git conversion policy on
+        // every query, and both read process state other tests change while
+        // holding this lock: AFT_STORAGE_DIR overrides every configured
+        // storage root, and HOME decides the path `git var GIT_ATTR_GLOBAL`
+        // reports.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        for (name, text) in [
+            ("a.ts", "export function target() { return 1; }\n"),
+            (
+                "b.ts",
+                "import { target } from './a';\nexport function caller() { return target(); }\n",
+            ),
+        ] {
+            std::fs::write(root.join(name), text).unwrap();
+        }
+        git_commit_all(&root, "graph");
+        let root = std::fs::canonicalize(root).unwrap();
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
+                .success
+        );
+        assert!(ctx.views_route_root());
+        // The view load stage runs here; a routed root opens no v1 view.
+        super::drain_deferred_configure_maintenance(&ctx);
+        let callers = |ctx: &AppContext| {
+            crate::commands::callers::handle_callers(
+                &RawRequest {
+                    id: "routed-callers".into(),
+                    command: "callers".into(),
+                    lsp_hints: None,
+                    session_id: None,
+                    params: json!({"file": root.join("a.ts"), "symbol": "target", "depth": 1}),
+                },
+                ctx,
+            )
+        };
+        let answer = callers(&ctx);
+        assert!(answer.success, "{:?}", answer.data);
+        assert!(ctx.callgraph_view_route_count() > 0);
+
+        // An edit, a watcher overflow and every publication trigger (a queued
+        // path publication and a full one) leave the v1 view and the legacy
+        // blob stores untouched.
+        std::fs::write(
+            root.join("b.ts"),
+            "import { target } from './a';\nexport function caller() { return target() + target(); }\n",
+        )
+        .unwrap();
+        ctx.record_checkout_watcher_change(&root.join("b.ts"));
+        ctx.record_checkout_watcher_overflow();
+        let _ = crate::executor::view_publication::schedule(
+            &ctx,
+            BTreeSet::from([b"b.ts".to_vec()]),
+            true,
+        );
+        let _ = crate::executor::view_publication::schedule(&ctx, BTreeSet::new(), true);
+        let answer = callers(&ctx);
+        assert!(answer.success, "{:?}", answer.data);
+        assert_eq!(legacy_views_on_writes(&storage), Vec::<String>::new());
+        assert_eq!(ctx.view_publication_attempts_for_test(), 0);
+        assert!(ctx.view_runtime_snapshot().is_none());
+        let direct = ctx.publish_view_paths(BTreeSet::new(), true);
+        assert!(
+            direct.as_ref().is_err_and(|error| error
+                .to_string()
+                .contains(crate::context::VIEW_PUBLICATION_STOPPED_ON_ROUTED_ROOT)),
+            "{direct:?}"
+        );
+        assert_eq!(legacy_views_on_writes(&storage), Vec::<String>::new());
+        assert!(crate::blob_store::v3::family_dir(
+            &storage,
+            &ctx.memoized_artifact_cache_key(&root)
+        )
+        .unwrap()
+        .is_dir());
+
+        // Views off is not a routed root.
+        let off = test_context();
+        assert!(
+            handle_configure_for_test(
+                &configure_callgraph_views(&root, &temp.path().join("off-storage"), false),
+                &off
+            )
+            .success
+        );
+        assert!(!off.views_route_root());
+    }
+
+    /// Idle eviction releases a routed root's lexical and call-graph views,
+    /// and the next query binds them again and answers.
+    #[test]
+    fn views_routed_idle_eviction_releases_views_and_the_next_query_rebinds() {
+        // Holds the process environment lock: these views resolve storage and
+        // the Git conversion policy through the process environment.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("a.ts"),
+            "export function target() { return 1; }\nexport function caller() { return target(); }\n",
+        )
+        .unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
+                .success
+        );
+        let grep = || crate::commands::grep::handle_grep(&grep_request("target"), &ctx);
+        let callers = || {
+            crate::commands::callers::handle_callers(
+                &RawRequest {
+                    id: "evicted-callers".into(),
+                    command: "callers".into(),
+                    lsp_hints: None,
+                    session_id: None,
+                    params: json!({"file": root.join("a.ts"), "symbol": "target", "depth": 1}),
+                },
+                &ctx,
+            )
+        };
+        assert!(grep().success);
+        assert!(callers().success);
+        assert!(ctx.lexical_view_is_ready() && ctx.callgraph_view_is_ready());
+
+        assert!(ctx.evict_idle_artifacts());
+        assert!(!ctx.lexical_view_is_ready() && !ctx.callgraph_view_is_ready());
+        let before = (
+            ctx.lexical_view_route_counts()[0],
+            ctx.callgraph_view_route_count(),
+        );
+        let answer = grep();
+        assert!(answer.success, "{:?}", answer.data);
+        assert_eq!(answer.data["index_status"], "Ready", "{:?}", answer.data);
+        let answer = callers();
+        assert!(answer.success, "{:?}", answer.data);
+        assert_eq!(
+            (
+                ctx.lexical_view_route_counts()[0],
+                ctx.callgraph_view_route_count()
+            ),
+            (before.0 + 1, before.1 + 1)
+        );
+        assert!(ctx.lexical_view_is_ready() && ctx.callgraph_view_is_ready());
+    }
+
+    #[test]
+    fn views_routed_symbol_prewarm_stores_then_reuses_v3_symbol_rows() {
+        // Holds the process environment lock for the whole test. These views
+        // resolve their storage root and verify the Git conversion policy on
+        // every query, and both read process state other tests change while
+        // holding this lock: AFT_STORAGE_DIR overrides every configured
+        // storage root, and HOME decides the path `git var GIT_ATTR_GLOBAL`
+        // reports.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("lib.rs"),
+            "pub fn alpha() -> u32 { 1 }\npub struct Beta;\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("notes.md"), "# notes\n").unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
+                .success
+        );
+        super::drain_deferred_configure_maintenance(&ctx);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while ctx.symbol_view_route_count() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the routed symbol prewarm never ran"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let family = ctx.memoized_artifact_cache_key(&root);
+        let lib = root.join("lib.rs");
+        let bytes = std::fs::read(&lib).unwrap();
+        let stored = crate::views::symbol_store::lookup(
+            &storage,
+            &family,
+            crate::blob_store::v2::ContentHash::of(&bytes),
+            &lib,
+        )
+        .unwrap()
+        .expect("the prewarm stored lib.rs's symbols in the v3 symbol plane");
+        let names: Vec<_> = stored.iter().map(|symbol| symbol.name.clone()).collect();
+        assert!(names.contains(&"alpha".to_owned()), "{names:?}");
+        let modified = std::fs::metadata(&lib).unwrap().modified().unwrap();
+        assert!(ctx
+            .symbol_cache()
+            .read()
+            .unwrap()
+            .contains_path_with_mtime(&lib, modified));
+        assert_eq!(legacy_views_on_writes(&storage), Vec::<String>::new());
+
+        // A fresh cache over the same files reuses the stored rows: nothing
+        // is parsed or stored again.
+        let snapshot = ctx.lexical_view_snapshot("bind").unwrap().unwrap();
+        let fresh: crate::parser::SharedSymbolCache =
+            Arc::new(std::sync::RwLock::new(crate::parser::SymbolCache::new()));
+        let report = super::prewarm_symbol_cache_from_view(
+            &storage,
+            &family,
+            &fresh,
+            0,
+            snapshot.file_entries(),
+        );
+        let parsed_files = snapshot
+            .file_entries()
+            .iter()
+            .filter(|file| crate::parser::detect_language(&file.path).is_some())
+            .count() as u64;
+        assert!(parsed_files >= 1);
+        assert_eq!(
+            report,
+            super::SymbolViewPrewarm {
+                reused: parsed_files,
+                ..Default::default()
+            }
+        );
+        assert!(fresh
+            .read()
+            .unwrap()
+            .contains_path_with_mtime(&lib, modified));
     }
 
     fn configure_search_with_max_file_size(
@@ -13744,10 +15450,112 @@ mod tests {
         }))
     }
 
+    #[test]
+    fn ready_semantic_refresh_worker_opens_blobs_only_on_cache_volume() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let durable = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        init_git_fixture(project.path());
+        let root = project.path().canonicalize().unwrap();
+        let server = CountingEmbeddingServer::start();
+        let tiers = [crate::config_resolve::ConfigTier { tier: "user".into(), source: "test".into(), doc: json!({"storage":{"cache_dir":cache.path()}, "views":{"enabled":true}, "semantic":{"backend":"openai_compatible", "model":"counting-test-embedding", "base_url":server.base_url}}).to_string() }];
+        let mut config = crate::config_resolve::resolve_config(&tiers).config;
+        config.storage_dir = Some(durable.path().to_path_buf());
+        config.project_root = Some(root.clone());
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+        ctx.set_canonical_cache_root(root.clone());
+        let family = ctx.memoized_artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &family, false);
+        crate::semantic_admission::note_opened("audit-refresh-worker", &root);
+        *ctx.semantic_index().write().unwrap() =
+            Some(crate::semantic_index::SemanticIndex::new(root.clone(), 3));
+        assert!(ctx.view_runtime_snapshot().is_none());
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        super::SEMANTIC_BLOB_OPEN_OBSERVERS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(family, sender);
+        assert!(super::ensure_ready_semantic_refresh_worker(&ctx));
+        let (opened_root, opened) = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("refresh worker did not open its blob store");
+        // The configured cache parent is resolved once (macOS temp
+        // directories sit behind the /var system symlink; Windows resolves
+        // to the plain, non-verbatim spelling).
+        assert_eq!(
+            opened_root,
+            crate::bash_background::persistence::canonical_root_path(cache.path())
+                .unwrap()
+                .join("aft")
+        );
+        assert!(opened);
+        assert!(cache.path().join("aft/blobs").is_dir());
+        assert!(
+            !durable.path().join("blobs").exists(),
+            "ready refresh worker created a blob store in durable storage"
+        );
+        crate::semantic_admission::note_closed("audit-refresh-worker", &root);
+    }
+
+    #[test]
+    fn configure_semantic_checkout_uses_cache_volume_with_storage_env_override() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let _quiet_window = EnvVarGuard::set("AFT_SEMANTIC_QUIET_WINDOW_MS", "50");
+        let server = CountingEmbeddingServer::start();
+        server.release_responses();
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let _volume =
+            crate::walk_boundary::simulated_volumes::simulate(cache.path(), u64::MAX - 17);
+        let _storage_env = EnvVarGuard::set("AFT_STORAGE_DIR", storage.path().to_str().unwrap());
+        init_git_fixture(project.path());
+        let root = project.path().canonicalize().unwrap();
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let fills = crate::views::semantic_runtime::FillObserver::new(root.clone());
+        let request = configure_request_with_params(json!({
+            "project_root": root, "harness": "opencode",
+            "config": [user_tier(json!({
+                "storage": {"cache_dir": cache.path()},
+                "views": {"enabled": true},
+                "indexes": {"trigram": false, "semantic": true, "callgraph": false},
+                "semantic": {"backend": "openai_compatible", "model": "counting-test-embedding", "base_url": server.base_url, "timeout_ms": 5000, "max_files": 1000}
+            }))]
+        }));
+        let response = handle_configure_for_test(&request, &ctx);
+        assert!(response.success, "{}", response.data);
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert_eq!(fills.next(), "settled");
+        assert!(ctx.checkout_semantic_runtime().is_some());
+        // The semantic lane is a v3 member: its registration and stores live
+        // under the cache volume's v3 blob namespace, not a v2 view registry.
+        assert!(cache.path().join("aft/blobs/v3").is_dir());
+        for domain in ["views", "blobs", "semantic"] {
+            assert!(
+                !storage.path().join(domain).exists(),
+                "semantic lane wrote {domain} to durable storage"
+            );
+        }
+    }
+
     fn configure_semantic_views(
         root: &std::path::Path,
         storage: &std::path::Path,
         base_url: &str,
+    ) -> RawRequest {
+        configure_semantic_views_with_timeout(root, storage, base_url, 5_000)
+    }
+
+    fn configure_semantic_views_with_timeout(
+        root: &std::path::Path,
+        storage: &std::path::Path,
+        base_url: &str,
+        timeout_ms: u64,
     ) -> RawRequest {
         configure_request_with_params(json!({
             "project_root": root,
@@ -13760,7 +15568,7 @@ mod tests {
                     "backend": "openai_compatible",
                     "model": "counting-test-embedding",
                     "base_url": base_url,
-                    "timeout_ms": 5_000,
+                    "timeout_ms": timeout_ms,
                     "max_batch_size": 64,
                     "max_files": 1_000
                 }
@@ -14128,11 +15936,16 @@ mod tests {
         requests: Arc<Mutex<Vec<Vec<String>>>>,
         request_changed: Arc<Condvar>,
         response_release: Arc<(Mutex<usize>, Condvar)>,
+        fail_summaries: Arc<AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
     }
 
     impl CountingEmbeddingServer {
         fn start() -> Self {
+            Self::start_with_dimension(3)
+        }
+
+        fn start_with_dimension(dimension: usize) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding mock");
             let addr = listener.local_addr().expect("embedding mock addr");
             listener
@@ -14142,10 +15955,12 @@ mod tests {
             let requests = Arc::new(Mutex::new(Vec::new()));
             let request_changed = Arc::new(Condvar::new());
             let response_release = Arc::new((Mutex::new(0usize), Condvar::new()));
+            let fail_summaries = Arc::new(AtomicBool::new(false));
             let stop_for_thread = Arc::clone(&stop);
             let requests_for_thread = Arc::clone(&requests);
             let request_changed_for_thread = Arc::clone(&request_changed);
             let response_release_for_thread = Arc::clone(&response_release);
+            let fail_summaries_for_thread = Arc::clone(&fail_summaries);
             let handle = std::thread::spawn(move || {
                 while !stop_for_thread.load(Ordering::Relaxed) {
                     match listener.accept() {
@@ -14153,12 +15968,15 @@ mod tests {
                             let requests = Arc::clone(&requests_for_thread);
                             let request_changed = Arc::clone(&request_changed_for_thread);
                             let response_release = Arc::clone(&response_release_for_thread);
+                            let fail_summaries = Arc::clone(&fail_summaries_for_thread);
                             std::thread::spawn(move || {
                                 handle_counting_embedding_request(
                                     stream,
                                     requests,
                                     request_changed,
                                     response_release,
+                                    fail_summaries,
+                                    dimension,
                                 )
                             });
                         }
@@ -14175,6 +15993,7 @@ mod tests {
                 requests,
                 request_changed,
                 response_release,
+                fail_summaries,
                 handle: Some(handle),
             }
         }
@@ -14284,6 +16103,8 @@ mod tests {
         requests: Arc<Mutex<Vec<Vec<String>>>>,
         request_changed: Arc<Condvar>,
         response_release: Arc<(Mutex<usize>, Condvar)>,
+        fail_summaries: Arc<AtomicBool>,
+        dimension: usize,
     ) {
         stream
             .set_nonblocking(false)
@@ -14318,6 +16139,14 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(inputs.clone());
         request_changed.notify_all();
+        if fail_summaries.load(Ordering::SeqCst)
+            && inputs.iter().any(|text| text.contains("kind:file-summary"))
+        {
+            let body = "temporary summary backend outage";
+            let response = format!("HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            let _ = stream.write_all(response.as_bytes());
+            return;
+        }
         if inputs
             .iter()
             .any(|text| text != "semantic index fingerprint probe")
@@ -14341,7 +16170,7 @@ mod tests {
             .map(|(index, _)| {
                 let base = index as f64 + 1.0;
                 json!({
-                    "embedding": [base, base + 0.1, base + 0.2],
+                    "embedding": (0..dimension).map(|axis| base + axis as f64 * 0.1).collect::<Vec<_>>(),
                     "index": index,
                 })
             })
@@ -14355,6 +16184,96 @@ mod tests {
         stream
             .write_all(response.as_bytes())
             .expect("write embedding response");
+    }
+
+    #[test]
+    fn legacy_summary_repair_outage_installs_saved_searches_then_retries() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _backoff = EnvVarGuard::set("AFT_SEMANTIC_RETRY_BACKOFF_MS", "500");
+        let _quiet = EnvVarGuard::set("AFT_SEMANTIC_QUIET_WINDOW_MS", "1");
+        let (_project, storage, root, _) =
+            crate::semantic_index::saved_pre_budget_summary_fixture(true);
+        let server = CountingEmbeddingServer::start_with_dimension(4);
+        server.release_responses();
+        server.fail_summaries.store(true, Ordering::SeqCst);
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: "counting-test-embedding".to_string(),
+            base_url: Some(server.base_url.clone()),
+            max_input_tokens: Some(20),
+            ..Default::default()
+        };
+        let mut saved =
+            SemanticIndex::read_from_disk(storage.path(), "summary-budget", &root, false, None)
+                .unwrap();
+        saved.set_fingerprint(
+            crate::semantic_index::SemanticIndexFingerprint::for_config_dimension(&config, 4),
+        );
+        let key = crate::search_index::artifact_cache_key(&root);
+        assert!(saved.write_to_disk(storage.path(), &key));
+        let ctx = AppContext::new(
+            crate::context::default_language_provider_factory(),
+            Config::default(),
+        );
+        let request = configure_request_with_params(json!({
+            "project_root":root, "harness":"opencode", "storage_dir":storage.path(),
+            "config":[user_tier(json!({
+                "views":{"enabled":false},
+                "indexes":{"trigram":false,"semantic":true,"callgraph":false},
+                "semantic":{"backend":"openai_compatible","model":"counting-test-embedding","base_url":server.base_url,"max_input_tokens":20,"timeout_ms":5000,"max_batch_size":64}
+            }))]
+        }));
+        let response = handle_configure(&request, &ctx);
+        assert!(response.success, "{response:?}");
+        wait_for_semantic_build_ready(&ctx, Duration::from_secs(30));
+        {
+            let index = ctx.semantic_index().read().unwrap();
+            let index = index
+                .as_ref()
+                .expect("usable saved index must be installed during repair outage");
+            assert!(index
+                .search(&[1.0, 0.0, 0.0, 0.0], 100)
+                .iter()
+                .any(|row| row.name == "exported"));
+            assert!(
+                index.summaries_need_repair(),
+                "a failed repair must leave its marker unset"
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            crate::runtime_drain::drain_semantic_refresh_events(&ctx);
+            if ctx.pending_reconciliation_snapshot_for_test().4
+                && crate::runtime_drain::semantic_refresh_probe_is_scheduled_for_test(&ctx)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the failed summary repair did not retain a corpus retry"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        server.fail_summaries.store(false, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            crate::runtime_drain::drain_build_completions(&ctx);
+            crate::runtime_drain::drain_semantic_refresh_events(&ctx);
+            if ctx
+                .semantic_index()
+                .read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|index| !index.summaries_need_repair())
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the automatic probe did not retry the deferred summary repair"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// A root with a ready semantic index embedded through `server`, a live
@@ -14683,6 +16602,31 @@ mod tests {
         }
     }
 
+    fn search_index_completion(ctx: &AppContext) -> crossbeam_channel::Receiver<SearchIndex> {
+        ctx.search_index_rx()
+            .read()
+            .unwrap()
+            .clone()
+            .expect("search index completion receiver")
+    }
+
+    fn install_search_index_completion(ctx: &AppContext, index: SearchIndex) {
+        assert!(index.ready, "search load published an unready index");
+        // The observing receiver consumes the publication. Restore it so the
+        // normal runtime drain still installs the index and retires its receiver.
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(index).expect("restore search index completion");
+        *ctx.search_index_rx().write().unwrap() = Some(rx);
+        crate::runtime_drain::drain_build_completions(ctx);
+        assert!(ctx.search_index_rx().read().unwrap().is_none());
+        assert!(ctx
+            .search_index()
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|index| index.ready));
+    }
+
     fn semantic_search_request(query: &str) -> RawRequest {
         serde_json::from_value(json!({
             "id": "semantic-reload-query",
@@ -14799,6 +16743,86 @@ mod tests {
                 .iter()
                 .any(|warning| warning["kind"] == "config_migrated")));
         assert_eq!(fs::read_to_string(&project_path).unwrap(), project_text);
+    }
+
+    #[test]
+    fn prepared_bind_branches_do_not_reselect_config_files() {
+        let source = include_str!("configure.rs");
+        for marker in [
+            "else if let Some(snapshot) = bind_config.as_ref() {",
+            "let sources = if let Some(snapshot) = bind_config.as_ref() {",
+            "let legacy_notice = if let Some(snapshot) = bind_config.as_ref() {",
+        ] {
+            let body = source
+                .split_once(marker)
+                .expect("prepared branch exists")
+                .1
+                .split_once("} else")
+                .unwrap()
+                .0;
+            assert!(body.contains("snapshot."));
+            for forbidden in [
+                "resolve_config_tiers_for_configure",
+                "from_configure",
+                "project_config_read_path",
+                ".exists(",
+                "std::fs::",
+            ] {
+                assert!(
+                    !body.contains(forbidden),
+                    "prepared configure re-observes files: {forbidden}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_bind_config_keeps_content_sources_and_notice_across_attempts() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        let user = temp.path().join("user.jsonc");
+        let project = temp.path().join(".pi/aft.jsonc");
+        let canonical = temp.path().join(".cortexkit/aft.jsonc");
+        write_config(&user, r#"{"url_fetch_allow_private":true}"#);
+        write_config(&project, r#"{"callgraph_chunk_size":7}"#);
+        write_config(
+            &temp.path().join(".opencode/aft.jsonc"),
+            r#"{"callgraph_chunk_size":8}"#,
+        );
+        let snapshot = crate::subc_config::PreparedBindConfig::read(
+            Some(&user),
+            temp.path(),
+            &crate::harness::Harness::Pi,
+        )
+        .unwrap();
+        write_config(&user, r#"{"url_fetch_allow_private":false}"#);
+        write_config(&canonical, r#"{"callgraph_chunk_size":9}"#);
+        fs::remove_file(&project).unwrap();
+        let request = configure_request_with_params(json!({
+            "project_root": temp.path(), "harness":"pi", "cortexkit_user_config_path":user,
+        }));
+        for _ in 0..2 {
+            let response =
+                crate::subc_config::with_prepared_bind_config(Arc::clone(&snapshot), || {
+                    handle_configure_for_test(&request, &ctx)
+                });
+            assert!(response.success, "{:?}", response.data);
+            assert_eq!(ctx.config().callgraph_chunk_size, 7);
+            assert!(ctx.config().url_fetch_allow_private);
+            let sources = ctx.config_live().sources().expect("applied sources");
+            assert_eq!(sources.project.path.as_deref(), Some(project.as_path()));
+            assert!(sources.project.from_file);
+            assert_eq!(
+                sources.project.text.as_deref(),
+                Some(r#"{"callgraph_chunk_size":7}"#)
+            );
+            assert!(response.data["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning["code"] == "legacy_project_config_location"));
+        }
+        assert!(crate::subc_config::current_prepared_bind_config().is_none());
     }
 
     #[test]
@@ -15359,6 +17383,173 @@ mod tests {
         lock
     }
 
+    #[test]
+    fn lexical_bind_busy_markers_do_not_retry_terminal_failures() {
+        for reason in [
+            "family registry I/O error: reservation_ledger_busy: read format: database is locked",
+            "[driver]: v3 store busy: reservation lock timeout",
+            "[driver]: v3 base build busy; retain direct-scan coverage and retry",
+        ] {
+            assert!(crate::views::trigram::bind_is_busy(reason), "{reason}");
+        }
+        for reason in [
+            "reservation_ledger_unreadable: permission denied",
+            "live_sqlite_file_replaced",
+            "a file named busy.rs is unreadable",
+        ] {
+            assert!(!crate::views::trigram::bind_is_busy(reason), "{reason}");
+        }
+    }
+
+    #[test]
+    fn busy_lexical_bind_retries_until_parent_can_read_child_trigram() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(temp.path()).unwrap();
+        let projects = base.join("projects");
+        let root = projects.join("alpha");
+        let storage = base.join("storage");
+        init_git_fixture(&root);
+        let ctx = test_context();
+        let response = super::handle_configure(
+            &configure_request_with_params(json!({
+                "project_root": root,
+                "harness": "opencode",
+                "storage_dir": storage,
+                "config": [user_tier(json!({
+                    "indexes": { "trigram": true, "semantic": false, "callgraph": false },
+                    "views": { "enabled": true },
+                }))],
+            })),
+            &ctx,
+        );
+        assert!(response.success, "{response:?}");
+        assert!(ctx.artifact_identity_provisional_reason().is_none());
+        assert!(ctx.views_route_root());
+        let family = ctx.cached_artifact_cache_key(&root).unwrap();
+        let mut state = super::ConfigureMaintenanceState::default();
+        state.absorb_enqueued(&ctx);
+        while state.jobs.front().unwrap().stage != super::ConfigureMaintenanceStage::ViewLoad {
+            assert!(super::drain_deferred_configure_maintenance_unit(
+                &ctx, &mut state
+            ));
+        }
+
+        let parent = test_context();
+        parent.update_config(|config| {
+            config.project_root = Some(projects.clone());
+            config.views.enabled = true;
+            config.indexes.semantic = false;
+            config.indexes.callgraph = false;
+        });
+        parent.set_canonical_cache_root(projects.clone());
+        let planes = crate::views::parent::RequestedPlanes {
+            trigram: true,
+            semantic: false,
+            callgraph: false,
+        };
+        assert!(crate::views::parent::prepare(&projects, planes));
+        assert!(crate::views::parent::activate(
+            &parent,
+            &projects,
+            &storage,
+            &parent.config().semantic
+        ));
+        let session = crate::views::parent::session_for_root(&projects).unwrap();
+        assert!(session.wait_rounds(1, Duration::from_secs(30)));
+        assert!(!session.children()[0].trigram_ready());
+
+        {
+            let reservation = crate::blob_store::v3::ReservationLock::acquire(&storage).unwrap();
+            crate::blob_store::v3::open_base_refs_registry(&storage, &family, &reservation, None)
+                .unwrap();
+        }
+        let ledger = crate::blob_store::v3::family_dir(&storage, &family)
+            .unwrap()
+            .join("members.sqlite");
+        let blocker = rusqlite::Connection::open(ledger).unwrap();
+        blocker.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; UPDATE accounting SET watermark=watermark+1;").unwrap();
+        // Only the configure tail may publish the child; the parent never binds it.
+        while super::drain_deferred_configure_maintenance_unit(&ctx, &mut state) {}
+        assert!(!session.children()[0].trigram_ready());
+        assert_eq!(
+            state.jobs.len(),
+            1,
+            "busy lexical bind was dropped instead of parked"
+        );
+        assert_eq!(
+            state.jobs[0].stage,
+            super::ConfigureMaintenanceStage::ViewLoad
+        );
+        let retry_at = state.jobs[0]
+            .retry_at()
+            .expect("busy bind needs a retry deadline");
+        assert_eq!(
+            state.jobs[0].lexical_bind_retry_delay,
+            Duration::from_secs(2)
+        );
+        state.replay_retry_cutoff = Some(retry_at - Duration::from_nanos(1));
+        assert!(!state.has_ready_job());
+        // Check every backoff step without spending SQLite's busy timeout on
+        // each attempt. The real locked bind above arms the same continuation.
+        for seconds in [2, 4, 8, 16, 30, 30] {
+            let now = Instant::now();
+            state.jobs[0].defer_lexical_bind(now);
+            let retry_at = state.jobs[0].retry_at().unwrap();
+            assert_eq!(retry_at, now + Duration::from_secs(seconds));
+            state.replay_retry_cutoff = Some(retry_at - Duration::from_nanos(1));
+            assert!(!state.has_ready_job());
+            assert_eq!(
+                state.jobs[0].stage,
+                super::ConfigureMaintenanceStage::ViewLoad
+            );
+        }
+        assert!(session.wait_rounds(session.rounds() + 1, Duration::from_secs(30)));
+        let query: RawRequest = serde_json::from_value(json!({
+            "id": "parent-busy-lexical",
+            "command": "semantic_search",
+            "query": "tracked",
+        }))
+        .unwrap();
+        let pending = crate::views::parent::route(&query, &parent).unwrap();
+        assert_eq!(pending.data["complete"], false, "{pending:?}");
+        let text = pending.data["text"].as_str().unwrap();
+        assert!(
+            text.contains("alpha") && text.contains("busy"),
+            "{pending:?}"
+        );
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+        assert!(session.wait_rounds(session.rounds() + 1, Duration::from_secs(30)));
+        let pending = crate::views::parent::route(&query, &parent).unwrap();
+        assert_eq!(pending.data["complete"], false, "{pending:?}");
+        let text = pending.data["text"].as_str().unwrap();
+        assert!(
+            text.contains("alpha") && text.contains("busy"),
+            "{pending:?}"
+        );
+        state.replay_retry_cutoff = state.jobs[0].retry_at();
+        assert!(state.has_ready_job());
+        assert!(super::drain_deferred_configure_maintenance_unit(
+            &ctx, &mut state
+        ));
+        assert!(state.jobs[0].lexical_bind_retry_at.is_none());
+        assert_eq!(
+            state.jobs[0].lexical_bind_retry_delay,
+            Duration::from_secs(1)
+        );
+        while super::drain_deferred_configure_maintenance_unit(&ctx, &mut state) {}
+        assert!(state.jobs.is_empty());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !session.children()[0].trigram_ready() {
+            assert!(
+                Instant::now() < deadline,
+                "parent never saw the retried lexical publication"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn trigram_bind_request(root: &std::path::Path, storage: &std::path::Path) -> RawRequest {
         configure_request_with_params(json!({
             "project_root": root,
@@ -15527,6 +17718,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prepared_bind_identity_replay_retains_the_original_observation() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_temp, root, storage, lock) = busy_bind_fixture();
+        let ctx = test_context();
+        let user = root.join("user.jsonc");
+        let legacy = root.join(".pi/aft.jsonc");
+        write_config(
+            &user,
+            r#"{"indexes":{"trigram":true,"semantic":false,"callgraph":false},"views":{"enabled":false},"url_fetch_allow_private":true}"#,
+        );
+        write_config(&legacy, r#"{"callgraph_chunk_size":7}"#);
+        let snapshot = crate::subc_config::PreparedBindConfig::read(
+            Some(&user),
+            &root,
+            &crate::harness::Harness::Pi,
+        )
+        .unwrap();
+        let request = configure_request_with_params(
+            json!({"project_root":root,"storage_dir":storage,"harness":"pi","cortexkit_user_config_path":user}),
+        );
+        crate::provisional_identity_retry::with_timing_for_test(
+            Duration::ZERO,
+            Duration::from_secs(600),
+            || {
+                let response = crate::subc_config::with_prepared_bind_config(snapshot, || {
+                    super::handle_configure(&request, &ctx)
+                });
+                assert!(response.success, "{}", response.data);
+                super::drain_deferred_configure_maintenance(&ctx);
+                assert!(ctx.provisional_identity_retry().is_armed());
+                write_config(&user, r#"{"url_fetch_allow_private":false}"#);
+                write_config(
+                    &root.join(".cortexkit/aft.jsonc"),
+                    r#"{"callgraph_chunk_size":9}"#,
+                );
+                fs::remove_file(&legacy).unwrap();
+                lock.execute_batch("ROLLBACK").unwrap();
+                drop(lock);
+                super::drain_deferred_configure_maintenance(&ctx);
+                assert!(!ctx.provisional_identity_retry().is_armed());
+                assert_eq!(ctx.config().callgraph_chunk_size, 7);
+                assert!(ctx.config().url_fetch_allow_private);
+                assert_eq!(
+                    ctx.config_live().sources().unwrap().project.path.as_deref(),
+                    Some(legacy.as_path())
+                );
+            },
+        );
+    }
+
     /// A replay can resolve and memoize the settled key and still be refused
     /// before its commit (for example by a storage error at its retention or
     /// artifact-owner step). The root then stays provisional with the settled
@@ -15685,6 +17927,272 @@ mod tests {
             },
         );
         assert!(!ctx.config().indexes.trigram);
+    }
+
+    #[test]
+    fn read_only_semantic_ready_and_supplied_vector_search_do_not_wait_for_query_warmup() {
+        let _storage_env = crate::test_env::without_storage_override();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let owner = temp.path().join("owner");
+        init_git_fixture(&owner);
+        let worktree = temp.path().join("worktree");
+        assert!(git_command(&owner)
+            .args(["worktree", "add", "--detach", "--quiet"])
+            .arg(&worktree)
+            .arg("HEAD")
+            .status()
+            .unwrap()
+            .success());
+        let owner = std::fs::canonicalize(owner).unwrap();
+        let root = std::fs::canonicalize(worktree).unwrap();
+        let storage = temp.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        let key = crate::search_index::artifact_cache_key(&owner);
+        assert_eq!(crate::search_index::artifact_cache_key(&root), key);
+        crate::root_cache::configure_artifact_access(&owner, &key, false);
+        let mut embed =
+            |texts: Vec<String>| Ok::<_, String>(vec![vec![1.0, 0.0, 0.0]; texts.len()]);
+        let mut index =
+            SemanticIndex::build(&owner, &[owner.join("tracked.rs")], &mut embed, 8).unwrap();
+        index.set_fingerprint(crate::semantic_index::SemanticIndexFingerprint {
+            backend: "fastembed".into(),
+            model: "all-MiniLM-L6-v2".into(),
+            base_url: "none".into(),
+            dimension: 3,
+            chunking_version: 2,
+            ..Default::default()
+        });
+        assert!(index.write_to_disk(&storage, &key));
+
+        let ctx = test_context();
+        ctx.update_config(|config| {
+            config.project_root = Some(root.clone());
+            config.storage_dir = Some(storage.clone());
+            config.indexes.semantic = true;
+            config.indexes.trigram = true;
+            config.views.enabled = false;
+            config.semantic = SemanticBackendConfig::default();
+        });
+        ctx.set_canonical_cache_root(root.clone());
+        ctx.set_cache_role(true, Some(owner.join(".git")));
+        crate::root_cache::configure_artifact_access(&root, &key, true);
+        *ctx.search_index().write().unwrap() = Some(SearchIndex::build(&root));
+
+        let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let (finished_tx, finished_rx) = crossbeam_channel::bounded(1);
+        struct ReleaseWarmup {
+            root: PathBuf,
+            release: crossbeam_channel::Sender<()>,
+        }
+        impl Drop for ReleaseWarmup {
+            fn drop(&mut self) {
+                let _ = self.release.try_send(());
+                if let Some(hooks) = super::READ_ONLY_QUERY_WARMUP_HOOKS
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_mut()
+                {
+                    hooks.remove(&self.root);
+                }
+            }
+        }
+        let _release = ReleaseWarmup {
+            root: root.clone(),
+            release: release_tx.clone(),
+        };
+        super::READ_ONLY_QUERY_WARMUP_HOOKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(std::collections::HashMap::new)
+            .insert(
+                root.clone(),
+                Box::new(move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    let _ = finished_tx.send(());
+                    Err("held query warmup failed without loading a model".into())
+                }),
+            );
+
+        let starts = super::schedule_artifact_loads(&ctx, false, true);
+        assert!(
+            starts.1.is_some(),
+            "read-only semantic loader was not scheduled"
+        );
+        assert!(super::start_artifact_loads(starts));
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("query warmup did not enter its gate");
+        // Keep warmup blocked while the real completion drain installs Ready.
+        // The timeout is only a deadlock backstop, not a latency assertion.
+        wait_for_semantic_build_ready(&ctx, Duration::from_secs(5));
+        assert!(ctx.semantic_embedding_model().lock().is_none());
+        let query = "where are cached semantic readiness markers handled";
+        let request: RawRequest = serde_json::from_value(json!({
+            "id": "readonly-parent-vector", "command": "semantic_search", "query": query,
+            "hint": "semantic", "top_k": 5,
+        }))
+        .unwrap();
+        let search = || {
+            crate::commands::semantic_search::with_precomputed_query_vector(
+                query,
+                vec![1.0, 0.0, 0.0],
+                || crate::commands::semantic_search::handle_semantic_search(&request, &ctx),
+            )
+        };
+        let response = search();
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["complete"], true, "{:?}", response.data);
+        assert!(
+            response.data["results"]
+                .as_array()
+                .is_some_and(|rows| rows.iter().any(|row| row["name"] == "tracked")),
+            "{:?}",
+            response.data
+        );
+
+        release_tx.send(()).unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let response = search();
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["complete"], true, "{:?}", response.data);
+        assert!(
+            ctx.semantic_embedding_model().lock().is_none(),
+            "failed warmup populated the query model cache"
+        );
+    }
+
+    #[test]
+    fn linked_worktree_with_failed_git_probe_opens_owner_semantic_snapshot() {
+        let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
+        let _storage_env = crate::test_env::without_storage_override();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        init_git_fixture(&main);
+        let worktree = temp.path().join("worktree");
+        assert!(git_command(&main)
+            .args(["worktree", "add", "--detach", "--quiet"])
+            .arg(&worktree)
+            .arg("HEAD")
+            .status()
+            .unwrap()
+            .success());
+        let canonical_main = std::fs::canonicalize(&main).unwrap();
+        let canonical_worktree = std::fs::canonicalize(&worktree).unwrap();
+        let common_dir = canonical_main.join(".git");
+        let storage = temp.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+
+        // The owner checkout and its linked worktree share the repository key.
+        let key = crate::search_index::artifact_cache_key(&canonical_main);
+        assert_eq!(
+            crate::search_index::artifact_cache_key(&canonical_worktree),
+            key
+        );
+        // A successful configure-time key lookup for the worktree stores the
+        // memo that a later lookup uses when its Git probe fails.
+        assert_eq!(
+            test_context()
+                .memoized_artifact_cache_key_for_configure(
+                    &worktree,
+                    &canonical_worktree,
+                    &storage,
+                    Some(&common_dir),
+                )
+                .unwrap(),
+            Some(key.clone())
+        );
+        crate::root_cache::configure_artifact_access(&canonical_main, &key, false);
+        let source = canonical_main.join("tracked.rs");
+        let mut embed =
+            |texts: Vec<String>| Ok::<_, String>(vec![vec![0.1, 0.2, 0.3]; texts.len()]);
+        let mut owner_index =
+            crate::semantic_index::SemanticIndex::build(&canonical_main, &[source], &mut embed, 8)
+                .expect("build owner semantic snapshot");
+        owner_index.set_fingerprint(crate::semantic_index::SemanticIndexFingerprint {
+            backend: "openai_compatible".to_string(),
+            model: "readonly-test".to_string(),
+            base_url: "http://127.0.0.1".to_string(),
+            dimension: 3,
+            chunking_version: 1,
+            ..Default::default()
+        });
+        assert!(owner_index.write_to_disk(&storage, &key));
+
+        let _override =
+            crate::search_index::force_git_root_commit_probe_transient_for_paths_for_test(
+                vec![worktree.clone(), canonical_worktree.clone()],
+                "spawn failed: Too many open files (os error 24)",
+            );
+        let ctx = test_context();
+        ctx.update_config(|config| {
+            config.project_root = Some(worktree.clone());
+            config.storage_dir = Some(storage.clone());
+            config.indexes.semantic = true;
+            config.views.enabled = false;
+        });
+        // Configure recovers the repository key from the memo ...
+        assert_eq!(
+            ctx.memoized_artifact_cache_key_for_configure(
+                &worktree,
+                &canonical_worktree,
+                &storage,
+                Some(&common_dir),
+            )
+            .unwrap(),
+            Some(key.clone())
+        );
+        // ... while a fresh derivation falls back to a path-based key, which
+        // names a folder that holds no snapshot.
+        assert_ne!(
+            crate::search_index::artifact_cache_key(&canonical_worktree),
+            key
+        );
+        ctx.set_canonical_cache_root(canonical_worktree.clone());
+        ctx.set_cache_role(true, Some(common_dir.clone()));
+        crate::root_cache::configure_artifact_access(&canonical_worktree, &key, true);
+        // Mark the worktree as open, as an interactive session would, so a
+        // missing snapshot reports as missing rather than as "not opened".
+        struct OpenedRoot(std::path::PathBuf);
+        impl Drop for OpenedRoot {
+            fn drop(&mut self) {
+                crate::semantic_admission::note_closed("linked-worktree-probe-test", &self.0);
+            }
+        }
+        crate::semantic_admission::note_opened("linked-worktree-probe-test", &canonical_worktree);
+        let _opened = OpenedRoot(canonical_worktree.clone());
+
+        let starts = super::schedule_artifact_loads(&ctx, false, true);
+        assert!(starts.1.is_some(), "the read-only semantic arm must start");
+        let receiver = ctx
+            .semantic_index_rx()
+            .lock()
+            .clone()
+            .expect("semantic load receiver");
+        assert!(super::start_artifact_loads(starts));
+        let cap = Instant::now() + Duration::from_secs(60);
+        let event = loop {
+            let event = receiver
+                .recv_timeout(cap.saturating_duration_since(Instant::now()))
+                .expect("read-only semantic load result");
+            if matches!(
+                &event,
+                crate::context::SemanticIndexEvent::Ready(_)
+                    | crate::context::SemanticIndexEvent::Failed(_)
+            ) {
+                break event;
+            }
+        };
+        match event {
+            crate::context::SemanticIndexEvent::Ready(_) => {}
+            crate::context::SemanticIndexEvent::Failed(reason) => {
+                panic!("linked worktree missed the owner's semantic snapshot: {reason}")
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]
@@ -18785,10 +21293,25 @@ mod tests {
             || true,
         )
         .unwrap();
+        let cold_refusal = limiter.observe_refusals_for_test();
         assert!(super::start_artifact_loads(super::schedule_artifact_loads(
             &ctx, true, false
         )));
-        wait_for_search_index_ready(&ctx, Duration::from_secs(2));
+        let completion = search_index_completion(&ctx);
+        // A slow disk may delay publication, but a warm load must not request
+        // a slot from the saturated cold-build limiter. The 30s deadline only
+        // bounds a stalled worker; the refusal event detects incorrect admission.
+        crossbeam_channel::select! {
+            recv(cold_refusal) -> refusal => {
+                panic!("warm search load requested a saturated cold-build slot: {refusal:?}");
+            }
+            recv(completion) -> index => {
+                install_search_index_completion(&ctx, index.expect("warm search load disconnected"));
+            }
+            default(Duration::from_secs(30)) => {
+                panic!("timed out waiting for warm search publication or cold-build refusal");
+            }
+        }
     }
 
     #[test]
@@ -19006,7 +21529,9 @@ mod tests {
             if count == 0 {
                 continue;
             }
-            let result = index.grep(needle, true, &[], &[], root.path(), count + 1);
+            let result = index
+                .grep(needle, true, &[], &[], root.path(), count + 1)
+                .expect("grep over a test index");
             let found: std::collections::BTreeSet<_> = result
                 .matches
                 .iter()
@@ -19154,12 +21679,28 @@ mod tests {
                 .expect("hold limiter permit")
             })
             .collect::<Vec<_>>();
+        let cold_refusal = limiter.observe_refusals_for_test();
 
         let starts = super::schedule_artifact_loads(&ctx, true, false);
         assert!(starts.0.is_some());
         assert!(starts.1.is_none());
         assert!(super::start_artifact_loads(starts));
-        std::thread::sleep(Duration::from_millis(150));
+        let completion = search_index_completion(&ctx);
+        crossbeam_channel::select! {
+            recv(cold_refusal) -> refusal => {
+                assert_eq!(
+                    refusal.expect("cold search load requested a slot"),
+                    "search index post-configure load"
+                );
+            }
+            recv(completion) -> index => {
+                let _ = index.expect("cold search load disconnected while waiting for permit");
+                panic!("cold search load published before permit release");
+            }
+            default(Duration::from_secs(30)) => {
+                panic!("timed out waiting for cold-build refusal before permit release");
+            }
+        }
         crate::runtime_drain::drain_build_completions(&ctx);
         assert!(
             ctx.search_index()
@@ -19177,7 +21718,10 @@ mod tests {
         );
 
         drop(held_permits.pop());
-        wait_for_search_index_ready(&ctx, Duration::from_secs(2));
+        let index = completion
+            .recv_timeout(Duration::from_secs(30))
+            .expect("cold search publication did not arrive within 30s after permit release");
+        install_search_index_completion(&ctx, index);
     }
 
     #[test]
@@ -21799,7 +24343,8 @@ mod tests {
             "project_root": "/", "harness": "runner", "storage_dir": ctx._storage.path(),
         }));
         assert!(handle_configure_for_test(&req, &ctx).success);
-        let file = ctx._storage.path().join("readable.txt");
+        let project = tempfile::tempdir().unwrap();
+        let file = project.path().join("readable.txt");
         std::fs::write(&file, "explicit path still works\n").unwrap();
         let read = RawRequest {
             id: "read-root".into(),
@@ -21851,11 +24396,16 @@ mod tests {
         assert!(ctx.config().indexes.semantic);
         assert!(ctx.config().indexes.callgraph);
         assert!(ctx.config().views.enabled);
-        assert!(ctx.search_index_rx().read().unwrap().is_some());
+        // With views on, the checkout's lexical view replaces the legacy
+        // search loader, so trigram work for this root is the lexical view.
+        assert!(ctx.lexical_views_enabled());
         assert!(ctx.semantic_index_rx().lock().is_some());
         super::drain_deferred_configure_maintenance(&ctx);
         assert!(ctx.watcher_runtime_active());
-        assert!(ctx.view_runtime_snapshot().is_some());
+        // The root's reads go through its v3 checkout views, so no v1 view
+        // runtime is opened for it.
+        assert!(ctx.views_route_root());
+        assert!(ctx.view_runtime_snapshot().is_none());
         assert!(ctx.callgraph_writer());
         ctx.stop_watcher_runtime();
     }
@@ -23024,10 +25574,15 @@ mod tests {
                     usize::from(label == "cold_context" || sample == 0)
                 );
                 let started = Instant::now();
-                crate::storage_retention::record_bind(&storage, &root, &key).unwrap();
+                crate::storage_retention::record_bind(
+                    &crate::root_cache::StoragePaths::same(&storage),
+                    &root,
+                    &key,
+                )
+                .unwrap();
                 profile.retention_bind = started.elapsed();
                 let started = Instant::now();
-                crate::persisted_format::preflight_project_artifacts(&storage, &key);
+                crate::persisted_format::preflight_project_artifacts(&storage, &storage, &key);
                 profile.format_preflight = started.elapsed();
                 eprintln!("cache_key_probe sample={sample} mode={label} total_us={} timings={:?} retention_us={} preflight_us={}",
                     profile.started.elapsed().as_micros(), profile.key,
@@ -23411,6 +25966,63 @@ mod tests {
 mod inspect_orphan_sweep_tests {
     use super::*;
 
+    /// Write a URL download fetched at `fetched_at_ms` under `storage`, the
+    /// way `url_fetch` lays it out, and return its content and metadata paths.
+    fn url_download(storage: &Path, url: &str, fetched_at_ms: u64) -> (PathBuf, PathBuf) {
+        let content = crate::url_fetch::cache_content_path_for_url(storage, url, ".md");
+        let meta = crate::url_fetch::cache_meta_path_for_url(storage, url);
+        fs::create_dir_all(content.parent().unwrap()).unwrap();
+        fs::write(&content, "body").unwrap();
+        let meta_json = serde_json::json!({
+            "url": url,
+            "contentType": "text/markdown",
+            "extension": ".md",
+            "fetchedAt": fetched_at_ms,
+        });
+        fs::write(&meta, serde_json::to_vec(&meta_json).unwrap()).unwrap();
+        (content, meta)
+    }
+
+    /// With `storage.cache_dir` set, URL downloads are written under the cache
+    /// root, so the configure sweep must expire them there; sweeping only the
+    /// durable root would let them pile up on the cache volume forever.
+    #[test]
+    fn configure_storage_sweep_expires_url_downloads_on_the_cache_root() {
+        let durable = tempfile::tempdir().expect("durable storage");
+        let cache = tempfile::tempdir().expect("cache root");
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let (expired, expired_meta) = url_download(cache.path(), "https://example.com/old.md", 0);
+        let (fresh, fresh_meta) = url_download(cache.path(), "https://example.com/new.md", now_ms);
+        // A download made before `storage.cache_dir` was set.
+        let (legacy, legacy_meta) =
+            url_download(durable.path(), "https://example.com/legacy.md", 0);
+
+        run_configure_storage_sweeps(
+            &crate::root_cache::StoragePaths::new(
+                durable.path().to_path_buf(),
+                cache.path().to_path_buf(),
+            ),
+            Harness::Opencode,
+        );
+
+        assert!(!expired.exists(), "expired download kept on the cache root");
+        assert!(
+            !expired_meta.exists(),
+            "expired metadata kept on the cache root"
+        );
+        assert!(
+            fresh.exists() && fresh_meta.exists(),
+            "fresh download removed"
+        );
+        assert!(
+            !legacy.exists() && !legacy_meta.exists(),
+            "expired download from before cache_dir kept on durable storage"
+        );
+    }
+
     #[test]
     fn configure_scheduled_storage_sweep_reaps_dead_inspect_scope_after_grace() {
         let storage = tempfile::tempdir().expect("storage");
@@ -23427,7 +26039,10 @@ mod inspect_orphan_sweep_tests {
         )
         .expect("age cache fixture");
 
-        run_configure_storage_sweeps(storage.path(), Harness::Opencode);
+        run_configure_storage_sweeps(
+            &crate::root_cache::StoragePaths::same(storage.path()),
+            Harness::Opencode,
+        );
         let ctx = AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),
             Config {
@@ -23440,7 +26055,7 @@ mod inspect_orphan_sweep_tests {
             // separate durable observation grace, not daemon warm-up admission.
             crate::storage_retention::allow_next_scheduled_pass_for_test(storage.path());
             crate::storage_retention::schedule(
-                storage.path().to_path_buf(),
+                crate::root_cache::StoragePaths::same(storage.path()),
                 ctx.subc_lifecycle_admission(),
                 ctx.configure_generation_flag(),
                 ctx.configure_generation(),
@@ -23517,14 +26132,14 @@ mod startup_view_sweep_tests {
             pending_paths: BTreeSet::new(),
             pending_inputs: Default::default(),
         };
-        run_configure_view_sweep(&view);
+        run_configure_view_sweep(&view, storage.path());
         assert_eq!(
             starts.load(Ordering::SeqCst),
             0,
             "view/blob GC started during startup warm-up"
         );
         crate::storage_retention::allow_next_scheduled_pass_for_test(storage.path());
-        run_configure_view_sweep(&view);
+        run_configure_view_sweep(&view, storage.path());
         assert_eq!(
             starts.load(Ordering::SeqCst),
             1,

@@ -9,6 +9,17 @@
 
 // --- logger contract ---
 export { setActiveLogger } from "./active-logger.js";
+// --- bash.env deny list (shared by both plugin hosts and the engine) ---
+export {
+  BLOCKED_BASH_ENV_NAMES,
+  BLOCKED_BASH_ENV_PREFIXES,
+  isBlockedBashEnvKey,
+  isProjectBlockedBashEnvKey,
+  PROJECT_ONLY_BLOCKED_BASH_ENV_NAMES,
+  PROJECT_ONLY_BLOCKED_BASH_ENV_PREFIXES,
+  PROJECT_ONLY_BLOCKED_BASH_ENV_SUBSTRINGS,
+  PROJECT_ONLY_NETWORK_BLOCKED_BASH_ENV_NAMES,
+} from "./bash-env.js";
 // --- bash output hints (shared by both plugin hosts) ---
 export {
   formatForegroundResult,
@@ -56,6 +67,7 @@ export {
   BASH_HOST_FALLBACK_MAX_OUTPUT_BYTES,
   BASH_HOST_FALLBACK_MAX_TIMEOUT_MS,
   BASH_HOST_FALLBACK_REFUSAL,
+  BASH_RETURN_PATHS_DESCRIPTION,
   BASH_RUNON_DESCRIPTION,
   BASH_RUNON_GUIDANCE,
   type BashHostFallbackOptions,
@@ -68,6 +80,35 @@ export {
   REGEX_WINDOW_SCAN_INCOMPLETE_TEXT,
   TERMINAL_SCAN_INCOMPLETE_TEXT,
 } from "./bash-output-page.js";
+export {
+  type BashAckTarget,
+  bashAckKey,
+  bashAckRequest,
+  bashAcksConfirmed,
+  bashAckTargetFromKey,
+  bashAckTargets,
+  bashPatternAckTarget,
+} from "./bash-pattern-ack.js";
+export {
+  BASH_PERMISSION_NOT_SETTLED,
+  type BashPermissionAsk,
+  BashPermissionLoopError,
+  bashPermissionRetryGrants,
+  escalationAskText,
+  groupBashPermissionAsks,
+  withBashPermissionLoop,
+} from "./bash-permissions.js";
+export {
+  formatBashOutputPages,
+  formatWatchLineBatch,
+  mergeWatchLineBatches,
+  WATCH_EACH_LINE_NEEDS_BACKGROUND,
+} from "./bash-watch-lines.js";
+export {
+  WatchBatchAdmissions,
+  WatchBatchProgress,
+  watchBatchHasContent,
+} from "./bash-watch-progress.js";
 // --- binary identity (no-exec cache trust) ---
 export type { BinaryIdentity, BinaryIdentityCheck } from "./binary-identity.js";
 export {
@@ -85,6 +126,7 @@ export type {
   BashLongRunningPayload,
   BashPatternMatchAck,
   BashPatternMatchFrame,
+  BashWatchLineBatch,
   BridgeClock,
   BridgeOptions,
   BridgeRequestOptions,
@@ -280,6 +322,7 @@ export {
   type GithubServerSpec,
   type Platform,
 } from "./lsp-github-table.js";
+export { lspNpmInstallInvocation, lspPublicationCutoff } from "./lsp-npm-policy.js";
 // --- which incoming messages interrupt a blocking bash wait ---
 export {
   BASH_WAIT_DETACH_MAGIC_KEYWORD,
@@ -372,9 +415,12 @@ export type {
   AftRequestEnvelope,
   AftResponse,
   AftSuccessResponse,
+  BashChangedFiles,
   BashCompletedFrame,
   BgCompletion,
   ConfigureWarningFrame,
+  LiveDescendant,
+  LiveDescendantsUnavailable,
   PermissionAskFrame,
   ProgressFrame,
   StatusCompression,
@@ -382,6 +428,7 @@ export type {
   StatusRemovalHealth,
   StatusResponse,
 } from "./protocol.js";
+export { LIVE_DESCENDANTS_UNAVAILABLE_REASONS } from "./protocol.js";
 export { findBinary, findBinarySync, isNativeExecutable, platformKey } from "./resolver.js";
 // --- reading a file at a git revision (`ref`) ---
 export {
@@ -443,6 +490,7 @@ export {
   subcConnectionFileError,
 } from "./transport-factory.js";
 export { readBinaryVersionOffThread } from "./version-probe.js";
+export { mintViewToken, type ViewToken } from "./view-token.js";
 // --- aft_zoom plain-text formatter (shared by both plugin hosts) ---
 export type {
   RustZoomBatchEntry,

@@ -1,1 +1,0 @@
-- Projects on machines without a working git stay indexable and keep a stable index identity, failed standing-root checks retry with backoff instead of every 250 ms, and backup repair and storage cleanup are safer.

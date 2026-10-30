@@ -7,7 +7,8 @@
 //! byte is read or written outside SQLite.
 //!
 //! A run may cut power before its N-th mutating call (write, truncate, sync,
-//! create or delete). From then on every mutating call fails with an I/O
+//! create or delete; creating an empty WAL file is not counted, see
+//! `open_file`). From then on every mutating call fails with an I/O
 //! error and changes nothing, as if the device had gone away; reads still
 //! see what reached the files before the cut.
 //!
@@ -90,6 +91,7 @@ struct State {
     dir_ops: Vec<DirOp>,
     dir_syncs: Vec<PathBuf>,
     asides: u64,
+    trace: Vec<String>,
 }
 
 /// What one replayed run did before its power cut.
@@ -100,6 +102,9 @@ pub(super) struct Report {
     pub crashed: bool,
     /// Directories synced before the cut, in order.
     pub dir_syncs: Vec<PathBuf>,
+    /// Each counted call in order (`write members.sqlite-wal @0+32`, ...), so
+    /// a test can name where two runs of the same operation diverged.
+    pub trace: Vec<String>,
 }
 
 fn state() -> MutexGuard<'static, State> {
@@ -200,6 +205,7 @@ pub(super) fn finish() -> Report {
         ops: state.ops,
         crashed: cut,
         dir_syncs: std::mem::take(&mut state.dir_syncs),
+        trace: std::mem::take(&mut state.trace),
     }
 }
 
@@ -262,12 +268,14 @@ fn drain_dir_syncs(state: &mut State) {
     }
 }
 
-/// Counts one mutating call. `false` means power is already off.
-fn step(state: &mut State) -> bool {
+/// Counts one mutating call, recording `label` in the run's trace. `false`
+/// means power is already off.
+fn step(state: &mut State, label: impl FnOnce() -> String) -> bool {
     drain_dir_syncs(state);
     if state.crashed {
         return false;
     }
+    state.trace.push(label());
     state.ops += 1;
     if state.crash_at == Some(state.ops) {
         state.crashed = true;
@@ -275,6 +283,13 @@ fn step(state: &mut State) -> bool {
         return false;
     }
     true
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 
 fn c_path(name: *const c_char) -> PathBuf {
@@ -299,7 +314,23 @@ unsafe extern "C" fn open_file(
     let mut creating = false;
     if let Some(path) = &path {
         if flags & ffi::SQLITE_OPEN_CREATE != 0 && !path.exists() {
-            if !step(&mut state()) {
+            if flags & ffi::SQLITE_OPEN_WAL != 0 {
+                // SQLite creates a WAL file empty, even for a read-only
+                // connection, and a read-only close cannot remove it. Whether
+                // one is already there depends on what earlier connections to
+                // the same database did, and on a loaded CI runner it has
+                // differed between runs of the same test. Counting the
+                // creation made the number of cut points depend on that
+                // leftover file.
+                // An empty file holds no durable state, so no cut point is
+                // lost: every write to it is still counted, and the power cut
+                // still removes the file unless its directory was synced.
+                let mut state = state();
+                drain_dir_syncs(&mut state);
+                if state.crashed {
+                    return ffi::SQLITE_CANTOPEN;
+                }
+            } else if !step(&mut state(), || format!("create {}", file_name(path))) {
                 return ffi::SQLITE_CANTOPEN;
             }
             creating = true;
@@ -354,7 +385,7 @@ unsafe extern "C" fn delete_file(
 ) -> c_int {
     let path = c_path(name);
     let mut state = state();
-    if !step(&mut state) {
+    if !step(&mut state, || format!("delete {}", file_name(&path))) {
         return ffi::SQLITE_IOERR_DELETE;
     }
     if !path.exists() {
@@ -437,7 +468,9 @@ unsafe extern "C" fn write(
 ) -> c_int {
     let mut state = state();
     let (methods, path) = methods_of(&state, file);
-    if !step(&mut state) {
+    if !step(&mut state, || {
+        format!("write {} @{offset}+{amount}", file_name(&path))
+    }) {
         return ffi::SQLITE_IOERR_WRITE;
     }
     // SAFETY: the file is open and its original methods are valid.
@@ -458,7 +491,9 @@ unsafe extern "C" fn write(
 unsafe extern "C" fn truncate(file: *mut ffi::sqlite3_file, size: i64) -> c_int {
     let mut state = state();
     let (methods, path) = methods_of(&state, file);
-    if !step(&mut state) {
+    if !step(&mut state, || {
+        format!("truncate {} {size}", file_name(&path))
+    }) {
         return ffi::SQLITE_IOERR_TRUNCATE;
     }
     // SAFETY: the file is open and its original methods are valid.
@@ -477,7 +512,7 @@ unsafe extern "C" fn truncate(file: *mut ffi::sqlite3_file, size: i64) -> c_int 
 unsafe extern "C" fn sync(file: *mut ffi::sqlite3_file, flags: c_int) -> c_int {
     let mut state = state();
     let (methods, path) = methods_of(&state, file);
-    if !step(&mut state) {
+    if !step(&mut state, || format!("sync {}", file_name(&path))) {
         return ffi::SQLITE_IOERR_FSYNC;
     }
     // SAFETY: forward the original SQLite-owned file and synchronization flags.

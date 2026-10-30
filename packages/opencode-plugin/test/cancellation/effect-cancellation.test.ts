@@ -146,7 +146,7 @@ describe("Effect-owned cancellation", () => {
     expect(daemonLog).toEqual(["request_cancelled command=search"]);
   });
 
-  test("does not reinterpret the existing V1 ToolContext abort signal", async () => {
+  test("honors explicit opt-out of the V1 ToolContext abort signal", async () => {
     const controller = new AbortController();
     const seenSignals: Array<AbortSignal | undefined> = [];
     const bridge = {
@@ -166,6 +166,8 @@ describe("Effect-owned cancellation", () => {
       ctx,
       { directory: process.cwd(), abort: controller.signal } as never,
       "status",
+      {},
+      { abortSignal: undefined },
     );
     expect(seenSignals).toEqual([undefined]);
   });

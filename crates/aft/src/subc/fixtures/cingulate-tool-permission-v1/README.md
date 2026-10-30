@@ -22,6 +22,19 @@ To update, copy the directory again from the Cingulate commit that changes the
 contract, update the commit named above, and rerun
 `cargo test -p agent-file-tools --lib -- consent_vectors`.
 
+## Folder-grant withdraw vectors
+
+`scope-owner-withdraw-request.json`, `scope-owner-withdraw-reply.json`,
+`non-owner-withdraw-request.json`, `non-owner-withdraw-refusal.json`,
+`notice-owner-withdrawn.json`, `settled-withdraw-request.json`,
+`settled-withdraw-reply.json` and `withdraw-bind-stamps.json` were additionally
+copied byte for byte from Cingulate commit `04b7cbd` (tags
+`access-escalated-phone-v2` and later; Cingulate HEAD `32b4ed84895c`). Their
+withdraw request envelopes match `withdrawn-request.json` apart from the
+elicitation id; the owner reply settles as `access_withdrawn`, the non-owner
+reply refuses as `elicitation_not_owner`, and the settled reply returns the
+ask's own settled record for the race guard.
+
 ## macOS informational-card pin
 
 `macos-open-request.json`, `macos-repeat-request.json` and

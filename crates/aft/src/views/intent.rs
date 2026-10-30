@@ -82,6 +82,19 @@ fn path_identity(path: &Path) -> PathBuf {
     }
 }
 
+/// Match event paths against the checkout identity, including Windows verbatim
+/// prefixes and symlinked roots. Resolve the existing prefix rather than only
+/// the whole path so deletions and not-yet-created descendants still route.
+pub(super) fn relative_to_root(path: &Path, root: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    path_identity(path)
+        .strip_prefix(path_identity(root))
+        .ok()
+        .map(Path::to_path_buf)
+}
+
 #[cfg(test)]
 thread_local! {
     static CLASSIFICATION_STATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -334,6 +347,7 @@ mod tests {
         });
         register_listener(&listener);
         crate::edit::write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
             &path,
             "new",
             &crate::config::Config::default(),
@@ -378,6 +392,7 @@ mod tests {
         drop(listener);
         drop(guard);
         crate::edit::write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
             &path,
             "again",
             &crate::config::Config::default(),

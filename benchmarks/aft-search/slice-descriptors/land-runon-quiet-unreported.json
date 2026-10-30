@@ -1,0 +1,1 @@
+{"fixtures": ["harness-goldens"], "kind": "harness", "note": "Agent-facing text only: runon terminal reports no longer print 'not reported by the runner' lines for the Git, untracked-file, and ignored-write fields the build server never fills. No aft_search ranking, fusion, lane admission or truncation change.", "slice_class": "non_ranking", "targeted_mechanism": "none"}

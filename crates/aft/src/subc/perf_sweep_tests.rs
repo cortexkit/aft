@@ -178,6 +178,16 @@ fn perf_sweep_log_caps_stop_the_iterator_and_report_truncation() {
 }
 
 #[test]
+fn perf_sweep_accepts_wall_and_cpu_phase_fields() {
+    let log = "2025-01-01T00:00:01.000Z [aft] WARN slow tool_call name=edit total=50ms queue=3.123ms/cpu=? translate=39.123ms/cpu=0.004ms exec=7.123ms/cpu=2.345ms\n";
+    let result = parse_log(log.as_bytes(), SINCE, u64::MAX, LOG_BYTES, LOG_LINES).unwrap();
+    assert_eq!(result["stats"]["slow_total"]["n"], 1);
+    assert_eq!(result["stats"]["slow_total"]["max"], 50);
+    assert_eq!(result["stats"]["slow_queue"]["max"], 3);
+    assert_eq!(result["stats"]["slow_exec"]["max"], 7);
+}
+
+#[test]
 fn perf_sweep_log_windows_are_half_open_and_consecutive_windows_cover_each_entry_once() {
     let log = concat!(
         "2025-01-01T00:00:00.000Z [aft] WARN slow tool_call name=window total=10ms queue=1ms exec=9ms\n",

@@ -239,7 +239,11 @@ def report_removed(repo: str, state: dict, removal: dict | None) -> None:
                 or run["conclusion"] not in {"failure", "timed_out", "cancelled"}):
             continue
         log(f"failing group {run['head_sha']}: {run['html_url']} ({run['conclusion']})")
-        jobs = pages(f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100")
+        # The jobs endpoint pages are objects ({"total_count", "jobs"}),
+        # unlike the pulls endpoint, whose pages are arrays.
+        jobs = [job for page in json.loads(gh("api", "--paginate", "--slurp",
+                f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100"))
+                for job in page["jobs"]]
         bad = [job for job in jobs if job["conclusion"] in {"failure", "timed_out", "cancelled"}]
         for job in bad:
             log(f"  {job['name']}: {job['conclusion']}")
@@ -312,6 +316,15 @@ def submit(args: argparse.Namespace) -> str:
     prs = [pr for pr in pages(f"repos/{repo}/pulls?state=all&base=main&head={quote(owner + ':' + branch, safe='')}&per_page=100")
            if pr["head"]["ref"] == branch and pr["head"]["repo"]["full_name"] == repo
            and pr["base"]["ref"] == "main"]
+    # A PR closed without merging at another head is an abandoned earlier
+    # attempt (for example a stale release PR closed by hand). GitHub can't
+    # reopen it once its branch is recreated, so a new PR on the same branch
+    # supersedes it. A merged PR, or one closed at this exact head, still
+    # refuses below.
+    current_head = git("rev-parse", "HEAD")
+    prs = [pr for pr in prs
+           if not (pr["state"] == "closed" and pr.get("merged_at", "unknown") is None
+                   and pr["head"]["sha"] != current_head)]
     if len(prs) > 1:
         raise ValueError("ambiguous existing PRs for delivery branch")
     existing_head = prs[0]["head"]["sha"] if prs else None

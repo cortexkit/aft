@@ -1,0 +1,9 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "note": "Derived against RANKING_FENCE_PREFIXES in benchmarks/aft-search/search_quality_lib.py: every changed path is under benchmarks/aft-search/ outside engine-fixtures/ or under docs/investigations/, so none is fenced. No engine code changes. Re-records the real-query reference on the landed engine after the symbol-range span-clip ranking landing (#1055), which clips approximate symbol spans at the next declaration in exact_lane.rs."
+}

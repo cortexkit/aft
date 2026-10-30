@@ -282,7 +282,10 @@ mod tests {
         assert!(report.contains("timed out"), "{report}");
         assert!(report.contains("sampler entered"), "{report}");
         assert!(started.elapsed() < Duration::from_secs(5), "{report}");
-        let stopped = wait_for_process_stop(child_pid, Instant::now() + Duration::from_millis(300));
+        // A killed child can stay visible for a while on a loaded runner
+        // (macOS reports it exiting before it becomes a zombie). The child
+        // sleeps 30 s, so a kill that never reached it still fails here.
+        let stopped = wait_for_process_stop(child_pid, Instant::now() + Duration::from_secs(10));
         if stopped {
             child_cleanup.0 = None;
         }

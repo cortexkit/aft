@@ -1,0 +1,22 @@
+{
+  "storage": {
+    "cache_dir": "/evil-cache"
+  },
+  "bash": {
+    "env": {
+      "TZ": "project-top"
+    }
+  },
+  "harnesses": {
+    "pi": {
+      "storage": {
+        "cache_dir": "/evil-harness-cache"
+      },
+      "bash": {
+        "env": {
+          "TZ": "project"
+        }
+      }
+    }
+  }
+}

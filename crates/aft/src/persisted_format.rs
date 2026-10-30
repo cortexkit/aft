@@ -111,16 +111,19 @@ impl PersistedStore {
             PersistedStore::ArtifactOwner => crate::artifact_owner::SCHEMA_VERSION,
             PersistedStore::BackupMeta => crate::backup::SCHEMA_VERSION,
             PersistedStore::BashTask => crate::bash_background::persistence::SCHEMA_VERSION,
-            PersistedStore::ViewsV3Registry | PersistedStore::ViewsV3Store => 1,
+            PersistedStore::ViewsV3Registry => crate::blob_store::v3::REGISTRY_VERIFICATION_VERSION,
+            PersistedStore::ViewsV3Store => 1,
         }
     }
 
-    /// Format version of this store that this build writes. Every store
-    /// currently writes the highest version it reads; the two are kept apart
-    /// so a build that learns to read a format before it starts writing it
-    /// raises the floor only when it actually writes.
+    /// The default version this build writes when preparing a store. Guarded
+    /// backup stacks opt into their newer format at the imported write boundary;
+    /// ordinary history must not raise that reader floor merely on startup.
     pub fn written(self) -> u32 {
-        self.supported()
+        match self {
+            Self::BackupMeta => crate::backup::ORDINARY_SCHEMA_VERSION,
+            _ => self.supported(),
+        }
     }
 }
 
@@ -353,7 +356,17 @@ fn absolute_route(path: &Path) -> PathBuf {
     };
     #[cfg(windows)]
     let absolute = crate::windows_path::normalize_windows_path(&absolute);
-    absolute
+    // An artifact on a `storage.cache_dir` cache root is owned by the durable
+    // storage root that owns the cache root, as if the cache were linked
+    // under it. Spell it that way so it is routed, listed and cleared there,
+    // and so the cache root never becomes a storage owner of its own.
+    match crate::root_cache::durable_route(&absolute) {
+        #[cfg(windows)]
+        Some(route) => crate::windows_path::normalize_windows_path(&route),
+        #[cfg(not(windows))]
+        Some(route) => route,
+        None => absolute,
+    }
 }
 
 fn canonical_scope(path: &Path) -> PathBuf {
@@ -717,6 +730,27 @@ fn registry() -> &'static Mutex<Vec<Entry>> {
     REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// Process-wide standing reader-floor refusals, without resolving paths or waiting.
+pub(crate) fn try_floor_refusal_counts() -> Option<std::collections::BTreeMap<String, u64>> {
+    let entries = registry().try_lock().ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+    let mut counts = std::collections::BTreeMap::new();
+    for entry in entries.iter() {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        let class = match entry.refusal.source {
+            RefusalSource::Floor => "requires_newer_reader",
+            RefusalSource::FloorUnreadable => "floor_unreadable",
+            _ => continue,
+        };
+        *counts
+            .entry(format!("{}/{class}", entry.refusal.store.name()))
+            .or_default() += 1;
+    }
+    Some(counts)
+}
+
 fn with_registry<T>(f: impl FnOnce(&mut Vec<Entry>) -> T) -> T {
     let mut guard = registry()
         .lock()
@@ -994,15 +1028,15 @@ pub fn gate(
 /// semantic, symbol cache, callgraph, ownership manifest) and record a named
 /// refusal for each one written in a newer format. Reads headers only; never
 /// changes anything. Absent artifacts are skipped.
-pub fn preflight_project_artifacts(storage_root: &Path, project_key: &str) {
+pub fn preflight_project_artifacts(storage_root: &Path, artifacts: &Path, project_key: &str) {
     register_storage_root(storage_root);
     let _ = crate::search_index::SearchIndex::check_disk_cache_format(
-        &storage_root.join("index").join(project_key),
+        &artifacts.join("index").join(project_key),
     );
-    let _ = crate::semantic_index::SemanticIndex::check_disk_format(storage_root, project_key);
-    let _ = crate::symbol_cache_disk::check_disk_format(storage_root, project_key);
+    let _ = crate::semantic_index::SemanticIndex::check_disk_format(artifacts, project_key);
+    let _ = crate::symbol_cache_disk::check_disk_format(artifacts, project_key);
     let _ = crate::callgraph_store::check_published_format(
-        &storage_root.join("callgraph").join(project_key),
+        &artifacts.join("callgraph").join(project_key),
         project_key,
     );
     let _ = crate::artifact_owner::check_manifest_format(storage_root, project_key);
@@ -1032,6 +1066,34 @@ pub fn formats_json() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostics_findings_floor_snapshot_is_nonblocking_and_counts_only_floors() {
+        if !isolated_owner_probe("persisted_format::tests::diagnostics_findings_floor_snapshot_is_nonblocking_and_counts_only_floors") { return; }
+        let path = PathBuf::from("seeded-floor.json");
+        let floor = UnsupportedPersistedFormat::floor(PersistedStore::AftDb, &path, 999);
+        let artifact = UnsupportedPersistedFormat::artifact(PersistedStore::AftDb, &path, 999);
+        {
+            let mut guard = registry().lock().unwrap();
+            guard.push(Entry {
+                scope: path.clone(),
+                root: None,
+                refusal: floor,
+            });
+            guard.push(Entry {
+                scope: path,
+                root: None,
+                refusal: artifact,
+            });
+            assert!(
+                try_floor_refusal_counts().is_none(),
+                "must not wait for a held registry"
+            );
+        }
+        let counts = try_floor_refusal_counts().unwrap();
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts["aft.db/requires_newer_reader"], 1);
+    }
 
     fn isolated_owner_probe(test: &str) -> bool {
         const CHILD: &str = "AFT_TEST_DIRECT_OWNER_PROBES";

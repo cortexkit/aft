@@ -369,6 +369,46 @@ pub(super) fn run(
     execute: &mut impl FnMut(&ReadRequest) -> Result<ReadReply, ReadError>,
     output: &mut impl Write,
 ) -> Result<i32, ReadError> {
+    // Remember the stdout error before renderers turn it into display text.
+    // A closed downstream reader is normal pipeline termination, unlike a
+    // failed jq child or a real output error such as a full disk.
+    struct Output<'a, W> {
+        writer: &'a mut W,
+        broken_pipe: bool,
+    }
+    impl<W: Write> Write for Output<'_, W> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let result = self.writer.write(bytes);
+            self.broken_pipe |= result
+                .as_ref()
+                .is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe);
+            result
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            let result = self.writer.flush();
+            self.broken_pipe |= result
+                .as_ref()
+                .is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe);
+            result
+        }
+    }
+    let mut output = Output {
+        writer: output,
+        broken_pipe: false,
+    };
+    let result = render(plan, execute, &mut output);
+    if output.broken_pipe {
+        Ok(0)
+    } else {
+        result
+    }
+}
+
+fn render(
+    plan: &Plan,
+    execute: &mut impl FnMut(&ReadRequest) -> Result<ReadReply, ReadError>,
+    output: &mut impl Write,
+) -> Result<i32, ReadError> {
     if let Some(request) = &plan.api {
         return api(plan, request, execute, output);
     }
@@ -1400,7 +1440,16 @@ fn page_path(path: &str, page: u64) -> String {
     )
 }
 
+/// Raw log bytes requested per job-log page. The reply body is display text
+/// that can grow past the raw byte count: a multibyte character split at either
+/// page edge decodes to U+FFFD (up to +8 bytes per page), and redaction markers
+/// can add a little more. The headroom keeps a full page under the unchanged
+/// REPLY_BYTES bound on the decoded body.
+pub(super) const LOG_WINDOW_BYTES: u64 = REPLY_BYTES as u64 - 1024;
+
 /// Request every log window from offset zero; omitting a range means a tail.
+/// Paging advances by the reply's raw `offset + length`, never by the body's
+/// length, because the body is display text rather than raw log bytes.
 fn stream_log(
     job_id: u64,
     execute: &mut impl FnMut(&ReadRequest) -> Result<ReadReply, ReadError>,
@@ -1414,7 +1463,7 @@ fn stream_log(
                 job_id,
                 range: Some(ByteRange {
                     offset,
-                    length: REPLY_BYTES as u64,
+                    length: LOG_WINDOW_BYTES,
                 }),
             },
             execute,
@@ -1422,10 +1471,7 @@ fn stream_log(
         let ReadReply::JobLog(reply) = response else {
             return Err(failed("job_log returned the wrong reply type"));
         };
-        if reply.offset != offset
-            || reply.length != reply.body.len() as u64
-            || reply.length > REPLY_BYTES as u64
-        {
+        if reply.offset != offset || reply.length > LOG_WINDOW_BYTES {
             return Err(failed("job_log returned an invalid offset or length"));
         }
         if total.is_some_and(|total| total != reply.total_bytes) {
@@ -1437,7 +1483,10 @@ fn stream_log(
         let end = offset
             .checked_add(reply.length)
             .ok_or_else(|| failed("job log offset overflow"))?;
-        if end > reply.total_bytes || (end < reply.total_bytes && reply.body.is_empty()) {
+        // A page that consumed no raw bytes before the end would repeat
+        // forever. An empty body alone is fine: a page of only ANSI codes
+        // still advances the raw cursor.
+        if end > reply.total_bytes || (end < reply.total_bytes && reply.length == 0) {
             return Err(failed("job_log returned an invalid byte range"));
         }
         output
@@ -1467,7 +1516,10 @@ fn run_logs(
     };
     for job in &jobs {
         if plan.flag("log-failed")
-            && !matches!(job["conclusion"].as_str(), Some("failure" | "timed_out"))
+            && !matches!(
+                job["conclusion"].as_str(),
+                Some("failure" | "timed_out" | "action_required" | "startup_failure")
+            )
         {
             continue;
         }
@@ -1476,7 +1528,6 @@ fn run_logs(
             .ok_or_else(|| failed("job response has no id"))?;
         let mut formatter = LogFormatter {
             job,
-            failed_only: plan.flag("log-failed"),
             pending: Vec::new(),
             output,
         };
@@ -1501,53 +1552,24 @@ fn run_logs(
 
 struct LogFormatter<'a, W> {
     job: &'a Value,
-    failed_only: bool,
     pending: Vec<u8>,
     output: &'a mut W,
 }
 
-// GitHub's log and step times are UTC. Compare whole seconds and decimal
-// fractions separately so differing fractional widths preserve full precision.
-fn log_timestamp(value: &str) -> Option<(&str, &str)> {
-    let value = value.strip_suffix('Z')?;
-    let (seconds, fraction) = value.split_once('.').unwrap_or((value, ""));
-    if seconds.len() != 19
-        || !seconds
-            .bytes()
-            .enumerate()
-            .all(|(index, byte)| match index {
-                4 | 7 => byte == b'-',
-                10 => byte == b'T',
-                13 | 16 => byte == b':',
-                _ => byte.is_ascii_digit(),
-            })
-        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
-    }
-    Some((seconds, fraction.trim_end_matches('0')))
-}
-
 impl<W: Write> LogFormatter<'_, W> {
     fn line(&mut self, line: &[u8]) -> io::Result<()> {
-        let timestamp = line.split(|byte| *byte == b' ').next().unwrap_or_default();
-        let timestamp = std::str::from_utf8(timestamp).unwrap_or("");
-        let step = log_timestamp(timestamp).and_then(|timestamp| {
-            self.job["steps"].as_array()?.iter().find(|step| {
-                let start = step["started_at"].as_str().and_then(log_timestamp);
-                let end = step["completed_at"].as_str().and_then(log_timestamp);
-                matches!((start, end), (Some(start), Some(end)) if start <= timestamp && timestamp < end)
-            })
-        });
-        if self.failed_only && !step.is_some_and(|step| step["conclusion"] == "failure") {
-            return Ok(());
-        }
+        // Plexus supplies whole-job display text, not gh's numbered step-log
+        // files. Mirror cli/cli v2.92.0 pkg/cmd/run/view/view.go:556-590:
+        // retain every line and label it UNKNOWN STEP rather
+        // than guessing from timestamps shared by several steps. Display text
+        // has already lost ANSI codes and may differ from native gh's archive.
         let name = self.job["name"].as_str().unwrap_or("job");
-        let step = step
-            .and_then(|step| step["name"].as_str())
-            .unwrap_or("UNKNOWN STEP");
-        write!(self.output, "{name}\t{step}\t")?;
-        self.output.write_all(line)
+        write!(self.output, "{name}\tUNKNOWN STEP\t")?;
+        // gh's line scanner removes CRLF and terminates even the final line.
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        self.output.write_all(line)?;
+        self.output.write_all(b"\n")
     }
     fn finish(&mut self) -> Result<(), ReadError> {
         if !self.pending.is_empty() {

@@ -1,0 +1,14 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/commands/semantic_search/external_disk_check.rs"
+  ],
+  "slices": [
+    "timing-flakes-batch"
+  ],
+  "note": "The ranking fence hits are test modules only: commands/semantic_search/mod.rs and external_disk_check.rs change only inside #[cfg(test)] code (a contended-search test bounds its wait well above the product budget; a capped disk-check test waits for the borrowed index to load and widens the time limits the test is not about). No product code in the fence changes, so ranked rows must remain byte-identical to the committed reference."
+}

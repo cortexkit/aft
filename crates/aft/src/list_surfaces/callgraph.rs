@@ -13,6 +13,7 @@ pub const CALLGRAPH_NARROW: &[&str] = &["depth", "includeTests"];
 
 pub static CALLGRAPH_SURFACES: &[SurfaceEntry] = &[
     SurfaceEntry {
+        requires: None,
         command: "callgraph",
         mode: "impact",
         list_id: SITES_LIST_ID,
@@ -32,6 +33,7 @@ pub static CALLGRAPH_SURFACES: &[SurfaceEntry] = &[
         ],
     },
     SurfaceEntry {
+        requires: None,
         command: "callgraph",
         mode: "callers",
         list_id: CALLERS_LIST_ID,
@@ -52,6 +54,7 @@ pub static CALLGRAPH_SURFACES: &[SurfaceEntry] = &[
         ],
     },
     SurfaceEntry {
+        requires: None,
         command: "callgraph",
         mode: "call_tree",
         list_id: TREE_LIST_ID,

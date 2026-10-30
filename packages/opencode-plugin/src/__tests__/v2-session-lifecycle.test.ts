@@ -160,7 +160,9 @@ test("cancelled worker watch does not acknowledge a racing inline completion", a
       sessionID: "child",
       directory: process.cwd(),
       abort: abort.signal,
-      metadata: (value: Record<string, unknown>) => metadata.push(value),
+      // The bash tools send OpenCode's { title?, metadata? } update shape.
+      metadata: (value: { metadata?: Record<string, unknown> }) =>
+        metadata.push(value.metadata ?? {}),
     } as never);
     expect(commands).toEqual(["bash_status"]);
     expect(metadata.at(-1)?.waited).toMatchObject({ reason: "aborted" });
@@ -651,9 +653,16 @@ test("V2 subc drain for a deleted session acknowledges its completion and watch 
       if (command === "bash_drain_completions")
         return { success: true, bg_completions: pending, pending_matches: matches };
       if (command === "bash_ack_completions") {
-        const acked = new Set(params.task_ids as string[]);
+        const acked = new Set((params.task_ids as string[] | undefined) ?? []);
+        const ackedMatches = new Set(
+          ((params.matches as Array<{ task_id: string }> | undefined) ?? []).map(
+            (match) => match.task_id,
+          ),
+        );
         pending = pending.filter((item) => !acked.has(item.task_id));
-        matches = matches.filter((item) => !acked.has(item.task_id));
+        matches = matches.filter(
+          (item) => !acked.has(item.task_id) && !ackedMatches.has(item.task_id),
+        );
       }
       return { success: true };
     },
@@ -673,20 +682,25 @@ test("V2 subc drain for a deleted session acknowledges its completion and watch 
     );
     await wakes.drainSession("drained-child");
     expect(synthetic).toEqual([]);
+    // The completion is acked by task id so the bridge never redelivers it.
     expect(
       sends.some(
         (send) =>
           send.command === "bash_ack_completions" &&
-          (send.params.task_ids as string[]).includes("bash-drained-late"),
+          ((send.params.task_ids as string[] | undefined) ?? []).includes("bash-drained-late"),
       ),
     ).toBe(true);
-    expect(
-      sends.some(
-        (send) =>
-          send.command === "bash_ack_completions" &&
-          (send.params.task_ids as string[]).includes("bash-watched-late"),
-      ),
-    ).toBe(true);
+    // The watch match is acked in the matches shape (task, watch, offset),
+    // not as a completion, so the deleted session's match is retired
+    // without queueing a wake for a session that no longer exists.
+    const matchAcks = sends.filter(
+      (send) => send.command === "bash_ack_completions" && Array.isArray(send.params.matches),
+    );
+    expect(matchAcks).toHaveLength(1);
+    expect(matchAcks[0]?.params).toEqual({
+      session_id: "drained-child",
+      matches: [{ task_id: "bash-watched-late", watch_id: "watch-late", match_offset: 0 }],
+    });
     expect(sessionBgStates.has("drained-child")).toBe(false);
   } finally {
     consumer.dispose();

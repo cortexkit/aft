@@ -77,7 +77,7 @@ fn answer_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             return Response::error(
                 &req.id,
                 "to_file_not_found",
-                format!("trace_to_symbol: toFile not found: {}", to_file),
+                format!("trace_to_symbol: toPath not found: {}", to_file),
             );
         }
     }
@@ -146,7 +146,7 @@ fn answer_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
                 &req.id,
                 "target_symbol_not_in_file",
                 format!(
-                    "trace_to_symbol: target symbol '{}' is not defined in toFile: {}",
+                    "trace_to_symbol: target symbol '{}' is not defined in toPath: {}",
                     to_symbol,
                     to_file_arg.unwrap_or("<unknown>")
                 ),
@@ -176,7 +176,7 @@ fn answer_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
                     &req.id,
                     "ambiguous_target",
                     format!(
-                        "trace_to_symbol: target symbol '{}' exists in multiple files; pass 'toFile' to disambiguate",
+                        "trace_to_symbol: target symbol '{}' exists in multiple files; pass 'toPath' to disambiguate",
                         to_symbol
                     ),
                     serde_json::json!({ "candidates": candidates_json }),

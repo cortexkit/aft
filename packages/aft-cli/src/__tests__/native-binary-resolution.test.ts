@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { linkCachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
 import { getAftBinaryName } from "../lib/paths.js";
+import { getSelfVersion } from "../lib/self-version.js";
 
 /** Exit code the fixture binary returns, so no other `aft` can fake a pass. */
 const FIXTURE_EXIT_CODE = 7;
@@ -67,7 +68,7 @@ function cacheOnlyInstall(prefix: string, versionDir: string | null): CacheOnlyI
 
 describe("commands that need the native binary", () => {
   test("aft index runs the binary that doctor --fix left in the cache", async () => {
-    const install = cacheOnlyInstall("aft-cli-index-cache-only-", "v0.56.2");
+    const install = cacheOnlyInstall("aft-cli-index-cache-only-", `v${getSelfVersion()}`);
 
     const result = runCli(["index"], install.env);
 

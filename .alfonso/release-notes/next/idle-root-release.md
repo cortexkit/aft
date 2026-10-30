@@ -1,1 +1,0 @@
-- Projects the AFT daemon has left idle now give back their threads, config file watches and compiled output filters, so a long-running daemon no longer grows with every project it has served.

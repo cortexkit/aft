@@ -47,6 +47,15 @@ pub enum AftError {
         path: String,
         message: String,
     },
+    /// A loose (whitespace-insensitive) match whose indentation differs from
+    /// the file in a way that has no single safe re-indentation of the
+    /// replacement. The edit is refused instead of guessing.
+    AmbiguousIndentation {
+        message: String,
+    },
+    DeniedFloor {
+        path: String,
+    },
 }
 
 impl AftError {
@@ -64,6 +73,8 @@ impl AftError {
             AftError::ScopeNotFound { .. } => "scope_not_found",
             AftError::MemberNotFound { .. } => "member_not_found",
             AftError::IoError { .. } => "io_error",
+            AftError::AmbiguousIndentation { .. } => "ambiguous_indentation",
+            AftError::DeniedFloor { .. } => "denied_floor",
         }
     }
 
@@ -81,6 +92,9 @@ impl AftError {
 impl fmt::Display for AftError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            AftError::DeniedFloor { path } => {
+                write!(f, "path '{}' is denied by the access policy floor", path)
+            }
             AftError::SymbolNotFound { name, file } => {
                 write!(f, "symbol '{}' not found in {}", name, file)
             }
@@ -149,6 +163,7 @@ impl fmt::Display for AftError {
             AftError::IoError { path, message } => {
                 write!(f, "I/O error on {}: {}", path, message)
             }
+            AftError::AmbiguousIndentation { message } => f.write_str(message),
         }
     }
 }

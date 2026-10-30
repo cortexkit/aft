@@ -1,0 +1,74 @@
+{
+  "github_reads": [
+    {
+      "request_body": null,
+      "request_line": "GET /repos/org/repo/pulls/7 HTTP/1.1",
+      "response": {
+        "base": {
+          "repo": {
+            "url": "https://api.github.com/repos/org/repo"
+          }
+        },
+        "html_url": "https://github.com/org/repo/pull/7",
+        "number": 7,
+        "user": {
+          "login": "app-fixture[bot]",
+          "type": "Bot"
+        }
+      },
+      "status": 200
+    },
+    {
+      "request_body": null,
+      "request_line": "GET /repos/org/repo/pulls/8 HTTP/1.1",
+      "response": {
+        "base": {
+          "repo": {
+            "url": "https://api.github.com/repos/org/repo"
+          }
+        },
+        "html_url": "https://github.com/org/repo/pull/8",
+        "number": 8,
+        "user": {
+          "login": "octocat",
+          "type": "User"
+        }
+      },
+      "status": 200
+    }
+  ],
+  "name": "stack-create-pr-not-own",
+  "reply": {
+    "repo_binding_generation": 1,
+    "result": {
+      "code": "stack_pr_not_own",
+      "detail": {
+        "author_login": "octocat",
+        "message": "Stack operations change only pull requests this repository's bot opened (app-fixture[bot]); #8 was opened by octocat.",
+        "number": 8
+      },
+      "refusal_code": "stack_pr_not_own",
+      "retry_same_nonce": false,
+      "status": "refused"
+    }
+  },
+  "request": {
+    "action": "api:POST:/repos/*/*/stacks",
+    "body": {
+      "pull_requests": [
+        7,
+        8
+      ]
+    },
+    "gh_route_schema": 1,
+    "manifest_version": 22,
+    "metadata": {
+      "agent_id": "alfonso-aft",
+      "pid": 4242
+    },
+    "operation": "gh.route",
+    "repository": "org/repo",
+    "rung_as_of_unix_secs": 1793066213,
+    "target": {}
+  }
+}

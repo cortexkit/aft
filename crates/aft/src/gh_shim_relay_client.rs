@@ -116,7 +116,7 @@ pub(super) fn relay_holder(entries: &[subc_client_rs::CatalogEntry]) -> Option<S
         .map(|entry| entry.module_id.clone())
 }
 
-/// How the shim reacts to a plexus refusal code.
+/// Legacy retry policy for Plexus replies without retry metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CodeClass {
     /// Resend with the same nonce after 5 s, then 10 s.
@@ -145,6 +145,7 @@ fn code_detail(code: &str) -> &str {
 pub(super) fn classify_code(code: &str) -> CodeClass {
     match code_prefix(code) {
         "nonce_in_flight"
+        | "module_warming"
         | "assertion_key_unavailable"
         | "store_failure"
         | "pre_dispatch_read_incomplete" => CodeClass::Transient,
@@ -202,32 +203,207 @@ fn detail_field(detail: &str, key: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-/// The caller-facing text for a plexus refusal that ends the command.
-pub(super) fn plexus_refusal_text(code: &str, class: CodeClass) -> String {
-    match class {
-        CodeClass::Terminal if code_prefix(code) == "agent_repository_conflict" => {
-            let detail = code_detail(code);
-            format!(
-                "plexus refused the bot write: agent_repository_conflict - this command speaks as agent {} but the repository is bound to agent {} ({code})",
-                detail_field(detail, "claimed_agent").unwrap_or_else(|| "(unnamed)".to_string()),
-                detail_field(detail, "bound_agent").unwrap_or_else(|| "(unnamed)".to_string()),
-            )
+#[derive(Clone, Copy)]
+enum GithubReach {
+    Never,
+    ReadsOnly,
+    Maybe,
+    Yes,
+}
+
+#[derive(Clone, Copy)]
+enum RefusalActor {
+    Agent,
+    Operator,
+    Nobody,
+}
+
+// More specific detail selectors precede the fallback for the same code.
+// Transmission includes reads, not just writes. A later gate can follow sent
+// steps, so phase-dependent codes must not promise that nothing reached GitHub.
+// Read-only gates stop before writes; sent-step evidence still takes precedence.
+const REFUSAL_EXPLANATIONS: &[(&str, &str, &str, GithubReach, RefusalActor)] = &[
+    ("agent_grant_absent", "", "The agent has no grant for this write.", GithubReach::Maybe, RefusalActor::Operator),
+    ("agent_grant_excludes_request", "", "The agent's grant does not cover this request.", GithubReach::Never, RefusalActor::Operator),
+    ("agent_handle_unknown", "", "The agent's GitHub bot handle is unknown.", GithubReach::Never, RefusalActor::Operator),
+    ("agent_repository_conflict", "claimed_agent=*", "This command speaks as agent {claimed_agent}, but the repository is bound to agent {bound_agent}.", GithubReach::Never, RefusalActor::Operator),
+    ("agent_repository_conflict", "", "The GitHub target does not match the bound repository.", GithubReach::ReadsOnly, RefusalActor::Agent),
+    ("argument_undeclared", "", "The request contains an unsupported identity field.", GithubReach::Never, RefusalActor::Agent),
+    ("approval_agent_mismatch", "", "The approval belongs to another agent.", GithubReach::Never, RefusalActor::Agent),
+    ("approval_denied", "", "Approval for this write was denied.", GithubReach::Never, RefusalActor::Operator),
+    ("approval_expired", "", "The approval has expired.", GithubReach::Never, RefusalActor::Agent),
+    ("call_mode_unsupported", "", "This call mode cannot make bot writes.", GithubReach::Never, RefusalActor::Agent),
+    ("comment_author_mismatch", "", "The comment was not written by the expected bot.", GithubReach::ReadsOnly, RefusalActor::Agent),
+    ("connector_home_not_held", "", "This machine does not hold permission to send GitHub requests.", GithubReach::Never, RefusalActor::Operator),
+    ("consent_unavailable", "", "This flow cannot answer the required consent prompt.", GithubReach::Never, RefusalActor::Operator),
+    ("delegating_scope_required", "", "The route has no scope authorized to act as an agent.", GithubReach::Never, RefusalActor::Agent),
+    ("flow_audience_conflict", "", "The flow's approved repository sets conflict.", GithubReach::Never, RefusalActor::Operator),
+    ("flow_not_approved", "", "The flow is not approved.", GithubReach::Never, RefusalActor::Operator),
+    ("flow_unknown", "", "The flow is unknown.", GithubReach::Never, RefusalActor::Operator),
+    ("flow_audience_excludes_repository", "", "The repository is outside the flow's approved set.", GithubReach::Never, RefusalActor::Agent),
+    ("flow_audience_mismatch", "", "The flow requires a matching agent-scoped route.", GithubReach::Never, RefusalActor::Agent),
+    ("flow_audience_unavailable", "", "The flow's approved repository set could not be read.", GithubReach::Never, RefusalActor::Operator),
+    ("flow_carrier_not_admitted", "", "This caller is not allowed to carry flow requests.", GithubReach::Never, RefusalActor::Agent),
+    ("flow_scope_required", "", "The route has no required flow scope.", GithubReach::Never, RefusalActor::Agent),
+    ("handle_credential_rejected", "", "GitHub rejected the bot's credential.", GithubReach::Yes, RefusalActor::Operator),
+    ("handle_credential_unresolvable", "class=transient", "The bot's credential is temporarily unavailable.", GithubReach::Maybe, RefusalActor::Nobody),
+    ("handle_credential_unresolvable", "", "The bot's credential could not be loaded.", GithubReach::Maybe, RefusalActor::Operator),
+    ("handle_disabled", "", "The bot handle is disabled.", GithubReach::Never, RefusalActor::Operator),
+    ("invalid_request", "", "The request has an invalid field or shape.", GithubReach::Never, RefusalActor::Agent),
+    ("module_grant_absent", "", "The calling module has no grant for this write.", GithubReach::Maybe, RefusalActor::Operator),
+    ("module_warming", "", "The module is still starting.", GithubReach::Never, RefusalActor::Nobody),
+    ("nonce_in_flight", "", "Another worker is still handling this request nonce.", GithubReach::Maybe, RefusalActor::Nobody),
+    ("nonce_payload_mismatch", "", "This nonce already belongs to a different request.", GithubReach::Maybe, RefusalActor::Agent),
+    ("not_present", "", "The GitHub target was not found.", GithubReach::ReadsOnly, RefusalActor::Agent),
+    ("outcome_unknown", "", "The GitHub read outcome is unknown.", GithubReach::Maybe, RefusalActor::Operator),
+    ("pipeline_denied", "denial=RecipientArgumentInvalid", "A permission or service check stopped the current step.", GithubReach::Maybe, RefusalActor::Agent),
+    ("pipeline_denied", "denial=ArgumentUndeclared", "A permission or service check stopped the current step.", GithubReach::Maybe, RefusalActor::Agent),
+    ("pipeline_denied", "denial=ResourceFilter(MissingRequiredFilter)", "A permission or service check stopped the current step.", GithubReach::Maybe, RefusalActor::Agent),
+    ("pipeline_denied", "denial=ResourceFilter(ValueNotAllowed)", "A permission or service check stopped the current step.", GithubReach::Maybe, RefusalActor::Agent),
+    ("pipeline_denied", "denial=ResourceFilter(WriteFiltersAbsent)", "A permission or service check stopped the current step.", GithubReach::Maybe, RefusalActor::Agent),
+    ("pipeline_denied", "", "A permission or service check stopped the current step.", GithubReach::Maybe, RefusalActor::Operator),
+    ("policy_blocked", "", "Policy blocks this write.", GithubReach::Never, RefusalActor::Operator),
+    ("pre_dispatch_read_incomplete", "reason=page_bound", "The GitHub read exceeded its page limit.", GithubReach::ReadsOnly, RefusalActor::Agent),
+    ("pre_dispatch_read_incomplete", "reason=invalid_response", "The GitHub read response could not be used.", GithubReach::Maybe, RefusalActor::Nobody),
+    ("pre_dispatch_read_incomplete", "", "The GitHub read did not finish.", GithubReach::Maybe, RefusalActor::Nobody),
+    ("pr_edit_not_own", "", "The pull request was not opened by this bot.", GithubReach::ReadsOnly, RefusalActor::Agent),
+    ("review_thread_not_own", "", "The pull request was not opened by this bot.", GithubReach::ReadsOnly, RefusalActor::Agent),
+    ("issue_edit_not_own", "", "The issue was not opened by this bot.", GithubReach::ReadsOnly, RefusalActor::Agent),
+    ("pr_head_cross_repository", "", "The pull request head is outside the bound repository.", GithubReach::Never, RefusalActor::Agent),
+    ("probe_unproven", "", "The bot handle has not passed its proof check.", GithubReach::Never, RefusalActor::Operator),
+    ("repository_unbound", "", "The repository has no bot binding.", GithubReach::Maybe, RefusalActor::Operator),
+    ("request_deadline_exceeded", "", "The request deadline expired before dispatch.", GithubReach::Never, RefusalActor::Nobody),
+    ("request_field_forbidden", "", "The request contains a forbidden field.", GithubReach::Never, RefusalActor::Agent),
+    ("request_kind_unmapped", "", "This request action or shape is not supported.", GithubReach::Never, RefusalActor::Agent),
+    ("route_not_bound", "", "The route is not bound to GitHub.", GithubReach::Never, RefusalActor::Operator),
+    ("run_scope_not_child", "", "The run scope is not a live child of the route scope.", GithubReach::Maybe, RefusalActor::Agent),
+    ("scope_ended", "", "The agent's route scope has ended.", GithubReach::Maybe, RefusalActor::Operator),
+    ("delegation_withdrawn", "", "Permission to act as this agent was withdrawn.", GithubReach::Maybe, RefusalActor::Operator),
+    ("scope_not_synced", "", "The agent's scope has not synced yet.", GithubReach::Maybe, RefusalActor::Operator),
+    ("scope_unverifiable", "", "The agent's scope could not be verified.", GithubReach::Maybe, RefusalActor::Operator),
+    ("secret_input_rejected", "", "The request contains credential material that is not allowed here.", GithubReach::Never, RefusalActor::Agent),
+    ("stale_authority", "dimension=expected_handle", "The expected bot handle has changed.", GithubReach::Never, RefusalActor::Agent),
+    ("stale_authority", "dimension=expected_binding", "The expected repository binding has changed.", GithubReach::Never, RefusalActor::Agent),
+    ("stale_authority", "", "The write's authorization changed or expired.", GithubReach::Maybe, RefusalActor::Operator),
+    ("stack_pr_not_own", "", "A stacked pull request was not opened by this bot.", GithubReach::ReadsOnly, RefusalActor::Agent),
+    ("store_failure", "", "Request storage failed.", GithubReach::Maybe, RefusalActor::Operator),
+    ("transport_not_sent", "", "The current step was not sent.", GithubReach::Maybe, RefusalActor::Operator),
+    ("vendor_rejected", "status=429", "GitHub rejected the request.", GithubReach::Yes, RefusalActor::Nobody),
+    ("vendor_rejected", "status=503", "GitHub rejected the request.", GithubReach::Yes, RefusalActor::Nobody),
+    ("vendor_rejected", "", "GitHub rejected the request.", GithubReach::Yes, RefusalActor::Agent),
+    ("agent_identity_conflict", "", "The repository is bound to another agent's bot.", GithubReach::Never, RefusalActor::Agent),
+    ("bot_write_requires_scope", "", "This session has no agent scope for bot writes.", GithubReach::Never, RefusalActor::Operator),
+    ("ticket_unknown", "", "This command's agent session ticket is no longer live.", GithubReach::Never, RefusalActor::Agent),
+    ("untrusted_principal", "", "Only first-party callers may relay bot writes.", GithubReach::Never, RefusalActor::Operator),
+];
+
+#[derive(Debug, Default, PartialEq)]
+pub(super) struct RefusalFacts {
+    retry_same_nonce: Option<bool>,
+    legs_sent: Vec<Value>,
+    not_sent: bool,
+    detail_message: Option<String>,
+}
+
+impl RefusalFacts {
+    fn from_reply(refusal: &Value) -> Self {
+        Self {
+            retry_same_nonce: refusal.get("retry_same_nonce").and_then(Value::as_bool),
+            legs_sent: refusal
+                .get("legs_sent")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            not_sent: refusal.get("transmission").and_then(Value::as_str) == Some("not_sent"),
+            detail_message: refusal
+                .pointer("/detail/message")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         }
-        CodeClass::Terminal => format!("plexus refused the bot write: {code}"),
-        CodeClass::PlexusSetup => format!(
-            "plexus configuration problem: {code} - the bot write was not attempted; the operator must fix plexus's GitHub handle, grant or assertion setup"
-        ),
-        CodeClass::Transient => format!(
-            "plexus refused the bot write: {code} (still refused after retrying with the same request nonce)"
-        ),
-        CodeClass::Remint => format!(
-            "plexus refused the bot write: {code} (a freshly minted assertion was refused too)"
-        ),
-        CodeClass::OutcomeUnknown => outcome_undetermined_text(code),
-        CodeClass::Unknown => format!(
-            "plexus refused the bot write with a code this shim does not know: {code}; it was not retried"
-        ),
     }
+}
+
+fn refusal_text(origin: &str, code: &str, facts: &RefusalFacts, budget_ms: Option<u64>) -> String {
+    let explanation = REFUSAL_EXPLANATIONS.iter().find(|(name, selector, ..)| {
+        *name == code_prefix(code)
+            && (selector.is_empty()
+                || selector.split_once('=').is_some_and(|(key, value)| {
+                    detail_field(code_detail(code), key)
+                        .is_some_and(|actual| value == "*" || actual == value)
+                }))
+    });
+    let mut text = format!("{origin} refused the bot write: {code}. ");
+    if let Some(message) = facts
+        .detail_message
+        .as_deref()
+        .filter(|_| origin == "Plexus")
+    {
+        text.push_str(message);
+    } else if let Some((_, _, sentence, _, _)) = explanation {
+        let mut sentence = sentence.to_string();
+        for key in ["claimed_agent", "bound_agent"] {
+            sentence = sentence.replace(
+                &format!("{{{key}}}"),
+                &detail_field(code_detail(code), key).unwrap_or_else(|| "(unnamed)".to_string()),
+            );
+        }
+        text.push_str(&sentence);
+    } else {
+        text.push_str("This shim does not recognize the refusal code.");
+    }
+    let reach = if !facts.legs_sent.is_empty() {
+        Some(GithubReach::Yes)
+    } else if facts.not_sent {
+        Some(GithubReach::Never)
+    } else {
+        explanation.map(|(_, _, _, reach, _)| *reach)
+    };
+    text.push_str(match reach {
+        Some(GithubReach::Never) => " Nothing reached GitHub.",
+        Some(GithubReach::ReadsOnly) => " GitHub received only reads; nothing was written.",
+        Some(GithubReach::Maybe) => " Earlier reads or writes may have reached GitHub.",
+        Some(GithubReach::Yes) => " GitHub received a request.",
+        None => " Whether anything reached GitHub is unknown.",
+    });
+    if !facts.legs_sent.is_empty() {
+        let steps: Vec<_> = facts
+            .legs_sent
+            .iter()
+            .map(|step| {
+                step.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| step.to_string())
+            })
+            .collect();
+        text.push_str(&format!(" Already-sent write steps: {}.", steps.join(", ")));
+    }
+    let actor = explanation.map(|(_, _, _, _, actor)| *actor);
+    if let Some(actor) = actor {
+        text.push_str(match actor {
+            RefusalActor::Agent => " The agent must change the request.",
+            RefusalActor::Operator => " An operator must fix the setup, grants, or policy.",
+            RefusalActor::Nobody => "",
+        });
+    }
+    if let Some(budget_ms) = budget_ms {
+        text.push_str(&format!(
+            " The relay's {budget_ms} ms budget cannot fit another retry."
+        ));
+    }
+    text.push_str(match (reach, actor) {
+        (Some(GithubReach::ReadsOnly), _) => "",
+        (Some(GithubReach::Never), Some(RefusalActor::Nobody)) => " Rerunning the command is safe.",
+        (Some(GithubReach::Never), Some(RefusalActor::Agent | RefusalActor::Operator)) => "",
+        (Some(GithubReach::Maybe | GithubReach::Yes), _) => {
+            " Check GitHub before rerunning; a rerun may repeat the steps that were sent."
+        }
+        _ => " Check GitHub before rerunning.",
+    });
+    text
+}
+
+fn plexus_refusal_text(code: &str, facts: &RefusalFacts) -> String {
+    refusal_text("Plexus", code, facts, None)
 }
 
 fn outcome_undetermined_text(code: &str) -> String {
@@ -250,6 +426,17 @@ pub(super) enum Reply {
         stage: String,
         message: String,
         generation: Option<u64>,
+        facts: RefusalFacts,
+    },
+    /// If retries do not complete, module refusals keep their historical
+    /// unknown-outcome exit while explaining the refusal itself.
+    ModuleRefused {
+        code: String,
+        facts: RefusalFacts,
+    },
+    /// The daemon refused before forwarding to a module that is still starting.
+    Warming {
+        origin: &'static str,
     },
     Malformed(String),
 }
@@ -265,19 +452,82 @@ pub(super) fn parse_reply(bytes: &[u8]) -> Reply {
     match envelope.get("status").and_then(Value::as_str) {
         Some("ok") => {
             let reply = facade_reply(&data);
+            if let Some(code) = reply
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_str)
+            {
+                return Reply::ModuleRefused {
+                    code: code.to_string(),
+                    facts: RefusalFacts::from_reply(&reply["error"]),
+                };
+            }
             let generation = reply.get("repo_binding_generation").and_then(Value::as_u64);
             let result = reply.get("result").cloned().unwrap_or(Value::Null);
+            if result["status"] == "refused"
+                && result
+                    .get("legs_sent")
+                    .and_then(Value::as_array)
+                    .is_some_and(|legs| {
+                        legs.iter()
+                            .any(|leg| leg.as_str().is_none_or(str::is_empty))
+                    })
+            {
+                return Reply::Malformed("plexus reported posted legs without valid action names; check GitHub before retrying".into());
+            }
             match result.get("status").and_then(Value::as_str) {
                 Some("completed") => Reply::Completed {
                     generation,
                     result: result.get("result").cloned().unwrap_or(Value::Null),
                 },
+                Some("refused")
+                    if result
+                        .get("legs_sent")
+                        .and_then(Value::as_array)
+                        .is_some_and(|legs| !legs.is_empty())
+                        && result.get("retry_same_nonce").and_then(Value::as_bool)
+                            != Some(true) =>
+                {
+                    let legs = result["legs_sent"].as_array().expect("checked above");
+                    // Only an explicit same-nonce retry guarantee can safely
+                    // resume a write without repeating its completed steps.
+                    Reply::Completed {
+                        generation,
+                        result: json!({
+                            "status":"partial_posted",
+                            "posted_legs":legs,
+                            "refusal_code":result.get("refusal_code").or_else(||result.get("code")).cloned().unwrap_or(Value::Null),
+                            "scope_role":result.get("scope_role").cloned().unwrap_or(Value::Null),
+                        }),
+                    }
+                }
+                Some("refused")
+                    if crate::gh_shim_speech::partner::map_refusal(
+                        &result,
+                        crate::gh_shim_speech::ScopeRole::Authority,
+                    )
+                    .is_some() =>
+                {
+                    let refusal = crate::gh_shim_speech::partner::map_refusal(
+                        &result,
+                        crate::gh_shim_speech::ScopeRole::Authority,
+                    )
+                    .expect("checked above");
+                    Reply::Refused {
+                        code: refusal.code.as_str().into(),
+                        stage: crate::gh_shim_speech::REFUSAL_STAGE.into(),
+                        message: refusal.text(),
+                        generation,
+                        facts: RefusalFacts::from_reply(&result),
+                    }
+                }
                 Some("refused") => match facade_refusal_code(&reply) {
                     Some(code) => Reply::Refused {
                         code: code.to_string(),
                         stage: PLEXUS_REPLY_STAGE.to_string(),
                         message: String::new(),
                         generation,
+                        facts: RefusalFacts::from_reply(&result),
                     },
                     None => Reply::Malformed("plexus refused without a refusal_code".to_string()),
                 },
@@ -291,6 +541,9 @@ pub(super) fn parse_reply(bytes: &[u8]) -> Reply {
                     ))
                 }
             }
+        }
+        Some("error") if data["refusal_code"] == "module_warming" && data["stage"] == "plexus" => {
+            Reply::Warming { origin: "Plexus" }
         }
         Some("error") => match data.get("refusal_code").and_then(Value::as_str) {
             Some(code) => Reply::Refused {
@@ -306,6 +559,7 @@ pub(super) fn parse_reply(bytes: &[u8]) -> Reply {
                     .unwrap_or("")
                     .to_string(),
                 generation: None,
+                facts: RefusalFacts::from_reply(&data),
             },
             None => Reply::Malformed("the relay refused without a refusal_code".to_string()),
         },
@@ -320,13 +574,23 @@ pub(super) fn parse_reply(bytes: &[u8]) -> Reply {
 /// GitHub did not return, so every field is optional; a reply with no detail
 /// prints a plain completion line.
 ///
-/// Plexus posts a close or reopen comment before it changes state and only
-/// changes state if the comment succeeded, so the partial "state applied,
-/// comment failed" rendering can never arise on this path.
+/// A multi-leg write can post a comment before its state change is stopped.
+/// Such a result reports posted actions and must never look safe to retry.
 pub(super) fn render_completed(result: &Value) -> Result<String, RouteOutcome> {
     let Some(object) = result.as_object().filter(|object| !object.is_empty()) else {
         return Ok("completed\n".to_string());
     };
+    if object.get("status").and_then(Value::as_str) == Some("partial_posted") {
+        let actions = object.get("posted_legs").cloned().unwrap_or(Value::Null);
+        let code = object
+            .get("refusal_code")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let code: String = code.chars().flat_map(char::escape_default).collect();
+        return Err(RouteOutcome::PartiallyApplied(format!(
+            "Posted as the bot: {actions}.\nThe rest of this GitHub write did not finish ({code}). Check GitHub before trying again.\n"
+        )));
+    }
     if let Some(url) = object.get("url").and_then(Value::as_str) {
         return Ok(format!("{url}\n"));
     }
@@ -373,20 +637,22 @@ fn render_thread_state_confirmation(result: &Value, request: &Value) -> Option<S
     Some(format!("✓ {past} {noun} {repository}#{number}{title}\n"))
 }
 
-fn daemon_refusal(code: &str, stage: &str, message: &str) -> RouteOutcome {
+fn daemon_refusal(code: &str, stage: &str, message: &str, facts: &RefusalFacts) -> RouteOutcome {
+    if stage == crate::gh_shim_speech::REFUSAL_STAGE
+        && crate::gh_shim_speech::Code::parse(code).is_some()
+    {
+        return RouteOutcome::RelayRefusal {
+            code: code.to_string(),
+            text: format!("{code}: {message}"),
+        };
+    }
     match code {
+        "gh_shim_worker_write_refused"=>RouteOutcome::WorkerWriteRefused,
         "ticket_absent" => RouteOutcome::NoAgentSession,
-        "ticket_unknown" => RouteOutcome::RelayRefusal {
+        // These are AFT's own pre-dispatch gates, not Plexus receipt replies.
+        "ticket_unknown" | "untrusted_principal" | "bot_write_requires_scope" | "agent_identity_conflict" => RouteOutcome::RelayRefusal {
             code: code.to_string(),
-            text: "this command's agent session ticket is not live (its command ended, or this daemon never issued it); bot speech must come from an agent's own session".to_string(),
-        },
-        "untrusted_principal" => RouteOutcome::RelayRefusal {
-            code: code.to_string(),
-            text: "the AFT daemon relays bot writes only for first-party callers".to_string(),
-        },
-        "bot_write_requires_scope" => RouteOutcome::RelayRefusal {
-            code: code.to_string(),
-            text: "AFT refused the bot write: this session's tool route has no agent scope, so bot writes are refused; a head session needs to bind with its core scope".to_string(),
+            text: refusal_text("AFT", code, facts, None),
         },
         "relay_unavailable" => RouteOutcome::Unavailable(format!(
             "the AFT daemon could not reach {} to relay the bot write, so nothing was sent: {message}",
@@ -404,10 +670,9 @@ fn daemon_refusal(code: &str, stage: &str, message: &str) -> RouteOutcome {
             ),
         },
         _ => {
-            let class = classify_code(code);
             RouteOutcome::RelayRefusal {
                 code: code.to_string(),
-                text: plexus_refusal_text(code, class),
+                text: refusal_text(if stage == "plexus" { "Plexus" } else { "AFT" }, code, facts, None),
             }
         }
     }
@@ -648,7 +913,64 @@ struct Exchange<'a, Io> {
     budget: Duration,
 }
 
+enum SendFailure {
+    Outcome(RouteOutcome),
+    Module { code: String, message: String },
+}
+
+impl SendFailure {
+    fn into_outcome(self) -> RouteOutcome {
+        match self {
+            Self::Outcome(outcome) => outcome,
+            Self::Module { code, .. } if code == "module_warming" => RouteOutcome::RelayRefusal {
+                text: refusal_text(
+                    "AFT",
+                    &code,
+                    &RefusalFacts {
+                        not_sent: true,
+                        ..RefusalFacts::default()
+                    },
+                    None,
+                ),
+                code,
+            },
+            Self::Module { code, message } => RouteOutcome::RelayRefusal {
+                text: format!("the AFT daemon refused the relay request: {code}: {message}"),
+                code,
+            },
+        }
+    }
+}
+
 impl<Io: ExchangeIo> Exchange<'_, Io> {
+    async fn retry_warming(&self, delays: &[Duration; 2], retries: &mut usize) -> bool {
+        let Some(delay) = delays.get(*retries) else {
+            return false;
+        };
+        if self.io.now() + *delay >= self.deadline() {
+            return false;
+        }
+        self.io.sleep(*delay).await;
+        *retries += 1;
+        true
+    }
+
+    async fn check_bindings_with_warming_retry(
+        &self,
+        agent_id: &str,
+        manifest: &Manifest,
+        delays: &[Duration; 2],
+        retries: &mut usize,
+    ) -> Result<BindingsCheck, RouteOutcome> {
+        loop {
+            match self.check_bindings(agent_id, manifest).await {
+                Err(RouteOutcome::RelayRefusal { code, .. })
+                    if code == "module_warming" && self.retry_warming(delays, retries).await => {}
+                result => return result,
+            }
+        }
+    }
+
     fn deadline(&self) -> Instant {
         self.started + self.budget
     }
@@ -660,17 +982,18 @@ impl<Io: ExchangeIo> Exchange<'_, Io> {
     /// Each attempt gets only what is left of the exchange's budget. With
     /// nothing left the request is not sent at all, which is a known
     /// not-sent outcome rather than an unknown one.
-    async fn send(&self, body: &Value) -> Result<Vec<u8>, RouteOutcome> {
+    async fn send(&self, body: &Value) -> Result<Vec<u8>, SendFailure> {
         *lock_probe_stage(self.stage) = ProbeStage::Request;
-        let bytes = serde_json::to_vec(body)
-            .map_err(|error| RouteOutcome::SchemaMismatch(error.to_string()))?;
+        let bytes = serde_json::to_vec(body).map_err(|error| {
+            SendFailure::Outcome(RouteOutcome::SchemaMismatch(error.to_string()))
+        })?;
         let now = self.io.now();
         let remaining = self.deadline().saturating_duration_since(now);
         if remaining.is_zero() {
-            return Err(RouteOutcome::Unavailable(format!(
+            return Err(SendFailure::Outcome(RouteOutcome::Unavailable(format!(
                 "the gh relay's {} ms budget ran out before the request could be sent; nothing was sent",
                 self.budget_ms()
-            )));
+            ))));
         }
         let options = CallOptions {
             timeout: remaining,
@@ -686,24 +1009,23 @@ impl<Io: ExchangeIo> Exchange<'_, Io> {
         }
         match self.io.request(bytes, options).await {
             Ok(bytes) => Ok(bytes),
-            Err(CallError::NotSent(_)) => Err(RouteOutcome::GovernanceUnavailable),
-            Err(CallError::Module(body)) => Err(RouteOutcome::RelayRefusal {
+            Err(CallError::NotSent(_)) => {
+                Err(SendFailure::Outcome(RouteOutcome::GovernanceUnavailable))
+            }
+            Err(CallError::Module(body)) => Err(SendFailure::Module {
                 code: body.code.clone(),
-                text: format!(
-                    "the AFT daemon refused the relay request: {}: {}",
-                    body.code, body.message
-                ),
+                message: body.message.clone(),
             }),
             // Reported as the time the whole exchange waited, which is what
             // the caller experienced; it never exceeds the budget.
-            Err(_) => Err(RouteOutcome::OutcomeUnknown {
+            Err(_) => Err(SendFailure::Outcome(RouteOutcome::OutcomeUnknown {
                 elapsed_ms: self
                     .io
                     .now()
                     .saturating_duration_since(self.started)
                     .min(self.budget)
                     .as_millis() as u64,
-            }),
+            })),
         }
     }
 
@@ -719,16 +1041,20 @@ impl<Io: ExchangeIo> Exchange<'_, Io> {
             // The daemon ignores agent_id: plexus answers the binding read
             // with every repository's binding, whoever asks. It is still sent
             // so a daemon from before this change keeps answering.
-            "params": {"ticket": self.ticket, "agent_id": agent_id},
+            "params": {"ticket": self.ticket, "agent_id": agent_id,"purpose":"speech"},
         });
-        let bytes = self.send(&body).await.map_err(|outcome| match outcome {
-            // A read cannot have written anything, so an unanswered read is
-            // simply unavailable rather than an unknown write outcome.
-            RouteOutcome::OutcomeUnknown { .. } => RouteOutcome::Unavailable(
-                "plexus's repository bindings could not be read for the version check".to_string(),
-            ),
-            other => other,
-        })?;
+        let bytes = self
+            .send(&body)
+            .await
+            .map_err(|error| match error.into_outcome() {
+                // A read cannot have written anything, so an unanswered read is
+                // simply unavailable rather than an unknown write outcome.
+                RouteOutcome::OutcomeUnknown { .. } => RouteOutcome::Unavailable(
+                    "plexus's repository bindings could not be read for the version check"
+                        .to_string(),
+                ),
+                other => other,
+            })?;
         let envelope: Value = serde_json::from_slice(&bytes).map_err(|_| {
             RouteOutcome::SchemaMismatch("the bindings read reply was not JSON".to_string())
         })?;
@@ -740,7 +1066,12 @@ impl<Io: ExchangeIo> Exchange<'_, Io> {
                 .unwrap_or("relay_refused");
             let stage = data.get("stage").and_then(Value::as_str).unwrap_or("relay");
             let message = data.get("message").and_then(Value::as_str).unwrap_or("");
-            return Err(daemon_refusal(code, stage, message));
+            return Err(daemon_refusal(
+                code,
+                stage,
+                message,
+                &RefusalFacts::from_reply(&data),
+            ));
         }
         let reply = facade_reply(&data);
         if let Some(code) = facade_refusal_code(&reply) {
@@ -748,7 +1079,7 @@ impl<Io: ExchangeIo> Exchange<'_, Io> {
                 code: code.to_string(),
                 text: format!(
                     "plexus refused the repository bindings read for the version check: {}",
-                    plexus_refusal_text(code, classify_code(code))
+                    plexus_refusal_text(code, &RefusalFacts::from_reply(&reply["result"]))
                 ),
             });
         }
@@ -779,10 +1110,10 @@ impl<Io: ExchangeIo> Exchange<'_, Io> {
     }
 }
 
-/// Send one governed request through the relay, retrying only as the plexus
-/// refusal class allows and always with this invocation's single nonce. The
-/// whole exchange shares one budget: attempts and retry sleeps come out of
-/// it, and a retry sleep that would run past it is not taken.
+/// Send one governed request through the relay with one nonce. Explicit retry
+/// metadata controls resends; older replies use the legacy refusal classes.
+/// Attempts and retry sleeps share one budget, so a retry sleep that would run
+/// past the deadline is not taken.
 #[allow(clippy::too_many_arguments)]
 async fn exchange(
     exchange: &Exchange<'_, impl ExchangeIo>,
@@ -792,11 +1123,17 @@ async fn exchange(
     body: &Value,
     transient_delays: [Duration; 2],
 ) -> RouteOutcome {
+    let mut transient_retries = 0_usize;
     let mut confirmed =
         load_check(paths).filter(|check| check.manifest_version == manifest.manifest_version);
     if confirmed.is_none() {
         match exchange
-            .check_bindings(&agent_binding.agent_id, manifest)
+            .check_bindings_with_warming_retry(
+                &agent_binding.agent_id,
+                manifest,
+                &transient_delays,
+                &mut transient_retries,
+            )
             .await
         {
             Ok(check) => {
@@ -806,17 +1143,29 @@ async fn exchange(
             Err(outcome) => return outcome,
         }
     }
-    let mut transient_retries = 0_usize;
     let mut reminted = false;
+    let mut sent_steps = Vec::new();
     loop {
-        let bytes = match exchange.send(body).await {
-            Ok(bytes) => bytes,
-            Err(outcome) => return outcome,
+        let mut reply = match exchange.send(body).await {
+            Ok(bytes) => parse_reply(&bytes),
+            Err(SendFailure::Module { code, .. }) if code == "module_warming" => {
+                Reply::Warming { origin: "AFT" }
+            }
+            Err(error) => return error.into_outcome(),
         };
-        let reply = parse_reply(&bytes);
+        if let Reply::Refused { facts, .. } | Reply::ModuleRefused { facts, .. } = &mut reply {
+            // An early gate on a later retry may not know which steps an
+            // earlier attempt sent. Keep those steps in the final warning.
+            for step in &facts.legs_sent {
+                if !sent_steps.contains(step) {
+                    sent_steps.push(step.clone());
+                }
+            }
+            facts.legs_sent.clone_from(&sent_steps);
+        }
         let reply_generation = match &reply {
             Reply::Completed { generation, .. } | Reply::Refused { generation, .. } => *generation,
-            Reply::Malformed(_) => None,
+            Reply::Malformed(_) | Reply::ModuleRefused { .. } | Reply::Warming { .. } => None,
         };
         // A new binding generation means plexus's bindings changed since the
         // last check; compare again before trusting the next write.
@@ -827,7 +1176,12 @@ async fn exchange(
                 .is_none_or(|check| check.repo_binding_generation != generation)
             {
                 match exchange
-                    .check_bindings(&agent_binding.agent_id, manifest)
+                    .check_bindings_with_warming_retry(
+                        &agent_binding.agent_id,
+                        manifest,
+                        &transient_delays,
+                        &mut transient_retries,
+                    )
                     .await
                 {
                     Ok(check) => {
@@ -841,7 +1195,47 @@ async fn exchange(
                 }
             }
         }
+        let retry_same_nonce = match &reply {
+            Reply::Refused { facts, .. } | Reply::ModuleRefused { facts, .. } => {
+                facts.retry_same_nonce
+            }
+            _ => None,
+        };
+        let mut retry_budget_ms = None;
+        if retry_same_nonce == Some(true) {
+            if let Some(outcome) = mismatch {
+                return outcome;
+            }
+            // Keep using the final backoff after the first two retries. The
+            // shared deadline, not the legacy attempt cap, bounds explicit retries.
+            let delay = transient_delays[transient_retries.min(transient_delays.len() - 1)];
+            if exchange.io.now() + delay < exchange.deadline() {
+                exchange.io.sleep(delay).await;
+                transient_retries += 1;
+                continue;
+            }
+            retry_budget_ms = Some(exchange.budget_ms());
+        }
         match reply {
+            Reply::Warming { origin } => {
+                if exchange
+                    .retry_warming(&transient_delays, &mut transient_retries)
+                    .await
+                {
+                    continue;
+                }
+                // module_warming is refused before forwarding. Do not infer
+                // the same guarantee for other daemon or transport errors.
+                let facts = RefusalFacts {
+                    not_sent: true,
+                    legs_sent: sent_steps,
+                    ..RefusalFacts::default()
+                };
+                return RouteOutcome::RelayRefusal {
+                    code: "module_warming".to_string(),
+                    text: refusal_text(origin, "module_warming", &facts, None),
+                };
+            }
             Reply::Completed { result, .. } => {
                 let outcome = if let Some(output) =
                     render_thread_state_confirmation(&result, &body["params"]["request"])
@@ -867,29 +1261,38 @@ async fn exchange(
                     "unreadable plexus reply: {message}"
                 )));
             }
+            Reply::ModuleRefused { code, facts } => {
+                return RouteOutcome::OutcomeUndetermined(refusal_text(
+                    "Plexus",
+                    &code,
+                    &facts,
+                    retry_budget_ms,
+                ));
+            }
             Reply::Refused {
                 code,
                 stage,
                 message,
+                facts,
                 ..
             } => {
                 if let Some(outcome) = mismatch {
                     return outcome;
                 }
                 if stage != PLEXUS_REPLY_STAGE {
-                    return daemon_refusal(&code, &stage, &message);
+                    return daemon_refusal(&code, &stage, &message, &facts);
                 }
                 let class = classify_code(&code);
-                match class {
-                    CodeClass::Transient if transient_retries < transient_delays.len() => {
+                match (retry_same_nonce, class) {
+                    (None, CodeClass::Transient) if transient_retries < transient_delays.len() => {
                         let delay = transient_delays[transient_retries];
                         if exchange.io.now() + delay >= exchange.deadline() {
-                            // Plexus refused this attempt, so nothing was
-                            // written; stopping here is a named refusal.
                             return RouteOutcome::RelayRefusal {
-                                text: format!(
-                                    "plexus refused the bot write: {code} (transient, but the gh relay's {} ms budget would run out before the next retry, so it was not resent)",
-                                    exchange.budget_ms()
+                                text: refusal_text(
+                                    "Plexus",
+                                    &code,
+                                    &facts,
+                                    Some(exchange.budget_ms()),
                                 ),
                                 code,
                             };
@@ -897,13 +1300,18 @@ async fn exchange(
                         exchange.io.sleep(delay).await;
                         transient_retries += 1;
                     }
-                    CodeClass::Remint if !reminted => reminted = true,
-                    CodeClass::OutcomeUnknown => {
-                        return RouteOutcome::OutcomeUndetermined(outcome_undetermined_text(&code))
+                    (None, CodeClass::Remint) if !reminted => reminted = true,
+                    (_, CodeClass::OutcomeUnknown) => {
+                        return RouteOutcome::OutcomeUndetermined(refusal_text(
+                            "Plexus",
+                            &code,
+                            &facts,
+                            retry_budget_ms,
+                        ))
                     }
                     _ => {
                         return RouteOutcome::RelayRefusal {
-                            text: plexus_refusal_text(&code, class),
+                            text: refusal_text("Plexus", &code, &facts, retry_budget_ms),
                             code,
                         }
                     }
@@ -943,12 +1351,14 @@ pub(super) fn route(
     let project_root = project_root_for(&cwd);
     // One nonce per invocation: every resend of this request reuses it, so
     // plexus can tell a retry from a second write.
+    let invocation = request.invocation.clone();
     let body = json!({
         "op": BOT_REQUEST_OPERATION,
         "params": {
             "ticket": ticket,
             "request_nonce": new_nonce(),
             "request": governed_wire_request(determination, &agent_binding.agent_id, request),
+            "invocation":invocation,
         },
     });
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -1143,6 +1553,10 @@ fn describe_session_agent_mismatch(
 #[cfg(test)]
 #[path = "gh_shim_relay_client_tests.rs"]
 pub(super) mod tests;
+
+#[cfg(test)]
+#[path = "gh_shim_speech/partner_client_tests.rs"]
+mod partner_contract_tests;
 
 /// Resolve session kind from the daemon's ticket record, never from a body claim.
 pub(super) fn worker_session(relay: &RelayContext) -> Result<Option<bool>, String> {

@@ -103,7 +103,10 @@ async function bootLocation(context, location, dependencies) {
     ? consumers.subcWakes?.(() => pool, directory)
     : undefined;
   // getPool is only called on a version mismatch, after the pool exists.
-  const pool = await dependencies.acquireBridge(directory, {
+  let pool;
+  let liveConfigReload;
+  try {
+  pool = await dependencies.acquireBridge(directory, {
     harness: "opencode",
     binaryPath: environment.binaryPath,
     poolOptions: {
@@ -152,7 +155,7 @@ async function bootLocation(context, location, dependencies) {
   const hintsBlock = hints === null ? null : renameV2ToolReferences(hints);
   // Keep this Location's live config keys current when a config file changes.
   // The finalizer that releases the bridge also stops the watch.
-  const liveConfigReload = dependencies.startLiveConfigReload({
+  liveConfigReload = dependencies.startLiveConfigReload({
     directory,
     initialSources: bootstrap.sources ?? [],
     initialSourceTexts: bootstrap.sourceTexts,
@@ -164,6 +167,15 @@ async function bootLocation(context, location, dependencies) {
     notify,
   });
   return { consumers, pool, tools, liveConfigReload, toolContext, directory, hintsBlock, subcWakes };
+  } catch (error) {
+    // Boot failures precede finalizer ownership, so unwind every acquired resource here.
+    await Promise.allSettled([
+      Promise.resolve().then(() => liveConfigReload?.stop()),
+      Promise.resolve().then(() => consumers.dispose?.()),
+      Promise.resolve().then(() => pool && dependencies.releaseBridge(pool)),
+    ]);
+    throw error;
+  }
 }
 
 /**
@@ -230,7 +242,20 @@ export function makeServerEffect(overrides = {}) {
       // The host runs this program under Effect.ignoreCause, so a rejected boot
       // would otherwise leave the Location without AFT and without any log.
       // Interruption is the host disposing the Location mid-boot, not a failure.
-      const runtime = yield* Effect.promise(() => bootLocation(context, location, dependencies)).pipe(
+      const runtime = yield* Effect.acquireRelease(
+        Effect.promise(() => bootLocation(context, location, dependencies)),
+        (runtime) => Effect.promise(async () => {
+          try {
+            runtime.liveConfigReload?.stop();
+          } finally {
+            try {
+              runtime.consumers.dispose?.();
+            } finally {
+              if (runtime.pool) await dependencies.releaseBridge(runtime.pool);
+            }
+          }
+        }),
+      ).pipe(
         Effect.tapCause((cause) =>
           Effect.sync(() => {
             if (Cause.hasInterruptsOnly(cause)) return;
@@ -249,13 +274,6 @@ export function makeServerEffect(overrides = {}) {
         return;
       }
 
-      yield* Effect.addFinalizer(() =>
-        Effect.promise(async () => {
-          runtime.liveConfigReload?.stop();
-          runtime.consumers.dispose?.();
-          await dependencies.releaseBridge(runtime.pool);
-        }),
-      );
       const rpc = yield* dependencies.registerRpc(context, location, runtime.pool);
       yield* Effect.addFinalizer(() => Effect.promise(() => rpc.dispose()));
       yield* registerV2SessionLifecycle(context, runtime.toolContext);

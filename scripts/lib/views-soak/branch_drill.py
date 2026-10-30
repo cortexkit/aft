@@ -30,6 +30,7 @@ from common import (
     git_bytes,
     git_text,
     health_snapshot,
+    index_event_root_matches,
     manifest_entry_count,
     manifest_fingerprint,
     markdown_cell,
@@ -461,6 +462,11 @@ def contention_metrics(text: str, root: Path) -> dict[str, Any]:
     tier2_categories: list[str] = []
     for line in text.splitlines():
         root_owned = any(marker in line for marker in root_markers)
+        if "index_event " in line and (match := re.search(r"\broot=(\S+)", line)):
+            root_owned = any(
+                index_event_root_matches(match.group(1), str(candidate))
+                for candidate in (root, root.resolve())
+            )
         if "index_event kind=build_progress" in line and root_owned:
             build_progress_lines += 1
         if "tier2 refresh scheduled" in line:
@@ -684,7 +690,14 @@ def perform_switch(
     index_events = [
         line
         for line in log_text.splitlines()
-        if "index_event " in line and any(marker in line for marker in root_markers)
+        if "index_event " in line and (
+            any(marker in line for marker in root_markers)
+            or any(
+                index_event_root_matches(match.group(1), str(candidate))
+                for match in re.finditer(r"\broot=(\S+)", line)
+                for candidate in (checkout, checkout.resolve())
+            )
+        )
     ][-200:]
     after_generation = current_generation(view_dir) if views_on else None
     after_manifest_fingerprint = (

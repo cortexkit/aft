@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/aft", "crates/aft-tokenizer", "crates/aft-fake-lsp"]
+members = [
+    "crates/aft",
+    "crates/aft-tokenizer",
+    "crates/aft-fake-lsp",
+    "crates/secret-rules",
+]
 default-members = ["crates/aft", "crates/aft-tokenizer"]
 
 # MSRV contract: the locked oxc 0.126 dependency family requires rustc 1.92,
@@ -53,6 +58,11 @@ panic = "unwind"
 # The latency harness keeps release optimization and absolute bounds, but does
 # not ship its binaries. Parallel codegen without LTO avoids the fat-LTO link
 # paid by production artifacts; CI also checks delayed-response controls.
+# The search-quality gate in tests.yml also builds its scored binary with this
+# profile: repeated benchmark runs gave real-query rows byte-identical to the
+# shipped [profile.release] build's. Re-prove that before changing a setting
+# here that could alter program semantics (for example enabling debug-assertions
+# or overflow checks).
 [profile.ci-storm]
 inherits = "release"
 opt-level = 3

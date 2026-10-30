@@ -1,0 +1,10 @@
+{
+  "bash": {
+    "env": {
+      "TZ": "UTC"
+    },
+    "runon_env": [
+      "TZ"
+    ]
+  }
+}

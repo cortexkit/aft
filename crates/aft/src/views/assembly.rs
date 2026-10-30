@@ -5,6 +5,7 @@ use std::time::Instant;
 
 #[cfg(test)]
 use rusqlite::Connection;
+#[cfg(test)]
 use rusqlite::OptionalExtension;
 
 use crate::alias::{head_tree_entries, AliasStore, GitMode};
@@ -18,6 +19,67 @@ use super::{
     PublicationClosure, PublicationRequest, PublishOutcome, RegularPlanes, RelPath, Result,
     ViewError, ViewStore,
 };
+
+#[path = "manifest_incremental.rs"]
+mod manifest_incremental;
+
+pub(crate) use manifest_incremental::CacheLease;
+
+pub(crate) fn release_manifest_cache(view_dir: &Path) {
+    manifest_incremental::release_cache(view_dir);
+}
+
+pub(crate) fn try_release_manifest_cache(view_dir: &Path) -> bool {
+    manifest_incremental::try_release_cache(view_dir)
+}
+
+#[cfg(test)]
+#[path = "manifest_publication_bench.rs"]
+mod manifest_publication_bench;
+
+pub(crate) fn full_verification_due(view_dir: &Path) -> bool {
+    manifest_incremental::full_verification_due(view_dir)
+}
+
+/// Avoid build admission for notifications outside committed membership. This
+/// does not replace rescans, semantic handoffs, artifact repair or graph builds.
+pub(crate) fn can_skip_irrelevant_paths(request: &AssemblyRequest, defer_derived: bool) -> bool {
+    let check = || -> Result<bool> {
+        let Some(view) =
+            ViewStore::existing_dir(ViewStore::cache_key(&request.storage, &request.scope)?)
+        else {
+            return Ok(false);
+        };
+        manifest_incremental::irrelevant_delta(request, &view, || {
+            if settle_gate(view.view_dir())
+                .outstanding
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0
+            {
+                return Ok(false);
+            }
+            let status = PathStatusStore::open(view.view_dir())
+                .and_then(|status| status.summary())
+                .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+            if status.pending_count != 0 || status.failed_count != 0 {
+                return Ok(false);
+            }
+            let Some(generation) = view.current_generation_read_only()? else {
+                return Ok(false);
+            };
+            if defer_derived && !super::read::derived_built(view.view_dir(), &generation) {
+                return Ok(true);
+            }
+            crate::callgraph_store::manifest_view_database_ready(
+                view.view_dir(),
+                &generation,
+                Instant::now() + crate::db::STEADY_BUSY_TIMEOUT,
+            )
+            .map_err(|error| ViewError::InvalidManifest(error.to_string()))
+        })
+    };
+    check().unwrap_or(false)
+}
 
 #[derive(Clone, Debug)]
 pub struct AssemblyRequest {
@@ -124,6 +186,14 @@ pub struct PreparedAssembly {
     publication: Option<super::PreparedPublication>,
     files: Option<(ViewStore, String)>,
     derived_checkpoint: Option<(PathBuf, crate::db::file_identity::IdentityConnection)>,
+    /// The family index row this generation's ready derived database earns
+    /// once published: the index path, this scope and the output identity.
+    derived_index_entry: Option<(PathBuf, String, [u8; 32])>,
+    /// That row once the generation is published, waiting for
+    /// `settle_status` to write it outside the publisher's commit barrier.
+    committed_index_entry: Option<IndexEntry>,
+    committed_sweep: Option<ViewStore>,
+    post_publication_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pin: Option<AssemblyPin>,
     _base_pin: Option<crate::pins::QueryPin>,
     profile: PublicationProfile,
@@ -131,6 +201,19 @@ pub struct PreparedAssembly {
     settlement: Option<StatusSettlement>,
     /// Status changes the commit accepted, waiting for `settle_status`.
     committed_settlement: Option<StatusSettlement>,
+    manifest_cache: Option<(ViewStore, manifest_incremental::CachedManifest, bool)>,
+    _verification: manifest_incremental::PreparationVerification,
+}
+
+#[cfg(test)]
+pub(crate) fn seed_labels_for_test(
+    prepared: &PreparedAssembly,
+) -> (&'static str, &'static str, &'static str) {
+    (
+        prepared.profile.seed_source,
+        prepared.profile.clone_mechanism,
+        prepared.profile.cold_build_reason,
+    )
 }
 
 /// The path-status changes a complete assembly computed: pending rows to
@@ -242,12 +325,132 @@ fn run_before_settle_write(view_dir: &Path) {
     }
 }
 
+/// A derived-output index row for a published generation, written after the
+/// publisher leaves its commit barrier.
+struct IndexEntry {
+    view: ViewStore,
+    index: PathBuf,
+    scope: String,
+    generation: String,
+    identity: [u8; 32],
+}
+
+/// What became of an [`IndexEntry`], for tests.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IndexWrite {
+    Recorded,
+    /// Another generation is served by now, so the row would name a
+    /// generation nobody serves.
+    Superseded,
+    /// The write failed (for example the index stayed locked) and was logged.
+    Failed,
+}
+
+impl IndexEntry {
+    /// Record the row unless the view no longer serves this generation. The
+    /// row is a hint for other scopes' seeding: losing it only costs a missed
+    /// reuse, so a failure is logged and never fails the publication.
+    ///
+    /// The view's settle gate serializes the check with the write, so an
+    /// older publication cannot overwrite the row of a newer one that
+    /// published between the check and the write.
+    fn write(self) {
+        let gate = settle_gate(self.view.view_dir());
+        let _serial = gate
+            .serial
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(test)]
+        run_before_index_write(self.view.view_dir());
+        let outcome = match self.view.current_generation() {
+            Ok(Some(served)) if served == self.generation => {
+                match derived_index::record(
+                    &self.index,
+                    &self.scope,
+                    &self.generation,
+                    &self.identity,
+                ) {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+            Ok(_) => {
+                log::info!(
+                    "view derived index skipped: scope={} generation={} is no longer served",
+                    self.scope,
+                    self.generation
+                );
+                #[cfg(test)]
+                note_index_write(self.view.view_dir(), IndexWrite::Superseded);
+                return;
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        match outcome {
+            Ok(()) => {
+                #[cfg(test)]
+                note_index_write(self.view.view_dir(), IndexWrite::Recorded);
+            }
+            Err(error) => {
+                log::warn!(
+                    "view derived index not updated: scope={} generation={} error={error}",
+                    self.scope,
+                    self.generation
+                );
+                #[cfg(test)]
+                note_index_write(self.view.view_dir(), IndexWrite::Failed);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+static BEFORE_INDEX_WRITE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, SettleHook>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+static INDEX_WRITES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<IndexWrite>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// The outcomes of every derived-index write for `view_dir` so far.
+#[cfg(test)]
+pub(crate) fn index_writes_for_test(view_dir: &Path) -> Vec<IndexWrite> {
+    INDEX_WRITES
+        .lock()
+        .unwrap()
+        .get(view_dir)
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn run_before_index_write(view_dir: &Path) {
+    let hook = BEFORE_INDEX_WRITE.lock().unwrap().get(view_dir).cloned();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn note_index_write(view_dir: &Path, outcome: IndexWrite) {
+    INDEX_WRITES
+        .lock()
+        .unwrap()
+        .entry(view_dir.to_path_buf())
+        .or_default()
+        .push(outcome);
+}
+
 impl PreparedAssembly {
     pub fn report(&self) -> &AssemblyReport {
         &self.report
     }
 
     pub fn commit(&mut self) -> Result<AssemblyReport> {
+        let _store_writes = self.profile.store_writes.enter();
         if let Some(publication) = self.publication.take() {
             let retires_legacy_plane = publication.base_generation.is_none();
             let attempted_generation = publication.generation.clone();
@@ -257,7 +460,24 @@ impl PreparedAssembly {
             match outcome? {
                 PublishOutcome::Published => {
                     self.report.published = true;
-                    self.files = None;
+                    // Only moved aside here: the commit runs under the root's
+                    // write gate and the process-wide job table, and the
+                    // index is a shared SQLite file another process may hold.
+                    // `settle_status` writes it after both are released.
+                    if let (Some((index, scope, identity)), Some((view, _)), Some(generation)) = (
+                        self.derived_index_entry.take(),
+                        self.files.as_ref(),
+                        self.report.generation.as_ref(),
+                    ) {
+                        self.committed_index_entry = Some(IndexEntry {
+                            view: view.clone(),
+                            index,
+                            scope,
+                            generation: generation.clone(),
+                            identity,
+                        });
+                    }
+                    self.committed_sweep = self.files.take().map(|(view, _)| view);
                     if retires_legacy_plane {
                         log::info!(
                             "views: root={} legacy plane retired at generation={}",
@@ -274,6 +494,9 @@ impl PreparedAssembly {
                             path,
                             connection,
                             self.profile.root.clone(),
+                            self.committed_sweep.clone().map(|view| {
+                                (view, std::sync::Arc::clone(&self.post_publication_ready))
+                            }),
                         );
                     }
                     self.profile.outcome = "published";
@@ -295,6 +518,9 @@ impl PreparedAssembly {
             // manifest equals the current generation's, so it describes the
             // generation being served and applies as is.
             self.accept_settlement();
+        }
+        if let Some((view, cached, verified)) = self.manifest_cache.take() {
+            manifest_incremental::remember(&view, cached, verified, &self._verification);
         }
         self.profile.finish();
         Ok(AssemblyReport {
@@ -327,7 +553,30 @@ impl PreparedAssembly {
     /// generation is already current, so a write that fails does not fail
     /// the publication: it is logged, the transaction rolls back, and the next
     /// publication of the view (a no-op included) computes the changes again.
+    ///
+    /// It also writes the derived-output index row a published generation
+    /// earned (see [`IndexEntry::write`]), for the same reason: that write
+    /// opens a shared SQLite file and may wait on another process.
     pub fn settle_status(&mut self) -> SettleOutcome {
+        if let Some(view) = self.committed_sweep.take() {
+            // The commit barrier is released before settlement. Release the
+            // assembly's pins too, so cleanup does not retain its old base.
+            self.pin.take();
+            self._base_pin.take();
+            self.post_publication_ready
+                .store(true, std::sync::atomic::Ordering::Release);
+            super::generation::schedule_generation_sweep(view);
+        }
+        if let Some(entry) = self.committed_index_entry.take() {
+            // `commit` has already closed the publication's I/O phases, so this
+            // write is measured as its own interval and added to the same
+            // record, which is logged when the assembly is dropped.
+            let started = Instant::now();
+            let before = super::io::Bytes::capture();
+            entry.write();
+            self.profile
+                .record_derived_index_write(before, super::io::Bytes::capture(), started);
+        }
         let Some(settlement) = self.committed_settlement.take() else {
             return SettleOutcome::Nothing;
         };
@@ -365,6 +614,10 @@ impl Drop for PreparedAssembly {
         // cleanup, otherwise the file-identity guard correctly refuses unlink
         // and leaves an entire unpublished database behind on every retry.
         self.derived_checkpoint.take();
+        // The uncommitted publication pins its own generation against
+        // concurrent sweeps. Release it first, or the read-marker check below
+        // sees that pin and keeps the abandoned files.
+        self.publication.take();
         if let Some((view, generation)) = &self.files {
             if view
                 .current_generation()
@@ -407,6 +660,13 @@ pub fn prepare_checkout_deferring(
     defer_derived: bool,
     phase: &mut impl FnMut(&str) -> Result<()>,
 ) -> Result<PreparedAssembly> {
+    // Register before delays, callbacks or opening stores: lifecycle release
+    // must invalidate every preparation already admitted for this view.
+    let verification = manifest_incremental::begin_preparation(&ViewStore::cache_key(
+        &request.storage,
+        &request.scope,
+    )?);
+    let verification_due = verification.due;
     publication_delay_for_test();
     let readiness_deadline = Instant::now() + crate::db::STEADY_BUSY_TIMEOUT;
     let mut timing = super::profile::PublicationTiming::new(&request.project_root);
@@ -416,18 +676,32 @@ pub fn prepare_checkout_deferring(
     // rather than only where the scheduler happened to compute it.
     super::cache_head_fingerprint(request.project_root.clone(), request.desired_head.clone());
     let mut profile = PublicationProfile::new(&request.project_root);
+    profile.scheduling =
+        super::publication_reason::Reason::current().fields(&request.changed_paths);
+    let _store_writes = profile.store_writes.enter();
     profile.enter(0, phase)?;
     let view = ViewStore::open(&request.storage, &request.scope)?;
     let current_generation = view.current_generation()?;
+    if current_generation.as_deref().is_some_and(|generation| {
+        !super::generation_matches_head(generation, &request.desired_head)
+    }) {
+        let mut reason = super::publication_reason::Reason::current();
+        reason.head = true;
+        profile.scheduling = reason.fields(&request.changed_paths);
+    }
     let base_pin = current_generation
         .as_deref()
         .map(|generation| crate::pins::QueryPin::acquire(view.view_dir(), generation))
         .transpose()
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
-    let previous = current_generation
-        .as_deref()
-        .map(|generation| view.load_manifest(generation))
-        .transpose()?;
+    let cached = manifest_incremental::previous(&view, current_generation.as_deref());
+    let previous = match &cached {
+        Some(cached) => Some(cached.manifest.clone()),
+        None => current_generation
+            .as_deref()
+            .map(|generation| view.load_manifest(generation))
+            .transpose()?,
+    };
     // A generation published while its derived graph was deferred has no
     // derived file. That is no base at all, not a base that failed a check.
     let current_derived_built = current_generation
@@ -484,8 +758,13 @@ pub fn prepare_checkout_deferring(
     let marked_through = status
         .mark_epoch()
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
-    let head = head_tree_entries(&request.project_root)
-        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+    let manifest_incremental::HeadRead {
+        tree: head_tree,
+        entries: head,
+        cached: head_cached,
+        snapshot: mut head_snapshot,
+        paths: head_paths,
+    } = manifest_incremental::head(request, &view)?;
     profile.head_ms = head_started.elapsed().as_millis();
     timing.phase("head_tree");
     let mut callgraph = BlobStore::open(
@@ -504,16 +783,52 @@ pub fn prepare_checkout_deferring(
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
 
     timing.phase("store_opens");
-    let previous_entries = previous
-        .as_ref()
-        .map(|manifest| {
-            manifest
-                .entries()
-                .map(|(path, entry)| (path.as_bytes().to_vec(), entry.clone()))
-                .collect::<BTreeMap<_, _>>()
-        })
-        .unwrap_or_default();
-    let rebuild_all = request.changed_paths.is_empty();
+    let stamps = manifest_incremental::StoreStamps::read(&callgraph, &semantic)?;
+    let admission = manifest_incremental::admission_snapshot(&request.storage);
+    let trusted = cached.as_ref().filter(|cached| cached.stamps == stamps);
+    // A watcher batch reads again only what it names: named members, and every
+    // member under a named HEAD directory, since a directory notification may
+    // be the only evidence for changed, removed or renamed children. Every
+    // other member keeps its previous entry. The whole checkout is read when
+    // there is no batch (a rescan, an ignore-rule change, a periodic
+    // verification), when HEAD or the index moved since the cached manifest,
+    // and when the batch names no member or HEAD directory, or names a path
+    // that may be a member under another spelling.
+    let reread_directories = if request.changed_paths.is_empty()
+        || !head_cached
+        || cached
+            .as_ref()
+            .is_none_or(|cached| cached.tree != head_tree)
+    {
+        None
+    } else {
+        manifest_incremental::checkout_delta_scope(
+            request,
+            &head,
+            &head_paths,
+            head_snapshot.as_ref(),
+        )
+    };
+    let rebuild_all = reread_directories.is_none();
+    let reread_directories = reread_directories.unwrap_or_default();
+    let reread = |path: &[u8]| {
+        request.changed_paths.contains(path)
+            || manifest_incremental::within_directories(&reread_directories, path)
+    };
+    // Cached metadata stands in for a stat only when the stores and the
+    // registry of live databases are unchanged since the cached manifest.
+    let incremental = !rebuild_all
+        && trusted.is_some()
+        && cached
+            .as_ref()
+            .is_some_and(|cached| cached.admission == admission);
+    // A periodic verification checks the incremental claims against a fresh
+    // full read. When this publication listed HEAD afresh and read every member
+    // anyway (no batch, or the HEAD listing was not reusable), it makes no
+    // incremental claim: reading the checkout a second time would only repeat
+    // the same read, and an unchanged result is then a no-op below like any
+    // other identical manifest.
+    let verify = verification_due && previous.is_some() && !(rebuild_all && !head_cached);
     let assembly_started = Instant::now();
     let mut blocking_paths = BTreeSet::new();
     let mut semantic_pending_paths = BTreeSet::new();
@@ -527,41 +842,68 @@ pub fn prepare_checkout_deferring(
     // from the bytes in hand so classifying it later needs no second read.
     let mut fresh_semantic_classes = std::collections::HashMap::new();
     let mut candidates = Vec::with_capacity(head.len());
+    let mut member_metadata = BTreeMap::new();
     let reader = CandidateReader {
         request,
-        previous_entries: &previous_entries,
+        previous: previous.as_ref(),
         callgraph: &callgraph,
     };
 
     #[cfg(test)]
-    let head = rewrite_head_for_test(head);
-    for tracked in head {
+    let head = std::sync::Arc::new(rewrite_head_for_test((*head).clone()));
+    for tracked in head.iter().cloned() {
         let rel_path = RelPath::new(tracked.rel_path.clone())?;
         let absolute = request
             .project_root
             .join(path_from_bytes(&tracked.rel_path));
         // Git membership includes database fixtures and internal storage. Omit
         // them before either opening bytes or reusing an older manifest entry.
-        if crate::project_content::is_excluded(&absolute) {
+        // A watcher-complete delta also permits reusing regular-file identity.
+        // Recheck live registrations against that identity: a source can become
+        // a database without its inode changing. Symlinks take fresh admission
+        // because their target can change independently of the link itself.
+        let cached_metadata = cached
+            .as_ref()
+            .and_then(|cached| cached.metadata.get(&tracked.rel_path))
+            .filter(|metadata| incremental && !reread(&tracked.rel_path) && metadata.is_file());
+        let excluded = match cached_metadata {
+            Some(metadata) => {
+                crate::project_content::is_excluded_event(&absolute)
+                    || crate::db::file_identity::is_live_sqlite_file_with_metadata(
+                        &absolute,
+                        Some(metadata),
+                    )
+            }
+            None => crate::project_content::is_excluded(&absolute),
+        };
+        if excluded {
             continue;
         }
-        // HEAD describes committed membership, not the checkout. Check absence
-        // before reusing an unchanged entry as well as when reading changed bytes.
+        // HEAD describes committed membership, not checkout existence. Fresh
+        // metadata checks absence; a complete delta can reuse its old evidence.
         // Do not follow symlinks: a dangling link is still a checkout member.
-        if matches!(tracked.mode, GitMode::Regular { .. } | GitMode::Symlink)
-            && working_tree_io(
-                fs::symlink_metadata(&absolute),
-                "reading metadata for",
-                &absolute,
-            )?
-            .is_none()
-        {
-            continue;
+        if matches!(tracked.mode, GitMode::Regular { .. } | GitMode::Symlink) {
+            let metadata = match cached_metadata {
+                Some(metadata) => Some(metadata.clone()),
+                None => working_tree_io(
+                    crate::db::file_identity::candidate_metadata(&absolute),
+                    "reading metadata for",
+                    &absolute,
+                )?,
+            };
+            let Some(metadata) = metadata else {
+                continue;
+            };
+            member_metadata.insert(tracked.rel_path.clone(), metadata);
         }
-        if !rebuild_all && !request.changed_paths.contains(&tracked.rel_path) {
-            if let Some(entry) = previous_entries.get(&tracked.rel_path).filter(|entry| {
-                !(request.callgraph && lacks_callgraph_key(entry, &tracked.rel_path))
-            }) {
+        if !rebuild_all && !reread(&tracked.rel_path) {
+            if let Some(entry) = previous
+                .as_ref()
+                .and_then(|manifest| manifest.get(&rel_path))
+                .filter(|entry| {
+                    !(request.callgraph && lacks_callgraph_key(entry, &tracked.rel_path))
+                })
+            {
                 candidates.push(Candidate {
                     path: rel_path,
                     entry: entry.clone(),
@@ -639,14 +981,67 @@ pub fn prepare_checkout_deferring(
         }
     }
 
-    let healed = heal_missing_payloads(
+    let mut healed = heal_missing_payloads(
         &reader,
         &semantic,
         &mut candidates,
         &mut fresh_skips,
         &mut fresh_reads,
+        if incremental { previous.as_ref() } else { None },
         phase,
     )?;
+    if verify {
+        let mut full_request = request.clone();
+        full_request.changed_paths.clear();
+        let full_head = manifest_incremental::head(&full_request, &view)?;
+        head_snapshot = full_head.snapshot;
+        let mut full_skips = Vec::new();
+        let mut full_reads = std::collections::HashSet::new();
+        let mut full = manifest_incremental::full_candidates(
+            &reader,
+            &full_head.entries,
+            &mut full_skips,
+            &mut full_reads,
+            phase,
+        )?;
+        let full_healed = heal_missing_payloads(
+            &reader,
+            &semantic,
+            &mut full,
+            &mut full_skips,
+            &mut full_reads,
+            None,
+            phase,
+        )?;
+        let entries = |candidates: &[Candidate]| {
+            Manifest::new(
+                candidates
+                    .iter()
+                    .map(|candidate| (candidate.path.clone(), candidate.entry.clone())),
+            )
+        };
+        if entries(&candidates)?.to_json_bytes()? != entries(&full)?.to_json_bytes()? {
+            if let Some(count) = manifest_incremental::note_mismatch(&view) {
+                log::warn!("view incremental manifest verification mismatch root={} count={count}; using full rebuild", request.project_root.display());
+            }
+        }
+        // Even equal entries can have required payload repairs. Use the full
+        // candidates, including those payloads, on every verification pass.
+        candidates = full;
+        healed = full_healed;
+        fresh_skips = full_skips;
+        fresh_reads = full_reads;
+        fresh_semantic_classes.clear();
+        member_metadata.clear();
+        for candidate in &candidates {
+            let path = request
+                .project_root
+                .join(path_from_bytes(candidate.path.as_bytes()));
+            if let Ok(metadata) = crate::db::file_identity::candidate_metadata(&path) {
+                member_metadata.insert(candidate.path.as_bytes().to_vec(), metadata);
+            }
+        }
+    }
     drop(reader);
 
     timing.phase("candidate_assembly");
@@ -789,11 +1184,17 @@ pub fn prepare_checkout_deferring(
         publication: None,
         files: Some((view.clone(), next_generation.clone())),
         derived_checkpoint: None,
+        derived_index_entry: None,
+        committed_index_entry: None,
+        committed_sweep: None,
+        post_publication_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         pin: Some(pin),
         _base_pin: base_pin,
         profile,
         settlement: None,
         committed_settlement: None,
+        manifest_cache: None,
+        _verification: verification,
     };
     prepared.profile.enter(1, phase)?;
     timing.phase("assembly_pin");
@@ -964,6 +1365,19 @@ pub fn prepare_checkout_deferring(
         // still replaces one whose derived file fails the readiness check.
         && (base_ready || (defer_derived && !current_derived_built))
     {
+        prepared.manifest_cache = Some((
+            view.clone(),
+            manifest_incremental::CachedManifest {
+                generation: current_generation.clone().expect("no-op generation"),
+                manifest: manifest.clone(),
+                stamps: stamps.clone(),
+                tree: head_tree.clone(),
+                metadata: std::sync::Arc::new(member_metadata),
+                admission,
+                head: head_snapshot,
+            },
+            verification_due,
+        ));
         prepared.profile.outcome = "no_op";
         prepared.profile.seed_source = if base_ready { "own" } else { "deferred" };
         prepared.profile.cold_build_reason = "none";
@@ -1008,7 +1422,11 @@ pub fn prepare_checkout_deferring(
                 let base_path = view.derived_path(base)?;
                 if base_path.is_file() {
                     let owner = view.derived_owner(base)?;
-                    match view.load_manifest(&owner) {
+                    match if Some(owner.as_str()) == current_generation.as_deref() {
+                        Ok(previous.clone().expect("current manifest"))
+                    } else {
+                        view.load_manifest(&owner)
+                    } {
                         Ok(base_manifest) => Some((base_path, base_manifest)),
                         Err(ViewError::IoAt { source, .. })
                             if source.kind() == std::io::ErrorKind::NotFound =>
@@ -1029,10 +1447,32 @@ pub fn prepare_checkout_deferring(
         // derived rows use manifest-relative paths,
         // and the ordinary cutoff/fingerprint checks still gate the patch.
         let sibling = if base.is_none() && request.callgraph {
-            worker_seed::sibling_checkout_seed(
+            let deadline = Instant::now() + crate::db::STEADY_BUSY_TIMEOUT;
+            // The family index finds an interchangeable or the nearest donor
+            // in any scope of the family. Donors published before the index
+            // existed are still found through the checkout's Git worktrees.
+            match worker_seed::indexed_seed(
                 request,
-                Instant::now() + crate::db::STEADY_BUSY_TIMEOUT,
-            )?
+                &derived_index::index_path(callgraph.path()),
+                &manifest,
+                deadline,
+            )? {
+                Some(seed) => {
+                    prepared.profile.seed_lookup = if seed.exact {
+                        "index_exact"
+                    } else {
+                        "index_nearest"
+                    };
+                    Some(seed)
+                }
+                None => {
+                    let seed = worker_seed::sibling_checkout_seed(request, deadline)?;
+                    if seed.is_some() {
+                        prepared.profile.seed_lookup = "worktrees";
+                    }
+                    seed
+                }
+            }
         } else {
             None
         };
@@ -1055,11 +1495,26 @@ pub fn prepare_checkout_deferring(
                     ),
                 ));
             } else {
-                match super::generation::clone_derived(&base_path, &derived) {
-                    Ok(_) => {
+                let cloned =
+                    super::generation::clone_derived(&base_path, &derived).and_then(|mechanism| {
+                        run_after_derived_clone_for_test(&derived);
+                        clone_readiness(view.view_dir(), &next_generation)
+                            .map(|ready| (mechanism, ready))
+                    });
+                match cloned {
+                    Ok((mechanism, Err((reason, detail)))) => {
+                        log::warn!(
+                            "view derived clone failed readiness: generation={next_generation} mechanism={} {detail}",
+                            mechanism.as_str()
+                        );
+                        cold_build = Some((reason, detail));
+                        super::generation::remove_unpublished_derived(&derived)?;
+                    }
+                    Ok((mechanism, Ok(()))) => {
                         prepared.profile.seed_source =
                             if sibling.is_some() { "sibling" } else { "own" };
                         prepared.profile.cold_build_reason = "none";
+                        prepared.profile.clone_mechanism = mechanism.as_str();
                         #[cfg(test)]
                         {
                             prepared.profile.derived_cloned = true;
@@ -1132,7 +1587,8 @@ pub fn prepare_checkout_deferring(
                 Some(reason) => reason.as_str(),
                 None => "no_base",
             };
-            prepared.derived_checkpoint = Some((derived.clone(), open_derived_keeper(&derived)?));
+            // A cold writer durably finishes its private main file before it
+            // returns; unlike an incremental patch it needs no WAL keeper.
             if let Some((reason, detail)) = &cold_build {
                 record_cold_build(view.view_dir(), *reason);
                 if *reason == ColdBuildReason::LargeDiff {
@@ -1159,6 +1615,14 @@ pub fn prepare_checkout_deferring(
         prepared.profile.materialization_call_ms = materialization_started.elapsed().as_millis();
         timing.phase("derived_materialization");
     }
+    if !defer_derived && request.callgraph {
+        // Reused, patched or built cold, the derived database is ready here.
+        prepared.derived_index_entry = Some((
+            derived_index::index_path(callgraph.path()),
+            request.scope.clone(),
+            derived_index::identity(&request.family, &manifest),
+        ));
+    }
     prepared.profile.io.enter(super::io::Phase::DerivedOther);
     let trigram = view.trigram_path(&next_generation)?;
     crate::private_storage::write(&trigram, [])
@@ -1176,11 +1640,15 @@ pub fn prepare_checkout_deferring(
         trigram_artifact: trigram.clone(),
         alias_database: aliases.path().to_path_buf(),
     };
-    let closure = SqliteClosure {
-        semantic: semantic.path().to_path_buf(),
-        callgraph: callgraph.path().to_path_buf(),
+    let closure = manifest_incremental::StoreClosure {
+        semantic: &semantic,
+        callgraph: &callgraph,
         trigram,
-        connections: Default::default(),
+        trusted: if !incremental || verify {
+            None
+        } else {
+            previous.as_ref().map(|manifest| (manifest, stamps.clone()))
+        },
     };
     prepared.profile.io.enter(super::io::Phase::Closure);
     let closure_started = Instant::now();
@@ -1211,6 +1679,19 @@ pub fn prepare_checkout_deferring(
         .unwrap_or(0);
     prepared.profile.enter(3, phase)?;
     prepared.publication = Some(publication);
+    prepared.manifest_cache = Some((
+        view.clone(),
+        manifest_incremental::CachedManifest {
+            generation: next_generation.clone(),
+            manifest: manifest.clone(),
+            stamps,
+            tree: head_tree,
+            metadata: std::sync::Arc::new(member_metadata),
+            admission,
+            head: head_snapshot,
+        },
+        verification_due,
+    ));
     prepared.report = AssemblyReport {
         generation: Some(next_generation),
         manifest: Some(manifest),
@@ -1227,6 +1708,8 @@ pub fn prepare_checkout_deferring(
 /// prepared generation leaves the actor barrier (including failed attempts).
 struct PublicationProfile {
     root: PathBuf,
+    scheduling: String,
+    store_writes: super::write_accounting::Publication,
     io: super::io::PublicationIo,
     overlap: super::io::Overlap,
     concurrent_publications: u64,
@@ -1248,6 +1731,14 @@ struct PublicationProfile {
     derived_clone_ms: u128,
     seed_source: &'static str,
     cold_build_reason: &'static str,
+    /// How a seeded derived database was copied (`clonefile`,
+    /// `sqlite_backup`), or `none` when nothing was copied.
+    clone_mechanism: &'static str,
+    /// Time spent writing the derived-output index row after the commit.
+    derived_index_ms: u128,
+    /// Where a sibling donor was found (`index_exact`, `index_nearest`,
+    /// `worktrees`), or `none`.
+    seed_lookup: &'static str,
     #[cfg(test)]
     derived_cloned: bool,
     materialization_call_ms: u128,
@@ -1260,6 +1751,8 @@ impl PublicationProfile {
         let now = Instant::now();
         Self {
             root: root.to_owned(),
+            scheduling: String::new(),
+            store_writes: super::write_accounting::Publication::current_or_default(),
             io: super::io::PublicationIo::new(root),
             overlap: super::io::Overlap::new(true),
             concurrent_publications: 0,
@@ -1281,6 +1774,9 @@ impl PublicationProfile {
             derived_clone_ms: 0,
             seed_source: "cold",
             cold_build_reason: "no_base",
+            clone_mechanism: "none",
+            seed_lookup: "none",
+            derived_index_ms: 0,
             #[cfg(test)]
             derived_cloned: false,
             materialization_call_ms: 0,
@@ -1321,25 +1817,62 @@ impl PublicationProfile {
     }
 }
 
+impl PublicationProfile {
+    /// Add the derived-index write, measured after `commit` closed the
+    /// publication's I/O phases. Its bytes join the derived and total I/O,
+    /// and its time is added to the total.
+    fn record_derived_index_write(
+        &mut self,
+        before: Option<super::io::Bytes>,
+        after: Option<super::io::Bytes>,
+        started: Instant,
+    ) {
+        self.io.credit_derived_index(before, after);
+        let elapsed = started.elapsed().as_millis();
+        self.derived_index_ms += elapsed;
+        self.total_ms += elapsed;
+    }
+}
+
 impl Drop for PublicationProfile {
     fn drop(&mut self) {
         if self.active_phase.is_some() {
             self.finish();
         }
         log_publication_profile(self);
+        #[cfg(test)]
+        PUBLICATION_OUTCOMES
+            .lock()
+            .entry(self.root.clone())
+            .or_default()
+            .push((self.outcome, self.scheduling.clone()));
     }
 }
 
+#[cfg(test)]
+static PUBLICATION_OUTCOMES: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<PathBuf, Vec<(&'static str, String)>>>,
+> = std::sync::LazyLock::new(Default::default);
+
 fn log_publication_profile(profile: &PublicationProfile) {
-    crate::slog_info!("{}", publication_profile_line(profile));
+    crate::slog_info!(
+        "{} {} {}",
+        publication_profile_line(profile),
+        profile.store_writes.fields(),
+        profile.scheduling
+    );
 }
+
+#[cfg(test)]
+#[path = "write_accounting_tests.rs"]
+mod write_accounting_tests;
 
 fn publication_profile_line(profile: &PublicationProfile) -> String {
     // Retain the existing drill fields alongside the shared phase names. The
     // pointer transaction is a subset of the cas phase, which also includes
     // waiting to acquire the actor barrier.
     format!(
-        "index_event kind=view_publication plane=views root={} outcome={} candidates={} blob_puts={} pending_paths={} manifest_ms={} blobs_ms={} derived_ms={} cas_ms={} head_ms={} assembly_ms={} blob_ms={} materialize_ms={} derived_clone_ms={} materialization_call_ms={} closure_ms={} materialize_load_bindings_select_ms={} materialize_delete_rows_ms={} materialize_owned_blob_decode_insert_ms={} materialize_join_load_payloads_ms={} materialize_join_decode_bind_index_entries_ms={} materialize_join_index_surface_replay_ms={} materialize_join_decode_resolved_callers_ms={} materialize_join_resolve_record_ms={} materialize_join_dependency_union_ms={} materialize_selected_join_ms={} materialize_write_bindings_ms={} materialize_emit_refs_edges_ms={} materialize_dispatch_ms={} materialize_commit_ms={} materialize_cleanup_memory_ms={} materialize_cleanup_connections_ms={} pointer_ms={} total_ms={} derived_bytes={} semantic_fill={} generation={} concurrent_publications={} seed_source={} cold_build_reason={} {}",
+        "index_event kind=view_publication plane=views root={} outcome={} candidates={} blob_puts={} pending_paths={} manifest_ms={} blobs_ms={} derived_ms={} cas_ms={} head_ms={} assembly_ms={} blob_ms={} materialize_ms={} derived_clone_ms={} materialization_call_ms={} closure_ms={} materialize_load_bindings_select_ms={} materialize_delete_rows_ms={} materialize_owned_blob_decode_insert_ms={} materialize_join_load_payloads_ms={} materialize_join_decode_bind_index_entries_ms={} materialize_join_index_surface_replay_ms={} materialize_join_decode_resolved_callers_ms={} materialize_join_resolve_record_ms={} materialize_join_dependency_union_ms={} materialize_selected_join_ms={} materialize_write_bindings_ms={} materialize_emit_refs_edges_ms={} materialize_dispatch_ms={} materialize_commit_ms={} materialize_cleanup_memory_ms={} materialize_cleanup_connections_ms={} pointer_ms={} total_ms={} derived_bytes={} semantic_fill={} generation={} concurrent_publications={} seed_source={} cold_build_reason={} clone_mechanism={} seed_lookup={} derived_index_ms={} {}",
         profile.root.display(), profile.outcome, profile.candidates, profile.blob_puts,
         profile.pending_paths, profile.phase_ms[0], profile.phase_ms[1],
         profile.phase_ms[2], profile.phase_ms[3], profile.head_ms, profile.assembly_ms,
@@ -1364,7 +1897,7 @@ fn publication_profile_line(profile: &PublicationProfile) -> String {
         profile.materialization.cleanup_memory_ms,
         profile.materialization.cleanup_connections_ms,
         profile.pointer_ms, profile.total_ms, profile.derived_bytes,
-        profile.semantic_fill, profile.generation, profile.concurrent_publications, profile.seed_source, profile.cold_build_reason, profile.io.fields(),
+        profile.semantic_fill, profile.generation, profile.concurrent_publications, profile.seed_source, profile.cold_build_reason, profile.clone_mechanism, profile.seed_lookup, profile.derived_index_ms, profile.io.fields(),
     )
 }
 
@@ -1560,6 +2093,59 @@ fn cold_build_reason_for_diff_error(
     }
 }
 
+/// Run the reader's readiness query on a freshly copied derived database
+/// before anything patches or publishes it. The donor passed the same query
+/// before the copy. Checking the copy as well means a torn, truncated or
+/// unfinished file is rebuilt cold, never served. The inner error is the
+/// cold-build reason; the outer error is contention the scheduler retries.
+fn clone_readiness(
+    view_dir: &Path,
+    generation: &str,
+) -> Result<std::result::Result<(), (ColdBuildReason, String)>> {
+    match crate::callgraph_store::manifest_view_database_ready(
+        view_dir,
+        generation,
+        Instant::now() + crate::db::STEADY_BUSY_TIMEOUT,
+    ) {
+        Ok(true) => Ok(Ok(())),
+        Ok(false) => Ok(Err((
+            ColdBuildReason::BaseNotReady,
+            "cloned derived graph fails the build-output readiness check".to_string(),
+        ))),
+        Err(crate::callgraph_store::CallGraphStoreError::Sqlite(error))
+            if crate::db::is_busy_error(&error) =>
+        {
+            Err(ViewError::Sqlite(error))
+        }
+        Err(crate::callgraph_store::CallGraphStoreError::Sqlite(error))
+            if sqlite_error_is_unreadable_database(&error) =>
+        {
+            Ok(Err((ColdBuildReason::BaseUnreadable, error.to_string())))
+        }
+        Err(error) => Err(ViewError::InvalidManifest(error.to_string())),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_DERIVED_CLONE: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `hook` on the next derived copy this thread makes, before its
+/// readiness check, to simulate a copy that was torn or left unfinished.
+#[cfg(test)]
+pub(super) fn after_derived_clone_for_test(hook: impl FnOnce(&Path) + 'static) {
+    AFTER_DERIVED_CLONE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+fn run_after_derived_clone_for_test(_derived: &Path) {
+    #[cfg(test)]
+    if let Some(hook) = AFTER_DERIVED_CLONE.with(|slot| slot.borrow_mut().take()) {
+        hook(_derived);
+    }
+}
+
 /// Keep one connection alive so SQLite does not checkpoint the committed WAL
 /// when the materializer closes its writer before pointer publication.
 fn open_derived_keeper(derived: &Path) -> Result<crate::db::file_identity::IdentityConnection> {
@@ -1584,7 +2170,7 @@ fn manifest_entry_callgraph_key(entry: &ManifestEntry) -> Option<&str> {
     }
 }
 
-pub(super) fn is_resolution_input(path: &[u8]) -> bool {
+pub(crate) fn is_resolution_input(path: &[u8]) -> bool {
     let name = path.rsplit(|byte| *byte == b'/').next().unwrap_or(path);
     name == b"package.json"
         || name == b"Cargo.toml"
@@ -1617,6 +2203,7 @@ fn generation_number(generation: &str) -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
 struct SqliteClosure {
     semantic: PathBuf,
     callgraph: PathBuf,
@@ -1626,6 +2213,7 @@ struct SqliteClosure {
     connections: std::cell::RefCell<BTreeMap<bool, crate::db::lifecycle::TrackedConnection>>,
 }
 
+#[cfg(test)]
 impl PublicationClosure for SqliteClosure {
     fn contains_blob(&self, plane: ArtifactPlane, full_key: &str) -> Result<bool> {
         let Some(key) = decode_hex(full_key) else {
@@ -1892,7 +2480,7 @@ pub const MISSING_PAYLOAD_SOURCE_UNREADABLE: &str =
 /// Turns working-tree files into manifest candidates for one assembly.
 struct CandidateReader<'a> {
     request: &'a AssemblyRequest,
-    previous_entries: &'a BTreeMap<Vec<u8>, ManifestEntry>,
+    previous: Option<&'a Manifest>,
     callgraph: &'a BlobStore,
 }
 
@@ -1933,8 +2521,8 @@ impl CandidateReader<'_> {
                 let key_hex = key.to_hex();
                 let callgraph_is_current = trust_previous_key
                     && self
-                        .previous_entries
-                        .get(rel_path.as_bytes())
+                        .previous
+                        .and_then(|manifest| manifest.get(&rel_path))
                         .is_some_and(|entry| {
                             manifest_entry_callgraph_key(entry) == Some(key_hex.as_str())
                         });
@@ -2040,10 +2628,19 @@ fn heal_missing_payloads(
     candidates: &mut Vec<Candidate>,
     fresh_skips: &mut Vec<(Vec<u8>, Option<SkipReason>)>,
     fresh_reads: &mut std::collections::HashSet<Vec<u8>>,
+    trusted: Option<&Manifest>,
     phase: &mut impl FnMut(&str) -> Result<()>,
 ) -> Result<HealOutcome> {
     let request = reader.request;
     let mut outcome = HealOutcome::default();
+    let old_keys = trusted
+        .map(|manifest| {
+            manifest
+                .plane_keys()
+                .map(|(plane, key)| (plane == ArtifactPlane::Semantic, key))
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
     // Candidates carrying a payload are stored by the put loop; the rest
     // assume their call-graph payload is already there.
     let callgraph_missing = reader
@@ -2052,7 +2649,8 @@ fn heal_missing_payloads(
             candidates
                 .iter()
                 .filter(|candidate| candidate.payload.is_none())
-                .filter_map(|candidate| manifest_entry_callgraph_key(&candidate.entry)),
+                .filter_map(|candidate| manifest_entry_callgraph_key(&candidate.entry))
+                .filter(|key| !old_keys.contains(&(false, *key))),
             None,
         )
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?
@@ -2073,7 +2671,8 @@ fn heal_missing_payloads(
                 .filter(|(path, key)| {
                     request.semantic_keys.get(*path).map(String::as_str) != Some(*key)
                 })
-                .map(|(_, key)| key),
+                .map(|(_, key)| key)
+                .filter(|key| !old_keys.contains(&(true, *key))),
             None,
         )
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?
@@ -2245,11 +2844,15 @@ mod reuse_tests {
 
     #[test]
     fn views_shared_checkout_presence_reads_no_payloads() {
-        const FILES: usize = 2048;
-        let project = super::cold_fallback_tests::repository(FILES);
+        let files = if std::env::var("AFT_STRESS").as_deref() == Ok("1") {
+            2048
+        } else {
+            32
+        };
+        let project = super::cold_fallback_tests::repository(files);
         let storage = tempfile::tempdir().unwrap();
         let store = BlobStore::open(storage.path(), "shared", BlobPlane::Callgraph).unwrap();
-        let payload_bytes = seed_callgraph_payloads(&store, project.path(), FILES);
+        let payload_bytes = seed_callgraph_payloads(&store, project.path(), files);
         let request = AssemblyRequest {
             storage: storage.path().to_path_buf(),
             project_root: project.path().to_path_buf(),
@@ -2267,7 +2870,7 @@ mod reuse_tests {
         let mut prepared = prepare_checkout(&request, &mut |phase| {
             if phase == "derived" {
                 let counts = PAYLOAD_READ_COUNTS.with(|counts| counts.get());
-                eprintln!("checkout_presence files={FILES} stored_payload_bytes={payload_bytes} reads={counts:?}");
+                eprintln!("checkout_presence files={files} stored_payload_bytes={payload_bytes} reads={counts:?}");
                 assert_eq!(counts, PayloadReadCounts::default());
                 measured = true;
             }
@@ -2278,7 +2881,7 @@ mod reuse_tests {
         assert!(report.published);
         assert_eq!(report.blob_puts, 0);
         let materialization = PAYLOAD_READ_COUNTS.with(|counts| counts.get());
-        eprintln!("checkout_materialization files={FILES} reads={materialization:?}");
+        eprintln!("checkout_materialization files={files} reads={materialization:?}");
         PAYLOAD_READ_COUNTS.with(|counts| counts.set(PayloadReadCounts::default()));
         let report = publish_checkout(&request).unwrap();
         assert!(!report.published);
@@ -2447,6 +3050,7 @@ mod reuse_tests {
     }
 }
 
+#[cfg(test)]
 fn membership_query(count: usize) -> String {
     format!(
         "SELECT full_key FROM blob_payloads INDEXED BY blob_membership WHERE full_key IN ({})",
@@ -2454,6 +3058,7 @@ fn membership_query(count: usize) -> String {
     )
 }
 
+#[cfg(test)]
 fn decode_hex(value: &str) -> Option<Vec<u8>> {
     crate::blob_store::v2::parse_hex32(value).map(|bytes| bytes.to_vec())
 }
@@ -2798,6 +3403,8 @@ mod payload_heal_tests {
 #[path = "cold_fallback_tests.rs"]
 mod cold_fallback_tests;
 
+#[path = "derived_index.rs"]
+pub(super) mod derived_index;
 #[path = "assembly_seed.rs"]
 pub(super) mod worker_seed;
 
@@ -2849,6 +3456,410 @@ mod status_settlement_tests {
 
     fn pending(storage: &Path) -> usize {
         status(storage).summary().unwrap().pending_count
+    }
+
+    #[test]
+    fn views_post_publication_sweep_bounds_independent_generations() {
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), SCOPE).unwrap();
+        let mut generations = Vec::new();
+        for index in 0..6 {
+            fs::write(
+                root.join("file_0.ts"),
+                format!("export function revision_{index}() {{}}\n"),
+            )
+            .unwrap();
+            let report = publish_checkout(&request(&root, storage.path(), "head")).unwrap();
+            assert!(report.published);
+            generations.push(report.generation.unwrap());
+            super::super::generation::wait_for_derived_checkpoint_for_test(view.view_dir());
+            super::super::generation::wait_for_generation_sweep_for_test(view.view_dir());
+            let remaining: Vec<_> = generations
+                .iter()
+                .filter(|generation| view.manifest_path(generation).unwrap().exists())
+                .collect();
+            assert_eq!(
+                remaining,
+                vec![generations.last().unwrap()],
+                "obsolete generations accumulated after commit {index}"
+            );
+            let databases = fs::read_dir(view.view_dir())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("derived-") && name.ends_with(".sqlite"))
+                .count();
+            assert_eq!(
+                databases, 1,
+                "obsolete derived databases accumulated after commit {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn views_publication_succeeds_while_cleanup_unlink_is_paused() {
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        publish_checkout(&request(&root, storage.path(), "head")).unwrap();
+        let view = ViewStore::open(storage.path(), SCOPE).unwrap();
+        crate::views::wait_for_generation_maintenance_for_test(view.view_dir());
+        fs::write(root.join("file_0.ts"), "export function replacement() {}\n").unwrap();
+        let mut prepared =
+            prepare_checkout(&request(&root, storage.path(), "head"), &mut |_| Ok(())).unwrap();
+        let busy_budget: u64 = prepared
+            .publication
+            .as_ref()
+            .unwrap()
+            .pointer
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        let obsolete = view.derived_path("obsolete").unwrap();
+        fs::write(&obsolete, b"obsolete").unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let once = std::sync::atomic::AtomicBool::new(false);
+        let _hook = crate::storage_retention::observe_test_hook(
+            view.view_dir(),
+            std::sync::Arc::new(move |step| {
+                if step == "generation-unlink"
+                    && !once.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(15))
+                        .unwrap();
+                }
+            }),
+        );
+        let sweeping = view.clone();
+        let cleanup = std::thread::spawn(move || sweeping.sweep_generations_with_bytes());
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        // Cleanup cannot finish its slow phase until this publication returns.
+        // A write reservation retained through unlink makes this fail BUSY.
+        let result = prepared.commit();
+        release_tx.send(()).unwrap();
+        let removed = cleanup.join().unwrap().unwrap();
+        assert!(
+            result.is_ok(),
+            "cleanup blocked the publication pointer writer: {result:?}"
+        );
+        assert_eq!(
+            busy_budget,
+            super::super::POINTER_BUSY_TIMEOUT.as_millis() as u64,
+            "prepared publication must retain the common pointer busy policy"
+        );
+        assert_eq!(removed.removed_generations, 1);
+        assert!(!obsolete.exists());
+        prepared.settle_status();
+        crate::views::wait_for_generation_maintenance_for_test(view.view_dir());
+    }
+
+    /// Prepares a replacement generation next to one obsolete derived file,
+    /// then parks a cleanup thread at `step` until the returned sender fires.
+    fn cleanup_paused_at(
+        step: &'static str,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        ViewStore,
+        PreparedAssembly,
+        PathBuf,
+        crate::storage_retention::TestHookGuard,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<super::super::Result<super::super::generation::GenerationSweep>>,
+    ) {
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        publish_checkout(&request(&root, storage.path(), "head")).unwrap();
+        let view = ViewStore::open(storage.path(), SCOPE).unwrap();
+        crate::views::wait_for_generation_maintenance_for_test(view.view_dir());
+        fs::write(root.join("file_0.ts"), "export function replacement() {}\n").unwrap();
+        let prepared =
+            prepare_checkout(&request(&root, storage.path(), "head"), &mut |_| Ok(())).unwrap();
+        let obsolete = view.derived_path("obsolete").unwrap();
+        fs::write(&obsolete, b"obsolete").unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let once = std::sync::atomic::AtomicBool::new(false);
+        let hook = crate::storage_retention::observe_test_hook(
+            view.view_dir(),
+            std::sync::Arc::new(move |reached| {
+                if reached == step && !once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(15))
+                        .unwrap();
+                }
+            }),
+        );
+        let sweeping = view.clone();
+        let cleanup = std::thread::spawn(move || sweeping.sweep_generations_with_bytes());
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        (
+            project, storage, view, prepared, obsolete, hook, release_tx, cleanup,
+        )
+    }
+
+    #[test]
+    fn views_publication_commits_while_cleanup_census_snapshot_is_held() {
+        let (_project, _storage, view, mut prepared, obsolete, _hook, release, cleanup) =
+            cleanup_paused_at("generation-census");
+        // The cleanup thread now holds its census transaction open, for as
+        // long as this publication takes. Holding a write lock there would
+        // make the commit wait out the whole busy budget and fail BUSY.
+        let started = std::time::Instant::now();
+        let result = prepared.commit();
+        let waited = started.elapsed();
+        release.send(()).unwrap();
+        let removed = cleanup.join().unwrap().unwrap();
+        assert!(
+            result.is_ok(),
+            "cleanup census blocked the publication: {result:?}"
+        );
+        assert!(
+            waited < super::super::POINTER_BUSY_TIMEOUT,
+            "publication queued behind the cleanup census for {waited:?}"
+        );
+        // The census predates the publication, so cleanup yields instead of
+        // acting on it; the sweep that publication schedules finishes the job.
+        assert_eq!(removed.removed_generations, 0);
+        assert!(obsolete.exists());
+        prepared.settle_status();
+        crate::views::wait_for_generation_maintenance_for_test(view.view_dir());
+        assert!(!obsolete.exists());
+    }
+
+    #[test]
+    fn views_publication_waits_out_cleanup_claim_instead_of_failing_busy() {
+        let (_project, _storage, view, mut prepared, obsolete, _hook, release, cleanup) =
+            cleanup_paused_at("generation-delete");
+        // Cleanup now holds its one write reservation: the bounded rename of
+        // one generation's names. The publication must wait for it, using the
+        // publisher's busy budget, rather than fail with "database is locked".
+        let hold = std::time::Duration::from_millis(300);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            release.send(()).unwrap();
+        });
+        let started = std::time::Instant::now();
+        let result = prepared.commit();
+        let waited = started.elapsed();
+        releaser.join().unwrap();
+        let removed = cleanup.join().unwrap().unwrap();
+        assert!(
+            result.is_ok(),
+            "publication failed while cleanup held its claim: {result:?}"
+        );
+        assert!(
+            waited >= hold / 2,
+            "publication did not overlap the cleanup claim ({waited:?})"
+        );
+        assert_eq!(removed.removed_generations, 1);
+        assert!(!obsolete.exists());
+        prepared.settle_status();
+        crate::views::wait_for_generation_maintenance_for_test(view.view_dir());
+    }
+
+    #[test]
+    fn views_post_publication_sweep_catches_up_with_backlogged_publications() {
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), SCOPE).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let once = std::sync::atomic::AtomicBool::new(false);
+        let _hook = crate::storage_retention::observe_test_hook(
+            view.view_dir(),
+            std::sync::Arc::new(move |step| {
+                if step == "post-publication-sweep"
+                    && !once.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                        .unwrap();
+                }
+            }),
+        );
+        let mut generations = Vec::new();
+        for index in 0..8 {
+            fs::write(
+                root.join("file_0.ts"),
+                format!("export function revision_{index}() {{}}\n"),
+            )
+            .unwrap();
+            let mut prepared =
+                prepare_checkout(&request(&root, storage.path(), "head"), &mut |_| Ok(())).unwrap();
+            // Only publication requests drive this fixture's cleanup; no
+            // checkpoint-close retry can conceal a lost pending request.
+            prepared.derived_checkpoint.take();
+            let report = prepared.commit().unwrap();
+            assert!(report.published);
+            generations.push(report.generation.unwrap());
+            prepared.settle_status();
+            if index == 0 {
+                entered_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+            }
+        }
+        assert!(generations
+            .iter()
+            .all(|generation| view.manifest_path(generation).unwrap().exists()));
+        release_tx.send(()).unwrap();
+        super::super::generation::wait_for_generation_sweep_for_test(view.view_dir());
+        for generation in &generations[..generations.len() - 1] {
+            assert!(
+                !view.manifest_path(generation).unwrap().exists(),
+                "backlogged generation survived: {generation}"
+            );
+            assert!(!view.derived_path(generation).unwrap().exists());
+        }
+        assert!(view
+            .derived_path(generations.last().unwrap())
+            .unwrap()
+            .exists());
+    }
+
+    #[test]
+    fn views_post_publication_sweep_retires_reference_sidecars_with_their_manifests() {
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), SCOPE).unwrap();
+        let mut generations = Vec::new();
+        for index in 0..4 {
+            fs::write(
+                root.join("file_0.ts"),
+                format!("export function revision_{index}() {{}}\n"),
+            )
+            .unwrap();
+            let mut request = request(&root, storage.path(), &format!("head-{index}"));
+            request.callgraph = false;
+            let mut prepared = prepare_checkout(&request, &mut |_| Ok(())).unwrap();
+            prepared.derived_checkpoint.take();
+            let report = prepared.commit().unwrap();
+            assert!(report.published);
+            generations.push(report.generation.unwrap());
+            prepared.settle_status();
+            super::super::generation::wait_for_generation_sweep_for_test(view.view_dir());
+            let sidecar = |generation: &str| {
+                view.view_dir()
+                    .join(super::super::reference_sidecar::sidecar_name(generation))
+            };
+            let current = generations.last().unwrap();
+            assert!(sidecar(current).is_file(), "publication wrote no sidecar");
+            for generation in &generations[..generations.len() - 1] {
+                // A superseded manifest may survive as a clone baseline, but
+                // its sidecar never outlives it.
+                assert_eq!(
+                    sidecar(generation).exists(),
+                    view.manifest_path(generation).unwrap().exists(),
+                    "sidecar and manifest of {generation} diverged"
+                );
+            }
+        }
+        assert!(
+            generations[..generations.len() - 1]
+                .iter()
+                .any(|generation| !sidecar_exists(&view, generation)),
+            "no superseded generation was retired"
+        );
+    }
+
+    fn sidecar_exists(view: &ViewStore, generation: &str) -> bool {
+        view.view_dir()
+            .join(super::super::reference_sidecar::sidecar_name(generation))
+            .exists()
+    }
+
+    #[test]
+    fn views_post_publication_sweep_runs_after_settlement_without_checkpoint() {
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), SCOPE).unwrap();
+        for index in 0..4 {
+            fs::write(
+                root.join("file_0.ts"),
+                format!("export function revision_{index}() {{}}\n"),
+            )
+            .unwrap();
+            let mut request = request(&root, storage.path(), &format!("head-{index}"));
+            request.callgraph = false;
+            let obsolete = view.trigram_path(&format!("unheld-{index}")).unwrap();
+            fs::write(&obsolete, b"obsolete trigram").unwrap();
+            let mut prepared = prepare_checkout(&request, &mut |_| Ok(())).unwrap();
+            // Exercise settlement's dispatch without a deferred keeper-close
+            // worker from this or a previous iteration also requesting cleanup.
+            prepared.derived_checkpoint.take();
+            let report = prepared.commit().unwrap();
+            assert!(report.published);
+            super::super::generation::wait_for_generation_sweep_for_test(view.view_dir());
+            assert!(
+                obsolete.exists(),
+                "cleanup started before the publisher released its commit barrier"
+            );
+            prepared.settle_status();
+            super::super::generation::wait_for_generation_sweep_for_test(view.view_dir());
+            assert!(
+                !obsolete.exists(),
+                "settlement did not schedule post-publication cleanup"
+            );
+        }
+    }
+
+    #[test]
+    fn views_post_publication_sweep_preserves_pins_and_readers_until_released() {
+        let project = super::cold_fallback_tests::repository(1);
+        let root = project.path().canonicalize().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), SCOPE).unwrap();
+        let publish = |index| {
+            fs::write(
+                root.join("file_0.ts"),
+                format!("export function revision_{index}() {{}}\n"),
+            )
+            .unwrap();
+            let report = publish_checkout(&request(&root, storage.path(), "head")).unwrap();
+            assert!(report.published);
+            super::super::generation::wait_for_derived_checkpoint_for_test(view.view_dir());
+            super::super::generation::wait_for_generation_sweep_for_test(view.view_dir());
+            report.generation.unwrap()
+        };
+        let pinned = publish(0);
+        let pin = crate::pins::QueryPin::acquire(view.view_dir(), &pinned).unwrap();
+        let read = publish(1);
+        let reader = crate::root_cache::ReadMarker::create(view.view_dir(), &read).unwrap();
+        let current = publish(2);
+        for generation in [&pinned, &read, &current] {
+            assert!(view.manifest_path(generation).unwrap().exists());
+            assert!(view.derived_path(generation).unwrap().exists());
+        }
+        drop(pin);
+        drop(reader);
+        publish(3);
+        for generation in [&pinned, &read, &current] {
+            assert!(!view.manifest_path(generation).unwrap().exists());
+            assert!(!view.derived_path(generation).unwrap().exists());
+        }
     }
 
     /// A skip recorded for the served generation stays while a publication

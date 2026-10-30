@@ -113,11 +113,13 @@ jobs:
         # fallback silently masks the version-mismatch bug (we try to publish
         # vN, it already exists, we say success even though we wanted vN+1).
         #
-        # `agent-file-tools` depends on `aft-tokenizer` by path; cargo refuses
-        # to publish a crate whose path-only dep has no `version =`. Both
-        # crates therefore declare versions (synced by version-sync.mjs) and
-        # we publish `aft-tokenizer` first so `agent-file-tools` can resolve
-        # the published version on crates.io. The `--no-verify` flag on the
+        # `agent-file-tools` depends on `aft-tokenizer` and `aft-secret-rules`
+        # by path; cargo refuses to publish a crate whose path-only dep has no
+        # `version =` or isn't on crates.io. All three crates therefore declare
+        # versions (synced by version-sync.mjs) and we publish the two leaf
+        # crates first so `agent-file-tools` can resolve them on crates.io.
+        # scripts/lib/test_native_release_workflow.py fails when a new path
+        # dependency is added without a publish line here. The `--no-verify` flag on the
         # tokenizer publish skips the build step (saves ~30s for a leaf crate
         # with no consumers in workspace until `agent-file-tools` resolves it
         # from crates.io after publish settles).
@@ -136,7 +138,9 @@ jobs:
           # already existed, agent-file-tools never published.)
           cargo publish --package aft-tokenizer \
             || { ec=$?; cargo publish --package aft-tokenizer --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
-          # Wait briefly for the new tokenizer version to become visible on
+          cargo publish --package aft-secret-rules \
+            || { ec=$?; cargo publish --package aft-secret-rules --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
+          # Wait briefly for the new leaf crate versions to become visible on
           # crates.io's sparse index before publishing `agent-file-tools` —
           # otherwise the verify step in the second publish can race against
           # index propagation and fail with "no matching package found".
@@ -156,8 +160,14 @@ jobs:
   # ---------------------------------------------------------------------------
   build-darwin-arm64:
     name: Build macOS ARM64
-    runs-on: macos-26
-    timeout-minutes: 120
+    # Blacksmith's M4 runner has 24 GB; the shipped-profile library compile
+    # peaks near 12 GB and swaps for hours on GitHub's 7 GB macos-26 runner.
+    # Temporary until the self-hosted release runner on our own Mac is live.
+    runs-on: blacksmith-6vcpu-macos-26
+    # The shipped-profile library codegen alone took 87 minutes for v0.63.0
+    # and ran past 120 for v0.63.1, so 120 cancelled the release. The x64 build
+    # on the same runner type already gets the 360-minute job default.
+    timeout-minutes: 240
     outputs:
       rust_version: ${{ steps.bundle.outputs.rust_version }}
     permissions:
@@ -173,6 +183,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       # cache-bin: false keeps a cached ~/.cargo/bin from overwriting the fresh
       # cargo shim, as in build-darwin-x64.
@@ -228,7 +242,8 @@ jobs:
 
   build-darwin-x64:
     name: Build macOS x64
-    runs-on: macos-26
+    # Same runner as the ARM64 build; see the note there.
+    runs-on: blacksmith-6vcpu-macos-26
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -245,6 +260,10 @@ jobs:
           targets: x86_64-apple-darwin
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -404,6 +423,10 @@ jobs:
           targets: aarch64-pc-windows-msvc
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -446,6 +469,10 @@ jobs:
           targets: x86_64-pc-windows-msvc
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -777,7 +804,15 @@ jobs:
         working-directory: packages/aft-cli
 
       - name: Fetch final v0.48.1 activation baseline
-        run: git fetch --force origin refs/tags/v0.48.1:refs/tags/v0.48.1
+        run: |
+          set -euo pipefail
+          # Retry so a brief network failure reaching github.com does not
+          # fail the release.
+          for attempt in 1 2 3; do
+            git fetch --force origin refs/tags/v0.48.1:refs/tags/v0.48.1 && break
+            if [ "$attempt" = 3 ]; then exit 1; fi
+            sleep 20
+          done
 
       - name: Prepare publication records from the tagged candidate
         run: node scripts/release-gate-v049.mjs --prepare --snapshot-dir "${{ runner.temp }}/governed-publication" --candidate

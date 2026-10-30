@@ -16,6 +16,7 @@ import {
   watchTimeoutSteer,
 } from "@cortexkit/aft-bridge";
 import { type ToolContext, tool } from "@opencode-ai/plugin";
+import { Effect } from "effect";
 import { withEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import {
   __resetBgNotificationStateForTests,
@@ -304,7 +305,7 @@ describe("OpenCode bash adapter", () => {
         "Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs this machine's own operating system or hardware (its sandbox, code signing, service manager, permission prompts or GUI frameworks)",
       );
       expect(bash.description).toContain(
-        "or runs a binary that already exists on this machine; building and testing still go remote, and a remote build leaves no binaries or target/ output in the local worktree.",
+        'or runs a binary that already exists on this machine; a build or test that needs only macOS (its sandbox, code signing or file watching) can use runon: "macos" instead; building and testing still go remote, and a remote build leaves no binaries or target/ output in the local worktree.',
       );
     },
   );
@@ -541,6 +542,43 @@ describe("OpenCode bash adapter", () => {
     expect(calls[1].params.permissions_granted).toEqual(["rm *", "/tmp/*"]);
   });
 
+  test("permission loop stops early and names an already granted ask", async () => {
+    const ask = mockAsk();
+    const { calls, tool: bash } = createHarness(() => ({
+      success: false,
+      code: "permission_required",
+      asks: [{ kind: "bash", patterns: ["rsync -a source/ worker/"], always: ["rsync *"] }],
+    }));
+    await expect(
+      bash.execute({ command: "rsync -a source/ worker/" }, createMockSdkContext({ ask })),
+    ).rejects.toThrow("bash rsync -a source/ worker/ (operation: bash; granted already: yes)");
+    expect(calls).toHaveLength(2);
+    expect(ask).toHaveBeenCalledTimes(1);
+  });
+
+  test("unknown cwd approval keeps the exact command and reason", async () => {
+    const ask = mockAsk();
+    const command = 'cd "$DEST" && cat checksums';
+    const reason = "Working directory is unknown; approve this exact command.";
+    const { calls, tool: bash } = createHarness((_command, params) =>
+      params.permissions_granted?.length
+        ? { success: true, output: "ok" }
+        : {
+            success: false,
+            code: "permission_required",
+            asks: [{ kind: "bash", patterns: [command], always: [], reason }],
+          },
+    );
+    await bash.execute({ command }, createMockSdkContext({ ask }));
+    expect(ask.mock.calls[0][0]).toEqual({
+      permission: "bash",
+      patterns: [command],
+      always: [],
+      metadata: { reason },
+    });
+    expect(calls[1].params.permissions_granted).toEqual([command]);
+  });
+
   test("host escalation ask shows exact payload and retries with opaque grant", async () => {
     const ask = mockAsk();
     let sendCount = 0;
@@ -657,6 +695,40 @@ describe("OpenCode bash adapter", () => {
       bash.execute({ command: "printf should-not-run" }, createMockSdkContext({ ask })),
     ).rejects.toThrow("outside project root");
     expect(ask).not.toHaveBeenCalled();
+  });
+
+  test("a memory cap refuses uncontained host fallback before asking", async () => {
+    const ask = mockAsk();
+    const { tool: bash } = createHarness(
+      () => {
+        throw new BridgeTransportUnavailableError("offline");
+      },
+      undefined,
+      false,
+      { bash: { host_fallback: true, memory_limit_mib: 64 } } as PluginContext["config"],
+    );
+    await expect(
+      bash.execute({ command: "printf should-not-run" }, createMockSdkContext({ ask })),
+    ).rejects.toThrow("bash.memory_limit_mib");
+    expect(ask).not.toHaveBeenCalled();
+  });
+
+  test("secret placeholders refuse host fallback before asking or executing", async () => {
+    for (const command of ["printf '{{ck-secret:test}}'", "printf '{{ck-secret:malformed'"]) {
+      const ask = mockAsk();
+      const { tool: bash } = createHarness(
+        () => {
+          throw new BridgeTransportUnavailableError("offline");
+        },
+        undefined,
+        false,
+        { bash: { host_fallback: true } } as PluginContext["config"],
+      );
+      await expect(bash.execute({ command }, createMockSdkContext({ ask }))).rejects.toThrow(
+        "Secret placeholder commands need AFT's shell; OpenCode's built-in shell cannot run them.",
+      );
+      expect(ask).not.toHaveBeenCalled();
+    }
   });
 
   test("a bash call that timed out at the bridge names the task AFT started (issue #577)", async () => {
@@ -931,7 +1003,12 @@ describe("OpenCode bash adapter", () => {
   });
 
   test("progress callback forwards rolling output previews through ctx.metadata", async () => {
-    const metadata = mock(() => {});
+    const applied: unknown[] = [];
+    const metadata = mock((update: unknown) =>
+      Effect.sync(() => {
+        applied.push(update);
+      }),
+    );
     const { tool: bash } = createHarness((_command, _params, options) => {
       options?.onProgress?.({ text: "hello " });
       options?.onProgress?.({ text: "world" });
@@ -945,17 +1022,38 @@ describe("OpenCode bash adapter", () => {
       ),
     );
 
-    expect(metadata.mock.calls[0][0]).toEqual({ output: "hello ", description: "Print greeting" });
+    expect(metadata.mock.calls[0][0]).toEqual({
+      metadata: { output: "hello ", description: "Print greeting" },
+    });
     expect(metadata.mock.calls[1][0]).toEqual({
-      output: "hello world",
-      description: "Print greeting",
+      metadata: {
+        output: "hello world",
+        description: "Print greeting",
+      },
     });
     expect(metadata.mock.calls.at(-1)?.[0]).toEqual({
-      output: "hello world",
-      description: "Print greeting",
-      exit: 0,
-      truncated: false,
+      metadata: {
+        output: "hello world",
+        description: "Print greeting",
+        exit: 0,
+        truncated: false,
+      },
     });
+    expect(applied).toEqual(metadata.mock.calls.map(([update]) => update));
+  });
+
+  test("a rejected metadata Effect does not replace the final bash result", async () => {
+    const metadata = mock(() => Effect.fail(new Error("tool part closed")));
+    const { tool: bash } = createHarness((_command, _params, options) => {
+      options?.onProgress?.({ text: "live output\n" });
+      return { success: true, output: "final output\n", exit_code: 0, truncated: false };
+    });
+    const result = await bash.execute(
+      { command: "echo hello" },
+      createMockSdkContext({ metadata }),
+    );
+    expect(bashText(result)).toBe("final output\n");
+    expect(metadata.mock.calls).toHaveLength(2);
   });
 
   test("bg_completions are captured for notification hooks, not appended by bash adapter", async () => {
@@ -1543,6 +1641,28 @@ describe("bash_status tool", () => {
     }
   });
 
+  test("bash_kill preserves its outcome and appends the durable-revocation warning", async () => {
+    const warning =
+      "bot_write_revocation_not_durable: the block on this command's bot writes was not saved and lasts only until AFT restarts; check the command's state.";
+    const { killTool } = makeCtx(() => ({
+      success: true,
+      status: "killed",
+      bot_write_revocation_warning: warning,
+    }));
+    expect(await killTool.execute({ taskId: "bash-warning" }, createMockSdkContext())).toBe(
+      `Task bash-warning: killed\n${warning}`,
+    );
+    const signaled = makeCtx(() => ({
+      success: true,
+      kill_signaled: true,
+      kill_reached: 2,
+      bot_write_revocation_warning: warning,
+    }));
+    expect(
+      await signaled.killTool.execute({ taskId: "bash-warning" }, createMockSdkContext()),
+    ).toBe(`Task bash-warning: kill_signaled · reached 2 live descendants\n${warning}`);
+  });
+
   test("failed bash_status includes a task's spawn reason", async () => {
     const reason = "failed to spawn background bash command: No such file or directory";
     const { statusTool } = makeCtx(() => ({
@@ -1583,6 +1703,23 @@ describe("bash_status tool", () => {
 
     expect(text).toContain("Task bash-remote: running");
     expect(text).not.toContain("remote job");
+  });
+
+  test("bash_status shows AFT's incomplete-listing sentence exactly", async () => {
+    const sentence =
+      "AFT could not read every process in the task's group, so others may also be running.";
+    const { statusTool } = makeCtx(() => ({
+      success: true,
+      status: "timed_out",
+      exit_code: 124,
+      live_descendants: null,
+      live_descendants_unavailable: "listing_incomplete",
+      live_descendants_summary: sentence,
+    }));
+
+    const text = await statusTool.execute({ taskId: "bash-hidden" }, createMockSdkContext());
+
+    expect(text).toContain(`Task bash-hidden: timed_out (exit 124) · ${sentence}`);
   });
 
   test("default sync cap rejects 120001 with the config knob in the error", async () => {
@@ -1666,6 +1803,50 @@ describe("bash_status tool", () => {
     );
 
     expect(sessionBgStates.get("s-watch")?.outstandingTaskIds.has("bash-finished")).toBe(false);
+  });
+
+  test("each_line recovery pages forward byte offsets and show only masked text", async () => {
+    const { calls, statusTool } = makeCtx(() => ({
+      success: true,
+      status: "running",
+      output_page_text: "masked output",
+      stderr_page_text: "masked error",
+      output_chunk_base64: "RAW-SECRET",
+      output_next_offset: 48,
+      stderr_next_offset: 20,
+      output_has_more: false,
+      stderr_has_more: false,
+    }));
+    const result = await statusTool.execute(
+      { taskId: "bash-lines", outputOffset: 16, stderrOffset: 10 },
+      createMockSdkContext(),
+    );
+    expect(calls.find((call) => call.cmd === "bash_status")?.params).toMatchObject({
+      output_offset: 16,
+      stderr_offset: 10,
+    });
+    expect(result).toContain("masked output");
+    expect(result).toContain("next outputOffset: 48");
+    expect(result).not.toContain("RAW-SECRET");
+  });
+
+  test("each_line forwards async delivery and refuses sync delivery", async () => {
+    const { calls, watchTool } = makeCtx(() => ({
+      success: true,
+      watch_id: "watch-lines",
+      status: "running",
+    }));
+    await watchTool.execute(
+      { taskId: "bash-lines", pattern: "ERROR", background: true, deliver: "each_line" },
+      createMockSdkContext(),
+    );
+    expect(calls.find((call) => call.cmd === "bash_notify")?.params.deliver).toBe("each_line");
+    await expect(
+      watchTool.execute(
+        { taskId: "bash-lines", pattern: "ERROR", deliver: "each_line" },
+        createMockSdkContext(),
+      ),
+    ).rejects.toThrow('bash_watch: deliver: "each_line" needs background: true.');
   });
 
   test('async bash_watch forwards string once "false" as boolean false', async () => {
@@ -1794,7 +1975,7 @@ describe("bash_status tool", () => {
         createMockSdkContext({ metadata }),
       );
       expect(result).toContain('matched "Server listening" in stdout at offset 7');
-      expect(metadata.mock.calls.at(-1)?.[0].waited).toMatchObject({
+      expect(metadata.mock.calls.at(-1)?.[0].metadata.waited).toMatchObject({
         reason: "matched",
         match: "Server listening",
         match_offset: 7,
@@ -1997,7 +2178,7 @@ describe("bash_status tool", () => {
         { taskId: `bash-default-${sessionID}` },
         createMockSdkContext({ sessionID, metadata }),
       );
-      return metadata.mock.calls.at(-1)?.[0].effectiveWaitMs;
+      return metadata.mock.calls.at(-1)?.[0].metadata.effectiveWaitMs;
     };
     expect(await effectiveFor(true, "ses_watch_worker_default")).toBe(1_800_000);
     // A configured limit is honoured.
@@ -2294,7 +2475,7 @@ describe("bash_status tool", () => {
         createMockSdkContext({ metadata }),
       );
       expect(result).toContain('matched "READY" in stderr at offset 9');
-      expect(metadata.mock.calls.at(-1)?.[0].waited).toMatchObject({
+      expect(metadata.mock.calls.at(-1)?.[0].metadata.waited).toMatchObject({
         reason: "matched",
         match: "READY",
         match_offset: 9,
@@ -2325,7 +2506,7 @@ describe("bash_status tool", () => {
 
       expect(result).toContain("task exited (completed, exit 0)");
       expect(result).not.toContain("matched");
-      expect(metadata.mock.calls.at(-1)?.[0].waited).toMatchObject({ reason: "exited" });
+      expect(metadata.mock.calls.at(-1)?.[0].metadata.waited).toMatchObject({ reason: "exited" });
     } finally {
       await rm(spill.dir, { recursive: true, force: true });
     }
@@ -2356,7 +2537,7 @@ describe("bash_status tool", () => {
       );
 
       expect(result).toContain('matched "READY" in stdout at offset 0');
-      expect(metadata.mock.calls.at(-1)?.[0].waited).toMatchObject({
+      expect(metadata.mock.calls.at(-1)?.[0].metadata.waited).toMatchObject({
         reason: "matched",
         match: "READY",
         match_offset: 0,
@@ -2415,6 +2596,22 @@ describe("bash_status tool", () => {
     await expect(killTool.execute({ taskId: "bash-done" }, createMockSdkContext())).rejects.toThrow(
       "task already finished",
     );
+  });
+
+  test("bash_kill reports the runner answer without claiming a known task outcome", async () => {
+    for (const remote_cancel of [
+      "runner confirmed cancellation",
+      "runner reports job already ended",
+      "remote cancellation unconfirmed; outcome is still unknown: runner unavailable",
+    ]) {
+      const { killTool } = makeCtx(() => ({
+        success: true,
+        status: "fate_unknown",
+        remote_cancel,
+      }));
+      const result = await killTool.execute({ taskId: "bash-unknown" }, createMockSdkContext());
+      expect(result).toBe(`Task bash-unknown: fate_unknown · ${remote_cancel}`);
+    }
   });
 
   // ─── sync-watch user-message abort ───

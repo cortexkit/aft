@@ -434,6 +434,117 @@ fn subc_unadopted_task_reports_output_without_cross_harness_recovery() {
 /// (3). Both arms run the real binary; the second is the control that keeps
 /// the codes provably distinct.
 #[test]
+fn standalone_and_index_take_storage_lease_before_cache_access() {
+    for index in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        std::fs::create_dir_all(storage.join("retention")).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(storage.join("retention/daemon-use.lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_aft"));
+        if index {
+            command.arg("index");
+        }
+        let output = command
+            .env("AFT_STORAGE_DIR", &storage)
+            .env("XDG_CONFIG_HOME", temp.path().join("config"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("cannot acquire storage lease"),
+            "{output:?}"
+        );
+        assert!(!storage.join("logs").exists());
+    }
+}
+
+#[test]
+fn subc_process_storage_lease_covers_configure_loop_and_exit_tail() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let project = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let conn = tempfile::tempdir().unwrap();
+        let storage = data.path().join("cortexkit/aft");
+        std::fs::create_dir_all(storage.join("retention")).unwrap();
+        std::fs::create_dir_all(config.path().join("cortexkit")).unwrap();
+        std::fs::write(
+            config.path().join("cortexkit/aft.jsonc"),
+            r#"{"indexes":{"trigram":false,"semantic":false,"callgraph":false}}"#,
+        )
+        .unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(storage.join("retention/daemon-use.lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        let listener = write_connection_file(conn.path()).await;
+        let conn_path = conn.path().join("subc-connection.json");
+        let mut blocked = ModuleProcess::spawn(&conn_path, config.path(), data.path());
+        assert!(!blocked.wait_for_exit("storage-busy startup").success());
+        assert!(
+            !storage.join("logs").exists(),
+            "binary initialized logging before taking its storage lease"
+        );
+        lock.unlock().unwrap();
+        for bind in [false, true] {
+            let probe = data
+                .path()
+                .join(if bind { "bound.ready" } else { "idle.ready" });
+            let mut module = ModuleProcess::spawn_with_storage_probe(
+                &conn_path,
+                config.path(),
+                data.path(),
+                &probe,
+            );
+            let mut stream = accept_module(&listener).await;
+            assert!(matches!(
+                lock.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+            if bind {
+                bind_route(&mut stream, project.path()).await;
+            }
+            assert!(matches!(
+                lock.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+            send_connection_goodbye(&mut stream).await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !probe.is_file() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("module did not reach the production exit tail");
+            assert!(
+                matches!(lock.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+                "storage lease ended before the process exit tail"
+            );
+            std::fs::write(probe.with_extension("release"), b"release").unwrap();
+            assert!(module.wait_for_exit("storage lease process exit").success());
+            lock.try_lock().unwrap();
+            lock.unlock().unwrap();
+        }
+    });
+}
+
+#[test]
 fn subc_bare_eof_exits_nonzero_and_goodbye_exits_zero() {
     const CONNECTION_LOST_EXIT_CODE: i32 = 3;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -736,6 +847,11 @@ fn drain_with_live_lsp_servers_and_writer(
         if writer_delay == "1000" {
             assert!(log.contains("phase=log_flush_done flushed=false"),
                 "slow writer must exhaust the async flush budget: {}", log_tail(&log));
+            // The terminal marker is mirrored to stderr after the queued
+            // flush; the stderr exit fence must deliver it there as well as
+            // to the durable file checked below.
+            assert!(log.contains("subc exit phase=process_exit mode="),
+                "stderr exit fence must deliver the terminal marker: {}", log_tail(&log));
         }
         // Print phase and LSP summary lines. The bound below uses the LSP
         // phase's own elapsed value, never the outer process-exit observation.
@@ -919,6 +1035,43 @@ pub(super) struct ModuleProcess {
 }
 
 impl ModuleProcess {
+    fn spawn_with_storage_probe(
+        conn_path: &Path,
+        config_home: &Path,
+        data_home: &Path,
+        probe: &Path,
+    ) -> Self {
+        use std::os::unix::process::CommandExt;
+        let binary = std::env::var_os("AFT_TEST_AFT_BINARY")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_aft")));
+        let mut command = Command::new(binary);
+        command
+            .args([std::ffi::OsStr::new("--subc"), conn_path.as_os_str()])
+            .env("XDG_CONFIG_HOME", config_home)
+            .env("XDG_DATA_HOME", data_home)
+            .env("AFT_TEST_STORAGE_LEASE_EXIT_PROBE", probe)
+            .env("AFT_TEST_DISABLE_FILE_WATCHER", "1")
+            .env_remove("AFT_STORAGE_DIR")
+            .env_remove("AFT_DATA_HOME")
+            .env_remove("SUBC_MODULE_ID")
+            .env_remove("SUBC_LAUNCH_NONCE")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        Self {
+            child: command.spawn().unwrap(),
+        }
+    }
+
     fn spawn(conn_path: &Path, config_home: &Path, data_home: &Path) -> Self {
         Self::spawn_with_stderr(conn_path, config_home, data_home, None)
     }
@@ -1008,6 +1161,8 @@ impl ModuleProcess {
             .env("AFT_TEST_DISABLE_FILE_WATCHER", "1")
             .env("XDG_CONFIG_HOME", config_home)
             .env("XDG_DATA_HOME", data_home)
+            .env_remove("AFT_STORAGE_DIR")
+            .env_remove("AFT_DATA_HOME")
             .env_remove("SUBC_MODULE_ID")
             .env_remove("SUBC_LAUNCH_NONCE")
             .stdin(Stdio::null())
@@ -1035,6 +1190,11 @@ impl ModuleProcess {
             // A writer this slow cannot acknowledge a flush inside the exit
             // budget, wherever in its batch delay the request lands.
             command.env("AFT_TEST_LOG_FLUSH_HOLD_MS", hold);
+            // Keep the stderr mirror from writing the exit's last lines until
+            // the stderr exit fence starts, so the stderr assertions prove the
+            // fence delivers them instead of depending on the mirror thread
+            // being scheduled before the process exits.
+            command.env("AFT_TEST_STDERR_EXIT_HOLD", "1");
         }
         if let Some(bin_dir) = bin_dir {
             // The test supplies its language servers through `bin_dir`. An
@@ -1114,7 +1274,7 @@ impl Drop for ModuleProcess {
     }
 }
 
-async fn accept_module(listener: &TcpListener) -> TcpStream {
+pub(super) async fn accept_module(listener: &TcpListener) -> TcpStream {
     let (mut stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
         .await
         .expect("timed out accepting module connection")
@@ -1160,6 +1320,20 @@ pub(super) async fn bind_route(stream: &mut TcpStream, root: &Path) {
 }
 
 async fn bind_route_as(stream: &mut TcpStream, root: &Path, channel: u16, harness: &str) {
+    bind_route_as_at_epoch(stream, root, channel, harness, 1).await;
+}
+
+pub(super) async fn bind_route_at_epoch(stream: &mut TcpStream, root: &Path, epoch: u32) {
+    bind_route_as_at_epoch(stream, root, ROUTE_CHANNEL, "opencode", epoch).await;
+}
+
+async fn bind_route_as_at_epoch(
+    stream: &mut TcpStream,
+    root: &Path,
+    channel: u16,
+    harness: &str,
+    epoch: u32,
+) {
     let project_cfg = root.join(".cortexkit").join("aft.jsonc");
     std::fs::create_dir_all(project_cfg.parent().expect("project config parent"))
         .expect("create project config dir");
@@ -1174,7 +1348,7 @@ async fn bind_route_as(stream: &mut TcpStream, root: &Path, channel: u16, harnes
 
     let request = ModuleControlRequest::RouteBind {
         route_channel: channel,
-        epoch: 1,
+        epoch,
         target: RouteTarget::ToolProvider {
             module_id: "aft".to_string(),
         },

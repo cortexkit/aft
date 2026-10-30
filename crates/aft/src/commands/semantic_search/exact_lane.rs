@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::memo::{
@@ -13,7 +13,6 @@ use crate::commands::semantic_search::evidence_descriptor::EvidenceDescriptor;
 use crate::commands::semantic_search::generation_token::GenerationToken;
 use crate::commands::semantic_search::plan_table::SearchLaneKind;
 use crate::commands::semantic_search::{LaneExecution, LaneInput, SearchLane};
-use crate::inspect::job::is_test_file;
 use crate::query_shape::{extract_content_tokens, minimum_content_token_window};
 use crate::search_index::{
     read_search_corpus_file, SearchCorpusEligibility, SearchIndex, SearchIndexSnapshot,
@@ -274,12 +273,34 @@ impl ExactLane {
         include_tests: bool,
         scope: &ExactEvidenceScope,
     ) -> VerifiedExactSet {
-        let matches = snapshot.whole_corpus_exact_pass_scoped(
+        let matches = match snapshot.whole_corpus_exact_pass_scoped(
             query,
             project_root,
-            Some(&|path| include_tests || !path.to_str().map_or(false, is_test_file)),
+            Some(&|path| super::path_allowed_by_include_tests(path, project_root, include_tests)),
             scope,
-        );
+        ) {
+            Ok(matches) => matches,
+            Err(error) => {
+                let mut fallback = self
+                    .execute_fallback_mode(
+                        project_root,
+                        query,
+                        include_tests,
+                        &FallbackExactOptions::default(),
+                    )
+                    .verified_set;
+                let reason = format!(
+                    "Exact index source unavailable: {error}; verified-source fallback used"
+                );
+                if let Some(disclosure) = &mut fallback.bound_disclosure {
+                    disclosure.push_str("; ");
+                    disclosure.push_str(&reason);
+                } else {
+                    fallback.bound_disclosure = Some(reason);
+                }
+                return fallback;
+            }
+        };
 
         let mut results = Vec::new();
         let mut file_digests = HashMap::new();
@@ -342,7 +363,7 @@ impl ExactLane {
 
         // Filter tests if needed
         if !include_tests {
-            files.retain(|p| !p.to_str().map_or(false, is_test_file));
+            files.retain(|p| super::path_allowed_by_include_tests(p, project_root, false));
         }
 
         // Prefer source over documentation/data; retain byte-wise path order
@@ -500,7 +521,36 @@ impl ExactLane {
         fallback_options: Option<&FallbackExactOptions>,
         scope: &ExactEvidenceScope,
     ) -> Result<ServeOutcome, MemoError> {
-        let is_ready = index.is_some_and(SearchIndex::is_ready);
+        let snapshot = index
+            .filter(|index| index.is_ready())
+            .map(SearchIndex::snapshot);
+        self.search_scoped_snapshot(
+            snapshot.as_ref(),
+            project_root,
+            snapshot_generation,
+            query,
+            include_tests,
+            offset,
+            top_k,
+            fallback_options,
+            scope,
+        )
+    }
+
+    /// Accepts an optional SearchIndexSnapshot without requiring a mutable index.
+    pub(crate) fn search_scoped_snapshot(
+        &self,
+        snapshot: Option<&crate::search_index::SearchIndexSnapshot>,
+        project_root: &Path,
+        snapshot_generation: GenerationToken,
+        query: &str,
+        include_tests: bool,
+        offset: usize,
+        top_k: usize,
+        fallback_options: Option<&FallbackExactOptions>,
+        scope: &ExactEvidenceScope,
+    ) -> Result<ServeOutcome, MemoError> {
+        let is_ready = snapshot.is_some();
         // Index loading can finish without changing snapshot_generation. Give
         // fallback results a separate memo key so they cannot be reused once
         // the full index is ready.
@@ -517,9 +567,8 @@ impl ExactLane {
 
         self.memo.get_or_verify(&key, offset, top_k, || {
             if is_ready {
-                let snapshot = index.unwrap().snapshot();
                 Ok(self.execute_ready_mode_scoped(
-                    &snapshot,
+                    snapshot.unwrap(),
                     project_root,
                     query,
                     include_tests,
@@ -545,7 +594,7 @@ impl SearchLane for ExactLane {
         SearchLaneKind::Exact
     }
 
-    fn execute(&self, input: &LaneInput<'_>) -> LaneExecution {
+    fn execute(&self, input: &LaneInput<'_>) -> std::io::Result<LaneExecution> {
         let snapshot = input.index.snapshot();
         let keeps_definitions =
             input.shape == crate::commands::semantic_search::SearchShape::Identifier;
@@ -569,10 +618,10 @@ impl SearchLane for ExactLane {
                     != crate::commands::semantic_search::EvidenceKind::Definition
             });
         }
-        LaneExecution {
+        Ok(LaneExecution {
             kind: self.kind(),
             candidates,
-        }
+        })
     }
 }
 
@@ -600,32 +649,214 @@ pub fn verify_exact_matches_in_text_with_member(
     content_tokens: &[String],
     member: Option<&str>,
 ) -> Option<Vec<CandidateResult>> {
+    let prepared = PreparedExactText::new(text);
+    verify_prepared_exact_matches(
+        file_path,
+        text,
+        &prepared,
+        norm_phrase,
+        content_tokens,
+        member,
+    )
+}
+
+struct PreparedExactSymbol {
+    name: String,
+    range: SymbolOffsetRange,
+    normalized: String,
+    member_declaration: bool,
+}
+
+struct PreparedExactText {
+    normalized: String,
+    symbols: Vec<PreparedExactSymbol>,
+}
+
+impl PreparedExactText {
+    fn new(text: &str) -> Self {
+        let symbols = scan_symbols_in_text(text)
+            .into_iter()
+            .filter_map(|(name, range)| {
+                // A scanner offset must address a UTF-8 boundary, even for CRLF
+                // input. A bad offset must not panic the search actor.
+                let Some(symbol_text) = text.get(range.start..range.end.min(text.len())) else {
+                    debug_assert!(false, "symbol range {range:?} is not char-boundary aligned");
+                    return None;
+                };
+                Some(PreparedExactSymbol {
+                    member_declaration: !symbol_text.trim_start().starts_with(name.as_str()),
+                    name: name.to_ascii_lowercase(),
+                    range,
+                    normalized: normalize_exact_phrase(symbol_text),
+                })
+            })
+            .collect();
+        Self {
+            normalized: normalize_exact_phrase(text),
+            symbols,
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.normalized.capacity()
+            + self.symbols.capacity() * std::mem::size_of::<PreparedExactSymbol>()
+            + self
+                .symbols
+                .iter()
+                .map(|symbol| symbol.name.capacity() + symbol.normalized.capacity())
+                .sum::<usize>()
+    }
+}
+
+struct PreparedExactEntry {
+    text: Arc<OnceLock<Arc<PreparedExactText>>>,
+    last_used: u64,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct PreparedExactCacheState {
+    entries: HashMap<blake3::Hash, PreparedExactEntry>,
+    clock: u64,
+    bytes: usize,
+}
+
+impl PreparedExactCacheState {
+    fn evict_oldest(&mut self) {
+        if let Some(key) = self
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(key, _)| *key)
+        {
+            if let Some(entry) = self.entries.remove(&key) {
+                self.bytes -= entry.bytes;
+            }
+        }
+    }
+}
+
+struct PreparedExactCache {
+    state: parking_lot::Mutex<PreparedExactCacheState>,
+    max_bytes: usize,
+    #[cfg(test)]
+    preparations: std::sync::atomic::AtomicUsize,
+}
+
+impl PreparedExactCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            state: parking_lot::Mutex::new(PreparedExactCacheState::default()),
+            max_bytes,
+            #[cfg(test)]
+            preparations: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn prepare(&self, digest: blake3::Hash, text: &str) -> Arc<PreparedExactText> {
+        let cell = {
+            let mut state = self.state.lock();
+            state.clock = state.clock.wrapping_add(1);
+            let clock = state.clock;
+            if let Some(entry) = state.entries.get_mut(&digest) {
+                entry.last_used = clock;
+                if let Some(prepared) = entry.text.get() {
+                    return Arc::clone(prepared);
+                }
+                Arc::clone(&entry.text)
+            } else {
+                // Bound placeholders as well as prepared bytes. A placeholder
+                // single-flights parallel queries without holding the map lock
+                // during normalization and symbol scanning.
+                if state.entries.len() >= 1024 {
+                    state.evict_oldest();
+                }
+                let cell = Arc::new(OnceLock::new());
+                state.entries.insert(
+                    digest,
+                    PreparedExactEntry {
+                        text: Arc::clone(&cell),
+                        last_used: clock,
+                        bytes: 0,
+                    },
+                );
+                cell
+            }
+        };
+        let prepared = cell.get_or_init(|| {
+            #[cfg(test)]
+            self.preparations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(test)]
+            crate::search_hot_path_measurements::record(|counts| counts.exact_preparations += 1);
+            Arc::new(PreparedExactText::new(text))
+        });
+        let mut state = self.state.lock();
+        if let Some(entry) = state.entries.get_mut(&digest) {
+            if Arc::ptr_eq(&entry.text, &cell) && entry.bytes == 0 {
+                entry.bytes = prepared.retained_bytes();
+                state.bytes += prepared.retained_bytes();
+            }
+        }
+        while state.bytes > self.max_bytes {
+            state.evict_oldest();
+        }
+        Arc::clone(prepared)
+    }
+}
+
+/// Reuse only query-independent work, addressed by the bytes just read from
+/// disk. A new content hash cannot reuse old preparation, even before a watcher
+/// notices a write. No candidate selection, evidence, or digest check is cached.
+pub(crate) fn verify_cached_exact_matches_in_text_with_member(
+    file_path: &Path,
+    text: &str,
+    digest: blake3::Hash,
+    norm_phrase: &str,
+    content_tokens: &[String],
+    member: Option<&str>,
+) -> Option<Vec<CandidateResult>> {
+    static CACHE: OnceLock<PreparedExactCache> = OnceLock::new();
+    let prepared = CACHE
+        .get_or_init(|| PreparedExactCache::new(32 * 1024 * 1024))
+        .prepare(digest, text);
+    verify_prepared_exact_matches(
+        file_path,
+        text,
+        &prepared,
+        norm_phrase,
+        content_tokens,
+        member,
+    )
+}
+
+fn verify_prepared_exact_matches(
+    file_path: &Path,
+    text: &str,
+    prepared: &PreparedExactText,
+    norm_phrase: &str,
+    content_tokens: &[String],
+    member: Option<&str>,
+) -> Option<Vec<CandidateResult>> {
     let mut matches = Vec::new();
-    let norm_text = normalize_exact_phrase(text);
+    let norm_text = &prepared.normalized;
     let definition_source = is_definition_source(file_path);
 
     // 1. Check symbols first (for symbol-level candidates like `cap_chars`)
-    let symbols = scan_symbols_in_text(text);
-    for (name, range) in &symbols {
-        // The scanner guarantees boundary-aligned offsets; a non-aligned range
-        // is a scanner bug, and skipping the symbol is the right failure here
-        // because a panic on this path takes the whole search actor down.
-        let Some(sym_text) = text.get(range.start..range.end.min(text.len())) else {
-            debug_assert!(false, "symbol range {range:?} is not char-boundary aligned");
-            continue;
-        };
-        let norm_sym_text = normalize_exact_phrase(sym_text);
-        let lowercase_name = name.to_ascii_lowercase();
+    for symbol in &prepared.symbols {
+        let range = &symbol.range;
+        let norm_sym_text = &symbol.normalized;
+        let lowercase_name = &symbol.name;
         // The member stand-in counts only item declarations (`fn`, `def`,
         // `function`, `class`, ...), whose line starts with a keyword. A
         // `name:` line is a struct field or an object-literal key, and for a
         // member name the keys are mostly test doubles (`clearPluginCache:
         // async () => ...`) that would outrank the real declaration.
-        let names_member = member.is_some_and(|member| {
-            lowercase_name == member && !sym_text.trim_start().starts_with(name.as_str())
-        });
+        let names_member =
+            member.is_some_and(|member| lowercase_name == member && symbol.member_declaration);
         let names_query =
-            content_tokens.iter().any(|token| lowercase_name == *token) || names_member;
+            content_tokens.iter().any(|token| lowercase_name == token) || names_member;
         if definition_source && names_query {
             matches.push(CandidateResult::new_exact(
                 file_path.to_path_buf(),
@@ -657,7 +888,7 @@ pub fn verify_exact_matches_in_text_with_member(
     // 3. Check 3-line window match (E2) if no E1 match on file-level.
     // Files missing any query token cannot contain an all-token window, so reject
     // them before scanning identifiers and tracking line coverage.
-    if matches.is_empty() && e2_window_scan_needed(&norm_text, content_tokens) {
+    if matches.is_empty() && e2_window_scan_needed(norm_text, content_tokens) {
         if let Some(width) = minimum_content_token_window(text, content_tokens) {
             matches.push(CandidateResult::new_exact(
                 file_path.to_path_buf(),
@@ -759,7 +990,103 @@ pub fn scan_symbols_in_text(text: &str) -> Vec<(String, SymbolOffsetRange)> {
         current_offset += segment.len();
     }
 
+    // Approximate bodies must not borrow evidence from the next declaration.
+    for index in 0..symbols.len().saturating_sub(1) {
+        symbols[index].1.end = symbols[index].1.end.min(symbols[index + 1].1.start);
+    }
     symbols
+}
+
+#[cfg(test)]
+#[test]
+fn audit01_approximate_span_stops_at_next_declaration() {
+    let source = "pub fn first() { }\n\npub fn second() { target_phrase(); }\n";
+    let symbols = scan_symbols_in_text(source);
+    assert_eq!(symbols.len(), 2);
+    assert!(symbols[0].1.end <= symbols[1].1.start);
+    assert!(!source[symbols[0].1.start..symbols[0].1.end].contains("target_phrase"));
+    assert!(source[symbols[1].1.start..symbols[1].1.end].contains("target_phrase"));
+
+    let matches = verify_exact_matches_in_text(
+        Path::new("fixture.rs"),
+        source,
+        "target_phrase",
+        &["target_phrase".to_string()],
+    )
+    .unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].symbol_range, Some(symbols[1].1));
+}
+
+#[cfg(test)]
+fn audit01_visibility_counts(
+    root: &Path,
+    paths: &[&str],
+    include_tests: bool,
+) -> (usize, usize, usize) {
+    std::fs::create_dir_all(root).unwrap();
+    let mut index = crate::search_index::SearchIndex::new();
+    for relative in paths {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let text = "pub fn visible() { needle_phrase(); }\n";
+        std::fs::write(&path, text).unwrap();
+        index.index_file(&path, text.as_bytes());
+    }
+    let lane = ExactLane::new();
+    let ready = lane.execute_ready_mode(&index.snapshot(), root, "needle_phrase", include_tests);
+    let fallback = lane.execute_fallback_mode(
+        root,
+        "needle_phrase",
+        include_tests,
+        &FallbackExactOptions::default(),
+    );
+    let anchored = super::anchored_lane::discover_anchored_candidate_files(
+        &index,
+        root,
+        &["needle_phrase".to_string()],
+        include_tests,
+    );
+    (
+        ready.file_digests.len(),
+        fallback.verified_set.file_digests.len(),
+        anchored
+            .expect("anchored candidates from a test index")
+            .len(),
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn audit01_nested_checkout_visibility() {
+    for ancestor in ["tests", "__tests__"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(ancestor).join("product");
+        assert_eq!(
+            audit01_visibility_counts(&root, &["src/lib.rs"], false),
+            (1, 1, 1)
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn audit01_shared_test_support_visibility() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = [
+        "src/lib.rs",
+        "src/FooTest.java",
+        "src/FooTest.kt",
+        "fixtures/helper.rs",
+    ];
+    assert_eq!(
+        audit01_visibility_counts(temp.path(), &paths, false),
+        (1, 1, 1)
+    );
+    assert_eq!(
+        audit01_visibility_counts(temp.path(), &paths, true),
+        (4, 4, 4)
+    );
 }
 
 fn extract_field_identifier(line: &str) -> Option<String> {
@@ -1247,6 +1574,97 @@ pub(crate) mod tests {
             results,
             crate::search_hot_path_measurements::counts().file_reads,
         )
+    }
+
+    #[test]
+    fn exact_preparation_is_reused_across_queries_but_not_changed_bytes() {
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("cache.rs");
+        let text = format!(
+            "// unique {}\r\nfn alpha() {{ let label = \"cache alpha café\"; }}\r\nfn beta() {{ let label = \"cache beta\"; }}\r\n",
+            project.path().display()
+        );
+        std::fs::write(&path, &text).unwrap();
+        let mut index = SearchIndex::new();
+        index.index_file(&path, text.as_bytes());
+        index.ready = true;
+        crate::search_hot_path_measurements::reset();
+        for query in ["cache alpha", "cache beta"] {
+            let mut expected = verify_exact_matches_in_text(
+                &path,
+                &text,
+                &normalize_exact_phrase(query),
+                &exact_verification_tokens(query),
+            )
+            .unwrap();
+            expected.sort_by(score_free_r3_cmp);
+            let actual = ExactLane::new().execute_ready_mode(
+                &index.snapshot(),
+                project.path(),
+                query,
+                false,
+            );
+            assert_eq!(actual.results, expected);
+            assert_eq!(
+                crate::search_hot_path_measurements::counts().exact_preparations,
+                1
+            );
+        }
+        let changed = text.replace("cache alpha café", "different bytes café");
+        std::fs::write(&path, &changed).unwrap();
+        let actual = ExactLane::new().execute_ready_mode(
+            &index.snapshot(),
+            project.path(),
+            "cache beta",
+            false,
+        );
+        let mut expected = verify_exact_matches_in_text(
+            &path,
+            &changed,
+            "cache beta",
+            &exact_verification_tokens("cache beta"),
+        )
+        .unwrap();
+        expected.sort_by(score_free_r3_cmp);
+        assert_eq!(actual.results, expected);
+        assert_eq!(
+            crate::search_hot_path_measurements::counts().exact_preparations,
+            2
+        );
+    }
+
+    #[test]
+    fn exact_preparation_single_flights_and_obeys_retained_byte_bound() {
+        let cache = PreparedExactCache::new(1024 * 1024);
+        let text = "fn café() {}\r\nfn beta() {}\r\n";
+        let digest = blake3::hash(text.as_bytes());
+        std::thread::scope(|scope| {
+            let handles = (0..16)
+                .map(|_| scope.spawn(|| cache.prepare(digest, text)))
+                .collect::<Vec<_>>();
+            let prepared = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>();
+            assert!(prepared
+                .iter()
+                .all(|entry| Arc::ptr_eq(entry, &prepared[0])));
+        });
+        assert_eq!(
+            cache
+                .preparations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        let tiny = PreparedExactCache::new(1);
+        tiny.prepare(digest, text);
+        tiny.prepare(digest, text);
+        assert_eq!(
+            tiny.preparations.load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        assert_eq!(tiny.state.lock().bytes, 0);
+        assert!(tiny.state.lock().entries.is_empty());
     }
 
     #[test]

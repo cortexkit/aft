@@ -4,8 +4,10 @@
 //! gracefully degrade when the formatter is missing or the language is unsupported.
 
 use std::fs;
-use std::process::Command;
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -69,8 +71,9 @@ fn prepend_path(existing_path: &std::ffi::OsStr, dir: &std::path::Path) -> std::
 
 /// Serialize rustfmt-edition tests when `cargo test` runs them in one process.
 ///
-/// Nextest runs each test in its own process, so it cannot share this lock; the
-/// dedicated configure helper below supplies the timeout isolation those runs need.
+/// Nextest runs each test in its own process, so it cannot share this lock;
+/// `warm_rustfmt` and `configure_real_rustfmt_test` below supply the timeout
+/// isolation those runs need.
 fn rustfmt_edition_test_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -78,14 +81,76 @@ fn rustfmt_edition_test_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Configure the guard-mediated rustfmt tests with a scheduling-tolerant budget.
+/// Formatter budget for the tests that assert real rustfmt formatted a file.
 ///
-/// Each test launches a command wrapper and the real formatter.
-/// Under Windows shard load, those process hops can exceed the product's normal
-/// 10-second formatter deadline even though this test only verifies the selected
-/// edition arguments. Keep the wider budget local to this fixture so it does not
-/// change the product timeout contract.
-fn configure_rustfmt_edition_test(aft: &mut AftProcess, project_root: &std::path::Path) {
+/// These tests check that formatting happened, not the product's 10-second
+/// `formatter_timeout_secs` default, so they configure a wider budget for
+/// their own AFT process only. It stays below the test harness's 60-second
+/// response wait, so a formatter that is still too slow fails the assertion
+/// with `format_skipped_reason: "timeout"` instead of a lost response.
+const REAL_RUSTFMT_TEST_TIMEOUT_SECS: u32 = 45;
+
+/// Longest time `warm_rustfmt` waits for its untimed first rustfmt run.
+const RUSTFMT_WARM_LIMIT: Duration = Duration::from_secs(120);
+
+/// Run the real rustfmt once, outside any product deadline, before a test
+/// sends the edit whose formatting it asserts.
+///
+/// On a fresh Windows CI runner the first rustfmt start goes through the
+/// rustup proxy and loads the toolchain from a cold disk. Windows CI runs
+/// have seen that first start take longer than 30 seconds, so no formatter
+/// budget that fits under the harness's 60-second response wait is a
+/// reliable fix on its own. Later starts are fast. Paying the cold start
+/// here, with no deadline, keeps the asserted edit measuring AFT's
+/// formatting path instead of the runner's disk.
+///
+/// The warm-up runs in `project_dir` so rustup picks the same toolchain AFT
+/// will. It formats a throwaway file, ignores the result, and gives up after
+/// `RUSTFMT_WARM_LIMIT`; a formatter that is still slow then fails the test's
+/// own assertion. The elapsed time is printed so a failing run shows whether
+/// the start was cold.
+fn warm_rustfmt(rustfmt: &Path, project_dir: &Path) {
+    let warm_dir = project_dir.join("rustfmt-warm-up");
+    fs::create_dir_all(&warm_dir).unwrap();
+    let warm_file = warm_dir.join("warm_up.rs");
+    fs::write(&warm_file, "fn  warm_up( ) {  }\n").unwrap();
+
+    let started = Instant::now();
+    let outcome = match Command::new(rustfmt)
+        .args(["--edition", "2021"])
+        .arg(&warm_file)
+        .current_dir(project_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break format!("exited with {status}"),
+                Ok(None) if started.elapsed() >= RUSTFMT_WARM_LIMIT => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break "gave up and killed it".to_string();
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(error) => break format!("could not be waited on: {error}"),
+            }
+        },
+        Err(error) => format!("could not start: {error}"),
+    };
+    eprintln!(
+        "rustfmt warm-up ({}) {outcome} after {} ms",
+        rustfmt.display(),
+        started.elapsed().as_millis()
+    );
+    let _ = fs::remove_dir_all(&warm_dir);
+}
+
+/// Configure a test that asserts real rustfmt output: format on edit, with
+/// the test-only `REAL_RUSTFMT_TEST_TIMEOUT_SECS` budget. Call `warm_rustfmt`
+/// first so the asserted edit does not pay the formatter's cold start.
+fn configure_real_rustfmt_test(aft: &mut AftProcess, project_root: &Path) {
     let response = aft.send(
         &serde_json::json!({
             "id": "cfg",
@@ -94,7 +159,7 @@ fn configure_rustfmt_edition_test(aft: &mut AftProcess, project_root: &std::path
             "project_root": project_root.display().to_string(),
             "config": user_config(json!({
                 "format_on_edit": true,
-                "formatter_timeout_secs": 30,
+                "formatter_timeout_secs": REAL_RUSTFMT_TEST_TIMEOUT_SECS,
             })),
         })
         .to_string(),
@@ -102,6 +167,20 @@ fn configure_rustfmt_edition_test(aft: &mut AftProcess, project_root: &std::path
     assert_eq!(
         response["success"], true,
         "configure should succeed: {response:?}"
+    );
+    // An out-of-range timeout does not fail configure: AFT discards just that
+    // key with an `invalid_config_section` warning and keeps the 10-second
+    // default, which would silently bring back the timeouts this budget
+    // exists to avoid. Fail here instead.
+    let discarded = response["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|warning| warning["code"] == "invalid_config_section")
+        .collect::<Vec<_>>();
+    assert!(
+        discarded.is_empty(),
+        "the test formatter budget must be accepted, not discarded: {discarded:?}"
     );
 }
 
@@ -154,10 +233,10 @@ fn format_test_dir(test_name: &str) -> std::path::PathBuf {
 #[test]
 
 fn format_integration_applied_rustfmt() {
-    if !is_on_path("rustfmt") {
+    let Some(real_rustfmt) = which::which("rustfmt").ok() else {
         eprintln!("SKIP: rustfmt not on PATH");
         return;
-    }
+    };
 
     let dir = format_test_dir("applied_rustfmt");
     // Cargo.toml needed so config-file detection triggers for Rust
@@ -167,9 +246,10 @@ fn format_integration_applied_rustfmt() {
 
     let ugly_code = "fn  main( ){  let   x=1;  }";
 
+    warm_rustfmt(&real_rustfmt, &dir);
     let path = prepend_path(&std::env::var_os("PATH").unwrap_or_default(), &dir);
     let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
-    aft.configure_format_on_edit(&dir);
+    configure_real_rustfmt_test(&mut aft, &dir);
     let resp = aft.send(&format!(
         r#"{{"id":"fmt-1","command":"write","file":{},"content":"{}"}}"#,
         crate::helpers::json_string(&target.display()),
@@ -229,6 +309,7 @@ fn format_integration_rustfmt_uses_package_edition() {
     )
     .unwrap();
     install_rustfmt_edition_guard(&dir, Some("2021"));
+    warm_rustfmt(&real_rustfmt, &dir);
     let target = dir.join("src").join("format_edition.rs");
     fs::create_dir_all(target.parent().unwrap()).unwrap();
 
@@ -237,7 +318,7 @@ fn format_integration_rustfmt_uses_package_edition() {
         ("PATH", path.as_os_str()),
         ("AFT_TEST_REAL_RUSTFMT", real_rustfmt.as_os_str()),
     ]);
-    configure_rustfmt_edition_test(&mut aft, &dir);
+    configure_real_rustfmt_test(&mut aft, &dir);
     let resp = aft.send(&format!(
         r#"{{"id":"fmt-rust-edition","command":"write","file":{},"content":"async   fn   format_me( ) {{ }}\n"}}"#,
         crate::helpers::json_string(&target.display()),
@@ -281,6 +362,7 @@ fn format_integration_rustfmt_uses_workspace_package_edition() {
     )
     .unwrap();
     install_rustfmt_edition_guard(&member, Some("2021"));
+    warm_rustfmt(&real_rustfmt, &member);
     let target = member.join("src").join("lib.rs");
 
     let path = prepend_path(&std::ffi::OsString::new(), &member);
@@ -288,7 +370,7 @@ fn format_integration_rustfmt_uses_workspace_package_edition() {
         ("PATH", path.as_os_str()),
         ("AFT_TEST_REAL_RUSTFMT", real_rustfmt.as_os_str()),
     ]);
-    configure_rustfmt_edition_test(&mut aft, &member);
+    configure_real_rustfmt_test(&mut aft, &member);
     let resp = aft.send(&format!(
         r#"{{"id":"fmt-workspace-edition","command":"write","file":{},"content":"async   fn   format_member( ) {{ }}\n"}}"#,
         crate::helpers::json_string(&target.display()),
@@ -332,6 +414,7 @@ fn format_integration_rustfmt_uses_member_edition_from_virtual_workspace() {
     )
     .unwrap();
     install_rustfmt_edition_guard(&workspace, Some("2021"));
+    warm_rustfmt(&real_rustfmt, &workspace);
     let target = member.join("src").join("lib.rs");
 
     let path = prepend_path(&std::ffi::OsString::new(), &workspace);
@@ -339,7 +422,7 @@ fn format_integration_rustfmt_uses_member_edition_from_virtual_workspace() {
         ("PATH", path.as_os_str()),
         ("AFT_TEST_REAL_RUSTFMT", real_rustfmt.as_os_str()),
     ]);
-    configure_rustfmt_edition_test(&mut aft, &workspace);
+    configure_real_rustfmt_test(&mut aft, &workspace);
     let resp = aft.send(&format!(
         r#"{{"id":"fmt-virtual-workspace-edition","command":"write","file":{},"content":"async   fn   format_member( ) {{ }}\n"}}"#,
         crate::helpers::json_string(&target.display()),
@@ -383,6 +466,7 @@ fn format_integration_rustfmt_prefers_member_edition_over_workspace_default() {
     )
     .unwrap();
     install_rustfmt_edition_guard(&workspace, Some("2021"));
+    warm_rustfmt(&real_rustfmt, &workspace);
     let target = member.join("src").join("lib.rs");
 
     let path = prepend_path(&std::ffi::OsString::new(), &workspace);
@@ -390,7 +474,7 @@ fn format_integration_rustfmt_prefers_member_edition_over_workspace_default() {
         ("PATH", path.as_os_str()),
         ("AFT_TEST_REAL_RUSTFMT", real_rustfmt.as_os_str()),
     ]);
-    configure_rustfmt_edition_test(&mut aft, &workspace);
+    configure_real_rustfmt_test(&mut aft, &workspace);
     let resp = aft.send(&format!(
         r#"{{"id":"fmt-member-edition-precedence","command":"write","file":{},"content":"async   fn   format_member( ) {{ }}\n"}}"#,
         crate::helpers::json_string(&target.display()),
@@ -421,6 +505,7 @@ fn format_integration_rustfmt_preserves_bare_2015_invocation() {
     )
     .unwrap();
     install_rustfmt_edition_guard(&dir, None);
+    warm_rustfmt(&real_rustfmt, &dir);
     let target = dir.join("src").join("format_2015.rs");
     fs::create_dir_all(target.parent().unwrap()).unwrap();
 
@@ -429,7 +514,7 @@ fn format_integration_rustfmt_preserves_bare_2015_invocation() {
         ("PATH", path.as_os_str()),
         ("AFT_TEST_REAL_RUSTFMT", real_rustfmt.as_os_str()),
     ]);
-    configure_rustfmt_edition_test(&mut aft, &dir);
+    configure_real_rustfmt_test(&mut aft, &dir);
     let resp = aft.send(&format!(
         r#"{{"id":"fmt-no-edition","command":"write","file":{},"content":"fn  main( ) {{ }}\n"}}"#,
         crate::helpers::json_string(&target.display()),
@@ -454,10 +539,10 @@ fn format_integration_rustfmt_preserves_bare_2015_invocation() {
 /// edit_match with a mis-wrapped replacement → reformatted.text in response.
 #[test]
 fn format_integration_edit_match_reformatted_excerpt_on_reflow() {
-    if !is_on_path("rustfmt") {
+    let Some(real_rustfmt) = which::which("rustfmt").ok() else {
         eprintln!("SKIP: rustfmt not on PATH");
         return;
-    }
+    };
 
     let dir = format_test_dir("edit_match_reflow");
     fs::write(dir.join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
@@ -468,18 +553,10 @@ fn format_integration_edit_match_reformatted_excerpt_on_reflow() {
     )
     .unwrap();
 
+    warm_rustfmt(&real_rustfmt, &dir);
     let path = prepend_path(&std::env::var_os("PATH").unwrap_or_default(), &dir);
     let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
-    aft.send(
-        &serde_json::json!({
-            "id": "cfg-fmt-reflow",
-            "command": "configure",
-            "harness": "opencode",
-            "project_root": dir.display().to_string(),
-            "config": user_config(serde_json::json!({ "format_on_edit": true })),
-        })
-        .to_string(),
-    );
+    configure_real_rustfmt_test(&mut aft, &dir);
 
     let req = serde_json::json!({
         "id": "fmt-edit-match",

@@ -1,1 +1,0 @@
-- Worker sandbox: a worker command can now signal only processes started by that same command, on macOS and on Linux kernels with Landlock signal scoping (older Linux kernels report the limit as not enforced). Stop background tasks started by earlier commands with bash_kill.

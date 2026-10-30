@@ -53,6 +53,8 @@ async function withPiTool(
     });
     client = spawned.client;
     client.onExtensionUIRequest((request) => {
+      // notify and status updates share this envelope but expect no response.
+      if (request.method !== "confirm") return;
       client?.sendExtensionUIResponse({
         id: request.id as string,
         confirmed: opts.confirmUi ?? true,
@@ -66,6 +68,7 @@ async function withPiTool(
       (event) => event.type === "tool_execution_end" && event.toolName === toolCall.name,
       30_000,
     );
+    await client.waitForEvent((event) => event.type === "agent_end", 30_000);
     await opts.afterTool?.(env, toolEnd);
     return toolEnd;
   } finally {

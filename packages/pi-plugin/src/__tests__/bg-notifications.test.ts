@@ -30,6 +30,7 @@ import {
   appendToolResultBgCompletions,
   cleanupIdleSessionStates,
   consumeBgCompletion,
+  formatPatternMatchReminder,
   formatSystemReminder,
   handlePushedBgCompletion,
   handlePushedPatternMatch,
@@ -39,6 +40,7 @@ import {
   markBgCompletionDelivered,
   markExplicitControl,
   markTaskWaiting,
+  type PatternMatchEntry,
   SESSION_BG_STATE_IDLE_TTL_MS,
   sessionBgStates,
   trackBgTask,
@@ -73,6 +75,38 @@ describe("Pi background notifications", () => {
       expect(text).toContain(`task bash-incomplete (exit ${exitCode})`);
       expect(text).toContain(reason);
     }
+  });
+
+  test("failed memory-cap completion shows its reason without a capture warning", () => {
+    const reason = "Command stopped: exceeded the 64 MiB memory cap (test enforcement).";
+    expect(
+      formatSystemReminder([
+        {
+          task_id: "bash-memory",
+          command: "allocate",
+          status: "failed",
+          exit_code: 137,
+          status_reason: reason,
+        },
+      ]),
+    ).toContain(reason);
+  });
+
+  test("completion notice shows AFT's incomplete-listing sentence exactly", () => {
+    const sentence =
+      "AFT could not read every process in the task's group, so others may also be running.";
+    const text = formatSystemReminder([
+      {
+        task_id: "bash-hidden",
+        command: "deploy",
+        status: "timed_out",
+        exit_code: 124,
+        live_descendants: null,
+        live_descendants_unavailable: "listing_incomplete",
+        live_descendants_summary: sentence,
+      },
+    ]);
+    expect(text.split("\n")).toContain(`    ${sentence}`);
   });
 
   test("formats system reminder bullets with status and duration", () => {
@@ -1009,7 +1043,7 @@ describe("Pi subc forced-drain dedup (C-#1 / C-#3)", () => {
                   match_offset: 0,
                   context: "background task artifacts were erased",
                   once: true,
-                  reason: "watch_target_erased",
+                  reason: "task_exit",
                 },
               ]
             : [],
@@ -1066,7 +1100,11 @@ describe("Pi subc forced-drain dedup (C-#1 / C-#3)", () => {
               },
             ],
           }
-        : { success: true, acked_task_ids: ["task-pattern"] },
+        : {
+            success: true,
+            acked_task_ids: [],
+            acked_matches: [{ task_id: "task-pattern", watch_id: "watch-1", match_offset: 42 }],
+          },
     );
     const { ctx } = harness(send);
     const sendUserMessage = mock(() => {});
@@ -1085,7 +1123,7 @@ describe("Pi subc forced-drain dedup (C-#1 / C-#3)", () => {
     expect(sendUserMessage.mock.calls[0][0]).toContain('task task-pattern matched "READY"');
     expect(send.mock.calls.find((call) => call[0] === "bash_ack_completions")?.[1]).toEqual({
       session_id: "s1",
-      task_ids: ["task-pattern"],
+      matches: [{ task_id: "task-pattern", watch_id: "watch-1", match_offset: 42 }],
     });
   });
 
@@ -1400,4 +1438,477 @@ async function waitUntil(
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+test.each([
+  [
+    2,
+    1,
+    'Some watch notices were lost: a stalled connection dropped 2 of them, and they cannot be recovered. At least 1 match is missing. Read the task output with bash_status({ task_id: "bash-gap", stderr_offset: 16 }).',
+  ],
+  [
+    1,
+    0,
+    'Some watch notices were lost: a stalled connection dropped 1 of them, and they cannot be recovered. Some matches may be missing. Read the task output with bash_status({ task_id: "bash-gap", stderr_offset: 16 }).',
+  ],
+  [
+    1,
+    1,
+    'Some watch notices were lost: a stalled connection dropped 1 of them, and they cannot be recovered. At least 1 match is missing. Read the task output with bash_status({ task_id: "bash-gap", stderr_offset: 16 }).',
+  ],
+  [
+    2,
+    3,
+    'Some watch notices were lost: a stalled connection dropped 2 of them, and they cannot be recovered. At least 3 matches are missing. Read the task output with bash_status({ task_id: "bash-gap", stderr_offset: 16 }).',
+  ],
+] as const)("retry gap-only reminder pins wording (%i notices, %i missing)", (notices, missing, expected) => {
+  const reminder = formatPatternMatchReminder([
+    {
+      task_id: "bash-gap",
+      session_id: "s1",
+      watch_id: "watch-gap",
+      match_text: "watch delivery gap",
+      match_offset: 9,
+      context: "",
+      once: false,
+      batch: {
+        lines: [],
+        dropped_lines: 0,
+        skipped_long_lines: 0,
+        first_dropped_offset: null,
+        first_dropped_stream: null,
+        retry_gap: {
+          reason: "retry_overflow",
+          dropped_notifications: notices,
+          known_missing_occurrences: missing,
+          first_offset: 16,
+          last_offset: 24,
+          stream: "stderr",
+        },
+      },
+    },
+  ]);
+  expect(reminder).toContain("[BG BASH NOTIFY]");
+  expect(reminder).toContain(expected);
+});
+
+test("each_line reminder keeps bounded rows and drop recovery hint", () => {
+  const reminder = formatPatternMatchReminder([
+    {
+      task_id: "bash-lines",
+      session_id: "s1",
+      watch_id: "watch-lines",
+      match_text: "matching lines",
+      match_offset: 0,
+      context:
+        'stdout byte 0 ×2: ERROR a\n3 matching lines dropped. Read them with bash_status({ task_id: "bash-lines", output_offset: 16 }).',
+      once: false,
+      batch: {
+        lines: [{ stream: "stdout", offset: 0, end_offset: 8, text: "ERROR a", count: 2 }],
+        dropped_lines: 3,
+        first_dropped_offset: 16,
+        first_dropped_stream: "stdout",
+        skipped_long_lines: 0,
+      },
+    },
+  ]);
+  expect(reminder).toContain("task bash-lines matching lines:");
+  expect(reminder).toContain("stdout byte 0 ×2: ERROR a");
+  expect(reminder).toContain(
+    '3 matching lines dropped. Read them with bash_status({ task_id: "bash-lines", output_offset: 16 }).',
+  );
+});
+
+test("each_line queue replaces snapshots without discarding another watch", async () => {
+  markTaskWaiting("s-lines", "bash-lines");
+  const { ctx } = harness(() => ({ success: true, acked_task_ids: [] }));
+  const base = {
+    task_id: "bash-lines",
+    session_id: "s-lines",
+    watch_id: "watch-a",
+    match_text: "matching lines",
+    match_offset: 0,
+    context: "rows",
+    once: false,
+  };
+  const batch = {
+    lines: [{ stream: "stdout", offset: 0, end_offset: 8, text: "ERROR a", count: 1 }],
+    dropped_lines: 0,
+    first_dropped_offset: null,
+    first_dropped_stream: null,
+    skipped_long_lines: 0,
+  };
+  const drain = {
+    ctx,
+    directory: "/tmp/project",
+    sessionID: "s-lines",
+    runtime: { sendUserMessage: () => {} },
+  };
+  await handlePushedPatternMatch(drain, { ...base, batch });
+  await handlePushedPatternMatch(drain, {
+    ...base,
+    batch: {
+      ...batch,
+      snapshot: true,
+      dropped_lines: 3,
+      first_dropped_offset: 8,
+      first_dropped_stream: "stdout",
+    },
+  });
+  await handlePushedPatternMatch(drain, { ...base, watch_id: "watch-b", batch });
+  const pending = sessionBgStates.get("s-lines")?.pendingPatternMatches;
+  expect(pending).toHaveLength(2);
+  expect(pending?.find((entry) => entry.watch_id === "watch-a")?.batch?.dropped_lines).toBe(3);
+});
+
+for (const route of ["push", "forced-drain", "restart-replay"] as const) {
+  test(`queued each_line batches render once in order with an exact ack (${route})`, async () => {
+    const sessionID = "s-queued-lines";
+    const frames = [0, 18, 36].map((offset, index) => ({
+      task_id: "bash-queued-lines",
+      session_id: sessionID,
+      watch_id: "watch-queued-lines",
+      match_text: "matching lines",
+      match_offset: offset,
+      context: "unused: render the batch",
+      once: false,
+      reason: "pattern_match" as const,
+      batch: {
+        pending_id: "watch-queued-lines:0",
+        version: offset,
+        lines: [
+          {
+            stream: "stdout",
+            offset,
+            end_offset: offset + 18,
+            text: `LIVECHECK3 line ${index + 1}`,
+            count: 1,
+          },
+        ],
+        dropped_lines: 0,
+        first_dropped_offset: null,
+        first_dropped_stream: null,
+        skipped_long_lines: 0,
+      },
+    }));
+    let pending: PatternMatchEntry[] = [];
+    const acks: Record<string, unknown>[] = [];
+    const { ctx } = harness((command, params) => {
+      if (command === "bash_drain_completions")
+        return { success: true, bg_completions: [], pending_matches: pending };
+      if (command === "bash_ack_completions") {
+        acks.push(params);
+        pending = [];
+        return { success: true, acked_matches: params.matches ?? [] };
+      }
+      return { success: true };
+    });
+    const sendUserMessage = mock(() => {});
+    const context = { ctx, directory: "/project", sessionID, runtime: { sendUserMessage } };
+    trackBgTask(sessionID, "bash-queued-lines");
+    await handleSubcBgEventsNudge(context);
+    for (const [index, frame] of frames.entries()) {
+      pending = [
+        {
+          ...frame,
+          batch: {
+            ...frame.batch,
+            snapshot: true,
+            lines: frames.slice(0, index + 1).flatMap((entry) => entry.batch.lines),
+          },
+        },
+      ];
+      if (route === "forced-drain") await handleSubcBgEventsNudge(context);
+      else await handlePushedPatternMatch(context, frame);
+      if (route === "restart-replay" && index === 1) {
+        __resetBgNotificationStateForTests();
+        await handleSubcBgEventsNudge(context);
+      }
+    }
+    expect(sendUserMessage).not.toHaveBeenCalled();
+    expect(acks).toEqual([]);
+    expect(sessionBgStates.get(sessionID)?.pendingPatternMatches).toMatchObject([
+      {
+        match_offset: 36,
+        batch: {
+          lines: [
+            { offset: 0, text: "LIVECHECK3 line 1", count: 1 },
+            { offset: 18, text: "LIVECHECK3 line 2", count: 1 },
+            { offset: 36, text: "LIVECHECK3 line 3", count: 1 },
+          ],
+        },
+      },
+    ]);
+    const result = await appendToolResultBgCompletions(context, [{ type: "text", text: "tool" }]);
+    const reminder = result?.at(-1);
+    expect(reminder?.type).toBe("text");
+    expect(
+      reminder && "text" in reminder
+        ? reminder.text.split("\n").filter((line) => line.includes("stdout byte"))
+        : [],
+    ).toEqual([
+      "      > stdout byte 0: LIVECHECK3 line 1",
+      "      > stdout byte 18: LIVECHECK3 line 2",
+      "      > stdout byte 36: LIVECHECK3 line 3",
+    ]);
+    expect(acks).toEqual([
+      {
+        session_id: sessionID,
+        matches: [
+          { task_id: "bash-queued-lines", watch_id: "watch-queued-lines", match_offset: 36 },
+        ],
+      },
+    ]);
+    expect(
+      await appendToolResultBgCompletions(context, [{ type: "text", text: "next" }]),
+    ).toBeUndefined();
+    expect(acks).toHaveLength(1);
+  });
+}
+
+test("exact pattern ack retries keep sibling watches and newer versions deliverable", async () => {
+  const old = {
+    task_id: "task-pattern",
+    session_id: "s1",
+    watch_id: "watch-one",
+    match_offset: 40,
+    match_text: "READY",
+    context: "READY old",
+    once: false,
+    reason: "pattern_match",
+  };
+  let pending = [old];
+  let confirm = false;
+  const calls: Array<{ command: string; params: Record<string, unknown> }> = [];
+  const { ctx } = harness((command, params) => {
+    calls.push({ command, params });
+    if (command === "bash_drain_completions")
+      return { success: true, bg_completions: [], pending_matches: pending };
+    return { success: true, acked_matches: confirm ? (params.matches ?? []) : [] };
+  });
+  const context = { ctx, directory: "/tmp/project", sessionID: "s1" };
+  const deliver = async () => {
+    const content = await appendToolResultBgCompletions(context, [{ type: "text", text: "tool" }]);
+    return (
+      content
+        ?.filter((item) => item.type === "text")
+        .map((item) => item.text)
+        .join("\n") ?? ""
+    );
+  };
+  expect(await deliver()).toContain("READY old");
+  expect(await deliver()).not.toContain("READY old");
+  pending = [
+    { ...old, watch_id: "watch-two", context: "READY sibling" },
+    { ...old, match_offset: 41, context: "READY newer" },
+  ];
+  confirm = true;
+  const next = await deliver();
+  expect(next).toContain("READY sibling");
+  expect(next).toContain("READY newer");
+  expect(next).not.toContain("READY old");
+  const acks = calls.filter((call) => call.command === "bash_ack_completions");
+  expect(
+    acks.some(
+      (call) =>
+        JSON.stringify(call.params.matches) ===
+        JSON.stringify([{ task_id: "task-pattern", watch_id: "watch-one", match_offset: 40 }]),
+    ),
+  ).toBe(true);
+  expect(
+    acks.some((call) => Array.isArray(call.params.matches) && call.params.matches.length === 2),
+  ).toBe(true);
+  for (const call of acks) expect(call.params.task_ids ?? []).not.toContain("task-pattern");
+});
+
+for (const route of ["in-turn", "wake"] as const) {
+  test(`admitted each_line snapshot rows and counters are not repeated after a failed ack (${route})`, async () => {
+    const first = {
+      task_id: "task-batch",
+      session_id: "s1",
+      watch_id: "watch-batch",
+      match_offset: 0,
+      match_text: "matching lines",
+      context: "batch",
+      once: false,
+      reason: "pattern_match",
+      batch: {
+        pending_id: "pending-a",
+        version: 0,
+        snapshot: true,
+        lines: [{ stream: "stdout", offset: 0, end_offset: 8, text: "ERROR A", count: 1 }],
+        dropped_lines: 3,
+        skipped_long_lines: 1,
+        first_dropped_offset: 20,
+        first_dropped_stream: "stdout",
+      },
+    };
+    let current = first;
+    let failAck = true;
+    const acknowledgements: Record<string, unknown>[] = [];
+    const { ctx } = harness((command, params) => {
+      if (command === "bash_drain_completions")
+        return { success: true, bg_completions: [], pending_matches: [current] };
+      if (command === "bash_ack_completions") {
+        acknowledgements.push(params);
+        if (failAck) {
+          failAck = false;
+          return { success: false, message: "ack response lost" };
+        }
+        return { success: true, acked_matches: params.matches ?? [] };
+      }
+      return { success: true };
+    });
+    const sent: string[] = [];
+    const runtime = {
+      sendUserMessage: (text: string) => {
+        sent.push(text);
+      },
+    };
+    const context = { ctx, directory: "/tmp/project", sessionID: "s1", runtime };
+    const deliver = async () => {
+      if (route === "in-turn") {
+        const content = await appendToolResultBgCompletions(context, [
+          { type: "text", text: "tool" },
+        ]);
+        return (
+          content
+            ?.filter((item) => item.type === "text")
+            .map((item) => item.text)
+            .join("\n") ?? ""
+        );
+      }
+      const wanted = sent.length + 1;
+      await handleSubcBgEventsNudge(context);
+      await waitUntil(() => sent.length === wanted && acknowledgements.length >= wanted);
+      return sent.at(-1)!;
+    };
+    const old = await deliver();
+    expect(old).toContain("stdout byte 0: ERROR A");
+    expect(old).toContain("3 matching lines dropped.");
+    expect(old).toContain("1 lines longer than 64 KiB");
+    current = {
+      ...first,
+      match_offset: 1,
+      batch: {
+        ...first.batch,
+        version: 1,
+        lines: [
+          { ...first.batch.lines[0] },
+          { stream: "stderr", offset: 0, end_offset: 8, text: "ERROR B", count: 1 },
+        ],
+        dropped_lines: 5,
+        skipped_long_lines: 2,
+      },
+    };
+    const next = await deliver();
+    expect(next).toContain("stderr byte 0: ERROR B");
+    expect(next).not.toContain("ERROR A");
+    expect(next).toContain("2 matching lines dropped.");
+    expect(next).not.toContain("5 matching lines dropped.");
+    expect(next).toContain("1 lines longer than 64 KiB");
+    expect(next).not.toContain("2 lines longer than 64 KiB");
+    expect(acknowledgements.at(-1)).toEqual({
+      session_id: "s1",
+      matches: [{ task_id: "task-batch", watch_id: "watch-batch", match_offset: 1 }],
+    });
+  });
+}
+
+for (const route of ["in-turn", "wake"] as const) {
+  test(`admitted retry gap-only snapshots wake once per new version after a failed ack (${route})`, async () => {
+    const first = {
+      task_id: "task-batch",
+      session_id: "s1",
+      watch_id: "watch-batch",
+      match_offset: 0,
+      match_text: "matching lines",
+      context: "batch",
+      once: false,
+      reason: "pattern_match",
+      batch: {
+        pending_id: "pending-a",
+        version: 0,
+        snapshot: true,
+        lines: [],
+        retry_gap: {
+          reason: "retry_overflow" as const,
+          dropped_notifications: 2,
+          known_missing_occurrences: 1,
+          first_offset: 10,
+        },
+        dropped_lines: 0,
+        skipped_long_lines: 0,
+        first_dropped_offset: 20,
+        first_dropped_stream: "stdout",
+      },
+    };
+    let current = first;
+    let failAck = true;
+    const acknowledgements: Record<string, unknown>[] = [];
+    const { ctx } = harness((command, params) => {
+      if (command === "bash_drain_completions")
+        return { success: true, bg_completions: [], pending_matches: [current] };
+      if (command === "bash_ack_completions") {
+        acknowledgements.push(params);
+        if (failAck) {
+          failAck = false;
+          return { success: false, message: "ack response lost" };
+        }
+        return { success: true, acked_matches: params.matches ?? [] };
+      }
+      return { success: true };
+    });
+    const sent: string[] = [];
+    const runtime = {
+      sendUserMessage: (text: string) => {
+        sent.push(text);
+      },
+    };
+    const context = { ctx, directory: "/tmp/project", sessionID: "s1", runtime };
+    const deliver = async () => {
+      if (route === "in-turn") {
+        const content = await appendToolResultBgCompletions(context, [
+          { type: "text", text: "tool" },
+        ]);
+        return (
+          content
+            ?.filter((item) => item.type === "text")
+            .map((item) => item.text)
+            .join("\n") ?? ""
+        );
+      }
+      const wanted = sent.length + 1;
+      await handleSubcBgEventsNudge(context);
+      await waitUntil(() => sent.length === wanted && acknowledgements.length >= wanted);
+      return sent.at(-1)!;
+    };
+    const old = await deliver();
+    expect(old).toContain("a stalled connection dropped 2 of them, and they cannot be recovered.");
+    expect(old).toContain("At least 1 match is missing.");
+    current = {
+      ...first,
+      match_offset: 1,
+      batch: {
+        ...first.batch,
+        version: 1,
+        lines: [],
+        retry_gap: {
+          ...first.batch.retry_gap,
+          dropped_notifications: 3,
+          known_missing_occurrences: 2,
+        },
+        dropped_lines: 0,
+        skipped_long_lines: 0,
+      },
+    };
+    const next = await deliver();
+    expect(next).toContain("a stalled connection dropped 1 of them, and they cannot be recovered.");
+    expect(next).not.toContain("dropped 3 of them");
+    expect(next).toContain("At least 1 match is missing.");
+    expect(acknowledgements.at(-1)).toEqual({
+      session_id: "s1",
+      matches: [{ task_id: "task-batch", watch_id: "watch-batch", match_offset: 1 }],
+    });
+  });
 }

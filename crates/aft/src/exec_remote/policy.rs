@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Runner platforms whose demands `runon` accepts; options are parsed separately.
-pub const KNOWN_DEMANDS: &[&str] = &["linux", "windows"];
+pub const KNOWN_DEMANDS: &[&str] = &["linux", "windows", "macos"];
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -120,11 +120,16 @@ pub fn parse_demand(demand: &str) -> Result<ResolvedDemand, String> {
     let mut resolved = ResolvedDemand::default();
     if platform == "windows" {
         resolved.platform = Some(super::types::Platform::Windows);
+    } else if platform == "macos" {
+        resolved.platform = Some(super::types::Platform::Macos);
     }
     for token in tokens {
         if token == "net" {
             if platform == "windows" {
                 return Err(format!("runon {demand:?} is not valid: Windows jobs have no network; windows,net is not supported"));
+            }
+            if platform == "macos" {
+                return Err(format!("runon {demand:?} is not valid: macOS jobs have no network; macos,net is not supported"));
             }
             if resolved.network {
                 return Err(format!(
@@ -146,6 +151,9 @@ pub fn parse_demand(demand: &str) -> Result<ResolvedDemand, String> {
         if platform == "windows" {
             return Err(format!("runon {demand:?} is not valid: the Windows slot is fixed at 4 vCPUs; use plain windows without a vCPU count"));
         }
+        if platform == "macos" {
+            return Err(format!("runon {demand:?} is not valid: the macOS slot is fixed at 4 vCPUs; use plain macos without a vCPU count"));
+        }
         if resolved.weight_hint.is_some() {
             return Err(format!(
                 "runon {demand:?} is not valid: duplicate vCPU count"
@@ -159,6 +167,9 @@ pub fn parse_demand(demand: &str) -> Result<ResolvedDemand, String> {
 fn invalid_vcpu_demand(demand: &str) -> String {
     if demand.starts_with("windows,") {
         return format!("runon {demand:?} is not valid: Windows jobs accept no options; use plain windows (fixed at 4 vCPUs, no network)");
+    }
+    if demand.starts_with("macos,") {
+        return format!("runon {demand:?} is not valid: macOS jobs accept no options; use plain macos (fixed at 4 vCPUs, no network)");
     }
     format!("runon {demand:?} is not valid: options are net and a vCPU count as Nc, for example \"linux,4c,net\"")
 }
@@ -193,6 +204,40 @@ mod tests {
             ("windows,4c", "fixed at 4 vCPUs"),
             ("windows,net", "no network"),
             ("windows,wat", "not valid"),
+        ] {
+            let error = resolve_demand(demand, None).unwrap_err();
+            assert!(error.contains(demand), "{error}");
+            assert!(error.contains(reason), "{error}");
+        }
+    }
+
+    #[test]
+    fn macos_demand_accepts_only_the_fixed_offline_slot() {
+        let resolved = resolve_demand("macos", None).unwrap();
+        assert_eq!(
+            resolved.platform,
+            Some(super::super::types::Platform::Macos)
+        );
+        assert_eq!(resolved.weight_hint, None);
+        assert!(!resolved.network);
+        assert_eq!(resolve_demand("", Some("macos")).unwrap(), resolved);
+        for (demand, reason) in [
+            (
+                "macos,4c",
+                "the macOS slot is fixed at 4 vCPUs; use plain macos without a vCPU count",
+            ),
+            (
+                "macos,net",
+                "macOS jobs have no network; macos,net is not supported",
+            ),
+            (
+                "macos,4c,net",
+                "the macOS slot is fixed at 4 vCPUs; use plain macos without a vCPU count",
+            ),
+            (
+                "macos,wat",
+                "macOS jobs accept no options; use plain macos (fixed at 4 vCPUs, no network)",
+            ),
         ] {
             let error = resolve_demand(demand, None).unwrap_err();
             assert!(error.contains(demand), "{error}");

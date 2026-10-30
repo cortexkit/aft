@@ -1,1 +1,0 @@
-`bash_kill` now cancels a background `runon` command right away even before the runner has accepted it; a command killed before it was sent is never sent, and one killed while the runner held it is reported with an unknown outcome rather than as confirmed stopped.

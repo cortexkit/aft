@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "gh-bypass-provisioned"
+  ],
+  "note": "gh shim: explicit operator bypass keeps its audited path in bot-provisioned head shells. No changed path matches RANKING_FENCE_PREFIXES."
+}

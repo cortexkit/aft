@@ -583,10 +583,77 @@ pub fn extract_go_value_references(source: &str, root: tree_sitter::Node) -> Vec
     results
 }
 
+/// Extract bare or namespace-qualified callback arguments, not invocation edges.
+pub fn extract_js_callback_references(
+    source: &str,
+    root: tree_sitter::Node<'_>,
+) -> Vec<(String, String, u32, usize, usize)> {
+    let mut results = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "arguments" {
+            for argument in node.named_children(&mut node.walk()) {
+                if matches!(argument.kind(), "identifier" | "member_expression") {
+                    let full = source[argument.byte_range()].trim();
+                    let root_name = full.split('.').next().unwrap_or(full);
+                    if !js_callback_is_shadowed(source, argument, root_name) {
+                        results.push((
+                            full.to_string(),
+                            full.rsplit('.').next().unwrap_or(full).to_string(),
+                            argument.start_position().row as u32 + 1,
+                            argument.start_byte(),
+                            argument.end_byte(),
+                        ));
+                    }
+                }
+            }
+        }
+        stack.extend(node.named_children(&mut node.walk()));
+    }
+    results.sort_by_key(|site| site.3);
+    results
+}
+
+fn js_callback_is_shadowed(source: &str, argument: tree_sitter::Node<'_>, name: &str) -> bool {
+    let mut ancestor = argument.parent();
+    while let Some(scope) = ancestor {
+        if let Some(parameters) = scope.child_by_field_name("parameters") {
+            let mut stack = vec![parameters];
+            while let Some(node) = stack.pop() {
+                if node.kind() == "identifier" && &source[node.byte_range()] == name {
+                    return true;
+                }
+                stack.extend(node.named_children(&mut node.walk()));
+            }
+        }
+        if matches!(scope.kind(), "statement_block" | "program") {
+            for declaration in scope.named_children(&mut scope.walk()) {
+                if matches!(
+                    declaration.kind(),
+                    "lexical_declaration" | "variable_declaration"
+                ) {
+                    for binding in declaration.named_children(&mut declaration.walk()) {
+                        if binding
+                            .child_by_field_name("name")
+                            .is_some_and(|n| &source[n.byte_range()] == name)
+                        {
+                            return !binding.child_by_field_name("value").is_some_and(|value| {
+                                matches!(value.kind(), "arrow_function" | "function_expression")
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        ancestor = scope.parent();
+    }
+    false
+}
+
 /// Extract Rust function paths used as values rather than called directly.
 ///
-/// The call graph stores these separately from calls so navigation remains
-/// call-only while dead-code reachability can follow callbacks passed to APIs
+/// The call graph stores these separately from calls so execution trees remain
+/// call-only while reverse dependencies and dead-code reachability follow callbacks passed to APIs
 /// such as `map` and `unwrap_or_else`.
 pub fn extract_rust_value_references(
     source: &str,

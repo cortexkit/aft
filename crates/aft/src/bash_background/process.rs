@@ -24,43 +24,337 @@ use std::time::Instant;
 pub const TERMINATE_GRACE: Duration = Duration::from_secs(2);
 pub const LIVE_DESCENDANT_CAP: usize = 16;
 
+/// Longest executable name kept for one process-group member, in characters.
+/// The kernel's own limit is shorter (15 on Linux, 32 on macOS); this guards
+/// the fallback paths.
+pub const LIVE_DESCENDANT_NAME_CAP: usize = 64;
+
+/// Appended to a member's shown command when it had arguments AFT left out.
+pub const OMITTED_ARGUMENTS_MARKER: &str = "…";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LiveDescendant {
     pub pid: u32,
     pub comm: String,
+    /// The first word of the process's first argument (normally the program
+    /// path it was started as), or its command name when that argument cannot
+    /// be read. Never any later argument.
     pub argv0: String,
+    /// Name of the user that owns the process (its real user ID), or the
+    /// numeric ID when the account has no name. Absent when it could not be
+    /// read, and on records written before AFT recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// The process's executable name, followed by `…` when it was started
+    /// with arguments. The arguments themselves are never kept: they can hold
+    /// a credential (`--token "$DEPLOY_TOKEN"`, a value read from a file) that
+    /// no pattern can recognise, and this field reaches the task record, the
+    /// status reply and the completion notice. Absent on older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
-/// Enumerate surviving members of a task's process group. `None` means the
-/// platform has no process-group enumeration support for these tasks today.
-pub fn live_process_group_members(pgid: i32) -> Option<(Vec<LiveDescendant>, usize)> {
+/// Why a task has no list of surviving process-group members. A list, even an
+/// empty one, always means AFT checked; this says why it could not.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveDescendantsUnavailable {
+    /// This platform has no process-group listing AFT can use (Windows, and
+    /// Unix systems other than Linux and macOS).
+    UnsupportedPlatform,
+    /// The task has no recorded process group.
+    NoProcessGroup,
+    /// Listing the group's members failed, for example because `/proc`
+    /// could not be read.
+    ListingFailed,
+    /// The listing could not account for every process that may belong to the
+    /// group: some were hidden or unreadable, for example because `/proc` is
+    /// mounted with `hidepid`. Any members it did identify are still listed;
+    /// others may also be running.
+    ListingIncomplete,
+    /// AFT did not check this task's group: a remote job, a pseudoterminal
+    /// task that ended on its own, or a record written by an older AFT.
+    NotChecked,
+}
+
+impl LiveDescendantsUnavailable {
+    /// The reason to record when a task has no process group to list.
+    pub fn without_group() -> Self {
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            Self::NoProcessGroup
+        } else {
+            Self::UnsupportedPlatform
+        }
+    }
+}
+
+/// One check of a task's process group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupListing {
+    /// The live members found, at most [`LIVE_DESCENDANT_CAP`], lowest pid first.
+    pub members: Vec<LiveDescendant>,
+    /// Live members found beyond the cap.
+    pub omitted: usize,
+    /// The group may have members the listing could not see or read, so
+    /// `members` may be only part of it.
+    pub incomplete: bool,
+    /// The identities of every member found, not only the ones in `members`,
+    /// up to [`GROUP_IDENTITY_CAP`]. A later kill uses them to recognise the
+    /// group as the task's while any member found here still runs.
+    pub identities: Vec<ProcessIdentity>,
+    /// More members were found than [`GROUP_IDENTITY_CAP`] identities kept.
+    pub identities_truncated: bool,
+}
+
+/// The most member identities one check keeps. Far above the members a task
+/// shows, so the display limit never limits which survivors a kill can stop,
+/// while a task record stays small (about 50 bytes per identity).
+pub const GROUP_IDENTITY_CAP: usize = 1_024;
+
+/// The identities of up to [`GROUP_IDENTITY_CAP`] of `pids`, in order, and
+/// whether some were left out. Only that many start times are read.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn capped_identities(
+    pids: impl ExactSizeIterator<Item = u32>,
+    mut identity: impl FnMut(u32) -> Option<ProcessIdentity>,
+) -> (Vec<ProcessIdentity>, bool) {
+    let truncated = pids.len() > GROUP_IDENTITY_CAP;
+    let identities = pids
+        .take(GROUP_IDENTITY_CAP)
+        .filter_map(&mut identity)
+        .collect();
+    (identities, truncated)
+}
+
+impl GroupListing {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn clean() -> Self {
+        Self {
+            members: Vec::new(),
+            omitted: 0,
+            incomplete: false,
+            identities: Vec::new(),
+            identities_truncated: false,
+        }
+    }
+
+    /// The group has no live member and the listing saw every process.
+    pub fn is_clean(&self) -> bool {
+        self.members.is_empty() && self.omitted == 0 && !self.incomplete
+    }
+}
+
+/// Enumerate surviving members of a task's process group, at most
+/// [`LIVE_DESCENDANT_CAP`] of them plus the count left out. A clean listing
+/// means the group was checked and has no live member; an incomplete one keeps
+/// the members it found; an error says why the group could not be checked.
+pub fn live_process_group_members(pgid: i32) -> Result<GroupListing, LiveDescendantsUnavailable> {
+    #[cfg(test)]
+    if test_hooks::listing_fails(pgid) {
+        return Err(LiveDescendantsUnavailable::ListingFailed);
+    }
     #[cfg(target_os = "linux")]
-    let mut members = linux_process_group_members(pgid);
+    return linux_process_group_members(pgid);
     #[cfg(target_os = "macos")]
-    let mut members = macos_process_group_members(pgid);
+    return macos_process_group_members(pgid);
     #[cfg(windows)]
     {
         let _ = pgid;
-        return None;
+        return Err(LiveDescendantsUnavailable::UnsupportedPlatform);
     }
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     {
         let _ = pgid;
-        return None;
+        return Err(LiveDescendantsUnavailable::UnsupportedPlatform);
+    }
+}
+
+/// Fault injection for tests, keyed by process group so parallel tests do not
+/// collide.
+#[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) mod test_hooks {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    static LISTING_FAILS: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+    static SIGKILL_DENIED: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+    static MEMBERS_INVISIBLE: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+    static MEMBERS_UNREADABLE: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+    static OUTSIDERS_UNREADABLE: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+
+    fn insert(set: &OnceLock<Mutex<HashSet<i32>>>, pgid: i32) {
+        set.get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(pgid);
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        members.sort_by_key(|member| member.pid);
-        let omitted = members.len().saturating_sub(LIVE_DESCENDANT_CAP);
-        members.truncate(LIVE_DESCENDANT_CAP);
-        Some((members, omitted))
+    fn contains(set: &OnceLock<Mutex<HashSet<i32>>>, pgid: i32) -> bool {
+        set.get()
+            .is_some_and(|groups| groups.lock().unwrap().contains(&pgid))
     }
+
+    /// Leave this group's members out of the process listing while they stay
+    /// alive, as `/proc` mounted with `hidepid=2` does for another user's
+    /// processes.
+    pub(crate) fn hide_members(pgid: i32) {
+        insert(&MEMBERS_INVISIBLE, pgid);
+    }
+
+    pub(super) fn members_invisible(pgid: i32) -> bool {
+        contains(&MEMBERS_INVISIBLE, pgid)
+    }
+
+    /// Make this group's members' `/proc/<pid>/stat` unreadable, as `/proc`
+    /// mounted with `hidepid=1` does for another user's processes.
+    pub(crate) fn make_members_unreadable(pgid: i32) {
+        insert(&MEMBERS_UNREADABLE, pgid);
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(super) fn members_unreadable(pgid: i32) -> bool {
+        contains(&MEMBERS_UNREADABLE, pgid)
+    }
+
+    /// While listing this group, make every process outside it unreadable, as
+    /// `/proc` mounted with `hidepid=1` does for other users' processes. The
+    /// group's own members stay readable.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn make_outsiders_unreadable(pgid: i32) {
+        insert(&OUTSIDERS_UNREADABLE, pgid);
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(super) fn outsiders_unreadable(pgid: i32) -> bool {
+        contains(&OUTSIDERS_UNREADABLE, pgid)
+    }
+
+    /// Make every listing of this group fail, as an unreadable `/proc` would.
+    pub(crate) fn fail_listing(pgid: i32) {
+        LISTING_FAILS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(pgid);
+    }
+
+    pub(super) fn listing_fails(pgid: i32) -> bool {
+        LISTING_FAILS
+            .get()
+            .is_some_and(|groups| groups.lock().unwrap().contains(&pgid))
+    }
+
+    /// Make the group SIGKILL reach no member of this group, as it does for
+    /// members owned by another user (the kernel answers EPERM for them).
+    /// Members that ignore SIGTERM then survive the kill.
+    pub(crate) fn deny_sigkill(pgid: i32) {
+        SIGKILL_DENIED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(pgid);
+    }
+
+    #[cfg(unix)]
+    pub(super) fn sigkill_denied(pgid: i32) -> bool {
+        SIGKILL_DENIED
+            .get()
+            .is_some_and(|groups| groups.lock().unwrap().contains(&pgid))
+    }
+}
+
+/// Cut a name to [`LIVE_DESCENDANT_NAME_CAP`] characters and mask anything in
+/// it that looks like a credential.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn safe_name(name: &str) -> String {
+    let name = name.trim();
+    let name = if name.chars().count() <= LIVE_DESCENDANT_NAME_CAP {
+        name.to_string()
+    } else {
+        let mut cut = name
+            .chars()
+            .take(LIVE_DESCENDANT_NAME_CAP - 1)
+            .collect::<String>();
+        cut.push('…');
+        cut
+    };
+    crate::log_redact::aft_redactor(&name).into_owned()
+}
+
+/// The command shown for a group member: its executable name, plus
+/// [`OMITTED_ARGUMENTS_MARKER`] when it had arguments. See
+/// [`LiveDescendant::command`] for why the arguments are left out.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn shown_command(name: &str, has_arguments: bool) -> Option<String> {
+    let name = safe_name(name);
+    if name.is_empty() {
+        return None;
+    }
+    Some(if has_arguments {
+        format!("{name} {OMITTED_ARGUMENTS_MARKER}")
+    } else {
+        name
+    })
+}
+
+/// Whether a process may have had arguments beyond its program name. An empty
+/// argument list means they could not be read (macOS hides another user's), so
+/// it counts as "may have".
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn arguments_may_be_present(args: &[String]) -> bool {
+    args.len() != 1
+}
+
+/// The first word of a process's first argument, or its command name when that
+/// argument cannot be read. A process can rewrite its
+/// arguments into one title string (`setproctitle`), so everything after the
+/// first whitespace may be argument text and is dropped.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn safe_argv0(first_argument: Option<&String>, comm: &str) -> String {
+    let word = first_argument
+        .and_then(|argument| argument.split_whitespace().next())
+        .unwrap_or(comm);
+    safe_name(word)
+}
+
+/// The account name for a user ID, or the ID itself when it has no name.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn user_name(uid: u32) -> String {
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result = std::ptr::null_mut();
+    let mut buffer = vec![0 as libc::c_char; 4096];
+    // SAFETY: entry, buffer and result outlive the call, and the buffer
+    // length passed is the buffer's real length.
+    let status = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut entry,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status == 0 && !result.is_null() && !entry.pw_name.is_null() {
+        // SAFETY: a successful lookup points pw_name at a NUL-terminated
+        // string inside `buffer`, which is still alive.
+        let name = unsafe { std::ffi::CStr::from_ptr(entry.pw_name) }.to_string_lossy();
+        if !name.is_empty() {
+            return name.into_owned();
+        }
+    }
+    uid.to_string()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct SystemdScopeLauncher {
+    path: PathBuf,
+    supports_expand_environment: bool,
 }
 
 #[cfg(target_os = "linux")]
 pub(crate) fn systemd_scope_argv(
-    systemd_run: &Path,
+    launcher: &SystemdScopeLauncher,
     executable: &Path,
     args: &[OsString],
 ) -> (PathBuf, Vec<OsString>) {
@@ -68,22 +362,29 @@ pub(crate) fn systemd_scope_argv(
         .into_iter()
         .map(OsString::from)
         .collect::<Vec<_>>();
+    if launcher.supports_expand_environment {
+        wrapped.push(OsString::from("--expand-environment=no"));
+    }
     wrapped.push(executable.as_os_str().to_os_string());
     wrapped.extend_from_slice(args);
-    (systemd_run.to_path_buf(), wrapped)
+    (launcher.path.clone(), wrapped)
 }
 
 #[cfg(target_os = "linux")]
 fn select_systemd_scope_launcher_with(
     find: impl FnOnce() -> Option<PathBuf>,
-    probe: impl FnOnce(&Path) -> bool,
-) -> Option<PathBuf> {
-    let launcher = find()?;
-    probe(&launcher).then_some(launcher)
+    probe: impl FnOnce(&Path) -> Option<bool>,
+) -> Option<SystemdScopeLauncher> {
+    let path = find()?;
+    let supports_expand_environment = probe(&path)?;
+    Some(SystemdScopeLauncher {
+        path,
+        supports_expand_environment,
+    })
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn select_systemd_scope_launcher() -> Option<PathBuf> {
+pub(crate) fn select_systemd_scope_launcher() -> Option<SystemdScopeLauncher> {
     select_systemd_scope_launcher_with(
         || which::which("systemd-run").ok(),
         |launcher| probe_systemd_scope(launcher, Duration::from_secs(1)),
@@ -91,10 +392,36 @@ pub(crate) fn select_systemd_scope_launcher() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
-fn probe_systemd_scope(launcher: &Path, limit: Duration) -> bool {
+fn probe_systemd_scope(launcher: &Path, limit: Duration) -> Option<bool> {
+    let deadline = Instant::now() + limit;
+    if probe_systemd_scope_with(launcher, true, deadline) {
+        return Some(true);
+    }
+    // Pre-254 systemd lacks this option but passes scope argv through literally.
+    // Never escape dollars on that path: doing so would change the shell's input.
+    probe_systemd_scope_with(launcher, false, deadline).then_some(false)
+}
+
+#[cfg(target_os = "linux")]
+fn probe_systemd_scope_with(
+    launcher: &Path,
+    supports_expand_environment: bool,
+    deadline: Instant,
+) -> bool {
+    if Instant::now() >= deadline {
+        return false;
+    }
+    let (_, args) = systemd_scope_argv(
+        &SystemdScopeLauncher {
+            path: launcher.to_path_buf(),
+            supports_expand_environment,
+        },
+        Path::new("/bin/true"),
+        &[],
+    );
     let mut command = std::process::Command::new(launcher);
     command
-        .args(["--user", "--scope", "--collect", "--quiet", "/bin/true"])
+        .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -102,7 +429,6 @@ fn probe_systemd_scope(launcher: &Path, limit: Duration) -> bool {
     let Ok(mut child) = command.spawn() else {
         return false;
     };
-    let deadline = Instant::now() + limit;
     loop {
         match child.try_wait() {
             Ok(Some(status)) if Instant::now() < deadline => return status.success(),
@@ -126,36 +452,223 @@ fn probe_systemd_scope(launcher: &Path, limit: Duration) -> bool {
     }
 }
 
+/// Describe at most [`LIVE_DESCENDANT_CAP`] group members, lowest pid first,
+/// and count the rest without describing them. Listing a member is cheap (its
+/// pid and group); describing it reads its command line and owner, so that work
+/// stops at the cap however large the group is.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn bounded_members<C>(
+    mut candidates: Vec<(u32, C)>,
+    mut describe: impl FnMut(u32, C) -> Option<LiveDescendant>,
+) -> (Vec<LiveDescendant>, usize) {
+    candidates.sort_by_key(|(pid, _)| *pid);
+    let mut rest = candidates.into_iter();
+    let members = rest
+        .by_ref()
+        .filter_map(|(pid, candidate)| describe(pid, candidate))
+        .take(LIVE_DESCENDANT_CAP)
+        .collect();
+    (members, rest.count())
+}
+
 #[cfg(target_os = "linux")]
-fn linux_process_group_members(pgid: i32) -> Vec<LiveDescendant> {
+fn linux_process_group_members(pgid: i32) -> Result<GroupListing, LiveDescendantsUnavailable> {
     // An empty group needs no /proc walk. EPERM still means the group exists
     // and must be enumerated, including reparented descendants.
-    if pgid > 0 && unsafe { libc::kill(-pgid, 0) } == -1 && io_group_missing() {
-        return Vec::new();
+    if pgid > 0 && process_group_gone(pgid) {
+        return Ok(GroupListing::clean());
     }
     #[cfg(test)]
     PROC_SCAN_COUNT.with(|count| count.set(count.get() + 1));
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    entries
+    // A group that exists but cannot be listed is not an empty group.
+    let entries =
+        std::fs::read_dir("/proc").map_err(|_| LiveDescendantsUnavailable::ListingFailed)?;
+    let mut candidates = Vec::new();
+    let mut zombies = 0_usize;
+    let mut unreadable = 0_usize;
+    for pid in entries
         .flatten()
         .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
-        .filter_map(|pid| linux_process_member(pid, pgid))
-        .collect()
+    {
+        match linux_proc_entry(pid, pgid) {
+            ProcEntry::Member(comm) => candidates.push((pid, comm)),
+            ProcEntry::Zombie => zombies += 1,
+            ProcEntry::Unreadable => unreadable += 1,
+            ProcEntry::Elsewhere => {}
+        }
+    }
+    // An unreadable entry may be a member of this group. With none of them,
+    // a group the probe found alive must show at least one member or zombie.
+    let incomplete = unreadable > 0 || (candidates.is_empty() && zombies == 0);
+    Ok(group_listing(pgid, candidates, incomplete, |pid, comm| {
+        Some(linux_describe_member(pid, comm))
+    }))
 }
 
-#[cfg(target_os = "linux")]
-fn io_group_missing() -> bool {
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+/// Build a listing from the members found. An incomplete listing of a group
+/// that has exited since the walk is clean; otherwise it keeps the members it
+/// did find and stays marked incomplete, so it never reads as a clean kill.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn group_listing<C>(
+    pgid: i32,
+    candidates: Vec<(u32, C)>,
+    incomplete: bool,
+    describe: impl FnMut(u32, C) -> Option<LiveDescendant>,
+) -> GroupListing {
+    if incomplete && process_group_gone(pgid) {
+        return GroupListing::clean();
+    }
+    let mut candidates = candidates;
+    candidates.sort_by_key(|(pid, _)| *pid);
+    let (identities, identities_truncated) =
+        capped_identities(candidates.iter().map(|(pid, _)| *pid), ProcessIdentity::of);
+    let (members, omitted) = bounded_members(candidates, describe);
+    GroupListing {
+        members,
+        omitted,
+        incomplete,
+        identities,
+        identities_truncated,
+    }
 }
 
+/// Whether the group has no process left, zombies included. Signal 0 that
+/// succeeds, or fails with EPERM (a member AFT may not signal), means it
+/// still exists.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn process_group_gone(pgid: i32) -> bool {
+    (unsafe { libc::kill(-pgid, 0) } == -1)
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// A process as AFT recorded it: its pid and the time it started. A pid alone
+/// can be reused by an unrelated process; the pair cannot.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub started_at_ms: u64,
+}
+
+impl ProcessIdentity {
+    /// The identity of a running process, or `None` when it has exited or
+    /// its start time cannot be read.
+    pub fn of(pid: u32) -> Option<Self> {
+        Some(Self {
+            pid,
+            started_at_ms: crate::root_cache::process_start_time_ms(pid)?,
+        })
+    }
+
+    /// Whether this exact process is still running and still in `pgid`. It is
+    /// the evidence that a process group answering under a task's saved
+    /// number is still that task's group, not a later one the system gave the
+    /// same number after the original group had exited.
+    pub fn is_running_in_group(self, pgid: i32) -> bool {
+        Self::of(self.pid) == Some(self) && process_group_of(self.pid) == Some(pgid)
+    }
+}
+
+/// The process group a process belongs to, read the same way for every user's
+/// processes. `None` when it has exited or the platform has no such reading.
+fn process_group_of(pid: u32) -> Option<i32> {
+    #[cfg(target_os = "linux")]
+    return std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| parse_proc_stat(&stat).map(|(_, _, pgrp)| pgrp));
+    #[cfg(target_os = "macos")]
+    return macos_kinfo(pid).map(|info| info.pgid);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
 #[cfg(all(test, target_os = "linux"))]
 thread_local! { static PROC_SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
+/// What one `/proc/<pid>` entry says about a process group.
 #[cfg(target_os = "linux")]
-fn linux_process_member(pid: u32, expected_pgid: i32) -> Option<LiveDescendant> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+enum ProcEntry {
+    /// A live member, with its command name.
+    Member(String),
+    /// A member that has exited but is not yet reaped.
+    Zombie,
+    /// In another group, or gone since the directory was listed.
+    Elsewhere,
+    /// Its `stat` could not be read, so it may or may not be a member.
+    Unreadable,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_entry(pid: u32, expected_pgid: i32) -> ProcEntry {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        // The process exited after its directory was listed.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            return ProcEntry::Elsewhere;
+        }
+        Err(_) => return ProcEntry::Unreadable,
+    };
+    let Some((comm, state, pgrp)) = parse_proc_stat(&stat) else {
+        return ProcEntry::Unreadable;
+    };
+    if pgrp != expected_pgid {
+        #[cfg(test)]
+        if test_hooks::outsiders_unreadable(expected_pgid) {
+            return ProcEntry::Unreadable;
+        }
+        return ProcEntry::Elsewhere;
+    }
+    #[cfg(test)]
+    if test_hooks::members_invisible(pgrp) {
+        return ProcEntry::Elsewhere;
+    }
+    #[cfg(test)]
+    if test_hooks::members_unreadable(pgrp) {
+        return ProcEntry::Unreadable;
+    }
+    if state == "Z" {
+        ProcEntry::Zombie
+    } else {
+        ProcEntry::Member(comm)
+    }
+}
+
+/// Whether `pid` has exited while its parent has not reaped it: the kernel
+/// reports it as a zombie, and `kill(pid, 0)` still succeeds for it.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn child_is_zombie_for_test(pid: u32) -> bool {
+    let zombie = macos_kinfo(pid).is_some_and(|info| info.state == SZOMB);
+    zombie && unsafe { libc::kill(pid as i32, 0) } == 0
+}
+
+/// A child that has exited and waits to be reaped, as a zombie. Returns the
+/// unreaped child so a caller can read its record from the kernel. Do not call
+/// `wait` on it before that check, and drop it afterwards to reap it. A
+/// short-lived `/usr/bin/true` is used because a shell can stay visible as
+/// running for a moment after its exit.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn spawn_unreaped_zombie_for_test() -> Child {
+    let child = std::process::Command::new("/usr/bin/true")
+        .spawn()
+        .expect("spawn zombie stand-in");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !child_is_zombie_for_test(child.id()) {
+        assert!(
+            Instant::now() < deadline,
+            "the child did not become a zombie"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child
+}
+
+/// The command name, state and process group from `/proc/<pid>/stat`.
+#[cfg(target_os = "linux")]
+fn parse_proc_stat(stat: &str) -> Option<(String, &str, i32)> {
     let open = stat.find('(')?;
     let close = stat.rfind(") ")?;
     let comm = stat.get(open + 1..close)?.to_string();
@@ -163,21 +676,47 @@ fn linux_process_member(pid: u32, expected_pgid: i32) -> Option<LiveDescendant> 
     let state = fields.next()?;
     let _ppid = fields.next()?;
     let pgrp = fields.next()?.parse::<i32>().ok()?;
-    if pgrp != expected_pgid || state == "Z" {
-        return None;
-    }
+    Some((comm, state, pgrp))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_describe_member(pid: u32, comm: String) -> LiveDescendant {
     let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-    let argv0 = cmdline
+    let mut args = cmdline
         .split(|byte| *byte == 0)
-        .next()
-        .filter(|value| !value.is_empty())
         .map(|value| String::from_utf8_lossy(value).into_owned())
-        .unwrap_or_else(|| comm.clone());
-    Some(LiveDescendant { pid, comm, argv0 })
+        .collect::<Vec<_>>();
+    // The command line ends with a NUL, which leaves one empty piece.
+    if args.last().is_some_and(String::is_empty) {
+        args.pop();
+    }
+    let argv0 = safe_argv0(args.first().filter(|value| !value.is_empty()), &comm);
+    // /proc/<pid>/status is normally readable for every user's processes; its
+    // Uid line lists the real, effective, saved and filesystem IDs. When it
+    // cannot be read the owner is left unknown.
+    let user = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Uid:"))?
+                .split_whitespace()
+                .next()?
+                .parse::<u32>()
+                .ok()
+        })
+        .map(user_name);
+    LiveDescendant {
+        pid,
+        command: shown_command(&comm, arguments_may_be_present(&args)),
+        comm: safe_name(&comm),
+        argv0,
+        user,
+    }
 }
 
 #[cfg(target_os = "macos")]
-fn macos_process_group_members(pgid: i32) -> Vec<LiveDescendant> {
+fn macos_process_group_members(pgid: i32) -> Result<GroupListing, LiveDescendantsUnavailable> {
     use std::ffi::{c_char, c_int, c_void};
 
     #[link(name = "proc")]
@@ -187,7 +726,7 @@ fn macos_process_group_members(pgid: i32) -> Vec<LiveDescendant> {
     }
 
     if pgid <= 0 {
-        return Vec::new();
+        return Ok(GroupListing::clean());
     }
     let mut pids = vec![0_u32; 16_384];
     let count = unsafe {
@@ -197,32 +736,84 @@ fn macos_process_group_members(pgid: i32) -> Vec<LiveDescendant> {
             i32::try_from(pids.len() * std::mem::size_of::<u32>()).unwrap_or(i32::MAX),
         )
     };
-    if count <= 0 {
-        return Vec::new();
+    if count < 0 {
+        return Err(LiveDescendantsUnavailable::ListingFailed);
     }
     pids.truncate(count as usize);
-    pids.into_iter()
-        .filter(|pid| *pid != 0)
-        .filter_map(|pid| {
-            let mut name = [0 as c_char; 1024];
-            let name_len =
-                unsafe { proc_name(pid as c_int, name.as_mut_ptr().cast(), name.len() as u32) };
-            if name_len <= 0 {
-                return None;
+    #[cfg(test)]
+    if test_hooks::members_invisible(pgid) {
+        pids.clear();
+    }
+    // kern.proc.pid answers for every user's processes. proc_name does not:
+    // it fails with EPERM for another user's process, and dropping the member
+    // on that failure hid exactly the processes a kill cannot reach. Only a
+    // process that is gone, a zombie, or in another group is left out.
+    //
+    //
+    // A process that has exited but is not reaped yet keeps its pid, its group
+    // and a working signal 0, and `kern.proc.pid` still answers for it. Only
+    // its own record says it is gone, so that record decides.
+    let mut exited = 0_usize;
+    let mut candidates = Vec::new();
+    for pid in pids.into_iter().filter(|pid| *pid != 0) {
+        let Some(info) = macos_kinfo(pid) else {
+            // Signal 0 that fails with ESRCH is the only proof it is gone; any
+            // other answer leaves a process that may still run, so it stays in
+            // the listing for the group check to settle.
+            if macos_pid_exists(pid) {
+                candidates.push((pid, None));
             }
-            let comm = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+            continue;
+        };
+        if info.pgid != pgid {
+            continue;
+        }
+        if info.has_exited() {
+            exited += 1;
+            continue;
+        }
+        candidates.push((pid, Some(info)));
+    }
+    // A group the probe finds alive must show at least one member, and a
+    // process that has exited counts as one it saw.
+    let incomplete = candidates.is_empty() && exited == 0;
+    Ok(group_listing(pgid, candidates, incomplete, |pid, info| {
+        let mut name = [0 as c_char; 1024];
+        let name_len =
+            unsafe { proc_name(pid as c_int, name.as_mut_ptr().cast(), name.len() as u32) };
+        let comm = if name_len > 0 {
+            unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
                 .to_string_lossy()
-                .into_owned();
-            let argv0 = macos_argv0(pid).unwrap_or_else(|| comm.clone());
-            Some(LiveDescendant { pid, comm, argv0 })
+                .into_owned()
+        } else {
+            info.as_ref()
+                .map(|info| info.comm.clone())
+                .unwrap_or_else(|| "?".to_string())
+        };
+        let args = macos_argv(pid).unwrap_or_default();
+        let argv0 = safe_argv0(args.first().filter(|value| !value.is_empty()), &comm);
+        Some(LiveDescendant {
+            pid,
+            command: shown_command(&comm, arguments_may_be_present(&args)),
+            comm: safe_name(&comm),
+            argv0,
+            user: info.map(|info| user_name(info.ruid)),
         })
-        .collect()
+    }))
 }
 
 #[cfg(target_os = "macos")]
-fn macos_argv0(pid: u32) -> Option<String> {
+use crate::fs_lock::macos_kinfo;
+#[cfg(all(test, target_os = "macos"))]
+use crate::fs_lock::{MacosKinfo, P_WEXIT, SZOMB};
+
+#[cfg(target_os = "macos")]
+fn macos_argv(pid: u32) -> Option<Vec<String>> {
     const CTL_KERN: libc::c_int = 1;
     const KERN_PROCARGS2: libc::c_int = 49;
+    // Two are enough to tell whether there are arguments beyond the program
+    // name; their text is never kept.
+    const MAX_ARGS: usize = 2;
     let mut mib = [CTL_KERN, KERN_PROCARGS2, i32::try_from(pid).ok()?];
     let mut size = 0_usize;
     if unsafe {
@@ -254,18 +845,36 @@ fn macos_argv0(pid: u32) -> Option<String> {
         return None;
     }
     bytes.truncate(size);
-    let mut cursor = std::mem::size_of::<libc::c_int>();
+    // Layout: argc (int), the executable path, NUL padding, then argc
+    // NUL-terminated arguments followed by the environment.
+    let int_size = std::mem::size_of::<libc::c_int>();
+    let argc = libc::c_int::from_ne_bytes(bytes.get(..int_size)?.try_into().ok()?);
+    let mut cursor = int_size;
     cursor += bytes.get(cursor..)?.iter().position(|byte| *byte == 0)?;
     while bytes.get(cursor).is_some_and(|byte| *byte == 0) {
         cursor += 1;
     }
-    let end = cursor
-        + bytes
-            .get(cursor..)?
-            .iter()
-            .position(|byte| *byte == 0)
-            .unwrap_or(bytes.len().saturating_sub(cursor));
-    (end > cursor).then(|| String::from_utf8_lossy(&bytes[cursor..end]).into_owned())
+    let mut args = Vec::new();
+    while args.len() < usize::try_from(argc).unwrap_or(0).min(MAX_ARGS) && cursor < bytes.len() {
+        let end = cursor
+            + bytes[cursor..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(bytes.len() - cursor);
+        args.push(String::from_utf8_lossy(&bytes[cursor..end]).into_owned());
+        cursor = end + 1;
+    }
+    (!args.is_empty()).then_some(args)
+}
+
+/// Whether a process exists, including one owned by another user.
+#[cfg(target_os = "macos")]
+fn macos_pid_exists(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    (unsafe { libc::kill(pid, 0) } == 0)
+        || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 /// The Unix payload wrapper runs the user's command in the same shell that
@@ -389,6 +998,10 @@ pub(crate) fn terminate_pgid_with(pgid: i32, mut leader_exited: impl FnMut() -> 
         }
         thread::sleep(Duration::from_millis(50));
     }
+    #[cfg(test)]
+    if test_hooks::sigkill_denied(pgid) {
+        return;
+    }
     unsafe {
         libc::killpg(pgid, libc::SIGKILL);
     }
@@ -471,28 +1084,25 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_scope_argv_wraps_the_tool_shell() {
-        let args = vec![OsString::from("-c"), OsString::from("printf ready")];
-        let (program, wrapped) = systemd_scope_argv(
-            Path::new("/usr/bin/systemd-run"),
-            Path::new("/bin/sh"),
-            &args,
-        );
-        assert_eq!(program, PathBuf::from("/usr/bin/systemd-run"));
-        assert_eq!(
-            wrapped,
-            vec![
-                "--user",
-                "--scope",
-                "--collect",
-                "--quiet",
-                "/bin/sh",
-                "-c",
-                "printf ready",
-            ]
-            .into_iter()
-            .map(OsString::from)
-            .collect::<Vec<_>>()
-        );
+        let command = "X=inner; echo ${X} $X $$; cd /usr; echo ${PWD}";
+        let args = vec![OsString::from("-c"), OsString::from(command)];
+        for supports_expand_environment in [true, false] {
+            let launcher = SystemdScopeLauncher {
+                path: PathBuf::from("/usr/bin/systemd-run"),
+                supports_expand_environment,
+            };
+            let (program, wrapped) = systemd_scope_argv(&launcher, Path::new("/bin/sh"), &args);
+            assert_eq!(program, launcher.path);
+            let mut expected = vec!["--user", "--scope", "--collect", "--quiet"];
+            if supports_expand_environment {
+                expected.push("--expand-environment=no");
+            }
+            expected.extend(["/bin/sh", "-c", command]);
+            assert_eq!(
+                wrapped,
+                expected.into_iter().map(OsString::from).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -503,10 +1113,10 @@ mod tests {
             || Some(PathBuf::from("/usr/bin/systemd-run")),
             |_| {
                 probes.set(probes.get() + 1);
-                false
+                None
             },
         );
-        assert_eq!(selected, None);
+        assert!(selected.is_none());
         assert_eq!(probes.get(), 1);
     }
 
@@ -883,7 +1493,7 @@ fn lifecycle_empty_group_avoids_proc_scan() {
     let pgid = child.id() as i32;
     child.wait().unwrap();
     PROC_SCAN_COUNT.with(|count| count.set(0));
-    assert!(linux_process_group_members(pgid).is_empty());
+    assert!(linux_process_group_members(pgid).unwrap().is_clean());
     assert_eq!(
         PROC_SCAN_COUNT.with(std::cell::Cell::get),
         0,
@@ -899,7 +1509,223 @@ fn lifecycle_scope_probe_deadline_falls_back() {
     crate::executable_cache::write_executable(&launcher, b"#!/bin/sh\nsleep 0.1\nexit 0\n")
         .unwrap();
     assert!(
-        !probe_systemd_scope(&launcher, Duration::ZERO),
+        probe_systemd_scope(&launcher, Duration::ZERO).is_none(),
         "expired probe still reported availability"
     );
+}
+
+/// A stale reading of a process that has exited is recognised by its zombie
+/// state, which is what keeps a kill from waiting for a process that is
+/// already gone. The helper it needs reads `kinfo_proc`, so it lives in a
+/// module of its own that is left out on other targets.
+#[cfg(all(test, target_os = "macos"))]
+mod macos_zombie_tests {
+    use super::*;
+
+    #[test]
+    fn macos_kinfo_reports_a_zombie_as_exited() {
+        let child = spawn_unreaped_zombie_for_test();
+        let info = macos_kinfo(child.id()).expect("a zombie is still readable");
+        assert_eq!(info.state, SZOMB, "the killed child must read as a zombie");
+        assert!(info.has_exited(), "a zombie has exited");
+        assert_eq!(info.exit_state(), crate::fs_lock::MacosExitState::Zombie);
+        assert!(
+            info.started_at_us.is_some(),
+            "the zombie retains its birth time"
+        );
+        assert_ne!(
+            info.flags & P_WEXIT,
+            0,
+            "a zombie's record still carries P_WEXIT, the bit the listing relies on"
+        );
+        let listing = live_process_group_members(child.id() as i32).expect("a listable group");
+        assert!(
+            listing.members.is_empty(),
+            "a group of one zombie was reported live: {:?}",
+            listing.members
+        );
+        drop(child);
+    }
+}
+
+/// A process whose exit has started but which is not a zombie yet is not a
+/// survivor. The kernel marks it with `P_WEXIT` first and only makes it a
+/// zombie (`SZOMB`) later, and for a while its record still shows a running
+/// state while `kill(pid, 0)` and `killpg(pgid, 0)` still succeed for it. The
+/// listing must tell that process from a running one, or a kill keeps waiting
+/// for a process that has already gone.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_exiting_process_counts_as_exited_before_it_is_a_zombie() {
+    let exiting = MacosKinfo {
+        comm: "sleep".into(),
+        ruid: 0,
+        pgid: 1,
+        state: 2, // SRUN
+        flags: P_WEXIT,
+        started_at_us: Some(1),
+    };
+    let running = MacosKinfo {
+        state: 2,
+        flags: 0,
+        ..exiting.clone()
+    };
+    assert_eq!(
+        exiting.exit_state(),
+        crate::fs_lock::MacosExitState::Exiting
+    );
+    assert_eq!(
+        running.exit_state(),
+        crate::fs_lock::MacosExitState::NotExiting
+    );
+    assert!(
+        exiting.has_exited(),
+        "a record with P_WEXIT reports the process as gone"
+    );
+    assert!(
+        !running.has_exited(),
+        "a running process without P_WEXIT is a survivor"
+    );
+}
+
+/// The `struct kinfo_proc` offsets AFT reads must match this process's own
+/// command name, real user and process group.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_kinfo_reads_this_process() {
+    let info = macos_kinfo(std::process::id()).expect("own process info");
+    assert_eq!(info.ruid, unsafe { libc::getuid() });
+    assert_eq!(info.pgid, unsafe { libc::getpgrp() });
+    assert_ne!(info.state, SZOMB, "the test process cannot be a zombie");
+    assert!(!info.has_exited(), "the test process has not exited");
+    assert_eq!(
+        info.flags & P_WEXIT,
+        0,
+        "a running process carries no P_WEXIT"
+    );
+    let exe = std::env::current_exe().unwrap();
+    let name = exe.file_name().unwrap().to_string_lossy();
+    assert!(
+        !info.comm.is_empty() && name.starts_with(&info.comm),
+        "comm {:?} is not a prefix of {name:?}",
+        info.comm
+    );
+}
+
+/// Another user's process is a member AFT cannot signal, and the listing must
+/// still include it. launchd (pid 1, owned by root) leads process group 1.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_group_listing_includes_another_users_process() {
+    let members = macos_process_group_members(1)
+        .expect("group 1 can be listed")
+        .members;
+    let launchd = members
+        .iter()
+        .find(|member| member.pid == 1)
+        .unwrap_or_else(|| panic!("launchd missing from its own group: {members:?}"));
+    assert_eq!(launchd.user.as_deref(), Some("root"));
+    assert_eq!(launchd.comm, "launchd");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_member_records_owner_and_executable_name_only() {
+    let mut command = std::process::Command::new("sleep");
+    command.arg("30");
+    start_new_session(&mut command);
+    let mut child = command.spawn().unwrap();
+    let pgid = child.id() as i32;
+    let members = linux_process_group_members(pgid);
+    let _ = child.kill();
+    let _ = child.wait();
+    let GroupListing {
+        members,
+        omitted,
+        incomplete,
+        ..
+    } = members.unwrap();
+    assert!(!incomplete);
+    assert_eq!(omitted, 0);
+    assert_eq!(members.len(), 1, "{members:?}");
+    assert_eq!(members[0].command.as_deref(), Some("sleep …"));
+    assert_eq!(members[0].argv0, "sleep");
+    assert_eq!(
+        members[0].user.as_deref(),
+        Some(user_name(unsafe { libc::getuid() }).as_str())
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn shown_command_never_carries_arguments() {
+    assert_eq!(shown_command("sleep", true).as_deref(), Some("sleep …"));
+    assert_eq!(shown_command("sleep", false).as_deref(), Some("sleep"));
+    assert_eq!(shown_command("  ", true), None);
+    assert!(arguments_may_be_present(&[]));
+    assert!(!arguments_may_be_present(&["sleep".into()]));
+    assert!(arguments_may_be_present(&["sleep".into(), "30".into()]));
+    // A rewritten process title keeps only its first word.
+    assert_eq!(
+        safe_argv0(Some(&"worker --token abc123".to_string()), "sh"),
+        "worker"
+    );
+    assert_eq!(safe_argv0(None, "sh"), "sh");
+    let long = "x".repeat(LIVE_DESCENDANT_NAME_CAP + 10);
+    let cut = safe_name(&long);
+    assert_eq!(cut.chars().count(), LIVE_DESCENDANT_NAME_CAP);
+    assert!(cut.ends_with('…'));
+    // Pattern masking still applies to the name itself.
+    assert!(!safe_name("ghp_abcdefghijklmnopqrstuvwxyz0123").contains("ghp_abc"));
+}
+
+/// Describing stops at the cap; the members past it are counted, not read.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn bounded_members_stops_describing_at_the_cap() {
+    let total = LIVE_DESCENDANT_CAP + 5;
+    let candidates = (1..=total as u32).rev().map(|pid| (pid, ())).collect();
+    let mut described = 0;
+    let (members, omitted) = bounded_members(candidates, |pid, ()| {
+        described += 1;
+        Some(LiveDescendant {
+            pid,
+            comm: "sleep".into(),
+            argv0: "sleep".into(),
+            user: None,
+            command: None,
+        })
+    });
+    assert_eq!(described, LIVE_DESCENDANT_CAP);
+    assert_eq!(members.len(), LIVE_DESCENDANT_CAP);
+    assert_eq!(omitted, 5);
+    assert_eq!(members.first().map(|member| member.pid), Some(1));
+    assert_eq!(
+        members.last().map(|member| member.pid),
+        Some(LIVE_DESCENDANT_CAP as u32)
+    );
+}
+
+/// One check keeps at most GROUP_IDENTITY_CAP identities, reads no start time
+/// past the cap, and says when members were left out.
+#[test]
+fn capped_identities_keeps_every_member_up_to_the_cap() {
+    let identity = |pid| {
+        Some(ProcessIdentity {
+            pid,
+            started_at_ms: u64::from(pid),
+        })
+    };
+    let (identities, truncated) = capped_identities(1..21_u32, identity);
+    assert_eq!(identities.len(), 20, "not limited to the members shown");
+    assert!(!truncated);
+
+    let mut read = 0;
+    let (identities, truncated) = capped_identities(0..(GROUP_IDENTITY_CAP as u32 + 76), |pid| {
+        read += 1;
+        identity(pid)
+    });
+    assert_eq!(identities.len(), GROUP_IDENTITY_CAP);
+    assert_eq!(read, GROUP_IDENTITY_CAP);
+    assert!(truncated);
 }

@@ -8,6 +8,22 @@ pub(super) const WAIT_BUDGET: Duration = Duration::from_secs(10);
 const MAX_WAITERS: usize = 256;
 const MAX_CONFINEMENT_READS: usize = 8;
 
+fn carrier_precheck_failed(identity: &RouteIdentity, body: &Value) -> bool {
+    identity.role == tool_provider::RouteRole::ToolProviderV1
+        && super::occipital_route(identity)
+        && super::route_request_is_tool_call(body)
+        && (super::occipital_session_refusal(identity, body).is_some()
+            || super::carrier_read_only::admit(identity, body)
+                .and_then(|()| {
+                    super::carrier_read_only::admit_operation(
+                        identity,
+                        body["name"].as_str().unwrap_or(""),
+                        body.get("arguments").unwrap_or(&Value::Null),
+                    )
+                })
+                .is_err())
+}
+
 pub(super) struct DatabaseWaits {
     tasks: tokio::task::JoinSet<DecodedFrame>,
     pending: HashMap<(RouteChannel, u64), (tokio::task::AbortHandle, AdmissionWait)>,
@@ -31,6 +47,75 @@ impl DatabaseWaits {
         self.tasks.is_empty()
     }
 
+    /// Compare codemode candidates only after their own saved policies have
+    /// been read. Share the confinement read budget so a locked database cannot
+    /// block the frame loop or create an unbounded number of blocking readers.
+    pub(super) fn read_codemode_policies(
+        &mut self,
+        mut decoded: DecodedFrame,
+        heads: Vec<RouteIdentity>,
+        executor: &Executor,
+    ) -> Result<(), DecodedFrame> {
+        let Some(candidates) = heads
+            .into_iter()
+            .map(|identity| {
+                executor
+                    .actor_context(&identity.root)
+                    .map(|ctx| (identity, ctx))
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Err(decoded);
+        };
+        let deadline = wait_deadline(
+            &decoded,
+            decoded
+                .body()
+                .ok()
+                .and_then(|body| body.get("deadline_ms"))
+                .and_then(Value::as_u64),
+        );
+        if deadline <= Instant::now() || self.pending.len() >= MAX_WAITERS {
+            return Err(decoded);
+        }
+        let Ok(permit) = self.confinement_reads.clone().try_acquire_owned() else {
+            return Err(decoded);
+        };
+        let route = route_key(decoded.frame.header.channel, decoded.frame.header.epoch);
+        let key = (route, decoded.frame.header.corr);
+        let admission = AdmissionWait::from_decoded(&decoded, "tool.call");
+        decoded.confinement = None;
+        let handle = self.tasks.spawn(async move {
+            for (identity, ctx) in &candidates {
+                if remote_policy::awaits_policy_store(ctx, identity) {
+                    crate::database_open::dispatch(ctx);
+                    ctx.wait_for_database_open(deadline).await;
+                }
+            }
+            let read = if deadline <= Instant::now() {
+                Err(remote_policy::policy_unavailable())
+            } else {
+                tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        codemode::SavedPolicies::read(candidates)
+                    }),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .ok_or_else(remote_policy::policy_unavailable)
+            };
+            decoded.codemode_policies = Some(read);
+            decoded
+        });
+        if let Some((old, _)) = self.pending.insert(key, (handle, admission)) {
+            old.abort();
+        }
+        Ok(())
+    }
+
     /// Restore a revived worker's launch authority before any tool preflight,
     /// without blocking the shared reader while saved paths are checked on disk.
     pub(super) fn restore_launch(
@@ -49,6 +134,13 @@ impl DatabaseWaits {
         let Ok(body) = decoded.body() else {
             return Err(decoded);
         };
+        // A carrier-supplied preset must never restore worker launch authority.
+        if identity.role == tool_provider::RouteRole::ToolProviderV1
+            && super::occipital_route(identity)
+            && super::route_request_is_tool_call(body)
+        {
+            return Err(decoded);
+        }
         let name = body.get("name").and_then(Value::as_str).unwrap_or("");
         if body.get("preset").and_then(Value::as_str) != Some("worker")
             || body
@@ -60,6 +152,10 @@ impl DatabaseWaits {
         {
             return Err(decoded);
         }
+        // A worker run's call runs with its worker route's grants, so it
+        // restores that route's launch grants, exactly as the worker's own
+        // call would.
+        let identity = codemode::worker_authority_route(identity);
         let Some(key) = access_grants::launch_key(identity, "worker") else {
             return Err(decoded);
         };
@@ -128,10 +224,10 @@ impl DatabaseWaits {
     }
 
     /// Return the frame unchanged unless this is a persistence-dependent call
-    /// on a bound root whose database is opening, or any catalog fetch or
-    /// tool call on a scoped worker route whose saved confinement is not yet
-    /// known. Failure and overflow are answered by the ordinary tool refusal
-    /// path without waiting.
+    /// on a bound root whose database is opening, a catalog that needs to
+    /// persist access settings, or a scoped worker's request whose saved
+    /// confinement is not yet known. Failure and overflow are answered by the
+    /// request's readiness refusal path without waiting.
     pub(super) fn defer(
         &mut self,
         decoded: DecodedFrame,
@@ -148,6 +244,29 @@ impl DatabaseWaits {
         let Ok(body) = decoded.body() else {
             return Err(decoded);
         };
+        // Structural carrier refusals precede all policy/database waits, for
+        // both the bare request and explicit tool.call forms.
+        if carrier_precheck_failed(identity, body) {
+            return Err(decoded);
+        }
+        if identity.role == tool_provider::RouteRole::ToolProviderV1
+            && super::occipital_carrier_route(identity)
+            && super::route_request_is_tool_call(body)
+        {
+            // Worker role and confinement both depend on the policy route's
+            // preset row. Do not let the carrier's disables or preset reject
+            // the call before that row can be read.
+            if identity
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.kind == subc_protocol::scope::ScopeKind::Worker)
+                && ctx.database_runtime_initializing()
+            {
+                let deadline_ms = body.get("deadline_ms").and_then(Value::as_u64);
+                return self.wait(decoded, route, &ctx, "tool.call".into(), deadline_ms, true);
+            }
+            return Err(decoded);
+        }
         // A scoped worker's saved confinement lives in aft.db, and the bind
         // reply goes out while that database may still be opening. Its
         // catalog fetch and tool calls wait for the open rather than be
@@ -161,7 +280,22 @@ impl DatabaseWaits {
         if let Some(operation) =
             operation.filter(|operation| tool_provider::recognized_operation(operation))
         {
-            if confine_wait && matches!(operation, "tool.catalog" | "tool.call") {
+            // Access settings and scoped catalog preset attestations also use
+            // aft.db, even when no saved worker policy needs to be read.
+            let catalog_body = if body.get("op").is_some() {
+                body
+            } else {
+                body.get("arguments").unwrap_or(body)
+            };
+            let catalog_wait = operation == "tool.catalog"
+                && ctx.database_runtime_initializing()
+                && remote_policy::catalog_needs_database(catalog_body, identity);
+            let grants_wait =
+                operation.starts_with("grants.") && ctx.database_runtime_initializing();
+            if catalog_wait
+                || grants_wait
+                || (confine_wait && matches!(operation, "tool.catalog" | "tool.call"))
+            {
                 let name = operation.to_string();
                 let deadline_ms = body.get("deadline_ms").and_then(Value::as_u64);
                 return self.wait(decoded, route, &ctx, name, deadline_ms, true);
@@ -271,6 +405,16 @@ impl DatabaseWaits {
         let Ok(body) = decoded.body() else {
             return Err(decoded);
         };
+        if carrier_precheck_failed(identity, body) {
+            return Err(decoded);
+        }
+        // V1 carrier policy is resolved on its executor job, including saved
+        // confinement. Legacy calls still need the ordinary pre-admission read.
+        if identity.role == tool_provider::RouteRole::ToolProviderV1
+            && super::occipital_carrier_route(identity)
+        {
+            return Err(decoded);
+        }
         // Catalog fetches and the other provider operations run on the
         // executor and read the policy there; only tool calls are checked
         // against it on the frame loop.
@@ -393,13 +537,39 @@ impl DatabaseWaits {
         // A caller may shorten the wait with an absolute Unix-millisecond
         // deadline. The bash timeout limits command execution, not the wait
         // for permission to admit the command.
-        let deadline = wait_deadline(&decoded, deadline_ms);
+        let mut deadline = wait_deadline(&decoded, deadline_ms);
+        if matches!(
+            name.as_str(),
+            "tool.catalog" | "grants.list" | "grants.revoke"
+        ) {
+            // Catalog/grant callers have a short transport budget. Resume after
+            // it expires so an unfinished aft.db open can be refused without
+            // another synchronous open wait on an executor worker.
+            deadline = deadline.min(decoded.phase_trace.received_at() + Duration::from_secs(2));
+        }
         let ctx = Arc::clone(ctx);
         let handle = self.tasks.spawn(async move {
             if any_command {
                 ctx.wait_for_database_open(deadline).await;
             } else {
                 ctx.wait_for_database_runtime(&name, deadline).await;
+            }
+            #[cfg(feature = "test-timing-hooks")]
+            if name == "bg_events" {
+                // Pause a resumed subscription without holding configure's
+                // maintenance job, so route reclamation can finish first.
+                if let Some(gate) = std::env::var_os("AFT_TEST_BG_EVENTS_DATABASE_RESUME_GATE")
+                    .map(std::path::PathBuf::from)
+                {
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    while gate.exists() {
+                        assert!(
+                            Instant::now() < deadline,
+                            "bg_events resume gate not released"
+                        );
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
             }
             decoded
         });
@@ -494,6 +664,7 @@ mod tests {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -530,12 +701,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bg_events_subscriptions_skip_database_initialization() {
+        let (_dir, root) = test_support::test_root("bg-events-database-waits");
+        let ctx = test_support::test_ctx();
+        ctx.mark_database_runtime_initializing_for_test();
+        let executor = Executor::new();
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let routes = [121, 122]
+            .into_iter()
+            .map(|channel| {
+                (
+                    route_key(channel, 1),
+                    test_support::route_identity(&root, "session"),
+                )
+            })
+            .collect();
+        let mut waits = DatabaseWaits::default();
+        for channel in [121, 122] {
+            let decoded = DecodedFrame {
+                parsed_body: Default::default(),
+                confinement: None,
+                launch_restore: None,
+                codemode_policies: None,
+                frame: Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    channel,
+                    1,
+                    950,
+                    serde_json::to_vec(&json!({"op": "bg_events"})).unwrap(),
+                )
+                .unwrap(),
+                phase_trace: PhaseTrace::new(Instant::now()),
+            };
+            assert!(
+                waits.defer(decoded, &routes, &executor).is_err(),
+                "bg_events on channel {channel} must reach its inline subscription handler"
+            );
+        }
+        assert!(waits.is_empty());
+        assert!(ctx.database_runtime_initializing());
+        assert!(ctx.database_runtime_pending("unclassified_test_operation"));
+    }
+
+    #[tokio::test]
     async fn stale_database_completion_cannot_remove_replacement_waiter() {
         let route = route_key(42, 1);
         let decoded = DecodedFrame {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame: Frame::build(FrameType::Request, control_flags(), 42, 1, 1, Vec::new()).unwrap(),
             phase_trace: PhaseTrace::new(Instant::now()),
         };
@@ -568,6 +784,7 @@ mod tests {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -644,6 +861,7 @@ mod tests {
             trust: BindTrust::FirstParty,
             spawn_principal: unscoped.spawn_principal.clone(),
             consumer_elicitation_capable: false,
+            tool_result_body: false,
             disabled_tools: Arc::default(),
             scope: Some(scope),
             call_mode: subc_protocol::call_mode::CallMode::Classic,
@@ -653,6 +871,262 @@ mod tests {
         }));
         assert!(remote_policy::key(&worker, Some("worker")).is_some());
         (worker, unscoped)
+    }
+
+    fn head_catalog(
+        root: &ProjectRootId,
+        deadline_ms: Option<u64>,
+    ) -> (RouteIdentity, DecodedFrame) {
+        let (mut head, _) = scoped_worker_and_head(root);
+        let scope = Arc::get_mut(&mut head.0).unwrap().scope.as_mut().unwrap();
+        scope.kind = subc_protocol::scope::ScopeKind::Head;
+        scope.owner = Principal::Reserved {
+            module_id: "prefrontal-core".into(),
+        };
+        if let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
+            &mut Arc::get_mut(&mut head.0).unwrap().spawn_principal
+        {
+            *principal_id = Some("reserved:prefrontal-core".into());
+        }
+        let decoded = DecodedFrame {
+            parsed_body: Default::default(),
+            confinement: None,
+            launch_restore: None,
+            codemode_policies: None,
+            frame: Frame::build(
+                FrameType::Request,
+                control_flags(),
+                43,
+                1,
+                7,
+                serde_json::to_vec(&json!({
+                    "op": "tool.catalog", "preset": "head", "params": {"mode": "ask"},
+                    "deadline_ms": deadline_ms,
+                }))
+                .unwrap(),
+            )
+            .unwrap(),
+            phase_trace: PhaseTrace::new(Instant::now()),
+        };
+        (head, decoded)
+    }
+
+    async fn head_catalog_reply(
+        decoded: DecodedFrame,
+        identity: RouteIdentity,
+        executor: &Arc<Executor>,
+    ) -> Frame {
+        let (writer, mut replies) = mpsc::channel(8);
+        let body = decoded.body().unwrap().clone();
+        submit_provider_read(
+            &writer,
+            &decoded.frame,
+            identity,
+            executor,
+            &Arc::default(),
+            &Arc::new(DispatchPathMetrics::new()),
+            "tool.catalog",
+            body,
+            decoded.phase_trace,
+            test_support::test_request_meta(),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), replies.recv())
+            .await
+            .expect("catalog reply")
+            .unwrap()
+            .frame
+    }
+
+    #[tokio::test]
+    async fn head_catalog_waits_for_database_and_persists_mode() {
+        use std::future::Future;
+        let (dir, root) = test_support::test_root("head-catalog-database-wait");
+        let ctx = test_support::test_ctx();
+        // Bind acknowledges a configured root before the deferred open installs
+        // its handle. Hold that state explicitly, without racing a real open.
+        ctx.mark_database_runtime_initializing_for_test();
+        assert!(ctx.db().is_none());
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), ctx.clone()));
+        let (head, decoded) = head_catalog(&root, None);
+        let routes = HashMap::from([(route_key(43, 1), head.clone())]);
+        let mut waits = DatabaseWaits::default();
+        let decoded = match waits.defer(decoded, &routes, &executor) {
+            Ok(()) => {
+                let resumed = waits.next();
+                tokio::pin!(resumed);
+                tokio::task::yield_now().await;
+                std::future::poll_fn(|cx| {
+                    assert!(
+                        resumed.as_mut().poll(cx).is_pending(),
+                        "catalog resumed before database open"
+                    );
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                ctx.set_db(Arc::new(std::sync::Mutex::new(
+                    crate::db::open(&dir.path().join("aft.db")).unwrap(),
+                )));
+                ctx.finish_database_runtime(Ok(()));
+                resumed.await
+            }
+            Err(decoded) => decoded,
+        };
+        let reply = head_catalog_reply(decoded, head.clone(), &executor).await;
+        assert_eq!(
+            reply.header.ty,
+            FrameType::Response,
+            "{}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        let db = ctx.db().expect("successful catalog requires persistence");
+        let conn = db.lock().unwrap();
+        let key = access_grants::policy_scope_key(&head);
+        assert!(crate::db::access_grants::is_head(&conn, &key).unwrap());
+        assert_eq!(
+            crate::db::access_grants::mode(&conn, &key).unwrap(),
+            crate::access_policy::ApprovalMode::Ask
+        );
+    }
+
+    #[tokio::test]
+    async fn rich_ui_preset_writer_catalog_waits_for_open_then_records_without_refetch() {
+        use std::future::Future;
+        for preset in ["worker", "reader"] {
+            let (dir, root) = test_support::test_root("preset-catalog-database-wait");
+            let ctx = test_support::test_ctx();
+            ctx.mark_database_runtime_initializing_for_test();
+            let executor = Arc::new(Executor::new());
+            assert!(executor.register_actor(root.clone(), ctx.clone()));
+            let (mut identity, mut decoded) = head_catalog(&root, None);
+            let data = Arc::get_mut(&mut identity.0).unwrap();
+            data.role = tool_provider::RouteRole::ToolProviderV1;
+            if preset == "worker" {
+                data.scope.as_mut().unwrap().kind = subc_protocol::scope::ScopeKind::Worker;
+            }
+            if let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
+                &mut data.spawn_principal
+            {
+                *principal_id = Some("reserved:broca".into());
+            }
+            decoded.frame = Frame::build(
+                FrameType::Request,
+                control_flags(),
+                43,
+                1,
+                7,
+                serde_json::to_vec(&json!({"op":"tool.catalog","preset":preset})).unwrap(),
+            )
+            .unwrap();
+            let routes = HashMap::from([(route_key(43, 1), identity.clone())]);
+            let mut waits = DatabaseWaits::default();
+            assert!(
+                waits.defer(decoded, &routes, &executor).is_ok(),
+                "{preset} catalog must wait"
+            );
+            let resumed = waits.next();
+            tokio::pin!(resumed);
+            tokio::task::yield_now().await;
+            std::future::poll_fn(|cx| {
+                assert!(
+                    resumed.as_mut().poll(cx).is_pending(),
+                    "catalog resumed before open"
+                );
+                std::task::Poll::Ready(())
+            })
+            .await;
+            ctx.set_db(Arc::new(std::sync::Mutex::new(
+                crate::db::open(&dir.path().join("aft.db")).unwrap(),
+            )));
+            ctx.finish_database_runtime(Ok(()));
+            let reply = head_catalog_reply(resumed.await, identity.clone(), &executor).await;
+            assert_eq!(
+                reply.header.ty,
+                FrameType::Response,
+                "{}",
+                String::from_utf8_lossy(&reply.body)
+            );
+            let key = remote_policy::session_preset_key(&identity, preset).unwrap();
+            assert_eq!(
+                crate::db::rich_ui::session_presets(&ctx.db().unwrap().lock().unwrap(), &key)
+                    .unwrap(),
+                [preset]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn head_catalog_database_deadline_and_failure_are_retryable() {
+        let (_dir, root) = test_support::test_root("head-catalog-database-refusal");
+        let ctx = test_support::test_ctx();
+        ctx.mark_database_runtime_initializing_for_test();
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), ctx.clone()));
+        for code in ["database_initializing", "database_unavailable"] {
+            let (head, decoded) = head_catalog(&root, Some(0));
+            let routes = HashMap::from([(route_key(43, 1), head.clone())]);
+            let mut waits = DatabaseWaits::default();
+            let decoded = match waits.defer(decoded, &routes, &executor) {
+                Ok(()) => waits.next().await,
+                Err(decoded) => decoded,
+            };
+            let reply = head_catalog_reply(decoded, head, &executor).await;
+            assert_eq!(reply.header.ty, FrameType::Error);
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(body["code"], code, "{body}");
+            assert_eq!(body["detail"]["retryable"], true, "{body}");
+            assert!(ctx.db().is_none());
+            ctx.finish_database_runtime_error("injected database busy failure".into(), true);
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_database_requirement_tracks_access_settings_not_head_worker_previews() {
+        let (_dir, root) = test_support::test_root("head-catalog-database-parameters");
+        let ctx = test_support::test_ctx();
+        ctx.mark_database_runtime_initializing_for_test();
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), ctx.clone()));
+        for (preset, params, needs_database) in [
+            ("head", json!({"mode": "ask"}), true),
+            ("worker", json!({"allow_paths": []}), true),
+            ("worker", json!({"mode": "ask"}), false),
+            ("worker", json!({"remote_exec": {"enabled": false}}), false),
+            ("head", json!({}), false),
+        ] {
+            let (head, mut decoded) = head_catalog(&root, None);
+            let body = json!({"op": "tool.catalog", "preset": preset, "params": params});
+            decoded.frame = Frame::build(
+                FrameType::Request,
+                control_flags(),
+                43,
+                1,
+                7,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap();
+            let routes = HashMap::from([(route_key(43, 1), head.clone())]);
+            let mut waits = DatabaseWaits::default();
+            match waits.defer(decoded, &routes, &executor) {
+                Ok(()) => assert!(needs_database, "preview waited for persistence: {body}"),
+                Err(decoded) => {
+                    assert!(
+                        !needs_database,
+                        "access settings bypassed persistence: {body}"
+                    );
+                    let reply = head_catalog_reply(decoded, head, &executor).await;
+                    assert_eq!(
+                        reply.header.ty,
+                        FrameType::Response,
+                        "{}",
+                        String::from_utf8_lossy(&reply.body)
+                    );
+                }
+            }
+            assert!(ctx.db().is_none());
+        }
     }
 
     #[tokio::test]
@@ -669,6 +1143,7 @@ mod tests {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -728,6 +1203,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codemode_saved_policies_wait_off_the_frame_loop() {
+        let (dir, root) = test_support::test_root("codemode-policy-held-lock");
+        let ctx = test_support::test_ctx();
+        ctx.set_db(Arc::new(std::sync::Mutex::new(
+            crate::db::open(&dir.path().join("aft.db")).unwrap(),
+        )));
+        let executor = Executor::new();
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let (worker, head) = scoped_worker_and_head(&root);
+        let candidates = vec![worker, head];
+        let db = ctx.db().unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _conn = db.lock().unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        });
+        held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut waits = DatabaseWaits::default();
+        let started = Instant::now();
+        assert!(waits
+            .read_codemode_policies(
+                policy_read_frame(1, crate::bash_background::persistence::unix_millis() + 5000),
+                candidates.clone(),
+                &executor,
+            )
+            .is_ok());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), waits.next())
+                .await
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let resumed = tokio::time::timeout(Duration::from_secs(5), waits.next())
+            .await
+            .unwrap();
+        let Some(Ok(policies)) = resumed.codemode_policies else {
+            panic!("saved policies were not read");
+        };
+        for candidate in &candidates {
+            assert_eq!(
+                policies.get(&ctx, candidate),
+                Some(Ok(codemode::EffectiveSavedPolicy::default()))
+            );
+        }
+        assert!(waits.is_empty());
+    }
+
+    #[tokio::test]
     async fn confinement_read_runs_off_the_frame_loop_and_holds_admission_until_it_finishes() {
         let (dir, root) = test_support::test_root("confine-read-held-lock");
         let ctx = test_support::test_ctx();
@@ -757,6 +1284,7 @@ mod tests {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -860,6 +1388,7 @@ mod tests {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -928,6 +1457,7 @@ mod tests {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -1115,6 +1645,7 @@ mod tests {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),

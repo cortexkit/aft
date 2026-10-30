@@ -3,7 +3,7 @@
 //! request JSON cannot manufacture a scope or choose an upstream principal.
 
 use super::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use subc_protocol::scope::ScopeStamp;
 
@@ -13,6 +13,7 @@ pub(super) struct ReadHolder {
     pub calls: Vec<Value>,
     pub dials: Vec<Value>,
     pub hold_reads: Option<Arc<tokio::sync::Notify>>,
+    pub results: VecDeque<Value>,
 }
 
 pub(super) async fn serve(listener: TcpListener, holder: Arc<Mutex<ReadHolder>>) {
@@ -125,7 +126,10 @@ async fn connection(mut stream: TcpStream, holder: Arc<Mutex<ReadHolder>>) {
                         if let Some(hold) = hold {
                             hold.notified().await;
                         }
-                        let result = if body["arguments"]["action"]
+                        let replay = holder.lock().unwrap().results.pop_front();
+                        let result = if let Some(result) = replay {
+                            result
+                        } else if body["arguments"]["action"]
                             .as_str()
                             .unwrap_or("")
                             .starts_with("github.search.")

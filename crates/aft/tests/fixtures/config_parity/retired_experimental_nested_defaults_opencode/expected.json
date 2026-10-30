@@ -1,5 +1,6 @@
 {
   "aft_search_registered": true,
+  "bash_long_running_reminder_enabled": false,
   "disabled_tools": [
     "aft_delete",
     "aft_move"

@@ -5,6 +5,8 @@ use aft::list_envelope::{render_trailer, ListEnvelope, Reason, Total, Unit};
 use aft::list_surfaces::{ExclusionEntry, EXCLUSIONS, LIST_SURFACES};
 use serde_json::Value;
 
+use crate::list_cut_item::extract_item_name;
+
 /// Returns the path to `crates/aft/src`.
 fn aft_src_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
@@ -30,14 +32,6 @@ fn collect_rs_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct CallSite {
-    file: String,
-    line: usize,
-    code: String,
-}
-
-/// Finds all call sites of a function in `crates/aft/src/`.
 /// Registry file keys are written with `/` (`commands/grep.rs`); a Windows
 /// walk yields `\`, so the key is rebuilt from path components rather than
 /// taken from `display()`, which would never match an entry on that host.
@@ -46,98 +40,6 @@ fn registry_file_key(rel: &Path) -> String {
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join("/")
-}
-
-fn find_call_sites(fn_name: &str, files: &[PathBuf]) -> Vec<CallSite> {
-    let mut sites = Vec::new();
-    let src_dir = aft_src_dir();
-
-    for file in files {
-        let content = fs::read_to_string(file).unwrap_or_default();
-        let rel_file = registry_file_key(file.strip_prefix(&src_dir).unwrap_or(file));
-
-        let mut in_test_cfg = false;
-        for (idx, line) in content.lines().enumerate() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("#[cfg(test)]") {
-                in_test_cfg = true;
-            }
-            if in_test_cfg && trimmed.starts_with("mod tests") {
-                break;
-            }
-            // Skip function definitions
-            if trimmed.starts_with("pub fn ")
-                || trimmed.starts_with("fn ")
-                || trimmed.starts_with("pub(crate) fn ")
-            {
-                continue;
-            }
-            // Skip comments
-            if trimmed.starts_with("//") || trimmed.starts_with('*') || trimmed.starts_with("/*") {
-                continue;
-            }
-
-            let is_call = trimmed.contains(&format!("{fn_name}("))
-                || trimmed.contains(&format!("{fn_name} ("));
-            if is_call {
-                sites.push(CallSite {
-                    file: rel_file.clone(),
-                    line: idx + 1,
-                    code: trimmed.to_string(),
-                });
-            }
-        }
-    }
-    sites
-}
-
-#[test]
-fn static_call_site_guard_render_trailer_and_measure_trailer_len() {
-    let src_dir = aft_src_dir();
-    let rs_files = collect_rs_files(&src_dir);
-
-    // Callers of render_trailer:
-    // Exactly three:
-    // 1. subc formatter (crates/aft/src/subc_format.rs)
-    // 2. NDJSON text builder (crates/aft/src/ndjson_text.rs)
-    // 3. measure_trailer_len (crates/aft/src/list_envelope.rs)
-    let render_call_sites = find_call_sites("render_trailer", &rs_files);
-    assert_eq!(
-        render_call_sites.len(),
-        3,
-        "render_trailer must have exactly 3 callers, found {}: {:#?}",
-        render_call_sites.len(),
-        render_call_sites
-    );
-
-    let render_files: Vec<&str> = render_call_sites.iter().map(|s| s.file.as_str()).collect();
-    assert!(
-        render_files.contains(&"subc_format.rs"),
-        "subc_format.rs must be an authorized caller of render_trailer: {render_files:#?}"
-    );
-    assert!(
-        render_files.contains(&"ndjson_text.rs"),
-        "ndjson_text.rs must be an authorized caller of render_trailer: {render_files:#?}"
-    );
-    assert!(
-        render_files.contains(&"list_envelope.rs"),
-        "list_envelope.rs must be an authorized caller of render_trailer: {render_files:#?}"
-    );
-
-    // Callers of measure_trailer_len:
-    // Exactly one caller: outline adapter (list_surfaces/outline.rs)
-    let measure_call_sites = find_call_sites("measure_trailer_len", &rs_files);
-    assert_eq!(
-        measure_call_sites.len(),
-        1,
-        "measure_trailer_len must have exactly 1 caller, found {}: {:#?}",
-        measure_call_sites.len(),
-        measure_call_sites
-    );
-    assert_eq!(
-        measure_call_sites[0].file, "list_surfaces/outline.rs",
-        "authorized caller must be in list_surfaces/outline.rs"
-    );
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,70 +51,7 @@ pub struct DiscoveredCut {
     pub snippet: String,
 }
 
-fn extract_item_name(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-
-    // Check fn
-    if let Some(rest) = trimmed
-        .strip_prefix("pub(crate) fn ")
-        .or_else(|| trimmed.strip_prefix("pub fn "))
-        .or_else(|| trimmed.strip_prefix("fn "))
-        .or_else(|| trimmed.strip_prefix("async fn "))
-        .or_else(|| trimmed.strip_prefix("pub async fn "))
-        .or_else(|| trimmed.strip_prefix("pub(crate) async fn "))
-    {
-        let name: String = rest
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect();
-        if !name.is_empty() {
-            return Some(name);
-        }
-    }
-
-    // Check const / static
-    if let Some(rest) = trimmed
-        .strip_prefix("pub(crate) const ")
-        .or_else(|| trimmed.strip_prefix("pub const "))
-        .or_else(|| trimmed.strip_prefix("const "))
-        .or_else(|| {
-            trimmed
-                .strip_prefix("pub(crate) static ")
-                .or_else(|| trimmed.strip_prefix("pub static "))
-                .or_else(|| trimmed.strip_prefix("static "))
-        })
-    {
-        let name: String = rest
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect();
-        if !name.is_empty() {
-            return Some(name);
-        }
-    }
-
-    // Check struct / enum
-    if let Some(rest) = trimmed
-        .strip_prefix("pub(crate) struct ")
-        .or_else(|| trimmed.strip_prefix("pub struct "))
-        .or_else(|| trimmed.strip_prefix("struct "))
-        .or_else(|| trimmed.strip_prefix("pub(crate) enum "))
-        .or_else(|| trimmed.strip_prefix("pub enum "))
-        .or_else(|| trimmed.strip_prefix("enum "))
-    {
-        let name: String = rest
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect();
-        if !name.is_empty() {
-            return Some(name);
-        }
-    }
-
-    None
-}
-
-fn find_enclosing_item(lines: &[&str], target_idx: usize) -> String {
+pub(crate) fn find_enclosing_item(lines: &[&str], target_idx: usize) -> String {
     for i in (0..=target_idx).rev() {
         if let Some(name) = extract_item_name(lines[i]) {
             return name;
@@ -232,6 +71,8 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     files_to_scan.push(src_dir.join("run_tool_call.rs"));
     // 3. crates/aft/src/subc_format.rs
     files_to_scan.push(src_dir.join("subc_format.rs"));
+    files_to_scan.push(src_dir.join("subc/bind_log.rs"));
+    files_to_scan.push(src_dir.join("subc/diagnostics_findings.rs"));
     // Remote downloads and the emergency rendered-reply ceiling also cut
     // bytes and must remain registered even though they are not list payloads.
     files_to_scan.push(src_dir.join("url_fetch.rs"));
@@ -246,6 +87,7 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
         "budget.exhausted()",
         ".take(",
         "truncate(",
+        "size >= BODY_LIMIT",
         "DEFAULT_MAX_RESULTS",
         "HUB_SUMMARY_LIMIT",
         "TRACE_TO_EXPANSION_BUDGET",

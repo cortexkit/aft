@@ -156,3 +156,42 @@ pub fn produce_bash_reply_data(
     attach_bash_output_envelope(&mut map, &envelope);
     map
 }
+
+/// Envelope for the optional watcher file list and its per-file diff lines.
+/// Callers supply measured retained and observed counts after applying caps.
+pub fn build_changed_files_envelope(
+    shown: usize,
+    total: usize,
+    lines: bool,
+    incomplete: bool,
+) -> ListEnvelope {
+    build_changed_files_envelope_with_time_limit(shown, total, lines, incomplete, false)
+}
+
+/// A reply deadline can stop path enumeration before the full total is known.
+pub fn build_changed_files_envelope_with_time_limit(
+    shown: usize,
+    total: usize,
+    lines: bool,
+    incomplete: bool,
+    time_limit: bool,
+) -> ListEnvelope {
+    let mut causes = Vec::new();
+    if shown < total {
+        causes.push(Reason::Cap);
+    }
+    if time_limit {
+        causes.push(Reason::TimeLimit);
+    }
+    ListEnvelope::new(
+        shown,
+        if incomplete || time_limit {
+            Total::AtLeast(total)
+        } else {
+            Total::Exact(total)
+        },
+        if lines { Unit::Lines } else { Unit::Files },
+        causes,
+        &[],
+    )
+}

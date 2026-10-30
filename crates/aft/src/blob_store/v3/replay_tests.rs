@@ -45,7 +45,9 @@ fn fixture(reuse: bool) -> Fixture {
     let registry = FamilyRegistry::open(&storage, FAMILY).unwrap();
     let checkout = storage.join("checkout");
     fs::create_dir_all(&checkout).unwrap();
-    let registration = registry.register_view(HOLDER, &checkout).unwrap();
+    let registration = registry
+        .register_view_with_storage(&storage, HOLDER, &checkout)
+        .unwrap();
     let payload = vec![0x5a; 64 * 1024];
     let key = FamilyKey::new(FamilyPlane::Semantic, *blake3::hash(&payload).as_bytes());
     registration
@@ -222,7 +224,12 @@ fn enumerate(reuse: bool, prepare: impl Fn(&Fixture)) -> (replay::Report, PathBu
             let fixture = fixture(reuse);
             prepare(&fixture);
             let report = replayed(&fixture, Some(cut));
-            assert_eq!(report.crashed, cut <= whole.ops, "cut {cut}");
+            assert_eq!(
+                report.crashed,
+                cut <= whole.ops,
+                "cut {cut}: this run made other file calls than the uncut run; {}",
+                first_divergence(&whole.trace, &report.trace)
+            );
             observe(&fixture)
         })
         .collect::<Vec<_>>();
@@ -233,6 +240,27 @@ fn enumerate(reuse: bool, prepare: impl Fn(&Fixture)) -> (replay::Report, PathBu
         whole.dir_syncs
     );
     (whole, storage, seen)
+}
+
+/// Where a cut run's file calls first differ from the uncut run's, with a
+/// few calls of context from each.
+fn first_divergence(uncut: &[String], cut: &[String]) -> String {
+    let at = uncut
+        .iter()
+        .zip(cut)
+        .position(|(a, b)| a != b)
+        .unwrap_or(uncut.len().min(cut.len()));
+    let window = |trace: &[String]| {
+        trace[at.saturating_sub(3).min(trace.len())..(at + 5).min(trace.len())].to_vec()
+    };
+    format!(
+        "first difference at call {} (uncut {} calls, cut run {} calls before its cut): uncut {:?}, cut run {:?}",
+        at + 1,
+        uncut.len(),
+        cut.len(),
+        window(uncut),
+        window(cut)
+    )
 }
 
 fn assert_never_torn(seen: &[Seen]) {
@@ -276,6 +304,9 @@ fn replayed_reuse_only_closure_is_whole_or_absent_after_any_power_cut() {
 fn replayed_retry_after_a_failed_floor_directory_sync_is_whole_or_absent() {
     let _guard = serial();
     let fail_floor_sync = |fixture: &Fixture| {
+        // The seed already synced this floor. Model a publisher without that
+        // process-local proof so its first covered raise must sync again.
+        crate::reader_floor::forget_durable_for_test(&fixture.storage);
         crate::durability::FAIL_DIRECTORY_SYNC
             .with(|slot| *slot.borrow_mut() = Some(fixture.storage.clone()));
         let error = copy(fixture).unwrap_err();
@@ -311,4 +342,42 @@ fn red_control_without_the_closure_flush_a_power_cut_tears_the_copy() {
     replay::set_unflushed_closure(false);
     let (_, _, seen) = result.unwrap();
     assert!(seen.contains(&Seen::Torn), "{seen:?}");
+}
+
+/// A plane WAL that an earlier read-only reader left behind (SQLite creates
+/// it even for a reader and cannot remove it on a read-only close) must not
+/// change how many calls the copy is cut at. Whether that file is still there
+/// when a copy starts has differed between runs on a loaded CI runner, and
+/// counting its creation then made a cut run disagree with the uncut run.
+#[test]
+fn replayed_copy_counts_the_same_calls_with_or_without_a_leftover_reader_wal() {
+    let _guard = serial();
+    let wal = |fixture: &Fixture| {
+        plane_path(&fixture.storage, FAMILY, FamilyPlane::Semantic)
+            .unwrap()
+            .with_file_name("semantic.sqlite-wal")
+    };
+    let without = fixture(false);
+    assert!(
+        !wal(&without).exists(),
+        "the fixture's writer removed its WAL"
+    );
+    let without = replayed(&without, None);
+    let with = fixture(false);
+    PlaneReader::open_existing(&with.storage, FAMILY, FamilyPlane::Semantic)
+        .unwrap()
+        .get(&with.key)
+        .unwrap();
+    assert!(
+        wal(&with).exists(),
+        "the read-only reader left its WAL behind"
+    );
+    let with = replayed(&with, None);
+    assert!(!without.crashed && !with.crashed);
+    assert_eq!(
+        without.ops,
+        with.ops,
+        "{}",
+        first_divergence(&without.trace, &with.trace)
+    );
 }

@@ -1,1 +1,0 @@
-- `bash_write` called with a task id this session never started now answers in one line that points to `bash` for running commands, and `bash_status`, `bash_kill` and `bash_watch` give a one-line not-found reply that names `bash` too. Thanks @kido5217 (#691).

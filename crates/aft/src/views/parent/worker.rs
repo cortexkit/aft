@@ -15,7 +15,7 @@ use super::super::semantic::SemanticProducer;
 use super::super::snapshot::LiveDelta;
 use super::{
     lock, read, write, CallgraphChild, Child, Discovery, ParentSemantic, ParentSession, Plane,
-    SemanticChild, TrigramChild, DEFAULT_MAX_CHILD_REPOS,
+    PublishedChild, SemanticChild, TrigramChild, TrigramSource, DEFAULT_MAX_CHILD_REPOS,
 };
 
 /// Longest the worker sleeps between two checks of its stop flag, holders
@@ -227,19 +227,36 @@ fn refresh_trigram(session: &ParentSession, child: &Child) {
             return;
         }
     };
+    // A child whose sessions run with views on publishes its lexical index
+    // only as its v3 lexical view; the parent reads that publication.
+    match open_child_lexical_view(session, child, family) {
+        Ok(None) => {}
+        Ok(Some(generation)) => {
+            install_view_trigram(session, child, family, &generation);
+            return;
+        }
+        Err(error) => {
+            *write(&child.trigram) = Plane::Gap(format!("lexical view unavailable: {error}"));
+            return;
+        }
+    }
     let artifact = crate::readonly_artifacts::search_index_artifact_generation_with_key(
         family,
         Some(&session.storage),
     );
     let Some(artifact) = artifact else {
-        *write(&child.trigram) =
-            Plane::Gap("no trigram index has been built for this repository yet".into());
+        let mut trigram = write(&child.trigram);
+        // Releasing the ledger lock does not itself publish a usable lexical index.
+        // Keep its last busy diagnostic until a usable publication arrives.
+        if matches!(&*trigram, Plane::Gap(reason) if super::super::trigram::bind_is_busy(reason)) {
+            return;
+        }
+        *trigram = Plane::Gap("no trigram index has been built for this repository yet".into());
         return;
     };
-    if read(&child.trigram)
-        .ready()
-        .is_some_and(|current| current.artifact == artifact)
-    {
+    if read(&child.trigram).ready().is_some_and(
+        |current| matches!(&current.source, TrigramSource::Legacy(current) if *current == artifact),
+    ) {
         // Same artifact: changes since it was read arrive as watcher paths
         // and through the backstop, never by reading the artifact again.
         return;
@@ -284,9 +301,68 @@ fn refresh_trigram(session: &ParentSession, child: &Child) {
         child,
         TrigramChild {
             index: Arc::new(index),
-            artifact,
+            source: TrigramSource::Legacy(artifact),
         },
     );
+}
+
+/// The child's published v3 lexical view, or `None` when none is published
+/// yet (a child bound only with views off, never bound, or not yet bound).
+fn open_child_lexical_view(
+    session: &ParentSession,
+    child: &Child,
+    family: &str,
+) -> Result<Option<Arc<super::super::snapshot::ComposedGeneration>>, String> {
+    let producers = Producers {
+        trigram: session.trigram_policy.fingerprint_hex(),
+        semantic: None,
+        callgraph: super::super::semantic_runtime::UNREGISTERED_PRODUCER.into(),
+    };
+    super::super::base_refs::open_foreign_v3(&session.storage, family, &child.scope, &producers)
+        .map_err(|error| error.to_string())
+}
+
+/// Installs the trigram snapshot of a child's published v3 lexical view
+/// unless the parent already serves that generation.
+fn install_view_trigram(
+    session: &ParentSession,
+    child: &Child,
+    family: &str,
+    generation: &Arc<super::super::snapshot::ComposedGeneration>,
+) {
+    let published = PublishedChild::of(generation);
+    if read(&child.trigram).ready().is_some_and(
+        |current| matches!(&current.source, TrigramSource::View(current) if *current == published),
+    ) {
+        return;
+    }
+    child.loads.fetch_add(1, Ordering::SeqCst);
+    match super::super::trigram::project_published(
+        &child.root,
+        &session.storage,
+        family,
+        session.trigram_policy,
+        generation,
+    ) {
+        Ok(snapshot) => {
+            // Changes made since the child published arrive with the child's
+            // next publication; the parent never applies them itself.
+            lock(&child.pending).clear();
+            install_trigram(
+                session,
+                child,
+                TrigramChild {
+                    index: Arc::new(crate::search_index::SearchIndex::from_view_snapshot(
+                        snapshot,
+                    )),
+                    source: TrigramSource::View(published),
+                },
+            );
+        }
+        Err(error) => {
+            *write(&child.trigram) = Plane::Gap(format!("lexical view unreadable: {error}"));
+        }
+    }
 }
 
 /// Applies the watcher paths queued for `child`.
@@ -313,6 +389,9 @@ fn apply_paths(child: &Arc<Child>, paths: BTreeSet<PathBuf>) {
         // Not loaded yet: the first load reconciles the whole child anyway.
         return;
     };
+    if matches!(current.source, TrigramSource::View(_)) {
+        return;
+    }
     let mut index = (*current.index).clone();
     let mut applied = 0usize;
     for path in &paths {
@@ -332,10 +411,9 @@ fn apply_paths(child: &Arc<Child>, paths: BTreeSet<PathBuf>) {
         return;
     }
     child.applied.fetch_add(applied, Ordering::SeqCst);
-    let artifact = current.artifact.clone();
     let session_less = TrigramChild {
         index: Arc::new(index),
-        artifact,
+        source: current.source.clone(),
     };
     *write(&child.trigram) = Plane::Ready(Arc::new(session_less));
     super::engine::sync_trigram(child);
@@ -348,6 +426,9 @@ fn backstop(child: &Arc<Child>) {
     let Some(current) = read(&child.trigram).ready().cloned() else {
         return;
     };
+    if matches!(current.source, TrigramSource::View(_)) {
+        return;
+    }
     let walked = crate::search_index::walk_project_files(
         &child.root,
         &crate::search_index::PathFilters::default(),
@@ -392,7 +473,7 @@ fn apply_walked_paths(child: &Arc<Child>, paths: BTreeSet<PathBuf>) {
     child.applied.fetch_add(paths.len(), Ordering::SeqCst);
     *write(&child.trigram) = Plane::Ready(Arc::new(TrigramChild {
         index: Arc::new(index),
-        artifact: current.artifact.clone(),
+        source: current.source.clone(),
     }));
     super::engine::sync_trigram(child);
 }
@@ -476,129 +557,10 @@ fn belongs_to_child(child: &Child, path: &Path) -> bool {
 // Call graph, inspect and semantic publications
 // ---------------------------------------------------------------------------
 
-/// Bytes that change whenever the checkout's HEAD commit can have changed: the
-/// HEAD file plus the ref file it names (and `packed-refs`), with their mtimes.
-fn head_probe(root: &Path) -> Vec<u8> {
-    let git = root.join(".git");
-    let git_dir = if git.is_file() {
-        std::fs::read_to_string(&git)
-            .ok()
-            .and_then(|text| {
-                text.trim()
-                    .strip_prefix("gitdir:")
-                    .map(|dir| root.join(dir.trim()))
-            })
-            .unwrap_or(git)
-    } else {
-        git
-    };
-    let mut probe = Vec::new();
-    let mut add = |path: &Path| {
-        if let Ok(bytes) = std::fs::read(path) {
-            probe.extend_from_slice(&bytes);
-        }
-        if let Ok(modified) = std::fs::metadata(path).and_then(|meta| meta.modified()) {
-            probe.extend_from_slice(format!("{modified:?}").as_bytes());
-        }
-        probe.push(0);
-    };
-    let head = git_dir.join("HEAD");
-    add(&head);
-    let head_text = std::fs::read_to_string(&head).unwrap_or_default();
-    if let Some(reference) = head_text.trim().strip_prefix("ref:") {
-        let reference = reference.trim();
-        add(&git_dir.join(reference));
-        // A linked worktree keeps branch refs in the common directory.
-        if let Ok(common) = std::fs::read_to_string(git_dir.join("commondir")) {
-            let common = git_dir.join(common.trim());
-            add(&common.join(reference));
-            add(&common.join("packed-refs"));
-        }
-    }
-    add(&git_dir.join("packed-refs"));
-    probe
-}
-
-/// The fingerprint that names the child's view generations for its current
-/// HEAD (a hash of HEAD's tracked tree). `git ls-tree` runs only when HEAD or
-/// the ref it names changed since the last call.
-fn head_fingerprint(child: &Child) -> Result<String, String> {
-    let probe = head_probe(&child.root);
-    if let Some((cached_probe, fingerprint)) = lock(&child.head).as_ref() {
-        if *cached_probe == probe {
-            return Ok(fingerprint.clone());
-        }
-    }
-    let entries =
-        crate::alias::head_tree_entries(&child.root).map_err(|error| error.to_string())?;
-    let fingerprint = super::super::assembly::head_tree_fingerprint(&entries);
-    *lock(&child.head) = Some((probe, fingerprint.clone()));
-    Ok(fingerprint)
-}
-
+/// Follows the child's published v3 call-graph view. The parent answers as of
+/// that publication and holds its read marker; a child whose sessions never
+/// published one is a named gap.
 fn refresh_callgraph(session: &ParentSession, child: &Child) {
-    let view_dir = session.storage.join("views").join(&child.scope);
-    let Some(store) = super::super::ViewStore::existing_dir(view_dir.clone()) else {
-        *write(&child.callgraph) =
-            Plane::Gap("no call graph view has been published for this repository yet".into());
-        return;
-    };
-    let generation = match store.current_generation_read_only() {
-        Ok(Some(generation)) => generation,
-        Ok(None) => {
-            *write(&child.callgraph) =
-                Plane::Gap("no call graph view has been published for this repository yet".into());
-            return;
-        }
-        Err(error) => {
-            *write(&child.callgraph) = Plane::Gap(format!("call graph view unreadable: {error}"));
-            return;
-        }
-    };
-    let head = match head_fingerprint(child) {
-        Ok(head) => head,
-        Err(error) => {
-            *write(&child.callgraph) = Plane::Gap(format!("HEAD unreadable: {error}"));
-            return;
-        }
-    };
-    if !super::super::generation_matches_head(&generation, &head) {
-        // The child's sessions have not yet published a view for its current
-        // HEAD. Serving the older graph would answer for another commit.
-        *write(&child.callgraph) =
-            Plane::Gap("the call graph view for the current HEAD is still pending".into());
-        return;
-    }
-    if read(&child.callgraph)
-        .ready()
-        .is_some_and(|current| current.generation == generation)
-    {
-        return;
-    }
-    // Protect before touching: the read marker on this generation exists
-    // before its derived database is opened, and the view's current-generation
-    // pointer is re-read afterwards, so a generation the child replaced in
-    // between is never adopted.
-    let pin = match crate::pins::QueryPin::acquire(&view_dir, &generation) {
-        Ok(pin) => Arc::new(pin),
-        Err(error) => {
-            *write(&child.callgraph) = Plane::Gap(format!("call graph view not pinned: {error}"));
-            return;
-        }
-    };
-    if store
-        .current_generation_read_only()
-        .ok()
-        .flatten()
-        .as_deref()
-        != Some(generation.as_str())
-    {
-        return;
-    }
-    // A linked worktree builds its own graph only when one of its own queries
-    // needs it. Until then the main checkout's graph answers for it while the
-    // published files match; otherwise the child's call-graph plane reports
-    // that the graph has not been built yet.
     let family = match child.family(&session.storage) {
         Ok(family) => family,
         Err(error) => {
@@ -606,45 +568,53 @@ fn refresh_callgraph(session: &ParentSession, child: &Child) {
             return;
         }
     };
-    if !super::super::read::derived_built(&view_dir, &generation) {
-        let main = store.load_manifest(&generation).ok().map(|manifest| {
-            super::super::read::main_checkout_callgraph(
-                &session.storage,
-                &child.root,
-                family,
-                &generation,
-                &manifest,
-            )
-        });
-        *write(&child.callgraph) = match main {
-            Some(super::super::read::MainCheckoutGraph::Answer(opened, _)) => {
-                child.loads.fetch_add(1, Ordering::SeqCst);
-                Plane::Ready(Arc::new(CallgraphChild {
-                    store: Arc::new(opened),
-                    generation,
-                }))
-            }
-            Some(super::super::read::MainCheckoutGraph::Busy) => Plane::Gap(
-                "the main checkout's call graph is locked by a publication; retrying".into(),
-            ),
-            Some(super::super::read::MainCheckoutGraph::Unavailable) | None => {
-                Plane::Gap(super::super::read::CALLGRAPH_NOT_BUILT.into())
-            }
-        };
+    let producers = Producers {
+        trigram: session.trigram_policy.fingerprint_hex(),
+        semantic: None,
+        callgraph: super::super::callgraph::PRODUCER.into(),
+    };
+    let scope = super::super::callgraph::view_scope(&child.root);
+    let generation = match super::super::base_refs::open_foreign_v3(
+        &session.storage,
+        family,
+        &scope,
+        &producers,
+    ) {
+        Ok(Some(generation)) => generation,
+        Ok(None) => {
+            *write(&child.callgraph) =
+                Plane::Gap("no call graph view has been published for this repository yet".into());
+            return;
+        }
+        Err(error) => {
+            *write(&child.callgraph) = Plane::Gap(format!("call graph view unavailable: {error}"));
+            return;
+        }
+    };
+    let published = PublishedChild::of(&generation);
+    if read(&child.callgraph)
+        .ready()
+        .is_some_and(|current| current.published == published)
+    {
         return;
     }
-    match super::super::read::open_published_callgraph(
+    let Some(route) = generation.v3_route().cloned() else {
+        *write(&child.callgraph) = Plane::Gap("call graph view has no v3 route".into());
+        return;
+    };
+    match crate::callgraph_store::ReadonlyCallGraphStore::open_pinned_derived(
         child.root.clone(),
         family.to_owned(),
-        view_dir,
-        &generation,
-        Some(pin),
+        route.member_dir(),
+        generation.name(),
     ) {
-        Ok(opened) => {
+        Ok(store) => {
             child.loads.fetch_add(1, Ordering::SeqCst);
+            // The store keeps the generation, and with it the generation's
+            // read marker, for as long as the parent serves it.
             *write(&child.callgraph) = Plane::Ready(Arc::new(CallgraphChild {
-                store: Arc::new(opened),
-                generation,
+                store: Arc::new(store.retain_generation(generation)),
+                published,
             }));
         }
         Err(error) => {
@@ -693,21 +663,6 @@ fn start_semantic(session: &ParentSession) {
     };
 }
 
-/// Size and modification time of a view's pointer database and its WAL.
-fn pointer_stat(view_dir: &Path) -> Vec<u8> {
-    let mut stat = Vec::new();
-    for name in ["pointer.sqlite", "pointer.sqlite-wal"] {
-        if let Ok(metadata) = std::fs::metadata(view_dir.join(name)) {
-            stat.extend_from_slice(&metadata.len().to_le_bytes());
-            if let Ok(modified) = metadata.modified() {
-                stat.extend_from_slice(format!("{modified:?}").as_bytes());
-            }
-        }
-        stat.push(0);
-    }
-    stat
-}
-
 fn refresh_semantic(session: &ParentSession, child: &Child) {
     let semantic = match &*read(&session.semantic) {
         Plane::Ready(semantic) => Arc::clone(semantic),
@@ -717,75 +672,61 @@ fn refresh_semantic(session: &ParentSession, child: &Child) {
             return;
         }
     };
-    // Read the view's current-generation pointer first, without the family
-    // registry: an unchanged pointer means this session already serves the
-    // generation. Before even opening the pointer database, compare the size
-    // and mtime of it and its WAL with the last read: a publication commits
-    // through the WAL, so unchanged files mean an unchanged pointer, and the
-    // idle check costs two stats instead of opening SQLite.
-    let view_dir = super::super::registry::view_dir(&session.storage, &child.scope).ok();
-    let stat = view_dir.as_deref().map(pointer_stat);
-    if read(&child.semantic).ready().is_some()
-        && stat.is_some()
-        && *lock(&child.semantic_pointer_stat) == stat
-    {
-        return;
-    }
-    let current_name = view_dir
-        .and_then(super::super::ViewStore::existing_dir)
-        .and_then(|store| store.current_generation_read_only().ok().flatten());
-    let Some(current_name) = current_name else {
-        *write(&child.semantic) =
-            Plane::Gap("no semantic view has been published for this repository yet".into());
-        return;
+    // The child's semantic view is its v3 member `<scope>.semantic`. Opening
+    // it pins the member's published generation and the base it composes
+    // with read markers; the answers are as of that publication.
+    let family = match child.family(&session.storage) {
+        Ok(family) => family,
+        Err(error) => {
+            *write(&child.semantic) = Plane::Gap(error);
+            return;
+        }
     };
-    if read(&child.semantic)
-        .ready()
-        .is_some_and(|current| current.generation.name() == current_name)
-    {
-        *lock(&child.semantic_pointer_stat) = stat;
-        return;
-    }
-    let reader = match child.reader(&session.storage) {
-        Ok(Some(reader)) => reader,
+    let scope = super::super::semantic_runtime::view_scope(&child.scope);
+    let producers = Producers {
+        trigram: session.trigram_policy.fingerprint_hex(),
+        semantic: Some(semantic.producer_id.clone()),
+        callgraph: super::super::callgraph::PRODUCER.into(),
+    };
+    let generation = match super::super::base_refs::open_foreign_v3(
+        &session.storage,
+        family,
+        &scope,
+        &producers,
+    ) {
+        Ok(Some(generation)) => generation,
         Ok(None) => {
             *write(&child.semantic) =
                 Plane::Gap("no semantic view has been published for this repository yet".into());
             return;
         }
         Err(error) => {
+            *write(&child.semantic) = Plane::Gap(format!("semantic view unavailable: {error}"));
+            return;
+        }
+    };
+    // The same worker generation composed with the same base generation: the
+    // parent already serves it. (A base readiness successor keeps the worker's
+    // name but changes what it composes.)
+    if read(&child.semantic)
+        .ready()
+        .is_some_and(|current| current.generation.resident_key() == generation.resident_key())
+    {
+        return;
+    }
+    let reader = match super::super::registry::ReaderRegistration::for_v3_foreign_read(
+        &generation,
+        "parent-folder",
+    ) {
+        Ok(reader) => Arc::new(reader),
+        Err(error) => {
             *write(&child.semantic) = Plane::Gap(format!("semantic view unreadable: {error}"));
             return;
         }
     };
-    let members = reader.members().unwrap_or_default();
-    if !members.iter().any(|member| member.scope == child.scope) {
-        *write(&child.semantic) =
-            Plane::Gap("no semantic view has been published for this repository yet".into());
-        return;
-    }
-    let producers = Producers {
-        trigram: super::super::semantic_runtime::UNREGISTERED_PRODUCER.into(),
-        semantic: Some(semantic.producer_id.clone()),
-        callgraph: super::super::semantic_runtime::UNREGISTERED_PRODUCER.into(),
-    };
-    let generation =
-        match super::super::read::open_foreign_generation(&reader, &child.scope, &producers) {
-            Ok(Some(generation)) => generation,
-            Ok(None) => {
-                *write(&child.semantic) = Plane::Gap(
-                    "no semantic view has been published for this repository yet".into(),
-                );
-                return;
-            }
-            Err(error) => {
-                *write(&child.semantic) = Plane::Gap(format!("semantic view unavailable: {error}"));
-                return;
-            }
-        };
     let access = ViewAccess::Reader {
-        registration: Arc::clone(&reader),
-        scope: child.scope.clone(),
+        registration: reader,
+        scope,
     };
     child.loads.fetch_add(1, Ordering::SeqCst);
     // Admission decodes the generation's vectors once into the family's
@@ -796,7 +737,6 @@ fn refresh_semantic(session: &ParentSession, child: &Child) {
         return;
     }
     let snapshot = LiveDelta::new(Arc::clone(&generation)).snapshot();
-    *lock(&child.semantic_pointer_stat) = stat;
     let previous = std::mem::replace(
         &mut *write(&child.semantic),
         Plane::Ready(Arc::new(SemanticChild {

@@ -151,6 +151,298 @@ fn dump_graph_rows(store: &CallGraphStore) -> String {
     out
 }
 
+#[test]
+fn stat_first_restart_does_not_read_unchanged_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    let files = write_scaling_fixture(&root, 8);
+    let store_dir = dir.path().join("store");
+    let (store, _) =
+        CallGraphStore::cold_build_with_lease_chunked(store_dir.clone(), root.clone(), &files, 100)
+            .unwrap();
+    drop(store);
+
+    let reader = CallGraphStore::open_readonly(store_dir, root.clone())
+        .unwrap()
+        .unwrap();
+    let source_reads = crate::project_content::Probe::new(&root);
+    let reads = crate::cache_freshness::watch_verify_stats(
+        &root,
+        crate::cache_freshness::VerifyScheduleForTest::SingleWorkerDrain,
+    );
+    let report = reader.reconcile_with_disk(1_000).unwrap();
+    assert_eq!(report.changed_count(), 0);
+    assert_eq!(report.examined_files, files.len());
+    let observed = reads.take_stats();
+    assert!(
+        observed.hash_reads.is_empty(),
+        "an unchanged restart read {} source files",
+        observed.hash_reads.len()
+    );
+    assert_eq!(report.hashed_files, 0);
+    assert!(
+        source_reads.paths().is_empty(),
+        "unchanged comparison opened source contents"
+    );
+}
+
+#[test]
+fn stat_first_legacy_store_hashes_once_then_records_source_stats() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    let files = write_scaling_fixture(&root, 8);
+    let store_dir = dir.path().join("store");
+    let (store, _) =
+        CallGraphStore::cold_build_with_lease_chunked(store_dir.clone(), root.clone(), &files, 100)
+            .unwrap();
+    let sqlite_path = store.sqlite_path().to_path_buf();
+    let graph_before = dump_graph_rows(&store);
+    let revision_before = store.projection_write_revision().unwrap();
+    drop(store);
+    let conn = Connection::open(&sqlite_path).unwrap();
+    let has_identity = conn
+        .prepare("PRAGMA table_info(files)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .any(|column| column.unwrap() == "source_identity");
+    if has_identity {
+        conn.execute_batch("ALTER TABLE files DROP COLUMN source_identity")
+            .unwrap();
+    }
+    drop(conn);
+
+    let source_reads = crate::project_content::Probe::new(&root);
+    let reads = crate::cache_freshness::watch_verify_stats(
+        &root,
+        crate::cache_freshness::VerifyScheduleForTest::SingleWorkerDrain,
+    );
+    let reader = CallGraphStore::open_readonly(store_dir.clone(), root.clone())
+        .unwrap()
+        .unwrap();
+    let first = reader.reconcile_with_disk(1_000).unwrap();
+    assert_eq!(first.changed_count(), 0);
+    assert_eq!(first.hashed_files, files.len());
+    assert_eq!(reads.take_stats().hash_reads.len(), files.len());
+    assert_eq!(source_reads.paths().len(), files.len());
+    drop(reader);
+
+    let reader = CallGraphStore::open_readonly(store_dir.clone(), root.clone())
+        .unwrap()
+        .unwrap();
+    let second = reader.reconcile_with_disk(1_000).unwrap();
+    assert_eq!(second.changed_count(), 0);
+    assert_eq!(
+        second.hashed_files, 0,
+        "the legacy fallback must persist its validated stat observations"
+    );
+    assert!(reads.take_stats().hash_reads.is_empty());
+    assert_eq!(
+        source_reads.paths().len(),
+        files.len(),
+        "second comparison opened source contents again"
+    );
+    drop(reader);
+    let store = CallGraphStore::open(store_dir, root).unwrap();
+    assert_eq!(store.projection_write_revision().unwrap(), revision_before);
+    assert_eq!(
+        dump_graph_rows(&store),
+        graph_before,
+        "stat backfill must not change graph rows"
+    );
+}
+
+#[test]
+#[cfg(any(unix, windows))]
+fn stat_first_refresh_records_replacement_identity_without_graph_churn() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    let source = "export function before() {}\n";
+    let path = write(&root, "source.ts", source);
+    let store_dir = dir.path().join("store");
+    let (store, _) = CallGraphStore::cold_build_with_lease_chunked(
+        store_dir.clone(),
+        root.clone(),
+        std::slice::from_ref(&path),
+        100,
+    )
+    .unwrap();
+    let revision = store.projection_write_revision().unwrap();
+    crate::file_identity::replace_keeping_times(&path, source.as_bytes());
+    store.refresh_files(std::slice::from_ref(&path)).unwrap();
+    assert_eq!(
+        store.projection_write_revision().unwrap(),
+        revision,
+        "a new identity with equal contents is metadata-only"
+    );
+    drop(store);
+
+    let reader = CallGraphStore::open_readonly(store_dir.clone(), root.clone())
+        .unwrap()
+        .unwrap();
+    let source_reads = crate::project_content::Probe::new(&root);
+    assert_eq!(reader.reconcile_with_disk(1_000).unwrap().hashed_files, 0);
+    assert!(source_reads.paths().is_empty());
+    drop(reader);
+    drop(source_reads);
+
+    let store = CallGraphStore::open(store_dir.clone(), root.clone()).unwrap();
+    crate::file_identity::replace_keeping_times(
+        &path,
+        source.replace("before", "after_").as_bytes(),
+    );
+    store.refresh_files(std::slice::from_ref(&path)).unwrap();
+    drop(store);
+    let reader = CallGraphStore::open_readonly(store_dir, root.clone())
+        .unwrap()
+        .unwrap();
+    let source_reads = crate::project_content::Probe::new(&root);
+    let report = reader.reconcile_with_disk(1_000).unwrap();
+    assert_eq!(report.changed_count(), 0);
+    assert_eq!(report.hashed_files, 0);
+    assert!(
+        source_reads.paths().is_empty(),
+        "refresh must record the stat of the newly extracted contents"
+    );
+}
+
+#[test]
+#[cfg(any(unix, windows))]
+fn stat_first_reconcile_rerecords_changed_identity_with_equal_contents() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    let source = "export function source() {}\n";
+    let path = write(&root, "source.ts", source);
+    let store_dir = dir.path().join("store");
+    let (store, _) = CallGraphStore::cold_build_with_lease_chunked(
+        store_dir.clone(),
+        root.clone(),
+        std::slice::from_ref(&path),
+        100,
+    )
+    .unwrap();
+    let revision = store.projection_write_revision().unwrap();
+    drop(store);
+    crate::file_identity::replace_keeping_times(&path, source.as_bytes());
+    let reader = CallGraphStore::open_readonly(store_dir.clone(), root.clone())
+        .unwrap()
+        .unwrap();
+    let source_reads = crate::project_content::Probe::new(&root);
+    let report = reader.reconcile_with_disk(1_000).unwrap();
+    assert_eq!(report.changed_count(), 0);
+    assert_eq!(report.hashed_files, 1);
+    assert_eq!(source_reads.paths(), vec![path]);
+    assert_eq!(reader.projection_write_revision().unwrap(), revision);
+    drop(reader);
+
+    let reader = CallGraphStore::open_readonly(store_dir, root)
+        .unwrap()
+        .unwrap();
+    assert_eq!(reader.reconcile_with_disk(1_000).unwrap().hashed_files, 0);
+    assert_eq!(
+        source_reads.paths().len(),
+        1,
+        "the new machine-local identity must be persisted"
+    );
+}
+
+#[test]
+fn stat_first_backfill_defers_to_a_live_writer_without_rebuilding() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    let files = write_scaling_fixture(&root, 4);
+    let store_dir = dir.path().join("store");
+    let (store, _) =
+        CallGraphStore::cold_build_with_lease_chunked(store_dir.clone(), root.clone(), &files, 100)
+            .unwrap();
+    let sqlite = store.sqlite_path().to_path_buf();
+    drop(store);
+    let conn = Connection::open(&sqlite).unwrap();
+    conn.execute("UPDATE files SET source_identity = NULL", [])
+        .unwrap();
+    drop(conn);
+    let held = crate::fs_lock::try_acquire(
+        &crate::root_cache::writer_lease_path(&store_dir),
+        Duration::ZERO,
+    )
+    .unwrap();
+    let reader = CallGraphStore::open_readonly(store_dir.clone(), root.clone())
+        .unwrap()
+        .unwrap();
+    let report = reader.reconcile_with_disk(1_000).unwrap();
+    assert_eq!(report.changed_count(), 0);
+    assert_eq!(report.hashed_files, files.len());
+    assert_eq!(reader.sqlite_path(), sqlite);
+    assert!(
+        held.verify_writer_epoch().unwrap(),
+        "a stat backfill must never steal a live lease"
+    );
+    let conn = Connection::open(&sqlite).unwrap();
+    let missing: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM files WHERE source_identity IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(missing, files.len());
+    drop(conn);
+    drop(held);
+    assert_eq!(
+        reader.reconcile_with_disk(1_000).unwrap().hashed_files,
+        files.len()
+    );
+    drop(reader);
+    let reader = CallGraphStore::open_readonly(store_dir, root)
+        .unwrap()
+        .unwrap();
+    assert_eq!(reader.reconcile_with_disk(1_000).unwrap().hashed_files, 0);
+}
+
+#[test]
+#[cfg(any(unix, windows))]
+fn stat_first_reconcile_detects_mtime_preserving_replacement_by_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    let source = "export function caller() { before(); }\nfunction before() {}\n";
+    let path = write(&root, "caller.ts", source);
+    let store_dir = dir.path().join("store");
+    let (store, _) = CallGraphStore::cold_build_with_lease_chunked(
+        store_dir.clone(),
+        root.clone(),
+        std::slice::from_ref(&path),
+        100,
+    )
+    .unwrap();
+    drop(store);
+    let (old_stat, old_identity) = crate::file_identity::metadata(&path).unwrap();
+    crate::file_identity::replace_keeping_times(
+        &path,
+        source.replace("before", "after_").as_bytes(),
+    );
+    let (new_stat, new_identity) = crate::file_identity::metadata(&path).unwrap();
+    assert_eq!(old_stat.len(), new_stat.len());
+    assert_eq!(old_stat.modified().unwrap(), new_stat.modified().unwrap());
+    assert_ne!(
+        old_identity, new_identity,
+        "the replacement changed file identity, not mtime or size"
+    );
+
+    let reader = CallGraphStore::open_readonly(store_dir, root.clone())
+        .unwrap()
+        .unwrap();
+    let source_reads = crate::project_content::Probe::new(&root);
+    let reads = crate::cache_freshness::watch_verify_stats(
+        &root,
+        crate::cache_freshness::VerifyScheduleForTest::SingleWorkerDrain,
+    );
+    let report = reader.reconcile_with_disk(1_000).unwrap();
+    assert_eq!(report.modified, vec![path]);
+    assert_eq!(report.hashed_files, 1);
+    assert_eq!(reads.take_stats().hash_reads.len(), 1);
+    assert_eq!(source_reads.paths().len(), 1);
+}
+
 /// Save a deterministic corpus before an I/O change, then compare the logical
 /// rows and public graph walks against that saved baseline after the change.
 #[test]
@@ -307,6 +599,80 @@ fn callgraph_io_extraction_commits_by_bytes_not_chunk_files() {
     assert_eq!(*batches.lock().unwrap(), vec![300]);
 }
 
+#[test]
+fn callgraph_io_extraction_residency_is_bounded_inside_bulk_commits() {
+    fn heap_in_use() -> usize {
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            // mallinfo2 is thread-safe and takes no pointer arguments.
+            unsafe { libc::mallinfo2().uordblks }
+        }
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        {
+            0
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    let source = format!(
+        "function leaf() {{}}\nexport function run() {{\n{}}}\n",
+        "  leaf();\n".repeat(128)
+    );
+    let files = (0..300)
+        .map(|index| write(&root, &format!("f{index:03}.ts"), &source))
+        .collect::<Vec<_>>();
+    let store = CallGraphStore::open(dir.path().join("store"), root).unwrap();
+    let commit_samples = Arc::new(std::sync::Mutex::new((None, None)));
+    let observed_commits = Arc::clone(&commit_samples);
+    let project_key = store.project_key().to_owned();
+    set_cold_build_slice_observer(Some(Arc::new(move |stage, completed, total| {
+        if stage != "extraction" {
+            return;
+        }
+        let mut samples = observed_commits.lock().unwrap();
+        if completed == 0 && samples.0.is_none() {
+            samples.0 = Some(callgraph_write_metrics_for_project(&project_key).commits_60s);
+        } else if completed == total && samples.1.is_none() {
+            samples.1 = Some(callgraph_write_metrics_for_project(&project_key).commits_60s);
+        }
+    })));
+    let batches = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&batches);
+    set_cold_build_extract_observer(Some(Arc::new(move |paths| {
+        observed.lock().unwrap().push(paths.len());
+    })));
+    let residents = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&residents);
+    let heap_before = heap_in_use();
+    set_cold_build_resident_extract_observer(Some(Arc::new(move |count| {
+        observed.lock().unwrap().push((count, heap_in_use()));
+    })));
+    let result = store.cold_build_chunked(&files, 100);
+    set_cold_build_extract_observer(None);
+    set_cold_build_resident_extract_observer(None);
+    set_cold_build_slice_observer(None);
+    result.unwrap();
+
+    let residents = residents.lock().unwrap();
+    let peak_residents = residents.iter().map(|(count, _)| *count).max().unwrap();
+    let peak_heap = residents.iter().map(|(_, bytes)| *bytes).max().unwrap();
+    eprintln!(
+        "extraction residency: peak_extracts={peak_residents} heap_before={heap_before} \
+         peak_glibc_heap_in_use={peak_heap} heap_delta={}",
+        peak_heap.saturating_sub(heap_before)
+    );
+    // One database commit can cover all 300 files without keeping their parsed
+    // graphs in memory together.
+    assert_eq!(*batches.lock().unwrap(), vec![300]);
+    let (before, after) = *commit_samples.lock().unwrap();
+    assert_eq!(after.unwrap().checked_sub(before.unwrap()), Some(1));
+    assert!(
+        peak_residents <= 16,
+        "resident extracts {peak_residents} exceeded the 16-file cold-build residency bound"
+    );
+}
+
 fn tiny_file_fixture(root: &Path) -> Vec<PathBuf> {
     (0..COLD_BUILD_EXTRACT_MAX_FILES + 17)
         .map(|index| {
@@ -378,18 +744,18 @@ fn callgraph_io_tiny_file_cancellation_stops_after_one_capped_batch() {
 }
 
 #[test]
-fn callgraph_io_large_cache_is_build_only() {
+fn callgraph_io_build_cache_matches_bounded_reader_budget() {
     let conn = TrackedConnection::open_in_memory(SqliteStore::CallgraphColdGeneration).unwrap();
     configure_build_connection(&conn).unwrap();
     let cache: i64 = conn
         .pragma_query_value(None, "cache_size", |row| row.get(0))
         .unwrap();
-    assert_eq!(cache, -262144);
+    assert_eq!(cache, -8192);
     configure_connection(&conn).unwrap();
     let cache: i64 = conn
         .pragma_query_value(None, "cache_size", |row| row.get(0))
         .unwrap();
-    assert_eq!(cache, CALLGRAPH_SQLITE_CACHE_KIB);
+    assert_eq!(cache, -8192);
 }
 
 #[test]
@@ -1994,7 +2360,7 @@ fn scaling_fixture_path(index: usize) -> String {
 /// and a class from other modules, declares a class with two methods, and
 /// makes direct, imported and method calls, so every graph table (nodes,
 /// refs, edges, dependencies, dispatch hints) grows with the file count.
-fn write_scaling_fixture(root: &Path, files: usize) -> Vec<PathBuf> {
+pub(crate) fn write_scaling_fixture(root: &Path, files: usize) -> Vec<PathBuf> {
     (0..files)
         .map(|index| {
             let other = (index * 7 + 3) % files;

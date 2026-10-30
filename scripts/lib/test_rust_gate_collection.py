@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class RustGateCollectionTests(unittest.TestCase):
     def run_gate(self, phases, ci=True, fail=False, archives=False, cargo_only=False, leak=False,
-                 log_dir_mode=None):
+                 log_dir_mode=None, macos=False):
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
             tools = home / "bin"
@@ -30,6 +30,14 @@ import json, os, sys
 args = sys.argv[1:]
 with open(os.environ["FAKE_CALL_LOG"], "a") as out:
     out.write(json.dumps(args) + "\\n")
+if args[:2] == ["nextest", "list"] and "--extract-to" in args:
+    from pathlib import Path
+    metadata = Path(args[args.index("--extract-to") + 1]) / "target/nextest"
+    metadata.mkdir(parents=True)
+    (metadata / "cargo-metadata.json").write_text("{}")
+    (metadata / "binaries-metadata.json").write_text(json.dumps({
+        "rust-build-meta": {"target-directory": "/builder/target"}, "rust-binaries": {},
+    }))
 leak_pid = os.environ.get("FAKE_LEAK_PID")
 if leak_pid and not os.path.exists(leak_pid):
     import subprocess
@@ -53,6 +61,8 @@ if os.environ.get("FAKE_FAIL") == "1":
 sys.exit(0)
 ''',
             }
+            if macos:
+                stubs["uname"] = '#!/bin/sh\nprintf "Darwin\\n"\n'
             for name, body in stubs.items():
                 path = tools / name
                 path.write_text(body)
@@ -75,6 +85,8 @@ sys.exit(0)
                 env.update({"AFT_NEXTEST_ARCHIVE_FILE": str(home / "lib.tar.zst"),
                             "AFT_NEXTEST_ARCHIVE_BIN_FILE": str(home / "bin.tar.zst"),
                             "AFT_NEXTEST_PARTITION": "hash:1/3"})
+            if macos:
+                env["AFT_NEXTEST_EXTRACT_TO"] = str(home / "extracted")
             if log_dir_mode is not None:
                 (home / "logs").mkdir(mode=log_dir_mode)
             leak_pid = home / "leak.pid"
@@ -166,6 +178,25 @@ sys.exit(0)
         self.assertEqual(len(calls), 1)
         self.assertIn("--no-fail-fast", calls[0])
         self.assertIn("GATE FAILED", result.stdout)
+
+    def test_macos_libtest_extracts_once_per_archive_and_runs_prewarmed_metadata(self):
+        result, calls = self.run_gate("lib,lib-shard", archives=True, macos=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        extracts = [call for call in calls if call[:2] == ["nextest", "list"]]
+        runs = [call for call in calls if call[:2] == ["nextest", "run"]]
+        self.assertEqual(len(extracts), 2, calls)
+        roots = [call[call.index("--extract-to") + 1] for call in extracts]
+        self.assertEqual(len(set(roots)), 2, "lib and bin archives must not replace each other")
+        self.assertEqual(len(runs), 3, calls)
+        for call, root in zip(runs, [roots[0], roots[0], roots[1]]):
+            self.assertNotIn("--archive-file", call, "running an archive extracts fresh, unwarmed inodes")
+            for flag, relative in (("--cargo-metadata", "target/nextest/cargo-metadata.json"),
+                                   ("--binaries-metadata", "target/nextest/binaries-metadata.json"),
+                                   ("--target-dir-remap", "target")):
+                self.assertEqual(call[call.index(flag) + 1], str(Path(root) / relative), calls)
+        self.assertEqual(result.stdout.count("==> warm macOS extracted libtest binaries"), 2)
+        self.assertEqual(result.stdout.count("Filesystem"), 2, "log workspace disk space before each extraction")
+        self.assertIn("GATE PASSED", result.stdout)
 
 
 if __name__ == "__main__":

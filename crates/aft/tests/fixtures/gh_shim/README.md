@@ -108,3 +108,15 @@ The wire-schema golden `gh-route-result-v1-golden.json`, `holder-responses-v1.js
 holder-facing wire and classification contract; the envelope v2 change does
 not touch them. The request bytes the shim actually sends are captured, with a
 drift test, in `docs/investigations/gh-shim-wire-goldens/requests/`.
+
+## Plexus github_read vectors
+
+`plexus-github-read-bot/` holds byte-for-byte copies of Plexus's own
+github_read contract vectors, so the shim's reply decoder is tested against
+exactly what Plexus emits. Source: plexus commit `019f6bbd`,
+`crates/plexus-module/tests/fixtures/github-read-bot/`. Do not edit or
+re-format them; copy a new revision from Plexus instead.
+
+| fixture | case |
+| --- | --- |
+| `job-log-range-display-text.{request,reply}.json` | job-log page whose `offset`/`length`/`total_bytes` count raw log bytes (18 bytes from offset 100, starting with a colour code and ending inside a three-byte character) while `body` is display text (`"✓ ok\n\uFFFD"`, 10 bytes) |

@@ -249,7 +249,19 @@ pub(super) fn enqueue_lossy_push_frame(
     root: ProjectRootId,
     frame: PushFrame,
 ) {
+    enqueue_lossy_push_frame_with_hook(tx, overflow, sequence, root, frame, || {});
+}
+
+fn enqueue_lossy_push_frame_with_hook(
+    tx: &mpsc::Sender<LossyPushEnvelope>,
+    overflow: &LossyOverflow,
+    sequence: &AtomicU64,
+    root: ProjectRootId,
+    frame: PushFrame,
+    before_send: impl FnOnce(),
+) {
     let order = sequence.fetch_add(1, Ordering::Relaxed);
+    before_send();
     match tx.try_send((order, root, frame)) {
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full((order, root, frame))) => {
@@ -260,6 +272,30 @@ pub(super) fn enqueue_lossy_push_frame(
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {}
     }
+}
+
+pub(super) fn drain_lossy_push_batch(
+    rx: &mut mpsc::Receiver<LossyPushEnvelope>,
+    overflow: &LossyOverflow,
+) -> Vec<LossyPushEnvelope> {
+    drain_lossy_push_batch_with_hook(rx, overflow, || {})
+}
+
+fn drain_lossy_push_batch_with_hook(
+    rx: &mut mpsc::Receiver<LossyPushEnvelope>,
+    overflow: &LossyOverflow,
+    mut between_receives: impl FnMut(),
+) -> Vec<LossyPushEnvelope> {
+    let mut batch = Vec::new();
+    between_receives();
+    while let Ok(item) = rx.try_recv() {
+        batch.push(item);
+        between_receives();
+    }
+    // Receiving frees channel capacity while producers are still running. Read
+    // overflow last so updates displaced during the drain join the same batch.
+    batch.extend(overflow.drain());
+    batch
 }
 
 pub(super) fn coalesce_push_batch(
@@ -557,9 +593,13 @@ pub(super) fn clear_stale_bg_wakes_for_empty_sessions(
 
 static RELIABLE_PUSH_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 
-fn bounded_push_back<T>(queue: &mut VecDeque<T>, item: T) {
-    if queue.len() >= PUSH_BUFFER_MAX_PER_KEY {
-        queue.pop_front();
+pub(super) fn reliable_push_evictions() -> u64 {
+    RELIABLE_PUSH_EVICTIONS.load(Ordering::Relaxed)
+}
+
+fn bounded_push_back<T>(queue: &mut VecDeque<T>, item: T) -> Option<T> {
+    let evicted = if queue.len() >= PUSH_BUFFER_MAX_PER_KEY {
+        let evicted = queue.pop_front();
         let total = RELIABLE_PUSH_EVICTIONS
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
@@ -567,28 +607,41 @@ fn bounded_push_back<T>(queue: &mut VecDeque<T>, item: T) {
         if total.is_power_of_two() {
             log::warn!("subc reliable Push buffer overflow: evicted_total={total}");
         }
-    }
+        evicted
+    } else {
+        None
+    };
     queue.push_back(item);
+    evicted
 }
 
 fn buffer_push_frame(
+    metrics: &DispatchPathMetrics,
     push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
     key: ReplayKey,
     frame: PushFrame,
 ) {
-    bounded_push_back(push_buffer.entry(key).or_default(), frame);
+    if let Some(evicted) = bounded_push_back(push_buffer.entry(key.clone()).or_default(), frame) {
+        metrics.watch_delivery.evicted(key, evicted);
+    }
 }
 
-fn buffer_retry_frame(
+pub(super) fn buffer_retry_frame(
+    metrics: &DispatchPathMetrics,
     retry_buffer: &mut RetryBuffer,
     channel: RouteChannel,
     key: ReplayKey,
     frame: PushFrame,
 ) {
-    bounded_push_back(retry_buffer.entry(channel).or_default(), (key, frame));
+    if let Some((key, frame)) =
+        bounded_push_back(retry_buffer.entry(channel).or_default(), (key, frame))
+    {
+        metrics.watch_delivery.evicted(key, frame);
+    }
 }
 
 pub(super) fn migrate_retry_buffer_to_push_buffer(
+    metrics: &DispatchPathMetrics,
     retry_buffer: &mut RetryBuffer,
     channel: RouteChannel,
     push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
@@ -598,7 +651,7 @@ pub(super) fn migrate_retry_buffer_to_push_buffer(
     };
     let migrated = frames.len();
     for (key, frame) in frames {
-        buffer_push_frame(push_buffer, key, frame);
+        buffer_push_frame(metrics, push_buffer, key, frame);
     }
     migrated
 }
@@ -721,11 +774,10 @@ fn matching_route_channels(
     root: &ProjectRootId,
     frame: &PushFrame,
 ) -> Vec<RouteChannel> {
-    let Some(channels) = root_channels.get(root) else {
-        return Vec::new();
-    };
-
     if let PushFrame::Progress(progress) = frame {
+        let Some(channels) = root_channels.get(root) else {
+            return Vec::new();
+        };
         let Some(origin) = progress.origin else {
             return Vec::new();
         };
@@ -741,8 +793,25 @@ fn matching_route_channels(
         };
     }
 
-    let session = frame_session(frame);
-    let bash_observation = frame_is_bash_observation(frame);
+    matching_session_route_channels(
+        routes,
+        root_channels,
+        root,
+        frame_session(frame),
+        frame_is_bash_observation(frame),
+    )
+}
+
+fn matching_session_route_channels(
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    root: &ProjectRootId,
+    session: Option<&str>,
+    bash_observation: bool,
+) -> Vec<RouteChannel> {
+    let Some(channels) = root_channels.get(root) else {
+        return Vec::new();
+    };
     channels
         .iter()
         .copied()
@@ -762,6 +831,7 @@ fn matching_route_channels(
 }
 
 fn buffer_detached_reliable_push_frame(
+    metrics: &DispatchPathMetrics,
     push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
     session_identity: &HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
     root: &ProjectRootId,
@@ -780,7 +850,7 @@ fn buffer_detached_reliable_push_frame(
         if frame_is_bash_observation(frame) && !trust.allows_bash_observation() {
             return;
         }
-        buffer_push_frame(push_buffer, key, frame.clone());
+        buffer_push_frame(metrics, push_buffer, key, frame.clone());
         if let (Some(probe), Some(task_id)) = (lifecycle_probe, completed_task_id(frame)) {
             probe.reliable_completion_retained(task_id, session);
         }
@@ -929,6 +999,7 @@ fn fan_out_reliable_push_frame(
     let matched_channels = matching_channels.len();
     if matched_channels == 0 {
         buffer_detached_reliable_push_frame(
+            metrics,
             push_buffer,
             session_identity,
             root,
@@ -952,14 +1023,14 @@ fn fan_out_reliable_push_frame(
             .get(&channel)
             .is_some_and(|queue| !queue.is_empty())
         {
-            buffer_retry_frame(retry_buffer, channel, key, frame.clone());
+            buffer_retry_frame(metrics, retry_buffer, channel, key, frame.clone());
             continue;
         }
 
         match try_send_push_frame(writer_tx, metrics, channel, frame) {
             PushSendOutcome::Sent => sent_frames += 1,
             PushSendOutcome::Backpressure => {
-                buffer_retry_frame(retry_buffer, channel, key, frame.clone());
+                buffer_retry_frame(metrics, retry_buffer, channel, key, frame.clone());
             }
             PushSendOutcome::PermanentFailure => {
                 log::warn!(
@@ -1159,20 +1230,41 @@ pub(super) fn drain_reliable_push_turn(
 #[derive(Default)]
 pub(super) struct StatusPushes {
     pending: HashMap<ProjectRootId, PendingStatus>,
+    published: HashMap<RouteChannel, u64>,
+    awaiting_binds: HashSet<ProjectRootId>,
 }
 
 struct PendingStatus {
+    order: Option<u64>,
     frame: Option<crate::protocol::StatusChangedFrame>,
     body: Option<Arc<Vec<u8>>>,
     recipients: VecDeque<RouteChannel>,
     cursor: Option<RouteChannel>,
     session: Option<String>,
+    queued_recipients: HashSet<RouteChannel>,
 }
 
 const STATUS_FANOUT_TURN_BYTES: usize = 1024 * 1024;
 
 impl StatusPushes {
-    fn queue(&mut self, root: ProjectRootId, frame: crate::protocol::StatusChangedFrame) {
+    pub(super) fn awaiting_binds(&mut self, roots: impl Iterator<Item = ProjectRootId>) {
+        self.awaiting_binds.clear();
+        self.awaiting_binds.extend(roots);
+    }
+
+    fn queue(
+        &mut self,
+        root: ProjectRootId,
+        order: Option<u64>,
+        frame: crate::protocol::StatusChangedFrame,
+    ) {
+        // A producer can pause between assigning an envelope order and sending
+        // it. Such a late envelope must not replace newer, still-pending state.
+        if let (Some(order), Some(pending)) = (order, self.pending.get(&root)) {
+            if pending.order.is_some_and(|latest| order <= latest) {
+                return;
+            }
+        }
         // Keep the newest state and resume at the first recipient still waiting,
         // rather than restarting every update at routes already served.
         let cursor = self
@@ -1183,11 +1275,13 @@ impl StatusPushes {
         self.pending.insert(
             root,
             PendingStatus {
+                order,
                 frame: Some(frame),
                 body: None,
                 recipients: VecDeque::new(),
                 cursor,
                 session,
+                queued_recipients: HashSet::new(),
             },
         );
     }
@@ -1199,7 +1293,14 @@ impl StatusPushes {
         routes: &HashMap<RouteChannel, RouteIdentity>,
         roots: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
     ) {
+        // RouteChannel includes the epoch. Forget released routes before another
+        // publication turn so neither closed nor reused channels retain state.
+        self.published
+            .retain(|channel, _| routes.contains_key(channel));
         for (root, pending) in &mut self.pending {
+            pending
+                .queued_recipients
+                .retain(|channel| routes.contains_key(channel));
             if let Some(frame) = pending.frame.take() {
                 let envelope = PushFrame::StatusChanged(frame);
                 let mut recipients = matching_route_channels(routes, roots, root, &envelope);
@@ -1213,7 +1314,7 @@ impl StatusPushes {
                         recipients.rotate_left(start % len);
                     }
                 }
-                if !recipients.is_empty() {
+                if !recipients.is_empty() || self.awaiting_binds.contains(root) {
                     let PushFrame::StatusChanged(frame) = envelope else {
                         unreachable!()
                     };
@@ -1222,6 +1323,21 @@ impl StatusPushes {
                     pending.body = Some(Arc::new(body.bytes));
                     pending.recipients = recipients.into();
                 }
+            }
+            // The ACK may finish after a snapshot was sent to existing routes.
+            // Retain only its bounded bytes and session, then select any newly
+            // published siblings without sending the snapshot twice to old ones.
+            if pending.body.is_some() && pending.recipients.is_empty() {
+                let mut recipients = matching_session_route_channels(
+                    routes,
+                    roots,
+                    root,
+                    pending.session.as_deref(),
+                    false,
+                );
+                recipients.retain(|channel| !pending.queued_recipients.contains(channel));
+                recipients.sort_by_key(|route| (route.channel, route.epoch));
+                pending.recipients = recipients.into();
             }
             let Some(body) = pending.body.as_ref() else {
                 continue;
@@ -1243,6 +1359,15 @@ impl StatusPushes {
                     pending.recipients.pop_front();
                     continue;
                 }
+                if pending.order.is_some_and(|order| {
+                    self.published
+                        .get(&channel)
+                        .is_some_and(|latest| order <= *latest)
+                }) {
+                    pending.queued_recipients.insert(channel);
+                    pending.recipients.pop_front();
+                    continue;
+                }
                 if spent + wire_bytes > STATUS_FANOUT_TURN_BYTES {
                     metrics
                         .status_push_aggregate_limited_total
@@ -1251,6 +1376,12 @@ impl StatusPushes {
                 }
                 match try_send_shared_push_body(writer, metrics, channel, Arc::clone(body)) {
                     PushSendOutcome::Sent => {
+                        pending.queued_recipients.insert(channel);
+                        if let Some(order) = pending.order {
+                            // The writer's FIFO now owns this snapshot, even if
+                            // the socket has not written it yet.
+                            self.published.insert(channel, order);
+                        }
                         spent += wire_bytes;
                         pending.recipients.pop_front();
                     }
@@ -1261,8 +1392,11 @@ impl StatusPushes {
                 }
             }
         }
-        self.pending
-            .retain(|_, pending| pending.frame.is_some() || !pending.recipients.is_empty());
+        self.pending.retain(|root, pending| {
+            self.awaiting_binds.contains(root)
+                || pending.frame.is_some()
+                || !pending.recipients.is_empty()
+        });
     }
 }
 
@@ -1319,23 +1453,23 @@ pub(super) fn process_lossy_push_envelope_batch(
     statuses: &mut StatusPushes,
 ) {
     batch.sort_by_key(|(order, _, _)| *order);
-    let batch = batch
-        .into_iter()
-        .map(|(_, root, frame)| (root, frame))
-        .collect();
-    for (root, frame) in coalesce_push_batch(batch) {
+    let mut other_frames = Vec::new();
+    for (order, root, frame) in batch {
         match frame {
-            PushFrame::StatusChanged(status) => statuses.queue(root, status),
-            frame => process_lossy_push_frame(
-                writer_tx,
-                metrics,
-                routes,
-                root_channels,
-                completed_tasks,
-                root,
-                frame,
-            ),
+            PushFrame::StatusChanged(status) => statuses.queue(root, Some(order), status),
+            frame => other_frames.push((root, frame)),
         }
+    }
+    for (root, frame) in coalesce_push_batch(other_frames) {
+        process_lossy_push_frame(
+            writer_tx,
+            metrics,
+            routes,
+            root_channels,
+            completed_tasks,
+            root,
+            frame,
+        );
     }
 }
 
@@ -1415,7 +1549,7 @@ mod tests {
                 serde_json::to_vec(&frame).unwrap().len() <= 16 * 1024,
                 "fixture must exercise the aggregate bound without invoking the body cap"
             );
-            pending.queue(root.clone(), frame);
+            pending.queue(root.clone(), None, frame);
             let metrics = DispatchPathMetrics::new();
             let mut seen = HashSet::new();
             for _ in 0..4 {
@@ -1464,8 +1598,8 @@ mod tests {
         let blocker = Frame::build(FrameType::Ping, control_flags(), 0, 0, 1, Vec::new()).unwrap();
         assert!(try_enqueue_writer_frame(&tx, &metrics, blocker).is_enqueued());
         let mut pending = StatusPushes::default();
-        pending.queue(root.clone(), busy_status(0, 1));
-        pending.queue(root.clone(), busy_status(0, 2));
+        pending.queue(root.clone(), None, busy_status(0, 1));
+        pending.queue(root.clone(), None, busy_status(0, 2));
         pending.drain_turn(&tx, &metrics, &routes, &roots);
         assert_eq!(
             pending.pending.len(),
@@ -1473,7 +1607,7 @@ mod tests {
             "full writer must retain latest status rather than dropping it"
         );
         assert_eq!(rx.try_recv().unwrap().header.ty, FrameType::Ping);
-        pending.queue(root, busy_status(0, 3));
+        pending.queue(root, None, busy_status(0, 3));
         pending.drain_turn(&tx, &metrics, &routes, &roots);
         let frame = rx.try_recv().unwrap();
         let value: Value = serde_json::from_slice(frame.body()).unwrap();
@@ -1833,6 +1967,7 @@ mod tests {
                 trust: BindTrust::FirstParty,
                 spawn_principal: AuthenticatedPrincipal::FirstParty,
                 consumer_elicitation_capable: false,
+                tool_result_body: false,
                 disabled_tools: Arc::default(),
                 run_scope: OnceLock::new(),
                 call_mode: subc_protocol::call_mode::CallMode::Classic,
@@ -2067,6 +2202,7 @@ mod tests {
 
         for index in 0..total {
             buffer_push_frame(
+                &DispatchPathMetrics::new(),
                 &mut push_buffer,
                 key.clone(),
                 completion_frame(&format!("task-{index}")),
@@ -2098,8 +2234,18 @@ mod tests {
         let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(4);
         let metrics = DispatchPathMetrics::new();
         let mut push_buffer = HashMap::new();
-        buffer_push_frame(&mut push_buffer, key.clone(), completion_frame("task-a"));
-        buffer_push_frame(&mut push_buffer, key.clone(), completion_frame("task-b"));
+        buffer_push_frame(
+            &DispatchPathMetrics::new(),
+            &mut push_buffer,
+            key.clone(),
+            completion_frame("task-a"),
+        );
+        buffer_push_frame(
+            &DispatchPathMetrics::new(),
+            &mut push_buffer,
+            key.clone(),
+            completion_frame("task-b"),
+        );
 
         let replayed = replay_buffered_push_frames(
             &writer_tx,
@@ -2134,7 +2280,12 @@ mod tests {
         let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(4);
         let metrics = DispatchPathMetrics::new();
         let mut push_buffer = HashMap::new();
-        buffer_push_frame(&mut push_buffer, key.clone(), completion_frame("task-a"));
+        buffer_push_frame(
+            &DispatchPathMetrics::new(),
+            &mut push_buffer,
+            key.clone(),
+            completion_frame("task-a"),
+        );
 
         let replayed = replay_buffered_push_frames(
             &writer_tx,
@@ -2287,6 +2438,222 @@ mod tests {
         .collect();
 
         assert_eq!(statuses, vec![3]);
+    }
+
+    #[test]
+    fn status_push_merges_overflow_created_during_channel_drain() {
+        let (_dir, root) = test_root("status-overflow-race");
+        let (routes, roots) = progress_routes(&root, 1);
+        let (tx, mut rx) = mpsc::channel(8);
+        let metrics = DispatchPathMetrics::new();
+        let mut statuses = StatusPushes::default();
+        let (lossy_tx, mut lossy_rx) = mpsc::channel(1);
+        let overflow = LossyOverflow::default();
+        let sequence = AtomicU64::new(0);
+        let emit = |seq| {
+            enqueue_lossy_push_frame(
+                &lossy_tx,
+                &overflow,
+                &sequence,
+                root.clone(),
+                status_frame(seq),
+            );
+        };
+        emit(0);
+        let mut receives = 0;
+        let batch = drain_lossy_push_batch_with_hook(&mut lossy_rx, &overflow, || {
+            match receives {
+                // The channel is full when the producer publishes 2029. Once
+                // the consumer frees capacity, the same producer sends 2047.
+                0 => emit(2029),
+                1 => emit(2047),
+                _ => {}
+            }
+            receives += 1;
+        });
+        let first_batch_len = batch.len();
+        process_lossy_push_envelope_batch(
+            &tx,
+            &metrics,
+            &routes,
+            &roots,
+            &CompletedTaskIds::default(),
+            batch,
+            &mut statuses,
+        );
+        statuses.drain_turn(&tx, &metrics, &routes, &roots);
+        let batch = drain_lossy_push_batch(&mut lossy_rx, &overflow);
+        process_lossy_push_envelope_batch(
+            &tx,
+            &metrics,
+            &routes,
+            &roots,
+            &CompletedTaskIds::default(),
+            batch,
+            &mut statuses,
+        );
+        statuses.drain_turn(&tx, &metrics, &routes, &roots);
+        let mut delivered = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            let value: Value = serde_json::from_slice(frame.body()).unwrap();
+            delivered.push(value["snapshot"]["seq"].as_u64().unwrap());
+        }
+        assert_eq!(
+            delivered,
+            vec![2047],
+            "status publication must not regress across turns"
+        );
+        assert_eq!(
+            first_batch_len, 3,
+            "the channel and concurrent overflow belong to one batch"
+        );
+    }
+
+    #[test]
+    fn status_push_rejects_delayed_producer_without_dropping_reliable_frames() {
+        let (_dir, root) = test_root("status-delayed-producer");
+        let (routes, roots) = progress_routes(&root, 1);
+        let (tx, mut rx) = mpsc::channel(8);
+        let metrics = DispatchPathMetrics::new();
+        let mut statuses = StatusPushes::default();
+        let mut completed = CompletedTaskIds::default();
+        let (lossy_tx, mut lossy_rx) = mpsc::channel(8);
+        let overflow = LossyOverflow::default();
+        let sequence = AtomicU64::new(0);
+
+        enqueue_lossy_push_frame_with_hook(
+            &lossy_tx,
+            &overflow,
+            &sequence,
+            root.clone(),
+            status_frame(2029),
+            || {
+                // The older producer has an order but has not sent yet. Publish
+                // the newer snapshot all the way into the writer before resuming.
+                enqueue_lossy_push_frame(
+                    &lossy_tx,
+                    &overflow,
+                    &sequence,
+                    root.clone(),
+                    status_frame(2047),
+                );
+                let batch = drain_lossy_push_batch(&mut lossy_rx, &overflow);
+                process_lossy_push_envelope_batch(
+                    &tx,
+                    &metrics,
+                    &routes,
+                    &roots,
+                    &completed,
+                    batch,
+                    &mut statuses,
+                );
+                statuses.drain_turn(&tx, &metrics, &routes, &roots);
+                assert!(statuses.pending.is_empty());
+            },
+        );
+        let reliable = |task: &str, completed: &mut CompletedTaskIds| {
+            process_reliable_push_frame(
+                &tx,
+                &metrics,
+                &routes,
+                &roots,
+                &HashMap::new(),
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                completed,
+                root.clone(),
+                completion_frame_with_session(task, "same-session"),
+                None,
+            );
+        };
+        reliable("completion-before", &mut completed);
+        let batch = drain_lossy_push_batch(&mut lossy_rx, &overflow);
+        process_lossy_push_envelope_batch(
+            &tx,
+            &metrics,
+            &routes,
+            &roots,
+            &completed,
+            batch,
+            &mut statuses,
+        );
+        statuses.drain_turn(&tx, &metrics, &routes, &roots);
+        reliable("completion-after", &mut completed);
+        let delivered: Vec<Value> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|frame| serde_json::from_slice(frame.body()).unwrap())
+            .collect();
+        assert_eq!(
+            delivered.len(),
+            3,
+            "only the stale status may be dropped: {delivered:?}"
+        );
+        assert_eq!(delivered[0]["snapshot"]["seq"], 2047);
+        assert_eq!(delivered[1]["task_id"], "completion-before");
+        assert_eq!(delivered[2]["task_id"], "completion-after");
+    }
+
+    #[test]
+    fn status_push_watermarks_follow_channels_and_preserve_pending_latest() {
+        let (_dir, root) = test_root("status-watermark-lifetime");
+        let (mut routes, mut roots) = progress_routes(&root, 2);
+        let channel = route_key(1, 7);
+        let other = route_key(2, 7);
+        let (tx, mut rx) = mpsc::channel(1);
+        let metrics = DispatchPathMetrics::new();
+        let mut statuses = StatusPushes::default();
+        let queue = |statuses: &mut StatusPushes, order, seq| {
+            let PushFrame::StatusChanged(frame) = status_frame(seq) else {
+                unreachable!()
+            };
+            statuses.queue(root.clone(), order, frame);
+        };
+        queue(&mut statuses, Some(2), 2047);
+        statuses.drain_turn(&tx, &metrics, &routes, &roots);
+        queue(&mut statuses, Some(1), 2029);
+        statuses.drain_turn(&tx, &metrics, &routes, &roots);
+        let first = rx.try_recv().unwrap();
+        statuses.drain_turn(&tx, &metrics, &routes, &roots);
+        let second = rx.try_recv().unwrap();
+        assert_ne!(first.header.channel, second.header.channel);
+        for frame in [first, second] {
+            let value: Value = serde_json::from_slice(frame.body()).unwrap();
+            assert_eq!(
+                value["snapshot"]["seq"], 2047,
+                "stale state replaced pending latest"
+            );
+        }
+        assert_eq!(statuses.published.len(), 2);
+
+        routes.remove(&channel);
+        roots.get_mut(&root).unwrap().remove(&channel);
+        statuses.drain_turn(&tx, &metrics, &routes, &roots);
+        assert!(!statuses.published.contains_key(&channel));
+        assert!(statuses.published.contains_key(&other));
+
+        // Reusing a released channel starts a new publication history. A new
+        // subscriber may receive an old envelope it has never observed before.
+        routes.insert(channel, route_identity(&root, "same-session"));
+        roots.get_mut(&root).unwrap().insert(channel);
+        queue(&mut statuses, Some(1), 2029);
+        statuses.drain_turn(&tx, &metrics, &routes, &roots);
+        let frame = rx.try_recv().unwrap();
+        assert_eq!(frame.header.channel, channel.channel);
+        statuses.drain_turn(&tx, &metrics, &routes, &roots);
+        assert!(
+            rx.try_recv().is_err(),
+            "the still-live channel must reject the stale envelope"
+        );
+
+        // Unsequenced callers do not participate in the ordering fence.
+        let published = statuses.published.clone();
+        queue(&mut statuses, None, 0);
+        for _ in 0..2 {
+            statuses.drain_turn(&tx, &metrics, &routes, &roots);
+            let frame = rx.try_recv().unwrap();
+            let value: Value = serde_json::from_slice(frame.body()).unwrap();
+            assert_eq!(value["snapshot"]["seq"], 0);
+        }
+        assert_eq!(statuses.published, published);
     }
 
     #[test]
@@ -2609,7 +2976,12 @@ mod tests {
             .expect("prefill writer queue");
         let mut push_buffer = HashMap::new();
         for task in ["replay-1", "replay-2", "replay-3"] {
-            buffer_push_frame(&mut push_buffer, key.clone(), completion_frame(task));
+            buffer_push_frame(
+                &DispatchPathMetrics::new(),
+                &mut push_buffer,
+                key.clone(),
+                completion_frame(task),
+            );
         }
 
         assert_eq!(
@@ -2665,6 +3037,7 @@ mod tests {
         };
         let mut retry_buffer = HashMap::new();
         buffer_retry_frame(
+            &DispatchPathMetrics::new(),
             &mut retry_buffer,
             route_key(5, 1),
             key.clone(),
@@ -2674,6 +3047,7 @@ mod tests {
 
         assert_eq!(
             migrate_retry_buffer_to_push_buffer(
+                &DispatchPathMetrics::new(),
                 &mut retry_buffer,
                 route_key(5, 1),
                 &mut push_buffer
@@ -2703,6 +3077,7 @@ mod tests {
 
         let mut push_buffer = HashMap::new();
         buffer_push_frame(
+            &DispatchPathMetrics::new(),
             &mut push_buffer,
             key.clone(),
             completion_frame("closed-replay"),
@@ -2723,6 +3098,7 @@ mod tests {
 
         let mut retry_buffer = HashMap::new();
         buffer_retry_frame(
+            &DispatchPathMetrics::new(),
             &mut retry_buffer,
             route_key(4, 1),
             key,

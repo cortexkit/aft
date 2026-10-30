@@ -185,19 +185,22 @@ fn offset_in(input: &str, line: &str) -> usize {
 }
 
 pub fn cap_final_output(input: &str) -> CappedText {
-    cap_final_output_preserving(input, None, &[])
+    cap_final_output_preserving(input, None, &[], false)
 }
 
 pub fn cap_final_output_with_marker(input: &str, marker: &str) -> CappedText {
-    cap_final_output_preserving(input, Some(marker), &[])
+    cap_final_output_preserving(input, Some(marker), &[], false)
 }
 
 /// A compressed reply must retain the ending of each capture, not just the
 /// ending of their concatenation. Reserve those lines before ordinary context.
+/// `failed` (a known non-zero exit) also keeps failure lines from the cut
+/// middle of the output.
 pub(crate) fn cap_final_output_preserving(
     input: &str,
     marker: Option<&str>,
     final_lines: &[String],
+    failed: bool,
 ) -> CappedText {
     let (pieced, truncated) = cap_preserving_pieces(
         input,
@@ -206,6 +209,7 @@ pub(crate) fn cap_final_output_preserving(
         FINAL_OUTPUT_TAIL_BYTES,
         marker,
         final_lines,
+        failed,
     );
     pieced.into_capped(truncated)
 }
@@ -217,15 +221,24 @@ fn cap_preserving_pieces(
     keep_tail: usize,
     marker: Option<&str>,
     final_lines: &[String],
+    rescue_failures: bool,
 ) -> (PiecedText, bool) {
-    cap_test_verdict(input, threshold, keep_head, keep_tail, marker, final_lines)
-        .map(|pieced| (pieced, true))
-        .unwrap_or_else(|| match marker {
-            Some(marker) => {
-                cap_head_tail_with_marker_pieces(input, threshold, keep_head, keep_tail, marker)
-            }
-            None => cap_head_tail_pieces(input, threshold, keep_head, keep_tail),
-        })
+    cap_test_verdict(
+        input,
+        threshold,
+        keep_head,
+        keep_tail,
+        marker,
+        final_lines,
+        rescue_failures,
+    )
+    .map(|pieced| (pieced, true))
+    .unwrap_or_else(|| match marker {
+        Some(marker) => {
+            cap_head_tail_with_marker_pieces(input, threshold, keep_head, keep_tail, marker)
+        }
+        None => cap_head_tail_pieces(input, threshold, keep_head, keep_tail),
+    })
 }
 
 /// Byte threshold under which a completion preview is passed through uncapped.
@@ -279,7 +292,8 @@ pub(crate) fn cap_completion_output_preserving_pieces(
     final_lines: &[String],
 ) -> (PiecedText, bool) {
     let (threshold, head, tail) = completion_caps(exit_ok);
-    cap_preserving_pieces(input, threshold, head, tail, marker, final_lines)
+    // Completion previews are a short glance; full replies keep failure lines.
+    cap_preserving_pieces(input, threshold, head, tail, marker, final_lines, false)
 }
 
 /// Reserve the runner's verdict before spending bytes on ordinary head/tail
@@ -296,6 +310,7 @@ fn cap_test_verdict(
     keep_tail: usize,
     marker: Option<&str>,
     final_lines: &[String],
+    rescue_failures: bool,
 ) -> Option<PiecedText> {
     if input.len() + marker.map_or(0, |marker| marker.len() + 1) <= threshold {
         return None;
@@ -305,7 +320,11 @@ fn cap_test_verdict(
     // Even a non-runner command's last line is never split by a compressed
     // byte cap. Ordinary fitting tails retain their original cap policy.
     let last = lines.len().checked_sub(1)?;
-    if verdict.is_none() && final_lines.is_empty() && lines[last].len() <= keep_tail {
+    if !rescue_failures
+        && verdict.is_none()
+        && final_lines.is_empty()
+        && lines[last].len() <= keep_tail
+    {
         return None;
     }
     let mut required = vec![false; lines.len()];
@@ -388,18 +407,143 @@ fn cap_test_verdict(
         tail_bytes += bytes;
         tail_lines += 1;
     }
-    let (capped, _) = cap_head_tail_with_marker_pieces(
-        &context.text,
-        available + marker.len() + 1,
-        keep_head.min(available),
-        tail_bytes.min(available),
-        marker,
-    );
+    let cap_context = |reserve: usize| {
+        let available = available.saturating_sub(reserve);
+        cap_head_tail_with_marker_pieces(
+            &context.text,
+            available + marker.len() + 1,
+            keep_head.min(available),
+            tail_bytes.min(available),
+            marker,
+        )
+        .0
+    };
+    let mut capped = cap_context(0);
+    // A failed command's error can sit anywhere in a long output; the head and
+    // tail windows above keep neither the middle nor its failure lines. Keep
+    // up to RESCUED_FAILURE_LINES of them from the cut. The block's bytes come
+    // out of the head budget, which changes what the cut drops, so pick the
+    // lines again from the new cut; the third pass reserves the block's
+    // largest possible size, so it always fits.
+    let mut rescued = PiecedText::default();
+    if rescue_failures {
+        let mut reserve = 0;
+        for attempt in 0..3 {
+            rescued = rescued_failure_lines(&context.text, &capped);
+            let needed = if rescued.text.is_empty() {
+                0
+            } else {
+                rescued.text.len() + 1
+            };
+            if needed <= reserve {
+                break;
+            }
+            reserve = if attempt == 0 {
+                needed
+            } else {
+                RESCUED_FAILURE_BLOCK_MAX_BYTES
+            };
+            capped = cap_context(reserve);
+        }
+    }
     let mut capped = capped.through(&context);
     capped.truncate(capped.text.trim_end().len());
     capped.insert("\n");
+    if !rescued.text.is_empty() {
+        capped.append(rescued.through(&context));
+        capped.insert("\n");
+    }
     capped.append(essentials);
     Some(capped)
+}
+
+/// Most failure lines a failed command's reply keeps from the cut middle of
+/// its output, and the most bytes those lines may take together.
+const RESCUED_FAILURE_LINES: usize = 20;
+const RESCUED_FAILURE_BYTES: usize = crate::compress::line_cut::TAIL_WINDOW_BYTES;
+/// The rescued block at its largest: label, lines and their newlines, plus
+/// the newline that joins the block to what follows it.
+const RESCUED_FAILURE_BLOCK_MAX_BYTES: usize = crate::compress::PRESERVED_FAILURES_LABEL.len()
+    + RESCUED_FAILURE_BYTES
+    + RESCUED_FAILURE_LINES
+    + 1;
+
+#[cfg(test)]
+thread_local! {
+    static RESCUE_LINES_EXAMINED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The labelled block of failure lines that `capped` (cut from `context`)
+/// dropped, in output order, in `context` coordinates. Empty when none was
+/// dropped. Scanning stops at the line limit; a line larger than the bytes
+/// left is skipped. A line already shown, or rescued once, is not repeated.
+fn rescued_failure_lines(context: &str, capped: &PiecedText) -> PiecedText {
+    let mut gaps = Vec::new();
+    let mut kept_to = 0;
+    for piece in &capped.pieces {
+        if let CapPiece::Input(range) = piece {
+            if range.start > kept_to {
+                gaps.push(kept_to..range.start);
+            }
+            kept_to = kept_to.max(range.end);
+        }
+    }
+    if kept_to < context.len() {
+        gaps.push(kept_to..context.len());
+    }
+    let mut block = PiecedText::default();
+    let mut shown: Option<std::collections::HashSet<&str>> = None;
+    let mut seen = std::collections::HashSet::new();
+    let mut lower = String::new();
+    let (mut lines, mut bytes) = (0, 0);
+    'gaps: for gap in gaps {
+        // Only whole lines: a gap that starts inside a line skips its rest.
+        let mut start = gap.start;
+        if start > 0 && context.as_bytes()[start - 1] != b'\n' {
+            match context[start..gap.end].find('\n') {
+                Some(at) => start += at + 1,
+                None => continue,
+            }
+        }
+        while start < gap.end {
+            let end = context[start..]
+                .find('\n')
+                .map_or(context.len(), |at| start + at);
+            if end > gap.end {
+                break;
+            }
+            #[cfg(test)]
+            RESCUE_LINES_EXAMINED.with(|count| count.set(count.get() + 1));
+            let line = context[start..end].trim_end_matches('\r');
+            let line_start = start;
+            start = end + 1;
+            let trimmed = line.trim();
+            if trimmed.is_empty() || bytes + line.len() > RESCUED_FAILURE_BYTES {
+                continue;
+            }
+            lower.clear();
+            lower.push_str(trimmed);
+            lower.make_ascii_lowercase();
+            if !crate::compress::line_has_failure_signal_lower(trimmed, &lower) {
+                continue;
+            }
+            let shown = shown.get_or_insert_with(|| capped.text.lines().map(str::trim).collect());
+            if shown.contains(trimmed) || !seen.insert(trimmed) {
+                continue;
+            }
+            if block.text.is_empty() {
+                block.insert(crate::compress::PRESERVED_FAILURES_LABEL);
+            }
+            block.insert("\n");
+            block.copy(context, line_start..line_start + line.len());
+            lines += 1;
+            bytes += line.len();
+            if lines == RESCUED_FAILURE_LINES {
+                break 'gaps;
+            }
+        }
+    }
+    block
 }
 
 pub fn cap_head_tail(
@@ -729,6 +873,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A failed command keeps at most twenty failure lines from the cut
+    /// middle, the first ones in output order, inside the reply cap. The scan
+    /// stops at the twentieth: lines after it are never examined.
+    #[test]
+    fn failed_reply_cap_keeps_the_first_twenty_middle_failure_lines() {
+        let mut input = "head line\n".repeat(1_000);
+        for index in 0..30 {
+            input.push_str(&format!("error: middle failure {index}\n"));
+        }
+        input.push_str(&"middle line\n".repeat(50_000));
+        input.push_str(&"tail line\n".repeat(100));
+        input.push_str("final verdict\n");
+        let final_lines = vec!["final verdict".to_string()];
+        let marker = "[cut]";
+
+        let succeeded = cap_final_output_preserving(&input, Some(marker), &final_lines, false);
+        assert!(!succeeded.text.contains("middle failure"));
+        assert!(!succeeded
+            .text
+            .contains(crate::compress::PRESERVED_FAILURES_LABEL));
+
+        RESCUE_LINES_EXAMINED.with(|count| count.set(0));
+        let failed = cap_final_output_preserving(&input, Some(marker), &final_lines, true);
+        let examined = RESCUE_LINES_EXAMINED.with(std::cell::Cell::get);
+        assert!(
+            failed.text.len() <= FINAL_OUTPUT_CAP_BYTES,
+            "{}",
+            failed.text.len()
+        );
+        let (_, rescued) = failed
+            .text
+            .split_once(&format!("{}\n", crate::compress::PRESERVED_FAILURES_LABEL))
+            .expect("label");
+        let expected: Vec<String> = (0..20)
+            .map(|index| format!("error: middle failure {index}"))
+            .chain(["final verdict".to_string()])
+            .collect();
+        assert_eq!(rescued.lines().collect::<Vec<_>>(), expected);
+        // The head keeps most of the 1,000 head lines, so the scan starts in
+        // the head's tail and ends at the twentieth failure line; it never
+        // reaches the 50,000 middle lines. Three passes at most.
+        assert!(examined < 3 * 1_100, "{examined} lines examined");
     }
 
     #[test]

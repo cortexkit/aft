@@ -18,6 +18,12 @@ use crate::harness::Harness;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+mod prepared;
+pub(crate) use prepared::{
+    current_prepared_bind_config, read_bounded_config, with_prepared_bind_config,
+    PreparedBindConfig,
+};
+
 /// CortexKit user config home: `$XDG_CONFIG_HOME/cortexkit/aft.jsonc`, falling
 /// back to `~/.config/cortexkit/aft.jsonc`. Matches the shared CortexKit
 /// convention (`~/.config/cortexkit/<module>.jsonc`) alongside `subc.jsonc` and
@@ -64,11 +70,8 @@ fn cortexkit_project_config_path(project_root: &Path) -> PathBuf {
 /// Prefer the shared file, then the active harness's legacy files, without writes.
 /// Within a harness, aft.jsonc precedes aft.json. Without a plugin harness,
 /// OpenCode is checked before Pi, matching the TypeScript fallback ordering.
-pub fn project_config_read_path(project_root: &Path, harness: Option<&Harness>) -> PathBuf {
-    let canonical = cortexkit_project_config_path(project_root);
-    if canonical.exists() {
-        return canonical;
-    }
+fn project_config_candidates(project_root: &Path, harness: Option<&Harness>) -> Vec<PathBuf> {
+    let mut candidates = vec![cortexkit_project_config_path(project_root)];
     let directories = if matches!(harness, Some(Harness::Pi)) {
         [".pi", ".opencode"]
     } else {
@@ -76,13 +79,17 @@ pub fn project_config_read_path(project_root: &Path, harness: Option<&Harness>) 
     };
     for directory in directories {
         for filename in ["aft.jsonc", "aft.json"] {
-            let path = project_root.join(directory).join(filename);
-            if path.exists() {
-                return path;
-            }
+            candidates.push(project_root.join(directory).join(filename));
         }
     }
-    canonical
+    candidates
+}
+
+pub fn project_config_read_path(project_root: &Path, harness: Option<&Harness>) -> PathBuf {
+    project_config_candidates(project_root, harness)
+        .into_iter()
+        .find(|path| path.exists())
+        .unwrap_or_else(|| cortexkit_project_config_path(project_root))
 }
 
 pub fn legacy_project_config_location_notice(project_root: &Path, path: &Path) -> Option<String> {
@@ -95,6 +102,10 @@ pub fn legacy_project_config_location_notice(project_root: &Path, path: &Path) -
         path.display(), canonical.display()
     ))
 }
+
+/// Largest configuration file the plain readers below accept, matching the
+/// bound the prepared bind reader uses.
+const CONFIG_READ_LIMIT: usize = 1024 * 1024;
 
 /// Rewrite the user file's retired keys before it is read (see
 /// [`crate::config_fix::auto_migrate_user_config`]) and log the outcome. A
@@ -129,7 +140,13 @@ fn read_tiers_from(
 
     if let Some(user_path) = user_config_path {
         migration = migrate_user_file(user_path);
-        if let Ok(doc) = std::fs::read_to_string(user_path) {
+        // Shared open: on Windows no reader of this file may block a tool that
+        // replaces it while this handle lives.
+        let read = crate::config::open_config_file(user_path)
+            .and_then(|file| crate::subc_config::read_bounded_config(file, CONFIG_READ_LIMIT));
+        if !matches!(&read, Err(error) if error.kind() == std::io::ErrorKind::NotFound) {
+            let doc =
+                read.unwrap_or_else(|error| format!("unreadable user configuration: {error}"));
             tiers.push(ConfigTier {
                 tier: "user".to_string(),
                 source: user_path.to_string_lossy().into_owned(),
@@ -138,7 +155,9 @@ fn read_tiers_from(
         }
     }
 
-    if let Ok(doc) = std::fs::read_to_string(project_config_path) {
+    if let Ok(doc) = crate::config::open_config_file(project_config_path)
+        .and_then(|file| crate::subc_config::read_bounded_config(file, CONFIG_READ_LIMIT))
+    {
         tiers.push(ConfigTier {
             tier: "project".to_string(),
             source: project_config_path.to_string_lossy().into_owned(),
@@ -191,7 +210,9 @@ pub fn catalog_disabled_tools(user_config_path: Option<&Path>) -> Vec<String> {
     let tiers: Vec<ConfigTier> = user_config_path
         .and_then(|path| {
             migrate_user_file(path);
-            let doc = std::fs::read_to_string(path).ok()?;
+            let doc = crate::config::open_config_file(path)
+                .and_then(|file| crate::subc_config::read_bounded_config(file, CONFIG_READ_LIMIT))
+                .ok()?;
             Some(ConfigTier {
                 tier: "user".to_string(),
                 source: path.to_string_lossy().into_owned(),
@@ -480,5 +501,31 @@ fn legacy_project_paths_match_shared_typescript_fixtures_and_are_read_without_wr
             assert!(notice.contains(&canonical.display().to_string()));
             assert!(notice.contains("doctor --fix"));
         }
+    }
+}
+
+#[cfg(test)]
+mod shared_config_open_tests {
+    use super::*;
+
+    #[test]
+    fn config_read_handles_do_not_block_replacing_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aft.jsonc");
+        std::fs::write(&path, r#"{"indexes": {"trigram": false}}"#).unwrap();
+
+        let file = crate::config::open_config_file(&path).unwrap();
+        assert!(
+            read_bounded_config(&file, CONFIG_READ_LIMIT)
+                .unwrap()
+                .contains("trigram"),
+            "the shared open still reads the file"
+        );
+
+        let replacement = dir.path().join("replacement.jsonc");
+        std::fs::write(&replacement, r#"{"indexes": {"semantic": false}}"#).unwrap();
+        std::fs::rename(&replacement, &path).expect("replace the config while it is open");
+        drop(file);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("semantic"));
     }
 }

@@ -160,8 +160,10 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // Write, format, and validate via shared pipeline
+    let tool_policy = &crate::sandbox_spawn::ToolLaunchPolicy::for_request(ctx);
     let written = if let (Some(observation), Some(original)) = (observation.as_ref(), original) {
         edit::write_format_validate_observed(
+            tool_policy,
             path.as_path(),
             content,
             &ctx.config(),
@@ -170,7 +172,13 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
             observation,
         )
     } else {
-        edit::write_format_validate(path.as_path(), content, &ctx.config(), &req.params)
+        edit::write_format_validate(
+            tool_policy,
+            path.as_path(),
+            content,
+            &ctx.config(),
+            &req.params,
+        )
     };
     let mut write_result = match written {
         Ok(r) => r,
@@ -185,9 +193,27 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     if write_result.rolled_back {
-        ctx.backup()
+        // A write takes one snapshot of this path. Do not spend rollback's
+        // cleanup allowance discovering unrelated stacks in the session.
+        if let Err(error) = ctx
+            .backup()
             .lock()
-            .discard_operation_entries(req.session(), &op_id);
+            .try_discard_latest_operation_entry_for_path(req.session(), &op_id, path.as_path())
+        {
+            return Response::error_with_data(
+                &req.id,
+                error.code(),
+                format!(
+                    "write: file was rolled back, but undo cleanup failed; its backup may still be in undo history: {error}"
+                ),
+                serde_json::json!({
+                    "file": file,
+                    "rolled_back": true,
+                    "undo_cleanup_failed": true,
+                    "backup_id": backup_id,
+                }),
+            );
+        }
     }
 
     if let Some(final_content) = write_result.final_content(path.as_path()) {
@@ -261,6 +287,188 @@ mod audit_regressions {
     use super::*;
 
     #[test]
+    fn backup_cancelled_rollback_restores_prior_success() {
+        cancelled_rollback(RollbackCleanupSetup::Normal);
+    }
+
+    #[test]
+    fn backup_cancelled_rollback_does_not_need_session_discovery() {
+        cancelled_rollback(RollbackCleanupSetup::NoSessionDiscovery);
+    }
+
+    #[test]
+    fn backup_cancelled_rollback_reports_cleanup_failure() {
+        cancelled_rollback(RollbackCleanupSetup::DiskWriteFailure);
+    }
+
+    #[derive(Clone, Copy)]
+    enum RollbackCleanupSetup {
+        Normal,
+        NoSessionDiscovery,
+        DiskWriteFailure,
+    }
+
+    fn cancelled_rollback(setup: RollbackCleanupSetup) {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        for released in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("cancelled.ts");
+            let original = "const value = 0;\n";
+            let successful = "const value = 1;\n";
+            std::fs::write(&path, original).unwrap();
+            let ctx = Arc::new(AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                crate::config::Config {
+                    format_on_edit: false,
+                    ..Default::default()
+                },
+            ));
+            ctx.backup()
+                .lock()
+                .set_storage_dir(dir.path().join("storage"), 72);
+            let first: RawRequest = serde_json::from_value(serde_json::json!({
+                "id": "successful", "command": "write", "file": path, "content": successful,
+            }))
+            .unwrap();
+            let first_response = handle_write(&first, &ctx);
+            assert!(first_response.success, "{first_response:?}");
+            let successful_backup_id = first_response.data["backup_id"].as_str().unwrap();
+            ctx.backup().lock().record_post_mutation_states();
+            if released {
+                ctx.backup().lock().release_after_next_snapshot_for_tests();
+            }
+            let failed: RawRequest = serde_json::from_value(serde_json::json!({
+                "id": "cancelled", "command": "write", "file": path, "content": "const value = {;\n", "validate": "full",
+            })).unwrap();
+            let cancellation = crate::executor::JobCancellation::new();
+            let guard = crate::executor::install_job_cancellation(cancellation.clone());
+            let observed = Arc::new(AtomicBool::new(false));
+            let hook_observed = Arc::clone(&observed);
+            let hook_ctx = Arc::clone(&ctx);
+            let hook_path = path.clone();
+            let response = edit::with_full_validation_start_hook(
+                Box::new(move || {
+                    // Cancel at the real post-write checker boundary, after syntax
+                    // rollback restored the file but before backup discard runs.
+                    assert_eq!(std::fs::read_to_string(&hook_path).unwrap(), successful);
+                    assert_eq!(
+                        hook_ctx.backup().lock().resident_entry_count(),
+                        if released { 0 } else { 2 }
+                    );
+                    match setup {
+                        RollbackCleanupSetup::Normal => {}
+                        RollbackCleanupSetup::NoSessionDiscovery => {
+                            // Rollback knows the one path written. An unavailable
+                            // session-wide scan must not leave its backup in undo.
+                            hook_ctx
+                                .backup()
+                                .lock()
+                                .set_discovery_entry_limit_for_tests(0);
+                        }
+                        RollbackCleanupSetup::DiskWriteFailure => {
+                            hook_ctx.backup().lock().fail_next_disk_write_for_tests()
+                        }
+                    }
+                    cancellation.request_cancel();
+                    assert!(crate::executor::current_job_cancelled());
+                    hook_observed.store(true, Ordering::Relaxed);
+                }),
+                || handle_write(&failed, &ctx),
+            );
+            assert!(
+                observed.load(Ordering::Relaxed),
+                "post-write checker hook did not run"
+            );
+            assert!(
+                crate::executor::current_job_cancelled(),
+                "cleanup must not clear the caller's cancellation"
+            );
+            drop(guard);
+            if matches!(setup, RollbackCleanupSetup::DiskWriteFailure) {
+                assert!(!response.success, "{response:?}");
+                assert_eq!(response.data["rolled_back"], true, "{response:?}");
+                assert_eq!(response.data["undo_cleanup_failed"], true, "{response:?}");
+                assert!(response.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("injected backup disk write failure"));
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), successful);
+                continue;
+            }
+            assert!(response.success, "{response:?}");
+            assert_eq!(response.data["rolled_back"], true, "{response:?}");
+            ctx.backup()
+                .lock()
+                .set_discovery_entry_limit_for_tests(usize::MAX);
+            ctx.backup().lock().record_post_mutation_states();
+            let restored = ctx
+                .backup()
+                .lock()
+                .restore_last_operation(first.session())
+                .unwrap();
+            assert_eq!(restored.restored.len(), 1);
+            assert_eq!(
+                restored.restored[0].backup_id, successful_backup_id,
+                "undo must select the successful write's backup, released={released}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                original,
+                "cancelled rollback must not leave its failed edit in undo"
+            );
+        }
+    }
+
+    #[test]
+    fn backup_discard_after_session_release_keeps_previous_successful_undo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollback.ts");
+        let original = "const value = 0;\n";
+        let successful = "const value = 1;\n";
+        std::fs::write(&path, original).unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        ctx.backup()
+            .lock()
+            .set_storage_dir(dir.path().join("storage"), 72);
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "successful", "command": "write", "file": path, "content": successful,
+        }))
+        .unwrap();
+        let response = handle_write(&request, &ctx);
+        assert!(response.success, "{response:?}");
+        ctx.backup().lock().record_post_mutation_states();
+        ctx.backup().lock().release_after_next_snapshot_for_tests();
+
+        let failed: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "failed", "command": "write", "file": path, "content": "const value = {;\n",
+        }))
+        .unwrap();
+        let response = handle_write(&failed, &ctx);
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["rolled_back"], true, "{response:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), successful);
+        ctx.backup().lock().record_post_mutation_states();
+        ctx.backup()
+            .lock()
+            .restore_last_operation(request.session())
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "undo must reverse the successful edit, not pop the rolled-back write"
+        );
+    }
+
+    #[test]
     fn binary_write_reuses_observed_backup_and_restores_exact_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("binary.txt");
@@ -287,7 +495,7 @@ mod audit_regressions {
         let mut store = ctx.backup().lock();
         let history = store.history(request.session(), &path);
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].content_bytes.as_ref(), original);
+        assert_eq!(history[0].content_bytes().unwrap().as_ref(), original);
         store.record_post_mutation_states();
         store.restore_last_operation(request.session()).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), original);

@@ -582,7 +582,10 @@ pub(crate) mod pause_test_support {
         let recorded = requests.clone();
         let server = std::thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async move {
-                tokio::time::timeout(Duration::from_secs(10), async move {
+                // Safety net only: stops a hung test from blocking forever. The
+                // session lasts as long as the test's own work, which a loaded
+                // CI runner (Windows) has stretched past 10 s, so keep it generous.
+                tokio::time::timeout(Duration::from_secs(60), async move {
                     let listener = tokio::net::TcpListener::from_std(listener).unwrap();
                     let (mut stream, _) = listener.accept().await.unwrap();
                     subc_transport::authenticate_server(&mut stream, &key, &daemon_id, "synapse-test", Duration::from_secs(2)).await.unwrap();
@@ -969,7 +972,7 @@ impl SynapseEmbeddingClient {
         );
         let mut vectors = HashMap::with_capacity(items.len());
         for page in pages {
-            match self.embed_batch_page(&page) {
+            match self.embed_batch_page(page) {
                 Ok(page_vectors) => vectors.extend(page_vectors),
                 Err(SynapseEmbeddingError::LanePaused(pause)) if !pause.retry_same_request() => {
                     shrink_page_rows(
@@ -1039,6 +1042,7 @@ impl SynapseEmbeddingClient {
             json!({ "items": wire_items, "request_key": request_key }),
         );
         let timeout = self.state.call_timeout;
+        let deadline = Instant::now() + timeout;
         let raw = self
             .runtime
             .block_on(self.state.call(BATCH_OPERATION, submit, timeout))?;
@@ -1050,7 +1054,6 @@ impl SynapseEmbeddingClient {
             return Ok(page.vectors);
         };
 
-        let deadline = Instant::now() + timeout;
         let mut vectors = HashMap::new();
         vectors.extend(page.vectors.drain());
         let mut next_chunk = page.next_chunk_id.clone();
@@ -1091,7 +1094,10 @@ impl SynapseEmbeddingClient {
                 if no_progress_polls >= MAX_NO_PROGRESS_POLLS {
                     return Err(SynapseEmbeddingError::NoProgress(job_id));
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(
+                    Duration::from_millis(100)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
             } else {
                 no_progress_polls = 0;
                 last_progress = progress;
@@ -1160,6 +1166,89 @@ impl SynapseEmbeddingClient {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only transport deadline for each request attempt on this thread,
+    /// so a test can make every attempt of one call time out well inside the
+    /// call's own budget without waiting for the SDK's default deadline.
+    pub(crate) static ATTEMPT_TIMEOUT_FOR_TEST: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Options for one request attempt. Production uses the SDK defaults.
+fn attempt_call_options() -> CallOptions {
+    #[cfg(test)]
+    if let Some(timeout) = ATTEMPT_TIMEOUT_FOR_TEST.with(std::cell::Cell::get) {
+        return CallOptions {
+            timeout,
+            ..CallOptions::default()
+        };
+    }
+    CallOptions::default()
+}
+
+fn typed_timeout_cause(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cause = Some(error);
+    while let Some(error) = cause {
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+            || error.is::<tokio::time::error::Elapsed>()
+        {
+            return true;
+        }
+        cause = error.source();
+    }
+    false
+}
+
+fn classify_transport_failure(
+    operation: &str,
+    error: &(dyn std::error::Error + 'static),
+) -> SynapseEmbeddingError {
+    if typed_timeout_cause(error) {
+        SynapseEmbeddingError::Timeout(operation.to_string())
+    } else {
+        SynapseEmbeddingError::DaemonUnavailable(error.to_string())
+    }
+}
+
+fn classify_call_failure(
+    operation: &str,
+    error: &subc_client_rs::CallError,
+) -> SynapseEmbeddingError {
+    // Transport labels and diagnostics may contain "timeout" without a
+    // timeout occurring. Inspect the typed cause, not its formatted wording.
+    let timed_out = error.outcome_cause() == Some(OutcomeUnknownCause::Deadline)
+        || match error {
+            subc_client_rs::CallError::NotSent(cause)
+            | subc_client_rs::CallError::OutcomeUnknown(cause) => {
+                typed_timeout_cause(cause.as_ref())
+            }
+            _ => typed_timeout_cause(error),
+        };
+    if timed_out {
+        SynapseEmbeddingError::Timeout(operation.to_string())
+    } else {
+        SynapseEmbeddingError::DaemonUnavailable(error.to_string())
+    }
+}
+
+fn classify_attempt_failure(
+    operation: &str,
+    error: &CallError,
+    deadline: tokio::time::Instant,
+) -> SynapseEmbeddingError {
+    // The SDK erases pre-send deadline causes into opaque NotSent errors.
+    // Use the attempt's own deadline, not diagnostic wording, to recognize
+    // expiry while waiting for route capacity or the writer.
+    if matches!(error, CallError::NotSent(_)) && tokio::time::Instant::now() >= deadline {
+        SynapseEmbeddingError::Timeout(operation.to_string())
+    } else {
+        classify_call_failure(operation, error)
+    }
+}
+
 impl SynapseState {
     async fn discover_model(
         &mut self,
@@ -1196,6 +1285,43 @@ impl SynapseState {
         params: Value,
         timeout: Duration,
     ) -> Result<Vec<u8>, SynapseEmbeddingError> {
+        // Routing, request retries and backoff share the caller's one budget.
+        // A per-attempt timeout alone would restart it after each failure.
+        let mut timeout_counted = false;
+        let outcome = tokio::time::timeout(
+            timeout,
+            self.call_with_retries(operation, params, &mut timeout_counted),
+        )
+        .await;
+        match outcome {
+            Ok(result) => result,
+            Err(_) => {
+                // One logical call counts at most one timeout toward the
+                // circuit, even when an attempt inside it already saw the
+                // transport's own deadline. The shared route is not reset:
+                // other callers may still be multiplexed on it.
+                if !timeout_counted {
+                    self.note_timeout();
+                }
+                if self.circuit_open_until.is_some() {
+                    Err(SynapseEmbeddingError::CircuitOpen)
+                } else {
+                    Err(SynapseEmbeddingError::Timeout(operation.to_string()))
+                }
+            }
+        }
+    }
+
+    /// Runs the attempts of one logical call. `timeout_counted` records
+    /// whether this call has already counted its one timeout toward the
+    /// circuit breaker, so later attempts and the caller's own deadline do
+    /// not count it again.
+    async fn call_with_retries(
+        &mut self,
+        operation: &str,
+        params: Value,
+        timeout_counted: &mut bool,
+    ) -> Result<Vec<u8>, SynapseEmbeddingError> {
         if self
             .circuit_open_until
             .is_some_and(|until| Instant::now() < until)
@@ -1205,20 +1331,21 @@ impl SynapseState {
         self.circuit_open_until = None;
         let body = serde_json::to_vec(&json!({ "method": operation, "params": params }))
             .map_err(|error| SynapseEmbeddingError::InvalidEnvelope(error.to_string()))?;
-        let mut last_error = String::new();
+        let mut last_error = None;
         for attempt in 0..MAX_CALL_ATTEMPTS {
             match self.ensure_route().await {
-                Err(error) => last_error = error.to_string(),
+                Err(error) => last_error = Some(error),
                 Ok(connection) => {
                     // Do not hold the connection-slot lock across a request. The
                     // SDK multiplexes up to 1024 requests on a management route.
-                    let request = connection.consumer.request(
-                        &connection.route,
-                        body.clone(),
-                        CallOptions::default(),
-                    );
-                    match tokio::time::timeout(timeout, request).await {
-                        Ok(Ok(response)) => {
+                    let options = attempt_call_options();
+                    let deadline = tokio::time::Instant::now() + options.timeout;
+                    let request =
+                        connection
+                            .consumer
+                            .request(&connection.route, body.clone(), options);
+                    match request.await {
+                        Ok(response) => {
                             if response.len() > MAX_RESULT_PAGE_BYTES {
                                 return Err(SynapseEmbeddingError::InvalidEnvelope(format!(
                                     "{operation} response exceeded 512KiB page bound"
@@ -1246,29 +1373,28 @@ impl SynapseState {
                             }
                             return result;
                         }
-                        Ok(Err(error)) => {
+                        Err(error) => {
                             if matches!(error, CallError::Module(_)) {
                                 return Err(SynapseEmbeddingError::DaemonUnavailable(
                                     error.to_string(),
                                 ));
                             }
-                            last_error = error.to_string();
+                            let failure = classify_attempt_failure(operation, &error, deadline);
                             if connection_is_gone(&error) {
                                 self.connection.reset(&connection).await;
-                            } else if error.outcome_cause() == Some(OutcomeUnknownCause::Deadline) {
+                            } else if matches!(failure, SynapseEmbeddingError::Timeout(_))
+                                && !*timeout_counted
+                            {
+                                // Only this call's first attempt deadline
+                                // counts. Its later attempts are the same slow
+                                // call, so they must not open the circuit.
+                                *timeout_counted = true;
                                 self.note_timeout();
                                 if self.circuit_open_until.is_some() {
                                     return Err(SynapseEmbeddingError::CircuitOpen);
                                 }
-                                last_error = format!("{operation} timed out");
                             }
-                        }
-                        Err(_) => {
-                            last_error = format!("{operation} timed out");
-                            self.note_timeout();
-                            if self.circuit_open_until.is_some() {
-                                return Err(SynapseEmbeddingError::CircuitOpen);
-                            }
+                            last_error = Some(failure);
                         }
                     }
                 }
@@ -1277,13 +1403,7 @@ impl SynapseState {
                 tokio::time::sleep(Duration::from_millis(RETRY_BACKOFF_MS[attempt.min(2)])).await;
             }
         }
-        if last_error.to_ascii_lowercase().contains("timed out")
-            || last_error.to_ascii_lowercase().contains("timeout")
-        {
-            Err(SynapseEmbeddingError::Timeout(operation.to_string()))
-        } else {
-            Err(SynapseEmbeddingError::DaemonUnavailable(last_error))
-        }
+        Err(last_error.unwrap_or_else(|| SynapseEmbeddingError::DaemonUnavailable(String::new())))
     }
 
     async fn ensure_route(&self) -> Result<Arc<ActiveConnection>, SynapseEmbeddingError> {
@@ -1304,11 +1424,11 @@ impl SynapseState {
         };
         let consumer = SubcConsumer::connect(&self.connection_file, options)
             .await
-            .map_err(|error| SynapseEmbeddingError::DaemonUnavailable(error.to_string()))?;
+            .map_err(|error| classify_transport_failure("route setup", &error))?;
         let catalog = consumer
             .catalog_list()
             .await
-            .map_err(|error| SynapseEmbeddingError::DaemonUnavailable(error.to_string()))?;
+            .map_err(|error| classify_call_failure("route setup", &error))?;
         if !catalog_advertises_operations(&catalog.modules, self.required_operations) {
             return Err(SynapseEmbeddingError::CapabilityUnavailable(format!(
                 "Synapse is not registered with required operations: {}",
@@ -1331,7 +1451,7 @@ impl SynapseState {
                 },
             )
             .await
-            .map_err(|error| SynapseEmbeddingError::DaemonUnavailable(error.to_string()))?;
+            .map_err(|error| classify_call_failure("route setup", &error))?;
         let connection = Arc::new(ActiveConnection { consumer, route });
         *active = Some(Arc::clone(&connection));
         Ok(connection)
@@ -1777,27 +1897,24 @@ fn batch_request_key(model: &str, identity: &SynapseIdentity, items: &[BatchItem
     hex_sha256(&encoded)
 }
 
-fn split_batch_pages<'a>(
-    items: &'a [BatchItem],
-    rows: usize,
-    token_budget: usize,
-) -> Vec<Vec<BatchItem>> {
+fn split_batch_pages(items: &[BatchItem], rows: usize, token_budget: usize) -> Vec<&[BatchItem]> {
     let mut pages = Vec::new();
-    let mut page = Vec::new();
+    let mut page_start = 0usize;
     let mut page_tokens = 0usize;
-    for item in items {
+    for (index, item) in items.iter().enumerate() {
         let item_tokens = item.text.chars().count().div_ceil(4).max(1);
-        if !page.is_empty()
-            && (page.len() >= rows || page_tokens.saturating_add(item_tokens) > token_budget)
+        if index > page_start
+            && (index - page_start >= rows
+                || page_tokens.saturating_add(item_tokens) > token_budget)
         {
-            pages.push(std::mem::take(&mut page));
+            pages.push(&items[page_start..index]);
+            page_start = index;
             page_tokens = 0;
         }
-        page.push(item.clone());
         page_tokens = page_tokens.saturating_add(item_tokens);
     }
-    if !page.is_empty() {
-        pages.push(page);
+    if page_start < items.len() {
+        pages.push(&items[page_start..]);
     }
     pages
 }
@@ -1837,6 +1954,62 @@ fn hex_sha256(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn audit10_47_transport_label_does_not_turn_missing_route_into_timeout() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = SynapseState {
+            connection_file: directory.path().join("timeout-model/absent.json"),
+            route_project_root: directory.path().to_path_buf(),
+            route_harness: "aft".to_string(),
+            model: "timeout-model".to_string(),
+            call_timeout: Duration::from_secs(10),
+            required_operations: &[],
+            connection: SynapseConnection::new().unwrap(),
+            consecutive_timeouts: 0,
+            circuit_open_until: None,
+        };
+        let error = state
+            .call_with_retries("embed.query", json!({}), &mut false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, SynapseEmbeddingError::DaemonUnavailable(_)),
+            "{error}"
+        );
+        assert_eq!(state.consecutive_timeouts, 0);
+    }
+
+    #[test]
+    fn audit10_47_call_failure_uses_typed_timeout_cause() {
+        let timeout = subc_client_rs::CallError::OutcomeUnknown(Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "deadline elapsed",
+        )));
+        assert!(matches!(
+            classify_call_failure("embed.query", &timeout),
+            SynapseEmbeddingError::Timeout(_)
+        ));
+        let transport = subc_client_rs::CallError::NotSent(Box::new(std::io::Error::other(
+            "timeout-model is unavailable",
+        )));
+        assert!(matches!(
+            classify_call_failure("embed.query", &transport),
+            SynapseEmbeddingError::DaemonUnavailable(_)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn synapse_presend_failure_before_deadline_stays_unavailable() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let error = CallError::NotSent(Box::new(std::io::Error::other(
+            "timeout-model is unavailable",
+        )));
+        assert!(matches!(
+            classify_attempt_failure(QUERY_OPERATION, &error, deadline),
+            SynapseEmbeddingError::DaemonUnavailable(_)
+        ));
+    }
+
     #[test]
     fn model_loading_synapse_failure_is_classified_as_waiting_only_for_its_cause() {
         assert_eq!(
@@ -2318,6 +2491,49 @@ mod tests {
                 },
             );
         });
+    }
+
+    #[test]
+    fn audit10_batch_pages_borrow_original_items() {
+        let items = vec![item("a", "first"), item("b", "second"), item("c", "third")];
+        let pages = super::split_batch_pages(&items, 2, usize::MAX);
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].len(), 2);
+        assert_eq!(pages[1].len(), 1);
+        assert_eq!(pages[0].as_ptr(), items.as_ptr());
+        assert_eq!(pages[1].as_ptr(), items[2..].as_ptr());
+        let pages = super::split_batch_pages(&items, 10, 2);
+        assert_eq!(
+            pages.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            vec![1, 1, 1]
+        );
+        assert!(super::split_batch_pages(&[], 10, 10).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn audit10_synapse_deadline_includes_route_and_retry_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = super::SynapseState {
+            connection_file: dir.path().join("absent.json"),
+            route_project_root: dir.path().to_path_buf(),
+            route_harness: "aft".to_string(),
+            model: "test".to_string(),
+            call_timeout: std::time::Duration::from_millis(1),
+            required_operations: &[],
+            connection: super::SynapseConnection::new().unwrap(),
+            consecutive_timeouts: 0,
+            circuit_open_until: None,
+        };
+        let error = state
+            .call("embed.query", serde_json::json!({}), state.call_timeout)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, super::SynapseEmbeddingError::Timeout(_)),
+            "{error}"
+        );
+        assert_eq!(state.consecutive_timeouts, 1);
+        assert!(state.connection.active.lock().await.is_none());
     }
 
     use super::*;

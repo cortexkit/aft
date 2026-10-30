@@ -42,6 +42,48 @@ fn signature(walk: &ApplicabilityWalk) -> Vec<String> {
     result
 }
 
+/// The parts of a walk that do not depend on directory listing order: the
+/// selected server keys with their definitions, and the server kinds with a
+/// root marker. Which file is recorded for a key or marker follows listing
+/// order, so only its existence is checked.
+fn canonical(walk: &ApplicabilityWalk) -> (Vec<String>, Vec<String>) {
+    for candidate in &walk.candidates {
+        assert!(
+            candidate.source_file.is_file(),
+            "recorded file {} for {:?} no longer exists",
+            candidate.source_file.display(),
+            candidate.key
+        );
+    }
+    for (kind, (_, dir, name)) in &walk.markers {
+        assert!(
+            dir.join(name).is_file(),
+            "recorded {kind:?} marker {} no longer exists",
+            dir.join(name).display()
+        );
+    }
+    let mut keys: Vec<_> = walk
+        .candidates
+        .iter()
+        .map(|candidate| {
+            format!(
+                "{:?} {} {:?}",
+                candidate.key.kind,
+                candidate.key.root.display(),
+                candidate.definition
+            )
+        })
+        .collect();
+    keys.sort();
+    let mut markers: Vec<_> = walk
+        .markers
+        .keys()
+        .map(|kind| format!("{kind:?}"))
+        .collect();
+    markers.sort();
+    (keys, markers)
+}
+
 fn measured<T>(f: impl FnOnce() -> T) -> (T, Vec<PathBuf>, Duration) {
     crate::inspect::job::CANONICALIZE_CALLS.with(|calls| *calls.borrow_mut() = Some(Vec::new()));
     let start = Instant::now();
@@ -658,23 +700,34 @@ fn applicability_walk_selection_inputs_match_across_root_spellings() {
 }
 
 #[test]
-fn applicability_walk_directory_and_ambiguous_modify_invalidate() {
-    for (name, kind) in [
-        ("folder", data_modify()),
-        (
-            "main.py",
-            notify::EventKind::Modify(notify::event::ModifyKind::Any),
-        ),
-    ] {
-        let fixture = WatcherWalkFixture::new();
-        fixture.walk();
-        let path = fixture.root.join(name);
-        if name == "folder" {
-            std::fs::create_dir(&path).unwrap();
-        }
-        fixture.batch(&[path], kind);
-        fixture.assert_one_new_walk();
-    }
+fn applicability_walk_directory_event_invalidates() {
+    let fixture = WatcherWalkFixture::new();
+    fixture.walk();
+    let path = fixture.root.join("folder");
+    std::fs::create_dir(&path).unwrap();
+    fixture.batch(&[path], data_modify());
+    fixture.assert_one_new_walk();
+}
+
+/// A modify event with no more specific subtype is classified from disk: an existing
+/// source file whose server is already selected cannot change the result,
+/// whatever the event was.
+#[test]
+fn applicability_walk_ambiguous_modify_of_covered_source_keeps_result() {
+    let fixture = WatcherWalkFixture::new();
+    fixture.walk();
+    fixture.batch(
+        &[fixture.root.join("main.py")],
+        notify::EventKind::Modify(notify::event::ModifyKind::Any),
+    );
+    let result = fixture.walk();
+    let metrics = fixture.cache.metrics(&fixture.root);
+    assert_eq!(metrics.full_walks, 1);
+    assert_eq!(metrics.retained_topology_batches, 1);
+    assert_eq!(
+        canonical(&result),
+        canonical(&scan(&fixture.root, &fixture.config))
+    );
 }
 
 #[cfg(unix)]
@@ -690,6 +743,33 @@ fn applicability_walk_symlinked_selection_input_content_invalidates() {
     // The watcher resolves the symlink, so its event names the target rather
     // than Cargo.toml. The captured input's identity must still invalidate it.
     fixture.batch(&[target], data_modify());
+    fixture.assert_one_new_walk();
+    assert_eq!(
+        fixture.cache.metrics(&fixture.root).invalidations["marker_ignore_config_or_ts_install"],
+        1
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn applicability_walk_replaced_symlinked_input_target_invalidates() {
+    let fixture = WatcherWalkFixture::new();
+    let target = fixture.root.join("workspace.settings");
+    std::fs::write(&target, "[workspace]\nmembers = []\n").unwrap();
+    std::os::unix::fs::symlink(&target, fixture.root.join("Cargo.toml")).unwrap();
+    std::fs::write(fixture.root.join("lib.rs"), "pub fn example() {}\n").unwrap();
+    fixture.walk();
+    // An atomic save writes a new file and renames it over the target, so
+    // the target's identity changes and only its path can match the input.
+    let staged = fixture.root.join("workspace.settings.new");
+    std::fs::write(&staged, "[package]\nname = 'app'\nversion = '0.1.0'\n").unwrap();
+    std::fs::rename(&staged, &target).unwrap();
+    fixture.batch(
+        &[staged, target],
+        notify::EventKind::Modify(notify::event::ModifyKind::Name(
+            notify::event::RenameMode::Both,
+        )),
+    );
     fixture.assert_one_new_walk();
     assert_eq!(
         fixture.cache.metrics(&fixture.root).invalidations["marker_ignore_config_or_ts_install"],
@@ -974,6 +1054,7 @@ fn legacy_scoped_walk(
     ApplicabilityWalk {
         candidates,
         markers,
+        entries: 0,
     }
 }
 
@@ -1203,4 +1284,562 @@ fn applicability_walk_repository_measurement() {
     println!("copied_files={copied} legacy: canonicalize={} elapsed={old_time:?}; lexical: canonicalize={} elapsed={new_time:?}; cached: canonicalize={} elapsed={cached_time:?}", old_calls.len(), new_calls.len(), cached_calls.len());
     assert_eq!(signature(&old), signature(&new));
     assert_eq!(new_calls, vec![root]);
+}
+
+/// Mirror the TypeScript-selection half of `invalidate_applicability_batch`,
+/// which these tests bypass to use their own cache.
+fn forget_typescript_selection_for(paths: &[PathBuf]) {
+    if paths.iter().any(|path| !path.is_file()) {
+        super::super::typescript_project::clear_typescript_selection();
+    } else {
+        super::super::typescript_project::invalidate_typescript_selection(
+            paths.iter().map(PathBuf::as_path),
+        );
+    }
+}
+
+/// Creating source files of languages the walk already selected, in
+/// directories it visited, keeps the cached result without a walk. So does a
+/// file in a hidden directory the walk never enters.
+#[test]
+fn applicability_walk_plain_source_creates_cause_no_full_walk() {
+    let fixture = WatcherWalkFixture::new();
+    std::fs::write(fixture.root.join("main.go"), "package main").unwrap();
+    std::fs::create_dir(fixture.root.join("lib")).unwrap();
+    std::fs::write(fixture.root.join("lib/util.py"), "").unwrap();
+    std::fs::write(fixture.root.join("lib/util.go"), "package lib").unwrap();
+    let before = fixture.walk();
+    std::fs::create_dir(fixture.root.join(".cache")).unwrap();
+    let create = notify::EventKind::Create(notify::event::CreateKind::File);
+    for n in 0..20 {
+        let paths = [
+            fixture.root.join(format!("extra{n}.py")),
+            fixture.root.join(format!("lib/extra{n}.go")),
+            fixture.root.join(format!("notes{n}.txt")),
+            // A shell script would select the Bash server, which no walked file
+            // selects; the walk never enters the hidden directory.
+            fixture.root.join(format!(".cache/scratch{n}.sh")),
+        ];
+        for path in &paths {
+            std::fs::write(path, "").unwrap();
+        }
+        fixture.batch(&paths, create);
+        assert_eq!(canonical(&fixture.walk()), canonical(&before), "batch {n}");
+    }
+    let metrics = fixture.cache.metrics(&fixture.root);
+    assert_eq!(metrics.full_walks, 1, "plain source creates must not walk");
+    assert_eq!(metrics.retained_topology_batches, 20);
+    assert_eq!(
+        canonical(&before),
+        canonical(&scan(&fixture.root, &fixture.config))
+    );
+}
+
+/// Deterministic xorshift generator, so a failing sequence can be replayed.
+struct Sequence(u64);
+
+impl Sequence {
+    fn below(&mut self, bound: usize) -> usize {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 % bound as u64) as usize
+    }
+}
+
+/// Random create, remove and rename batches over a mixed-language tree: after
+/// every batch, the cached result (kept or walked again) must equal a fresh
+/// walk of the tree.
+#[test]
+fn applicability_walk_incremental_batches_match_fresh_walks() {
+    let mut retained = 0;
+    let mut walks = 0;
+    for seed in [
+        0x9e37_79b9_7f4a_7c15,
+        7,
+        42,
+        1234,
+        0xdead_beef,
+        31,
+        99,
+        2024,
+        0x5eed,
+        65_537,
+        777,
+        13,
+        0xc0ffee,
+        4096,
+        123_456_789,
+        8,
+    ] {
+        let (kept, walked) = differential_sequence(seed, 80);
+        retained += kept;
+        walks += walked;
+    }
+    // Both the kept and the walked paths must have run for the comparison to
+    // cover the incremental decision.
+    println!("kept={retained} walked={walks}");
+    assert!(
+        retained > 40,
+        "only {retained} batches kept the cached result"
+    );
+    assert!(walks > 20, "only {walks} batches walked again");
+}
+
+fn differential_sequence(seed: u64, batches: usize) -> (u64, u64) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    std::fs::create_dir(root.join(".git")).unwrap();
+    for (name, contents) in [
+        (".gitignore", "ignored/\n"),
+        ("Cargo.toml", "[workspace]\nmembers = ['crates/*']\n"),
+        (
+            "crates/core/Cargo.toml",
+            "[package]\nname = 'core'\nversion = '0.1.0'\n",
+        ),
+        ("crates/core/src/lib.rs", ""),
+        ("go/go.mod", "module example.test/go\n"),
+        ("go/main.go", "package main"),
+        ("web/package.json", "{}"),
+        ("web/src/index.ts", ""),
+        ("web/src/app.js", ""),
+        (
+            "web/node_modules/typescript/package.json",
+            r#"{"name":"typescript","version":"7.0.2"}"#,
+        ),
+        ("pkg/package.json", "{}"),
+        ("py/pyproject.toml", "[project]\nname = 'py'\n"),
+        ("py/app.py", ""),
+        ("scripts/run.sh", ""),
+        ("docs/readme.md", ""),
+        ("ignored/skip.py", ""),
+        ("node_modules/pkg/index.js", ""),
+        (".cache/tmp.py", ""),
+    ] {
+        let path = root.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+    let mut config = config(&root);
+    // Biome probes directories above the checkout, which parallel tests change.
+    config.disabled_lsp.insert("biome".into());
+    let mut dirs: Vec<PathBuf> = [
+        "",
+        "crates/core/src",
+        "go",
+        "web/src",
+        "pkg",
+        "py",
+        "scripts",
+        "docs",
+        "ignored",
+        "node_modules/pkg",
+        ".cache",
+    ]
+    .iter()
+    .map(|dir| root.join(dir))
+    .collect();
+    let mut files: Vec<PathBuf> = [
+        "crates/core/src/lib.rs",
+        "go/main.go",
+        "web/src/index.ts",
+        "web/src/app.js",
+        "py/app.py",
+        "scripts/run.sh",
+        "docs/readme.md",
+        "ignored/skip.py",
+        "node_modules/pkg/index.js",
+        ".cache/tmp.py",
+    ]
+    .iter()
+    .map(|file| root.join(file))
+    .collect();
+    let extensions = [
+        "py", "go", "rs", "ts", "js", "sh", "yaml", "txt", "md", "c", "lua", "tmp",
+    ];
+    let markers = [
+        (
+            "Cargo.toml",
+            "[package]\nname = 'extra'\nversion = '0.1.0'\n",
+        ),
+        ("go.mod", "module example.test/extra\n"),
+        ("package.json", "{}"),
+        ("pyproject.toml", "[project]\nname = 'extra'\n"),
+    ];
+    let cache = ApplicabilityCache::default();
+    let walk = || {
+        cache
+            .walk(
+                &root,
+                &config,
+                Instant::now() + Duration::from_secs(30),
+                || Ok(scan(&root, &config)),
+            )
+            .unwrap()
+    };
+    walk();
+    let mut sequence = Sequence(seed);
+    let mut counter = 0;
+    for batch in 0..batches {
+        let mut paths = Vec::new();
+        if batch == 0 {
+            // Removing an installed TypeScript reported as its enclosing
+            // `node_modules` alone: no recorded file or marker is below it,
+            // but the walk read the install to choose the TypeScript server.
+            let modules = root.join("web/node_modules");
+            std::fs::remove_dir_all(&modules).unwrap();
+            paths.push(modules);
+        }
+        let operations = if batch == 0 { 0 } else { 1 + sequence.below(3) };
+        for _ in 0..operations {
+            counter += 1;
+            match sequence.below(100) {
+                30..=34 => {
+                    // Install or remove one package's TypeScript, reported as
+                    // the topmost directory that appeared or disappeared.
+                    let package = root.join(["", "web", "pkg"][sequence.below(3)]);
+                    if !package.is_dir() {
+                        continue;
+                    }
+                    let modules = package.join("node_modules");
+                    if modules.exists() && sequence.below(2) == 0 {
+                        std::fs::remove_dir_all(&modules).unwrap();
+                        files.retain(|file| !file.starts_with(&modules));
+                        dirs.retain(|dir| !dir.starts_with(&modules));
+                        paths.push(modules);
+                    } else {
+                        let version = ["5.4.5", "5.9.3", "7.0.2"][sequence.below(3)];
+                        let install = modules.join("typescript");
+                        let reported = if modules.exists() {
+                            install.clone()
+                        } else {
+                            modules
+                        };
+                        std::fs::create_dir_all(&install).unwrap();
+                        std::fs::write(
+                            install.join("package.json"),
+                            format!(r#"{{"name":"typescript","version":"{version}"}}"#),
+                        )
+                        .unwrap();
+                        paths.push(reported);
+                    }
+                }
+                0..=29 => {
+                    let dir = &dirs[sequence.below(dirs.len())];
+                    let ext = extensions[sequence.below(extensions.len())];
+                    let file = dir.join(format!("f{counter}.{ext}"));
+                    std::fs::write(&file, "").unwrap();
+                    paths.push(file.clone());
+                    files.push(file);
+                }
+                35..=59 if !files.is_empty() => {
+                    let file = files.swap_remove(sequence.below(files.len()));
+                    std::fs::remove_file(&file).unwrap();
+                    paths.push(file);
+                }
+                60..=74 if !files.is_empty() => {
+                    let index = sequence.below(files.len());
+                    let dir = &dirs[sequence.below(dirs.len())];
+                    let ext = extensions[sequence.below(extensions.len())];
+                    let to = dir.join(format!("f{counter}.{ext}"));
+                    std::fs::rename(&files[index], &to).unwrap();
+                    paths.push(std::mem::replace(&mut files[index], to.clone()));
+                    paths.push(to);
+                }
+                75..=82 => {
+                    let dir = &dirs[sequence.below(dirs.len())];
+                    let (name, contents) = markers[sequence.below(markers.len())];
+                    let marker = dir.join(name);
+                    if !marker.exists() {
+                        std::fs::write(&marker, contents).unwrap();
+                        files.push(marker.clone());
+                    }
+                    paths.push(marker);
+                }
+                83..=94 => {
+                    let parent = &dirs[sequence.below(dirs.len())];
+                    let dir = parent.join(format!("d{counter}"));
+                    std::fs::create_dir(&dir).unwrap();
+                    // Some watchers report a new directory's files without the
+                    // directory itself.
+                    if sequence.below(2) == 0 {
+                        paths.push(dir.clone());
+                    }
+                    if sequence.below(2) == 0 {
+                        let ext = extensions[sequence.below(extensions.len())];
+                        let file = dir.join(format!("f{counter}.{ext}"));
+                        std::fs::write(&file, "").unwrap();
+                        paths.push(file.clone());
+                        files.push(file);
+                    }
+                    dirs.push(dir);
+                }
+                95..=97 if dirs.len() > 1 => {
+                    let dir = dirs[1 + sequence.below(dirs.len() - 1)].clone();
+                    let to = root.join(format!("r{counter}"));
+                    std::fs::rename(&dir, &to).unwrap();
+                    let moved = |path: &mut PathBuf| {
+                        if let Ok(relative) = path.strip_prefix(&dir) {
+                            *path = to.join(relative);
+                        }
+                    };
+                    files.iter_mut().for_each(moved);
+                    dirs.iter_mut().for_each(moved);
+                    paths.push(dir);
+                    paths.push(to);
+                }
+                98.. if dirs.len() > 1 => {
+                    let dir = dirs[1 + sequence.below(dirs.len() - 1)].clone();
+                    std::fs::remove_dir_all(&dir).unwrap();
+                    // A recursive removal may be reported as the directory
+                    // alone, or with the files it held.
+                    let report_files = sequence.below(2) == 0;
+                    files.retain(|file| {
+                        let inside = file.starts_with(&dir);
+                        if inside && report_files {
+                            paths.push(file.clone());
+                        }
+                        !inside
+                    });
+                    dirs.retain(|other| !other.starts_with(&dir));
+                    paths.push(dir);
+                }
+                _ => {}
+            }
+        }
+        if paths.is_empty() {
+            continue;
+        }
+        forget_typescript_selection_for(&paths);
+        cache.invalidate_batch(&root, &paths, false);
+        let cached = walk();
+        let fresh = scan(&root, &config);
+        assert_eq!(
+            canonical(&cached),
+            canonical(&fresh),
+            "seed {seed} batch {batch} paths {paths:?}"
+        );
+    }
+    let metrics = cache.metrics(&root);
+    (metrics.retained_topology_batches, metrics.full_walks - 1)
+}
+
+#[cfg(unix)]
+fn thread_cpu_time() -> Duration {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `time` is a valid, writable timespec for the call to fill.
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
+        0
+    );
+    Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+}
+
+/// Replays 1,000 create and remove events on a 20,000-file tree, each
+/// followed by a lookup as an inspection would make. "before" handles each
+/// batch as the cache did before topology batches were checked, invalidating
+/// the result; "after" uses the batch classification.
+#[cfg(unix)]
+#[test]
+#[ignore = "builds a 20,000-file tree for a before/after measurement"]
+fn applicability_walk_create_remove_burst_measurement() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    std::fs::create_dir(root.join(".git")).unwrap();
+    std::fs::write(root.join("package.json"), "{}").unwrap();
+    std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+    std::fs::write(root.join("go.mod"), "module example.test/app\n").unwrap();
+    std::fs::write(root.join("pyproject.toml"), "[project]\nname = 'app'\n").unwrap();
+    let extensions = ["ts", "py", "rs", "go", "sh", "yaml", "txt", "md"];
+    for directory in 0..200 {
+        let dir = root.join(format!("packages/pkg{directory}/src"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in 0..100 {
+            let extension = extensions[file % extensions.len()];
+            std::fs::write(dir.join(format!("file{file}.{extension}")), "").unwrap();
+        }
+    }
+    let mut config = config(&root);
+    config.disabled_lsp.insert("biome".into());
+    for incremental in [false, true] {
+        let cache = ApplicabilityCache::default();
+        let walk = || {
+            cache
+                .walk(
+                    &root,
+                    &config,
+                    Instant::now() + Duration::from_secs(60),
+                    || Ok(scan(&root, &config)),
+                )
+                .unwrap()
+        };
+        walk();
+        let walks_before = cache.metrics(&root).full_walks;
+        let walk_micros_before = cache.metrics(&root).full_walk_micros;
+        let cpu = thread_cpu_time();
+        let wall = Instant::now();
+        for n in 0..500 {
+            let file = root.join(format!(
+                "packages/pkg{}/src/burst{n}.{}",
+                n % 200,
+                extensions[n % extensions.len()]
+            ));
+            for create in [true, false] {
+                if create {
+                    std::fs::write(&file, "").unwrap();
+                } else {
+                    std::fs::remove_file(&file).unwrap();
+                }
+                let paths = std::slice::from_ref(&file);
+                forget_typescript_selection_for(paths);
+                if incremental {
+                    cache.invalidate_batch(&root, paths, false);
+                } else {
+                    cache.invalidate(&root, InvalidationCause::CreateRemoveRename);
+                }
+                walk();
+            }
+        }
+        let cpu = thread_cpu_time() - cpu;
+        let metrics = cache.metrics(&root);
+        println!(
+            "{} events=1000 files=20000 full_walks={} cpu={cpu:?} wall={:?} full_walk_time={:?}",
+            if incremental { "after" } else { "before" },
+            metrics.full_walks - walks_before,
+            wall.elapsed(),
+            Duration::from_micros(metrics.full_walk_micros - walk_micros_before),
+        );
+        if incremental {
+            assert_eq!(metrics.full_walks, walks_before);
+        }
+    }
+}
+
+/// A fresh walk counts every directory it enters as well as every file, and
+/// reports an incomplete result past [`APPLICABILITY_WALK_ENTRY_LIMIT`]
+/// entries. A covered file kept without a walk must count its new parent
+/// directories too, even when the watcher reported only the file.
+#[test]
+fn applicability_walk_entry_estimate_counts_new_parent_directories_at_the_limit() {
+    let fixture = WatcherWalkFixture::new();
+    let real_entries = scan(&fixture.root, &fixture.config).entries;
+    let create = notify::EventKind::Create(notify::event::CreateKind::File);
+    for (walked_entries, file, walks_again) in [
+        // One past the limit: a fresh walk reports an incomplete result.
+        (
+            APPLICABILITY_WALK_ENTRY_LIMIT - 2,
+            "fresh/deeper/extra.py",
+            true,
+        ),
+        (APPLICABILITY_WALK_ENTRY_LIMIT - 1, "fresh/extra.py", true),
+        // Exactly at the limit: a fresh walk still completes.
+        (
+            APPLICABILITY_WALK_ENTRY_LIMIT - 3,
+            "fresh/deeper/extra.py",
+            false,
+        ),
+        (APPLICABILITY_WALK_ENTRY_LIMIT - 1, "extra.py", false),
+    ] {
+        let cache = ApplicabilityCache::default();
+        // Pretend the tree already held all but a few entries of the limit.
+        let walk = || {
+            cache
+                .walk(
+                    &fixture.root,
+                    &fixture.config,
+                    Instant::now() + Duration::from_secs(10),
+                    || {
+                        let mut walk = scan(&fixture.root, &fixture.config);
+                        walk.entries = walk.entries - real_entries + walked_entries;
+                        Ok(walk)
+                    },
+                )
+                .unwrap()
+        };
+        walk();
+        let path = fixture.root.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "").unwrap();
+        let added = Path::new(file).components().count();
+        assert_eq!(
+            scan(&fixture.root, &fixture.config).entries,
+            real_entries + added,
+            "a fresh walk counts the file and each new directory"
+        );
+        cache.invalidate_batch(
+            &fixture.root,
+            std::slice::from_ref(&path),
+            crate::watcher_filter::watcher_event_is_content_only(&create),
+        );
+        walk();
+        assert_eq!(
+            cache.metrics(&fixture.root).full_walks,
+            1 + u64::from(walks_again),
+            "{file} with {walked_entries} walked entries"
+        );
+        std::fs::remove_dir_all(fixture.root.join("fresh")).ok();
+        std::fs::remove_file(fixture.root.join("extra.py")).ok();
+    }
+}
+
+/// The root and a child package each install the same TypeScript, and only
+/// the root has TypeScript sources, so the walk never reads the child's
+/// install. The child's first TypeScript file shares the root's server and is
+/// kept without a walk, but deciding that read the child's install. Removing
+/// the child's `node_modules`, reported alone, must then walk again.
+#[test]
+fn applicability_walk_kept_create_records_the_inputs_it_read() {
+    let mut fixture = WatcherWalkFixture::new();
+    // Oxlint looks for its configuration above the checkout, in directories
+    // parallel tests change; this test counts walks.
+    fixture.config.disabled_lsp.insert("oxlint".into());
+    let typescript = r#"{"name":"typescript","version":"5.4.5"}"#;
+    for (name, contents) in [
+        ("node_modules/typescript/package.json", typescript),
+        ("src/index.ts", ""),
+        ("pkg/package.json", "{}"),
+        ("pkg/node_modules/typescript/package.json", typescript),
+    ] {
+        let path = fixture.root.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+    super::super::typescript_project::clear_typescript_selection();
+    fixture.walk();
+    let source = fixture.root.join("pkg/a.ts");
+    std::fs::write(&source, "").unwrap();
+    let created = [source];
+    forget_typescript_selection_for(&created);
+    fixture.batch(
+        &created,
+        notify::EventKind::Create(notify::event::CreateKind::File),
+    );
+    fixture.walk();
+    assert_eq!(
+        fixture.cache.metrics(&fixture.root).full_walks,
+        1,
+        "the child's file shares the root's TypeScript server: {:?}",
+        fixture.cache.metrics(&fixture.root)
+    );
+    let modules = fixture.root.join("pkg/node_modules");
+    std::fs::remove_dir_all(&modules).unwrap();
+    let removed = [modules];
+    forget_typescript_selection_for(&removed);
+    fixture.batch(
+        &removed,
+        notify::EventKind::Remove(notify::event::RemoveKind::Folder),
+    );
+    let result = fixture.walk();
+    assert_eq!(
+        canonical(&result),
+        canonical(&scan(&fixture.root, &fixture.config))
+    );
+    assert_eq!(
+        fixture.cache.metrics(&fixture.root).full_walks,
+        2,
+        "removing an install the kept create read must walk again"
+    );
 }

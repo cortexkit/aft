@@ -1,0 +1,20 @@
+{
+  "name": "accepted-reopen-issue",
+  "request": {
+    "operation": "gh.route",
+    "gh_route_schema": 1,
+    "verb": "issue reopen",
+    "repository": "cortexkit/aft",
+    "number": "42",
+    "manifest_version": 22,
+    "rung_as_of_unix_secs": 1793066213,
+    "metadata": {
+      "agent_id": "alfonso-aft",
+      "pid": 4242
+    },
+    "comment": "Reopening for another pass."
+  },
+  "expect": {
+    "accepted": true
+  }
+}

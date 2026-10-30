@@ -16,7 +16,7 @@ export { intro, log, note, outro, spinner };
 function handleCancel(value: unknown, message = "Cancelled."): void {
   if (isCancel(value)) {
     log.warn(message);
-    process.exit(0);
+    process.exit(130);
   }
 }
 

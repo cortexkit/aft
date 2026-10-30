@@ -1,4 +1,4 @@
-//! Background retry for a root whose bind found aft.db busy.
+//! Background bind retries for transient database or cache coordination contention.
 //!
 //! A bind reads older standing-root pins from aft.db without waiting, so a
 //! database held by another writer leaves the root's identity provisional:
@@ -19,6 +19,11 @@
 //! attached daemon it also, like a route bind, takes over from standing-root
 //! maintenance every entry that shares the now settled key before the
 //! session's indexes start loading.
+//!
+//! A bind whose cache coordination file stayed busy after its bounded open
+//! attempts uses the same admission and root-lifetime checks for repeated
+//! recovery. Cache retries back off from one second to a sixty-second ceiling,
+//! without giving up while the root stays bound and its cache stays busy.
 //!
 //! The replay runs with the admission a bind of the root gets, never inside
 //! the maintenance job that noticed the free database. Configure publishes
@@ -51,6 +56,8 @@ const MAX_DELAY: Duration = Duration::from_secs(10);
 /// Stop retrying once this long has passed since the bind. The exhausted
 /// degraded reason names this window, so keep both in step.
 const GIVE_UP_AFTER: Duration = Duration::from_secs(5 * 60);
+const CACHE_FIRST_DELAY: Duration = Duration::from_secs(1);
+const CACHE_MAX_DELAY: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy)]
 struct Timing {
@@ -68,6 +75,33 @@ const PRODUCTION_TIMING: Timing = Timing {
 #[cfg(test)]
 thread_local! {
     static TIMING_FOR_TEST: std::cell::Cell<Option<Timing>> = const { std::cell::Cell::new(None) };
+    static NOW_FOR_TEST: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+fn now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = NOW_FOR_TEST.with(std::cell::Cell::get) {
+        return now;
+    }
+    Instant::now()
+}
+
+#[cfg(test)]
+pub(crate) fn with_clock_for_test<T>(body: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Instant>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            NOW_FOR_TEST.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(NOW_FOR_TEST.with(|slot| slot.replace(Some(Instant::now()))));
+    body()
+}
+
+#[cfg(test)]
+pub(crate) fn advance_clock_for_test(elapsed: Duration) {
+    NOW_FOR_TEST
+        .with(|slot| slot.set(Some(slot.get().expect("test clock is installed") + elapsed)));
 }
 
 fn timing() -> Timing {
@@ -76,6 +110,19 @@ fn timing() -> Timing {
         return timing;
     }
     PRODUCTION_TIMING
+}
+
+fn cache_timing() -> Timing {
+    #[cfg(test)]
+    if let Some(timing) = TIMING_FOR_TEST.with(std::cell::Cell::get) {
+        return timing;
+    }
+    Timing {
+        first_delay: CACHE_FIRST_DELAY,
+        max_delay: CACHE_MAX_DELAY,
+        // Cache retries have no give-up window; only identity retries use it.
+        give_up_after: Duration::MAX,
+    }
 }
 
 /// Run `body` with retry delays and the give-up window replaced on this
@@ -112,10 +159,20 @@ fn delay_before(attempts: u32, timing: Timing) -> Duration {
         .min(timing.max_delay)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetryKind {
+    Identity,
+    CacheCoordination,
+}
+
 #[derive(Clone)]
 struct PendingRetry {
-    /// The configure request whose bind left the identity provisional.
+    /// The configure request whose bind left a retryable degradation.
     request: RawRequest,
+    prepared_bind: Option<std::sync::Arc<crate::subc_config::PreparedBindConfig>>,
+    kind: RetryKind,
+    root: std::path::PathBuf,
+    connect_generation: u64,
     /// The configure generation that bind published. Any later configure
     /// moves it, which makes this retry stale.
     generation: u64,
@@ -123,6 +180,9 @@ struct PendingRetry {
     attempts: u32,
     next_attempt_at: Instant,
     exhausted: bool,
+    // A prepared replay reserves this slot until it completes or is dropped.
+    // The deadline remains armed if admission drops the prepared replay.
+    cache_claim: std::sync::Weak<()>,
 }
 
 /// Per-root retry state, held by the root's [`AppContext`].
@@ -134,8 +194,11 @@ impl RetrySlot {
     /// slot reads as not due, and the next maintenance tick probes again.
     pub(crate) fn is_due(&self) -> bool {
         self.0.try_lock().is_some_and(|slot| {
-            slot.as_ref()
-                .is_some_and(|retry| !retry.exhausted && Instant::now() >= retry.next_attempt_at)
+            slot.as_ref().is_some_and(|retry| {
+                !retry.exhausted
+                    && retry.cache_claim.strong_count() == 0
+                    && now() >= retry.next_attempt_at
+            })
         })
     }
 
@@ -160,21 +223,35 @@ pub(crate) fn note_configure_outcome(ctx: &AppContext, request: &RawRequest, suc
         // next drain finds the retry stale and drops it.
         return;
     }
-    let busy_at_bind = ctx
-        .degraded_reasons()
+    let reasons = ctx.degraded_reasons();
+    let kind = if reasons
         .iter()
-        .any(|reason| reason == PROVISIONAL_IDENTITY_REASON);
+        .any(|reason| reason == crate::root_cache::CACHE_DIR_BUSY)
+    {
+        Some(RetryKind::CacheCoordination)
+    } else if reasons
+        .iter()
+        .any(|reason| reason == PROVISIONAL_IDENTITY_REASON)
+    {
+        Some(RetryKind::Identity)
+    } else {
+        None
+    };
     let mut slot = ctx.provisional_identity_retry().0.lock();
-    if !busy_at_bind {
+    let Some(kind) = kind else {
         // Settled, provisional for a reason a retry cannot fix, or not
         // needing an identity at all: nothing to retry.
         *slot = None;
         return;
-    }
-    let now = Instant::now();
+    };
+    let Some(root) = ctx.canonical_cache_root_opt() else {
+        *slot = None;
+        return;
+    };
+    let now = now();
     if slot.is_none() {
         crate::slog_info!(
-            "identity provisional (aft.db busy) for root={}; retrying in the background",
+            "bind met transient coordination contention for root={}; retrying in the background",
             ctx.canonical_cache_root_opt()
                 .map(|root| root.display().to_string())
                 .unwrap_or_default()
@@ -182,11 +259,23 @@ pub(crate) fn note_configure_outcome(ctx: &AppContext, request: &RawRequest, suc
     }
     *slot = Some(PendingRetry {
         request: request.clone(),
+        prepared_bind: crate::subc_config::current_prepared_bind_config(),
+        kind,
+        root,
+        connect_generation: ctx.connect_generation(),
         generation: ctx.configure_generation(),
         armed_at: now,
         attempts: 0,
-        next_attempt_at: now + delay_before(0, timing()),
+        next_attempt_at: now
+            + delay_before(
+                0,
+                match kind {
+                    RetryKind::Identity => timing(),
+                    RetryKind::CacheCoordination => cache_timing(),
+                },
+            ),
         exhausted: false,
+        cache_claim: std::sync::Weak::new(),
     });
 }
 
@@ -196,9 +285,25 @@ pub(crate) fn cancel(ctx: &AppContext) -> bool {
     ctx.provisional_identity_retry().0.lock().take().is_some()
 }
 
+/// Whether the current bound root has cache recovery pending, due or admitted.
+/// A busy root without recovery must not promise an automatic retry to agents.
+pub(crate) fn cache_retry_pending(ctx: &AppContext) -> bool {
+    let Some(retry) = ctx
+        .provisional_identity_retry()
+        .0
+        .try_lock()
+        .and_then(|slot| slot.clone())
+    else {
+        return false;
+    };
+    retry.kind == RetryKind::CacheCoordination
+        && !retry.exhausted
+        && stale_reason(ctx, &retry).is_none()
+}
+
 /// Why `retry` is no longer safe to replay, if it is not. It may be replayed
 /// only for the configure generation that armed it, while the root is bound
-/// and its identity is still provisional because aft.db was busy. Otherwise
+/// and its retryable degradation is still present. Otherwise
 /// the root is unbound, a newer configure superseded the retry, the root is
 /// missing, the identity is provisional for a reason a retry cannot fix, or
 /// it has already settled and must not be keyed again.
@@ -221,15 +326,29 @@ fn stale_reason(ctx: &AppContext, retry: &PendingRetry) -> Option<&'static str> 
     if retry.generation != ctx.configure_generation() {
         return Some("superseded");
     }
-    match ctx.artifact_identity_provisional_reason() {
-        None => return Some("settled"),
-        Some(reason) if reason != PROVISIONAL_IDENTITY_REASON => {
-            return Some("not_provisional");
+    match retry.kind {
+        RetryKind::CacheCoordination => {
+            if retry.connect_generation != ctx.connect_generation() {
+                return Some("newer_connect");
+            }
+            if !ctx
+                .degraded_reasons()
+                .iter()
+                .any(|reason| reason == crate::root_cache::CACHE_DIR_BUSY)
+            {
+                return Some("settled");
+            }
         }
-        Some(_) => {}
+        RetryKind::Identity => match ctx.artifact_identity_provisional_reason() {
+            None => return Some("settled"),
+            Some(reason) if reason != PROVISIONAL_IDENTITY_REASON => {
+                return Some("not_provisional");
+            }
+            Some(_) => {}
+        },
     }
-    if ctx.canonical_cache_root_opt().is_none() {
-        return Some("no_root");
+    if ctx.canonical_cache_root_opt().as_ref() != Some(&retry.root) {
+        return Some("root_changed");
     }
     None
 }
@@ -250,20 +369,47 @@ pub(crate) fn poll(ctx: &AppContext) -> Option<PreparedReplay> {
     if !slot.is_due() {
         return None;
     }
-    let mut retry = slot.0.lock().take()?;
+    let (retry, cache_claim) = {
+        let mut pending = slot.0.lock();
+        let retry = pending.as_mut()?;
+        if retry.exhausted || retry.cache_claim.strong_count() > 0 || now() < retry.next_attempt_at
+        {
+            return None;
+        }
+        if retry.kind == RetryKind::CacheCoordination {
+            let claim = std::sync::Arc::new(());
+            retry.cache_claim = std::sync::Arc::downgrade(&claim);
+            // Keep a bounded fallback deadline if admission drops the replay.
+            retry.next_attempt_at = now() + delay_before(retry.attempts, cache_timing());
+            (retry.clone(), Some(claim))
+        } else {
+            retry.attempts = retry.attempts.saturating_add(1);
+            (pending.take()?, None)
+        }
+    };
     if stale_reason(ctx, &retry).is_some() {
+        let mut pending = slot.0.lock();
+        if pending.as_ref().is_some_and(|current| {
+            current.generation == retry.generation
+                && current.root == retry.root
+                && current.armed_at == retry.armed_at
+        }) {
+            pending.take();
+        }
         return None;
     }
-    let root = ctx.canonical_cache_root_opt()?;
-    let storage = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
-    retry.attempts = retry.attempts.saturating_add(1);
-    if !crate::root_identity::legacy_pins_readable(&root, &storage) {
-        reschedule(ctx, &root, retry, timing());
-        return None;
+    let root = retry.root.clone();
+    if retry.kind == RetryKind::Identity {
+        let storage = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+        if !crate::root_identity::legacy_pins_readable(&root, &storage) {
+            reschedule(ctx, &root, retry, timing());
+            return None;
+        }
     }
     Some(PreparedReplay {
         retry: std::sync::Arc::new(parking_lot::Mutex::new(Some(retry))),
         root,
+        _cache_claim: cache_claim,
     })
 }
 
@@ -294,6 +440,7 @@ pub(crate) fn drain_inline(ctx: &AppContext) -> bool {
 pub(crate) struct PreparedReplay {
     retry: std::sync::Arc<parking_lot::Mutex<Option<PendingRetry>>>,
     root: std::path::PathBuf,
+    _cache_claim: Option<std::sync::Arc<()>>,
 }
 
 impl std::fmt::Debug for PreparedReplay {
@@ -341,14 +488,37 @@ impl PreparedReplay {
         bind_handoff: impl FnOnce(&AppContext),
     ) -> crate::protocol::Response {
         let id = self.request_id();
-        let Some(retry) = self.retry.lock().clone() else {
+        let Some(mut retry) = self.retry.lock().clone() else {
             return skipped(id, "already_replayed");
         };
         if let Some(reason) = stale_reason(ctx, &retry) {
             self.retry.lock().take();
             return skipped(id, reason);
         }
-        let response = crate::commands::configure::handle_configure(&retry.request, ctx);
+        if retry.kind == RetryKind::CacheCoordination {
+            retry.attempts = retry.attempts.saturating_add(1);
+        }
+        let run = || match retry.kind {
+            RetryKind::Identity => {
+                crate::commands::configure::handle_configure(&retry.request, ctx)
+            }
+            RetryKind::CacheCoordination => {
+                // Cache recovery must preserve the running configuration,
+                // including edits deferred until the next real connect.
+                let mut prepared = (*ctx.config()).clone();
+                crate::root_cache::prepare_cache_root(&mut prepared);
+                crate::commands::configure::handle_cache_recovery(
+                    &retry.request,
+                    retry.connect_generation,
+                    ctx,
+                    &prepared,
+                )
+            }
+        };
+        let response = match retry.prepared_bind.as_ref() {
+            Some(prepared) => crate::subc_config::with_prepared_bind_config(prepared.clone(), run),
+            None => run(),
+        };
         if response.data["code"] == "configure_needs_exclusive" {
             // A shared-hold run handed its worker back before changing the
             // root; the executor runs this job again as an exclusive writer.
@@ -357,7 +527,7 @@ impl PreparedReplay {
         if response.success {
             bind_handoff(ctx);
         }
-        if let Some(retry) = self.retry.lock().take() {
+        if self.retry.lock().take().is_some() {
             finish_replay(ctx, &self.root, retry, &response);
         }
         response
@@ -384,8 +554,25 @@ fn finish_replay(
         slot.0.lock().take();
         return;
     }
+    if retry.kind == RetryKind::CacheCoordination {
+        if let Some(delay) = reschedule_cache_retry(ctx, &retry) {
+            crate::slog_debug!(
+                "cache coordination retry failed for root={} attempt={}; retrying in {}s",
+                root.display(),
+                retry.attempts,
+                delay.as_secs_f64()
+            );
+            if cache_failure_reports_info(retry.attempts) {
+                crate::slog_info!("cache coordination still busy for root={} after {} retry attempt(s); retrying in {}s", root.display(), retry.attempts, delay.as_secs_f64());
+            }
+        }
+        return;
+    }
     let mut rearmed = slot.0.lock();
     match rearmed.take() {
+        Some(next) if next.kind != retry.kind => {
+            *rearmed = Some(next);
+        }
         // The database was taken again between the check and the replay, so
         // the replay re-armed the retry: keep the original window and backoff
         // instead of starting over.
@@ -417,10 +604,43 @@ fn finish_replay(
     }
 }
 
+fn cache_failure_reports_info(attempts: u32) -> bool {
+    attempts == 1 || (attempts > 0 && attempts % 10 == 0)
+}
+
+/// Continue the same cache recovery chain, without reviving cancelled work.
+/// Holding the slot through the bound check and publication pairs with unbind's
+/// cancellation: an unbind either prevents this schedule or removes it afterward.
+fn reschedule_cache_retry(ctx: &AppContext, retry: &PendingRetry) -> Option<Duration> {
+    let mut slot = ctx.provisional_identity_retry().0.lock();
+    let pending = slot.as_mut()?;
+    if pending.kind != RetryKind::CacheCoordination
+        || pending.root != retry.root
+        || pending.connect_generation != retry.connect_generation
+        || ctx.subc_unbound_quiesced()
+        || ctx.canonical_cache_root_opt().as_ref() != Some(&retry.root)
+        || ctx.connect_generation() != retry.connect_generation
+        || !ctx
+            .degraded_reasons()
+            .iter()
+            .any(|reason| reason == crate::root_cache::CACHE_DIR_BUSY)
+    {
+        return None;
+    }
+    pending.armed_at = retry.armed_at;
+    pending.attempts = retry.attempts;
+    pending.generation = ctx.configure_generation();
+    pending.exhausted = false;
+    pending.cache_claim = std::sync::Weak::new();
+    let delay = delay_before(retry.attempts, cache_timing());
+    pending.next_attempt_at = now() + delay;
+    Some(delay)
+}
+
 /// Store `retry` with its next attempt time, or give up once its window has
 /// passed and say so in the root's degraded reasons.
 fn reschedule(ctx: &AppContext, root: &std::path::Path, mut retry: PendingRetry, timing: Timing) {
-    let now = Instant::now();
+    let now = now();
     if now.duration_since(retry.armed_at) >= timing.give_up_after {
         retry.exhausted = true;
         ctx.replace_degraded_reason(
@@ -441,6 +661,33 @@ fn reschedule(ctx: &AppContext, root: &std::path::Path, mut retry: PendingRetry,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_clock_advances_without_sleeping() {
+        with_clock_for_test(|| {
+            let before = now();
+            advance_clock_for_test(Duration::from_secs(2));
+            assert_eq!(now().duration_since(before), Duration::from_secs(2));
+        });
+    }
+
+    #[test]
+    fn cache_backoff_doubles_to_sixty_seconds_without_giving_up() {
+        let timing = cache_timing();
+        let actual = (0..9)
+            .map(|attempt| delay_before(attempt, timing).as_secs())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, vec![1, 2, 4, 8, 16, 32, 60, 60, 60]);
+        assert_eq!(delay_before(u32::MAX, timing), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn cache_failed_retry_info_is_first_and_every_tenth() {
+        let attempts = (0..=31)
+            .filter(|attempt| cache_failure_reports_info(*attempt))
+            .collect::<Vec<_>>();
+        assert_eq!(attempts, vec![1, 10, 20, 30]);
+    }
 
     #[test]
     fn backoff_doubles_from_the_first_delay_to_the_ceiling() {

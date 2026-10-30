@@ -227,13 +227,19 @@ pub fn handle_remove_import(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // --- Write, format, and validate ---
     let _mutation = crate::runtime_drain::record_file_mutation(ctx, [path.as_path()]);
-    let mut write_result =
-        match edit::write_format_validate(&path, &new_source, &ctx.config(), &req.params) {
-            Ok(r) => r,
-            Err(e) => {
-                return Response::error(&req.id, e.code(), e.to_string());
-            }
-        };
+    let tool_policy = &crate::sandbox_spawn::ToolLaunchPolicy::for_request(ctx);
+    let mut write_result = match edit::write_format_validate(
+        tool_policy,
+        &path,
+        &new_source,
+        &ctx.config(),
+        &req.params,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
+    };
 
     if let Ok(final_content) = std::fs::read_to_string(&path) {
         write_result.lsp_outcome = ctx.lsp_post_write(&path, &final_content, &req.params);
@@ -336,7 +342,7 @@ fn remove_name_from_imports(
                         .map(String::as_str)
                         .collect();
                     if remaining.is_empty() {
-                        edits.push((line_range(source, &imp.byte_range), String::new()));
+                        edits.push((line_range(source, &imp.byte_range, lang), String::new()));
                     } else {
                         edits.push((
                             imp.byte_range.clone(),
@@ -353,7 +359,7 @@ fn remove_name_from_imports(
                 match replacement {
                     Some(new_line) => edits.push((imp.byte_range.clone(), new_line)),
                     None => {
-                        let range = line_range(source, &imp.byte_range);
+                        let range = line_range(source, &imp.byte_range, lang);
                         edits.push((range, String::new()));
                     }
                 }
@@ -381,7 +387,7 @@ fn remove_name_from_imports(
                 || !new_names.is_empty();
             if !has_other {
                 // No bindings remain — remove entire statement
-                let range = line_range(source, &imp.byte_range);
+                let range = line_range(source, &imp.byte_range, lang);
                 edits.push((range, String::new()));
             } else {
                 // Other bindings remain — edit the matched list entry in place when
@@ -410,7 +416,7 @@ fn remove_name_from_imports(
             // Removing the default import
             if imp.names.is_empty() && imp.namespace_import.is_none() {
                 // Only default — remove entire statement
-                let range = line_range(source, &imp.byte_range);
+                let range = line_range(source, &imp.byte_range, lang);
                 edits.push((range, String::new()));
             } else {
                 // Has named or namespace imports too — regenerate without default
@@ -431,7 +437,7 @@ fn remove_name_from_imports(
             // Removing the namespace import
             if imp.names.is_empty() && imp.default_import.is_none() {
                 // Only namespace — remove entire statement
-                let range = line_range(source, &imp.byte_range);
+                let range = line_range(source, &imp.byte_range, lang);
                 edits.push((range, String::new()));
             } else {
                 // Has default or named imports too — regenerate without namespace
@@ -581,7 +587,7 @@ fn remove_entire_imports(
                 if let Some(replacement) = imports::rewrite_php_import_without_module(imp, module) {
                     return match replacement {
                         Some(new_line) => (imp.byte_range.clone(), new_line),
-                        None => (line_range(source, &imp.byte_range), String::new()),
+                        None => (line_range(source, &imp.byte_range, lang), String::new()),
                     };
                 }
             }
@@ -600,7 +606,7 @@ fn remove_entire_imports(
                     }
                 }
             }
-            (line_range(source, &imp.byte_range), String::new())
+            (line_range(source, &imp.byte_range, lang), String::new())
         })
         .collect();
     edits.sort_by(|a, b| b.0.start.cmp(&a.0.start));
@@ -638,10 +644,24 @@ fn python_import_matches_module(imp: &imports::ImportStatement, module: &str) ->
     )
 }
 
-/// Expand a byte range to include the full line (including trailing newline).
-fn line_range(source: &str, range: &std::ops::Range<usize>) -> std::ops::Range<usize> {
+/// Expand a deleted statement's byte range to its whole line: the spaces and
+/// same-line comment after it (the comment describes only that statement) and
+/// the line break. Anything else after it on the line, such as a second
+/// statement, is left in place.
+fn line_range(
+    source: &str,
+    range: &std::ops::Range<usize>,
+    lang: LangId,
+) -> std::ops::Range<usize> {
     let start = range.start;
     let mut end = range.end;
+
+    if let Some(tail) = source
+        .get(end..)
+        .and_then(|after| organize_imports::same_line_tail(after, lang))
+    {
+        end += tail.line_end;
+    }
 
     // Include trailing newline
     if end < source.len() {

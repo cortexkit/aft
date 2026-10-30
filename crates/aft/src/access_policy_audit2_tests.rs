@@ -1797,15 +1797,16 @@ fn audit9_ask_after_an_expired_approval_says_so() {
         .to_string();
     plugin::expire_for_test(&token);
     let mut late = scope.clone();
-    let once = plugin::claim(&mut late, &[token]);
+    let once = plugin::claim(&mut late, std::slice::from_ref(&token));
     assert!(once.is_empty());
-    let again = ask_for(late, once);
+    let (again, lines) = crate::logging::capture_log_lines(|| ask_for(late, once));
     assert_eq!(
         again.data["code"], "permission_required",
         "{:?}",
         again.data
     );
     assert_eq!(again.data["asks"][0]["reason"], "approval_expired");
+    assert_outside_retry_log(&lines, "approval_expired", &target, &token);
 }
 
 /// Runs `inspect` through one of its entry points, deferred or not, and
@@ -1956,4 +1957,246 @@ fn audit11_outside_zoom_batch_entry_asks_then_answers_with_the_approval() {
     assert!(text.contains("inside_fn"), "{text}");
     assert!(text.contains("outside_fn"), "{text}");
     assert!(!text.contains("permission_required"), "{text}");
+}
+
+#[test]
+fn outside_grep_grant_round_trip_plain_directory() {
+    let f = Fixture::new();
+    std::fs::create_dir(f.outside.join("packages")).unwrap();
+    std::fs::write(f.outside.join("packages/probe.rs"), "outside_grep_canary\n").unwrap();
+    assert_outside_grep_round_trip(&f, &f.outside);
+}
+
+#[cfg(unix)]
+#[test]
+fn outside_grep_grant_round_trip_symlinked_parent() {
+    let f = Fixture::new();
+    let scratch = f._dir.path().join("CortexKit-scratch");
+    std::fs::create_dir(&scratch).unwrap();
+    std::os::unix::fs::symlink(&f.outside, scratch.join("antigravity-auth-314-prs")).unwrap();
+    std::fs::create_dir(f.outside.join("packages")).unwrap();
+    std::fs::write(f.outside.join("packages/probe.rs"), "outside_grep_canary\n").unwrap();
+    assert_outside_grep_round_trip(&f, &scratch.join("antigravity-auth-314-prs"));
+}
+
+fn assert_outside_grep_round_trip(f: &Fixture, folder: &Path) {
+    let scope = plugin::Scope::new(&f.owner, "audit-session").for_tool("grep", &Value::Null);
+    let run = |path: &Path, tokens: Vec<String>| {
+        let mut scope = scope.clone();
+        let once = plugin::claim(&mut scope, &tokens);
+        let _route = ask_route_guard(Some(AskRoute::Plugin { scope, once }));
+        crate::commands::grep::handle_grep(
+            &request(
+                "grep",
+                json!({"path": path, "pattern": "outside_grep_canary"}),
+            ),
+            &f.ctx,
+        )
+    };
+    for path in [folder.to_path_buf(), folder.join("packages")] {
+        let asked = run(folder, Vec::new());
+        assert_eq!(
+            asked.data["code"], "permission_required",
+            "{:?}",
+            asked.data
+        );
+        assert_eq!(asked.data["asks"][0]["operation"], "read");
+        let token = asked.data["asks"][0]["grant_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let answered = run(&path, vec![token]);
+        assert!(answered.success, "{}: {:?}", path.display(), answered.data);
+        assert!(
+            answered.data.to_string().contains("outside_grep_canary"),
+            "{:?}",
+            answered.data
+        );
+    }
+}
+
+#[test]
+fn outside_grep_grant_round_trip_route_replaced() {
+    let f = Fixture::new();
+    std::fs::create_dir(f.outside.join("packages")).unwrap();
+    std::fs::write(f.outside.join("packages/probe.rs"), "outside_grep_canary\n").unwrap();
+    let run = |mut scope: plugin::Scope, tokens: Vec<String>| {
+        let once = plugin::claim(&mut scope, &tokens);
+        let _route = ask_route_guard(Some(AskRoute::Plugin { scope, once }));
+        crate::commands::grep::handle_grep(
+            &request(
+                "grep",
+                json!({"path": f.outside, "pattern": "outside_grep_canary"}),
+            ),
+            &f.ctx,
+        )
+    };
+    let owner = std::sync::Arc::new(());
+    let scope = plugin::Scope::new(&owner, "audit-session").for_tool("grep", &Value::Null);
+    let asked = run(scope, Vec::new());
+    assert_eq!(
+        asked.data["code"], "permission_required",
+        "{:?}",
+        asked.data
+    );
+    let token = asked.data["asks"][0]["grant_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Closing a daemon route while the host asks the person drops its owner.
+    drop(owner);
+    let replacement = std::sync::Arc::new(());
+    let scope = plugin::Scope::new(&replacement, "audit-session").for_tool("grep", &Value::Null);
+    let (reasked, lines) =
+        crate::logging::capture_log_lines(|| run(scope.clone(), vec![token.clone()]));
+    assert_eq!(
+        reasked.data["code"], "permission_required",
+        "{:?}",
+        reasked.data
+    );
+    assert_eq!(
+        reasked.data["asks"][0]["reason"], "approval_route_replaced",
+        "{:?}",
+        reasked.data
+    );
+    assert!(
+        reasked.data.get("matches").is_none(),
+        "the old route's token must not authorize the replacement"
+    );
+    assert_outside_retry_log(&lines, "approval_route_replaced", &f.outside, &token);
+    let fresh = reasked.data["asks"][0]["grant_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let answered = run(scope, vec![fresh]);
+    assert!(answered.success, "{:?}", answered.data);
+    assert!(
+        answered.data.to_string().contains("outside_grep_canary"),
+        "{:?}",
+        answered.data
+    );
+}
+
+fn assert_outside_retry_log(lines: &[String], reason: &str, path: &Path, token: &str) {
+    let retries: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("outside-access retry refused"))
+        .collect();
+    assert_eq!(retries.len(), 1, "{lines:?}");
+    let line = retries[0];
+    assert!(line.starts_with("INFO "), "{line}");
+    assert!(
+        line.contains(&format!("reason={reason} operation=read ")),
+        "{line}"
+    );
+    let hash = line.split_once("path_hash=").unwrap().1;
+    assert_eq!(hash.len(), 64, "{line}");
+    assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()), "{line}");
+    assert!(!line.contains(path.to_str().unwrap()), "{line}");
+    assert!(!line.contains(token), "{line}");
+}
+
+#[test]
+fn outside_grep_grant_does_not_cover_sibling() {
+    let f = Fixture::new();
+    let sibling = f.outside.with_file_name("outside-sibling");
+    std::fs::create_dir(&sibling).unwrap();
+    assert_outside_grep_grant_refuses(&f, &sibling);
+}
+
+#[cfg(unix)]
+#[test]
+fn outside_grep_grant_does_not_follow_symlink_escape() {
+    let f = Fixture::new();
+    let sibling = f.outside.with_file_name("outside-sibling");
+    std::fs::create_dir(&sibling).unwrap();
+    let escape = f.outside.join("escape");
+    std::os::unix::fs::symlink(&sibling, &escape).unwrap();
+    assert_outside_grep_grant_refuses(&f, &escape);
+}
+
+fn assert_outside_grep_grant_refuses(f: &Fixture, target: &Path) {
+    std::fs::write(f.outside.join("inside.rs"), "outside_grep_canary\n").unwrap();
+    std::fs::write(target.join("secret.rs"), "outside_grep_secret\n").unwrap();
+    let scope = plugin::Scope::new(&f.owner, "audit-session").for_tool("grep", &Value::Null);
+    let run = |path: &Path, tokens: Vec<String>| {
+        let mut scope = scope.clone();
+        let once = plugin::claim(&mut scope, &tokens);
+        let _route = ask_route_guard(Some(AskRoute::Plugin { scope, once }));
+        crate::commands::grep::handle_grep(
+            &request("grep", json!({"path": path, "pattern": "outside_grep_"})),
+            &f.ctx,
+        )
+    };
+    let issue = || {
+        let asked = run(&f.outside, Vec::new());
+        assert_eq!(
+            asked.data["code"], "permission_required",
+            "{:?}",
+            asked.data
+        );
+        asked.data["asks"][0]["grant_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let inside = run(&f.outside, vec![issue()]);
+    assert!(inside.success, "{:?}", inside.data);
+    assert!(inside.data.to_string().contains("outside_grep_canary"));
+    assert!(!inside.data.to_string().contains("outside_grep_secret"));
+    let token = issue();
+    let (refused, lines) = crate::logging::capture_log_lines(|| run(target, vec![token.clone()]));
+    assert_eq!(
+        refused.data["code"], "permission_required",
+        "{:?}",
+        refused.data
+    );
+    assert!(
+        refused.data["asks"][0].get("reason").is_none(),
+        "uncovered paths must not get a retry exception"
+    );
+    assert!(refused.data.get("matches").is_none());
+    assert_outside_retry_log(&lines, "approval_not_covered", &policy_path(target), &token);
+}
+
+#[test]
+fn outside_retry_unknown_token_is_logged_without_authority() {
+    let f = Fixture::new();
+    let mut scope = plugin::Scope::new(&f.owner, "audit-session").for_tool("grep", &Value::Null);
+    let token = "outside:unknown-token".to_owned();
+    let once = plugin::claim(&mut scope, std::slice::from_ref(&token));
+    assert!(once.is_empty());
+    let _route = ask_route_guard(Some(AskRoute::Plugin { scope, once }));
+    let (refused, lines) = crate::logging::capture_log_lines(|| {
+        f.ctx
+            .validate_read_path("outside-log", "audit-session", &f.outside)
+            .unwrap_err()
+    });
+    assert_eq!(refused.data["code"], "permission_required");
+    assert!(refused.data["asks"][0].get("reason").is_none());
+    assert_outside_retry_log(&lines, "approval_not_recognized", &f.outside, &token);
+}
+
+#[test]
+fn outside_retry_cannot_override_a_floor_and_logs_the_refusal() {
+    let f = Fixture::new();
+    let target = f.ctx.storage_dir().join("private.txt");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, "private storage canary").unwrap();
+    let mut scope = plugin::Scope::new(&f.owner, "audit-session").for_tool("read", &Value::Null);
+    let grant = AccessGrant {
+        path: policy_path(&f.outside),
+        kind: GrantKind::Subtree,
+        operation: AccessOperation::Read,
+    };
+    let token = plugin::issue(&scope, &grant);
+    let once = plugin::claim(&mut scope, std::slice::from_ref(&token));
+    let _route = ask_route_guard(Some(AskRoute::Plugin { scope, once }));
+    let (refused, lines) = crate::logging::capture_log_lines(|| {
+        f.ctx
+            .validate_read_path("outside-floor-log", "audit-session", &target)
+            .unwrap_err()
+    });
+    assert_eq!(refused.data["code"], "denied_floor", "{:?}", refused.data);
+    assert_outside_retry_log(&lines, "denied_floor", &target, &token);
 }

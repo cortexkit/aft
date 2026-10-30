@@ -1,0 +1,12 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/lib.rs"
+  ],
+  "note": "non-ranking: agent-data participant groundwork (inert) Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}

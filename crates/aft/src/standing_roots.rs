@@ -1634,8 +1634,13 @@ mod tests {
         assert!(!roots
             .wait_for_case_a_checkpoint(root_dir.path().to_str().unwrap())
             .unwrap());
+        // The build is still held, so returning without an acknowledgement
+        // proves the checkpoint wait expired. A delayed wakeup is not a longer budget.
         assert!(before.elapsed() >= Duration::from_secs(2));
-        assert!(before.elapsed() < Duration::from_millis(2300));
+        let lifecycle = roots.lifecycle(root_dir.path().to_str().unwrap()).unwrap();
+        let state = lifecycle.state.lock();
+        assert_eq!(state.active_builds, 1);
+        assert!(!state.checkpoint_acknowledged);
     }
 
     #[test]

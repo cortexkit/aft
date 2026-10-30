@@ -644,6 +644,7 @@ mod approved_audit11 {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.txt");
         crate::edit::write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
             &path,
             &changed,
             &crate::config::Config {

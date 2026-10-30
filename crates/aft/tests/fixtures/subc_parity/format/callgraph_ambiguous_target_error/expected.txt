@@ -1,3 +1,3 @@
-trace_to_symbol: ambiguous_target — multiple symbols named "leaf". Pass toFile to disambiguate:
+trace_to_symbol: ambiguous_target — multiple symbols named "leaf". Pass toPath to disambiguate:
   - <PROJECT_ROOT>/src/leaf.ts:3
   - <PROJECT_ROOT>/src/other_leaf.ts:9

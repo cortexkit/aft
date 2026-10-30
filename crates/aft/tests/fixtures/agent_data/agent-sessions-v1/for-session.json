@@ -1,0 +1,5 @@
+[
+  {"request":{"method":"agent.for_session","params":{"harness":"pi","session_id":"session-002"}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"result":{"agent_id":"agent_0000000000000101","incarnation":"0123456789abcdef","ref":"0123456789abcdef0123456789abcdef","ref_kind":"pi-session"}}},
+  {"request":{"method":"agent.for_session","params":{"harness":"opencode","session_id":"opencode-session-001"}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"result":{"agent_id":"agent_0000000000000101","incarnation":"0123456789abcdef","ref":"abcdef0123456789abcdef0123456789","ref_kind":"opencode-session"}}},
+  {"request":{"method":"agent.for_session","params":{"harness":"pi","session_id":"not-registered"}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"code":"not_found","detail":null,"message":"no agent session is registered under this harness and session id"}}
+]

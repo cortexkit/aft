@@ -1,0 +1,7 @@
+{
+  "bash": {
+    "env": {
+      "XDG_CONFIG_HOME": "/tmp/elsewhere"
+    }
+  }
+}

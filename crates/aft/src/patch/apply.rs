@@ -743,8 +743,14 @@ mod audit11_regressions {
                 format_on_edit: false,
                 ..Default::default()
             };
-            crate::edit::write_format_validate(&path, &content, &config, &serde_json::json!({}))
-                .unwrap();
+            crate::edit::write_format_validate(
+                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                &path,
+                &content,
+                &config,
+                &serde_json::json!({}),
+            )
+            .unwrap();
             assert_eq!(std::fs::read(path).unwrap(), expected.as_bytes());
         }
     }

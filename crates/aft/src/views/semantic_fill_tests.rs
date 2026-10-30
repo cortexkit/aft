@@ -44,7 +44,7 @@ fn semantic_fill_has_no_derived_writes_or_checkpoint_and_reader_uses_owner() {
     assert!(initial.published);
     assert_eq!(initial.pending_paths, BTreeSet::from([b"lib.rs".to_vec()]));
     let view = ViewStore::open(storage.path(), &request.scope).unwrap();
-    // The initial publish owns a deferred checkpoint; settle it before reopening its database.
+    // Settle any queued checkpoint before reopening the owned database.
     crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
     let owner_path = view
         .derived_path(initial.generation.as_deref().unwrap())
@@ -123,6 +123,27 @@ fn prepared_callgraph_retains_committed_wal_before_pointer_publication() {
         allow_blob_put: true,
         callgraph: true,
     };
+    let mut cold = prepare_checkout(&request, &mut |_| Ok(())).unwrap();
+    let cold_generation = cold.report().generation.as_ref().unwrap();
+    let view = ViewStore::open(storage.path(), "wal-scope").unwrap();
+    let cold_path = view.derived_path(cold_generation).unwrap();
+    assert!(
+        cold.derived_checkpoint.is_none(),
+        "cold output is already synced in the main file"
+    );
+    assert!(!PathBuf::from(format!("{}-wal", cold_path.display())).exists());
+    let connection =
+        crate::db::file_identity::IdentityConnection::open(&cold_path, "cold-publication-test")
+            .unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+    drop(connection);
+    cold.commit().unwrap();
+    fs::write(project.path().join("lib.rs"), "pub fn changed() {}\n").unwrap();
     let prepared = prepare_checkout(&request, &mut |_| Ok(())).unwrap();
     let (path, _) = prepared
         .derived_checkpoint

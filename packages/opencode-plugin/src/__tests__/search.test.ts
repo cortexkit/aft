@@ -601,6 +601,40 @@ describe("searchTools", () => {
       path: path.dirname(absoluteFile),
     });
   });
+
+  test("absolute glob splitting preserves nonrecursive and recursive suffixes", async () => {
+    const { toolCallCalls, tools } = createMockSearchHarness({ disabled_tools: [] }, () => ({
+      success: true,
+      text: "",
+    }));
+    for (const suffix of ["*.ts", "**/*.ts", "*/test?.ts"]) {
+      await tools.glob.execute({ pattern: `${projectRoot}/${suffix}` }, createMockSdkContext());
+      expect(toolCallCalls.at(-1)?.rawArgs).toMatchObject({ path: projectRoot, pattern: suffix });
+    }
+  });
+
+  test("absolute glob splitting recognizes drive and UNC separators", async () => {
+    const { toolCallCalls, tools } = createMockSearchHarness({ disabled_tools: [] }, () => ({
+      success: true,
+      text: "",
+    }));
+    for (const pattern of ["C:\\src\\*.ts", "C:/src/*.ts", "\\\\server\\share\\src\\*.ts"]) {
+      await tools.glob.execute({ pattern }, createMockSdkContext());
+      expect(toolCallCalls.at(-1)?.rawArgs.pattern).toBe("*.ts");
+      expect(toolCallCalls.at(-1)?.rawArgs.path).toBeDefined();
+    }
+  });
+
+  test("absolute glob splitting preserves POSIX suffix escapes", async () => {
+    const { toolCallCalls, tools } = createMockSearchHarness({ disabled_tools: [] }, () => ({
+      success: true,
+      text: "",
+    }));
+    await tools.glob.execute({ pattern: `${projectRoot}/src/file\\?.ts` }, createMockSdkContext());
+    expect(toolCallCalls.at(-1)?.rawArgs.pattern).toBe(
+      process.platform === "win32" ? "?.ts" : "file\\?.ts",
+    );
+  });
 });
 
 describe("splitIncludeArg", () => {

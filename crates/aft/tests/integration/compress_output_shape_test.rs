@@ -166,11 +166,17 @@ fn npm_run_typecheck_with_tsc_output_routes_to_tsc() {
 
 #[test]
 fn make_test_with_cargo_output_routes_to_cargo_before_make_filter() {
-    let output = "running 2 tests\ntest ok_test ... ok\ntest failing_test ... FAILED\n\nfailures:\n\n---- failing_test stdout ----\nboom\n\ntest result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n";
+    // Forty passing tests put the fixture past the cargo compressor's 1 KiB raw
+    // passthrough, below which output is returned as printed.
+    let passing = (0..40)
+        .map(|index| format!("test ok_test_{index} ... ok\n"))
+        .collect::<String>();
+    let output = format!("running 42 tests\ntest ok_test ... ok\n{passing}test failing_test ... FAILED\n\nfailures:\n\n---- failing_test stdout ----\nboom\n\ntest result: FAILED. 41 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n");
+    assert!(output.len() > 1024);
 
-    let compressed = compress_with_builtin_filters("make test", output);
+    let compressed = compress_with_builtin_filters("make test", &output);
 
-    assert!(compressed.contains("running 2 tests"));
+    assert!(compressed.contains("running 42 tests"));
     assert!(compressed.contains("---- failing_test stdout ----"));
     assert!(compressed.contains("test result: FAILED"));
     assert!(!compressed.contains("test ok_test ... ok"));
@@ -256,12 +262,21 @@ fn package_manager_install_commands_remain_command_only() {
 
 #[test]
 fn cargo_and_go_build_commands_do_not_get_pulled_into_test_output_sniffers() {
-    let cargo_output = "   Compiling app v0.1.0\nPASS\nwarning: unused variable: `x`\n --> src/lib.rs:1:9\n    Finished `dev` profile [unoptimized] target(s) in 0.12s\n";
-    let cargo = compress("cargo build", cargo_output);
+    // The dependency `Compiling` lines put the fixture past the cargo
+    // compressor's 1 KiB raw passthrough, below which output is returned as
+    // printed.
+    let compiling = (0..40)
+        .map(|index| format!("   Compiling dep{index} v1.2.3\n"))
+        .collect::<String>();
+    let cargo_output = format!("{compiling}   Compiling app v0.1.0\nPASS\nwarning: unused variable: `x`\n --> src/lib.rs:1:9\n    Finished `dev` profile [unoptimized] target(s) in 0.12s\n");
+    assert!(cargo_output.len() > 1024);
+    let cargo = compress("cargo build", &cargo_output);
     assert!(cargo.contains("warning: unused variable"));
     assert!(cargo.contains("Finished `dev` profile"));
+    // Only the cargo build summary drops cargo's own `Compiling` lines.
     assert!(!cargo.contains("Compiling app"));
-    assert!(!cargo.contains("PASS"));
+    // A line cargo did not write is not the summary's to drop.
+    assert!(cargo.contains("PASS\nwarning: unused variable"));
 
     let go_output = "PASS\nmain.go:10:5: undefined: missingFunc\n";
     let go = compress("go build ./...", go_output);

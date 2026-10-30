@@ -10,3 +10,6 @@ mod helpers {
 
 #[path = "integration/semantic_test.rs"]
 mod semantic_test;
+
+#[path = "semantic_query_latency_test.rs"]
+mod semantic_query_latency_test;

@@ -311,7 +311,7 @@ describe("runAutoInstall", () => {
     // npm must be resolved beyond a GUI-stripped PATH, then converted to a
     // platform-safe invocation (npm.cmd requires cmd.exe on Windows).
     expect(source).toMatch(/resolveNpm\(\)/);
-    expect(source).toMatch(/npmInvocation\(npm,/);
+    expect(source).toContain("await lspNpmInstallInvocation(npm, target, before)");
     expect(source).toMatch(/spawn\(invocation\.command, invocation\.args,/);
     expect(source).toContain("npmSpawnEnv(npm)");
     expect(source).toContain("terminateNpmProcessTree(child, invocation)");
@@ -326,7 +326,10 @@ describe("runAutoInstall", () => {
     expect(source).toContain("if (terminationPromise && child.pid !== undefined) return;");
     expect(source).not.toContain('child.kill("SIGTERM")');
     expect(source).toContain("finish(false)");
-    expect(source).toMatch(/\[\s*["']install["']\s*,\s*["']--no-save["']/);
+    // The real-spawn policy tests assert the shared helper's final npm argv.
+    expect(source).toContain(
+      "lspPublicationCutoff(config.graceDays, Boolean(config.versions[spec.npm]))",
+    );
     // There must be no live `spawn("bun", ...)` call. Comments referencing
     // the old behavior are fine (they explain the historical bug); only a
     // real spawn would reintroduce the regression.

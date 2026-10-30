@@ -1,4 +1,44 @@
 use super::*;
+
+#[test]
+fn rust_receiver_index_slices_preserve_local_preorder() {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&crate::parser::grammar_for(LangId::Rust))
+        .unwrap();
+    let mut checked = 0;
+    for source in [
+        "fn outer() { fn inner() { f(); } inner(); } fn sibling() {}",
+        "struct T; impl T { fn new() -> Self { T } fn call(&self) { self.m(); } }",
+        "fn before() {} fn unfinished(",
+        "fn before() {} fn broken() { let x = ; x.m(); }",
+        "fn outer() { fn nested() {} fn unfinished(",
+    ] {
+        let tree = parser.parse(source, None).unwrap();
+        let nodes = descendants(tree.root_node());
+        let index = RustReceiverIndex::new(&nodes, source);
+        for &function in nodes.iter().filter(|node| FUNCTIONS.contains(&node.kind())) {
+            assert_eq!(
+                index
+                    .function_nodes(function)
+                    .unwrap()
+                    .iter()
+                    .map(|node| node.id())
+                    .collect::<Vec<_>>(),
+                descendants(function)
+                    .iter()
+                    .map(|node| node.id())
+                    .collect::<Vec<_>>(),
+                "subtree order for {source:?}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 8,
+        "complete and incomplete function scopes must be exercised"
+    );
+}
 use crate::callgraph_store::join::CallgraphBlob;
 
 fn parse(source: &str, language: &str) -> ParseBlob {

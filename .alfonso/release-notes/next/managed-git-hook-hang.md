@@ -1,1 +1,0 @@
-- A managed git hook no longer hangs a commit when a helper process it starts keeps running.

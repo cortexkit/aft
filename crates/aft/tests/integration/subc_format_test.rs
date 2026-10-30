@@ -66,10 +66,48 @@ fn project_root_for_input(raw: &str) -> PathBuf {
 }
 
 fn replace_project_root(text: String, project_root: &Path) -> String {
-    text.replace(
-        &project_root.to_string_lossy().to_string(),
-        PROJECT_ROOT_TOKEN,
-    )
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()));
+    replace_project_root_with_home(text, project_root, home.as_deref().map(Path::new))
+}
+
+fn replace_project_root_with_home(
+    text: String,
+    project_root: &Path,
+    home: Option<&Path>,
+) -> String {
+    let root = project_root.to_string_lossy();
+    let normalized = text.replace(root.as_ref(), PROJECT_ROOT_TOKEN);
+    let Some(home) = home else {
+        return normalized;
+    };
+    // The renderer abbreviates paths below HOME. Remote runners can put the
+    // scratch project there, so normalize that spelling of this root too,
+    // without rewriting unrelated home-relative paths in a golden.
+    if project_root.strip_prefix(home).is_ok() {
+        if let Some(suffix) = root.strip_prefix(home.to_string_lossy().as_ref()) {
+            if !suffix.is_empty() {
+                return normalized.replace(&format!("~{suffix}"), PROJECT_ROOT_TOKEN);
+            }
+        }
+    }
+    normalized
+}
+
+#[test]
+fn project_root_normalization_accepts_absolute_and_home_relative_spellings() {
+    let root = Path::new("/home/runner/tmp/project");
+    let text =
+        "/home/runner/tmp/project/src/main.ts\n~/tmp/project/src/main.ts\n~/other/src/main.ts";
+    assert_eq!(
+        replace_project_root_with_home(text.to_string(), root, Some(Path::new("/home/runner"))),
+        "<PROJECT_ROOT>/src/main.ts\n<PROJECT_ROOT>/src/main.ts\n~/other/src/main.ts"
+    );
+    assert_eq!(
+        replace_project_root_with_home(text.to_string(), root, Some(Path::new("/home/run"))),
+        "<PROJECT_ROOT>/src/main.ts\n~/tmp/project/src/main.ts\n~/other/src/main.ts"
+    );
 }
 
 fn expand_stable_path_tokens(value: Value, project_root: &Path) -> Value {

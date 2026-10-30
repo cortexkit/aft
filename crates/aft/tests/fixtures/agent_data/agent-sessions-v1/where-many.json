@@ -1,0 +1,3 @@
+[
+  {"request":{"method":"agent.where_many","params":{"agentIds":["agent_0000000000000107","agent_ffffffffffffffff","agent_0000000000000106"]}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"result":{"agents":[{"agent_id":"agent_0000000000000107","cut_id":null,"epoch":1,"holder":"2222222222222222","holder_name":"Other machine","known":true,"read_at_ms":700,"stale":false,"status":"held_elsewhere"},{"agent_id":"agent_0000000000000106","cut_id":null,"epoch":1,"holder":"1111111111111111","holder_name":"This machine","known":true,"read_at_ms":700,"stale":false,"status":"held_here"}]}}}
+]

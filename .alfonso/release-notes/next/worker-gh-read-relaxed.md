@@ -1,1 +1,0 @@
-- Workers on the default relaxed sandbox profile on macOS can now read GitHub through AFT's worker read broker, as strict workers already could. On Linux, relaxed workers still run without the broker, because relaxed Linux does not keep one worker out of another's broker files; the daemon log names that reason.

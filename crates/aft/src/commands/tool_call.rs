@@ -119,11 +119,23 @@ fn handle_on_route(req: &RawRequest, ctx: &AppContext, dispatch: &DispatchFn<'_>
     };
 
     let sanitized_arguments = strip_agent_preview_arg_owned(arguments);
+    let agent_visible =
+        !preview && !crate::subc::is_native_plumbing_call(name, &sanitized_arguments);
     let format_context = crate::subc_format::FormatContext::from_tool_call(
         name,
         &sanitized_arguments,
         tool_ctx.project_root.as_path(),
     );
+    let finalizer = |response: &mut Response, text: &mut String| {
+        if agent_visible {
+            crate::response_finalize::append_cancelled_call_notices(
+                response,
+                text,
+                ctx,
+                req.session(),
+            );
+        }
+    };
 
     match run_tool_call(
         name,
@@ -132,7 +144,7 @@ fn handle_on_route(req: &RawRequest, ctx: &AppContext, dispatch: &DispatchFn<'_>
         &tool_ctx,
         ctx,
         dispatch,
-        None,
+        Some(&finalizer),
         None,
     ) {
         ToolCallOutcome::Unary(result) => response_with_text(result.response, result.text),

@@ -7,6 +7,7 @@ pub mod buffer;
 mod exit_observer;
 mod gc_cursor;
 mod gc_memo;
+mod memory_limit;
 pub mod output;
 pub mod persistence;
 pub mod process;
@@ -14,8 +15,11 @@ pub mod pty_process;
 pub mod pty_runtime;
 pub mod registry;
 mod temp_cleanup;
+pub(crate) mod viewed_task;
+pub mod watch_lines;
 pub mod watchdog;
 pub mod watches;
+pub(crate) mod windows_waiter;
 pub(crate) mod worker_thread;
 
 use crate::bash_permissions::PermissionAsk;
@@ -50,6 +54,7 @@ mod slot_limit_tests;
 /// end states are final, so a caller told "refused" can rely on the command
 /// never starting later, and a caller told "committed" gets the task id.
 pub(crate) struct SpawnReceipt {
+    changed_files_deadline: std::sync::OnceLock<crate::bash_changed_files::SharedCallDeadline>,
     state: std::sync::Mutex<SpawnReceiptState>,
     deadline: std::time::Instant,
     startup_steps: std::sync::Mutex<StartupSteps>,
@@ -235,6 +240,24 @@ pub(crate) enum StartupOutcome {
 }
 
 impl SpawnReceipt {
+    pub(crate) fn bind_changed_files_deadline(
+        &self,
+        deadline: crate::bash_changed_files::SharedCallDeadline,
+    ) {
+        let _ = self.changed_files_deadline.set(deadline);
+    }
+    pub(crate) fn limit_changed_files_deadline(&self, deadline: std::time::Instant) {
+        if let Some(shared) = self.changed_files_deadline.get() {
+            let mut bound = shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // None means the foreground reply no longer needs this deadline;
+            // late spawn completion must not reactivate it.
+            if let Some(current) = bound.as_mut() {
+                *current = (*current).min(deadline);
+            }
+        }
+    }
     #[cfg(test)]
     pub(crate) fn new(deadline: std::time::Instant) -> Self {
         Self::new_with_start_time(deadline, std::time::Instant::now())
@@ -246,6 +269,7 @@ impl SpawnReceipt {
     ) -> Self {
         Self {
             state: std::sync::Mutex::new(SpawnReceiptState::Pending),
+            changed_files_deadline: std::sync::OnceLock::new(),
             deadline,
             startup_steps: std::sync::Mutex::new(StartupSteps::new(startup_started_at)),
             #[cfg(feature = "test-timing-hooks")]
@@ -400,6 +424,16 @@ pub(crate) fn with_spawn_receipt<T>(
     let _restore = Restore(previous);
     run()
 }
+pub(crate) fn changed_files_deadline_for_spawn(
+) -> Option<crate::bash_changed_files::SharedCallDeadline> {
+    CURRENT_SPAWN_RECEIPT.with(|slot| {
+        slot.borrow()
+            .as_ref()?
+            .changed_files_deadline
+            .get()
+            .cloned()
+    })
+}
 
 pub(crate) fn enter_bash_startup_step(step: BashStartupStep) {
     CURRENT_SPAWN_RECEIPT.with(|slot| {
@@ -531,9 +565,50 @@ thread_local! {
     static CURRENT_CALL_REQUESTER: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
     static CURRENT_REMOTE: std::cell::RefCell<Option<RemoteLaunch>> = const { std::cell::RefCell::new(None) };
+    static CURRENT_RUNON_TIMINGS: std::cell::RefCell<Option<crate::exec_remote::LaunchTimings>> = const { std::cell::RefCell::new(None) };
     /// True only while dispatching a bash call admitted under the catalog's
     /// worker preset. Plugin worker-session flags do not set this marker.
     static CURRENT_WORKER_PRESET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Request-side timings stay scoped to this dispatch thread until the remote
+/// worker takes ownership of them. Early refusals discard the unfinished log.
+pub(crate) struct RunonTimingScope(Option<crate::exec_remote::LaunchTimings>);
+
+impl RunonTimingScope {
+    pub(crate) fn start(started: std::time::Instant) -> Self {
+        Self(CURRENT_RUNON_TIMINGS.with(|current| {
+            current.replace(Some(crate::exec_remote::LaunchTimings::new(
+                started,
+                "secret_preflight",
+            )))
+        }))
+    }
+}
+
+impl Drop for RunonTimingScope {
+    fn drop(&mut self) {
+        CURRENT_RUNON_TIMINGS.with(|current| {
+            current.replace(self.0.take());
+        });
+    }
+}
+
+pub(crate) fn enter_runon_phase(phase: &'static str) {
+    CURRENT_RUNON_TIMINGS.with(|current| {
+        if let Some(timings) = current.borrow_mut().as_mut() {
+            timings.enter(phase);
+        }
+    });
+}
+
+#[cfg(unix)]
+fn take_runon_timings() -> crate::exec_remote::LaunchTimings {
+    CURRENT_RUNON_TIMINGS.with(|current| {
+        current.borrow_mut().take().unwrap_or_else(|| {
+            crate::exec_remote::LaunchTimings::new(std::time::Instant::now(), "task_setup")
+        })
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -551,6 +626,15 @@ pub(crate) struct RemoteLaunch {
     pub session: String,
     pub requested_vcpus: Option<u32>,
     pub requested_network: bool,
+    /// Configured `bash.env` names carried in the launch environment, with the
+    /// map they came from. The remote request drops those names from the shell
+    /// environment before it is sent, so only `bash.runon_env` can send a user
+    /// value; see `commands::bash_remote_env`.
+    pub configured_env_names: Vec<String>,
+    /// Files to copy back after the command, relative to its workdir. Set
+    /// only for an explicit `runon` call that passed `return_paths`.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub return_paths: Vec<String>,
 }
 
 /// Decide where a bash call that set `runon` runs, before anything is spawned.
@@ -702,6 +786,38 @@ pub(crate) fn with_call_requester<T>(requester: Option<String>, run: impl FnOnce
     let previous = CURRENT_CALL_REQUESTER.with(|slot| slot.replace(requester));
     let _restore = Restore(Some(previous));
     run()
+}
+
+thread_local! {
+    /// The v1 `bash` schema pin of the tool call whose dispatch runs on this
+    /// thread, if any. Installed around the dispatch like the call key (see
+    /// [`with_call_key`]), because the spawn path that records the task only
+    /// sees the tool's own arguments. A pinless call leaves no pin, and so
+    /// no view record, even when view writing is enabled.
+    static CURRENT_SCHEMA_PIN: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `run` with `schema_pin` recorded as the pin of any task it creates,
+/// restoring the previous one afterwards, even if `run` panics.
+pub(crate) fn with_schema_pin<T>(schema_pin: Option<String>, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Option<String>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                CURRENT_SCHEMA_PIN.with(|slot| *slot.borrow_mut() = previous);
+            }
+        }
+    }
+    let previous = CURRENT_SCHEMA_PIN.with(|slot| slot.replace(schema_pin));
+    let _restore = Restore(Some(previous));
+    run()
+}
+
+/// The schema pin to record on a task being created now, if its call
+/// carried one.
+pub(crate) fn current_schema_pin() -> Option<String> {
+    CURRENT_SCHEMA_PIN.with(|slot| slot.borrow().clone())
 }
 
 /// The requester and key to record on a task being created now: the
@@ -987,7 +1103,7 @@ impl TaskSlot {
 /// background feature and takes a background slot. A foreground command
 /// (`false`, and not a PTY) always starts; see [`TaskSlot::Foreground`].
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn(
+pub(crate) fn spawn_with_secrets(
     request_id: &str,
     session_id: &str,
     command: &str,
@@ -1007,7 +1123,9 @@ pub(crate) fn spawn(
     scanner_requires_approval: bool,
     host_escalation: Option<HostEscalationAttempt>,
     remote: Option<RemoteLaunch>,
+    #[cfg(unix)] mut secret_launch: Option<secrets::Launch>,
 ) -> Response {
+    enter_runon_phase("spawn_setup");
     if require_background_flag && !ctx.config().experimental_bash_background {
         return Response::error(
             request_id,
@@ -1035,6 +1153,7 @@ pub(crate) fn spawn(
         .or_else(|| std::env::current_dir().ok())
         .and_then(|path| std::fs::canonicalize(&path).ok().or(Some(path)));
 
+    enter_runon_phase("child_environment");
     enter_bash_startup_step(BashStartupStep::Environment);
     let mut env = env.unwrap_or_default();
     let config = ctx.config();
@@ -1046,6 +1165,8 @@ pub(crate) fn spawn(
         session_id,
         project_root.as_deref(),
     );
+    let _speech_ticket = crate::gh_shim_ticket::spawn_ticket_guard(gh_shim_ticket.value());
+    crate::gh_shim_ticket::mark_spawn_background(require_background_flag || pty);
     if let Err(error) = crate::agent_child_env::inject(
         config.as_ref(),
         &child_storage_root,
@@ -1054,6 +1175,11 @@ pub(crate) fn spawn(
     ) {
         return Response::error(request_id, "child_environment_unavailable", error);
     }
+    crate::gh_shim_speech::start_view::inject(
+        gh_shim_ticket.value(),
+        &mut env,
+        &child_storage_root,
+    );
     if worker_preset_active() {
         let worktree_root = project_root.as_deref().unwrap_or(&workdir);
         crate::agent_child_env::inject_worker_test_threads(worktree_root, &mut env);
@@ -1069,6 +1195,7 @@ pub(crate) fn spawn(
     if !pty && config.bash.linux_scope {
         env.insert(registry::LINUX_SCOPE_ENV.to_string(), "1".to_string());
     }
+    enter_runon_phase("sandbox_preflight");
     let task_kind = if pty {
         SandboxTaskKind::BashPty
     } else if require_background_flag {
@@ -1086,11 +1213,16 @@ pub(crate) fn spawn(
     };
     let session_dir = persistence::session_tasks_dir(&storage_dir, session_id);
     #[cfg(unix)]
-    let (spawn_plan, unregistered_task) = if native_sandbox_enforced(ctx, &principal)
-        && host_escalation.is_none()
+    let (spawn_plan, unregistered_task) = if secret_launch.is_some()
+        || (native_sandbox_enforced(ctx, &principal) && host_escalation.is_none())
     {
         enter_bash_startup_step(BashStartupStep::TaskDirectory);
-        let task = match persistence::allocate_task_layout(&storage_dir, session_id) {
+        let task = match secret_launch
+            .as_mut()
+            .and_then(|launch| launch.preflight.task.take())
+            .map(Ok)
+            .unwrap_or_else(|| persistence::allocate_task_layout(&storage_dir, session_id))
+        {
             Ok(task) => task,
             Err(error) => {
                 return Response::error(
@@ -1103,14 +1235,19 @@ pub(crate) fn spawn(
             }
         };
         enter_bash_startup_step(BashStartupStep::Profile);
-        let plan = resolve_sandbox_spawn(
-            ctx,
-            &principal,
-            requested_tier,
-            task_kind,
-            &task.paths.io_dir,
-            None,
-        );
+        let plan = secret_launch
+            .as_ref()
+            .map(|launch| launch.preflight.plan.clone())
+            .unwrap_or_else(|| {
+                resolve_sandbox_spawn(
+                    ctx,
+                    &principal,
+                    requested_tier,
+                    task_kind,
+                    &task.paths.io_dir,
+                    None,
+                )
+            });
         if plan.refusal_code().is_some() {
             (plan, Some(task))
         } else {
@@ -1137,7 +1274,12 @@ pub(crate) fn spawn(
                 &shell_path,
                 &environment,
             ) {
-                Ok(prepared) => (plan.with_prepared_task(prepared), Some(task)),
+                Ok(prepared) => {
+                    if let Some(launch) = secret_launch.as_ref() {
+                        prepared.set_secret_runtime(launch.runtime.clone());
+                    }
+                    (plan.with_prepared_task(prepared), Some(task))
+                }
                 Err(error) => {
                     let _ = persistence::delete_resolved_task(&task);
                     return Response::error(
@@ -1213,6 +1355,10 @@ pub(crate) fn spawn(
     // handle, which reads the registry as it is. An idle-evicted root has
     // released its registry, so load it again before the task can finish.
     ctx.reload_released_filter_registry();
+    enter_runon_phase("changed_files_baseline");
+    let _changed_files =
+        crate::bash_changed_files::Capture::start_for_spawn(ctx, request_id, &spawn_plan)
+            .map(|capture| crate::bash_changed_files::scope(Some(capture)));
     #[cfg(unix)]
     ctx.bash_background()
         .set_db_schema_hints(ctx.config().bash.db_schema_hints);
@@ -1227,6 +1373,7 @@ pub(crate) fn spawn(
             workdir.clone(),
             env.clone(),
             hard_kill,
+            config.bash.memory_limit_mib,
             storage_dir.clone(),
             slot,
             notify_on_completion,
@@ -1252,6 +1399,7 @@ pub(crate) fn spawn(
             workdir,
             env,
             hard_kill,
+            config.bash.memory_limit_mib,
             storage_dir,
             max_running,
             notify_on_completion,
@@ -1270,6 +1418,7 @@ pub(crate) fn spawn(
             workdir,
             env,
             hard_kill,
+            config.bash.memory_limit_mib,
             storage_dir,
             slot,
             notify_on_completion,
@@ -1277,6 +1426,17 @@ pub(crate) fn spawn(
             project_root,
         )
     };
+    #[cfg(unix)]
+    if spawn_result.is_ok() {
+        if let Some(launch) = secret_launch.as_mut() {
+            launch.spawned();
+        }
+    } else {
+        if let Some(task) = cleanup_plan.prepared_task() {
+            ctx.bash_background()
+                .stop_secret_proxy(&task.resolved_task().paths.task_id);
+        }
+    }
 
     match spawn_result {
         Ok(task_id) => {
@@ -1325,6 +1485,54 @@ pub(crate) fn spawn(
             }
         }
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn(
+    request_id: &str,
+    session_id: &str,
+    command: &str,
+    shell: BashShell,
+    shell_path: PathBuf,
+    workdir: Option<PathBuf>,
+    env: Option<HashMap<String, String>>,
+    hard_kill: HardKill,
+    ctx: &AppContext,
+    require_background_flag: bool,
+    notify_on_completion: bool,
+    compressed: bool,
+    pty: bool,
+    pty_rows: u16,
+    pty_cols: u16,
+    scanner_report: Vec<PermissionAsk>,
+    scanner_requires_approval: bool,
+    host_escalation: Option<HostEscalationAttempt>,
+    remote: Option<RemoteLaunch>,
+) -> Response {
+    spawn_with_secrets(
+        request_id,
+        session_id,
+        command,
+        shell,
+        shell_path,
+        workdir,
+        env,
+        hard_kill,
+        ctx,
+        require_background_flag,
+        notify_on_completion,
+        compressed,
+        pty,
+        pty_rows,
+        pty_cols,
+        scanner_report,
+        scanner_requires_approval,
+        host_escalation,
+        remote,
+        #[cfg(unix)]
+        None,
+    )
 }
 
 /// Decide, in one place, whether a jailed worker's shell receives the host-local
@@ -1606,6 +1814,10 @@ pub(crate) fn note_storage_root(storage_root: &std::path::Path) {
 }
 
 pub fn storage_dir(configured: Option<&std::path::Path>) -> PathBuf {
+    // Test hook for the health-rollup path cache: one tick over many contexts
+    // sharing a storage root must resolve it once, not once per context.
+    #[cfg(test)]
+    STORAGE_DIR_CALLS.with(|calls| calls.set(calls.get() + 1));
     let lookup = |name: &str| std::env::var_os(name);
     let fallback_home = std::env::home_dir();
     let current_dir = std::env::current_dir().ok();
@@ -1618,6 +1830,49 @@ pub fn storage_dir(configured: Option<&std::path::Path>) -> PathBuf {
     );
     crate::project_content::register_storage_root(&root);
     root
+}
+
+/// Resolve the root that holds rebuildable cache artifacts (search, semantic,
+/// symbol, call-graph, inspect and view caches).
+///
+/// `cache_root` is a root the caller already resolved, normally
+/// `Config::cache_storage_dir()`, which is `<storage.cache_dir>/aft` when a
+/// separate cache volume is configured. That root must be used exactly as
+/// given. [`storage_dir`] is the wrong helper here: it lets `AFT_STORAGE_DIR`
+/// replace the supplied path, which is right for durable state but would move
+/// cache artifacts back onto the durable disk, where the split-storage guard
+/// then refuses to create them. Without a resolved root the caches share the
+/// default durable root, as they always have.
+pub fn cache_artifact_root(cache_root: Option<&std::path::Path>) -> PathBuf {
+    match cache_root.filter(|path| !path.as_os_str().is_empty()) {
+        Some(root) => {
+            crate::project_content::register_storage_root(root);
+            root.to_path_buf()
+        }
+        None => storage_dir(None),
+    }
+}
+
+// Test hook counting storage_dir resolutions on this thread. Reset
+// before a health tick and read after it to prove the tick resolved shared
+// roots once instead of once per context.
+#[cfg(test)]
+thread_local! {
+    static STORAGE_DIR_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test hook counting [`storage_dir`] resolutions on this thread. Reset
+/// before a health tick and read after it to prove the tick resolved shared
+/// roots once instead of once per context.
+#[cfg(test)]
+pub(crate) fn storage_dir_calls_for_test() -> u64 {
+    STORAGE_DIR_CALLS.with(|calls| calls.get())
+}
+
+/// Test hook resetting [`storage_dir_calls_for_test`].
+#[cfg(test)]
+pub(crate) fn reset_storage_dir_calls_for_test() {
+    STORAGE_DIR_CALLS.with(|calls| calls.set(0));
 }
 
 /// Resolve the current test environment's default, excluding AFT-specific
@@ -2289,3 +2544,5 @@ mod legacy_root_task_repair_tests {
 
 #[cfg(all(test, unix))]
 pub(crate) use registry::push_projection_fixture;
+pub(crate) mod progress;
+pub(crate) mod secrets;

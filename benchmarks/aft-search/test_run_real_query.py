@@ -226,6 +226,29 @@ class SplitQueryRunnerTests(unittest.TestCase):
         self.assertIn(tree / broad["opened_file"], matched)
         self.assertTrue(all((tree / row["opened_file"]).is_file() for row in rows + tuning["rows"]))
 
+    def test_candidate_chunk_texts_have_vectors_in_the_gate_supplement(self) -> None:
+        # A pending engine change embeds these texts on the pinned tree; the
+        # unchanged engine never does. Without their vectors the candidate's
+        # replay faults with vector_missing instead of producing a score.
+        from capture_split_query_vectors import CANDIDATE_CHUNK_TEXTS, candidate_chunk_texts
+        texts = candidate_chunk_texts()
+        self.assertTrue(texts)
+        gate = json.loads(Path(__file__).with_name("real-query-manifest.json").read_text())
+        main_pack = read_pack(ROOT / next(row for row in gate["rows"] if "excluded_reason" not in row)["embedding_pack"])
+        supplement = read_pack(ROOT / gate["split_query_pack"]["path"])
+        template = str(main_pack["embed_template_version"])
+        for text in texts:
+            key = corpus_key(text, template)
+            self.assertIn(key, supplement["vectors"])
+            self.assertNotIn(key, main_pack["vectors"])
+        document = json.loads(CANDIDATE_CHUNK_TEXTS.read_text())
+        document["texts"][0]["embed_text"] += " "
+        with tempfile.TemporaryDirectory() as directory:
+            tampered = Path(directory) / "texts.json"
+            tampered.write_text(json.dumps(document))
+            with self.assertRaisesRegex(InputFault, "candidate_chunk_text_digest_mismatch"):
+                candidate_chunk_texts(tampered)
+
     def test_binary_capability_probe_classifies_invalid_pattern_and_ignored_input(self) -> None:
         class Probe:
             def __init__(self, response: dict[str, Any]):

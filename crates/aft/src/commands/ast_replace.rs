@@ -14,6 +14,10 @@ use crate::commands::ast_scope::collect_ast_files;
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
+/// Reply to a dry run whose rewrite would leave at least one file with invalid
+/// syntax; `{files}` is replaced by the comma-separated file paths.
+const DRY_RUN_INVALID_REWRITE_MESSAGE: &str = "ast_replace: dry run: rewritten code failed syntax validation in {files}; apply would refuse this rewrite (no files were written)";
+
 /// Per-file compute result from the parallel phase. Holds everything needed
 /// for the serial apply phase (dry_run diff or backup+write).
 struct FileChange {
@@ -343,6 +347,12 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
                 &change.new_content,
                 change.file_path.as_path(),
             );
+            // Apply refuses a rewrite that fails syntax validation, so the
+            // preview must refuse it too rather than promise the change.
+            if diff_result.syntax_valid == Some(false) {
+                invalid_rewrites.push(change.file_path.display().to_string());
+                continue;
+            }
             file_results.push(serde_json::json!({
                 "file": change.file_path.display().to_string(),
                 "diff": diff_result.diff,
@@ -378,10 +388,21 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     if !invalid_rewrites.is_empty() {
+        invalid_rewrites.sort();
+        if dry_run {
+            return Response::error_with_data(
+                &req.id,
+                "invalid_rewrite",
+                DRY_RUN_INVALID_REWRITE_MESSAGE.replace("{files}", &invalid_rewrites.join(", ")),
+                serde_json::json!({
+                    "invalid_files": invalid_rewrites,
+                    "dry_run": true,
+                }),
+            );
+        }
         ctx.backup()
             .lock()
             .discard_operation_entries(req.session(), &op_id);
-        invalid_rewrites.sort();
         return Response::error_with_data(
             &req.id,
             "invalid_rewrite",
@@ -589,11 +610,11 @@ mod lsp_tests {
             manager.set_extra_env("AFT_FAKE_LSP_DISABLE_PUSH", "1");
             manager.set_extra_env("AFT_FAKE_LSP_ECHO_CHANGES", "1");
             assert_eq!(
-                manager
-                    .ensure_file_open(&file, &ctx.config())
-                    .unwrap()
-                    .server_keys
-                    .len(),
+                crate::lsp::manager::settled_lsp(&mut manager, |startup_manager| startup_manager
+                    .ensure_file_open(&file, &ctx.config()))
+                .unwrap()
+                .server_keys
+                .len(),
                 1
             );
         }

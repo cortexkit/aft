@@ -117,7 +117,45 @@ pub fn hash_file_if_small(path: &Path, size: u64) -> std::io::Result<Option<blak
             }
         }
     }
-    crate::project_content::read(path).map(|bytes| Some(hash_bytes(&bytes)))
+    // The same read-policy gate as `project_content::read`, but streamed.
+    // The work counters match what that read and `hash_bytes` record.
+    let (hash, bytes_read) = hash_small_reader(crate::project_content::open(path)?)?;
+    let work = &crate::views::io::WORK;
+    work.content_read_bytes
+        .fetch_add(bytes_read, std::sync::atomic::Ordering::Relaxed);
+    if hash.is_some() {
+        work.source_hashes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        work.source_hash_bytes
+            .fetch_add(bytes_read, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(hash)
+}
+
+/// Hashes `reader` with a fixed 8 KiB buffer and returns the hash with the
+/// number of bytes consumed. Stat metadata may predate a growing file, so at
+/// most one byte beyond the admission cap is read: growth past the cap yields
+/// no hash, rather than an unbounded read or a hash of a truncated prefix.
+fn hash_small_reader(reader: impl std::io::Read) -> std::io::Result<(Option<blake3::Hash>, u64)> {
+    use std::io::Read;
+    let mut reader = reader.take(CONTENT_HASH_SIZE_CAP + 1);
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0u8; 8192];
+    let mut total = 0u64;
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if read == 0 {
+            return Ok((Some(hasher.finalize()), total));
+        }
+        total += read as u64;
+        if total > CONTENT_HASH_SIZE_CAP {
+            return Ok((None, total));
+        }
+        hasher.update(&buffer[..read]);
+    }
 }
 
 pub fn metadata_matches(path: &Path, cached: &FileFreshness) -> std::io::Result<bool> {
@@ -418,7 +456,7 @@ fn build_strict_verify_pool() -> Option<rayon::ThreadPool> {
     STRICT_VERIFY_POOL_BUILDS.fetch_add(1, Ordering::Relaxed);
     rayon::ThreadPoolBuilder::new()
         .num_threads(strict_verify_pool_size())
-        .thread_name(|index| format!("aft-semantic-verify-{index}"))
+        .thread_name(|index| format!("aft-rayon-semantic-verify-{index}"))
         .build()
         .ok()
 }
@@ -542,6 +580,7 @@ pub(crate) fn watch_verify_stats(root: &Path, schedule: VerifyScheduleForTest) -
     let probe = std::sync::Arc::new(VerifyStatProbe {
         pool: rayon::ThreadPoolBuilder::new()
             .num_threads(2)
+            .thread_name(|index| format!("aft-rayon-verify-test-{index}"))
             .build()
             .expect("two-worker verification test pool"),
         schedule,
@@ -689,6 +728,61 @@ fn verify_file_inner(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn audit10_freshness_hash_streams_bounded_buffers() {
+        struct MeasuredReader<'a> {
+            bytes: std::io::Cursor<Vec<u8>>,
+            largest: &'a mut usize,
+            consumed: &'a mut usize,
+        }
+        impl std::io::Read for MeasuredReader<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                *self.largest = (*self.largest).max(buffer.len());
+                let read = self.bytes.read(buffer)?;
+                *self.consumed += read;
+                Ok(read)
+            }
+        }
+        let data = vec![b'x'; 64 * 1024];
+        let mut largest = 0;
+        let mut consumed = 0;
+        let (hash, bytes_read) = hash_small_reader(MeasuredReader {
+            bytes: std::io::Cursor::new(data.clone()),
+            largest: &mut largest,
+            consumed: &mut consumed,
+        })
+        .unwrap();
+        assert_eq!(hash, Some(blake3::hash(&data)));
+        assert_eq!(bytes_read, data.len() as u64);
+        assert_eq!(consumed, data.len());
+        assert!(largest <= 8192, "read buffer grew to {largest}");
+        let data = vec![b'x'; CONTENT_HASH_SIZE_CAP as usize + 16384];
+        let mut largest = 0;
+        let mut consumed = 0;
+        let (hash, _) = hash_small_reader(MeasuredReader {
+            bytes: std::io::Cursor::new(data),
+            largest: &mut largest,
+            consumed: &mut consumed,
+        })
+        .unwrap();
+        assert!(hash.is_none());
+        assert_eq!(consumed as u64, CONTENT_HASH_SIZE_CAP + 1);
+    }
+
+    #[test]
+    fn audit10_file_growing_past_the_cap_has_no_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grown.rs");
+        fs::write(&path, vec![b'x'; CONTENT_HASH_SIZE_CAP as usize + 1]).unwrap();
+        // The caller's stat said the file was small; it grew afterwards.
+        assert!(hash_file_if_small(&path, 1).unwrap().is_none());
+        fs::write(&path, b"small").unwrap();
+        assert_eq!(
+            hash_file_if_small(&path, 5).unwrap(),
+            Some(blake3::hash(b"small"))
+        );
+    }
 
     fn write(path: &Path, bytes: &[u8]) {
         fs::write(path, bytes).unwrap();

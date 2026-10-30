@@ -234,6 +234,68 @@ describe("loadAftConfig", () => {
     expect(JSON.parse(loaded.stdout).format_on_edit).toBe(true);
     expect(loaded.stderr).toContain("Discarded invalid configuration section: inspect");
   });
+
+  test("unrelated unknown user keys retain warning and partial-load behavior", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({
+        format_on_edit: true,
+        future_feature: true,
+        harnesses: { pi: { future_option: true } },
+      }),
+    );
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+    expect(JSON.parse(result.stdout).format_on_edit).toBe(true);
+    expect(result.stderr).toContain("validation error");
+  });
+
+  test("cache-location load failures still relay the native path and raw tiers", () => {
+    // Unparseable and unreadable user documents now reject the whole load
+    // (invalid_config_document); the tests above cover that.
+    for (const failure of ["number", "missing"]) {
+      const fixture = createConfigFixture();
+      const raw = '{"storage":{"cache_dir":123}}';
+      if (failure === "number") writeFileSync(fixture.userConfigPath, raw);
+      const result = spawnConfigLoader(
+        fixture.projectDirectory,
+        { HOME: join(fixture.root, "home"), XDG_CONFIG_HOME: fixture.xdgConfigHome },
+        `
+        import { loadAftConfig, buildConfigTierConfigureParams } from "./src/config.ts";
+        const merged = loadAftConfig(process.env.PROJECT_DIR!);
+        console.log(JSON.stringify({merged, params:buildConfigTierConfigureParams(process.env.PROJECT_DIR!)}));
+      `,
+      );
+      expect(result.status).toBe(0);
+      const value = JSON.parse(result.stdout);
+      expect(value.merged.storage).toBeUndefined();
+      expect(value.params.cortexkit_user_config_path).toBe(fixture.userConfigPath);
+      if (failure === "number") expect(value.params.config[0].doc).toBe(raw);
+      else expect(value.params.config).toEqual([]);
+    }
+  });
+
+  test("rejects user cache-location typos before partial or harness parsing", () => {
+    for (const user of [
+      { storge: { cache_dir: "/cache" } },
+      { storage: { cachedir: "/cache" } },
+      { harnesses: { future: { storge: { cache_dir: "/cache" } } } },
+      { harnesses: { future: { storage: { cachedir: "/cache" } } } },
+    ]) {
+      const fixture = createConfigFixture();
+      writeFileSync(fixture.userConfigPath, JSON.stringify(user));
+      const result = spawnConfigLoader(fixture.projectDirectory, {
+        HOME: join(fixture.root, "home"),
+        XDG_CONFIG_HOME: fixture.xdgConfigHome,
+      });
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("invalid_cache_config: unknown field");
+    }
+  });
+
   test("legacy user override cannot relocate a project config file", () => {
     const fixture = createConfigFixture();
     const directory = join(fixture.projectDirectory, ".opencode");
@@ -1172,26 +1234,26 @@ describe("loadAftConfig", () => {
     expect(result.stderr).not.toContain("Ignoring");
   });
 
-  test("bash.env is user-only and blocked values are refused at load", () => {
+  test("bash.env keeps the user map, carries the project map, and refuses blocked names", () => {
     const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,
-      JSON.stringify({ bash: { env: { TZ: "UTC", AFT_PI_ENV_TEST: "user-value" } } }),
+      JSON.stringify({ bash: { env: { TZ: "UTC", PI_ENV_TEST: "user-value" } } }),
     );
     writeFileSync(
       fixture.projectConfigPath,
-      JSON.stringify({ bash: { env: { TZ: "Mars", AFT_PI_PROJECT_ENV_TEST: "project-value" } } }),
+      JSON.stringify({ bash: { env: { TZ: "Mars", PI_PROJECT_ENV_TEST: "project-value" } } }),
     );
 
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: fixture.home,
       XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
-    expect(JSON.parse(result.stdout).bash.env).toEqual({
-      TZ: "UTC",
-      AFT_PI_ENV_TEST: "user-value",
-    });
-    expect(result.stderr).toContain("bash.env");
+    // A project's values are applied by the engine only while the project is
+    // trusted, so the loader keeps them in `project_env`.
+    const bash = JSON.parse(result.stdout).bash;
+    expect(bash.env).toEqual({ TZ: "UTC", PI_ENV_TEST: "user-value" });
+    expect(bash.project_env).toEqual({ TZ: "Mars", PI_PROJECT_ENV_TEST: "project-value" });
 
     const candidate = { bash: { env: { PYTHONPATH: "/tmp/injected" } } };
     writeFileSync(fixture.userConfigPath, JSON.stringify(candidate));

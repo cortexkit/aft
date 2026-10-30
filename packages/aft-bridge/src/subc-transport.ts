@@ -1396,6 +1396,7 @@ class SubcTransport implements AftProjectTransport {
     this.assertCurrent();
     const { preview, timeoutMs, onProgress, abortSignal } = this.splitOptions(options);
     const body: Record<string, unknown> = { name, arguments: rawArgs };
+    if (onProgress) body.handles_progress = true;
     const editSlotSurvives = this.pool.getEditSlotSurvives();
     if (editSlotSurvives !== undefined) body.edit_slot_survives = editSlotSurvives;
     if (preview === true) body.preview = true;
@@ -1445,6 +1446,7 @@ class SubcTransport implements AftProjectTransport {
       ...args
     } = params;
     const body: Record<string, unknown> = { name: command, arguments: args };
+    if (onProgress) body.handles_progress = true;
     if (workerSession === true) body[WORKER_SESSION_FIELD] = true;
     if (hostToolNames !== undefined) body[HOST_TOOL_NAMES_FIELD] = hostToolNames;
     body[PRESET_FIELD] = callPresetFor(workerSession === true);

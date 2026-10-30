@@ -1,1 +1,0 @@
-Remote bash launch replies no longer report an already accepted job as still waiting for input capture when the host's blocking pool is busy. Background launches still return their task ID immediately, and saved runner refusals remain errors.

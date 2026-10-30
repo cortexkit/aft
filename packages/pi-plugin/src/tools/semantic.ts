@@ -36,11 +36,14 @@ import {
   shortenPath,
 } from "./render-helpers.js";
 
+/** Search-status note for an answer read from files directly, with no index. */
+const FILESYSTEM_SCAN_STATUS = "answered by a filesystem scan";
+
 function semanticHonestyNote(response: Record<string, unknown>, theme: Theme): string | undefined {
   const notes: string[] = [];
   if (response.more_available === true) notes.push("more results available");
   if (response.engine_capped === true) notes.push("enumeration capped");
-  if (response.fully_degraded === true) notes.push("fully degraded");
+  if (response.fully_degraded === true) notes.push(FILESYSTEM_SCAN_STATUS);
   if (response.complete === false) notes.push("partial/incomplete");
   return notes.length > 0 ? theme.fg("warning", `Search status: ${notes.join("; ")}.`) : undefined;
 }

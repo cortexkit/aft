@@ -208,7 +208,9 @@ fn drain_callgraph_store_for_test(ctx: &AppContext) {
 }
 
 fn ensure_callgraph_store_ready(ctx: &AppContext) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // A cold call-graph build on a loaded CI runner (Windows especially) can
+    // take well over 10 s; a build that never finishes still fails here.
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         match ctx.callgraph_store_for_ops() {
             // A published store is served while its build is still settling,

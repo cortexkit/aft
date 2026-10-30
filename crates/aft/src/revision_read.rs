@@ -630,6 +630,16 @@ impl GitFailure {
 /// Run one read-only git command in `directory` under a deadline, killing it
 /// (and anything it started) when the deadline passes or its output grows
 /// past the sink's limit.
+pub(crate) fn bounded_git_bytes(
+    directory: &Path,
+    args: &[&str],
+    deadline: Instant,
+    limit: usize,
+) -> Option<Vec<u8>> {
+    let output = run_git(directory, args, deadline, Sink::memory(limit)).ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
 fn run_git<I, S>(
     directory: &Path,
     args: I,

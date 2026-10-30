@@ -11,11 +11,15 @@ import select
 import shutil
 import sqlite3
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from scripts.lib.index_event import index_event_root_matches
 
 
 SOAK_SCOPE_BY_ROOT = {
@@ -667,7 +671,9 @@ def _semantic_log_work(log_text: str, root: Path) -> str | None:
         if "request=semantic post-configure cold build" in line and "queued" in line:
             queued_at = position
         event = event_re.search(line)
-        if not event or event.group("root") not in root_texts:
+        if not event or not any(
+            index_event_root_matches(event.group("root"), candidate) for candidate in root_texts
+        ):
             continue
         kind = event.group("kind")
         build_id = event.group("build_id")

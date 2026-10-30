@@ -5,10 +5,15 @@ import type {
   BashCompletedPayload,
   BashLongRunningPayload,
   BashPatternMatchAck,
+  BashWatchLineBatch,
   BgNudgeRef,
   BridgeOptions,
 } from "@cortexkit/aft-bridge";
-import { canonicalizeProjectRoot } from "@cortexkit/aft-bridge";
+import {
+  canonicalizeProjectRoot,
+  WatchBatchProgress,
+  watchBatchHasContent,
+} from "@cortexkit/aft-bridge";
 import { Effect } from "effect";
 
 import { interruptBashWaitsForChatMessage } from "../bash-wait-detach.js";
@@ -379,9 +384,9 @@ export function createV2RuntimeConsumer(
   options: V2RuntimeConsumerOptions = {},
 ): V2RuntimeConsumer {
   const delivery = new V2SessionDelivery(context.session);
-  // SubC owns acknowledgement retries outside this consumer and does not
-  // expose confirmed retirement here. Preserve its retained deduplication keys
-  // without imposing the standalone path's cap on long-lived SubC sessions.
+  // SubC owns acknowledgement retries outside admission. Keep its existing
+  // completion and non-batched watch keys. Batched watch keys clear when an
+  // acknowledgement is confirmed or the watch is absent from the pending list.
   const subcDelivery = new V2SessionDelivery(context.session, Number.POSITIVE_INFINITY);
   const sessions = new Set<string>();
   let subcPool: (() => AftTransportPool) | undefined;
@@ -395,6 +400,38 @@ export function createV2RuntimeConsumer(
   >();
   const completing = new Map<string, Promise<void>>();
   const matching = new Map<string, Promise<void>>();
+  const eachLineWork = new Map<
+    string,
+    {
+      version: number;
+      latest?: { match: PatternMatchEntry; bridge: AftProjectTransport };
+      promise: Promise<void>;
+    }
+  >();
+  const lineProgress = new Map<string, WatchBatchProgress>();
+  const subcLineProgress = new Map<string, WatchBatchProgress>();
+  const subcMatchID = (watch: string, version: number) => `match\0${watch}\0${version}`;
+  const retireSubcBatchVersion = (
+    sessionID: string,
+    task: string,
+    watch: string,
+    version: number,
+  ) =>
+    subcDelivery.retireCompletion({
+      sessionID,
+      taskIDs: [task],
+      notificationID: subcMatchID(watch, version),
+    });
+  const watchKey = (match: PatternMatchEntry) =>
+    JSON.stringify([match.session_id, match.task_id, match.watch_id]);
+  const matchKey = (match: PatternMatchEntry) =>
+    JSON.stringify([
+      match.session_id,
+      match.task_id,
+      match.watch_id,
+      match.match_offset,
+      match.reason,
+    ]);
   const draining = new Map<string, Promise<void>>();
   let disposed = false;
   const retryDelays = options.standaloneRetryDelaysMs ?? STANDALONE_RETRY_DELAYS_MS;
@@ -449,110 +486,40 @@ export function createV2RuntimeConsumer(
     (retry.timer as { unref?: () => void }).unref?.();
     retries.set(key, retry);
   };
-  const route: WakeRoute = {
-    standalonePatternMatch: async (match, bridge) => {
-      const key = JSON.stringify([
-        match.session_id,
-        match.task_id,
-        match.watch_id,
-        match.match_offset,
-        match.reason,
-      ]);
-      // As in `patternMatch`: a deleted session has no one to tell. Acknowledge
-      // the match without queueing it, so the bridge does not deliver it again.
-      if (v2SessionDeleted(context, match.session_id)) {
+  const retireOlderEachLine = (match: PatternMatchEntry): boolean => {
+    const watch = watchKey(match);
+    for (const [key, pending] of pendingMatches) {
+      if (!pending.match.batch || watchKey(pending.match) !== watch) continue;
+      if (pending.match.match_offset > match.match_offset) return false;
+      if (pending.match.match_offset < match.match_offset) {
         pendingMatches.delete(key);
         clearRetry(key);
-        await bridge
-          .send("bash_ack_completions", {
-            session_id: match.session_id,
-            ...(match.reason === "task_exit"
-              ? { task_ids: [match.task_id] }
-              : {
-                  matches: [
-                    {
-                      task_id: match.task_id,
-                      watch_id: match.watch_id,
-                      match_offset: match.match_offset,
-                    } satisfies BashPatternMatchAck,
-                  ],
-                }),
-          })
-          .catch((error) => {
-            warn(
-              `[bash_pattern_match] acknowledging watch ${match.watch_id} of deleted session ${match.session_id} failed: ${error instanceof Error ? error.message : String(error)}`,
-            );
-          });
-        return;
+        delivery.retirePatternMatch({
+          sessionID: pending.match.session_id,
+          taskIDs: [pending.match.task_id],
+          watchID: pending.match.watch_id,
+          matchOffset: pending.match.match_offset,
+          reason: pending.match.reason,
+          text: "",
+        });
       }
-      const active = matching.get(key);
-      if (active) return active;
-      const pending = pendingMatches.get(key) ?? { match, bridge, admitted: false };
-      pendingMatches.set(key, pending);
-      const deliver = async () => {
-        if (disposed) return;
-        const isSubagent = await resolveIsSubagent(context, match.session_id);
-        if (disposed) return;
-        if (isSubagent) {
-          await awaitV2ExecutionSettlement(context, match.session_id);
-          if (disposed) return;
-          if (!v2WatchWakeAllowed(context, match.session_id, match.task_id)) return;
-        }
-        const wake = {
-          sessionID: match.session_id,
-          taskIDs: [match.task_id],
-          watchID: match.watch_id,
-          matchOffset: match.match_offset,
-          reason: match.reason,
-          text: formatPatternMatchReminder([match]),
-        };
-        // Rust reports a deleted task by sending a terminal notification, not
-        // by saving a pending match. There is no task row in which to persist it.
-        const erased = match.reason === "task_exit" && match.match_text === "watch target erased";
-        if (!erased) {
-          // A late push can arrive after its ack, or after a newer sticky match
-          // replaced it. Durable pending state is the replay fence, not an
-          // ever-growing set of every offset this Location has delivered.
-          const current = await pending.bridge.send("bash_drain_completions", {
-            session_id: match.session_id,
-          });
-          if (disposed) return;
-          if (current.success === false || !Array.isArray(current.pending_matches)) {
-            throw new Error("pattern replay validation failed");
-          }
-          if (
-            !current.pending_matches
-              .filter(isPatternMatchEntry)
-              .some(
-                (entry) =>
-                  entry.session_id === match.session_id &&
-                  entry.task_id === match.task_id &&
-                  entry.watch_id === match.watch_id &&
-                  entry.match_offset === match.match_offset &&
-                  entry.reason === match.reason,
-              )
-          ) {
-            delivery.retirePatternMatch(wake);
-            pendingMatches.delete(key);
-            return;
-          }
-        }
-        if (!pending.admitted) {
-          const text = wake.text;
-          const admitted = await Effect.runPromise(
-            delivery.patternMatch({
-              ...wake,
-              metadata: { source: "aft", kind: "bash_pattern_match", watch_id: match.watch_id },
-            }),
-          );
-          if (disposed || admitted === "not-delivered") return;
-          pending.admitted = true;
-          if (admitted === "delivered")
-            detachWaitsForCompletion(match.session_id, text, bridge, getConfig());
-        }
-        // The daemon deletes an acknowledged once-watch, but only clears a
-        // sticky watch's pending match so it can keep scanning later output.
-        const ack = await pending.bridge.send("bash_ack_completions", {
+    }
+    return true;
+  };
+  const deliverStandalonePatternMatch = async (
+    match: PatternMatchEntry,
+    bridge: AftProjectTransport,
+  ): Promise<void> => {
+    const key = matchKey(match);
+    const watch = watchKey(match);
+    // As in `patternMatch`: a deleted session has no one to tell. Acknowledge
+    // the match without queueing it, so the bridge does not deliver it again.
+    if (v2SessionDeleted(context, match.session_id)) {
+      pendingMatches.delete(key);
+      if (match.batch) lineProgress.delete(watch);
+      clearRetry(key);
+      await bridge
+        .send("bash_ack_completions", {
           session_id: match.session_id,
           ...(match.reason === "task_exit"
             ? { task_ids: [match.task_id] }
@@ -565,49 +532,195 @@ export function createV2RuntimeConsumer(
                   } satisfies BashPatternMatchAck,
                 ],
               }),
+        })
+        .catch((error) => {
+          warn(
+            `[bash_pattern_match] acknowledging watch ${match.watch_id} of deleted session ${match.session_id} failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        });
+      return;
+    }
+    const active = matching.get(key);
+    if (active) return active;
+    const pending = pendingMatches.get(key) ?? { match, bridge, admitted: false };
+    pendingMatches.set(key, pending);
+    const deliver = async () => {
+      if (disposed) return;
+      const isSubagent = await resolveIsSubagent(context, match.session_id);
+      if (disposed) return;
+      if (isSubagent) {
+        await awaitV2ExecutionSettlement(context, match.session_id);
+        if (disposed) return;
+        if (!v2WatchWakeAllowed(context, match.session_id, match.task_id)) return;
+      }
+      let admittedBatch: BashWatchLineBatch | undefined;
+      let progress: WatchBatchProgress | undefined;
+      const wake = {
+        sessionID: match.session_id,
+        taskIDs: [match.task_id],
+        watchID: match.watch_id,
+        matchOffset: match.match_offset,
+        reason: match.reason,
+        text: formatPatternMatchReminder([match]),
+      };
+      // Rust reports a deleted task by sending a terminal notification, not
+      // by saving a pending match. There is no task row in which to persist it.
+      const erased = match.reason === "task_exit" && match.match_text === "watch target erased";
+      if (!erased) {
+        // A late push can arrive after its ack, or after a newer sticky match
+        // replaced it. Durable pending state is the replay fence, not an
+        // ever-growing set of every offset this consumer has delivered.
+        const current = await pending.bridge.send("bash_drain_completions", {
+          session_id: match.session_id,
         });
         if (disposed) return;
-        if (ack.success === false)
-          throw new Error(String(ack.message ?? "pattern acknowledgement failed"));
-        if (
-          match.reason !== "task_exit" &&
-          (!Array.isArray(ack.acked_matches) ||
-            !ack.acked_matches.some((entry) => {
-              if (typeof entry !== "object" || entry === null) return false;
-              const confirmed = entry as Partial<BashPatternMatchAck>;
-              return (
-                confirmed.task_id === match.task_id &&
-                confirmed.watch_id === match.watch_id &&
-                confirmed.match_offset === match.match_offset
-              );
-            }))
-        ) {
-          // Older engines may ignore the matches parameter. Keep the admission
-          // reserved until a later drain proves this match is no longer pending.
-          throw new Error("pattern acknowledgement was not confirmed");
+        if (current.success === false || !Array.isArray(current.pending_matches)) {
+          throw new Error("pattern replay validation failed");
         }
-        pendingMatches.delete(key);
-        delivery.retirePatternMatch(wake);
-      };
-      const attempt = deliver()
-        .then(
-          () => clearRetry(key),
-          (error) => {
-            warn(
-              `[bash_pattern_match] delivery of watch ${match.watch_id} to session ${match.session_id} failed: ${error instanceof Error ? error.message : String(error)}`,
+        const durable = current.pending_matches.filter(isPatternMatchEntry);
+        const currentMatch = durable.find(
+          (entry) =>
+            entry.session_id === match.session_id &&
+            entry.task_id === match.task_id &&
+            entry.watch_id === match.watch_id &&
+            entry.match_offset === match.match_offset &&
+            entry.reason === match.reason,
+        );
+        if (!currentMatch) {
+          if (match.batch && !durable.some((entry) => watchKey(entry) === watch))
+            lineProgress.delete(watch);
+          delivery.retirePatternMatch(wake);
+          pendingMatches.delete(key);
+          return;
+        }
+        if (match.batch) {
+          // A superseded push may never have reached the host. The durable
+          // snapshot retains its rows; watermarks remove only admitted data.
+          admittedBatch = {
+            ...(currentMatch.batch ?? match.batch),
+            snapshot: true,
+            version: match.match_offset,
+          };
+          progress = lineProgress.get(watch) ?? new WatchBatchProgress();
+          const unseen = progress.unseen(admittedBatch);
+          wake.text = formatPatternMatchReminder([{ ...currentMatch, batch: unseen }]);
+          if (!watchBatchHasContent(unseen)) pending.admitted = true;
+        }
+      }
+      if (!pending.admitted) {
+        const text = wake.text;
+        const admitted = await Effect.runPromise(
+          delivery.patternMatch({
+            ...wake,
+            metadata: { source: "aft", kind: "bash_pattern_match", watch_id: match.watch_id },
+          }),
+        );
+        if (disposed || admitted === "not-delivered") return;
+        pending.admitted = true;
+        if (admittedBatch && progress) {
+          progress.admit(admittedBatch);
+          lineProgress.set(watch, progress);
+        }
+        if (admitted === "delivered")
+          detachWaitsForCompletion(match.session_id, text, bridge, getConfig());
+      }
+      // The daemon deletes an acknowledged once-watch, but only clears a
+      // sticky watch's pending match so it can keep scanning later output.
+      const ack = await pending.bridge.send("bash_ack_completions", {
+        session_id: match.session_id,
+        ...(match.reason === "task_exit"
+          ? { task_ids: [match.task_id] }
+          : {
+              matches: [
+                {
+                  task_id: match.task_id,
+                  watch_id: match.watch_id,
+                  match_offset: match.match_offset,
+                } satisfies BashPatternMatchAck,
+              ],
+            }),
+      });
+      if (disposed) return;
+      if (ack.success === false)
+        throw new Error(String(ack.message ?? "pattern acknowledgement failed"));
+      if (
+        match.reason !== "task_exit" &&
+        (!Array.isArray(ack.acked_matches) ||
+          !ack.acked_matches.some((entry) => {
+            if (typeof entry !== "object" || entry === null) return false;
+            const confirmed = entry as Partial<BashPatternMatchAck>;
+            return (
+              confirmed.task_id === match.task_id &&
+              confirmed.watch_id === match.watch_id &&
+              confirmed.match_offset === match.match_offset
             );
-            // The match stays in `pendingMatches`. Retry it from there, unless
-            // something else delivered or retired it first.
-            scheduleRetry(key, match.session_id, `watch ${match.watch_id} match`, () => {
-              const current = pendingMatches.get(key);
-              if (current) void route.standalonePatternMatch?.(current.match, current.bridge);
-              else clearRetry(key);
-            });
-          },
-        )
-        .finally(() => matching.delete(key));
-      matching.set(key, attempt);
-      return attempt;
+          }))
+      ) {
+        // Older engines may ignore the matches parameter. Keep the admission
+        // reserved until a later drain proves this match is no longer pending.
+        throw new Error("pattern acknowledgement was not confirmed");
+      }
+      pendingMatches.delete(key);
+      if (match.batch) lineProgress.delete(watch);
+      delivery.retirePatternMatch(wake);
+    };
+    const attempt = deliver()
+      .then(
+        () => clearRetry(key),
+        (error) => {
+          warn(
+            `[bash_pattern_match] delivery of watch ${match.watch_id} to session ${match.session_id} failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          // The match stays in `pendingMatches`. Retry it from there, unless
+          // something else delivered or retired it first.
+          scheduleRetry(key, match.session_id, `watch ${match.watch_id} match`, () => {
+            const current = pendingMatches.get(key);
+            if (current) void route.standalonePatternMatch?.(current.match, current.bridge);
+            else clearRetry(key);
+          });
+        },
+      )
+      .finally(() => matching.delete(key));
+    matching.set(key, attempt);
+    return attempt;
+  };
+  const route: WakeRoute = {
+    standalonePatternMatch: async (match, bridge) => {
+      if (!match.batch) return deliverStandalonePatternMatch(match, bridge);
+      const watch = watchKey(match);
+      const active = eachLineWork.get(watch);
+      if (active) {
+        if (match.match_offset > (active.latest?.match.match_offset ?? active.version))
+          active.latest = { match, bridge };
+        return;
+      }
+      if (!retireOlderEachLine(match)) return;
+      // One active admission and one latest version bound a noisy watch's
+      // backlog. The durable snapshot accounts for coalesced versions' rows.
+      const work: {
+        version: number;
+        latest?: { match: PatternMatchEntry; bridge: AftProjectTransport };
+        promise: Promise<void>;
+      } = {
+        version: match.match_offset,
+        latest: { match, bridge },
+        promise: Promise.resolve(),
+      };
+      eachLineWork.set(watch, work);
+      work.promise = Promise.resolve()
+        .then(async () => {
+          while (!disposed && work.latest) {
+            const next = work.latest;
+            work.latest = undefined;
+            work.version = next.match.match_offset;
+            if (retireOlderEachLine(next.match))
+              await deliverStandalonePatternMatch(next.match, next.bridge);
+          }
+        })
+        .finally(() => {
+          if (eachLineWork.get(watch) === work) eachLineWork.delete(watch);
+        });
+      return work.promise;
     },
     drainPatterns: async (sessionID, root) => {
       // SubC owns session-event subscriptions and retries pending wakes after
@@ -651,6 +764,15 @@ export function createV2RuntimeConsumer(
       return attempt;
     },
     completion: async (completion, bridge, acknowledge = true) => {
+      if (
+        !v2SessionDeleted(context, completion.session_id) &&
+        (await resolveIsSubagent(context, completion.session_id))
+      ) {
+        await awaitV2ExecutionSettlement(context, completion.session_id);
+      }
+      // Settlement may be released by Location disposal or session deletion,
+      // not just execution end. Do not admit a wake into a released Location.
+      if (disposed) return false;
       // The host deleted this session. Holding or delivering the completion
       // would recreate notification state nothing releases again, so drop it
       // here. It is still acknowledged so the bridge does not deliver it again;
@@ -663,9 +785,6 @@ export function createV2RuntimeConsumer(
           });
         }
         return true;
-      }
-      if (await resolveIsSubagent(context, completion.session_id)) {
-        await awaitV2ExecutionSettlement(context, completion.session_id);
       }
       if (
         (await resolveIsSubagent(context, completion.session_id)) &&
@@ -744,12 +863,25 @@ export function createV2RuntimeConsumer(
         await awaitV2ExecutionSettlement(context, match.session_id);
         if (!v2WatchWakeAllowed(context, match.session_id, match.task_id)) return false;
       }
-      const text = formatPatternMatchReminder([match]);
+      const watch = watchKey(match);
+      const batch = match.batch
+        ? { ...match.batch, snapshot: true, version: match.match_offset }
+        : undefined;
+      const progress = batch
+        ? (subcLineProgress.get(watch) ?? new WatchBatchProgress())
+        : undefined;
+      const unseen = batch && progress ? progress.unseen(batch) : undefined;
+      if (batch && progress && unseen && !watchBatchHasContent(unseen)) {
+        progress.admit(batch);
+        subcLineProgress.set(watch, progress);
+        return true;
+      }
+      const text = formatPatternMatchReminder([unseen ? { ...match, batch: unseen } : match]);
       const admitted = await Effect.runPromise(
         subcDelivery.completion({
           sessionID: match.session_id,
           taskIDs: [match.task_id],
-          notificationID: `match\0${match.watch_id}\0${match.match_offset}`,
+          notificationID: subcMatchID(match.watch_id, match.match_offset),
           text,
           metadata: {
             source: "aft",
@@ -760,6 +892,10 @@ export function createV2RuntimeConsumer(
         }),
       );
       if (disposed || admitted === "not-delivered") return false;
+      if (batch && progress) {
+        progress.admit(batch);
+        subcLineProgress.set(watch, progress);
+      }
       if (admitted === "delivered") {
         detachWaitsForCompletion(match.session_id, text, bridge, getConfig());
         if (match.reason === "task_exit") forgetUnroutedCompletion(match.session_id, match.task_id);
@@ -950,6 +1086,31 @@ export function createV2RuntimeConsumer(
                 false
               );
             },
+            patternMatchAcked: (sessionID, match) => {
+              if (!sessionID) return;
+              const key = JSON.stringify([sessionID, match.task_id, match.watch_id]);
+              const progress = subcLineProgress.get(key);
+              if (!progress) return;
+              retireSubcBatchVersion(sessionID, match.task_id, match.watch_id, match.match_offset);
+              if (progress.admittedVersion === match.match_offset) subcLineProgress.delete(key);
+            },
+            patternMatchesPending: (sessionID, matches) => {
+              const pending = new Map(
+                matches.filter((match) => match.batch).map((match) => [watchKey(match), match]),
+              );
+              for (const [key, progress] of subcLineProgress) {
+                const [session, task, watch] = JSON.parse(key) as [string, string, string];
+                if (session !== sessionID) continue;
+                const current = pending.get(key);
+                if (
+                  progress.admittedVersion !== undefined &&
+                  current?.match_offset !== progress.admittedVersion
+                ) {
+                  retireSubcBatchVersion(session, task, watch, progress.admittedVersion);
+                }
+                if (!current) subcLineProgress.delete(key);
+              }
+            },
           },
         });
         // A drain keeps its own per-session bookkeeping while it delivers and
@@ -990,6 +1151,9 @@ export function createV2RuntimeConsumer(
       disposed = true;
       for (const key of [...retries.keys()]) clearRetry(key);
       pendingMatches.clear();
+      eachLineWork.clear();
+      lineProgress.clear();
+      subcLineProgress.clear();
       delivery.dispose();
       subcDelivery.dispose();
       const { routes } = wakeRouteState();

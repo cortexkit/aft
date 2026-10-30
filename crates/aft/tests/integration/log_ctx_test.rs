@@ -87,13 +87,12 @@ fn slog_macros_prepend_session_tag() {
         );
     });
 
-    // Case 2: Without explicit session id — verify LAST_SESSION fallback.
-    // session_prefix() falls back to the most recently set session id so that
-    // between-request log lines (filesystem watcher invalidation, gitignore
-    // matcher rebuilds) still carry a session tag. This thread had Case 1
-    // set "abcd1234", so the fallback should return that.
+    // Case 2: Without a session scope there is no tag, even though this
+    // thread served "abcd1234" in Case 1: an unscoped line is not
+    // attributed to whichever session the thread served last.
     aft::log_ctx::with_session(None, || {
         let prefix = aft::log_ctx::session_prefix();
-        assert_eq!(prefix, "[ses_abcd1234] ");
+        assert_eq!(prefix, "");
     });
+    assert_eq!(aft::log_ctx::session_prefix(), "");
 }

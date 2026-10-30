@@ -75,6 +75,19 @@ impl UnboundRetention {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) enum DeletedTaskRetention {
+    KillInFlight,
+    KillBackoff,
+    RegistryBusy,
+}
+
+const DELETED_TASK_RETENTION_LABELS: [&str; 3] = [
+    "task_kill_in_flight",
+    "task_kill_backoff",
+    "task_registry_busy",
+];
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct ReapBlockerCensus {
     pub(super) deleted_retained: usize,
@@ -89,6 +102,7 @@ pub(super) struct ReapBlockerCensus {
     pub(super) actor_state_busy: usize,
     pub(super) artifact_eviction_blocked: usize,
     pub(super) artifact_eviction_failed: usize,
+    deleted_task_blockers: [usize; 3],
     /// Existing roots with no bound route that are past their idle TTL but
     /// were not evicted, counted once each under the reason in
     /// `unbound_blockers`.
@@ -97,6 +111,12 @@ pub(super) struct ReapBlockerCensus {
 }
 
 impl ReapBlockerCensus {
+    pub(super) fn note_deleted_task_retained(&mut self, reason: DeletedTaskRetention) {
+        self.deleted_retained += 1;
+        self.artifact_eviction_blocked += 1;
+        self.deleted_task_blockers[reason as usize] += 1;
+    }
+
     pub(super) fn note_unbound_retained(&mut self, reason: UnboundRetention) {
         self.unbound_retained += 1;
         self.unbound_blockers[reason.index()] += 1;
@@ -112,7 +132,7 @@ impl ReapBlockerCensus {
     }
     pub(super) fn blocker_histogram(&self) -> String {
         format!(
-            "absence_unconfirmed={},bound_routes={},unbound_quiesced={},bash_waits={},maintenance_pending={},maintenance_queued={},pending_binds={},actor_busy={},actor_state_busy={},artifact_eviction_blocked={},artifact_eviction_failed={}",
+            "absence_unconfirmed={},bound_routes={},unbound_quiesced={},bash_waits={},maintenance_pending={},maintenance_queued={},pending_binds={},actor_busy={},actor_state_busy={},artifact_eviction_blocked={},artifact_eviction_failed={},task_kill_in_flight={},task_kill_backoff={},task_registry_busy={}",
             self.absence_unconfirmed,
             self.bound_routes,
             self.unbound_quiesced,
@@ -124,6 +144,9 @@ impl ReapBlockerCensus {
             self.actor_state_busy,
             self.artifact_eviction_blocked,
             self.artifact_eviction_failed,
+            self.deleted_task_blockers[0],
+            self.deleted_task_blockers[1],
+            self.deleted_task_blockers[2],
         )
     }
 }
@@ -147,6 +170,7 @@ struct ReapMetrics {
     actor_state_busy: AtomicUsize,
     artifact_eviction_blocked: AtomicUsize,
     artifact_eviction_failed: AtomicUsize,
+    deleted_task_blockers: [AtomicUsize; 3],
     unbound_retained: AtomicUsize,
     unbound_blockers: [AtomicUsize; UNBOUND_RETENTION_KINDS],
 }
@@ -168,6 +192,7 @@ impl ReapMetrics {
             actor_state_busy: AtomicUsize::new(0),
             artifact_eviction_blocked: AtomicUsize::new(0),
             artifact_eviction_failed: AtomicUsize::new(0),
+            deleted_task_blockers: std::array::from_fn(|_| AtomicUsize::new(0)),
             unbound_retained: AtomicUsize::new(0),
             unbound_blockers: std::array::from_fn(|_| AtomicUsize::new(0)),
         }
@@ -215,6 +240,13 @@ impl ReapMetrics {
             .store(census.artifact_eviction_blocked, Ordering::Relaxed);
         self.artifact_eviction_failed
             .store(census.artifact_eviction_failed, Ordering::Relaxed);
+        for (slot, count) in self
+            .deleted_task_blockers
+            .iter()
+            .zip(census.deleted_task_blockers)
+        {
+            slot.store(count, Ordering::Relaxed);
+        }
         self.unbound_retained
             .store(census.unbound_retained, Ordering::Relaxed);
         for (slot, count) in self
@@ -228,6 +260,11 @@ impl ReapMetrics {
     }
 
     fn snapshot(&self) -> Value {
+        let deleted_task_blockers = DELETED_TASK_RETENTION_LABELS
+            .iter()
+            .zip(self.deleted_task_blockers.iter())
+            .map(|(label, count)| ((*label).to_string(), json!(count.load(Ordering::Relaxed))))
+            .collect::<serde_json::Map<_, _>>();
         let unbound_blockers = UNBOUND_RETENTION_LABELS
             .iter()
             .zip(self.unbound_blockers.iter())
@@ -235,6 +272,7 @@ impl ReapMetrics {
             .collect::<serde_json::Map<_, _>>();
         json!({
             "deleted_retained": self.deleted_retained.load(Ordering::Relaxed),
+            "deleted_task_blockers": deleted_task_blockers,
             "blockers": {
                 "absence_unconfirmed": self.absence_unconfirmed.load(Ordering::Relaxed),
                 "bound_routes": self.bound_routes.load(Ordering::Relaxed),
@@ -511,7 +549,7 @@ impl BindAckLatencies {
 #[derive(Default)]
 struct FrameOperation {
     corr: u64,
-    op: String,
+    op: &'static str,
     root: String,
     session: String,
     awaited: &'static str,
@@ -520,6 +558,7 @@ struct FrameOperation {
 }
 
 pub(super) struct DispatchPathMetrics {
+    pub(super) watch_delivery: Arc<super::watch_delivery::WatchDelivery>,
     unanswered_tools: StdMutex<HashMap<(super::RouteChannel, u64), UnansweredTool>>,
     pub(super) origin: Instant,
     pub(super) frame_loop_last_tick_ms: AtomicU64,
@@ -532,6 +571,7 @@ pub(super) struct DispatchPathMetrics {
     /// Best-effort header context; no locks are taken by the watchdog reader.
     frame_loop_frame_header: AtomicU64,
     frame_loop_frame_corr: AtomicU64,
+    frame_loop_step: super::work_step::WorkStep,
     /// Kept separate from scheduler and bash-registry locks. Publishers and the
     /// watchdog use try_lock so evidence collection cannot block either thread.
     frame_operation: StdMutex<FrameOperation>,
@@ -551,6 +591,10 @@ pub(super) struct DispatchPathMetrics {
     pub(super) deferred_bash_waits_in_flight: AtomicUsize,
     /// Bash calls whose route request is still waiting for a terminal frame.
     pub(super) held_bash_calls: super::drain::HeldBashCalls,
+    /// Test-only probe that learns when a bash call reaches its foreground
+    /// wait. Production never installs one; integration tests wait on its
+    /// `BashForegroundWait` event instead of sleeping past the spawn job.
+    pub(super) lifecycle_probe: StdMutex<Option<super::SubcTestLifecycleProbe>>,
     pub(super) reliable_push_budget_deferrals: AtomicU64,
     pub(super) maintenance_budget_deferrals: AtomicU64,
     pub(super) response_tasks_live: AtomicUsize,
@@ -559,6 +603,7 @@ pub(super) struct DispatchPathMetrics {
     pub(super) bg_wake_unacked_total: AtomicUsize,
     bg_wake_rearm_total: AtomicU64,
     stuck_pending_watch_next_scan_ms: AtomicU64,
+    stuck_pending_watch_scan_running: AtomicBool,
     stuck_pending_watch_logs: StdMutex<HashMap<String, Instant>>,
     bg_events: StdMutex<HashMap<BgEventKey, BgEventRecord>>,
     bg_event_rates: BgEventRates,
@@ -571,11 +616,22 @@ pub(super) struct DispatchPathMetrics {
     /// Routes bound with a daemon scope stamp that made at least one tool
     /// call, each counted once.
     scoped_routes_with_tool_calls: AtomicU64,
+    pub(super) scope_descriptions: StdMutex<super::route_census::ScopeDescriptions>,
 }
 
 impl DispatchPathMetrics {
+    pub(super) fn in_flight_route_requests(&self) -> Vec<(RouteChannel, u64)> {
+        self.unanswered_tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .copied()
+            .collect()
+    }
+
     pub(super) fn new() -> Self {
         Self {
+            watch_delivery: Arc::default(),
             unanswered_tools: StdMutex::new(HashMap::new()),
             origin: Instant::now(),
             frame_loop_last_tick_ms: AtomicU64::new(0),
@@ -583,6 +639,7 @@ impl DispatchPathMetrics {
             frame_loop_phase: AtomicUsize::new(0),
             frame_loop_frame_header: AtomicU64::new(0),
             frame_loop_frame_corr: AtomicU64::new(0),
+            frame_loop_step: super::work_step::WorkStep::default(),
             frame_operation: StdMutex::new(FrameOperation::default()),
             stall_stats: Arc::default(),
             writer_queued: AtomicUsize::new(0),
@@ -598,6 +655,7 @@ impl DispatchPathMetrics {
             bash_poll_touch_queued: AtomicUsize::new(0),
             deferred_bash_waits_in_flight: AtomicUsize::new(0),
             held_bash_calls: super::drain::HeldBashCalls::default(),
+            lifecycle_probe: StdMutex::new(None),
             reliable_push_budget_deferrals: AtomicU64::new(0),
             maintenance_budget_deferrals: AtomicU64::new(0),
             response_tasks_live: AtomicUsize::new(0),
@@ -606,6 +664,7 @@ impl DispatchPathMetrics {
             bg_wake_unacked_total: AtomicUsize::new(0),
             bg_wake_rearm_total: AtomicU64::new(0),
             stuck_pending_watch_next_scan_ms: AtomicU64::new(0),
+            stuck_pending_watch_scan_running: AtomicBool::new(false),
             stuck_pending_watch_logs: StdMutex::new(HashMap::new()),
             bg_events: StdMutex::new(HashMap::new()),
             bg_event_rates: BgEventRates::new(),
@@ -613,6 +672,7 @@ impl DispatchPathMetrics {
             bind_acks: StdMutex::new(BindAckLatencies::default()),
             presetless_tool_calls: StdMutex::new(BTreeMap::new()),
             scoped_routes_with_tool_calls: AtomicU64::new(0),
+            scope_descriptions: StdMutex::new(super::route_census::ScopeDescriptions::default()),
         }
     }
 
@@ -860,9 +920,16 @@ impl DispatchPathMetrics {
             .store(self.now_ms(), Ordering::Relaxed);
     }
 
+    pub(super) fn mark_frame_loop_step(&self, entry: &'static str, command: &str, request_id: u64) {
+        self.frame_loop_step
+            .enter(entry, command, request_id, self.now_ms());
+        self.frame_loop_phase.store(0, Ordering::Relaxed);
+    }
+
     /// Records that the frame loop is about to park and will wake again within
     /// `within` because its drain-tick timer fires then.
     pub(super) fn publish_frame_loop_wake_deadline(&self, within: Duration) {
+        self.frame_loop_step.clear();
         self.frame_loop_phase.store(1, Ordering::Relaxed);
         let deadline = self
             .now_ms()
@@ -875,6 +942,7 @@ impl DispatchPathMetrics {
     /// Called when the frame loop exits, so a finished loop never reads as a
     /// stalled one.
     pub(super) fn clear_frame_loop_wake_deadline(&self) {
+        self.frame_loop_step.clear();
         self.frame_loop_wake_deadline_ms_plus_one
             .store(0, Ordering::Relaxed);
     }
@@ -899,7 +967,47 @@ impl DispatchPathMetrics {
         deadline != 0 && self.now_ms() >= deadline
     }
 
+    pub(super) fn mark_frame_loop_entry(&self, entry: &'static str, frame: &Frame) {
+        let command = match frame.header.ty {
+            super::FrameType::Ping => "ping",
+            super::FrameType::Pong => "pong",
+            _ => "",
+        };
+        self.frame_loop_step
+            .enter(entry, command, frame.header.corr, self.now_ms());
+    }
+
+    pub(super) fn mark_frame_loop_command(&self, entry: &'static str, name: &str, request_id: u64) {
+        self.frame_loop_step
+            .enter(entry, name, request_id, self.now_ms());
+    }
+
+    pub(super) fn mark_frame_loop_tool(&self, name: &str, request_id: u64) {
+        self.mark_frame_loop_command("handle_tool_call", name, request_id);
+    }
+
+    pub(super) fn mark_frame_loop_control(
+        &self,
+        request: &super::ModuleControlRequest,
+        frame: &Frame,
+    ) {
+        let (name, awaited) = match request {
+            super::ModuleControlRequest::RouteBind { .. } => ("route_bind", "control_validation"),
+            super::ModuleControlRequest::HealthCheck {} => ("health_check", "cached_health"),
+        };
+        self.mark_frame_loop_command("handle_control_request", name, frame.header.corr);
+        if let Ok(mut operation) = self.frame_operation.try_lock() {
+            operation.op = name;
+            operation.awaited = awaited;
+            if let super::ModuleControlRequest::RouteBind { identity, .. } = request {
+                operation.root = identity.project_root.to_string_lossy().into_owned();
+                operation.session.clone_from(&identity.session);
+            }
+        }
+    }
+
     pub(super) fn mark_frame_loop_frame(&self, frame: &Frame) {
+        self.mark_frame_loop_entry("run_module_loop/handle_frame", frame);
         self.frame_loop_frame_header.store(
             (frame.header.ty as u64)
                 | (u64::from(frame.header.channel) << 8)
@@ -911,25 +1019,20 @@ impl DispatchPathMetrics {
         if let Ok(mut operation) = self.frame_operation.try_lock() {
             *operation = FrameOperation {
                 corr: frame.header.corr,
-                op: format!("{:?}", frame.header.ty).to_lowercase(),
+                op: match frame.header.ty {
+                    super::FrameType::Request => "request",
+                    super::FrameType::Response => "response",
+                    super::FrameType::Ping => "ping",
+                    super::FrameType::Pong => "pong",
+                    super::FrameType::Error => "error",
+                    super::FrameType::Cancel => "cancel",
+                    super::FrameType::Goodbye => "goodbye",
+                    super::FrameType::Push => "push",
+                    _ => "frame",
+                },
                 awaited: "none",
                 ..FrameOperation::default()
             };
-            if frame.header.channel == 0 && frame.header.ty == super::FrameType::Request {
-                match serde_json::from_slice::<super::ModuleControlRequest>(&frame.body) {
-                    Ok(super::ModuleControlRequest::RouteBind { identity, .. }) => {
-                        operation.op = "route_bind".to_string();
-                        operation.root = identity.project_root.to_string_lossy().into_owned();
-                        operation.session = identity.session;
-                        operation.awaited = "control_validation";
-                    }
-                    Ok(super::ModuleControlRequest::HealthCheck {}) => {
-                        operation.op = "health_check".to_string();
-                        operation.awaited = "cached_health";
-                    }
-                    Err(_) => operation.op = "invalid_control_request".to_string(),
-                }
-            }
         }
         self.frame_loop_phase.store(2, Ordering::Release);
     }
@@ -960,7 +1063,7 @@ impl DispatchPathMetrics {
     }
 
     pub(super) fn frame_loop_context(&self) -> String {
-        match self.frame_loop_phase.load(Ordering::Acquire) {
+        let context = match self.frame_loop_phase.load(Ordering::Acquire) {
             0 => "phase=turn_work frame=none".to_string(),
             1 => "phase=select_wait frame=none".to_string(),
             _ => {
@@ -996,7 +1099,8 @@ impl DispatchPathMetrics {
                     corr,
                 )
             }
-        }
+        };
+        format!("{context} {}", self.frame_loop_step.snapshot(self.now_ms()))
     }
 
     /// Returns whether the retained-roots summary changed since the last sweep.
@@ -1006,6 +1110,17 @@ impl DispatchPathMetrics {
             .map(duration_millis_u64)
             .unwrap_or(0);
         self.reap.record(last_sweep_ms, census)
+    }
+
+    /// The last sweep's census as the health surface reports it, without the
+    /// wall-clock sweep time.
+    #[cfg(test)]
+    pub(super) fn reap_census_for_test(&self) -> Value {
+        let mut census = self.reap.snapshot();
+        if let Some(fields) = census.as_object_mut() {
+            fields.remove("last_sweep_ms");
+        }
+        census
     }
 
     pub(super) fn record_bg_runtime(
@@ -1040,8 +1155,8 @@ impl DispatchPathMetrics {
     }
 
     pub(super) fn warn_stuck_pending_watches(
-        &self,
-        executor: &Executor,
+        self: &Arc<Self>,
+        executor: &Arc<Executor>,
         subscriptions: &BgSubsBySession,
     ) {
         let now_ms = self.now_ms();
@@ -1060,8 +1175,36 @@ impl DispatchPathMetrics {
             return;
         }
 
+        self.prune_bg_event_records(subscriptions, Instant::now());
+        if subscriptions.is_empty()
+            || self
+                .stuck_pending_watch_scan_running
+                .swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+        let metrics = Arc::clone(self);
+        let executor = Arc::clone(executor);
+        let subscriptions = subscriptions.clone();
+        // Watch rows live in the shared SQLite database. Even acquiring its
+        // mutex can wait behind a disk-bound retention worker. One outstanding
+        // scan suffices; never queue more scans behind a stalled database.
+        tokio::task::spawn_blocking(move || {
+            struct ScanFinished(Arc<DispatchPathMetrics>);
+            impl Drop for ScanFinished {
+                fn drop(&mut self) {
+                    self.0
+                        .stuck_pending_watch_scan_running
+                        .store(false, Ordering::Relaxed);
+                }
+            }
+            let _finished = ScanFinished(Arc::clone(&metrics));
+            metrics.scan_stuck_pending_watches(&executor, &subscriptions);
+        });
+    }
+
+    fn scan_stuck_pending_watches(&self, executor: &Executor, subscriptions: &BgSubsBySession) {
         let now = Instant::now();
-        self.prune_bg_event_records(subscriptions, now);
         let Ok(mut logged) = self.stuck_pending_watch_logs.lock() else {
             return;
         };
@@ -1086,14 +1229,18 @@ impl DispatchPathMetrics {
                     continue;
                 }
                 logged.insert(key, now);
-                crate::slog_warn!(
-                    "subc bg wake: pending watch remains unacked root={} session={} task={} watch={} age_ms={}",
-                    root.as_path().display(),
-                    session,
-                    task_id,
-                    watch_id,
-                    age_ms
-                );
+                // One scan covers every session's watches, so log each inside
+                // its own session's scope to tag it with that session.
+                crate::log_ctx::with_session(Some(session.clone()), || {
+                    crate::slog_warn!(
+                        "subc bg wake: pending watch remains unacked root={} session={} task={} watch={} age_ms={}",
+                        root.as_path().display(),
+                        session,
+                        task_id,
+                        watch_id,
+                        age_ms
+                    );
+                });
             }
         }
         logged.retain(|_, last| {
@@ -1289,6 +1436,7 @@ impl DispatchPathMetrics {
                 "oldest_age_ms": oldest_pending_age_ms,
             },
             "bind_acks": self.bind_ack_snapshot(),
+            "reliable_push": self.watch_delivery.health(),
             "tool_call_presets": self.tool_call_preset_snapshot(),
             "completion_channels": {
                 "control": self.control_completion_queued.load(Ordering::Relaxed),
@@ -1554,16 +1702,19 @@ pub(super) fn warn_slow_pending_binds(
                 in_flight_writer: None,
                 reader_admissions_while_promoted_writer_waited: 0,
             });
-        crate::slog_warn!(
-            "{}",
-            pending_bind_breadcrumb(
-                *route,
-                &pending.bind_root_id,
-                age,
-                &pending.configure_request_id,
-                &snapshot,
-            )
+        let breadcrumb = pending_bind_breadcrumb(
+            *route,
+            &pending.bind_root_id,
+            age,
+            &pending.configure_request_id,
+            &snapshot,
         );
+        // The frame loop serves every session, so tag the line with the
+        // session that requested this bind rather than whatever scope (if
+        // any) the thread happens to be in.
+        crate::log_ctx::with_session(pending.session.clone(), || {
+            crate::slog_warn!("{breadcrumb}");
+        });
     }
 }
 
@@ -1790,7 +1941,24 @@ fn retention_report_totals(
     reports: &std::collections::BTreeMap<String, crate::storage_retention::SweepReport>,
 ) -> Value {
     let mut totals = serde_json::Map::from_iter([("reports".into(), json!(reports.len()))]);
+    let mut trash = crate::storage_retention::TrashReport {
+        at_ms: crate::pins::now_ms(),
+        ..Default::default()
+    };
     for report in reports.values() {
+        let census = &report.trash;
+        trash.entries = trash.entries.saturating_add(census.entries);
+        trash.bytes_estimate = trash.bytes_estimate.saturating_add(census.bytes_estimate);
+        trash.removed_entries = trash.removed_entries.saturating_add(census.removed_entries);
+        trash.incomplete |= census.incomplete || census.at_ms == 0;
+        if let Some(age) = census.oldest_age_ms {
+            let age = age.saturating_add(trash.at_ms.saturating_sub(census.at_ms));
+            trash.oldest_age_ms = Some(trash.oldest_age_ms.unwrap_or(0).max(age));
+        }
+        for (reason, count) in &census.kept_by_reason {
+            let total = trash.kept_by_reason.entry(reason.clone()).or_default();
+            *total = total.saturating_add(*count);
+        }
         for (field, value) in serde_json::to_value(report).unwrap().as_object().unwrap() {
             let (key, count) = match value {
                 Value::Number(number) if field != "at_ms" => {
@@ -1804,7 +1972,129 @@ fn retention_report_totals(
             totals.insert(key, json!(total.saturating_add(count)));
         }
     }
+    // Detail reports can be omitted by the health payload budget; keep the
+    // trash backlog and counts of entries retained by reason in the aggregate
+    // that survives trimming.
+    totals.insert("trash".into(), serde_json::to_value(trash).unwrap());
     Value::Object(totals)
+}
+
+fn ordinary_ready_health_root(root: &Value) -> bool {
+    root["abbreviated"] != true
+        && root["standing"] != true
+        && !root["standing_refusal"].is_string()
+        && root["cache_unavailable_reason"].is_null()
+        && root["state"] == "ready"
+        && ["search_index", "semantic_index", "callgraph_store", "tier2"]
+            .iter()
+            .all(|component| {
+                matches!(
+                    root[component]["status"].as_str(),
+                    Some("ready" | "disabled")
+                )
+            })
+        && root["suspended_domains"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+        && root["tier2"]["retry_paused"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+        && root["bash"]["project_replay_failures"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+        && root["views"].as_object().is_none_or(|views| {
+            views.get("pinned").and_then(Value::as_bool) == Some(true)
+                && views.get("pending_paths").and_then(Value::as_u64) == Some(0)
+                && views.get("failed_paths").and_then(Value::as_u64) == Some(0)
+                && views.get("publication_failure").is_none_or(Value::is_null)
+                && views
+                    .get("callgraph_readiness_deferred")
+                    .is_none_or(Value::is_null)
+        })
+}
+
+fn abbreviated_health_path(path: &str) -> String {
+    if path.len() <= 160 {
+        return path.to_owned();
+    }
+    let basename = path
+        .rsplit(['/', '\\'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(path);
+    let label = basename.chars().take(64).collect::<String>();
+    // Keep a digest of the entire identity: roots with the same basename must
+    // remain distinguishable after their parent directories are hidden.
+    format!(
+        "<blake3:{}>/{label}",
+        blake3::hash(path.as_bytes()).to_hex()
+    )
+}
+
+fn abbreviated_health_refusal(refusal: &str) -> String {
+    if refusal.len() <= 256 {
+        return refusal.to_owned();
+    }
+    if refusal.starts_with("resolved-path-drift refusal") {
+        let field = [
+            "resolved_target",
+            "resolved_git_toplevel",
+            "scoped_relative_path",
+        ]
+        .into_iter()
+        .find(|field| refusal.contains(&format!(": {field} changed from ")))
+        .unwrap_or("resolved path");
+        return format!("resolved-path-drift refusal: {field} changed (details abbreviated)");
+    }
+    // Resolution errors start with their refusal category. Keep that prefix,
+    // but bound the error's user-controlled paths and nested detail.
+    let prefix = refusal.chars().take(160).collect::<String>();
+    format!(
+        "{prefix}… <blake3:{}>",
+        blake3::hash(refusal.as_bytes()).to_hex()
+    )
+}
+
+fn abbreviate_health_root(root: &mut Value) -> bool {
+    let Some(row) = root.as_object_mut() else {
+        return false;
+    };
+    if row.get("abbreviated") == Some(&Value::Bool(true)) {
+        return false;
+    }
+    // The final actionable row is a summary, not an omitted root. Preserve its
+    // identity, readiness and refusal codes while yielding optional telemetry.
+    row.retain(|key, _| {
+        matches!(
+            key.as_str(),
+            "project_root"
+                | "root_id"
+                | "state"
+                | "status"
+                | "standing"
+                | "standing_entry"
+                | "standing_refusal"
+                | "cache_unavailable_reason"
+                | "search_index"
+                | "semantic_index"
+                | "callgraph_store"
+                | "tier2"
+        )
+    });
+    for field in ["project_root", "root_id", "standing_entry"] {
+        if let Some(Value::String(path)) = row.get_mut(field) {
+            *path = abbreviated_health_path(path);
+        }
+    }
+    if let Some(Value::String(refusal)) = row.get_mut("standing_refusal") {
+        *refusal = abbreviated_health_refusal(refusal);
+    }
+    for component in ["search_index", "semantic_index", "callgraph_store", "tier2"] {
+        if let Some(Value::Object(component)) = row.get_mut(component) {
+            component.retain(|key, _| key == "status");
+        }
+    }
+    row.insert("abbreviated".into(), Value::Bool(true));
+    true
 }
 
 fn budget_health_metrics(metrics: &mut serde_json::Map<String, Value>) {
@@ -1813,17 +2103,19 @@ fn budget_health_metrics(metrics: &mut serde_json::Map<String, Value>) {
         if refresh_metrics_bytes(metrics) <= HEALTH_METRICS_BUDGET_BYTES {
             return;
         }
+        // Historical sweep detail must yield before current root diagnostics,
+        // including standing health. The snapshot is newest first.
         if metrics
-            .get_mut("roots")
+            .get_mut("v2_family_sweeps")
             .and_then(Value::as_array_mut)
-            .is_some_and(|roots| roots.pop().is_some())
+            .is_some_and(|sweeps| sweeps.pop().is_some())
         {
             let omitted = metrics
-                .get("root_details_omitted")
+                .get("v2_family_sweeps_omitted")
                 .and_then(Value::as_u64)
                 .unwrap_or(0)
                 .saturating_add(1);
-            metrics.insert("root_details_omitted".to_string(), json!(omitted));
+            metrics.insert("v2_family_sweeps_omitted".into(), json!(omitted));
             continue;
         }
         if !ledger_compacted {
@@ -1847,6 +2139,63 @@ fn budget_health_metrics(metrics: &mut serde_json::Map<String, Value>) {
                 .saturating_add(1);
             metrics.insert("storage_retention_reports_omitted".into(), json!(omitted));
             continue;
+        }
+        // Cache-root paths are user-chosen and may be long. Their detail yields
+        // before root health, unavailable entries first because their paths
+        // repeat ones listed in cache_roots, counting each one dropped.
+        let mut trimmed_cache_path = false;
+        for (field, omitted_field) in [
+            ("cache_unavailable", "cache_unavailable_omitted"),
+            ("cache_roots", "cache_roots_omitted"),
+        ] {
+            let removed = match metrics.get_mut(field) {
+                Some(Value::Object(entries)) => {
+                    let last = entries.keys().next_back().cloned();
+                    last.is_some_and(|key| entries.remove(&key).is_some())
+                }
+                Some(Value::Array(entries)) => entries.pop().is_some(),
+                _ => false,
+            };
+            if removed {
+                let omitted = metrics
+                    .get(omitted_field)
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                metrics.insert(omitted_field.into(), json!(omitted));
+                trimmed_cache_path = true;
+                break;
+            }
+        }
+        if trimmed_cache_path {
+            continue;
+        }
+        // Current refusals and unhealthy roots are more useful than ancillary
+        // telemetry. After compacting that telemetry, discard ordinary ready
+        // roots first; keep the original order among the surviving rows.
+        if let Some(roots) = metrics.get_mut("roots").and_then(Value::as_array_mut) {
+            if !roots.is_empty() {
+                let index = roots
+                    .iter()
+                    .rposition(ordinary_ready_health_root)
+                    .or_else(|| (roots.len() > 1).then(|| roots.len() - 1));
+                let Some(index) = index else {
+                    // A degraded headline without its last actionable root is
+                    // misleading. Abbreviating that row does not omit a root.
+                    if abbreviate_health_root(&mut roots[0]) {
+                        continue;
+                    }
+                    return;
+                };
+                roots.remove(index);
+                let omitted = metrics
+                    .get("root_details_omitted")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                metrics.insert("root_details_omitted".into(), json!(omitted));
+                continue;
+            }
         }
         return;
     }
@@ -2013,6 +2362,40 @@ pub(super) struct HealthRollupCache {
 }
 
 impl HealthRollupCache {
+    pub(super) fn findings(
+        &self,
+        now_ms: u64,
+        window_ms: u64,
+    ) -> Vec<super::diagnostics_findings::Finding> {
+        let snapshot = match self.snapshot.try_read() {
+            Ok(snapshot) => Arc::clone(&snapshot),
+            Err(_) => {
+                return super::diagnostics_findings::from_health(
+                    &Value::Null,
+                    None,
+                    Some("cache_contended_or_poisoned"),
+                    now_ms,
+                    window_ms,
+                )
+            }
+        };
+        let age_ms = snapshot
+            .generated_at_ms
+            .map(|generated| self.now_ms().saturating_sub(generated));
+        let reason = if self.census_contended(&snapshot) {
+            Some("executor_contended")
+        } else {
+            snapshot.stale_reason
+        };
+        super::diagnostics_findings::from_health(
+            &snapshot.metrics,
+            age_ms,
+            reason,
+            now_ms,
+            window_ms,
+        )
+    }
+
     pub(super) fn new() -> Self {
         Self {
             origin: Instant::now(),
@@ -2179,15 +2562,19 @@ impl HealthRollupCache {
         ctx: &AppContext,
         project_root: &std::path::Path,
         project_key: Option<&str>,
-    ) {
+        cache_dir: &std::path::Path,
+    ) -> Option<&'static str> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis()
             .min(u128::from(u64::MAX)) as u64;
-        let Some(path) = ctx.build_breaker_path_for_health(project_key) else {
+        // The caller resolved the cache root once for the whole tick; the
+        // breaker database lives under it for every context sharing the root.
+        let Some(path) = crate::context::build_breaker_path_for_health(cache_dir, project_key)
+        else {
             ctx.publish_build_suspensions_for_health(Vec::new(), now_ms);
-            return;
+            return Some("breaker_location_unknown");
         };
         let breaker = {
             let mut breakers = self
@@ -2206,13 +2593,16 @@ impl HealthRollupCache {
                     Err(error) => {
                         log::debug!("health breaker open failed; retrying next rollup: {error}");
                         ctx.publish_build_suspensions_for_health(Vec::new(), now_ms);
-                        return;
+                        return Some("breaker_open_failed");
                     }
                 }
             }
         };
         match breaker.active_suspensions_for_root_at(&project_root.display().to_string(), now_ms) {
-            Ok(suspensions) => ctx.publish_build_suspensions_for_health(suspensions, now_ms),
+            Ok(suspensions) => {
+                ctx.publish_build_suspensions_for_health(suspensions, now_ms);
+                None
+            }
             Err(error) => {
                 log::debug!("health breaker read failed; reopening next rollup: {error}");
                 self.breakers
@@ -2220,6 +2610,7 @@ impl HealthRollupCache {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .retain(|_, cached| !Arc::ptr_eq(cached, &breaker));
                 ctx.publish_build_suspensions_for_health(Vec::new(), now_ms);
+                Some("breaker_read_failed")
             }
         }
     }
@@ -2444,6 +2835,24 @@ impl HealthRollupCache {
     #[cfg(test)]
     fn census_builds_for_test(&self) -> u64 {
         self.census_builds.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod findings_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_findings_contended_cache_returns_unknown_without_fallback_probes() {
+        let cache = HealthRollupCache::new();
+        let _held = cache.snapshot.write().unwrap();
+        let findings = serde_json::to_value(cache.findings(1_000_000, 60_000)).unwrap();
+        assert_eq!(findings.as_array().unwrap().len(), 1);
+        assert_eq!(findings[0]["severity"], "error");
+        assert_eq!(
+            findings[0]["samples"][0]["reason"],
+            "cache_contended_or_poisoned"
+        );
     }
 }
 
@@ -2833,7 +3242,7 @@ fn insert_lifecycle_metrics(
     }
 }
 
-fn dispatch_liveness_metrics(executor: &Executor) -> Value {
+pub(super) fn dispatch_liveness_metrics(executor: &Executor) -> Value {
     match executor.try_dispatch_liveness_snapshot() {
         Some(snapshot) => json!({
             "interactive": {
@@ -2976,6 +3385,75 @@ impl RollupStepTimer {
     }
 }
 
+/// Storage roots resolved once per rollup tick. Every context in one tick
+/// that names the same configured storage and cache roots resolves to the
+/// same directories, so resolving once per distinct configuration keeps a
+/// many-root tick off realpath/getcwd instead of re-resolving once per
+/// context. The resolved values are identical to calling
+/// [`crate::bash_background::storage_dir`] and [`crate::root_cache::cache_root`]
+/// directly: the memo is keyed by the exact configured spellings and dropped
+/// with the tick, so a reconfiguration on the next tick resolves afresh.
+#[derive(Default)]
+struct TickStoragePaths {
+    storage: HashMap<Option<std::path::PathBuf>, std::path::PathBuf>,
+    cache: HashMap<(Option<std::path::PathBuf>, Option<std::path::PathBuf>), std::path::PathBuf>,
+}
+
+impl TickStoragePaths {
+    fn storage_dir(&mut self, configured: Option<&std::path::Path>) -> std::path::PathBuf {
+        let key = configured.map(std::path::Path::to_path_buf);
+        if let Some(hit) = self.storage.get(&key) {
+            return hit.clone();
+        }
+        let resolved = crate::bash_background::storage_dir(configured);
+        self.storage.insert(key, resolved.clone());
+        resolved
+    }
+
+    fn cache_dir(&mut self, config: &crate::config::Config) -> std::path::PathBuf {
+        let key = (config.storage_dir.clone(), config.cache_dir.clone());
+        if let Some(hit) = self.cache.get(&key) {
+            return hit.clone();
+        }
+        let resolved = crate::root_cache::cache_root(config);
+        self.cache.insert(key, resolved.clone());
+        resolved
+    }
+
+    fn storage_paths(&mut self, config: &crate::config::Config) -> crate::root_cache::StoragePaths {
+        crate::root_cache::StoragePaths::new(
+            self.storage_dir(config.storage_dir.as_deref()),
+            self.cache_dir(config),
+        )
+    }
+
+    fn cache_unavailable_reason(
+        &mut self,
+        ctx: &AppContext,
+        config: &crate::config::Config,
+    ) -> Option<String> {
+        let cache_dir = self.cache_dir(config);
+        ctx.cache_unavailable_reason_for_root(&cache_dir)
+    }
+}
+
+/// The unavailable code of each context whose cache location is unavailable,
+/// keyed by its cache root. The reason is read once per context: a recovery
+/// can clear it at any moment, so a second read may find nothing. The
+/// description computes the cache root too, so a tick that already resolved
+/// it passes both together instead of resolving the same root twice.
+fn cache_unavailable_codes<'a>(
+    contexts: impl Iterator<Item = &'a AppContext>,
+    mut describe: impl FnMut(&AppContext) -> Option<(std::path::PathBuf, String)>,
+) -> std::collections::BTreeMap<std::path::PathBuf, &'static str> {
+    contexts
+        .filter_map(|ctx| {
+            let (cache_dir, reason) = describe(ctx)?;
+            Some((cache_dir, crate::root_cache::unavailable_code(&reason)))
+        })
+        .collect()
+}
+
 fn build_health_diagnostic_rollup_from_actors(
     cache: &HealthRollupCache,
     executor: &Executor,
@@ -2993,10 +3471,12 @@ fn build_health_diagnostic_rollup_from_actors(
         // This field deliberately covers only already-open resident stores. A
         // standing report is necessary because stale rows block projection by
         // making dead-code findings disappear rather than raising an error.
-        resident_callgraph_stale_backend_rows: Option<crate::callgraph_store::StalePathCensus>,
+        resident_callgraph_stale_backend_rows:
+            Option<crate::callgraph_store::StalePathHealthCensus>,
         watcher: Option<crate::context::WatcherCountersSnapshot>,
         disclaim_privacy: Option<bool>,
         standing: Option<StandingHealthEntry>,
+        diagnostics_evidence: Value,
     }
 
     let lifecycle_contexts = actor_entries
@@ -3023,8 +3503,13 @@ fn build_health_diagnostic_rollup_from_actors(
     let mut embedding_backend_since_ms = None;
     let mut task_storage_roots = std::collections::HashSet::new();
     let mut bash_task_refusals = Vec::new();
+    // Process-wide storage paths cannot change mid-tick: every context that
+    // names the same configured roots shares the resolution below instead of
+    // repeating its realpath and current-directory probes once per context.
+    let mut tick_paths = TickStoragePaths::default();
     for (root_id, ctx) in actor_entries {
-        let storage = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+        let config = ctx.config();
+        let storage = tick_paths.storage_dir(config.storage_dir.as_deref());
         if task_storage_roots.insert(storage.clone()) {
             // Refused tasks are named health diagnostics, not a reason to
             // disable shell execution for every route sharing this daemon.
@@ -3045,12 +3530,17 @@ fn build_health_diagnostic_rollup_from_actors(
                     }),
             );
         }
-        crate::storage_retention::schedule(
-            ctx.storage_dir(),
-            ctx.subc_lifecycle_admission(),
-            ctx.configure_generation_flag(),
-            ctx.configure_generation(),
-        );
+        if tick_paths
+            .cache_unavailable_reason(ctx.as_ref(), &config)
+            .is_none()
+        {
+            crate::storage_retention::schedule(
+                tick_paths.storage_paths(&config),
+                ctx.subc_lifecycle_admission(),
+                ctx.configure_generation_flag(),
+                ctx.configure_generation(),
+            );
+        }
         let root_label = root_id.as_path().display().to_string();
         let standing_index = standing_entries.iter().position(|entry| {
             entry
@@ -3089,7 +3579,13 @@ fn build_health_diagnostic_rollup_from_actors(
         // Durable breaker state is loaded during the off-path rollup, then the
         // cached health reply reads only the context snapshot. Standing keys can
         // be scoped or path-based, so they must not depend on the session-key memo.
-        cache.refresh_build_suspensions(ctx.as_ref(), root_id.as_path(), artifact_key);
+        let cache_dir = tick_paths.cache_dir(&config);
+        let breaker_error = cache.refresh_build_suspensions(
+            ctx.as_ref(),
+            root_id.as_path(),
+            artifact_key,
+            &cache_dir,
+        );
         let repair_entries_60s = artifact_key.and_then(|key| {
             repair_roots_annotated = repair_roots_annotated.saturating_add(1);
             crate::callgraph_store::repair_entry_rate(key)
@@ -3100,7 +3596,7 @@ fn build_health_diagnostic_rollup_from_actors(
             ctx.callgraph_store().try_read().ok().and_then(|store| {
                 store
                     .as_ref()
-                    .and_then(|store| store.try_stale_path_census().ok().flatten())
+                    .and_then(|store| store.try_stale_path_census_for_health().ok().flatten())
             });
         let backend = ctx.semantic_backend_health_snapshot();
         if !backend.available {
@@ -3136,7 +3632,7 @@ fn build_health_diagnostic_rollup_from_actors(
             );
         }
         rollup_mark!(timer, "root disk probes / breaker / callgraph");
-        let health_summary = ctx.try_health_summary();
+        let health_summary = ctx.try_health_summary_for_root(Some(&cache_dir));
         rollup_mark!(timer, "index readiness / view status");
         let busy = health_summary.is_busy();
         let fully_ready = health_summary.is_fully_ready();
@@ -3151,6 +3647,11 @@ fn build_health_diagnostic_rollup_from_actors(
             watcher: Some(ctx.watcher_counters().snapshot()),
             disclaim_privacy: Some(ctx.config().bash.disclaim_privacy),
             standing,
+            diagnostics_evidence: json!({
+                "build_breaker_error": breaker_error,
+                "database_open_failed": ctx.database_runtime_failed(),
+                "lsp_start_failures": ctx.try_lsp().map(|lsp| lsp.cached_start_failure_counts()),
+            }),
         });
         rollup_mark!(timer, "root summary assembly");
     }
@@ -3173,6 +3674,7 @@ fn build_health_diagnostic_rollup_from_actors(
             resident_callgraph_stale_backend_rows: None,
             watcher: None,
             standing: Some(standing),
+            diagnostics_evidence: Value::Null,
         });
     }
 
@@ -3246,6 +3748,10 @@ fn build_health_diagnostic_rollup_from_actors(
                 );
             }
             if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "diagnostics_evidence".to_owned(),
+                    candidate.diagnostics_evidence,
+                );
                 if let Some(configured) = candidate.disclaim_privacy {
                     // The root snapshot may already carry a `bash` block with
                     // background task counts; add the privacy fields to it
@@ -3262,7 +3768,12 @@ fn build_health_diagnostic_rollup_from_actors(
                         );
                     }
                 }
-                if let Some(census) = candidate.resident_callgraph_stale_backend_rows {
+                if let Some(sample) = candidate.resident_callgraph_stale_backend_rows {
+                    let census = sample.census;
+                    object.insert(
+                        "resident_callgraph_stale_backend_rows_age_ms".to_string(),
+                        json!(sample.measured_age_ms),
+                    );
                     object.insert(
                         "resident_callgraph_stale_backend_rows".to_string(),
                         json!(census.stale),
@@ -3318,6 +3829,21 @@ fn build_health_diagnostic_rollup_from_actors(
         )
     });
     rollup_mark!(timer, "process memory snapshots");
+    // The tick's resolved roots are reused here: the same directories the
+    // per-context loop above resolved are not resolved again per context.
+    let mut cache_roots = std::collections::BTreeSet::new();
+    for ctx in &lifecycle_contexts {
+        cache_roots.insert(tick_paths.cache_dir(&ctx.config()));
+    }
+    let cache_unavailable = cache_unavailable_codes(
+        lifecycle_contexts.iter().map(Arc::as_ref),
+        |ctx: &AppContext| {
+            let config = ctx.config();
+            let cache_dir = tick_paths.cache_dir(&config);
+            let reason = ctx.cache_unavailable_reason_for_root(&cache_dir)?;
+            Some((cache_dir, reason))
+        },
+    );
     let measured_census = census_snapshot.map(|census_snapshot| {
         #[cfg(test)]
         cache.census_builds.fetch_add(1, Ordering::Relaxed);
@@ -3330,6 +3856,8 @@ fn build_health_diagnostic_rollup_from_actors(
             &census_snapshot,
             census_rows,
         );
+        memory_census["cache_roots"] = json!(cache_roots);
+        memory_census["cache_unavailable"] = json!(cache_unavailable);
         if let Some(rows) = memory_census
             .get_mut("roots")
             .and_then(Value::as_object_mut)
@@ -3365,7 +3893,7 @@ fn build_health_diagnostic_rollup_from_actors(
     let storage_retention = lifecycle_contexts
         .iter()
         .filter_map(|ctx| {
-            let storage = ctx.storage_dir();
+            let storage = tick_paths.cache_dir(&ctx.config());
             crate::storage_retention::snapshot(&storage)
                 .map(|report| (storage.display().to_string(), report))
         })
@@ -3374,7 +3902,27 @@ fn build_health_diagnostic_rollup_from_actors(
     rollup_mark!(timer, "storage retention snapshots");
     let bash_retention = bash_task_retention_metrics(cache, shared_app);
     rollup_mark!(timer, "bash retention database count");
+    // Every context normally shares one cache root, but each context may name
+    // its own, so these lists grow with the root count. The size-budgeted
+    // reply carries at most HEALTH_ROOT_DETAIL_CAP entries of each plus an
+    // omitted count; the uncapped memory census above keeps the full lists.
+    let cache_roots_omitted = cache_roots.len().saturating_sub(HEALTH_ROOT_DETAIL_CAP);
+    let cache_roots = cache_roots
+        .into_iter()
+        .take(HEALTH_ROOT_DETAIL_CAP)
+        .collect::<Vec<_>>();
+    let cache_unavailable_omitted = cache_unavailable
+        .len()
+        .saturating_sub(HEALTH_ROOT_DETAIL_CAP);
+    let cache_unavailable = cache_unavailable
+        .into_iter()
+        .take(HEALTH_ROOT_DETAIL_CAP)
+        .collect::<std::collections::BTreeMap<_, _>>();
     let mut metrics = json!({
+        "cache_roots": cache_roots,
+        "cache_roots_omitted": cache_roots_omitted,
+        "cache_unavailable": cache_unavailable,
+        "cache_unavailable_omitted": cache_unavailable_omitted,
         "actor_count": actor_count,
         "root_count": root_count,
         "warming_roots": warming_roots,
@@ -3474,23 +4022,32 @@ pub(super) fn build_health_report(
     dispatch_path_metrics: &DispatchPathMetrics,
     shared_app: &App,
 ) -> HealthReport {
-    build_health_report_with_indexing(
+    build_health_report_with_snapshots(
         cache,
         executor,
         pending_binds,
         dispatch_path_metrics,
         shared_app,
         crate::cold_build_limiter::progress::snapshot,
+        crate::gc::family::sweep_stats(),
     )
 }
 
-fn build_health_report_with_indexing(
+pub(super) fn with_route_ownership_summary(report: &mut HealthReport, summary: Value) {
+    if let Some(Value::Object(metrics)) = report.metrics.as_mut() {
+        metrics.insert("route_ownership_summary".into(), summary);
+        budget_health_metrics(metrics);
+    }
+}
+
+fn build_health_report_with_snapshots(
     cache: &HealthRollupCache,
     executor: &Executor,
     pending_binds: &HashMap<RouteChannel, PendingBind>,
     dispatch_path_metrics: &DispatchPathMetrics,
     shared_app: &App,
     indexing_snapshot: impl FnOnce(u64) -> crate::cold_build_limiter::progress::Snapshot,
+    sweep_snapshot: crate::gc::family::SweepStatsSnapshot,
 ) -> HealthReport {
     // The diagnostic payload is fixed-size and cached. Only probe-purpose
     // liveness signals are read fresh, using atomics or non-blocking snapshots.
@@ -3508,6 +4065,16 @@ fn build_health_report_with_indexing(
         .as_object()
         .cloned()
         .unwrap_or_else(serde_json::Map::new);
+    // Findings read their evidence from the cached rollup, not the public
+    // health reply. Do not let that internal evidence displace root diagnostics
+    // under the public reply's byte budget.
+    if let Some(roots) = metrics.get_mut("roots").and_then(Value::as_array_mut) {
+        for root in roots {
+            if let Some(root) = root.as_object_mut() {
+                root.remove("diagnostics_evidence");
+            }
+        }
+    }
     // The count's age is recorded at assembly; include time spent serving this
     // rollup too, including when scheduler contention delays the next census.
     if let Some(age) = metrics
@@ -3605,8 +4172,17 @@ fn build_health_report_with_indexing(
     metrics.insert("views_work".to_string(), crate::views::io::work_snapshot());
     metrics.insert(
         "v2_family_sweeps".to_string(),
-        crate::gc::family::sweep_stats(),
+        json!(sweep_snapshot.details),
     );
+    metrics.insert(
+        "v2_family_sweep_details_evicted_total".into(),
+        json!(sweep_snapshot.evicted_total),
+    );
+    metrics.insert(
+        "v2_family_sweep_details_retired_total".into(),
+        json!(sweep_snapshot.retired_total),
+    );
+    metrics.insert("v2_family_sweeps_omitted".into(), json!(0));
     metrics.insert(
         "filesystem_helpers".to_string(),
         crate::bounded_io::helper_health(),
@@ -3636,7 +4212,14 @@ fn build_health_report_with_indexing(
     metrics.insert("headline".to_string(), json!(headline));
     budget_health_metrics(&mut metrics);
 
-    let warning = if scheduler_busy {
+    let gap_health = dispatch_path_metrics.watch_delivery.health();
+    let watch_gap_unresolved = gap_health["status"] != "ok";
+    let warning = if watch_gap_unresolved {
+        Some(format!(
+            "watch delivery is degraded: {}",
+            gap_health["reason"].as_str().unwrap_or("retry_overflow")
+        ))
+    } else if scheduler_busy {
         Some(EXECUTOR_SCHEDULER_CONTENTION_DETAIL.to_string())
     } else {
         rollup.detail.clone()
@@ -3649,7 +4232,7 @@ fn build_health_report_with_indexing(
         (None, warning) => warning,
     };
     HealthReport {
-        status: if scheduler_busy {
+        status: if scheduler_busy || watch_gap_unresolved {
             HealthStatus::Degraded
         } else {
             rollup.status.clone()
@@ -3858,6 +4441,75 @@ mod tests {
         }
     }
 
+    /// A cache recovery can clear a context's unavailable reason at any
+    /// moment. The health rollup reads it once per context, so a recovery
+    /// landing right after the read cannot panic the health worker, and the
+    /// next refresh reads the new state.
+    #[test]
+    fn health_cache_codes_survive_a_recovery_between_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(temp.path().join("storage")),
+                ..Default::default()
+            },
+        );
+        // Each read returns the reason once, then the recovered state. The
+        // description also resolves the cache root, mirroring the tick's
+        // once-per-context read of both together.
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let recovering = |ctx: &AppContext| {
+            (reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0).then(|| {
+                (
+                    ctx.cache_dir(),
+                    "cache_dir_unavailable: volume missing".to_string(),
+                )
+            })
+        };
+        let refresh = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::cache_unavailable_codes(std::iter::once(&ctx), &recovering)
+        }));
+        let codes = refresh.expect("a recovery between reads panicked the health refresh");
+        assert_eq!(
+            codes.get(&ctx.cache_dir()).copied(),
+            Some(crate::root_cache::CACHE_DIR_UNAVAILABLE)
+        );
+        // The next refresh runs and sees the recovered state.
+        assert!(super::cache_unavailable_codes(std::iter::once(&ctx), &recovering).is_empty());
+    }
+
+    #[test]
+    fn health_budget_drops_long_cache_root_paths_and_counts_them() {
+        use serde_json::json;
+        let long = |index: usize| format!("/{}/{index}", "cache-volume".repeat(200));
+        let mut metrics = json!({
+            "cache_roots": (0..8).map(long).collect::<Vec<_>>(),
+            "cache_roots_omitted": 0,
+            "cache_unavailable": (0..4)
+                .map(|index| (long(index), "cache_dir_unavailable"))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+            "cache_unavailable_omitted": 0,
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        super::budget_health_metrics(&mut metrics);
+        let bytes = serde_json::to_vec(&metrics).unwrap().len();
+        assert!(bytes <= super::HEALTH_METRICS_BUDGET_BYTES, "{bytes}");
+        assert_eq!(metrics["metrics_bytes"].as_u64(), Some(bytes as u64));
+        let listed = metrics["cache_roots"].as_array().unwrap().len() as u64;
+        assert_eq!(listed + metrics["cache_roots_omitted"].as_u64().unwrap(), 8);
+        let unavailable = metrics["cache_unavailable"].as_object().unwrap().len() as u64;
+        assert_eq!(
+            unavailable + metrics["cache_unavailable_omitted"].as_u64().unwrap(),
+            4
+        );
+        // Unavailable roots are trimmed first: they repeat paths already
+        // counted in cache_roots.
+        assert_eq!(unavailable, 0);
+    }
+
     #[test]
     fn health_borrowed_budget_matches_golden_json_and_digit_boundaries() {
         use serde_json::json;
@@ -3893,24 +4545,27 @@ mod tests {
             "write_ledger_top_10m": [{"root_id":format!("/very/long/{}/root", "directory/".repeat(1000)), "bytes": 123}],
             "storage_retention": (0..20).map(|i| (format!("report-{i:02}"), json!({"detail":"r".repeat(1500)}))).collect::<serde_json::Map<_,_>>()
         }).as_object().unwrap().clone();
-        let mut expected = oversized.clone();
-        legacy_health_budget(&mut expected);
         super::budget_health_metrics(&mut oversized);
-        assert_eq!(
-            serde_json::to_vec(&oversized).unwrap(),
-            serde_json::to_vec(&expected).unwrap()
-        );
+        // Byte counting still matches the legacy serializer, but trimming now
+        // preserves root detail ahead of ledger paths and retention reports.
+        assert_eq!(oversized["roots"].as_array().unwrap().len(), 1);
+        assert_eq!(oversized["root_details_omitted"], 9);
         assert_eq!(oversized["write_ledger_top_10m"][0]["root_id"], "root");
-        assert!(
-            oversized["storage_retention_reports_omitted"]
-                .as_u64()
-                .unwrap()
-                > 0
+        assert_eq!(oversized["storage_retention_reports_omitted"], 20);
+        assert_eq!(
+            oversized["metrics_bytes"],
+            serde_json::to_vec(&oversized).unwrap().len()
         );
-        let mut cached = json!({"roots":[{"detail":"r".repeat(12000)}]})
-            .as_object()
-            .unwrap()
-            .clone();
+        assert!(oversized["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
+        let mut cached = json!({"roots":[{
+            "project_root": "ordinary", "state": "ready",
+            "search_index": {"status": "ready"}, "semantic_index": {"status": "disabled"},
+            "callgraph_store": {"status": "ready"}, "tier2": {"status": "ready"},
+            "detail":"r".repeat(11800)
+        }]})
+        .as_object()
+        .unwrap()
+        .clone();
         super::budget_health_metrics(&mut cached);
         assert_eq!(cached["roots"].as_array().unwrap().len(), 1);
         cached.insert("fresh_liveness".into(), json!("f".repeat(1000)));
@@ -3922,6 +4577,321 @@ mod tests {
             serde_json::to_vec(&expected).unwrap()
         );
         assert_eq!(cached["roots"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn long_running_daemon_sweeps_preserve_root_and_standing_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = crate::gc::family::SweepStatsStore::default();
+        for family in 0..96 {
+            let family_dir = dir
+                .path()
+                .join(format!("family-{family:03}-{}", "p".repeat(120)));
+            std::fs::create_dir(&family_dir).unwrap();
+            // Thirty days of ten-minute passes reuse each family's counters.
+            for _ in 0..4320 {
+                store.record_stale_rows(&family_dir.join("semantic.db"), "family", 1);
+            }
+        }
+        let sweeps = store.snapshot();
+        assert_eq!(sweeps.details.len(), 64);
+        assert_eq!(sweeps.evicted_total, 32);
+        assert_eq!(sweeps.retired_total, 0);
+        assert!(
+            serde_json::to_vec(&sweeps.details).unwrap().len() > super::HEALTH_METRICS_BUDGET_BYTES
+        );
+        let cache = HealthRollupCache::new();
+        let mut rollup = HealthDiagnosticRollup::unavailable();
+        rollup.metrics = json!({
+            "root_count": 170,
+            "root_details_omitted": 168,
+            "roots": [{"root":"active-root"}, {"root":"standing-root", "standing_health":{"status":"ready"}}],
+        });
+        cache.publish(Some(rollup));
+        let executor = Executor::new();
+        let app = App::default_shared();
+        let report = super::build_health_report_with_snapshots(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &app,
+            crate::cold_build_limiter::progress::snapshot,
+            sweeps,
+        );
+        let metrics = report.metrics.unwrap();
+        assert_eq!(metrics["roots"].as_array().unwrap().len(), 2);
+        assert_eq!(metrics["roots"][1]["standing_health"]["status"], "ready");
+        assert_eq!(metrics["root_details_omitted"], 168);
+        assert_eq!(metrics["v2_family_sweep_details_evicted_total"], 32);
+        assert_eq!(metrics["v2_family_sweep_details_retired_total"], 0);
+        let kept = metrics["v2_family_sweeps"].as_array().unwrap();
+        assert!(kept.len() < 64);
+        assert_eq!(metrics["v2_family_sweeps_omitted"], 64 - kept.len());
+        assert!(kept.iter().all(|entry| entry["stale_rows_touched"] == 4320));
+        assert!(metrics["v2_family_sweeps_omitted"].as_u64().unwrap() > 0);
+        assert!(
+            metrics["metrics_bytes"].as_u64().unwrap() <= super::HEALTH_METRICS_BUDGET_BYTES as u64
+        );
+    }
+
+    #[test]
+    fn health_budget_trims_every_sweep_before_root_detail() {
+        let roots = json!([{
+            "project_root": "standing", "state": "ready", "standing": true,
+            "standing_refusal": "resolved-path-drift refusal", "detail":"r".repeat(13000)
+        }]);
+        let mut metrics = json!({
+            "roots": roots,
+            "root_details_omitted": 0,
+            "v2_family_sweeps": [{"family":"one"}, {"family":"two"}],
+            "v2_family_sweeps_omitted": 3,
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        super::budget_health_metrics(&mut metrics);
+        assert_eq!(metrics["v2_family_sweeps"], json!([]));
+        assert_eq!(metrics["v2_family_sweeps_omitted"], 5);
+        assert_eq!(metrics["root_details_omitted"], 0);
+        assert_eq!(
+            metrics["roots"],
+            json!([{
+                "project_root": "standing", "state": "ready", "standing": true,
+                "standing_refusal": "resolved-path-drift refusal", "abbreviated": true
+            }])
+        );
+    }
+
+    #[test]
+    fn health_budget_compacts_other_metrics_before_standing_detail() {
+        let root = json!({
+            "project_root": "standing", "standing": true,
+            "standing_refusal": "resolved-path-drift refusal",
+            "diagnostics_evidence": {"build_breaker_error": null,
+                "database_open_failed": false, "lsp_start_failures": {}}
+        });
+        let mut metrics = json!({
+            "roots": [root.clone()], "root_details_omitted": 0,
+            "write_ledger_top_10m": [{"root_id": format!("/{}project", "directory/".repeat(2000))}],
+            "storage_retention": {"cache": {"detail": "r".repeat(13000)}},
+            "storage_retention_reports_omitted": 0,
+            "cache_roots": ["c".repeat(13000)], "cache_roots_omitted": 0,
+            "cache_unavailable": {"unavailable": "c".repeat(13000)},
+            "cache_unavailable_omitted": 0
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        budget_health_metrics(&mut metrics);
+        assert_eq!(metrics["roots"], json!([root]));
+        assert_eq!(metrics["root_details_omitted"], 0);
+        assert_eq!(metrics["write_ledger_top_10m"][0]["root_id"], "project");
+        assert_eq!(metrics["storage_retention_reports_omitted"], 1);
+        assert_eq!(metrics["cache_roots_omitted"], 1);
+        assert_eq!(metrics["cache_unavailable_omitted"], 1);
+        assert!(metrics["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
+    }
+
+    #[test]
+    fn health_budget_abbreviates_last_oversized_degraded_root() {
+        let path = format!("/{}project", "long-directory/".repeat(2000));
+        let mut metrics = json!({
+            "root_count": 3, "root_details_omitted": 2,
+            "roots": [{
+                "project_root": path, "state": "ready", "standing": true,
+                "standing_entry": format!("{path}/standing-link"),
+                "standing_refusal": format!(
+                    "resolved-path-drift refusal for {path:?}: resolved_target changed from {path:?} to {path:?}"
+                ),
+                "semantic_index": {"status": "degraded", "detail": "x".repeat(20000)},
+                "cache_unavailable_reason": "resolved_path_drift"
+            }]
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        budget_health_metrics(&mut metrics);
+        let roots = metrics["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 1, "the last actionable root must survive");
+        let root = &roots[0];
+        assert_eq!(root["abbreviated"], true);
+        let identity = root["project_root"].as_str().unwrap();
+        assert!(identity.contains(blake3::hash(path.as_bytes()).to_hex().as_str()));
+        assert!(identity.ends_with("/project"));
+        assert_eq!(root["state"], "ready");
+        assert_eq!(root["semantic_index"]["status"], "degraded");
+        assert_eq!(root["standing"], true);
+        assert_eq!(root["cache_unavailable_reason"], "resolved_path_drift");
+        let refusal = root["standing_refusal"].as_str().unwrap();
+        assert!(refusal.contains("resolved-path-drift refusal"));
+        assert!(refusal.contains("resolved_target"));
+        assert_eq!(metrics["root_count"], 3);
+        assert_eq!(metrics["root_details_omitted"], 2);
+        assert_eq!(
+            metrics["metrics_bytes"],
+            serde_json::to_vec(&metrics).unwrap().len()
+        );
+        assert!(metrics["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
+    }
+
+    #[test]
+    fn health_budget_drops_healthy_roots_before_degraded_refused_and_standing_rows() {
+        for (detail_bytes, expected) in [
+            (
+                2000,
+                vec!["healthy-a", "degraded", "standing", "refused", "healthy-b"],
+            ),
+            (2600, vec!["healthy-a", "degraded", "standing", "refused"]),
+            (3400, vec!["degraded", "standing", "refused"]),
+            (7000, vec!["degraded"]),
+        ] {
+            let mut roots = [
+                "healthy-a",
+                "degraded",
+                "standing",
+                "refused",
+                "healthy-b",
+                "healthy-c",
+            ]
+            .map(|name| {
+                json!({
+                    "project_root": name, "state": "ready",
+                    "search_index": {"status": "ready"},
+                    "semantic_index": {"status": "disabled"},
+                    "callgraph_store": {"status": "ready"},
+                    "tier2": {"status": "ready"},
+                    "diagnostics_evidence": {"build_breaker_error": null,
+                        "database_open_failed": false, "lsp_start_failures": {}},
+                    "detail": "x".repeat(detail_bytes)
+                })
+            });
+            roots[1]["semantic_index"]["status"] = json!("degraded");
+            roots[2]["standing"] = json!(true);
+            roots[3]["standing_refusal"] = json!("resolved-path-drift refusal");
+            let mut metrics = json!({"roots": roots, "root_details_omitted": 2})
+                .as_object()
+                .unwrap()
+                .clone();
+            budget_health_metrics(&mut metrics);
+            let retained = metrics["roots"].as_array().unwrap();
+            let names = retained
+                .iter()
+                .map(|row| row["project_root"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(names, expected, "detail_bytes={detail_bytes}");
+            assert_eq!(metrics["root_details_omitted"], 2 + 6 - retained.len());
+            assert_eq!(
+                metrics["metrics_bytes"],
+                serde_json::to_vec(&metrics).unwrap().len()
+            );
+            assert!(
+                metrics["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64
+            );
+        }
+    }
+
+    #[test]
+    fn health_budget_does_not_treat_unknown_or_nonready_roots_as_healthy() {
+        let ready = json!({
+            "state": "ready", "search_index": {"status": "ready"},
+            "semantic_index": {"status": "disabled"}, "callgraph_store": {"status": "ready"},
+            "tier2": {"status": "ready"},
+            "views": {"pinned": true, "pending_paths": 0, "failed_paths": 0}
+        });
+        assert!(ordinary_ready_health_root(&ready));
+        for (pointer, value) in [
+            ("/state", json!("busy")),
+            ("/search_index/status", json!("building")),
+            ("/semantic_index/status", json!("degraded")),
+            ("/callgraph_store/status", json!("absent")),
+            ("/tier2/status", json!("stale")),
+            ("/views/pinned", json!(false)),
+            ("/views/pending_paths", json!(1)),
+            ("/views/failed_paths", json!(1)),
+        ] {
+            let mut root = ready.clone();
+            *root.pointer_mut(pointer).unwrap() = value;
+            assert!(!ordinary_ready_health_root(&root), "{pointer}");
+        }
+        for (field, value) in [
+            ("standing", json!(true)),
+            ("standing_refusal", json!("resolved-path-drift refusal")),
+            ("cache_unavailable_reason", json!("storage unavailable")),
+            ("suspended_domains", json!([{"domain": "search"}])),
+            ("search_index", Value::Null),
+        ] {
+            let mut root = ready.clone();
+            root[field] = value;
+            assert!(!ordinary_ready_health_root(&root), "{field}");
+        }
+    }
+
+    #[test]
+    fn health_budget_keeps_findings_evidence_out_of_the_public_reply() {
+        let cache = HealthRollupCache::new();
+        let executor = Executor::new();
+        let app = App::default_shared();
+        let evidence = json!({
+            "build_breaker_error": null, "database_open_failed": false,
+            "lsp_start_failures": {("server".repeat(HEALTH_METRICS_BUDGET_BYTES / 6)): 3}
+        });
+        let mut rollup = allocator_rollup(&cache);
+        rollup.status = HealthStatus::Degraded;
+        rollup.detail = Some("1 standing root(s) refused current resolved-path identity".into());
+        rollup.metrics["root_count"] = json!(1);
+        rollup.metrics["roots"] = json!([{
+            "project_root": "standing", "state": "ready", "standing": true,
+            "standing_refusal": "resolved-path-drift refusal", "diagnostics_evidence": evidence
+        }]);
+        cache.publish(Some(rollup));
+
+        let report = build_health_report(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &app,
+        );
+        assert_eq!(report.status, HealthStatus::Degraded);
+        let metrics = report.metrics.unwrap();
+        assert_eq!(metrics["roots"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            metrics["roots"][0]["standing_refusal"],
+            "resolved-path-drift refusal"
+        );
+        assert!(metrics["roots"][0].get("diagnostics_evidence").is_none());
+        assert_eq!(metrics["root_details_omitted"], 0);
+        assert!(metrics["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
+        assert_eq!(
+            cache.snapshot().0.metrics["roots"][0]["diagnostics_evidence"],
+            evidence
+        );
+        let findings = serde_json::to_value(cache.findings(1_000, 60_000)).unwrap();
+        assert!(findings
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["check"] == "lsp_start_failures"));
+    }
+
+    #[test]
+    fn health_fixture_ignores_process_global_sweep_telemetry() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::gc::family::record_stale_rows(&dir.path().join("semantic.db"), "foreign-family", 1);
+        let executor = Executor::new();
+        let app = App::default_shared();
+        let report = test_health_report(
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &app,
+        );
+        let metrics = report.metrics.unwrap();
+        assert_eq!(metrics["v2_family_sweeps"], json!([]));
+        assert_eq!(metrics["v2_family_sweep_details_evicted_total"], 0);
+        assert_eq!(metrics["v2_family_sweep_details_retired_total"], 0);
+        assert_eq!(metrics["v2_family_sweeps_omitted"], 0);
     }
 
     #[test]
@@ -4341,6 +5311,44 @@ mod tests {
     }
     use serde_json::json;
 
+    // Health fixtures own their roots, not sweep observations made by other
+    // tests in the process. Production still supplies the live store snapshot.
+    fn build_health_report(
+        cache: &HealthRollupCache,
+        executor: &Executor,
+        pending_binds: &HashMap<RouteChannel, PendingBind>,
+        metrics: &DispatchPathMetrics,
+        app: &App,
+    ) -> HealthReport {
+        build_health_report_with_indexing(
+            cache,
+            executor,
+            pending_binds,
+            metrics,
+            app,
+            crate::cold_build_limiter::progress::snapshot,
+        )
+    }
+
+    fn build_health_report_with_indexing(
+        cache: &HealthRollupCache,
+        executor: &Executor,
+        pending_binds: &HashMap<RouteChannel, PendingBind>,
+        metrics: &DispatchPathMetrics,
+        app: &App,
+        indexing_snapshot: impl FnOnce(u64) -> crate::cold_build_limiter::progress::Snapshot,
+    ) -> HealthReport {
+        super::build_health_report_with_snapshots(
+            cache,
+            executor,
+            pending_binds,
+            metrics,
+            app,
+            indexing_snapshot,
+            crate::gc::family::SweepStatsSnapshot::default(),
+        )
+    }
+
     fn test_health_report(
         executor: &Executor,
         pending_binds: &HashMap<RouteChannel, PendingBind>,
@@ -4374,22 +5382,22 @@ mod tests {
         )
     }
 
-    const HEALTH_REPORT_CONTENTION_ATTEMPTS: usize = 200;
-
     fn health_report_after_scheduler_contention(
         test_name: &str,
         mut read_report: impl FnMut() -> HealthReport,
     ) -> HealthReport {
-        for _ in 0..HEALTH_REPORT_CONTENTION_ATTEMPTS {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
             let report = read_report();
             if report.detail.as_deref() != Some(EXECUTOR_SCHEDULER_CONTENTION_DETAIL) {
                 return report;
             }
-            std::thread::yield_now();
+            assert!(
+                Instant::now() < deadline,
+                "{test_name}: scheduler remained contended for 30 seconds"
+            );
+            std::thread::sleep(Duration::from_millis(5));
         }
-        panic!(
-            "{test_name}: scheduler remained contended after {HEALTH_REPORT_CONTENTION_ATTEMPTS} health snapshots"
-        );
     }
 
     fn health_report_while_scheduler_locked(
@@ -4409,7 +5417,7 @@ mod tests {
                 });
             });
             held_rx
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(Duration::from_secs(30))
                 .expect("scheduler lock holder starts");
             let report = build_report();
             release_tx.send(()).expect("release scheduler lock holder");
@@ -4805,30 +5813,230 @@ mod tests {
         assert_eq!(snapshot["percentiles"]["p99_ms"], 90_000);
     }
 
+    fn view_health_fixture() -> (
+        tempfile::TempDir,
+        Executor,
+        Arc<AppContext>,
+        std::path::PathBuf,
+    ) {
+        let (dir, root) = super::super::test_support::test_root("view-health-next-tick");
+        let view_dir = dir.path().join("view");
+        let mut status = crate::path_status::PathStatusStore::open(&view_dir).unwrap();
+        status.mark_pending(b"a.rs", "fixture", 1).unwrap();
+        drop(status);
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.as_path().into()),
+                storage_dir: Some(dir.path().join("storage")),
+                ..Default::default()
+            },
+        ));
+        ctx.update_config(|config| config.views.enabled = true);
+        ctx.install_view_runtime(
+            crate::context::ViewRuntimeSnapshot {
+                query_pin: None,
+                storage: dir.path().join("storage"),
+                family: "health-fixture".into(),
+                scope: "health-checkout".into(),
+                view_dir: view_dir.clone(),
+                generation: Some("1-fixture".into()),
+                manifest: None,
+                head_fingerprint: String::new(),
+                head_metadata: crate::alias::GitHeadMetadata {
+                    head_path: Default::default(),
+                    head_mtime: None,
+                    resolved_ref_path: None,
+                    resolved_ref_mtime: None,
+                },
+                pending_paths: Default::default(),
+                pending_inputs: Default::default(),
+            },
+            None,
+        );
+        let executor = Executor::new();
+        assert!(executor.register_actor(root, Arc::clone(&ctx)));
+        (dir, executor, ctx, view_dir)
+    }
+
+    fn rolled_up_view(cache: &HealthRollupCache, executor: &Executor, app: &App) -> Value {
+        cache.refresh_for_test(executor, app);
+        cache.snapshot().0.metrics["roots"][0]["views"].clone()
+    }
+
+    #[test]
+    fn view_health_local_batches_are_in_next_rollup_with_one_refresh() {
+        let (_dir, executor, _ctx, view_dir) = view_health_fixture();
+        let app = App::default_shared();
+        let cache = HealthRollupCache::new();
+        assert_eq!(rolled_up_view(&cache, &executor, &app)["pending_paths"], 1);
+        let before = crate::path_status::HEALTH_READS.with(std::cell::Cell::get);
+        let scans = crate::path_status::HEALTH_SUMMARY_READS.with(std::cell::Cell::get);
+        {
+            let mut status = crate::path_status::PathStatusStore::open(&view_dir).unwrap();
+            for _ in 0..20 {
+                status.mark_pending(b"a.rs", "pending", 1).unwrap();
+            }
+            status.mark_failed(b"a.rs", "missing payload", 1).unwrap();
+        }
+        assert_eq!(
+            crate::path_status::HEALTH_SUMMARY_READS.with(std::cell::Cell::get),
+            scans,
+            "local batches must not scan health on the writer"
+        );
+        let next = rolled_up_view(&cache, &executor, &app);
+        assert_eq!(
+            next["failed_paths"], 1,
+            "committed failure must show next tick"
+        );
+        assert_eq!(next["pending_paths"], 0);
+        assert_eq!(
+            crate::path_status::HEALTH_READS.with(std::cell::Cell::get),
+            before + 1,
+            "all local batches must share one refresh on the next tick"
+        );
+        assert_eq!(rolled_up_view(&cache, &executor, &app)["failed_paths"], 1);
+        assert_eq!(
+            crate::path_status::HEALTH_READS.with(std::cell::Cell::get),
+            before + 1,
+            "an unchanged tick must reuse the projection"
+        );
+    }
+
+    #[test]
+    fn view_health_external_failure_is_in_next_rollup() {
+        const CHILD_VIEW: &str = "AFT_HEALTH_EXTERNAL_WRITE_VIEW";
+        if let Some(view_dir) = std::env::var_os(CHILD_VIEW) {
+            let mut status =
+                crate::path_status::PathStatusStore::open(Path::new(&view_dir)).unwrap();
+            status
+                .mark_failed(b"a.rs", "external missing payload", 1)
+                .unwrap();
+            return;
+        }
+        let (_dir, executor, _ctx, view_dir) = view_health_fixture();
+        let app = App::default_shared();
+        let cache = HealthRollupCache::new();
+        assert_eq!(rolled_up_view(&cache, &executor, &app)["pending_paths"], 1);
+        // First make a local write and refresh health. The later child-process
+        // signature change must still trigger a fresh SQLite read.
+        {
+            let mut status = crate::path_status::PathStatusStore::open(&view_dir).unwrap();
+            status.mark_pending(b"b.rs", "local", 1).unwrap();
+        }
+        assert_eq!(rolled_up_view(&cache, &executor, &app)["pending_paths"], 2);
+        let before = crate::path_status::HEALTH_READS.with(std::cell::Cell::get);
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "subc::health::tests::view_health_external_failure_is_in_next_rollup",
+                "--nocapture",
+            ])
+            .env(CHILD_VIEW, &view_dir)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "child: {}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let next = rolled_up_view(&cache, &executor, &app);
+        assert_eq!(
+            next["failed_paths"], 1,
+            "external commit must show next tick"
+        );
+        assert_eq!(next["pending_paths"], 1);
+        assert_eq!(
+            crate::path_status::HEALTH_READS.with(std::cell::Cell::get),
+            before + 1,
+            "external signature changes must refresh the summary"
+        );
+    }
+
+    #[test]
+    fn view_health_runtime_replacement_disable_and_clear_are_in_next_rollup() {
+        let (_dir, executor, ctx, _view_dir) = view_health_fixture();
+        let app = App::default_shared();
+        let cache = HealthRollupCache::new();
+        assert_eq!(rolled_up_view(&cache, &executor, &app)["generation"], 1);
+        let mut next = ctx.view_runtime_snapshot().unwrap();
+        next.generation = Some("2-fixture".into());
+        ctx.install_view_runtime(next, None);
+        assert_eq!(rolled_up_view(&cache, &executor, &app)["generation"], 2);
+        ctx.update_config(|config| config.views.enabled = false);
+        assert!(rolled_up_view(&cache, &executor, &app).is_null());
+        ctx.update_config(|config| config.views.enabled = true);
+        assert_eq!(rolled_up_view(&cache, &executor, &app)["generation"], 2);
+        ctx.clear_view_runtime();
+        assert!(rolled_up_view(&cache, &executor, &app).is_null());
+    }
+
+    #[test]
+    fn view_health_runtime_drop_closes_reader_even_with_live_writer() {
+        let (_dir, executor, ctx, view_dir) = view_health_fixture();
+        let app = App::default_shared();
+        let cache = HealthRollupCache::new();
+        assert_eq!(rolled_up_view(&cache, &executor, &app)["pending_paths"], 1);
+        let writer = crate::path_status::PathStatusStore::open(&view_dir).unwrap();
+        let path = writer.path().to_path_buf();
+        assert_eq!(crate::db::file_identity::open_connections(&path), 2);
+        ctx.clear_view_runtime();
+        assert_eq!(
+            crate::db::file_identity::open_connections(&path),
+            1,
+            "a writer must not retain the retired runtime's health connection"
+        );
+        drop(writer);
+        assert_eq!(crate::db::file_identity::open_connections(&path), 0);
+    }
+
+    #[test]
+    fn view_health_readiness_replacement_is_in_next_rollup_without_ledger_change() {
+        let (_dir, executor, ctx, _view_dir) = view_health_fixture();
+        let app = App::default_shared();
+        let cache = HealthRollupCache::new();
+        let initial = rolled_up_view(&cache, &executor, &app);
+        assert!(initial["callgraph_readiness_deferred"].is_null());
+        let reads = crate::path_status::HEALTH_READS.with(std::cell::Cell::get);
+        for reason in [
+            crate::views::read::CALLGRAPH_READINESS_BUSY,
+            crate::views::read::CALLGRAPH_READINESS_PROBE_FAILED,
+        ] {
+            let mut next = ctx.view_runtime_snapshot().unwrap();
+            next.pending_inputs.insert(
+                b"a.rs".to_vec(),
+                crate::views::assembly::PendingInput {
+                    plane: "callgraph",
+                    reason,
+                    blob_key: None,
+                },
+            );
+            ctx.install_view_runtime(next, None);
+            let view = rolled_up_view(&cache, &executor, &app);
+            assert_eq!(view["generation"], 1);
+            assert_eq!(
+                view["callgraph_readiness_deferred"], reason,
+                "runtime readiness changes must show on the next tick"
+            );
+        }
+        let mut next = ctx.view_runtime_snapshot().unwrap();
+        next.pending_inputs.clear();
+        ctx.install_view_runtime(next, None);
+        assert!(rolled_up_view(&cache, &executor, &app)["callgraph_readiness_deferred"].is_null());
+        assert_eq!(crate::path_status::HEALTH_READS.with(std::cell::Cell::get), reads,
+            "readiness replacement must invalidate the projection without relying on a ledger change");
+    }
+
     fn refresh_until_root_count(
         cache: &HealthRollupCache,
         executor: &Executor,
         app: &App,
         expected: u64,
     ) -> HealthReport {
-        refresh_until_root_count_with_walk_counts(cache, executor, app, expected).0
-    }
-
-    fn refresh_until_root_count_with_walk_counts(
-        cache: &HealthRollupCache,
-        executor: &Executor,
-        app: &App,
-        expected: u64,
-    ) -> (HealthReport, Vec<(bool, usize)>) {
         let metrics = DispatchPathMetrics::new();
         let deadline = Instant::now() + Duration::from_secs(30);
-        let mut walks_by_attempt = Vec::new();
         loop {
-            let walks_before = crate::context::memory_estimate_walks_for_test();
             cache.refresh(executor, app);
-            let walks = crate::context::memory_estimate_walks_for_test() - walks_before;
-            let rollup_root_count = cache.snapshot().0.metrics["root_count"].as_u64();
-            walks_by_attempt.push((rollup_root_count == Some(expected), walks));
             let report = build_health_report(cache, executor, &HashMap::new(), &metrics, app);
             // Both the rollup and the live probe can skip a contended scheduler.
             // Wait for the roots, not the diagnostic values being asserted, so
@@ -4844,7 +6052,7 @@ mod tests {
                 == Some(expected)
                 && !scheduler_busy
             {
-                return (report, walks_by_attempt);
+                return report;
             }
             assert!(
                 Instant::now() < deadline,
@@ -4882,6 +6090,32 @@ mod tests {
         *ctx.callgraph_store()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(reader));
+    }
+
+    #[test]
+    fn idle_rollup_reuses_resident_stale_path_censuses() {
+        let executor = Executor::new();
+        let app = crate::context::App::default_shared();
+        let mut dirs = Vec::new();
+        for index in 0..111 {
+            let (dir, root) = test_root(&format!("idle-stale-{index}"));
+            let ctx = test_ctx();
+            install_resident_stale_callgraph(&ctx, &root, "src/stale.ts", false);
+            assert!(executor.register_actor(root, ctx));
+            dirs.push(dir);
+        }
+        let cache = HealthRollupCache::new();
+        cache.refresh_for_test(&executor, &app);
+        let before = crate::callgraph_store::STALE_PATH_CENSUS_BUILDS.with(std::cell::Cell::get);
+        for _ in 0..5 {
+            cache.refresh_for_test(&executor, &app);
+        }
+        assert_eq!(
+            crate::callgraph_store::STALE_PATH_CENSUS_BUILDS.with(std::cell::Cell::get) - before,
+            0,
+            "idle ticks must not query stale rows and probe their paths again"
+        );
+        assert_eq!(cache.snapshot().0.metrics["root_count"], 111);
     }
 
     #[test]
@@ -4983,8 +6217,12 @@ mod tests {
         );
         let bounded = report.metrics.expect("bounded health metrics");
         assert_eq!(bounded["root_count"], 2);
-        assert_eq!(bounded["root_details_omitted"], 2);
-        assert!(bounded["roots"].as_array().unwrap().is_empty());
+        assert_eq!(bounded["root_details_omitted"], 1);
+        let roots = bounded["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0]["abbreviated"], true);
+        assert_eq!(roots[0]["semantic_index"]["status"], "building");
+        assert!(bounded["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
     }
 
     #[cfg(unix)]
@@ -5908,20 +7146,86 @@ mod tests {
             "a contended refresh walked the root's indexes"
         );
 
-        let (report, walks_by_attempt) =
-            refresh_until_root_count_with_walk_counts(&cache, &executor, &app, 1);
-        assert_eq!(report.metrics.unwrap()["root_count"], 1);
-        // The census row and rollup row must share a single root-index walk.
-        assert!(
-            walks_by_attempt.iter().any(|(successful, _)| *successful),
-            "no successful root census was observed: {walks_by_attempt:?}"
+        let epoch = Instant::now();
+        let refresh_at = |now_ms| {
+            cache.clock_ms.store(now_ms, Ordering::Relaxed);
+            let walks_before = crate::context::memory_estimate_walks_for_test();
+            let census_before = cache.census_builds_for_test();
+            crate::context::with_memory_walk_clock_for_test(
+                epoch + Duration::from_millis(now_ms),
+                || cache.refresh_for_test(&executor, &app),
+            );
+            let rollup = cache.snapshot().0;
+            // Root membership is valid for both a new census and a reused one;
+            // root_count does not say whether this refresh walked any indexes.
+            assert_eq!(rollup.metrics["root_count"], 1);
+            (
+                crate::context::memory_estimate_walks_for_test() - walks_before,
+                cache.census_builds_for_test() - census_before,
+                rollup.memory_census_at_ms,
+            )
+        };
+        // The census row and rollup row share one root-index walk. Both reuse
+        // it inside the window and measure again exactly at the 30 s boundary.
+        assert_eq!(refresh_at(0), (1, 1, Some(0)));
+        assert_eq!(refresh_at(29_999), (0, 0, Some(0)));
+        assert_eq!(refresh_at(30_000), (1, 1, Some(30_000)));
+    }
+
+    #[test]
+    fn rollup_resolves_shared_storage_paths_once_per_tick() {
+        // One shared App, so every context names the same storage root the way
+        // the daemon's contexts do; only the project roots differ.
+        let app = crate::context::App::default_shared();
+        let executor = Executor::new();
+        let cache = HealthRollupCache::new();
+        let shared_app = crate::context::App::default_shared();
+        let mut entries = Vec::new();
+        let mut dirs = Vec::new();
+        for index in 0..32 {
+            let (dir, root) = test_root(&format!("health-shared-storage-{index:02}"));
+            let ctx = Arc::new(AppContext::from_app(
+                Arc::clone(&app),
+                crate::config::Config::default(),
+            ));
+            entries.push((root, ctx));
+            dirs.push(dir);
+        }
+        // The fixture really shares one storage root. Comparing configured
+        // spellings resolves nothing, so the tick below measures the first
+        // registration of this root.
+        let storage = entries[0].1.config().storage_dir.clone();
+        assert!(storage.is_some());
+        for (_, ctx) in &entries {
+            assert_eq!(ctx.config().storage_dir, storage);
+        }
+        crate::bash_background::reset_storage_dir_calls_for_test();
+        crate::project_content::reset_register_canonicalizations_for_test();
+        let rollup =
+            build_health_diagnostic_rollup_from_actors(&cache, &executor, &shared_app, entries);
+        assert_eq!(
+            rollup.metrics["root_count"], 32,
+            "the tick must have visited every actor"
+        );
+        // One tick over 32 contexts sharing a root resolves it once (plus the
+        // one standing-roots probe, which runs once per tick by construction).
+        // Resolving once per context would report hundreds here.
+        let resolutions = crate::bash_background::storage_dir_calls_for_test();
+        let canonicalizations = crate::project_content::register_canonicalizations_for_test();
+        println!(
+            "health tick over 32 contexts: {resolutions} storage resolutions, {canonicalizations} canonicalizations"
         );
         assert!(
-            walks_by_attempt
-                .iter()
-                .all(|(successful, walks)| { *walks == if *successful { 1 } else { 0 } }),
-            "memory walks did not match each attempt's census outcome: {walks_by_attempt:?}"
+            resolutions <= 8,
+            "shared storage resolved once per context: {resolutions}",
         );
+        // The first registration canonicalizes the root; repeats reuse the
+        // retained spelling without another realpath probe.
+        assert!(
+            canonicalizations <= 4,
+            "storage root canonicalized once per context: {canonicalizations}",
+        );
+        drop(dirs);
     }
 
     #[test]
@@ -6131,6 +7435,209 @@ mod tests {
             "dropped runs were still counted"
         );
         assert_eq!(walks(), after_first + 2);
+    }
+
+    #[test]
+    fn quiet_rollup_does_not_rebuild_inspect_memory_payloads() {
+        let executor = Executor::new();
+        let app = App::default_shared();
+        let cache = HealthRollupCache::new();
+        let storage = tempfile::tempdir().unwrap();
+        let mut dirs = Vec::new();
+        for index in 0..200 {
+            let (dir, root) = test_root(&format!("quiet-memory-payload-{index}"));
+            let ctx = Arc::new(AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                crate::config::Config {
+                    storage_dir: Some(storage.path().to_path_buf()),
+                    project_root: Some(root.as_path().to_path_buf()),
+                    ..crate::config::Config::default()
+                },
+            ));
+            let inspect = ctx
+                .inspect_manager()
+                .cache_for_paths(ctx.inspect_dir(), root.as_path().to_path_buf())
+                .unwrap();
+            let scope = crate::inspect::JobScope::for_project(root.as_path().to_path_buf());
+            let key = crate::inspect::JobKey::for_category_scope(
+                crate::inspect::InspectCategory::Diagnostics,
+                &scope,
+            );
+            inspect
+                .store_aggregated(
+                    key,
+                    json!({"items": [{"message": format!("warning {index}")}]}),
+                )
+                .unwrap();
+            assert!(executor.register_actor(root, ctx));
+            dirs.push(dir);
+        }
+        let now = Instant::now();
+        cache.clock_ms.store(0, Ordering::Relaxed);
+        crate::context::with_memory_walk_clock_for_test(now, || {
+            cache.refresh_for_test(&executor, &app);
+        });
+        let before = crate::inspect::cache::aggregate_memory_walks_for_test();
+        cache.clock_ms.store(3_000, Ordering::Relaxed);
+        crate::context::with_memory_walk_clock_for_test(now + Duration::from_secs(3), || {
+            cache.refresh_for_test(&executor, &app);
+        });
+        assert_eq!(
+            crate::inspect::cache::aggregate_memory_walks_for_test() - before,
+            0,
+            "a quiet 200-root tick rebuilt retained inspect payload estimates",
+        );
+        let (root, ctx) = executor.actor_entries().into_iter().next().unwrap();
+        let inspect = ctx
+            .inspect_manager()
+            .cache_for_paths(ctx.inspect_dir(), root.as_path().to_path_buf())
+            .unwrap();
+        let scope = crate::inspect::JobScope::for_project(root.as_path().to_path_buf());
+        let key = crate::inspect::JobKey::for_category_scope(
+            crate::inspect::InspectCategory::Diagnostics,
+            &scope,
+        );
+        inspect
+            .store_aggregated(
+                key,
+                json!({"items": [{"message": "a changed diagnostic with a longer message"}]}),
+            )
+            .unwrap();
+        let before = crate::inspect::cache::aggregate_memory_walks_for_test();
+        cache.clock_ms.store(6_000, Ordering::Relaxed);
+        crate::context::with_memory_walk_clock_for_test(now + Duration::from_secs(6), || {
+            cache.refresh_for_test(&executor, &app);
+        });
+        assert_eq!(
+            crate::inspect::cache::aggregate_memory_walks_for_test() - before,
+            1,
+            "only the changed root may rebuild its inspect estimate"
+        );
+        let label = root.as_path().display().to_string();
+        let snapshot = cache.snapshot().0;
+        assert!(snapshot.metrics["memory"]["roots"]
+            .as_object()
+            .unwrap()
+            .contains_key(&label));
+        assert!(snapshot.metrics["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["project_root"] == label));
+    }
+
+    #[test]
+    fn inspect_memory_rollup_json_matches_legacy_under_churn() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let inspect = crate::inspect::InspectCache::open(
+            storage.path().to_path_buf(),
+            root.path().to_path_buf(),
+        )
+        .unwrap();
+        let peers = (0..2)
+            .map(|index| {
+                let cache = crate::inspect::InspectCache::open(
+                    storage.path().join(format!("peer-{index}")),
+                    root.path().to_path_buf(),
+                )
+                .unwrap();
+                cache
+                    .store_aggregated(
+                        crate::inspect::JobKey::for_project_category(
+                            crate::inspect::InspectCategory::Todos,
+                        ),
+                        json!({"items": ["fixed peer diagnostic".repeat(30 * (index + 1))]}),
+                    )
+                    .unwrap();
+                cache
+            })
+            .collect::<Vec<_>>();
+        let assert_parity = || {
+            let caches = std::iter::once(&inspect).chain(peers.iter());
+            let legacy = caches
+                .clone()
+                .map(|cache| cache.legacy_estimated_memory_for_test())
+                .collect::<Vec<_>>();
+            let current = caches
+                .map(|cache| cache.estimated_memory())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                serde_json::to_vec(&current).unwrap(),
+                serde_json::to_vec(&legacy).unwrap()
+            );
+            let shared = crate::memory::SharedProcessMemory::measure();
+            let allocator = crate::memory::AllocatorObservation::measure();
+            let build = |estimates: &[crate::memory::MemoryEstimate]| {
+                let roots = (0..200usize)
+                    .map(|index| {
+                        let other = crate::memory::MemoryEstimate::estimated(index as u64 * 100);
+                        let row = crate::memory::RootMemoryRollup::from_estimates(&[
+                            &estimates[index % estimates.len()],
+                            &other,
+                        ])
+                        .with_measured_age_ms(3_000);
+                        let row = if index % 3 == 0 {
+                            row.with_standing()
+                        } else {
+                            row
+                        };
+                        (format!("/parity/root-{index:03}"), row)
+                    })
+                    .collect();
+                crate::memory::MemoryRollupSnapshot::with_shared(
+                    "ready",
+                    roots,
+                    allocator.clone(),
+                    &shared,
+                )
+            };
+            let expected = build(&legacy);
+            let mut actual = build(&current);
+            let root_and_shared = |process: &crate::memory::ProcessMemorySnapshot| {
+                process.total_attributed_bytes
+                    - process.sqlite.memory_used_bytes
+                    - process.embedding_model_bytes
+            };
+            assert_eq!(
+                root_and_shared(&actual.process),
+                root_and_shared(&expected.process)
+            );
+            assert_eq!(actual.process.root_count, expected.process.root_count);
+            assert_eq!(
+                actual.process.busy_subsystems,
+                expected.process.busy_subsystems
+            );
+            assert_eq!(
+                actual.process.not_estimated_subsystems,
+                expected.process.not_estimated_subsystems
+            );
+            // Process counters can change between constructors. Their root-derived
+            // totals were checked above; use one observation for the wire comparison.
+            actual.process = expected.process.clone();
+            assert_eq!(
+                serde_json::to_vec(&memory_rollup_metrics(Some(actual))).unwrap(),
+                serde_json::to_vec(&memory_rollup_metrics(Some(expected))).unwrap(),
+            );
+        };
+        assert_parity();
+        let project =
+            crate::inspect::JobKey::for_project_category(crate::inspect::InspectCategory::Todos);
+        for revision in 0..140 {
+            inspect.store_aggregated(project.clone(), json!({"items": [{"message": "warning".repeat(revision + 1), "revision": revision}]})).unwrap();
+            inspect
+                .store_aggregated(
+                    crate::inspect::JobKey {
+                        category: crate::inspect::InspectCategory::Todos,
+                        scope_hash: Some(format!("scope-{revision}")),
+                    },
+                    json!({"nested": [{"unicode": "λ", "values": [null, false, revision]}]}),
+                )
+                .unwrap();
+            assert_parity();
+            inspect.get_aggregated(&project).unwrap().unwrap();
+            assert_parity();
+        }
     }
 
     /// What a rollup costs while nothing changes, counted rather than timed:
@@ -7041,6 +8548,18 @@ mod tests {
         assert!(health["dropped_lines_total"].is_u64(), "{health}");
         assert!(health.get("last_write_error").is_some(), "{health}");
         assert!(health.get("failing_since").is_some(), "{health}");
+        assert!(
+            health["stderr_mirror"]["dropped_lines_total"].is_u64(),
+            "{health}"
+        );
+        assert!(
+            health["stderr_mirror"]["dropped_flushes_total"].is_u64(),
+            "{health}"
+        );
+        assert!(
+            health["stderr_mirror"]["best_effort"].is_boolean(),
+            "{health}"
+        );
     }
 
     #[test]
@@ -7343,6 +8862,19 @@ mod tests {
                         removed_roots: 3,
                         removed_bytes: 4096,
                         errors: vec!["example maintenance error".repeat(8)],
+                        trash: crate::storage_retention::TrashReport {
+                            at_ms: crate::pins::now_ms(),
+                            entries: 2,
+                            bytes_estimate: 1_500_000_000,
+                            oldest_age_ms: Some(7_200_000),
+                            removed_entries: 1,
+                            incomplete: true,
+                            kept_by_reason: std::collections::BTreeMap::from([(
+                                "witness".into(),
+                                2,
+                            )]),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
                 )
@@ -7370,6 +8902,13 @@ mod tests {
         assert_eq!(metrics["storage_retention_totals"]["removed_roots"], 384);
         assert_eq!(metrics["storage_retention_totals"]["removed_bytes"], 524288);
         assert_eq!(metrics["storage_retention_totals"]["errors"], 128);
+        let trash = &metrics["storage_retention_totals"]["trash"];
+        assert_eq!(trash["entries"], 256);
+        assert_eq!(trash["bytes_estimate"], 192_000_000_000_u64);
+        assert_eq!(trash["removed_entries"], 128);
+        assert_eq!(trash["kept_by_reason"]["witness"], 256);
+        assert_eq!(trash["incomplete"], true);
+        assert!(trash["oldest_age_ms"].as_u64().unwrap() >= 7_200_000);
         let encoded = serde_json::to_vec(&metrics).unwrap();
         assert!(encoded.len() <= 12 * 1024);
         assert_eq!(metrics["metrics_bytes"], encoded.len());
@@ -7438,6 +8977,20 @@ mod tests {
         assert!(report_metrics["metrics_bytes"]
             .as_u64()
             .is_some_and(|bytes| bytes <= HEALTH_METRICS_BUDGET_BYTES as u64));
+        // Each test context has its own storage, so there are fifty distinct
+        // cache roots; the reply lists a bounded number and counts the rest.
+        let listed_cache_roots = report_metrics["cache_roots"]
+            .as_array()
+            .expect("cache roots")
+            .len();
+        assert!(listed_cache_roots <= HEALTH_ROOT_DETAIL_CAP);
+        assert_eq!(
+            listed_cache_roots as u64
+                + report_metrics["cache_roots_omitted"]
+                    .as_u64()
+                    .expect("omitted cache root count"),
+            50
+        );
         assert_eq!(report_metrics["memory"]["roots_total"].as_u64(), Some(50));
         assert_eq!(
             report_metrics["memory"]["roots"]
@@ -8034,10 +9587,40 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn standing_health_names_resolved_path_drift_without_re_recording() {
-        let storage = tempfile::tempdir().expect("storage directory");
-        let original = tempfile::tempdir().expect("original standing root");
-        let retargeted = tempfile::tempdir().expect("retargeted standing root");
-        let link = storage.path().join("standing-link");
+        assert_standing_health_names_resolved_path_drift(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn standing_health_names_resolved_path_drift_with_long_temp_paths() {
+        assert_standing_health_names_resolved_path_drift(true);
+    }
+
+    #[cfg(unix)]
+    fn assert_standing_health_names_resolved_path_drift(long_paths: bool) {
+        let parent = tempfile::tempdir().expect("standing fixture parent");
+        let mut base = parent.path().to_path_buf();
+        if long_paths {
+            // Repeated directory paths must force abbreviation under the health
+            // metrics byte budget, even with a short system temp directory.
+            // Each component stays below NAME_MAX and complete paths stay below
+            // macOS's PATH_MAX.
+            while base.as_os_str().len() < 700 {
+                base.push("standing-health-resolved-path-drift-".repeat(2));
+            }
+            std::fs::create_dir_all(&base).expect("long standing fixture parent");
+        }
+        let directory = || {
+            tempfile::Builder::new()
+                .tempdir_in(&base)
+                .expect("standing directory")
+        };
+        // Keep the database short so SQLite's path limit does not prevent the
+        // long-path variant from reaching health budgeting.
+        let storage = tempfile::tempdir().expect("standing storage directory");
+        let original = directory();
+        let retargeted = directory();
+        let link = base.join("standing-link");
         std::os::unix::fs::symlink(original.path(), &link).expect("initial standing symlink");
         let config = standing_config(&link, storage.path());
         let literal_path = config.index.roots[0].path.clone();
@@ -8059,17 +9642,44 @@ mod tests {
         std::os::unix::fs::symlink(retargeted.path(), &link).expect("retarget standing symlink");
 
         let metrics = DispatchPathMetrics::new();
-        let report = test_health_report(&executor, &HashMap::new(), &metrics, &app);
+        // A loaded runner can report scheduler contention instead of the root
+        // rows; wait that out like the other health tests do.
+        let report = health_report_after_scheduler_contention(
+            "standing_health_names_resolved_path_drift_without_re_recording",
+            || test_health_report(&executor, &HashMap::new(), &metrics, &app),
+        );
         assert_eq!(report.status, HealthStatus::Degraded);
+        let report_summary = format!("status={:?} detail={:?}", report.status, report.detail);
         let metrics = report.metrics.expect("health metrics");
         let root_row = metrics["roots"]
             .as_array()
             .and_then(|rows| {
                 rows.iter()
-                    .find(|row| row["standing_entry"] == json!(literal_path))
+                    .find(|row| row["standing"] == true)
             })
-            .expect("drifted standing health row");
+            .unwrap_or_else(|| {
+                panic!(
+                    "drifted standing health row: {report_summary} row_count={:?} roots={} metrics={metrics}",
+                    metrics["roots"].as_array().map(Vec::len),
+                    metrics["roots"],
+                )
+            });
         assert_eq!(root_row["standing"], true);
+        if root_row["abbreviated"] == true {
+            let identity = root_row["standing_entry"].as_str().unwrap();
+            assert!(identity.contains(blake3::hash(literal_path.as_bytes()).to_hex().as_str()));
+            assert!(identity.ends_with("/standing-link"));
+        } else {
+            assert_eq!(root_row["standing_entry"], literal_path);
+        }
+        if long_paths {
+            assert_eq!(
+                root_row["abbreviated"], true,
+                "fixture must exhaust the budget"
+            );
+        }
+        assert_eq!(metrics["root_details_omitted"], 0);
+        assert!(metrics["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
         let refusal = root_row["standing_refusal"]
             .as_str()
             .expect("named drift refusal");
@@ -8383,6 +9993,7 @@ fn standing_root_health_value(
 
 fn unhosted_standing_health_snapshot(entry: &StandingHealthEntry) -> RootHealthSnapshot {
     RootHealthSnapshot {
+        cache_unavailable_reason: None,
         project_root: entry.root_id.as_ref().map_or_else(
             || entry.literal_path.clone(),
             |root_id| root_id.as_path().display().to_string(),
@@ -8396,6 +10007,8 @@ fn unhosted_standing_health_snapshot(entry: &StandingHealthEntry) -> RootHealthS
         callgraph_commits_60s: None,
         callgraph_pages_or_bytes_written_60s: None,
         views: None,
+        view_load_failures: Default::default(),
+        view_load_failure_last: None,
         tier2: None,
         bash: None,
         suspended_domains: Vec::new(),
@@ -8505,5 +10118,77 @@ mod observability_retention_tests {
         let events = metrics.bg_events.lock().unwrap();
         assert_eq!(events.len(), 2);
         assert!(events.keys().all(|key| key.session != "inactive"));
+    }
+}
+
+#[cfg(test)]
+mod watch_gap_tests {
+
+    #[test]
+    fn retry_overflow_health_keeps_evictions_separate_and_clears_after_ack() {
+        use crate::bash_background::watch_lines::{LineBatch, RetryGap};
+        use crate::db::bash_watches::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+        let conn = crate::db::open(&path).unwrap();
+        let batch = LineBatch {
+            retry_gap: Some(RetryGap {
+                reason: "retry_overflow".into(),
+                dropped_notifications: 3,
+                known_missing_occurrences: 1,
+                ..Default::default()
+            }),
+            version: Some(5),
+            ..Default::default()
+        };
+        let row = BashPatternWatchRow {
+            harness: "opencode".into(),
+            session_id: "session".into(),
+            task_id: "task".into(),
+            watch_id: "watch".into(),
+            pattern_kind: "substring".into(),
+            pattern: "READY".into(),
+            once: false,
+            each_line: false,
+            match_batch: Some(serde_json::to_string(&batch).unwrap()),
+            created_at: 0,
+            stdout_offset: 0,
+            stderr_offset: 0,
+            pty_offset: 0,
+            scanning: true,
+            pending_match: true,
+            match_text: Some("watch delivery gap".into()),
+            match_offset: Some(5),
+            match_context: None,
+        };
+        upsert_delivery_gap(&conn, &row).unwrap();
+        let (gaps, missing, uncertain) = watch_gap_health_for(&conn);
+        assert_eq!((gaps, missing, uncertain), (1, 1, false));
+        let health = super::super::watch_delivery::health_from_census(gaps, missing, uncertain, 0);
+        assert_eq!(health["status"], "degraded");
+        assert_eq!(health["reason"], "retry_overflow");
+        assert_eq!(health["outstanding_watch_gaps"], 1);
+        assert_eq!(health["known_missing_occurrences"], 1);
+        assert!(health["evicted_transport_copies_total"].is_u64());
+        acknowledge_delivery(
+            &conn,
+            "opencode",
+            "session",
+            "task",
+            "watch",
+            5,
+            batch.retry_gap.as_ref(),
+        )
+        .unwrap();
+        delete_delivery_gap(&conn, "opencode", "session", "task", "watch").unwrap();
+        let (gaps, missing, uncertain) = watch_gap_health_for(&conn);
+        let cleared = super::super::watch_delivery::health_from_census(gaps, missing, uncertain, 0);
+        assert_eq!(cleared["status"], "ok");
+        assert!(cleared["reason"].is_null());
+        assert_eq!(cleared["outstanding_watch_gaps"], 0);
+        assert_eq!(cleared["known_missing_occurrences"], 0);
+        let unconfirmed = super::super::watch_delivery::health_from_census(0, 0, true, 1);
+        assert_eq!(unconfirmed["status"], "degraded");
+        assert_eq!(unconfirmed["reason"], "watch_gap_persistence_unconfirmed");
     }
 }

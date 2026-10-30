@@ -80,7 +80,9 @@ fn build() -> BusyRoot {
         entries_total: Some(52_000),
     };
     let family = crate::views::registry::FamilyRegistry::open(&storage, "push-fixture").unwrap();
-    let view = family.register_view("prefrontal", &root).unwrap();
+    let view = family
+        .register_view_with_storage(&storage, "prefrontal", &root)
+        .unwrap();
     let mut paths = crate::path_status::PathStatusStore::open(view.view_dir()).unwrap();
     for i in 0..20 {
         paths
@@ -117,7 +119,7 @@ fn build() -> BusyRoot {
         crate::lsp::registry::ServerKind::Bash,
     ] {
         let mut manager = ctx.lsp();
-        let client = crate::lsp::client::LspClient::spawn(
+        let client = crate::lsp::client::LspClient::spawn_with_reclaim_root(
             kind,
             root.clone(),
             Path::new("/bin/cat"),
@@ -125,6 +127,8 @@ fn build() -> BusyRoot {
             &HashMap::new(),
             manager.event_sender_for_test(),
             app.lsp_child_registry(),
+            None,
+            false,
         )
         .unwrap();
         manager.insert_client_for_test(client);

@@ -1,12 +1,24 @@
+import type { BashWatchLineBatch } from "@cortexkit/aft-bridge";
 import {
   type AftProjectTransport,
+  type BashAckTarget,
   type BgNudgeRef,
+  bashAckKey,
+  bashAckRequest,
+  bashAcksConfirmed,
+  bashAckTargetFromKey,
+  bashAckTargets,
+  bashPatternAckTarget,
+  formatWatchLineBatch,
+  mergeWatchLineBatches,
   resolveBridgeForNudge,
+  WatchBatchAdmissions,
 } from "@cortexkit/aft-bridge";
 import { sessionLog, sessionWarn } from "./logger.js";
 import type { PluginContext } from "./types.js";
 
 export interface BgCompletion {
+  _bash_changed_files?: import("@cortexkit/aft-bridge").BashChangedFiles;
   task_id: string;
   status: string;
   exit_code: number | null;
@@ -29,14 +41,16 @@ export interface BgCompletion {
   tokens_skipped?: boolean;
   status_reason?: string;
   output_incomplete?: boolean;
-  live_descendants?: Array<{ pid: number; comm: string; argv0: string }> | null;
+  live_descendants?: import("@cortexkit/aft-bridge").LiveDescendant[] | null;
   live_descendants_omitted?: number;
+  live_descendants_unavailable?: import("@cortexkit/aft-bridge").LiveDescendantsUnavailable;
   live_descendants_summary?: string;
   mode?: "pipes" | "pty" | string;
   output_path?: string;
 }
 
 export interface PatternMatchEntry {
+  batch?: BashWatchLineBatch;
   task_id: string;
   session_id: string;
   watch_id: string;
@@ -62,6 +76,7 @@ type SessionBgState = {
   pendingCompletions: BgCompletion[];
   pendingLongRunning: BgLongRunningReminder[];
   pendingPatternMatches: PatternMatchEntry[];
+  batchAdmissions: WatchBatchAdmissions;
   explicitControlTasks: Set<string>;
   debounceTimer: NodeJS.Timeout | null;
   firstCompletionAt: number | null;
@@ -97,14 +112,14 @@ type SessionBgState = {
   consumedTaskIds: Set<string>;
   consumedTaskOrder: string[];
   /**
-   * Task IDs whose delivery is IN FLIGHT (removed from pendingCompletions /
+   * Task IDs and exact watch-version keys whose delivery is IN FLIGHT (removed from pendingCompletions /
    * pattern queues, delivery not yet resolved). Ingest skips these so a subc
    * forced drain in the removal→delivery window can't re-accept and double-deliver
    * an already-departing completion (audit C-#1). Mirrors the OpenCode twin.
    */
   deliveringTaskIds: Set<string>;
   /**
-   * Task IDs DELIVERED to the agent but whose `bash_ack_completions` has not yet
+   * Acknowledgement target keys DELIVERED to the agent but whose `bash_ack_completions` has not yet
    * confirmed (Rust still holds them and, over subc, re-nudges). Ingest skips them
    * for fresh delivery AND a forced drain RE-ACKs them (the self-terminating close
    * of the re-nudge loop, C-#3). Removed by DAEMON RECONCILIATION, not a timer:
@@ -145,6 +160,7 @@ const LOG_PREFIX = "[aft-pi] bg-notifications:";
 const SUBC_NUDGE_LOG_INTERVAL_MS = 60_000;
 const FOREIGN_SESSION_DROP_INTERVAL_MS = 60_000;
 const foreignSessionDropLogState = new Map<string, { lastEmittedAt: number; suppressed: number }>();
+let lastLogStateSweepAt = 0;
 let activeSessionId: string | undefined;
 
 export function setActiveSessionId(sessionId: string | undefined): void {
@@ -163,6 +179,7 @@ function logDroppedForeignSessionFrame(
   liveSessionId?: string,
 ): void {
   const now = Date.now();
+  cleanupIdleLogStates(now);
   const state = foreignSessionDropLogState.get(droppedSessionId);
   if (state && now - state.lastEmittedAt < FOREIGN_SESSION_DROP_INTERVAL_MS) {
     state.suppressed += 1;
@@ -238,9 +255,7 @@ export async function markBgCompletionDelivered(
   // that set is also used pre-delivery by markTaskWaiting.)
   const state = stateFor(drainContext.sessionID);
   markDeliveredAwaitingAck(state, [taskId]);
-  const acked = await ackCompletions(drainContext, [
-    { task_id: taskId, status: "unknown", exit_code: null, command: "" },
-  ]);
+  const acked = await ackCompletions(drainContext, [{ task_id: taskId }]);
   if (acked) confirmAcked(state, [taskId]);
 }
 
@@ -330,11 +345,24 @@ function queuePendingPatternMatch(state: SessionBgState, entry: PatternMatchEntr
     ? entry
     : { ...entry, reason: "pattern_match" };
   const existingIdx = state.pendingPatternMatches.findIndex(
-    (match) => match.task_id === normalized.task_id,
+    (match) =>
+      match.task_id === normalized.task_id &&
+      (match.watch_id === normalized.watch_id ||
+        (!normalized.batch &&
+          !match.batch &&
+          (normalized.reason === "task_exit" || match.reason === "task_exit"))),
   );
   if (existingIdx >= 0) {
     const existing = state.pendingPatternMatches[existingIdx];
-    if (existing.reason !== "pattern_match" && normalized.reason === "pattern_match") {
+    // Live pushes contain only new rows; replay replaces the durable snapshot.
+    // Bound the queue too, since the host can stay busy across many scan intervals.
+    if (normalized.batch && existing.batch) {
+      normalized.batch = mergeWatchLineBatches(existing.batch, normalized.batch);
+    }
+    if (
+      normalized.batch ||
+      (existing.reason !== "pattern_match" && normalized.reason === "pattern_match")
+    ) {
       state.pendingPatternMatches[existingIdx] = normalized;
     }
     return;
@@ -371,6 +399,7 @@ export async function handlePushedPatternMatch(
     return;
   }
   const state = stateFor(drainContext.sessionID);
+  if (isDeliveringOrAwaitingAck(state, frame)) return;
   queuePendingPatternMatch(state, { ...frame, ackCompletionOnDelivery: true });
   await triggerWakeIfPending(drainContext, true);
 }
@@ -479,8 +508,9 @@ export async function appendToolResultBgCompletions(
   const reminder = formatCombinedSystemReminder(
     state.pendingCompletions,
     state.pendingLongRunning,
-    state.pendingPatternMatches,
+    state.batchAdmissions.unseen(deliveredPatternMatches),
   );
+  state.batchAdmissions.admit(deliveredPatternMatches);
   state.pendingCompletions = [];
   for (const completion of deliveredCompletions) {
     state.wakeDeferredTaskIds.delete(completion.task_id);
@@ -493,7 +523,7 @@ export async function appendToolResultBgCompletions(
   // C-#1 site 4: tool-result piggyback delivery (the reminder is returned below
   // and cannot fail here), so mark ack-target ids awaiting-ack, then confirm/keep
   // on the ack result (keep → re-ack on a later forced drain, C-#3).
-  const inTurnAckIds = completionAcks.map((completion) => completion.task_id);
+  const inTurnAckIds = completionAcks.map(bashAckKey);
   markDeliveredAwaitingAck(state, inTurnAckIds);
   const inTurnAcked = await ackCompletions(drainContext, completionAcks);
   if (inTurnAcked) confirmAcked(state, inTurnAckIds);
@@ -501,7 +531,7 @@ export async function appendToolResultBgCompletions(
   // pendingLongRunning are now drained, and firing the timer anyway would
   // build an empty-body "[BACKGROUND BASH STILL RUNNING]" reminder.
   clearWakeTimerIfNoPending(state);
-  return [...content, { type: "text", text: reminder }];
+  return reminder ? [...content, { type: "text", text: reminder }] : undefined;
 }
 
 export async function handleTurnEndBgCompletions(
@@ -590,6 +620,7 @@ function logDeliveryHop(
         : "";
   const key = `${kind}\u0000${taskKey}\u0000${drainContext.directory}\u0000${sessionID}`;
   const now = Date.now();
+  cleanupIdleLogStates(now);
   const state = subcNudgeLogState.get(key);
   if (state && now - state.lastEmittedAt < SUBC_NUDGE_LOG_INTERVAL_MS) {
     state.suppressed += 1;
@@ -709,6 +740,13 @@ async function triggerWakeIfPending(
         return;
       }
       const ackTargetIds = deliveredCompletions.map((completion) => completion.task_id);
+      const ackKeys = deliveredCompletions.map(bashAckKey);
+      if (!reminder) {
+        state.batchAdmissions.admit(deliveredPatternMatches ?? []);
+        markDeliveredAwaitingAck(state, ackKeys);
+        if (await ackCompletions(drainContext, deliveredCompletions)) confirmAcked(state, ackKeys);
+        return;
+      }
       const watchIds = deliveredPatternMatches?.map((m) => m.watch_id) ?? [];
       const watchId = watchIds.join(",") || undefined;
       logPerTaskDeliveryHop(drainContext, "inject-start", "session inject start", ackTargetIds, {
@@ -718,6 +756,7 @@ async function triggerWakeIfPending(
       });
       try {
         drainContext.runtime.sendUserMessage(reminder, { deliverAs: "steer" });
+        state.batchAdmissions.admit(deliveredPatternMatches ?? []);
       } catch (err) {
         logPerTaskDeliveryHop(
           drainContext,
@@ -741,9 +780,9 @@ async function triggerWakeIfPending(
       });
       // Session injection completed synchronously. Only now may these task IDs
       // enter awaiting-ack state and become eligible for daemon acknowledgement.
-      markDeliveredAwaitingAck(state, ackTargetIds);
+      markDeliveredAwaitingAck(state, ackKeys);
       const acked = await ackCompletions(drainContext, deliveredCompletions);
-      if (acked) confirmAcked(state, ackTargetIds);
+      if (acked) confirmAcked(state, ackKeys);
     },
     (err, hardStopped) => {
       if (isTerminalNudgeError(err)) {
@@ -791,7 +830,14 @@ export function formatLongRunningReminder(reminders: readonly BgLongRunningRemin
 export function formatPatternMatchReminder(matches: readonly PatternMatchEntry[]): string {
   const bullets = matches
     .map((match) => {
-      const context = (match.context || match.match_text).replace(/\n/g, "\n      > ");
+      const context = (
+        match.batch
+          ? formatWatchLineBatch(match.task_id, match.batch, false)
+          : match.context || match.match_text
+      ).replace(/\n/g, "\n      > ");
+      if (match.batch) {
+        return `- task ${match.task_id} matching lines:\n      > ${context}`;
+      }
       if (match.reason === "task_exit") {
         return `- task ${match.task_id} exited:\n      > ${context}`;
       }
@@ -825,6 +871,7 @@ export function __resetBgNotificationStateForTests(): void {
   subcNudgesInFlight.clear();
   subcNudgeLogState.clear();
   foreignSessionDropLogState.clear();
+  lastLogStateSweepAt = 0;
   activeSessionId = undefined;
   bgHopTimeoutMs = DEFAULT_BG_HOP_TIMEOUT_MS;
 }
@@ -912,6 +959,7 @@ async function drainCompletions(drainContext: DrainContext): Promise<void> {
     const drainedMatches = Array.isArray(response.pending_matches)
       ? response.pending_matches.filter(isPatternMatchEntry)
       : [];
+    state.batchAdmissions.reconcile(drainedMatches);
     const drainedTaskIds = [
       ...new Set([
         ...drainedCompletions.map((completion) => completion.task_id),
@@ -928,19 +976,15 @@ async function drainCompletions(drainContext: DrainContext): Promise<void> {
     // nudges, self-terminating); one it no longer returns was dropped daemon-side
     // → reconcile forgets it. Ingest skips awaiting-ack tasks, so re-ack never
     // double-delivers.
-    const reackTaskIds = reconcileAwaitingAck(state, drainedTaskIds);
+    const drainedAckKeys = [
+      ...drainedCompletions.map(bashAckKey),
+      ...drainedMatches.map((match) => bashAckKey(bashPatternAckTarget(match))),
+    ];
+    const reackTaskIds = reconcileAwaitingAck(state, drainedAckKeys);
     ingestDrainedBgCompletions(drainContext.sessionID, drainedCompletions);
     ingestDrainedPatternMatches(drainContext.sessionID, drainedMatches);
     if (reackTaskIds.length > 0) {
-      const reacked = await ackCompletions(
-        drainContext,
-        reackTaskIds.map((task_id) => ({
-          task_id,
-          status: "unknown",
-          exit_code: null,
-          command: "",
-        })),
-      );
+      const reacked = await ackCompletions(drainContext, reackTaskIds.map(bashAckTargetFromKey));
       if (reacked) confirmAcked(state, reackTaskIds);
     }
   } catch (err) {
@@ -962,20 +1006,21 @@ async function drainCompletions(drainContext: DrainContext): Promise<void> {
 
 async function ackCompletions(
   drainContext: DrainContext,
-  completions: readonly BgCompletion[],
+  completions: readonly BashAckTarget[],
 ): Promise<boolean> {
   const taskIds = [...new Set(completions.map((completion) => completion.task_id))];
-  if (taskIds.length === 0) return true;
+  if (completions.length === 0) return true;
+  const targets = bashAckRequest(completions);
   try {
     const bridge = bridgeForDrain(drainContext);
     const params = drainContext.sessionID
-      ? { session_id: drainContext.sessionID, task_ids: taskIds }
-      : { task_ids: taskIds };
+      ? { session_id: drainContext.sessionID, ...targets }
+      : targets;
     const response = await withBgHopTimeout(
       bridge.send("bash_ack_completions", params, { timeoutMs: bgHopTimeoutMs }),
       "bash_ack_completions",
     );
-    if (response.success === false) {
+    if (!bashAcksConfirmed(response, completions)) {
       logPerTaskDeliveryHop(
         drainContext,
         "ack-error",
@@ -989,6 +1034,7 @@ async function ackCompletions(
       );
       return false;
     }
+    stateFor(drainContext.sessionID).batchAdmissions.confirmed(completions);
     logPerTaskDeliveryHop(drainContext, "ack-ok", "ack ok", taskIds, {
       event: "bash_completion_ack_ok",
     });
@@ -1055,7 +1101,7 @@ function scheduleWake(
   state: SessionBgState,
   sendWake: (
     reminder: string,
-    completions: readonly BgCompletion[],
+    completions: readonly BashAckTarget[],
     patternMatches?: readonly PatternMatchEntry[],
   ) => Promise<void>,
   onSendFailure: (err: unknown, hardStopped: boolean) => void,
@@ -1108,7 +1154,7 @@ function scheduleWake(
     const reminder = formatCombinedSystemReminder(
       pending,
       pendingLongRunning,
-      pendingPatternMatches,
+      state.batchAdmissions.unseen(pendingPatternMatches),
     );
     const deliveredTaskIds = new Set(pending.map((completion) => completion.task_id));
     state.pendingCompletions = state.pendingCompletions.filter(
@@ -1121,7 +1167,7 @@ function scheduleWake(
     // C-#1 site 1: mark ALL ack-target ids (completions + ack-on-delivery pattern
     // matches) as delivery-in-flight at the same sync tick they leave the queues,
     // before the sendWake await, so ingest skips them during delivery.
-    const ackTargetIds = completionAcks.map((completion) => completion.task_id);
+    const ackTargetIds = completionAcks.map(bashAckKey);
     markDelivering(state, ackTargetIds);
     void sendWake(reminder, completionAcks, pendingPatternMatches)
       .then(() => {
@@ -1173,6 +1219,7 @@ function stateFor(sessionID: string | undefined): SessionBgState {
       pendingCompletions: [],
       pendingLongRunning: [],
       pendingPatternMatches: [],
+      batchAdmissions: new WatchBatchAdmissions(),
       explicitControlTasks: new Set(),
       debounceTimer: null,
       firstCompletionAt: null,
@@ -1205,7 +1252,7 @@ function ingestDrainedPatternMatches(
   const state = stateFor(sessionID);
   for (const match of matches) {
     state.outstandingTaskIds.delete(match.task_id);
-    if (isDeliveringOrAwaitingAck(state, match.task_id)) continue;
+    if (isDeliveringOrAwaitingAck(state, match)) continue;
     queuePendingPatternMatch(state, { ...match, ackCompletionOnDelivery: true });
   }
 }
@@ -1243,7 +1290,20 @@ function ingestDrainedBgCompletions(
   return accepted;
 }
 
+function cleanupIdleLogStates(now: number): void {
+  if (now - lastLogStateSweepAt < 60_000) return;
+  lastLogStateSweepAt = now;
+  const cutoff = now - SESSION_BG_STATE_IDLE_TTL_MS;
+  // Foreign frames and failed nudges can create log keys without session state.
+  for (const map of [foreignSessionDropLogState, subcNudgeLogState]) {
+    for (const [key, state] of map) {
+      if (state.lastEmittedAt < cutoff) map.delete(key);
+    }
+  }
+}
+
 export function cleanupIdleSessionStates(now: number = Date.now()): void {
+  cleanupIdleLogStates(now);
   const cutoff = now - SESSION_BG_STATE_IDLE_TTL_MS;
   for (const [sessionID, state] of sessionBgStates) {
     if (state.outstandingTaskIds.size > 0) continue;
@@ -1297,24 +1357,22 @@ function completionToExitPattern(
 function completionAcksForDelivery(
   completions: readonly BgCompletion[],
   patternMatches: readonly PatternMatchEntry[],
-): BgCompletion[] {
-  const acks = [...completions];
-  const ackedTaskIds = new Set(acks.map((completion) => completion.task_id));
-  for (const match of patternMatches) {
-    if (!match.ackCompletionOnDelivery || ackedTaskIds.has(match.task_id)) continue;
-    acks.push({ task_id: match.task_id, status: "unknown", exit_code: null, command: "" });
-    ackedTaskIds.add(match.task_id);
-  }
-  return acks;
+): BashAckTarget[] {
+  return bashAckTargets(completions, patternMatches);
 }
 
-/**
- * True if `taskId` has a delivery in flight or delivered-awaiting-ack — it has
- * already left a deliverable queue and will be acked, so a fresh ingest (push or
- * forced drain) must NOT re-accept it (audit C-#1 double-deliver guard).
- */
-function isDeliveringOrAwaitingAck(state: SessionBgState, taskId: string): boolean {
-  return state.deliveringTaskIds.has(taskId) || state.deliveredAwaitingAckTaskIds.has(taskId);
+/** Suppress an exact watch version, or any notice covered by a task-level acknowledgement. */
+function isDeliveringOrAwaitingAck(
+  state: SessionBgState,
+  target: string | PatternMatchEntry,
+): boolean {
+  const keys =
+    typeof target === "string"
+      ? [target]
+      : [target.task_id, bashAckKey(bashPatternAckTarget(target))];
+  return keys.some(
+    (key) => state.deliveringTaskIds.has(key) || state.deliveredAwaitingAckTaskIds.has(key),
+  );
 }
 
 /** Mark ack-target task ids as delivery-in-flight (at queue-removal, before await). */
@@ -1414,10 +1472,19 @@ function formatCompletion(completion: BgCompletion): string {
   const descendantWarning = completion.live_descendants_summary
     ? `    ${completion.live_descendants_summary}`
     : "";
-  const captureWarning = completion.output_incomplete
-    ? `    [${completion.status_reason || "PTY output may be incomplete"}]`
-    : "";
-  return [header, captureWarning, previewBlock, descendantWarning].filter(Boolean).join("\n");
+  const captureWarning =
+    completion.output_incomplete || (completion.status === "failed" && completion.status_reason)
+      ? `    [${completion.status_reason || "PTY output may be incomplete"}]`
+      : "";
+  return [
+    header,
+    captureWarning,
+    previewBlock,
+    descendantWarning,
+    completion._bash_changed_files?.text,
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function formatOutputPreview(completion: BgCompletion): string {
@@ -1467,3 +1534,9 @@ function formatDurationMs(ms: number): string {
 function shorten(value: string, limit: number): string {
   return value.length <= limit ? value : `${value.slice(0, limit - 1)}…`;
 }
+
+export const __bgLogSuppressionForTests = {
+  foreign: logDroppedForeignSessionFrame,
+  hop: logDeliveryHop,
+  sizes: () => ({ foreign: foreignSessionDropLogState.size, hop: subcNudgeLogState.size }),
+};

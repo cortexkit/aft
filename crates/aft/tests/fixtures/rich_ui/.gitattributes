@@ -1,0 +1,2 @@
+*.json -text
+*.sha256 -text

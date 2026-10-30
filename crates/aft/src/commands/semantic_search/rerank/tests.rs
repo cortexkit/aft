@@ -272,6 +272,52 @@ fn candidate_text_is_bounded_relative_and_repeatable() {
 
 // ---- served path ---------------------------------------------------------
 
+#[test]
+fn candidate_text_reuses_raw_source_without_lossy_matching_or_stale_lines() {
+    let project = tempfile::tempdir().unwrap();
+    let file = project.path().join("raw.rs");
+    let whole = CandidateResult::new_exact(
+        file.clone(),
+        None,
+        super::super::evidence_descriptor::EvidenceDescriptor::for_e1(1, true, false),
+    );
+    std::fs::write(&file, b"// bad: \xff\r\n\r\nfn target_name() {}\r\n").unwrap();
+    assert_eq!(
+        candidate_text(project.path(), &whole, "target_name"),
+        "raw.rs:1\ntarget_name\n// bad: \u{fffd}\nfn target_name() {}"
+    );
+    std::fs::write(&file, "// valid\r\n\r\nfn target_name() {}\r\n").unwrap();
+    assert!(candidate_text(project.path(), &whole, "target_name")
+        .starts_with("raw.rs:3\ntarget_name\n"));
+    std::fs::write(&file, "fn target_name() {}\n").unwrap();
+    assert_eq!(
+        candidate_text(project.path(), &whole, "target_name"),
+        "raw.rs:1\ntarget_name\nfn target_name() {}"
+    );
+}
+
+#[test]
+fn audit01_raw_range_survives_crlf_and_invalid_prefix() {
+    let project = tempfile::tempdir().unwrap();
+    let file = project.path().join("raw.rs");
+    let mut source = b"// bad: \xff\r\n// second\r\n// third\r\n".to_vec();
+    let start = source.len();
+    source.extend_from_slice(b"pub fn selected() {\r\n    target();\r\n}\r\n");
+    std::fs::write(&file, &source).unwrap();
+    let symbol = CandidateResult::new_exact(
+        file,
+        Some(super::super::comparator::SymbolOffsetRange::new(
+            start,
+            source.len(),
+        )),
+        super::super::evidence_descriptor::EvidenceDescriptor::for_e1(1, true, false),
+    );
+    assert_eq!(
+        candidate_text(project.path(), &symbol, "anything"),
+        "raw.rs:4\nselected\npub fn selected() {\n    target();\n}"
+    );
+}
+
 fn page_request(query: &str, top_k: usize, offset: usize) -> RawRequest {
     serde_json::from_value(serde_json::json!({
         "id": "rerank-page-test",
@@ -998,6 +1044,9 @@ fn recorder_captures_scores_that_the_fixture_backend_then_replays() {
 #[test]
 fn invalid_backend_configuration_fails_build_with_a_reason() {
     let inputs = |rerank: RerankConfig| slot::BuildInputs {
+        cache_unavailable: false,
+        cache_lease: None,
+        cache_epoch: 0,
         search: SearchConfig {
             rerank: Some(rerank),
         },
@@ -1035,6 +1084,9 @@ fn invalid_backend_configuration_fails_build_with_a_reason() {
 
 fn onnx_inputs(model: Option<&str>) -> slot::BuildInputs {
     slot::BuildInputs {
+        cache_unavailable: false,
+        cache_lease: None,
+        cache_epoch: 0,
         search: SearchConfig {
             rerank: Some(RerankConfig {
                 backend: Some(RerankBackendKind::Onnx),
@@ -1091,6 +1143,9 @@ fn the_search_path_reads_the_slot_without_io_and_never_builds_on_its_thread() {
         })
     };
     let mut all_inputs = vec![slot::BuildInputs {
+        cache_unavailable: false,
+        cache_lease: None,
+        cache_epoch: 0,
         search: SearchConfig::default(),
         semantic: Default::default(),
         under_subc: false,
@@ -1103,6 +1158,9 @@ fn the_search_path_reads_the_slot_without_io_and_never_builds_on_its_thread() {
     ] {
         for under_subc in [false, true] {
             all_inputs.push(slot::BuildInputs {
+                cache_unavailable: false,
+                cache_lease: None,
+                cache_epoch: 0,
                 search: SearchConfig {
                     rerank: Some(RerankConfig {
                         backend: Some(backend),
@@ -1730,6 +1788,9 @@ fn remote_slot_factory_installs_ready_and_reports_bad_configuration() {
     let (endpoint, server) =
         remote::tests::serve(r#"[{"index":0,"score":0.7}]"#, 200, Duration::ZERO);
     let inputs = slot::BuildInputs {
+        cache_unavailable: false,
+        cache_lease: None,
+        cache_epoch: 0,
         search: SearchConfig {
             rerank: Some(RerankConfig {
                 backend: Some(RerankBackendKind::Remote),
@@ -1790,6 +1851,9 @@ fn synapse_slot_factory_installs_pinned_ready_and_reports_failed_discovery() {
         true,
     );
     let inputs = slot::BuildInputs {
+        cache_unavailable: false,
+        cache_lease: None,
+        cache_epoch: 0,
         search: SearchConfig {
             rerank: Some(RerankConfig {
                 backend: Some(RerankBackendKind::Synapse),
@@ -1886,4 +1950,106 @@ fn blocked_synapse_connect_never_delays_searches_reading_not_ready() {
     let requests = server.join().unwrap();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0]["method"], "models.list");
+}
+
+#[test]
+fn cache_root_unavailable_reranker_never_activates() {
+    let mut inputs = onnx_inputs(None);
+    inputs.cache_unavailable = true;
+    let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = Arc::clone(&builds);
+    let slot = slot::BackendSlot::with_constructor(Arc::new(move |_| {
+        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(None)
+    }));
+    assert!(matches!(slot.read(inputs.clone()), slot::Installed::Off));
+    assert_eq!(builds.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(slot::build_backend(&inputs)
+        .err()
+        .unwrap()
+        .contains("cache_dir_unavailable"));
+}
+
+#[test]
+fn cache_root_onnx_factory_passes_configured_model_cache_to_provisioner() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("volume");
+    std::fs::create_dir(&parent).unwrap();
+    // Resolve the folder the way prepare does (on Windows, the plain spelling
+    // rather than a verbatim `\\?\` path), so the simulated volume and the
+    // expected model path name the folder prepare will use.
+    let parent = crate::bash_background::persistence::canonical_root_path(&parent).unwrap();
+    let model = onnx::ALLOWED_MODELS.last().unwrap().name;
+    let mut config = crate::config::Config {
+        storage_dir: Some(temp.path().join("storage")),
+        cache_dir: Some(parent.clone()),
+        ..Default::default()
+    };
+    config.search.rerank = Some(crate::config::RerankConfig {
+        backend: Some(crate::config::RerankBackendKind::Onnx),
+        model: Some(model.to_string()),
+        ..Default::default()
+    });
+    assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+    let inputs = slot::BuildInputs::from_config(&config, false);
+    let (result, observed) = onnx::with_provision_probe(model, || slot::build_backend(&inputs));
+    assert!(result.err().unwrap().contains("provision path observed"));
+    assert_eq!(observed, vec![parent.join("aft/semantic/models")]);
+    assert!(!temp.path().join("storage/semantic").exists());
+}
+
+#[test]
+fn cache_root_onnx_backends_do_not_share_across_cache_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = temp.path().join("first-model-cache");
+    let second = temp.path().join("second-model-cache");
+    let one = onnx::shared_onnx_reranker_in(None, Some(first.clone()), None).unwrap();
+    let same = onnx::shared_onnx_reranker_in(None, Some(first.clone()), None).unwrap();
+    let other = onnx::shared_onnx_reranker_in(None, Some(second.clone()), None).unwrap();
+    assert!(Arc::ptr_eq(&one, &same));
+    assert!(!Arc::ptr_eq(&one, &other));
+    assert!(!first.exists());
+    assert!(!second.exists());
+}
+
+/// The reranker's cache lease only proves the cache context is alive. When
+/// the cache volume disappears and leaves a writable empty folder at its path,
+/// the model download must still refuse rather than let hf-hub recreate the
+/// folders and put the model on the main disk.
+#[test]
+fn cache_root_rerank_model_download_refuses_a_replaced_cache_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("storage");
+    let volume = temp.path().join("cache-volume");
+    std::fs::create_dir(&volume).unwrap();
+    let mut config = Config {
+        storage_dir: Some(storage.clone()),
+        cache_dir: Some(volume.clone()),
+        ..Default::default()
+    };
+    let warning = crate::root_cache::prepare_cache_root_for_test(&mut config);
+    assert!(warning.is_none(), "cache root not enrolled: {warning:?}");
+    let models = config.semantic.local_cache_dir.clone().unwrap();
+    // On Unix the lease stays alive, as it does for a running reranker whose
+    // context never retired. Windows cannot remove a folder the lease holds.
+    #[cfg(windows)]
+    drop(config);
+    #[cfg(not(windows))]
+    let _live_lease = config;
+    std::fs::remove_dir_all(&volume).unwrap();
+    std::fs::create_dir(&volume).unwrap();
+
+    let model = onnx::find_allowed_model(onnx::DEFAULT_MODEL).unwrap();
+    let error = onnx::provision_model_files_in(model, &models).unwrap_err();
+
+    assert!(
+        error.starts_with(crate::root_cache::CACHE_DIR_UNAVAILABLE),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&volume).unwrap().count(),
+        0,
+        "the download recreated folders on the replacement volume"
+    );
+    assert!(!storage.join("semantic").exists());
 }

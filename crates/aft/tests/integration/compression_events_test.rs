@@ -50,6 +50,7 @@ fn spawn_task(registry: &BgTaskRegistry, storage: &Path, project: &Path, command
             project.to_path_buf(),
             HashMap::new(),
             aft::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             storage.to_path_buf(),
             16,
             true,
@@ -246,8 +247,10 @@ fn compression_event_links_to_bash_task_via_task_id() {
     registry.detach();
 }
 
+/// Nothing reads a compression event's command, and a command can carry an
+/// inline credential, so the real completion path stores none.
 #[test]
-fn compression_event_records_command_for_diagnostics() {
+fn compression_event_does_not_store_the_command() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let (registry, conn) = registry_with_db(storage.path(), Harness::Opencode);
@@ -259,7 +262,7 @@ fn compression_event_records_command_for_diagnostics() {
     let event = fetch_event(&conn, &task_id);
 
     assert_eq!(event.task_id.as_deref(), Some(task_id.as_str()));
-    assert_eq!(event.command.as_deref(), Some(command));
+    assert_eq!(event.command, None);
     registry.detach();
 }
 

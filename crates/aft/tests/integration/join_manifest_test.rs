@@ -107,6 +107,8 @@ fn disk_rows(root: &Path, manifest: &Manifest, blobs: &MemoryBlobs) -> JoinResul
             let kind = match raw.kind {
                 BlobRefKind::Call => "call",
                 BlobRefKind::ValueRef => "value_ref",
+                BlobRefKind::Construction => "construction",
+                BlobRefKind::CallbackRef => "callback_ref",
                 BlobRefKind::Import => "import",
                 BlobRefKind::Module => "module",
                 BlobRefKind::Reexport => "reexport",

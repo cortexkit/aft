@@ -1,0 +1,6 @@
+[
+  {"request":{"method":"agent.where","params":{"agent_id":"agent_0000000000000105"}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"result":{"cut_id":null,"epoch":0,"holder":null,"holder_name":null,"known":false,"read_at_ms":null,"stale":true,"status":"unclaimed"}}},
+  {"request":{"method":"agent.where","params":{"agent_id":"agent_0000000000000106"}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"result":{"cut_id":null,"epoch":1,"holder":"1111111111111111","holder_name":"This machine","known":true,"read_at_ms":700,"stale":false,"status":"held_here"}}},
+  {"request":{"method":"agent.where","params":{"agent_id":"agent_0000000000000107"}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"result":{"cut_id":null,"epoch":1,"holder":"2222222222222222","holder_name":"Other machine","known":true,"read_at_ms":700,"stale":false,"status":"held_elsewhere"}}},
+  {"request":{"method":"agent.where","params":{"agent_id":"agent_ffffffffffffffff"}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"code":"unknown_agent","detail":null,"message":"unknown_agent"}}
+]

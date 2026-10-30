@@ -67,6 +67,7 @@ pub enum LexicalLaneError {
     InvalidDepth(usize),
     DepthRegression { observed: usize, requested: usize },
     NonFiniteScore { path: PathBuf },
+    PostingRead(String),
 }
 
 impl fmt::Display for LexicalLaneError {
@@ -86,6 +87,7 @@ impl fmt::Display for LexicalLaneError {
                 formatter,
                 "lexical enumeration cannot regress from {observed} observed candidates to depth {requested}"
             ),
+            Self::PostingRead(message) => formatter.write_str(message),
             Self::NonFiniteScore { path } => {
                 write!(formatter, "lexical score for {} is not finite", path.display())
             }
@@ -172,7 +174,8 @@ impl CanonicalLexicalLane {
         initial_batch_size: usize,
         mut build_candidate: impl FnMut(PathBuf, f32) -> LexicalCandidate,
     ) -> Result<Self, LexicalLaneError> {
-        let scored = score_complete_selected_pool(snapshot, query_trigrams, candidate_filter);
+        let scored = score_complete_selected_pool(snapshot, query_trigrams, candidate_filter)
+            .map_err(|error| LexicalLaneError::PostingRead(error.to_string()))?;
         let candidates = scored
             .into_iter()
             .map(|(path, score)| build_candidate(path, score))
@@ -263,7 +266,7 @@ fn score_complete_selected_pool(
     snapshot: &SearchIndexSnapshot,
     query_trigrams: &[u32],
     candidate_filter: Option<&dyn Fn(&Path) -> bool>,
-) -> Vec<(PathBuf, f32)> {
+) -> std::io::Result<Vec<(PathBuf, f32)>> {
     snapshot.lexical_selected_pool(query_trigrams, candidate_filter)
 }
 
@@ -288,6 +291,7 @@ fn reference_selected_pool(
         .filter_map(|trigram| {
             let files = snapshot
                 .lexical_rank_at_depth(&[*trigram], None, usize::MAX)
+                .unwrap()
                 .files;
             (!files.is_empty()).then_some((*trigram, files))
         })
@@ -310,6 +314,7 @@ fn reference_selected_pool(
 
     snapshot
         .lexical_rank_at_depth(&unique_trigrams, candidate_filter, usize::MAX)
+        .unwrap()
         .files
         .into_iter()
         .filter(|(path, _)| selected_paths.contains(path))
@@ -358,7 +363,7 @@ mod hot_path_tests {
             trigrams.extend(trigrams.clone());
             for filter in [None, Some(&include as &dyn Fn(&Path) -> bool)] {
                 let expected = reference_selected_pool(&snapshot, &trigrams, filter);
-                let actual = score_complete_selected_pool(&snapshot, &trigrams, filter);
+                let actual = score_complete_selected_pool(&snapshot, &trigrams, filter).unwrap();
                 assert_eq!(
                     serde_json::to_vec(&actual).unwrap(),
                     serde_json::to_vec(&expected).unwrap(),
@@ -379,7 +384,7 @@ mod hot_path_tests {
         let expected = reference_selected_pool(&snapshot, &trigrams, None);
         crate::search_hot_path_measurements::reset();
         crate::search_index::reset_postings_for_trigram_count_for_debug();
-        let actual = score_complete_selected_pool(&snapshot, &trigrams, None);
+        let actual = score_complete_selected_pool(&snapshot, &trigrams, None).unwrap();
         assert!(!actual.is_empty());
         assert_eq!(actual, expected);
         assert_eq!(

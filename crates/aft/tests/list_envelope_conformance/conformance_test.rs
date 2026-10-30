@@ -345,6 +345,42 @@ fn renderer_and_measurement_callers_are_closed() {
 }
 
 #[test]
+fn qualified_visibility_cut_fixture_attribution() {
+    let source = r#"
+fn plain() {
+    values.iter().take(1);
+}
+pub(super) fn restricted() {
+    values.iter().take(2);
+}
+pub(in crate::x) fn scoped() {
+    values.iter().take(3);
+}
+"#;
+    let lines = source.lines().collect::<Vec<_>>();
+    let cuts = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains(".take("))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let conformance = cuts
+        .iter()
+        .map(|&index| super::support::enclosing_item(&lines, index))
+        .collect::<Vec<_>>();
+    let drift_guard = cuts
+        .iter()
+        .map(|&index| crate::list_envelope_drift_guard::find_enclosing_item(&lines, index))
+        .collect::<Vec<_>>();
+    let expected = ["plain", "restricted", "scoped"].map(String::from).to_vec();
+    assert_eq!(
+        (conformance, drift_guard),
+        (expected.clone(), expected),
+        "both scanners must attribute each cut to its own function"
+    );
+}
+
+#[test]
 fn registry_free_discovery_resolves_every_cut() {
     let discovered = discover_list_cutting_sites();
     assert!(!discovered.is_empty(), "discovery must find list cuts");

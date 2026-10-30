@@ -1,0 +1,20 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/commands/semantic_search/anchored_lane.rs",
+    "crates/aft/src/commands/semantic_search/blocks.rs",
+    "crates/aft/src/commands/semantic_search/comparator.rs",
+    "crates/aft/src/commands/semantic_search/confidence.rs",
+    "crates/aft/src/commands/semantic_search/exact_lane.rs",
+    "crates/aft/src/commands/semantic_search/memo.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/commands/semantic_search/rerank/mod.rs",
+    "crates/aft/src/commands/semantic_search/rerank/tests.rs"
+  ],
+  "note": "u20 Part A: fence files changed, rows byte-identical (row sha 42af68ee); declaration-span clipping parked on keep/u20-row-moving Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}

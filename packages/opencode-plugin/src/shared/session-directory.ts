@@ -19,6 +19,8 @@
  * `packages/opencode/src/session/registry.ts`. Until then this
  * workaround makes AFT robust against the wrong cwd.
  */
+
+import type { AftTransportPool } from "@cortexkit/aft-bridge";
 import { Effect } from "effect";
 
 import { sessionWarn } from "../logger.js";
@@ -97,6 +99,7 @@ interface CacheEntry {
 const CACHE_MAX_ENTRIES = 200;
 const cache = new Map<string, CacheEntry>();
 const inflight = new Map<string, Promise<string | null>>();
+const lookupGenerations = new Map<string, object>();
 
 /**
  * Resolve the project directory the session was created with from the SDK's
@@ -136,12 +139,18 @@ export async function getSessionDirectory(
   return lookup;
 }
 
-/** Ignore late answers: a timed-out lookup must not overwrite a later retry. */
+/** A late success may repair its provisional answer, but never overwrite a newer lookup. */
 async function boundedLookup(
   client: unknown,
   sessionId: string,
   fallbackDirectory: string,
 ): Promise<string | null> {
+  const generation = {};
+  lookupGenerations.set(sessionId, generation);
+  if (lookupGenerations.size > CACHE_MAX_ENTRIES) {
+    const oldest = lookupGenerations.keys().next().value;
+    if (oldest !== undefined) lookupGenerations.delete(oldest);
+  }
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const timeout = new Promise<null>((resolve) => {
@@ -154,7 +163,16 @@ async function boundedLookup(
       }, LOOKUP_TIMEOUT_MS);
     });
     const directory = await Promise.race([
-      lookupSessionDirectory(client, sessionId, fallbackDirectory),
+      lookupSessionDirectory(client, sessionId, fallbackDirectory)
+        .then((directory) => {
+          if (lookupGenerations.get(sessionId) === generation && directory !== null) {
+            setCache(sessionId, directory);
+          }
+          return directory;
+        })
+        .finally(() => {
+          if (lookupGenerations.get(sessionId) === generation) lookupGenerations.delete(sessionId);
+        }),
       timeout,
     ]);
     setCache(sessionId, directory);
@@ -308,6 +326,7 @@ export function warmSessionDirectory(
  */
 const VERIFY_TTL_MS = 15_000;
 const verifyCache = new Map<string, { directory: string | null; verifiedAt: number }>();
+const verifyInflight = new Map<string, Promise<string | null>>();
 
 export async function verifySessionDirectory(
   client: unknown,
@@ -316,14 +335,32 @@ export async function verifySessionDirectory(
   if (!sessionId) return null;
   const hit = verifyCache.get(sessionId);
   if (hit && Date.now() - hit.verifiedAt < VERIFY_TTL_MS) return hit.directory;
+  const pending = verifyInflight.get(sessionId);
+  if (pending) return pending;
+  const lookup = boundedVerification(client, sessionId).finally(() => {
+    verifyInflight.delete(sessionId);
+  });
+  verifyInflight.set(sessionId, lookup);
+  return lookup;
+}
 
+async function boundedVerification(client: unknown, sessionId: string): Promise<string | null> {
   const c = client as OpenCodeClientShape;
   const sessionApi = c?.session;
   if (!sessionApi || typeof sessionApi.get !== "function") return null;
 
   let dir: string | null = null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const result = await sessionApi.get({ path: { id: sessionId } });
+    const result = await Promise.race([
+      sessionApi.get({ path: { id: sessionId } }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("Session verification timed out")),
+          LOOKUP_TIMEOUT_MS,
+        );
+      }),
+    ]);
     const session: SessionInfo | undefined =
       (result as { data?: SessionInfo } | undefined)?.data ?? (result as SessionInfo | undefined);
     if (session && typeof session.directory === "string" && session.directory.length > 0) {
@@ -334,6 +371,8 @@ export async function verifySessionDirectory(
     // failures: the next poll should retry (transient SDK errors must not
     // stick the sidebar on placeholder for the TTL window).
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 
   verifyCache.set(sessionId, { directory: dir, verifiedAt: Date.now() });
@@ -346,9 +385,26 @@ export async function verifySessionDirectory(
   return dir;
 }
 
+/** Release transport routes on deletion without querying a session the host has already removed. */
+export async function closeDeletedSessionRoutes(
+  pool: AftTransportPool,
+  sessionId: string,
+  fallbackDirectory: string,
+): Promise<void> {
+  // A timeout may have bound a fallback before the stored root was known. Close both routes.
+  const roots = new Set(pool.activeBridges().map((bridge) => bridge.getCwd()));
+  roots.add(getSessionDirectoryCached(sessionId) ?? fallbackDirectory);
+  await Promise.allSettled([...roots].map((root) => pool.closeSession(root, sessionId)));
+  cache.delete(sessionId);
+  lookupGenerations.delete(sessionId);
+  verifyCache.delete(sessionId);
+}
+
 /** Test-only: clear the cache between unit tests. */
 export function _resetSessionDirectoryCacheForTest(): void {
   cache.clear();
   inflight.clear();
+  lookupGenerations.clear();
   verifyCache.clear();
+  verifyInflight.clear();
 }

@@ -116,6 +116,7 @@ fn pty_spawn_echo_exit() {
             project.path().to_path_buf(),
             Default::default(),
             aft::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             storage.path().to_path_buf(),
             10,
             true,
@@ -286,6 +287,7 @@ fn pipes_unaffected_by_pty_changes() {
             project.path().to_path_buf(),
             Default::default(),
             aft::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             storage.path().to_path_buf(),
             10,
             true,
@@ -314,6 +316,7 @@ fn pty_waiter_writes_code_marker_on_natural_exit() {
             project.path().to_path_buf(),
             Default::default(),
             aft::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             storage.path().to_path_buf(),
             10,
             true,
@@ -347,6 +350,7 @@ fn pty_reader_drains_before_completion_fires() {
             project.path().to_path_buf(),
             Default::default(),
             aft::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             storage.path().to_path_buf(),
             10,
             true,
@@ -385,22 +389,7 @@ fn pty_watchdog_wake_channel_triggers_immediate_completion() {
     // so this guard writes the sentinel before either TempDir removes its directory.
     let _release_guard = ReleaseOnDrop::new(wake_ready.clone());
     let registry = registry();
-    let task_id = registry
-        .spawn_pty(
-            aft::sandbox_spawn::SpawnPlan::Unsandboxed,
-            "/bin/sh -c 'polls=0; while [ ! -f wake-ready ] && [ \"$polls\" -lt 6000 ]; do sleep 0.01; polls=$((polls + 1)); done; if [ -f wake-ready ]; then printf wake; else printf gate-timeout; fi'",
-            SESSION.to_string(),
-            project.path().to_path_buf(),
-            Default::default(),
-            aft::bash_background::HardKill::After(Duration::from_secs(30)),
-            storage.path().to_path_buf(),
-            10,
-            true,
-            false,
-            Some(project.path().to_path_buf()),
-            24,
-            80,
-        )
+    let task_id = registry.spawn_pty(aft::sandbox_spawn::SpawnPlan::Unsandboxed, "/bin/sh -c 'polls=0; while [ ! -f wake-ready ] && [ \"$polls\" -lt 6000 ]; do sleep 0.01; polls=$((polls + 1)); done; if [ -f wake-ready ]; then printf wake; else printf gate-timeout; fi'", SESSION.to_string(), project.path().to_path_buf(), Default::default(), aft::bash_background::HardKill::After(Duration::from_secs(30)), None, storage.path().to_path_buf(), 10, true, false, Some(project.path().to_path_buf()), 24, 80)
         .unwrap();
     // Start the budget AFTER spawn returns, not before. The watchdog's 500ms
     // periodic-poll clock starts at task registration (during spawn_pty), so the
@@ -501,6 +490,7 @@ fn spawn_pty_task(
             project.to_path_buf(),
             Default::default(),
             aft::bash_background::HardKill::After(timeout),
+            None,
             storage.to_path_buf(),
             32,
             true,
@@ -611,10 +601,7 @@ fn windows_piped_stdin_remains_eof_without_bootstrap_gate() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let registry = registry();
-    let task_id = registry.spawn(aft::sandbox_spawn::SpawnPlan::Unsandboxed,
-        "if ([Console]::OpenStandardInput().ReadByte() -ne -1) { exit 42 }; [Console]::Write('stdin-eof')",
-        SESSION.into(), project.path().to_path_buf(), Default::default(),
-        aft::bash_background::HardKill::After(Duration::from_secs(30)), storage.path().to_path_buf(), 10, true, false, Some(project.path().to_path_buf())).unwrap();
+    let task_id = registry.spawn(aft::sandbox_spawn::SpawnPlan::Unsandboxed, "if ([Console]::OpenStandardInput().ReadByte() -ne -1) { exit 42 }; [Console]::Write('stdin-eof')", SESSION.into(), project.path().to_path_buf(), Default::default(), aft::bash_background::HardKill::After(Duration::from_secs(30)), None, storage.path().to_path_buf(), 10, true, false, Some(project.path().to_path_buf())).unwrap();
     let snapshot = wait_for_status(&registry, &task_id, BgTaskStatus::Completed);
     assert!(
         snapshot.output_preview.contains("stdin-eof"),
@@ -704,6 +691,7 @@ fn pty_write_non_pty_task() {
             project.path().to_path_buf(),
             Default::default(),
             aft::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             storage.path().to_path_buf(),
             32,
             true,

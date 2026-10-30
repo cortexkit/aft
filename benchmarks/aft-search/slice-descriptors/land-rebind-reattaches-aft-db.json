@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "rebind-reattaches-aft-db"
+  ],
+  "note": "A rebound root re-attaches the shared aft.db to its bash registry and backup store. No changed path matches RANKING_FENCE_PREFIXES."
+}

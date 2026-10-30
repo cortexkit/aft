@@ -38,6 +38,22 @@ def paths(base: str, head: str) -> list[str]:
     return git("diff", "--name-only", "--no-renames", f"{base}...{head}").splitlines()
 
 
+def first_parent_between(base: str, head: str) -> list[str]:
+    """Commits on head's first-parent chain after base, oldest first.
+
+    Walks the chain from head until it reaches base instead of asking
+    `git rev-list base..head`. Merge-queue commits carry committer dates out of
+    order (a group commit can be dated before the commits under it), and git's
+    date-based range walk then returns commits that base already contains.
+    """
+    chain = []
+    for sha in git("rev-list", "--first-parent", head).splitlines():
+        if sha == base:
+            return list(reversed(chain))
+        chain.append(sha)
+    raise InputFault("queue_base_not_on_first_parent_chain")
+
+
 def resolve_git_descriptor(descriptor: dict, changed: list[str], base: str, head: str) -> tuple[dict, bool]:
     notes: list[str] = []
     try:
@@ -244,7 +260,7 @@ def queue_members(base: str, head: str, head_ref: str | None, repository: str) -
             raise InputFault(f"unknown_queue_ref:{head_ref}")
     members = []
     previous = base
-    commits = git("rev-list", "--first-parent", "--reverse", f"{base}..{head}").splitlines()
+    commits = first_parent_between(base, head)
     for index, commit in enumerate(commits):
         parents = git("show", "-s", "--format=%P", commit).split()
         # Only two-parent merges bind the synthetic commit to an exact PR head.

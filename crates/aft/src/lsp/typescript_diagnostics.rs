@@ -313,7 +313,10 @@ mod tests {
             ServerKind::TypeScript,
             modules.join(".bin/typescript-language-server"),
         );
-        let opened = manager.ensure_file_open_default(&file).unwrap();
+        let opened = crate::lsp::manager::settled_lsp(&mut manager, |startup_manager| {
+            startup_manager.ensure_file_open_default(&file)
+        })
+        .unwrap();
         let key = opened
             .server_keys
             .iter()

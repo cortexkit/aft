@@ -1,11 +1,38 @@
-//! Opt-in work counts for search operations, independent of compiler optimization.
-use std::cell::Cell;
+//! Opt-in search work counts and per-pass timings.
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static FILE_READS: AtomicUsize = AtomicUsize::new(0);
 pub(crate) fn record_file_read() {
     FILE_READS.fetch_add(1, Ordering::Relaxed);
     record(|counts| counts.file_reads += 1);
+}
+
+pub(crate) fn record_file_read_path(path: &Path) {
+    record_file_read();
+    let first = READ_PATHS.with(|paths| paths.borrow_mut().insert(path.to_path_buf()));
+    record(|counts| {
+        if first {
+            counts.unique_read_paths += 1;
+        } else {
+            counts.repeated_path_reads += 1;
+        }
+    });
+}
+
+pub(crate) fn record_memo_file_read(path: &Path) {
+    record_file_read_path(path);
+    let first = MEMO_PATHS.with(|paths| paths.borrow_mut().insert(path.to_path_buf()));
+    record(|counts| {
+        counts.memo_digest_reads += 1;
+        if first {
+            counts.memo_unique_paths += 1;
+        } else {
+            counts.memo_repeated_path_reads += 1;
+        }
+    });
 }
 
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
@@ -19,14 +46,32 @@ pub(crate) struct Counts {
     pub anchor_windows_evaluated: usize,
     pub reused_payload_clones: usize,
     pub refresh_entry_visits: usize,
+    pub project_walks: usize,
+    pub project_walk_entries: usize,
+    pub project_walk_files: usize,
+    pub exact_passes: usize,
+    pub exact_preparations: usize,
+    pub exact_pass_candidates: usize,
+    pub exact_pass_reads: usize,
+    pub exact_pass_micros: usize,
+    pub unique_read_paths: usize,
+    pub repeated_path_reads: usize,
+    pub memo_digest_reads: usize,
+    pub memo_unique_paths: usize,
+    pub memo_repeated_path_reads: usize,
 }
 
 thread_local! {
     static COUNTS: Cell<Counts> = Cell::new(Counts::default());
+    static READ_PATHS: RefCell<HashSet<PathBuf>> = RefCell::new(HashSet::new());
+    static MEMO_PATHS: RefCell<HashSet<PathBuf>> = RefCell::new(HashSet::new());
 }
 
+/// Start a thread-local measurement window, including repeated-path counts.
 pub(crate) fn reset() {
     COUNTS.with(|cell| cell.set(Counts::default()));
+    READ_PATHS.with(|paths| paths.borrow_mut().clear());
+    MEMO_PATHS.with(|paths| paths.borrow_mut().clear());
 }
 
 pub(crate) fn counts() -> Counts {
@@ -139,11 +184,13 @@ fn real_corpus_lane_work_counts() {
         let trigrams = extract_trigrams(query.as_bytes()).into_iter().map(|(trigram, _, _)| trigram).collect::<Vec<_>>();
         let lane = measure(&format!("lexical/{label}"), || CanonicalLexicalLane::from_snapshot(&snapshot, &trigrams, None, 50).unwrap());
         result_digest(&format!("lexical/{label}"), &lane.canonical_order());
-        let exact = measure(&format!("exact/{label}"), || snapshot.whole_corpus_exact_pass(query, &root, None));
+        let exact = measure(&format!("exact/{label}"), || snapshot.whole_corpus_exact_pass(query, &root, None).unwrap());
         result_digest(&format!("exact/{label}"), &exact.iter().map(|hit| (&hit.path, hit.symbol_range, &hit.evidence, &hit.content_digest)).collect::<Vec<_>>());
     }
     let anchored = measure("anchored/search.*index", || {
-        AnchoredLane::new().execute_ready_mode(&index, &root, "search.*index", true)
+        AnchoredLane::new()
+            .execute_ready_mode(&index, &root, "search.*index", true)
+            .unwrap()
     });
     result_digest("anchored/search.*index", &anchored);
 }

@@ -801,6 +801,25 @@ impl DiagnosticsStore {
         (had_entries, changed)
     }
 
+    /// Mark one server's cached report for a file stale without evicting it,
+    /// for when that server has been sent text its report does not describe
+    /// (an AFT edit, or a re-sync after the file changed on disk). Other
+    /// servers' reports for the file are left alone. Returns true if the
+    /// report was fresh before.
+    pub fn mark_stale_for_server_file(&mut self, key: &ServerKey, file: &Path) -> bool {
+        let cache_key = (key.clone(), file.to_path_buf());
+        let Some(entry) = self
+            .entries
+            .get_mut(&cache_key)
+            .filter(|entry| !entry.stale)
+        else {
+            return false;
+        };
+        entry.stale = true;
+        self.generation = self.generation.wrapping_add(1);
+        true
+    }
+
     /// Mark one cached report fresh after a server response proves it still
     /// describes the current document (for example a pull `kind: unchanged`).
     pub fn mark_fresh_for_server_file(&mut self, key: &ServerKey, file: &Path) -> bool {

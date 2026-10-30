@@ -29,6 +29,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { getAftCacheRoot, getAftLspPackagesDir } from "@cortexkit/aft-bridge";
+import { writeAtomicFile } from "./atomic-file.js";
 import { log, warn } from "./logger.js";
 
 /** Keep aftCacheBase as an alias for getAftCacheRoot so existing callers using the older name continue to work. */
@@ -96,7 +97,7 @@ export function writeInstalledMetaIn(installDir: string, version: string, sha256
       installedAt: new Date().toISOString(),
       ...(sha256 ? { sha256 } : {}),
     };
-    writeFileSync(join(installDir, INSTALLED_META_FILE), JSON.stringify(meta), "utf8");
+    writeAtomicFile(join(installDir, INSTALLED_META_FILE), JSON.stringify(meta));
   } catch (err) {
     log(`[lsp-cache] failed to write installed-meta in ${installDir}: ${err}`);
   }
@@ -493,7 +494,7 @@ export function writeVersionCheck(npmPackage: string, latest: string | null): vo
     last_checked: new Date().toISOString(),
     latest_eligible: latest,
   };
-  writeFileSync(file, JSON.stringify(record, null, 2));
+  writeAtomicFile(file, JSON.stringify(record, null, 2));
 }
 
 /** True if more than `graceDays` × 24h have elapsed since `last_checked`. */

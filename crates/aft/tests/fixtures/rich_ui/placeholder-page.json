@@ -1,0 +1,1 @@
+{"catalog":{"digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","version":"1.0"},"executionDialect":"1.0","profile":"tool_page","reads":[{"id":"bash_output","version":1},{"id":"bash_status","version":1},{"id":"bash_watch","version":1}],"schema":"ckios.richui.template/1","source":"test-only page placeholder"}

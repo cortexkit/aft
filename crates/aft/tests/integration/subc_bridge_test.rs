@@ -303,9 +303,44 @@ fn bridge_test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+// In-process configure fixtures also resolve storage from the environment,
+// so every environment change here must happen while the shared
+// process-settings lock is held, until the previous value is restored.
+//
+// That lock is reentrant per thread only. A bridge runner takes it on its own
+// thread for the whole test and then runs the dispatch closure on another
+// thread; taking it again there would wait on the runner forever. While a
+// runner owns the lock, changes made under it are already excluded from the
+// configure fixtures, so the setters below skip their own acquisition.
+static BRIDGE_RUNNER_OWNS_ENV_LOCK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Marks the current bridge runner as owner of the process-settings lock.
+/// Declare it after the guard that took the lock so it is released first.
+struct BridgeRunnerEnvLockOwner;
+
+impl BridgeRunnerEnvLockOwner {
+    fn claim() -> Self {
+        BRIDGE_RUNNER_OWNS_ENV_LOCK.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for BridgeRunnerEnvLockOwner {
+    fn drop(&mut self) {
+        BRIDGE_RUNNER_OWNS_ENV_LOCK.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn process_settings_unless_runner_owns() -> Option<crate::test_helpers::ProcessEnvLockGuard> {
+    (!BRIDGE_RUNNER_OWNS_ENV_LOCK.load(std::sync::atomic::Ordering::SeqCst))
+        .then(crate::test_helpers::process_env_lock)
+}
+
 struct EnvVarGuard {
     key: &'static str,
     previous: Option<std::ffi::OsString>,
+    _process_settings: Option<crate::test_helpers::ProcessEnvLockGuard>,
 }
 
 impl Drop for EnvVarGuard {
@@ -319,15 +354,48 @@ impl Drop for EnvVarGuard {
 }
 
 fn set_test_env(key: &'static str, value: &str) -> EnvVarGuard {
+    let process_settings = process_settings_unless_runner_owns();
     let previous = std::env::var_os(key);
     std::env::set_var(key, value);
-    EnvVarGuard { key, previous }
+    EnvVarGuard {
+        key,
+        previous,
+        _process_settings: process_settings,
+    }
 }
 
 fn remove_test_env(key: &'static str) -> EnvVarGuard {
+    let process_settings = process_settings_unless_runner_owns();
     let previous = std::env::var_os(key);
     std::env::remove_var(key);
-    EnvVarGuard { key, previous }
+    EnvVarGuard {
+        key,
+        previous,
+        _process_settings: process_settings,
+    }
+}
+
+#[test]
+fn storage_override_holds_shared_process_settings_guard() {
+    let storage = tempfile::tempdir().unwrap();
+    {
+        let _setting = set_test_env("AFT_STORAGE_DIR", storage.path().to_str().unwrap());
+        assert!(
+            !std::thread::spawn(crate::test_helpers::process_env_lock_is_available)
+                .join()
+                .unwrap(),
+            "a bridge storage override must exclude in-process configure fixtures"
+        );
+    }
+    {
+        let _setting = remove_test_env("AFT_STORAGE_DIR");
+        assert!(
+            !std::thread::spawn(crate::test_helpers::process_env_lock_is_available)
+                .join()
+                .unwrap(),
+            "removing a bridge storage override must also hold the shared guard"
+        );
+    }
 }
 
 fn set_test_foreground_wait_ms(ms: u64) -> EnvVarGuard {
@@ -336,26 +404,17 @@ fn set_test_foreground_wait_ms(ms: u64) -> EnvVarGuard {
 
 #[cfg(feature = "test-timing-hooks")]
 fn set_test_force_bash_promote_error() -> EnvVarGuard {
-    let key = "AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR";
-    let previous = std::env::var_os(key);
-    std::env::set_var(key, "1");
-    EnvVarGuard { key, previous }
+    set_test_env("AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR", "1")
 }
 
 #[cfg(feature = "test-timing-hooks")]
 fn set_test_force_bash_promote_panic() -> EnvVarGuard {
-    let key = "AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR";
-    let previous = std::env::var_os(key);
-    std::env::set_var(key, "panic");
-    EnvVarGuard { key, previous }
+    set_test_env("AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR", "panic")
 }
 
 #[cfg(feature = "test-timing-hooks")]
 fn set_test_bash_elicitation_ttl_ms(ms: u64) -> EnvVarGuard {
-    let key = "AFT_TEST_SUBC_BASH_ELICITATION_TTL_MS";
-    let previous = std::env::var_os(key);
-    std::env::set_var(key, ms.to_string());
-    EnvVarGuard { key, previous }
+    set_test_env("AFT_TEST_SUBC_BASH_ELICITATION_TTL_MS", &ms.to_string())
 }
 
 fn install_bridge_state(state: Arc<BridgeState>) {
@@ -706,6 +765,10 @@ impl BridgeState {
 }
 
 fn configure_bridge_context(req: &RawRequest, ctx: &AppContext) -> Response {
+    let configured = aft::commands::configure::handle_configure(req, ctx);
+    if !configured.success {
+        return configured;
+    }
     let root = match req.params.get("project_root").and_then(Value::as_str) {
         Some(root) => std::path::PathBuf::from(root),
         None => {
@@ -773,6 +836,7 @@ fn emit_test_status_burst(ctx: &AppContext, marker: &str, count: u64) {
 
 fn bash_completed_push(task_id: &str, session_id: &str) -> PushFrame {
     PushFrame::BashCompleted(BashCompletedFrame {
+        changed_files: None,
         frame_type: "bash_completed",
         task_id: task_id.to_string(),
         session_id: session_id.to_string(),
@@ -789,6 +853,7 @@ fn bash_completed_push(task_id: &str, session_id: &str) -> PushFrame {
         output_incomplete: false,
         live_descendants: Some(Vec::new()),
         live_descendants_omitted: 0,
+        live_descendants_unavailable: None,
         live_descendants_summary: None,
     })
 }
@@ -1628,6 +1693,37 @@ pub(super) fn run_subc_bridge_test_with_dispatch_and_executor_config<F, Fut, A>(
     );
 }
 
+/// Like the executor-config variant, but also installs the lifecycle probe so
+/// the driver can wait on `BashForegroundWait` instead of sleeping past the
+/// bash spawn job.
+fn run_subc_bridge_test_with_dispatch_lifecycle_and_executor_config<F, Fut, A>(
+    name: &'static str,
+    watchdog: Duration,
+    driver: F,
+    after: A,
+    dispatch: aft::subc::DispatchFn,
+    executor_config: ExecutorConfig,
+) where
+    F: FnOnce(FakeDaemonInput) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+    A: FnOnce(&Arc<BridgeState>, &Arc<Executor>, &SubcBridgeTestRoots),
+{
+    run_subc_bridge_test_inner(
+        name,
+        watchdog,
+        Vec::new,
+        driver,
+        after,
+        true,
+        None,
+        dispatch,
+        executor_config,
+        true,
+        None,
+        None,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_subc_bridge_test_inner<E, F, Fut, A>(
     name: &'static str,
@@ -1652,6 +1748,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     let _serial = bridge_test_serial_guard();
     crate::test_helpers::disable_in_process_file_watcher();
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    let _env_lock_owner = BridgeRunnerEnvLockOwner::claim();
     let _subc_module_id = remove_test_env("SUBC_MODULE_ID");
     let _subc_launch_nonce = remove_test_env("SUBC_LAUNCH_NONCE");
     let _env_guards = env_setup();
@@ -1664,6 +1761,20 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     install_bridge_state(Arc::clone(&state));
 
     let roots = SubcBridgeTestRoots::new();
+    // Bind actors start with default configuration, so the entry context's
+    // explicit storage path alone does not isolate their database or recovery.
+    // Give this serialized fixture a private process-wide storage selection.
+    let _fixture_storage = if _env_guards
+        .iter()
+        .any(|guard| guard.key == "AFT_STORAGE_DIR")
+    {
+        None
+    } else {
+        Some(set_test_env(
+            "AFT_STORAGE_DIR",
+            &roots.storage.path().to_string_lossy(),
+        ))
+    };
     // Strict untrusted routes re-exec the native launcher. This fixture runs the
     // bridge in libtest, so use the real binary without bypassing confinement.
     #[cfg(unix)]
@@ -1865,6 +1976,7 @@ where
 {
     let _serial = bridge_test_serial_guard();
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    let _env_lock_owner = BridgeRunnerEnvLockOwner::claim();
     let conn_dir = tempfile::tempdir().expect("connection tempdir");
     let storage = tempfile::tempdir().expect("storage tempdir");
     let conn_path = conn_dir.path().join("subc-connection.json");
@@ -2334,6 +2446,85 @@ fn subc_bridge_same_root_rebind_is_acked_while_a_read_is_held() {
     );
 }
 
+/// The SQLite main file the first bind's actor opened, recorded by the driver
+/// and checked once the run has finished.
+static FRESH_ACTOR_DB_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// The fixture starts the module with an explicit storage path. The actor a
+/// first bind creates must open its aft.db there, not in the default data
+/// home, so the module and every actor keep one storage root.
+#[test]
+fn subc_bridge_fresh_bind_actor_opens_aft_db_in_the_module_storage_root() {
+    *FRESH_ACTOR_DB_PATH.lock().unwrap() = None;
+    run_subc_bridge_test_inner(
+        "subc_bridge_fresh_bind_actor_opens_aft_db_in_the_module_storage_root",
+        Duration::from_secs(45),
+        // AFT_STORAGE_DIR outranks an explicit path for the module and its
+        // actors alike, which would hide where the actor's own choice lands.
+        || vec![remove_test_env("AFT_STORAGE_DIR")],
+        drive_fresh_actor_database_daemon,
+        |_, _, roots| {
+            let opened = FRESH_ACTOR_DB_PATH
+                .lock()
+                .unwrap()
+                .take()
+                .expect("driver recorded the actor's database");
+            let expected = roots.storage.path().join("aft.db");
+            assert_eq!(
+                std::fs::canonicalize(&opened).expect("opened database exists"),
+                std::fs::canonicalize(&expected).expect("module storage database exists"),
+                "actor opened {} instead of the module's {}",
+                opened.display(),
+                expected.display()
+            );
+        },
+        true,
+        None,
+        real_configure_bridge_dispatch,
+        bridge_executor_config(),
+        false,
+        None,
+        None,
+    );
+}
+
+async fn drive_fresh_actor_database_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        executor,
+        ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    let root_id = ProjectRootId::from_path(&root1).expect("root1 id");
+    let actor = executor.actor_context(&root_id).expect("bound actor");
+    // The database opens after the bind is acknowledged; wait until the actor
+    // would admit a persistence-requiring tool.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let db = loop {
+        if actor.database_runtime_refusal("probe", "bash").is_none() {
+            if let Some(db) = actor.db() {
+                break db;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the bound actor never opened its database"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let opened = db
+        .lock()
+        .unwrap()
+        .path()
+        .map(std::path::PathBuf::from)
+        .expect("aft.db is a file-backed database");
+    *FRESH_ACTOR_DB_PATH.lock().unwrap() = Some(opened);
+    drop(db);
+    drop(actor);
+    send_connection_goodbye(&mut stream).await;
+}
+
 #[test]
 fn subc_bridge_configure_warning_pushes_are_session_scoped() {
     run_subc_bridge_test(
@@ -2467,9 +2658,9 @@ fn subc_bridge_duplicate_routebind_rejects_in_flight_bind() {
 }
 
 #[test]
-fn subc_bridge_tool_call_before_bind_ack_is_route_not_bound() {
+fn subc_bridge_tool_call_before_bind_ack_is_held_until_written() {
     run_subc_bridge_test(
-        "subc_bridge_tool_call_before_bind_ack_is_route_not_bound",
+        "subc_bridge_tool_call_before_bind_ack_is_held_until_written",
         Duration::from_secs(30),
         drive_pending_bind_tool_call_daemon,
         |_, _, _| {},
@@ -2483,6 +2674,24 @@ fn subc_bridge_goodbye_cancels_pending_bind() {
         Duration::from_secs(30),
         drive_goodbye_cancels_pending_bind_daemon,
         |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_higher_epoch_rebind_preserves_queued_read() {
+    run_subc_bridge_test_with_dispatch_and_executor_config(
+        "higher-epoch-rebind-preserves-queued-read",
+        Duration::from_secs(60),
+        drive_higher_epoch_rebind_preserves_queued_read_daemon,
+        |_, _, _| {},
+        bridge_dispatch,
+        ExecutorConfig {
+            pool_size: 2,
+            read_cap: 1,
+            actor_cap: 1,
+            heavy_permits: 1,
+            drr_quantum: 1,
+        },
     );
 }
 
@@ -2772,6 +2981,62 @@ fn subc_bridge_deleted_root_reclaim_late_call_is_route_reclaimed() {
     );
 }
 
+#[cfg(all(feature = "test-timing-hooks", debug_assertions))]
+#[test]
+fn subc_bridge_deleted_root_reclaim_ends_streams_while_database_initializes() {
+    struct DatabaseGates {
+        open: std::path::PathBuf,
+        resume: std::path::PathBuf,
+    }
+    impl Drop for DatabaseGates {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.open);
+            let _ = std::fs::remove_file(&self.resume);
+        }
+    }
+    let gate_dir = tempfile::tempdir().unwrap();
+    let gates = DatabaseGates {
+        open: gate_dir.path().join("database-open"),
+        resume: gate_dir.path().join("database-resume"),
+    };
+    std::fs::write(&gates.open, b"hold").unwrap();
+    std::fs::write(&gates.resume, b"hold").unwrap();
+    let open_env = gates.open.clone();
+    let resume_env = gates.resume.clone();
+    run_subc_bridge_test_with_env(
+        "subc_bridge_deleted_root_reclaim_ends_streams_while_database_initializes",
+        Duration::from_secs(120),
+        || {
+            vec![
+                set_test_env("AFT_TEST_DATABASE_OPEN_GATE", open_env.to_str().unwrap()),
+                set_test_env(
+                    "AFT_TEST_BG_EVENTS_DATABASE_RESUME_GATE",
+                    resume_env.to_str().unwrap(),
+                ),
+            ]
+        },
+        move |input| async move {
+            let (mut session, _root, frames, late_error) =
+                reclaim_bound_test_root_with_database_gates(
+                    input,
+                    Some((&gates.open, &gates.resume)),
+                )
+                .await;
+            assert_error_frame(&late_error, 121, 999, "route_reclaimed");
+            assert_eq!(
+                frames
+                    .iter()
+                    .filter(|frame| frame.header.ty == FrameType::StreamEnd)
+                    .count(),
+                2,
+                "both installed subscriptions must end on reclamation"
+            );
+            send_connection_goodbye(&mut session.stream).await;
+        },
+        |_, _, _| {},
+    );
+}
+
 /// The root's executor gets a single reader slot, so one long read occupies it
 /// and every bash wait poll on that root queues behind the read.
 fn single_reader_executor_config() -> ExecutorConfig {
@@ -2786,7 +3051,7 @@ fn single_reader_executor_config() -> ExecutorConfig {
 
 #[test]
 fn subc_bridge_module_draining_answers_bash_wait_whose_poll_is_stuck() {
-    run_subc_bridge_test_with_dispatch_and_executor_config(
+    run_subc_bridge_test_with_dispatch_lifecycle_and_executor_config(
         "subc_bridge_module_draining_answers_bash_wait_whose_poll_is_stuck",
         Duration::from_secs(90),
         drive_module_draining_answers_stuck_bash_wait_daemon,
@@ -2798,13 +3063,12 @@ fn subc_bridge_module_draining_answers_bash_wait_whose_poll_is_stuck() {
 
 #[test]
 fn subc_bridge_client_cancel_answers_held_bash_wait_and_keeps_command_running() {
-    run_subc_bridge_test_with_dispatch_and_executor_config(
+    run_subc_bridge_test_with_dispatch_and_lifecycle_probe(
         "subc_bridge_client_cancel_answers_held_bash_wait_and_keeps_command_running",
         Duration::from_secs(90),
         drive_client_cancel_answers_held_bash_wait_daemon,
         |_, _, _| {},
         bridge_dispatch,
-        bridge_executor_config(),
     );
 }
 
@@ -3203,7 +3467,9 @@ fn subc_bridge_management_surface_is_passive_closed_and_first_party() {
 fn subc_bridge_health_check_returns_root_status_report() {
     run_subc_bridge_test_inner(
         "subc_bridge_health_check_returns_root_status_report",
-        Duration::from_secs(30),
+        // Exceeds the driver's 30 s wait for an Ok health report, so a report
+        // that never turns Ok fails with its detail instead of the watchdog.
+        Duration::from_secs(60),
         Vec::new,
         drive_health_check_daemon,
         |_, executor, roots| {
@@ -3527,6 +3793,10 @@ fn subc_bridge_bash_hand_off_text_follows_the_worker_role() {
     );
 }
 
+// Startup admission ends at the earlier of 15 seconds and the worker wait
+// limit. Do not shrink that startup budget on loaded Windows CI runners.
+const WORKER_BASH_WAIT_LIMIT_MS: u64 = if cfg!(windows) { 30_000 } else { 1_500 };
+
 /// A delegated worker's blocking bash call over subc (`wait: true`, and a
 /// `block_to_completion` call) returns at the worker wait limit with the
 /// command still running in the background, as on the standalone path.
@@ -3534,8 +3804,13 @@ fn subc_bridge_bash_hand_off_text_follows_the_worker_role() {
 fn subc_bridge_worker_blocking_bash_detaches_at_the_worker_wait_limit() {
     run_subc_bridge_test_with_env(
         "subc_bridge_worker_blocking_bash_detaches_at_the_worker_wait_limit",
-        Duration::from_secs(60),
-        || vec![set_test_env("AFT_TEST_WORKER_WAIT_MAX_MS", "1500")],
+        Duration::from_millis(2 * WORKER_BASH_WAIT_LIMIT_MS) + Duration::from_secs(60),
+        || {
+            vec![set_test_env(
+                "AFT_TEST_WORKER_WAIT_MAX_MS",
+                &WORKER_BASH_WAIT_LIMIT_MS.to_string(),
+            )]
+        },
         drive_bash_worker_wait_limit_daemon,
         |_, _, _| {},
     );
@@ -3854,7 +4129,7 @@ static S1_ATTACKER_CONFIG_REACHED_DISPATCH: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 const S1_ATTACKER_MARKER: &str = "S1_ATTACKER_SECRET_ENV";
 
-fn s1_guard_dispatch(req: RawRequest, _ctx: &AppContext) -> Response {
+fn s1_guard_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     // The RouteBind reconcile dispatches a clean `configure` (no marker); only a
     // forwarded tool-call `configure` would carry the marker. If the marker ever
     // arrives here, the fail-closed gate failed and the cap was bypassed.
@@ -3863,6 +4138,7 @@ fn s1_guard_dispatch(req: RawRequest, _ctx: &AppContext) -> Response {
         if raw.contains(S1_ATTACKER_MARKER) {
             S1_ATTACKER_CONFIG_REACHED_DISPATCH.store(true, std::sync::atomic::Ordering::SeqCst);
         }
+        return aft::commands::configure::handle_configure(&req, ctx);
     }
     Response::success(req.id, json!({}))
 }
@@ -3947,7 +4223,8 @@ fn subc_rejects_forwarded_configure_tool_call_in_production() {
         heavy_permits: 1,
         drr_quantum: 1,
     }));
-    let user_config_path = storage.path().join("nonexistent-user-aft.jsonc");
+    let user_config_path = storage.path().join("user-aft.jsonc");
+    std::fs::write(&user_config_path, r#"{"indexes":{"trigram":false,"semantic":false,"callgraph":false},"views":{"enabled":false}}"#).unwrap();
 
     // PRODUCTION entry — passthrough is OFF.
     run_subc_mode(
@@ -5017,7 +5294,11 @@ async fn drive_bash_wait_true_daemon(input: FakeDaemonInput) {
             "command": "printf 'wait-early\\n'; sleep 1; printf 'wait-late\\n'",
             "foreground_orchestrate": true,
             "wait": true,
-            "timeout": 5_000,
+            // The test checks that wait:true returns terminal output, not how
+            // fast the command runs: a loaded Windows runner can take over 5 s
+            // to start the shell and its two printfs around the 1 s sleep.
+            // Stays under read_frame_timeout's 30 s so a kill still answers.
+            "timeout": 20_000,
             "compressed": false,
         }),
     )
@@ -5043,7 +5324,10 @@ async fn drive_bash_wait_true_daemon(input: FakeDaemonInput) {
 
 async fn drive_repeat_breaker_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
-        mut stream, root1, ..
+        mut stream,
+        root1,
+        executor,
+        ..
     } = open_fake_daemon_session(input).await;
     std::fs::write(root1.join("stable.repeat-fixture"), "stable")
         .expect("write subc repeat fixture");
@@ -5083,7 +5367,22 @@ async fn drive_repeat_breaker_daemon(input: FakeDaemonInput) {
         }
     }
 
-    super::repeat_breaker_test::assert_transport_repeat_sequence(&texts);
+    super::repeat_breaker_test::assert_transport_repeat_sequence_with_diagnostics(&texts, || {
+        let context = ProjectRootId::from_path(&root1)
+            .ok()
+            .and_then(|root_id| executor.actor_context(&root_id));
+        match context {
+            // Read the hashes the breaker stored, rather than re-hashing replies
+            // that already include reminders and finalizer decorations.
+            Some(ctx) => format!(
+                "recorded repeat-breaker observations: {:#?}",
+                ctx.repeat_breaker()
+            ),
+            None => {
+                "recorded repeat-breaker observations unavailable: root actor not found".to_string()
+            }
+        }
+    });
     send_connection_goodbye(&mut stream).await;
 }
 
@@ -5136,8 +5435,13 @@ async fn drive_bash_repeat_breaker_daemon(input: FakeDaemonInput) {
             ),
         ] {
             let corr = 900 + offset + index as u64;
-            let response =
-                call_tool_response(&mut stream, 1, corr, "bash", arguments, "repeated bash").await;
+            let response = {
+                // Allow slow shell startup for the positive foreground-finish
+                // assertion without lengthening the promotion-path wait.
+                let _foreground_wait =
+                    (kind == "finished").then(|| set_test_foreground_wait_ms(30_000));
+                call_tool_response(&mut stream, 1, corr, "bash", arguments, "repeated bash").await
+            };
             assert_tool_success(&response, kind);
             let text = response["text"].as_str().unwrap_or_default().to_string();
             match kind {
@@ -5188,20 +5492,27 @@ async fn drive_bash_abort_inflight_daemon(input: FakeDaemonInput) {
     } = open_fake_daemon_session(input).await;
     bind_route1(&mut stream, &root1).await;
 
+    // The command writes the marker once it is running. The release file is
+    // never created, so only the abort (or the 5 s command timeout) ends it.
+    let marker = root1.join("abort-inflight-started");
+    let release = root1.join("abort-inflight-release");
     send_tool_call(
         &mut stream,
         1,
         130,
         "bash",
         json!({
-            "command": "sleep 30",
+            "command": hold_bash_until_release_command(&marker, &release, "abort-done"),
             "foreground_orchestrate": true,
             "wait": true,
             "timeout": 5_000,
         }),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // An abort only kills calls already registered as in flight, and a call
+    // registers when its command starts. Waiting a fixed time lost that race
+    // on a slow Windows runner; wait for the running command's marker instead.
+    wait_for_path_event(&marker, "aborted bash command start").await;
     send_tool_call(
         &mut stream,
         1,
@@ -5402,6 +5713,12 @@ async fn drive_bash_worker_wait_limit_daemon(input: FakeDaemonInput) {
         mut stream, root1, ..
     } = open_fake_daemon_session(input).await;
     bind_route1(&mut stream, &root1).await;
+    let wait_limit = Duration::from_millis(WORKER_BASH_WAIT_LIMIT_MS);
+    let reply_budget = if cfg!(windows) {
+        wait_limit + Duration::from_secs(30)
+    } else {
+        Duration::from_secs(15)
+    };
     for (corr, mode) in [(140_u64, "wait"), (141_u64, "block_to_completion")] {
         let marker = root1.join(format!("worker-{mode}-started"));
         let release = root1.join(format!("worker-{mode}-release"));
@@ -5427,17 +5744,22 @@ async fn drive_bash_worker_wait_limit_daemon(input: FakeDaemonInput) {
             .expect("worker limit tool call frame"),
         )
         .await;
-        let frame = read_frame_timeout(&mut stream, "worker limit bash").await;
+        let frame = read_frame_within(&mut stream, reply_budget, "worker limit bash")
+            .await
+            .expect("worker limit bash reply");
         let elapsed = started.elapsed();
         assert_eq!(frame.header.corr, corr);
         let text = tool_result_text(&frame);
         assert!(!tool_result_is_error(&frame), "{mode}: {text}");
         assert!(
-            elapsed >= Duration::from_millis(1_400) && elapsed < Duration::from_secs(15),
-            "{mode}: the call must return at the 1.5s limit, took {elapsed:?}"
+            elapsed >= wait_limit - Duration::from_millis(100) && elapsed < reply_budget,
+            "{mode}: the call must return at the {wait_limit:?} limit, took {elapsed:?}"
         );
         assert!(
-            text.contains("still running after 1.5s"),
+            text.contains(&format!(
+                "still running after {}s",
+                wait_limit.as_secs_f64()
+            )),
             "{mode}: {text:?}"
         );
         assert!(text.contains("it was not killed"), "{mode}: {text:?}");
@@ -5461,9 +5783,14 @@ async fn drive_bash_worker_wait_limit_daemon(input: FakeDaemonInput) {
             "{mode}: {text:?}"
         );
         let task_id = extract_bash_task_id(&text);
+        let status_deadline = if cfg!(windows) {
+            Instant::now() + Duration::from_secs(30)
+        } else {
+            started + Duration::from_secs(15)
+        };
         let status = loop {
             assert!(
-                started.elapsed() < Duration::from_secs(15),
+                Instant::now() < status_deadline,
                 "{mode}: command never started"
             );
             send_tool_call(
@@ -6473,7 +6800,13 @@ async fn drive_back_to_back_binds_beside_held_mutating_job(input: FakeDaemonInpu
     release_tx.send(()).unwrap();
     held.recv_timeout(Duration::from_secs(5)).unwrap();
     let health = health.expect("the frame loop must service health while the writer is held");
-    assert_eq!((health.header.channel, health.header.corr), (0, 40));
+    assert_eq!(
+        (health.header.channel, health.header.corr),
+        (0, 40),
+        "first control frame while Mutating was held: header={:?} body={}",
+        health.header,
+        String::from_utf8_lossy(&health.body)
+    );
     let mut acks = HashSet::new();
     while acks.len() < 2 {
         let ack = read_frame_timeout(&mut stream, "deferred bind ack").await;
@@ -7382,7 +7715,6 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
         inner.slow_configure_started > slow_bind_base
     });
 
-    let release_turn = probe.hold_reliable_push_turn_for_test(19);
     let flood_prefix = "routebind-priority-flood";
     let flood_count = 1024_u64;
     send_tool_call(
@@ -7390,9 +7722,39 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
         1,
         901,
         "subc_test_emit_bash_completed_burst",
-        json!({ "prefix": flood_prefix, "count": flood_count }),
+        json!({ "prefix": flood_prefix, "count": 1 }),
     )
     .await;
+    // Drain one marker and its response before holding the loop. The
+    // bind-ACK path queues synchronously only when the raw writer has capacity;
+    // otherwise its off-loop waiter can observe later reliable batches even
+    // when the route-bind completion was drained first. Isolate loop priority from
+    // writer backpressure by queuing the entire reliable flood during the hold.
+    let mut flood_seen = 0_u64;
+    let mut flood_response_seen = false;
+    while flood_seen == 0 || !flood_response_seen {
+        let frame =
+            read_any_frame_timeout(&mut stream, "flood pressure before bind completion").await;
+        match frame.header.ty {
+            FrameType::Push => {
+                let body: Value = serde_json::from_slice(&frame.body).unwrap();
+                if push_type(&body) == Some("bash_completed")
+                    && push_task_id(&body).is_some_and(|task| task.starts_with(flood_prefix))
+                {
+                    flood_seen += 1;
+                }
+            }
+            FrameType::Response if frame.header.corr == 901 => flood_response_seen = true,
+            other => panic!("unexpected frame before bind completion: {other:?}"),
+        }
+    }
+    let root_id = ProjectRootId::from_path(&root1).expect("root1 id");
+    let ctx = executor.actor_context(&root_id).expect("root1 actor");
+    let release_turn = probe.hold_reliable_push_turn_for_test(19);
+    assert!(emit_push_frame(
+        &ctx,
+        bash_completed_push("routebind-priority-turn-hold", "session-1")
+    ));
     expect_priority_event(&mut events, SubcLifecycleEvent::ReliablePushTurnHeld).await;
 
     // Hold the loop at a turn boundary, not the configure worker: completion
@@ -7403,13 +7765,18 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
         SubcLifecycleEvent::RouteBindCompletionQueued { corr: 19 },
     )
     .await;
-    let root_id = ProjectRootId::from_path(&root1).expect("root1 id");
-    let ctx = executor.actor_context(&root_id).expect("root1 actor");
     let ready_task = "routebind-priority-ready";
     assert!(emit_push_frame(
         &ctx,
         bash_completed_push(ready_task, "session-1")
     ));
+    for seq in 0..flood_count {
+        assert!(emit_push_frame(
+            &ctx,
+            bash_completed_push(&format!("{flood_prefix}-held-{seq}"), "session-1")
+        ));
+    }
+    let expected_flood_count = 1 + flood_count;
     // Fill the 1024-slot lossy funnel and put an update in overflow while the
     // loop is held. Overflow drains a reliable batch before the biased select,
     // so only the pre-turn bind drain can put the ready ACK ahead of that batch.
@@ -7445,14 +7812,12 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
         &ctx,
         bash_completed_push(after_ack_task, "session-1")
     ));
-    let mut flood_seen = 0_u64;
-    let mut flood_response_seen = false;
     let mut ack_seen = false;
     let mut ready_seen = false;
     let mut after_ack_seen = false;
     let deadline = Instant::now() + Duration::from_secs(30);
     while !ack_seen
-        || flood_seen < flood_count
+        || flood_seen < expected_flood_count
         || !flood_response_seen
         || !ready_seen
         || !after_ack_seen
@@ -7501,7 +7866,7 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
         }
     }
     assert_eq!(
-        flood_seen, flood_count,
+        flood_seen, expected_flood_count,
         "every reliable flood frame must arrive"
     );
     state.wait_for_slow_configure_finished(slow_bind_base + 1);
@@ -7565,8 +7930,8 @@ async fn drive_pending_bind_tool_call_daemon(input: FakeDaemonInput) {
         ..
     } = open_fake_daemon_session(input).await;
 
-    // P5b B2 finding (d): a route-channel tool call sent before its bind ack is
-    // a protocol error and remains route_not_bound while the bind is pending.
+    // Candidate calls wait for bind authority instead of racing configure and
+    // receiving an unbound-route error before its bind ACK finishes writing.
     let pending_tool_base = state.begin_slow_configure_wave();
     send_route_bind_with_doc(
         &mut stream,
@@ -7583,10 +7948,13 @@ async fn drive_pending_bind_tool_call_daemon(input: FakeDaemonInput) {
         inner.slow_configure_started > pending_tool_base
     });
     send_tool_call(&mut stream, 12, 1201, "echo", json!({ "case": "fast" })).await;
-    expect_error_frame(&mut stream, 12, 1201, "route_not_bound").await;
     state.release_slow_configures();
     state.wait_for_slow_configure_finished(pending_tool_base + 1);
     expect_route_bind_ack(&mut stream, 1200).await;
+    let response = read_frame_timeout(&mut stream, "held candidate response").await;
+    assert_eq!(response.header.ty, FrameType::Response);
+    assert_eq!(response.header.channel, 12);
+    assert_eq!(response.header.corr, 1201);
 
     send_connection_goodbye(&mut stream).await;
 }
@@ -7633,9 +8001,7 @@ async fn drive_goodbye_cancels_pending_bind_daemon(input: FakeDaemonInput) {
             .expect("goodbye barrier ping"),
     )
     .await;
-    let pong = read_frame_timeout(&mut stream, "goodbye barrier pong").await;
-    assert_eq!(pong.header.ty, FrameType::Pong, "{:?}", pong.header);
-    assert_eq!(pong.header.corr, 1109);
+    expect_cancelled_bind_with_control_reply(&mut stream, 110, 1109, FrameType::Pong).await;
     // NO manual release: the Goodbye's operational cancellation must itself
     // settle the stuck configure, or this test proves only bookkeeping.
     state.wait_for_slow_configure_finished(goodbye_bind_base + 1);
@@ -7648,6 +8014,122 @@ async fn drive_goodbye_cancels_pending_bind_daemon(input: FakeDaemonInput) {
     )
     .await;
 
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_higher_epoch_rebind_preserves_queued_read_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        state,
+        ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+
+    // Hold the only actor slot so the read is admitted but cannot start before
+    // the same session replaces its route with a higher epoch, without Goodbye.
+    let epoch_base = state.begin_epoch_wave();
+    send_tool_call(
+        &mut stream,
+        1,
+        120,
+        "semantic_search",
+        json!({ "query": "hold the only interactive actor slot" }),
+    )
+    .await;
+    state.wait_until("heavy route call started", |inner| inner.heavy_started);
+    send_tool_call(&mut stream, 1, 121, "echo", json!({ "case": "epoch" })).await;
+    send_frame(
+        &mut stream,
+        Frame::build(FrameType::Ping, control_flags(), 0, 0, 122, Vec::new())
+            .expect("queued-read barrier ping"),
+    )
+    .await;
+    let barrier = read_frame_timeout(&mut stream, "queued-read barrier pong").await;
+    assert_eq!(
+        (barrier.header.ty, barrier.header.corr),
+        (FrameType::Pong, 122)
+    );
+    assert_eq!(
+        state.epoch_started_count(),
+        epoch_base,
+        "read must be queued"
+    );
+
+    send_route_bind_epoch(&mut stream, 1, 2, 220, &root1).await;
+    send_frame(
+        &mut stream,
+        Frame::build(FrameType::Ping, control_flags(), 0, 0, 124, Vec::new())
+            .expect("rebind submission barrier ping"),
+    )
+    .await;
+    let mut bind_ack = false;
+    loop {
+        let frame = read_frame_timeout(&mut stream, "rebind barrier").await;
+        match (frame.header.ty, frame.header.channel, frame.header.corr) {
+            (FrameType::Pong, 0, 124) => break,
+            (FrameType::Response, 0, 220) => {
+                assert!(!bind_ack, "duplicate bind ack");
+                let ack: ModuleControlResponse = serde_json::from_slice(&frame.body).unwrap();
+                assert_eq!(ack, ModuleControlResponse::RouteBindAck {});
+                bind_ack = true;
+            }
+            other => {
+                state.release_heavy();
+                state.release_epoch_reads();
+                panic!(
+                    "rebind must retain the queued call, got {other:?}: {:?}",
+                    frame.body
+                );
+            }
+        }
+    }
+    assert_eq!(
+        state.epoch_started_count(),
+        epoch_base,
+        "read must still be queued"
+    );
+    state.release_heavy();
+    state.release_epoch_reads();
+
+    let mut responses = HashSet::new();
+    while !bind_ack || responses.len() < 2 {
+        let frame = read_frame_timeout(&mut stream, "retained call response or bind ack").await;
+        assert_eq!(frame.header.ty, FrameType::Response, "{:?}", frame.body);
+        if frame.header.channel == 0 {
+            assert_eq!(frame.header.corr, 220);
+            assert!(!bind_ack, "duplicate bind ack");
+            let ack: ModuleControlResponse = serde_json::from_slice(&frame.body).unwrap();
+            assert_eq!(ack, ModuleControlResponse::RouteBindAck {});
+            bind_ack = true;
+        } else {
+            assert_eq!((frame.header.channel, frame.header.epoch), (1, 1));
+            assert!([120, 121].contains(&frame.header.corr));
+            assert!(
+                responses.insert(frame.header.corr),
+                "duplicate tool terminal"
+            );
+            assert_eq!(tool_response_json(&frame)["success"], true);
+        }
+    }
+    assert_eq!(
+        state.epoch_started_count(),
+        epoch_base + 1,
+        "queued read must execute once"
+    );
+
+    send_tool_call_epoch(&mut stream, 1, 2, 221, "echo", json!({ "case": "fast" })).await;
+    let successor = read_frame_timeout(&mut stream, "successor route response").await;
+    assert_eq!(successor.header.ty, FrameType::Response);
+    assert_eq!(
+        (
+            successor.header.channel,
+            successor.header.epoch,
+            successor.header.corr
+        ),
+        (1, 2, 221)
+    );
+    assert_eq!(tool_response_json(&successor)["success"], true);
     send_connection_goodbye(&mut stream).await;
 }
 
@@ -7694,23 +8176,45 @@ async fn drive_goodbye_cancels_queued_read_before_rebind_daemon(input: FakeDaemo
             .expect("rebind submission barrier ping"),
     )
     .await;
-    let rebind_barrier = read_frame_timeout(&mut stream, "rebind submission barrier pong").await;
-    assert_eq!(rebind_barrier.header.ty, FrameType::Pong);
-    assert_eq!(rebind_barrier.header.corr, 124);
+    let mut released_terminal = false;
+    let mut rebind_barrier = false;
+    let mut bind_ack = None;
+    // Goodbye must settle the queued call's request credit, not merely remove
+    // the job. Pong has its own writer priority, so accept either reply order.
+    while !released_terminal || !rebind_barrier {
+        let frame = read_frame_timeout(&mut stream, "released call terminal and rebind pong").await;
+        match (frame.header.ty, frame.header.channel, frame.header.corr) {
+            (FrameType::Error, 1, 121) => {
+                assert!(!released_terminal, "queued call received two terminals");
+                assert_eq!(frame.header.epoch, 1);
+                let body: Value = serde_json::from_slice(&frame.body).unwrap();
+                assert_eq!(body["code"], "route_released", "{body}");
+                released_terminal = true;
+            }
+            (FrameType::Pong, 0, 124) => rebind_barrier = true,
+            (FrameType::Response, 0, 220) => bind_ack = Some(frame),
+            other => panic!("unexpected reply before releasing heavy work: {other:?}"),
+        }
+    }
 
     state.release_heavy();
     state.release_epoch_reads();
     let deadline = Instant::now() + Duration::from_secs(60);
-    let mut bind_ack = None;
-    while let Some(frame) =
-        read_any_frame_until(&mut stream, deadline, "same-root rebind ack").await
-    {
-        if frame.header.channel == 0
-            && frame.header.corr == 220
-            && frame.header.ty == FrameType::Response
+    if bind_ack.is_none() {
+        while let Some(frame) =
+            read_any_frame_until(&mut stream, deadline, "same-root rebind ack").await
         {
-            bind_ack = Some(frame);
-            break;
+            assert!(
+                frame.header.channel != 1 || frame.header.corr != 121,
+                "queued call received a second terminal after release"
+            );
+            if frame.header.channel == 0
+                && frame.header.corr == 220
+                && frame.header.ty == FrameType::Response
+            {
+                bind_ack = Some(frame);
+                break;
+            }
         }
     }
     assert!(
@@ -7780,7 +8284,7 @@ async fn drive_cancelled_first_bind_does_not_orphan_later_bind_daemon(input: Fak
     // NO manual release: cancelling route 20's configure must free the
     // mutating lane so route 21's queued configure runs and acks.
     state.wait_for_slow_configure_finished(slow_bind_base + 1);
-    expect_route_bind_ack(&mut stream, 210).await;
+    expect_cancelled_bind_with_control_reply(&mut stream, 200, 210, FrameType::Response).await;
     send_tool_call(&mut stream, 21, 211, "echo", json!({ "case": "fast" })).await;
     let joined = read_frame_timeout(&mut stream, "post-cancel sibling bind response").await;
     assert_eq!(joined.header.channel, 21);
@@ -7905,12 +8409,12 @@ async fn drive_goodbye_removes_queued_bind_daemon(input: FakeDaemonInput) {
             .expect("queued-cancel barrier ping"),
     )
     .await;
-    let pong = read_frame_timeout(&mut stream, "queued-cancel barrier pong").await;
-    assert_eq!(pong.header.ty, FrameType::Pong, "{:?}", pong.header);
+    expect_cancelled_bind_with_control_reply(&mut stream, 410, 412, FrameType::Pong).await;
 
     // Cancel the first via Goodbye too; operational cancellation settles it.
     send_route_goodbye(&mut stream, 40, 401).await;
     state.wait_for_slow_configure_finished(slow_bind_base + 1);
+    expect_route_bind_error(&mut stream, 400, "cancelled").await;
     assert_eq!(
         state.slow_configure_started_count(),
         slow_bind_base + 1,
@@ -9690,6 +10194,50 @@ async fn wait_for_file(path: &std::path::Path, label: &str) {
     }
 }
 
+/// Waits until each listed bash call has left its spawn job and reached the
+/// foreground wait loop, publishing the detach target the drain uses to
+/// answer it. The census then reports `bash:wait` / `bash:block` instead of
+/// `bash:spawning`. This replaces the old fixed sleep past the spawn job: on
+/// a loaded runner the spawn job can still be queued when the sleep expires.
+/// Waits up to 30 s (a generous positive wait); every assertion that follows
+/// still checks the exact census the drain reports.
+async fn wait_for_bash_foreground_waits(
+    events: &mut mpsc::UnboundedReceiver<SubcLifecycleEvent>,
+    expected: &[(u16, u64, &str)],
+) {
+    let bound = Duration::from_secs(30);
+    let deadline = Instant::now() + bound;
+    let wanted: HashMap<(u16, u64), &str> = expected
+        .iter()
+        .map(|(channel, corr, phase)| ((*channel, *corr), *phase))
+        .collect();
+    let mut seen: HashSet<(u16, u64)> = HashSet::new();
+    while seen.len() < expected.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let event = tokio::time::timeout(remaining, events.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("bash foreground waits {expected:?} not reached within {bound:?}; seen {seen:?}")
+            })
+            .expect("lifecycle probe open");
+        if let SubcLifecycleEvent::BashForegroundWait {
+            route_channel,
+            route_epoch: _,
+            corr,
+            phase,
+        } = event
+        {
+            if let Some(wanted_phase) = wanted.get(&(route_channel, corr)) {
+                assert_eq!(
+                    &phase, wanted_phase,
+                    "foreground phase for channel={route_channel} corr={corr}"
+                );
+                seen.insert((route_channel, corr));
+            }
+        }
+    }
+}
+
 /// At the moment of `module.draining` the module holds one of every long-lived
 /// request kind: a `wait: true` bash call, a `block_to_completion` bash call, an
 /// untrusted bash call waiting on the host's permission answer, a bg_events
@@ -9806,8 +10354,17 @@ async fn drive_module_draining_releases_every_held_request_daemon(input: FakeDae
     .await;
     wait_for_file(&wait_started, "wait:true bash start marker").await;
     wait_for_file(&block_started, "block_to_completion bash start marker").await;
-    // Let both calls move from their spawn job into the foreground wait.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait until both calls have left their spawn job and reached the
+    // foreground wait loop (census `bash:wait` / `bash:block`, never
+    // `bash:spawning`) before starting the drain.
+    wait_for_bash_foreground_waits(
+        &mut lifecycle_events,
+        &[
+            (WAIT_CHANNEL, WAIT_CORR, "bash:wait"),
+            (BLOCK_CHANNEL, BLOCK_CORR, "bash:block"),
+        ],
+    )
+    .await;
 
     let drain_started = Instant::now();
     send_module_draining(&mut stream, Duration::from_secs(30)).await;
@@ -10070,6 +10627,13 @@ async fn pump_daemon_credits(
 async fn reclaim_bound_test_root(
     input: FakeDaemonInput,
 ) -> (FakeDaemonSession, tempfile::TempDir, Vec<Frame>, Frame) {
+    reclaim_bound_test_root_with_database_gates(input, None).await
+}
+
+async fn reclaim_bound_test_root_with_database_gates(
+    input: FakeDaemonInput,
+    database_gates: Option<(&std::path::Path, &std::path::Path)>,
+) -> (FakeDaemonSession, tempfile::TempDir, Vec<Frame>, Frame) {
     let mut session = open_fake_daemon_session(input).await;
     let root_dir = tempfile::tempdir().expect("reclaimed root tempdir");
     let root = root_dir.path();
@@ -10085,13 +10649,16 @@ async fn reclaim_bound_test_root(
         .await;
         expect_route_bind_ack(&mut session.stream, u64::from(channel)).await;
     }
+    if let Some((open, _)) = database_gates {
+        wait_for_file(&open.with_extension("entered"), "database open gate").await;
+    }
     let mut ledger = DaemonCreditLedger::default();
     for channel in [121, 122] {
         send_bg_events_subscribe(&mut session.stream, channel, 950).await;
         ledger.open(channel, 950, "held bg_events on deleted root");
     }
-    // The control reply is a FIFO barrier: both subscriptions have reached the
-    // frame loop before the directory disappears.
+    // bg_events installs inline, without waiting for database initialization.
+    // The later control reply fences installation before directory deletion.
     send_control_request(
         &mut session.stream,
         980,
@@ -10108,7 +10675,12 @@ async fn reclaim_bound_test_root(
     }
     assert_eq!(ledger.open.len(), 2, "streams must be held before deletion");
     std::fs::remove_dir_all(root).expect("delete bound root");
-    let deadline = Instant::now() + Duration::from_secs(15);
+    if let Some((open, _)) = database_gates {
+        // Configure maintenance must finish before the root can be reclaimed.
+        // Keep only database-wait continuations paused until after reclamation.
+        std::fs::remove_file(open).expect("release database open");
+    }
+    let deadline = Instant::now() + Duration::from_secs(if cfg!(windows) { 30 } else { 15 });
     let mut frames = Vec::new();
     while session.executor.actor_registered(&root_id) {
         assert!(
@@ -10125,6 +10697,15 @@ async fn reclaim_bound_test_root(
             ledger.observe(&frame);
             frames.push(frame);
         }
+    }
+    if let Some((_, resume)) = database_gates {
+        std::fs::remove_file(resume).expect("release database continuations");
+    }
+    while !ledger.open.is_empty() {
+        let frame =
+            read_frame_timeout(&mut session.stream, "reclaimed subscription terminal").await;
+        ledger.observe(&frame);
+        frames.push(frame);
     }
     // Restoring the same path must not resurrect the forgotten route. The
     // session needs a fresh bind, just as a reclaimed worktree's carrier does.
@@ -10157,8 +10738,20 @@ async fn reclaim_bound_test_root(
         ledger.unmatched_terminals
     );
     eprintln!(
-        "deleted-root frame-loop reproduction: held terminals={}, route GOODBYEs={:?}, old-route refusal={}",
+        "deleted-root frame-loop reproduction: stream ends={}, held terminals={:?}, route GOODBYEs={:?}, old-route refusal={}",
         frames.iter().filter(|frame| frame.header.ty == FrameType::StreamEnd).count(),
+        frames.iter().filter(|frame| {
+            [121, 122].contains(&frame.header.channel)
+                && frame.header.epoch == 1
+                && frame.header.corr == 950
+                && matches!(frame.header.ty, FrameType::Response | FrameType::Error | FrameType::StreamEnd)
+        }).map(|frame| (
+            frame.header.channel,
+            frame.header.epoch,
+            frame.header.corr,
+            frame.header.ty,
+            String::from_utf8_lossy(&frame.body).into_owned(),
+        )).collect::<Vec<_>>(),
         frames.iter().filter(|frame| frame.header.ty == FrameType::Goodbye).map(|frame| (frame.header.channel, frame.header.epoch)).collect::<Vec<_>>(),
         String::from_utf8_lossy(&late_error.body),
     );
@@ -10473,8 +11066,10 @@ async fn drive_module_draining_answers_stuck_bash_wait_daemon(input: FakeDaemonI
         mut stream,
         root1,
         state,
+        lifecycle_events,
         ..
     } = open_fake_daemon_session(input).await;
+    let mut lifecycle_events = lifecycle_events.expect("lifecycle probe installed");
     const WAIT_CHANNEL: u16 = 1;
     // Channel 5 is reserved by the bridge dispatch for a failing configure.
     const READ_CHANNEL: u16 = 6;
@@ -10505,8 +11100,13 @@ async fn drive_module_draining_answers_stuck_bash_wait_daemon(input: FakeDaemonI
     )
     .await;
     wait_for_file(&started, "stuck bash wait start marker").await;
-    // Let the call move from its spawn job into the foreground wait.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait until the call has left its spawn job and reached the foreground
+    // wait loop (census `bash:wait`, never `bash:spawning`).
+    wait_for_bash_foreground_waits(
+        &mut lifecycle_events,
+        &[(WAIT_CHANNEL, WAIT_CORR, "bash:wait")],
+    )
+    .await;
 
     // Occupy the root's only reader slot: the wait's next poll queues behind it.
     send_tool_call(
@@ -10595,8 +11195,12 @@ async fn drive_module_draining_answers_stuck_bash_wait_daemon(input: FakeDaemonI
 /// completion is still delivered.
 async fn drive_client_cancel_answers_held_bash_wait_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
-        mut stream, root1, ..
+        mut stream,
+        root1,
+        lifecycle_events,
+        ..
     } = open_fake_daemon_session(input).await;
+    let mut lifecycle_events = lifecycle_events.expect("lifecycle probe installed");
     const WAIT_CHANNEL: u16 = 1;
     const WAIT_CORR: u64 = 1301;
     const TERMINAL_BOUND: Duration = Duration::from_secs(2);
@@ -10620,7 +11224,13 @@ async fn drive_client_cancel_answers_held_bash_wait_daemon(input: FakeDaemonInpu
     )
     .await;
     wait_for_file(&started, "cancelled bash wait start marker").await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait until the call has left its spawn job and reached the foreground
+    // wait loop (census `bash:wait`, never `bash:spawning`).
+    wait_for_bash_foreground_waits(
+        &mut lifecycle_events,
+        &[(WAIT_CHANNEL, WAIT_CORR, "bash:wait")],
+    )
+    .await;
 
     let cancelled_at = Instant::now();
     send_bg_events_cancel(&mut stream, WAIT_CHANNEL, WAIT_CORR).await;
@@ -10904,11 +11514,16 @@ async fn drive_bg_events_daemon(input: FakeDaemonInput) {
         }
     }
 
+    // The re-armed nudge follows the product's backoff: 1 s, doubling to a
+    // 30 s cap (BG_WAKE_REARM_*_BACKOFF in subc/push.rs). On a loaded runner
+    // a re-arm may already have landed among the early events above, so the
+    // next one can be several seconds away. Wait past the cap; a wake lane
+    // that never re-arms still fails here.
     let _ = wait_for_bg_event(
         &mut stream,
         provider_channel,
         700,
-        Duration::from_secs(2),
+        Duration::from_secs(40),
         "re-armed bg_events wake before ack",
     )
     .await;
@@ -11016,6 +11631,51 @@ fn minimal_bind_doc() -> Value {
     })
 }
 
+/// Write `doc` as the root's project config in one atomic replacement, so a
+/// reader in the daemon never sees a half-written document.
+///
+/// On Windows, replacing a file is refused with ERROR_ACCESS_DENIED (os error
+/// 5) while a handle on the destination is open without share-delete, and
+/// briefly after such a handle closes while Windows finishes removing its
+/// directory entry. The daemon reads this file on every bind and config
+/// reload, so the second case can happen here: retry it for a bounded time
+/// instead of failing the scenario. On Unix a rename over a file is never
+/// refused for this reason.
+fn write_bind_project_config(root: &std::path::Path, doc: &Value) {
+    let path = root.join(".cortexkit").join("aft.jsonc");
+    let parent = path.parent().expect("project config parent");
+    std::fs::create_dir_all(parent).expect("create .cortexkit dir");
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(parent).expect("create project config temp");
+    std::io::Write::write_all(
+        &mut temporary,
+        &serde_json::to_vec(doc).expect("serialize bind doc"),
+    )
+    .expect("write project config temp");
+    let mut attempt = 0u32;
+    loop {
+        match temporary.persist(&path) {
+            Ok(_) => return,
+            Err(error)
+                if cfg!(windows) && is_windows_sharing_retry(error.error.kind(), attempt) =>
+            {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                temporary = error.file;
+            }
+            Err(error) => panic!("publish project config: {:?}", error.error),
+        }
+    }
+}
+
+/// Whether a refused publish should be tried again: only the Windows
+/// replacement conflict, and only for the bounded number of attempts the
+/// caller allows.
+fn is_windows_sharing_retry(kind: std::io::ErrorKind, attempts_so_far: u32) -> bool {
+    const PUBLISH_ATTEMPTS: u32 = 40;
+    kind == std::io::ErrorKind::PermissionDenied && attempts_so_far < PUBLISH_ATTEMPTS
+}
+
 fn subc_mcp_principal() -> Principal {
     Principal::Reserved {
         module_id: "subc-mcp".to_string(),
@@ -11061,14 +11721,7 @@ async fn send_route_bind_with_elicitation_capability(
     corr: u64,
     root: &std::path::Path,
 ) {
-    let project_cfg = root.join(".cortexkit").join("aft.jsonc");
-    std::fs::create_dir_all(project_cfg.parent().expect("cortexkit dir parent"))
-        .expect("create .cortexkit dir");
-    std::fs::write(
-        &project_cfg,
-        serde_json::to_string(&minimal_bind_doc()).expect("serialize bind doc"),
-    )
-    .expect("write project config");
+    write_bind_project_config(root, &minimal_bind_doc());
 
     let body = ModuleControlRequest::RouteBind {
         route_channel,
@@ -12837,6 +13490,10 @@ async fn drive_module_hello_health_manifest_daemon(input: FakeDaemonInput) {
             "gh_shim.session_context",
             "gh_shim.read_request",
             "backups.purge",
+            "page.collect",
+            "page.read",
+            "page.release",
+            "diagnostics.findings",
         ])
     );
     let schema_count = serde_json::from_str::<serde_json::Map<String, Value>>(include_str!(
@@ -13007,6 +13664,41 @@ async fn drive_management_surface_daemon(input: FakeDaemonInput) {
     assert!(census_io["available"].is_boolean());
     assert!(census_io["sampled_at_ms"].is_u64());
 
+    let ownership = &census["data"]["route_ownership"];
+    assert_eq!(ownership["summary"]["bound_routes"], 1);
+    assert_eq!(
+        ownership["summary"]["unscoped"],
+        json!({"routes": 1, "roots": 1})
+    );
+    let route = &ownership["roots"][0]["routes"][0];
+    assert_eq!(route["channel"], 1);
+    assert_eq!(route["harness"], "opencode");
+    assert_eq!(route["session_id"], "session-1");
+    assert_eq!(route["principal"], "direct");
+    assert_eq!(route["scope"], "none");
+    assert!(route["last_tool_call_age_ms"].is_null());
+    send_control_request(&mut stream, 330, ModuleControlRequest::HealthCheck {}).await;
+    let health = expect_health_check_report(&mut stream, 330).await;
+    assert_eq!(
+        health.metrics.unwrap()["route_ownership_summary"]["bound_routes"],
+        1
+    );
+    send_management_request(&mut stream, 2, 331, json!({"op":"memory.census"})).await;
+    let polled = read_management_response(&mut stream, 2, 331, "memory.census").await;
+    assert!(
+        polled["data"]["route_ownership"]["roots"][0]["routes"][0]["last_tool_call_age_ms"]
+            .is_null(),
+        "health and census polling must not count as admitted tools"
+    );
+    expect_manifest_tool_success(&mut stream, 332, "glob", json!({"pattern":"*"})).await;
+    send_management_request(&mut stream, 2, 333, json!({"op":"memory.census"})).await;
+    let called = read_management_response(&mut stream, 2, 333, "memory.census").await;
+    assert!(
+        called["data"]["route_ownership"]["roots"][0]["routes"][0]["last_tool_call_age_ms"]
+            .is_u64()
+    );
+    assert!(called["data"]["route_ownership"]["roots"][0]["last_tool_call_age_ms"].is_u64());
+
     send_management_request(
         &mut stream,
         2,
@@ -13089,6 +13781,79 @@ async fn drive_management_surface_daemon(input: FakeDaemonInput) {
     assert_eq!(state.configure_count(), configure_count);
     assert_eq!(app.watcher_count(), watcher_count);
 
+    let owner = Principal::Reserved {
+        module_id: "prefrontal-core".into(),
+    };
+    let stamp = subc_protocol::scope::ScopeStamp::new(
+        owner.clone(),
+        "census-scope",
+        7,
+        subc_protocol::scope::ScopeKind::Head,
+    );
+    send_control_request(
+        &mut stream,
+        340,
+        ModuleControlRequest::RouteBind {
+            route_channel: 6,
+            epoch: 1,
+            target: RouteTarget::ToolProvider {
+                module_id: "aft".into(),
+            },
+            identity: BindIdentity::new(root1.clone(), "opencode", "census-scoped"),
+            principal: Some(owner),
+            scope: Some(stamp),
+            consumer_capabilities: None,
+            admission_facts: Default::default(),
+            role_versions: None,
+            call_mode: None,
+        },
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 340).await;
+    send_management_request(&mut stream, 2, 341, json!({"op":"memory.census"})).await;
+    let paired = read_management_response(&mut stream, 2, 341, "memory.census").await;
+    let ownership = &paired["data"]["route_ownership"];
+    assert_eq!(ownership["summary"]["bound_routes"], 2);
+    assert_eq!(ownership["summary"]["bound_roots"], 1);
+    assert_eq!(
+        ownership["summary"]["scoped"],
+        json!({"routes":1,"roots":1})
+    );
+    assert_eq!(
+        ownership["summary"]["unscoped"],
+        json!({"routes":1,"roots":1})
+    );
+    assert_eq!(
+        ownership["roots"][0]["routes"][1]["scope"],
+        json!({"owner":"reserved:prefrontal-core","ref":"census-scope","epoch":7})
+    );
+    assert_eq!(
+        ownership["roots"][0]["routes"][1]["principal"],
+        "reserved:prefrontal-core"
+    );
+    send_route_goodbye(&mut stream, 6, 342).await;
+    send_management_request(&mut stream, 2, 343, json!({"op":"memory.census"})).await;
+    let detached = read_management_response(&mut stream, 2, 343, "memory.census").await;
+    assert_eq!(
+        detached["data"]["route_ownership"]["summary"]["bound_routes"],
+        1
+    );
+    assert_eq!(
+        detached["data"]["route_ownership"]["summary"]["scoped"]["routes"],
+        0
+    );
+    send_route_goodbye(&mut stream, 1, 344).await;
+    send_management_request(&mut stream, 2, 345, json!({"op":"memory.census"})).await;
+    let unbound = read_management_response(&mut stream, 2, 345, "memory.census").await;
+    assert_eq!(
+        unbound["data"]["route_ownership"]["summary"]["bound_roots"],
+        0
+    );
+    assert_eq!(
+        unbound["data"]["route_ownership"]["summary"]["bound_routes"],
+        0
+    );
+
     send_connection_goodbye(&mut stream).await;
 }
 
@@ -13118,20 +13883,38 @@ async fn drive_health_check_daemon(input: FakeDaemonInput) {
     // Bind acknowledgement follows configure commit, not health publication.
     // Wait for the actor to release its configure work, then acknowledge an
     // actual post-bind cache refresh instead of polling a throttled snapshot.
+    //
+    // Even after that barrier, a loaded runner can report Degraded for a
+    // moment: the rollup marks a root busy when one of its state locks is held
+    // while the census reads it, and the health reply itself marks the report
+    // Degraded when the executor scheduler lock is held at that instant. Both
+    // clear on their own, and the test worker only republishes the rollup on
+    // request, so each attempt requests a fresh rollup before asking again.
+    // Any other Degraded cause persists across attempts and still fails here,
+    // with the last report's detail in the message.
     let root_id = ProjectRootId::from_path(&root1).expect("bound root identity");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !executor.actor_is_idle(&root_id) {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut corr = 20;
+    let report = loop {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !executor.actor_is_idle(&root_id) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            health_probe
+                .request_refresh()
+                .await
+                .expect("rollup published");
+        })
+        .await
+        .expect("post-bind health publication barrier");
+        send_control_request(&mut stream, corr, ModuleControlRequest::HealthCheck {}).await;
+        let report = expect_health_check_report(&mut stream, corr).await;
+        if report.status == subc_protocol::session::HealthStatus::Ok || Instant::now() >= deadline {
+            break report;
         }
-        health_probe
-            .request_refresh()
-            .await
-            .expect("rollup published");
-    })
-    .await
-    .expect("post-bind health publication barrier");
-    send_control_request(&mut stream, 20, ModuleControlRequest::HealthCheck {}).await;
-    let report = expect_health_check_report(&mut stream, 20).await;
+        corr += 1;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
     let metrics = report.metrics.clone().expect("health check metrics");
     let work = metrics.get("views_work").expect("production work counters");
     assert_eq!(work["pid"], std::process::id());
@@ -13156,7 +13939,13 @@ async fn drive_health_check_daemon(input: FakeDaemonInput) {
             "missing production counter {field}: {work}"
         );
     }
-    assert_eq!(report.status, subc_protocol::session::HealthStatus::Ok);
+    assert_eq!(
+        report.status,
+        subc_protocol::session::HealthStatus::Ok,
+        "health.check never reported Ok within 30 s; last detail: {:?}, stale_reason: {}",
+        report.detail,
+        metrics.get("stale_reason").unwrap_or(&Value::Null),
+    );
     for (section, fields) in [
         (
             "lsp",
@@ -14209,14 +14998,7 @@ async fn send_route_bind_with_harness_session_principal_and_doc_epoch(
     // to the project config file so it reaches handle_control_request's local
     // read. The wire `config` is still attached but no longer consulted by
     // production; keeping it asserts it's harmlessly ignored.
-    let project_cfg = root.join(".cortexkit").join("aft.jsonc");
-    std::fs::create_dir_all(project_cfg.parent().expect("cortexkit dir parent"))
-        .expect("create .cortexkit dir");
-    std::fs::write(
-        &project_cfg,
-        serde_json::to_string(&doc).expect("serialize bind doc"),
-    )
-    .expect("write project config");
+    write_bind_project_config(root, &doc);
 
     let request = ModuleControlRequest::RouteBind {
         route_channel,
@@ -14810,11 +15592,50 @@ fn extract_bash_task_id(text: &str) -> String {
 
 async fn expect_route_bind_ack(stream: &mut tokio::net::TcpStream, corr: u64) {
     let frame = read_frame_timeout(stream, "RouteBindAck").await;
-    assert_eq!(frame.header.ty, FrameType::Response);
+    assert_eq!(
+        frame.header.ty,
+        FrameType::Response,
+        "bind corr={corr}: header={:?} body={}",
+        frame.header,
+        String::from_utf8_lossy(&frame.body)
+    );
     assert_eq!(frame.header.channel, 0);
     assert_eq!(frame.header.corr, corr);
     let ack: ModuleControlResponse = serde_json::from_slice(&frame.body).expect("ack body");
     assert_eq!(ack, ModuleControlResponse::RouteBindAck {});
+}
+
+async fn expect_cancelled_bind_with_control_reply(
+    stream: &mut tokio::net::TcpStream,
+    bind_corr: u64,
+    other_corr: u64,
+    other_type: FrameType,
+) {
+    // Pong uses the priority lane and the sibling ACK is independent. Neither
+    // ordering is promised, but the cancelled bind must answer exactly once.
+    let mut seen = HashSet::new();
+    for _ in 0..2 {
+        let frame = read_frame_timeout(stream, "cancelled bind and control reply").await;
+        assert_eq!(frame.header.channel, 0);
+        assert!(seen.insert(frame.header.corr), "duplicate control reply");
+        if frame.header.corr == bind_corr {
+            assert_error_frame(&frame, 0, bind_corr, "cancelled");
+            assert_eq!(
+                serde_json::from_slice::<Value>(&frame.body).unwrap()["message"],
+                "request cancelled"
+            );
+        } else {
+            assert_eq!(frame.header.corr, other_corr);
+            assert_eq!(frame.header.ty, other_type);
+            if other_type == FrameType::Response {
+                assert_eq!(
+                    serde_json::from_slice::<ModuleControlResponse>(&frame.body).unwrap(),
+                    ModuleControlResponse::RouteBindAck {}
+                );
+            }
+        }
+    }
+    assert_eq!(seen, HashSet::from([bind_corr, other_corr]));
 }
 
 async fn expect_route_bind_error(stream: &mut tokio::net::TcpStream, corr: u64, code: &str) {
@@ -16111,3 +16932,6 @@ mod scope_revocation_test;
 
 #[path = "confine_admission_test.rs"]
 mod confine_admission_test;
+
+#[path = "page_collect_test.rs"]
+mod page_collect_test;

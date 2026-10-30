@@ -195,3 +195,89 @@ fn exact_tier(page: &SearchPage) -> EvidenceKind {
         .find(|entry| entry.result.evidence.tier == EvidenceTier::Exact)
         .map_or(EvidenceKind::None, |entry| entry.result.evidence.kind)
 }
+// The opt-in performance probe records phase wall times without changing tool
+// responses. Release builds do not contain the collector or read its switch.
+#[cfg(feature = "test-timing-hooks")]
+mod cost_trace {
+    use std::{cell::RefCell, time::Instant};
+
+    thread_local! {
+        static PHASES: RefCell<Option<Vec<(&'static str, f64)>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct Request {
+        id: String,
+        started: Instant,
+        enabled: bool,
+    }
+
+    impl Request {
+        pub(crate) fn start(id: &str) -> Self {
+            let enabled = std::env::var_os("AFT_SEARCH_COST_TRACE").is_some();
+            if enabled {
+                PHASES.with(|phases| *phases.borrow_mut() = Some(Vec::new()));
+            }
+            Self {
+                id: id.to_string(),
+                started: Instant::now(),
+                enabled,
+            }
+        }
+    }
+
+    impl Drop for Request {
+        fn drop(&mut self) {
+            if self.enabled {
+                let phases = PHASES.with(|phases| std::mem::take(&mut *phases.borrow_mut()));
+                eprintln!(
+                    "AFT_SEARCH_COST {}",
+                    serde_json::json!({
+                        "id": self.id, "total_ms": self.started.elapsed().as_secs_f64() * 1000.0,
+                        "phases": phases,
+                    })
+                );
+            }
+        }
+    }
+
+    pub(crate) struct Phase(&'static str, Option<Instant>);
+
+    impl Phase {
+        pub(crate) fn start(name: &'static str) -> Self {
+            Self(
+                name,
+                PHASES.with(|phases| phases.borrow().is_some().then(Instant::now)),
+            )
+        }
+    }
+
+    impl Drop for Phase {
+        fn drop(&mut self) {
+            if let Some(started) = self.1 {
+                PHASES.with(|phases| {
+                    if let Some(phases) = phases.borrow_mut().as_mut() {
+                        phases.push((self.0, started.elapsed().as_secs_f64() * 1000.0));
+                    }
+                });
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "test-timing-hooks"))]
+mod cost_trace {
+    pub(crate) struct Request;
+    impl Request {
+        pub(crate) fn start(_: &str) -> Self {
+            Self
+        }
+    }
+    pub(crate) struct Phase;
+    impl Phase {
+        pub(crate) fn start(_: &'static str) -> Self {
+            Self
+        }
+    }
+}
+
+pub(crate) use cost_trace::{Phase as CostPhase, Request as CostRequest};

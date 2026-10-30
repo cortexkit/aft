@@ -485,7 +485,10 @@ fn handle_zoom_targets(
                             // An access ask must reach the host unchanged so it
                             // can ask and retry; inside one batch entry nobody
                             // would see it.
-                            if crate::access_policy::is_access_request(&response) {
+                            // One explicit file also keeps its direct floor refusal.
+                            if crate::access_policy::is_access_request(&response)
+                                || (targets.len() == 1 && response.data["code"] == "denied_floor")
+                            {
                                 return response;
                             }
                             entries.push(serde_json::json!({
@@ -496,15 +499,17 @@ fn handle_zoom_targets(
                         }
                     }
                     Err(response) => {
-                        if crate::access_policy::is_access_request(&response) {
+                        if crate::access_policy::is_access_request(&response)
+                            || (targets.len() == 1 && response.data["code"] == "denied_floor")
+                        {
                             return response;
                         }
-                        // A forbidden historical read refuses the call, rather
-                        // than being presented as a missing symbol in the batch.
+                        // Keep outside-root historical authorization failures
+                        // at call scope; floor refusals remain target-local.
                         if revision.is_some()
                             && matches!(
                                 response.data.get("code").and_then(|value| value.as_str()),
-                                Some("path_outside_root" | "denied_floor")
+                                Some("path_outside_root")
                             )
                         {
                             return response;
@@ -569,6 +574,7 @@ fn same_file_zoom_targets(req: &RawRequest, file: &str) -> Vec<serde_json::Value
 /// whitespace in `symbol`/`symbols` strings separate same-file lookups; nested
 /// signature text stays intact.
 pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
+    let _fetch_temp = super::url_resolution::FetchTempScope::enter();
     super::url_output::cap_zoom_response(req, ctx, handle_zoom_inner(req, ctx))
 }
 
@@ -1510,7 +1516,11 @@ fn zoom_one_symbol_inner(
 
     // LSP-enhanced disambiguation (S03)
     let matches = if let Some(hints) = lsp_hints::parse_lsp_hints(req) {
-        lsp_hints::apply_lsp_disambiguation(matches, &hints)
+        lsp_hints::apply_lsp_disambiguation(
+            matches,
+            &hints,
+            &ctx.resolve_relative_path(Path::new(".")),
+        )
     } else {
         matches
     };

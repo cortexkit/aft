@@ -1,13 +1,13 @@
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
-/** Recursive byte size of a file or directory; 0 when missing. */
+/** Physical byte size of a file or directory; symlink targets are excluded. */
 export function dirSize(path: string): number {
   if (!existsSync(path)) {
     return 0;
   }
 
-  const stat = statSync(path);
+  const stat = lstatSync(path);
   if (stat.isFile()) {
     return stat.size;
   }
@@ -24,9 +24,9 @@ export function dirSize(path: string): number {
 
 /** Human-readable file size: 12.3 KB / 4.5 MB / 1.2 GB. */
 export function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B";
+  if (!Number.isFinite(bytes) || bytes < 1) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
   return `${(bytes / 1024 ** i).toFixed(1)} ${units[i]}`;
 }
 

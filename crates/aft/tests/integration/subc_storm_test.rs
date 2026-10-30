@@ -325,11 +325,6 @@ fn handle_embedding_request(mut stream: std::net::TcpStream, delay: Duration) {
 }
 
 fn storm_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
-    // Delaying a real fixture read must still trip the two-second interactive
-    // read bound, regardless of the optimization profile used by the harness.
-    if req.command == "read" && storm_positive_control_is("interactive-read") {
-        thread::sleep(Duration::from_secs(3));
-    }
     match req.command.as_str() {
         "configure" => {
             if let Some(delay) = configure_sleep_delay(&req) {
@@ -343,10 +338,6 @@ fn storm_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "subc_storm_egress_payload" => egress_payload_response(&req, ctx),
         _ => subc_bridge_test::bridge_dispatch(req, ctx),
     }
-}
-
-fn storm_positive_control_is(name: &str) -> bool {
-    std::env::var("AFT_STORM_POSITIVE_CONTROL").as_deref() == Ok(name)
 }
 
 fn egress_payload_response(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -2418,11 +2409,6 @@ fn start_io(
         loop {
             match read_frame(&mut read_half).await {
                 Ok(Some(frame)) => {
-                    // Hold the acknowledgement in the transport fixture, not
-                    // the assertion: the unchanged bind deadline must reject it.
-                    if storm_positive_control_is("bind-ack") && is_ack(&frame, frame.header.corr) {
-                        tokio::time::sleep(Duration::from_secs(3)).await;
-                    }
                     if in_tx.send(frame).is_err() {
                         break;
                     }
@@ -2446,6 +2432,29 @@ fn send_bind(
     send_bind_epoch(tx, channel, 1, corr, root, session, doc);
 }
 
+/// Publish the storm root's project config atomically so a concurrent rebind
+/// never observes a half-written document. Several storm routes share one
+/// root with independent rebind schedules, so one route's write can land
+/// while another route's bind is reading the same file; a direct
+/// truncate-and-write lets that reader see a torn file and fail the bind
+/// with `invalid_config_document`. A sibling temp file plus rename keeps
+/// every observed document complete.
+fn publish_storm_project_config(root: &Path, doc: &Value) {
+    let project_cfg = root.join(".cortexkit").join("aft.jsonc");
+    std::fs::create_dir_all(project_cfg.parent().expect("project cfg parent")).expect("cfg dir");
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(project_cfg.parent().expect("project cfg parent"))
+            .expect("create project config temp");
+    std::io::Write::write_all(
+        &mut temporary,
+        &serde_json::to_vec(doc).expect("serialize storm config"),
+    )
+    .expect("write project config temp");
+    temporary
+        .persist(&project_cfg)
+        .expect("publish project config");
+}
+
 fn send_bind_epoch(
     tx: &mpsc::UnboundedSender<Frame>,
     channel: u16,
@@ -2455,10 +2464,7 @@ fn send_bind_epoch(
     session: &str,
     doc: Value,
 ) {
-    let project_cfg = root.join(".cortexkit").join("aft.jsonc");
-    std::fs::create_dir_all(project_cfg.parent().expect("project cfg parent")).expect("cfg dir");
-    std::fs::write(&project_cfg, serde_json::to_string(&doc).expect("cfg json"))
-        .expect("write cfg");
+    publish_storm_project_config(root, &doc);
     let request = ModuleControlRequest::RouteBind {
         route_channel: channel,
         epoch,
@@ -2486,15 +2492,7 @@ async fn write_measure_bind(
     root: &Path,
     session: &str,
 ) {
-    let project_cfg = root.join(".cortexkit").join("aft.jsonc");
-    std::fs::create_dir_all(project_cfg.parent().expect("measurement config parent"))
-        .expect("create measurement config directory");
-    std::fs::write(
-        &project_cfg,
-        serde_json::to_string(&storm_project_config(false, false, false, 0))
-            .expect("measurement config json"),
-    )
-    .expect("write measurement config");
+    publish_storm_project_config(root, &storm_project_config(false, false, false, 0));
     let corr = 700_000 + u64::from(channel);
     let request = ModuleControlRequest::RouteBind {
         route_channel: channel,

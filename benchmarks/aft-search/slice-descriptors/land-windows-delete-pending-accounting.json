@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "windows-delete-pending-accounting"
+  ],
+  "note": "Views v3 disk accounting and view-size walks read metadata from the directory listing (DirEntry::metadata) so a file being deleted on Windows no longer fails the walk with Access is denied. No changed path matches RANKING_FENCE_PREFIXES."
+}

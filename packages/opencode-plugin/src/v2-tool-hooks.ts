@@ -2,9 +2,11 @@ import type { SessionContext, SessionDomain } from "@opencode/plugin/effect/sess
 import type { ToolDomain } from "@opencode/plugin/effect/tool";
 import { Effect, Schema } from "effect";
 import { appendInTurnBgCompletions, hasHeldBgCompletions } from "./bg-notifications.js";
+import { sessionWarn } from "./logger.js";
 import { prepareOpenCodeArguments } from "./normalize-schemas.js";
 import { maybeAppendConflictsHint } from "./shared/bash-hints.js";
 import { rememberReadModel } from "./shared/read-vision.js";
+import { resolveSubagentStatus } from "./shared/subagent-detect.js";
 import type { PluginContext } from "./types.js";
 import {
   aftToolNameForV2Host,
@@ -92,7 +94,21 @@ export function registerV2ToolHooks(
             event.status === "completed" &&
             !hasHeldBgCompletions(event.sessionID)
           ) {
-            await runtime.drainBgNotifications(event.sessionID);
+            // A subagent's drain can wait for the current execution to settle
+            // after a tool abort. Joining it here would prevent that execution
+            // from ending. Let the existing handler continue in the background
+            // to deliver and acknowledge the completion after execution ends.
+            // Only a proven primary may wait for it from a tool hook.
+            if ((await resolveSubagentStatus(context, event.sessionID)) === false) {
+              await runtime.drainBgNotifications(event.sessionID);
+            } else {
+              void runtime.drainBgNotifications(event.sessionID).catch((error) => {
+                sessionWarn(
+                  event.sessionID,
+                  `Background notification drain failed: ${String(error)}`,
+                );
+              });
+            }
             if (!hasHeldBgCompletions(event.sessionID)) return;
           }
           if (

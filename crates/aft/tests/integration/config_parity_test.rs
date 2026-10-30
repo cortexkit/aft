@@ -23,11 +23,26 @@ fn fixtures_root() -> PathBuf {
         .join("config_parity")
 }
 
+/// Placeholder the capture script writes in front of paths that must be
+/// absolute, such as an accepted `storage.cache_dir`. `/aft-cache` is absolute
+/// on macOS and Linux but relative on Windows (no drive letter), so one fixture
+/// spelling cannot be absolute everywhere.
+const ABSOLUTE_ROOT_PLACEHOLDER: &str = "{ABSOLUTE_ROOT}";
+
+/// Replace the placeholder with an absolute root for this platform: empty on
+/// Unix (`{ABSOLUTE_ROOT}/aft-cache` becomes `/aft-cache`) and a drive letter
+/// on Windows (`C:/aft-cache`). Applied to the tier files and the golden alike,
+/// so both sides of the comparison carry the same platform path.
+fn platform_fixture_text(text: &str) -> String {
+    let root = if cfg!(windows) { "C:" } else { "" };
+    text.replace(ABSOLUTE_ROOT_PLACEHOLDER, root)
+}
+
 /// Read a tier file if present; returns None when the file is absent (case has
 /// no tier at that level).
 fn read_tier(dir: &Path, filename: &str, tier: &str) -> Option<ConfigTier> {
     let path = dir.join(filename);
-    let doc = fs::read_to_string(&path).ok()?;
+    let doc = platform_fixture_text(&fs::read_to_string(&path).ok()?);
     Some(ConfigTier {
         tier: tier.to_string(),
         source: path.to_string_lossy().to_string(),
@@ -106,15 +121,29 @@ fn assert_case(dir: &Path) -> Option<String> {
     // `idle.lsp_ttl_minutes`; both languages translate them in memory.
     let result = resolve_config_for_harness(&tiers, Some(&harness));
 
-    let golden: Value = serde_json::from_str(
+    let golden: Value = serde_json::from_str(&platform_fixture_text(
         &fs::read_to_string(dir.join("expected.json")).expect("read expected.json"),
-    )
+    ))
     .expect("parse expected.json");
 
     // A rejected TypeScript load must be rejected by Rust with the same codes.
     if let Some(rejected) = golden.get("rejected") {
         let want: Vec<String> = serde_json::from_value(rejected.clone()).expect("rejected codes");
-        return (result.errors != want).then(|| {
+        // The engine names the refused `bash.env` key and the plugin reports
+        // the section code; both reject the same candidate for the same
+        // reason, so code the engine's message as that section.
+        let got: Vec<String> = result
+            .errors
+            .iter()
+            .map(|error| {
+                if error.contains("blocked bash.env key") {
+                    "invalid_security_config:bash".to_string()
+                } else {
+                    error.clone()
+                }
+            })
+            .collect();
+        return (got != want).then(|| {
             format!(
                 "case `{case}`: rejection mismatch\n  resolved errors: {:?}\n  expected: {want:?}",
                 result.errors
@@ -122,6 +151,20 @@ fn assert_case(dir: &Path) -> Option<String> {
         });
     }
     if !result.errors.is_empty() {
+        // The engine refuses some `bash.env` names the plugin schema accepts.
+        // Two reasons, both deliberate: the plugin's project-tier check runs
+        // after the shared security-section classifier, so a refused project
+        // name is reported only as a member of that section, and the plugin
+        // schema cannot tell a user tier from a project tier on its own. The
+        // refusal must still name the key, so a fixture cannot pass here by
+        // having its environment field dropped silently.
+        let refused_here = result
+            .errors
+            .iter()
+            .all(|error| error.contains("blocked bash.env key"));
+        if refused_here && case.starts_with("bash_env_") {
+            return None;
+        }
         return Some(format!(
             "case `{case}`: Rust rejected a config TypeScript accepted: {:?}",
             result.errors
@@ -140,10 +183,22 @@ fn assert_case(dir: &Path) -> Option<String> {
 
     // Expected = Config::default() with the captured TS configure params overlaid.
     let mut golden = golden;
+    // A project's `bash.env` is carried as `project_env` on the TypeScript side;
+    // the Rust resolver reads the same values from the project tier itself.
+    golden
+        .as_object_mut()
+        .map(|object| object.remove("project_env"));
     fill_server_defaults(&mut golden);
     let mut want_json = serde_json::to_value(Config::default()).expect("serialize default config");
     overlay(&mut want_json, &golden);
 
+    // The engine carries a project's validated `bash.env` in `project_env` for
+    // `commands/bash.rs` to apply behind the trust check; it is not part of the
+    // configure-params surface both sides compare here.
+    resolved_json
+        .get_mut("bash")
+        .and_then(|bash| bash.as_object_mut())
+        .map(|bash| bash.remove("project_env"));
     normalize(&mut resolved_json);
     normalize(&mut want_json);
 

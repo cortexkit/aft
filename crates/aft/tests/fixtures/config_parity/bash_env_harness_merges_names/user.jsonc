@@ -1,0 +1,16 @@
+{
+  "bash": {
+    "env": {
+      "PARITY_BASE_ENV": "base"
+    }
+  },
+  "harnesses": {
+    "opencode": {
+      "bash": {
+        "env": {
+          "PARITY_HARNESS_ENV": "harness"
+        }
+      }
+    }
+  }
+}

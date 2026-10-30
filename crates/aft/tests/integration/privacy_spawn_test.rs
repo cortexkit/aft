@@ -166,6 +166,108 @@ fn timeout_group_snapshot(group: i32) -> String {
     }
 }
 
+/// One process the kernel still files under a process group.
+#[derive(Debug)]
+struct GroupMember {
+    pid: i32,
+    /// `proc_pidinfo(PROC_PIDTBSDINFO)` result: the `pbi_status` run state, or
+    /// the errno when the kernel would not describe the process.
+    state: Result<u32, i32>,
+}
+
+impl GroupMember {
+    /// Whether this member can still run. macOS refuses BSD info with ESRCH for
+    /// a process that has started exiting (it can no longer run or be
+    /// signalled, but stays listed in its group until its parent reaps it),
+    /// and reports `SZOMB` for an exited, unreaped one. Any other refusal
+    /// leaves the member's state unknown, so it counts as live.
+    fn is_live(&self) -> bool {
+        match self.state {
+            Ok(status) => status != libc::SZOMB,
+            Err(errno) => errno != libc::ESRCH,
+        }
+    }
+}
+
+/// Lists the processes the kernel files under `group`, including ones that
+/// are exiting or exited but not yet reaped.
+fn group_members(group: i32) -> Vec<GroupMember> {
+    const PROC_PGRP_ONLY: u32 = 2;
+    let mut pids = vec![0i32; 256];
+    let bytes = unsafe {
+        libc::proc_listpids(
+            PROC_PGRP_ONLY,
+            group as u32,
+            pids.as_mut_ptr().cast(),
+            (pids.len() * std::mem::size_of::<i32>()) as i32,
+        )
+    };
+    pids.truncate(usize::try_from(bytes).unwrap_or(0) / std::mem::size_of::<i32>());
+    pids.into_iter()
+        .filter(|pid| *pid > 0)
+        .map(|pid| {
+            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+            let read = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    (&mut info as *mut libc::proc_bsdinfo).cast(),
+                    size,
+                )
+            };
+            let state = if read == size {
+                Ok(info.pbi_status)
+            } else {
+                Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+            };
+            GroupMember { pid, state }
+        })
+        .collect()
+}
+
+/// Waits until `group` no longer exists, or returns why it still does at
+/// `deadline`.
+///
+/// `kill(-group, 0)` failing with ESRCH means the group is gone. On macOS it
+/// fails with EPERM instead while the group still exists but holds no process
+/// that could take a signal: for example, right after the leader is reaped, an
+/// orphaned member killed alongside it is still exiting or waiting for launchd
+/// to reap it. Such a group has nothing left to kill, so keep polling for it to
+/// disappear. An EPERM group that still has a live member is a survivor this
+/// process is not allowed to signal, and fails at once.
+fn await_group_exit(group: i32, deadline: Instant) -> Result<(), String> {
+    loop {
+        let result = unsafe { libc::kill(-group, 0) };
+        let error = std::io::Error::last_os_error().raw_os_error();
+        let members = if result == 0 {
+            None
+        } else if error == Some(libc::ESRCH) {
+            return Ok(());
+        } else if error == Some(libc::EPERM) {
+            let members = group_members(group);
+            if members.iter().any(GroupMember::is_live) {
+                return Err(format!(
+                    "kill(-{group}, 0) failed with EPERM while the group has a live member: {members:?}"
+                ));
+            }
+            Some(members)
+        } else {
+            return Err(format!("kill(-{group}, 0)={result}, errno={error:?}"));
+        };
+        if Instant::now() >= deadline {
+            return Err(match members {
+                None => format!("process group {group} still accepts signals"),
+                Some(members) => format!(
+                    "process group {group} was never reaped; members that can no longer run: {members:?}"
+                ),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn disclaimed_timeout_kills_foreground_background_and_pty_groups_with_seatbelt() {
     let project = macos_native_fixture_project();
@@ -214,22 +316,73 @@ fn disclaimed_timeout_kills_foreground_background_and_pty_groups_with_seatbelt()
                 ids[1], ids[2]
             );
             assert!(group > 0);
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                let result = unsafe { libc::kill(-group, 0) };
-                let error = std::io::Error::last_os_error().raw_os_error();
-                if result != 0 {
-                    if error != Some(libc::ESRCH) {
-                        eprintln!("timeout-group {case}: kill(-{group}, 0)={result}, errno={error:?}, identity={identity:?}\n{}\nstatus={status}", timeout_group_snapshot(group));
-                    }
-                    assert_eq!(error, Some(libc::ESRCH), "{case}, identity={identity:?}");
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    panic!("{case}: timed-out process group {group} survived, identity={identity:?}\n{}\nstatus={status}", timeout_group_snapshot(group));
-                }
-                std::thread::sleep(Duration::from_millis(10));
+            if let Err(reason) = await_group_exit(group, Instant::now() + Duration::from_secs(5)) {
+                panic!("{case}: timed-out process group {group} survived: {reason}, identity={identity:?}\n{}\nstatus={status}", timeout_group_snapshot(group));
             }
         }
     }
+}
+
+/// Spawns `/usr/bin/true` as the leader of its own process group and returns
+/// once it has exited but is still unreaped, the state in which macOS answers
+/// `kill(-group, 0)` with EPERM rather than ESRCH.
+fn unreaped_exited_group() -> (std::process::Child, i32) {
+    use std::os::unix::process::CommandExt;
+    let child = Command::new("/usr/bin/true")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let group = child.id() as i32;
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        let result = unsafe { libc::kill(-group, 0) };
+        if result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
+            return (child, group);
+        }
+        assert!(
+            Instant::now() < until,
+            "group {group} never became exited-but-unreaped"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn timeout_group_wait_outlasts_eperm_from_an_exited_unreaped_member() {
+    let (mut child, group) = unreaped_exited_group();
+    let reaper = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        child.wait().unwrap()
+    });
+    let result = await_group_exit(group, Instant::now() + Duration::from_secs(5));
+    reaper.join().unwrap();
+    assert_eq!(result, Ok(()));
+}
+
+#[test]
+fn timeout_group_wait_reports_an_exited_member_never_reaped_by_its_deadline() {
+    let (mut child, group) = unreaped_exited_group();
+    let result = await_group_exit(group, Instant::now() + Duration::from_millis(200));
+    child.wait().unwrap();
+    let reason = result.unwrap_err();
+    assert!(
+        reason.contains("was never reaped") && reason.contains(&format!("pid: {group}")),
+        "{reason}"
+    );
+}
+
+#[test]
+fn timeout_group_wait_reports_a_live_member_by_its_deadline() {
+    use std::os::unix::process::CommandExt;
+    let mut child = Command::new("/bin/sleep")
+        .arg("30")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let group = child.id() as i32;
+    let result = await_group_exit(group, Instant::now() + Duration::from_millis(200));
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let reason = result.unwrap_err();
+    assert!(reason.contains("still accepts signals"), "{reason}");
 }

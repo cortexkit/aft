@@ -71,22 +71,24 @@ pub(super) fn ledger_carrier(principal: &crate::sandbox_spawn::AuthenticatedPrin
 }
 
 pub(super) fn describe() -> Value {
-    serde_json::to_value(RoleDescribe {
-        majors: vec![Major {
-            version: "tool-provider/v1".into(),
-            ops: vec![
-                "role.describe".into(),
-                "tool.catalog".into(),
-                "tool.call".into(),
-                "tool.withdraw".into(),
-                "late_results".into(),
-                "late_results.ack".into(),
-            ],
-            stability: "alpha".into(),
-        }],
-        implementation_version: env!("CARGO_PKG_VERSION").into(),
-        capabilities: vec!["tool-catalog-confine/v1".into()],
-    })
+    serde_json::to_value(
+        RoleDescribe::new(
+            vec![Major {
+                version: "tool-provider/v1".into(),
+                ops: vec![
+                    "role.describe".into(),
+                    "tool.catalog".into(),
+                    "tool.call".into(),
+                    "tool.withdraw".into(),
+                    "late_results".into(),
+                    "late_results.ack".into(),
+                ],
+                stability: "alpha".into(),
+            }],
+            env!("CARGO_PKG_VERSION"),
+        )
+        .with_capabilities(vec!["tool-catalog-confine/v1".into()]),
+    )
     .expect("the commons role declaration is JSON")
 }
 
@@ -241,29 +243,92 @@ struct ServedTool {
     /// Admission validates those calls against it, and the command refuses
     /// `ref` by name when the setting is off.
     with_ref: Option<CatalogTool>,
+    /// Filled by module preparation, not by catalog discovery. Metadata only
+    /// needs schemas and digests; compiling call validators can be much slower.
     validator: OnceLock<jsonschema::Validator>,
 }
 
-static SERVED_TOOLS: LazyLock<[Vec<ServedTool>; 3]> = LazyLock::new(|| {
-    CatalogPreset::ALL.map(|preset| {
-        build_tools(preset)
-            .into_iter()
-            .map(|(catalog, with_runon, with_ref)| ServedTool {
-                catalog,
-                with_runon,
-                with_ref,
-                validator: OnceLock::new(),
-            })
-            .collect()
-    })
+static SERVED_TOOLS: [OnceLock<Vec<ServedTool>>; 3] = [const { OnceLock::new() }; 3];
+
+fn build_served_tools(preset: CatalogPreset) -> Vec<ServedTool> {
+    build_tools(preset)
+        .into_iter()
+        .map(|(catalog, with_runon, with_ref)| ServedTool {
+            catalog,
+            with_runon,
+            with_ref,
+            validator: OnceLock::new(),
+        })
+        .collect()
+}
+
+static ADMISSION_READY: LazyLock<()> = LazyLock::new(|| {
+    // Compilation recursively checks JSON Schema's own rules and can need more
+    // stack than the host's protocol thread provides. Prepare on a worker before HELLO.
+    // Catalog discovery must not wait for this unrelated admission preparation.
+    std::thread::Builder::new()
+        .name("aft-admission-validators".into())
+        .spawn(|| {
+            #[cfg(test)]
+            {
+                let gate = VALIDATOR_BUILD_GATE
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                if let Some((reached, release)) = gate {
+                    let _ = reached.send(());
+                    let _ = release.recv();
+                }
+            }
+            for preset in CatalogPreset::ALL {
+                for served in served_tools(preset) {
+                    served.validator.get_or_init(|| {
+                        let tool = served
+                            .with_runon
+                            .as_ref()
+                            .or(served.with_ref.as_ref())
+                            .unwrap_or(&served.catalog);
+                        #[cfg(test)]
+                        ADMISSION_WORK.with(|count| {
+                            let (catalogs, validators) = count.get();
+                            count.set((catalogs, validators + 1));
+                        });
+                        let validator = jsonschema::validator_for(&tool.input_schema)
+                            .expect("embedded schemas are valid JSON schemas");
+                        #[cfg(test)]
+                        VALIDATORS_COMPILED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        validator
+                    });
+                }
+            }
+        })
+        .expect("spawning the admission-validator builder")
+        .join()
+        .expect("embedded admission validators build on a worker")
 });
 
+/// Prepare immutable call validators before advertising the module's providers.
+/// Catalog discovery uses schema snapshots and does not need these validators.
+pub(super) fn prepare_admission() {
+    LazyLock::force(&ADMISSION_READY);
+}
+
+#[cfg(test)]
+static VALIDATORS_COMPILED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+type ValidatorBuildGate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+
+#[cfg(test)]
+static VALIDATOR_BUILD_GATE: Mutex<Option<ValidatorBuildGate>> = Mutex::new(None);
+
 fn served_tools(preset: CatalogPreset) -> &'static [ServedTool] {
-    &SERVED_TOOLS[match preset {
+    SERVED_TOOLS[match preset {
         CatalogPreset::Head => 0,
         CatalogPreset::Worker => 1,
         CatalogPreset::Reader => 2,
     }]
+    .get_or_init(|| build_served_tools(preset))
 }
 
 type ServedVariants = (CatalogTool, Option<CatalogTool>, Option<CatalogTool>);
@@ -496,6 +561,22 @@ pub(super) fn validate_catalog_request(
 ) -> Result<(CatalogRequest, CatalogPreset), ErrorBody> {
     let request: CatalogRequest = serde_json::from_value(body)
         .map_err(|e| errors::invalid_request("arguments", e.to_string()))?;
+    // The tool-provider contract reads a system-text item's preset as
+    // optional, where a missing preset asks for the provider's default text.
+    // AFT does not offer default text (its manifest does not declare
+    // system-text-default/v1), so it keeps refusing such an item with the
+    // error the contract's decoder gave while the preset was required. That
+    // decoder refused it before any other check ran, so this check runs first.
+    if request
+        .system_text
+        .as_ref()
+        .is_some_and(|item| item.preset.is_none())
+    {
+        return Err(errors::invalid_request(
+            "arguments",
+            "missing field `preset`",
+        ));
+    }
     let preset = CatalogPreset::parse("preset", request.preset.as_deref())?;
     if let Some((key, _)) = request.params.iter().next() {
         return Err(errors::invalid_request(
@@ -504,17 +585,19 @@ pub(super) fn validate_catalog_request(
         ));
     }
     if let Some(item) = &request.system_text {
-        if item.preset != "broca" && item.preset != preset.name() {
+        // Checked above: a system-text item without a preset never gets here.
+        let text_preset = item.preset.as_deref().unwrap_or_default();
+        if text_preset != "broca" && text_preset != preset.name() {
             return Err(errors::invalid_request(
                 "system_text.preset",
                 format!(
-                    "AFT serves the {:?} system text beside the {:?} catalog preset, or the legacy \"broca\" text",
-                    preset.name(), preset.name()
+                    "AFT serves the {:?} system text beside the {:?} catalog preset, or the legacy \"broca\" text; this request asked for {:?}",
+                    preset.name(), preset.name(), text_preset
                 ),
             ));
         }
         for (key, value) in &item.params {
-            if key != "worker" || !value.is_boolean() || item.preset != "broca" {
+            if key != "worker" || !value.is_boolean() || text_preset != "broca" {
                 return Err(errors::invalid_request(
                     &format!("system_text.params.{key}"),
                     "unsupported system-text parameter",
@@ -549,7 +632,7 @@ pub(super) fn catalog_for_request(
         powershell_available,
         (runon, revision_reads),
         worker_wait_max_ms,
-        false,
+        CatalogRestrictions::default(),
     )
 }
 
@@ -569,7 +652,32 @@ pub(super) fn catalog_for_confined_request(
         powershell_available,
         (runon, revision_reads),
         worker_wait_max_ms,
-        true,
+        CatalogRestrictions {
+            confined: true,
+            rich_ui: false,
+        },
+    )
+}
+
+pub(super) fn catalog_for_rich_ui_request(
+    request: CatalogRequest,
+    preset: CatalogPreset,
+    disabled: &[String],
+    revision_reads: bool,
+    worker_wait_max_ms: u64,
+    confined: bool,
+) -> Result<Value, ErrorBody> {
+    render_catalog(
+        request,
+        preset,
+        disabled,
+        false,
+        (false, revision_reads),
+        worker_wait_max_ms,
+        CatalogRestrictions {
+            confined,
+            rich_ui: true,
+        },
     )
 }
 
@@ -874,6 +982,12 @@ fn rename_served_tools(text: &str, served: &[String]) -> String {
     out
 }
 
+#[derive(Default)]
+struct CatalogRestrictions {
+    confined: bool,
+    rich_ui: bool,
+}
+
 /// `offers` is the session's (`runon`, `revision_reads`) pair: which
 /// enabled-only arguments its catalog carries.
 fn render_catalog(
@@ -883,7 +997,7 @@ fn render_catalog(
     powershell_available: bool,
     offers: (bool, bool),
     worker_wait_max_ms: u64,
-    confined: bool,
+    restrictions: CatalogRestrictions,
 ) -> Result<Value, ErrorBody> {
     #[cfg(test)]
     CATALOG_RENDERS.set(CATALOG_RENDERS.get() + 1);
@@ -895,10 +1009,41 @@ fn render_catalog(
         runon,
         revision_reads,
     ));
-    if confined {
+    if request.preset.is_none() {
+        answer = answer.with_presets(CatalogPreset::ALL.map(CatalogPreset::name));
+    }
+    if restrictions.rich_ui {
+        // Head catalogs normally omit the worker-only watch tool. A UI may
+        // observe an existing task without gaining permission to start one.
+        if preset == CatalogPreset::Head {
+            answer.tools.extend(
+                tools_for_session(
+                    CatalogPreset::Worker,
+                    disabled,
+                    false,
+                    false,
+                    revision_reads,
+                )
+                .into_iter()
+                .filter(|tool| tool.name == "bash_watch"),
+            );
+        }
         answer
             .tools
-            .retain(|tool| matches!(tool.name.as_str(), "read" | "grep" | "glob" | "outline"));
+            .retain(|tool| super::carrier_read_only::allowed(&tool.name));
+        for tool in &mut answer.tools {
+            if let Some(canonical) = crate::tool_gate::canonical_tool_name(&tool.name) {
+                tool.name = canonical.into();
+            }
+        }
+    }
+    if restrictions.confined {
+        answer.tools.retain(|tool| {
+            matches!(
+                tool.name.as_str(),
+                "read" | "grep" | "glob" | "outline" | "aft_outline"
+            )
+        });
         for tool in &mut answer.tools {
             if tool.name == "outline" {
                 tool.name = "aft_outline".into();
@@ -908,6 +1053,7 @@ fn render_catalog(
     // Last, once the served names are final: every description names the
     // tools of this catalog and no other.
     render_tool_references(&mut answer.tools);
+    declare_result_format(&mut answer.tools, super::result_body::DECLARE_RESULT_FORMAT);
     // Every preset can settle a keyed call after its reply (a held shell
     // call, or a scoped call whose end was never observed), so every catalog
     // declares the session capability that lets a custodian pull those
@@ -969,8 +1115,8 @@ fn render_catalog(
     content.as_object_mut().unwrap().remove("catalog_digest");
     // The preset is part of the fingerprint, so two presets can never share a
     // generation even if their content one day coincides. `head` adds
-    // nothing: an absent preset is `head`, and its fingerprint stays the one
-    // runners froze before presets existed.
+    // nothing: the preset-less answer serves head's tools, but its discovery
+    // list is additional content and participates in the fingerprint above.
     if preset != CatalogPreset::Head {
         content
             .as_object_mut()
@@ -984,6 +1130,14 @@ fn render_catalog(
         return Ok(json!({"generation": digest, "catalog_digest": digest}));
     }
     Ok(serde_json::to_value(answer).expect("catalog is JSON"))
+}
+
+pub(super) fn declare_result_format(tools: &mut [CatalogTool], enabled: bool) {
+    if enabled {
+        for tool in tools {
+            tool.result_format = Some(super::result_body::RESULT_FORMAT.to_string().into());
+        }
+    }
 }
 
 /// Admit a v1 `tool.call` before anything runs, and resolve the role it runs
@@ -1179,6 +1333,7 @@ pub(super) fn admission_trusted(
     call: &cortexkit_role_tool_provider::call::ToolCallRequest,
 ) -> bool {
     !matches!(identity.trust, super::BindTrust::Untrusted)
+        || super::carrier_read_only::observes_tasks(identity, &call.name)
         || (call.call_key.is_some()
             && identity.consumer_elicitation_capable
             && matches!(call.name.as_str(), "bash" | "powershell"))
@@ -1648,6 +1803,28 @@ async fn kill_on_owning_root(
 }
 
 impl LedgerEdge {
+    #[cfg(test)]
+    pub(super) fn retain_shell_for_egress_test(
+        &self,
+        root: crate::path_identity::ProjectRootId,
+        route: super::RouteChannel,
+        corr: u64,
+    ) {
+        self.calls.lock().unwrap().insert(
+            (route, corr),
+            LedgerCall {
+                root,
+                key: crate::db::call_ledger::Key {
+                    carrier: "egress-test".into(),
+                    call_key: "held-detach".into(),
+                },
+                shell: true,
+                detached: false,
+                expires_at: std::time::Instant::now() + std::time::Duration::from_secs(60),
+                withdrawn: None,
+            },
+        );
+    }
     pub(super) fn new() -> (
         std::sync::Arc<Self>,
         tokio::sync::mpsc::UnboundedReceiver<super::DecodedFrame>,
@@ -1690,8 +1867,27 @@ impl LedgerEdge {
             .run_owner
             .as_ref()
             .map_or(&identity.spawn_principal, |owner| &owner.run_principal);
+        let carrier = if super::occipital_route(identity) {
+            identity
+                .scope
+                .as_ref()
+                .map(|scope| {
+                    format!(
+                        "reserved:occipital#{}",
+                        serde_json::to_string(&json!([
+                            super::principal_id(&Some(scope.owner.clone())).unwrap(),
+                            scope.scope_ref,
+                            scope.scope_epoch.to_string()
+                        ]))
+                        .expect("scope tuple serializes")
+                    )
+                })
+                .unwrap_or_else(|| ledger_carrier(principal))
+        } else {
+            ledger_carrier(principal)
+        };
         crate::db::call_ledger::Key {
-            carrier: ledger_carrier(principal),
+            carrier,
             call_key: call_key.into(),
         }
     }
@@ -1750,16 +1946,26 @@ impl LedgerEdge {
         let Some(call_key) = call.call_key.as_deref() else {
             return Err(decoded);
         };
-        if admit(
-            &call,
-            identity.scope.is_some(),
-            &identity.disabled_tools,
-            crate::bash_background::powershell_available(),
-            &identity.session,
-            admission_trusted(&identity, &call),
-        )
-        .is_err()
-        {
+        let carrier = super::occipital_carrier_route(&identity);
+        let admitted = if carrier {
+            super::carrier_read_only::admit(&identity, body).and_then(|()| {
+                super::carrier_read_only::admit_operation(&identity, &call.name, &call.arguments)
+                    .map(|_| ())
+            })
+        } else if super::occipital_route(&identity) {
+            return Err(decoded);
+        } else {
+            admit(
+                &call,
+                identity.scope.is_some(),
+                &identity.disabled_tools,
+                crate::bash_background::powershell_available(),
+                &identity.session,
+                admission_trusted(&identity, &call),
+            )
+            .and_then(|_| super::rich_ui::admission::reject_non_carrier(&call.arguments))
+        };
+        if admitted.is_err() {
             return Err(decoded);
         };
         let held = matches!(identity.trust, BindTrust::Untrusted)
@@ -1790,21 +1996,38 @@ impl LedgerEdge {
             let metrics = metrics.clone();
             tokio::spawn(async move {
                 let result = ledger_refusal_result(&call, response, &identity.project_root);
-                if let Ok(frame) = build_tool_response_frame(
-                    decoded.frame.header.ver,
-                    route,
-                    decoded.frame.header.corr,
-                    decoded.frame.header.flags,
-                    &result,
-                    identity.trust,
-                ) {
+                let outgoing = if carrier {
+                    super::wire::build_carrier_response_frame(
+                        &decoded.frame,
+                        None,
+                        super::rich_ui::carrier::error_body(
+                            result.response.data["code"].as_str().unwrap_or("unknown"),
+                        ),
+                    )
+                } else {
+                    build_tool_response_frame(
+                        decoded.frame.header.ver,
+                        route,
+                        decoded.frame.header.corr,
+                        decoded.frame.header.flags,
+                        &result,
+                        identity.reply_policy(),
+                    )
+                };
+                if let Ok(frame) = outgoing {
                     let _ = send_reliable_writer_frame(&writer, &metrics, frame, "ledger refusal")
                         .await;
                 }
             });
             return Ok(());
         }
-        let scope = identity.scope.as_ref().map(ledger_scope);
+        // Carrier observations must not enter the scope owner's ack sequence,
+        // late-results feed or retention accounting.
+        let scope = if super::occipital_route(&identity) {
+            None
+        } else {
+            identity.scope.as_ref().map(ledger_scope)
+        };
         // composition_digest is the role crate's SHA-256 over JCS, without
         // schema-description projection. Hash before server shell injections.
         let digest = composition_digest(
@@ -1817,6 +2040,7 @@ impl LedgerEdge {
         let metrics = metrics.clone();
         let root = identity.root.clone();
         let request_id = format!("ledger-{}-{}", route.channel, decoded.frame.header.corr);
+        let include_tool_result_body = identity.tool_result_body && !carrier;
         let response_key = key.clone();
         let cancel = PersistentCancelSignal::new();
         let terminal_claim = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1870,7 +2094,7 @@ impl LedgerEdge {
                     }
                     ledger::reduce_expired(&conn, &key, now)
                         .and_then(|_| {
-                            ledger::admit(
+                            ledger::admit_with_tool_result_source(
                                 &conn,
                                 &key,
                                 &digest,
@@ -1880,6 +2104,7 @@ impl LedgerEdge {
                                 } else {
                                     State::DispatchStarted
                                 },
+                                include_tool_result_body,
                             )
                         })
                         .map_err(|error| {
@@ -1972,9 +2197,15 @@ impl LedgerEdge {
                             "ledger-attach".into(),
                             Box::new(move |ctx| {
                                 let row = ctx.db().and_then(|db| {
-                                    db.lock()
+                                    db.lock().ok().and_then(|conn| {
+                                        if include_tool_result_body {
+                                            ledger::get_for_replay(&conn, &key)
+                                        } else {
+                                            ledger::get(&conn, &key)
+                                        }
                                         .ok()
-                                        .and_then(|conn| ledger::get(&conn, &key).ok().flatten())
+                                        .flatten()
+                                    })
                                 });
                                 let _ = row_tx.send(row);
                                 Response::success("ledger-attach", json!({}))
@@ -1997,7 +2228,16 @@ impl LedgerEdge {
                                     let _ = send_reliable_writer_frame(
                                         &writer,
                                         &metrics,
-                                        frame,
+                                        if carrier {
+                                            WriterFrame::plain(frame)
+                                        } else {
+                                            WriterFrame::retained_tool_response_with_source(
+                                                frame,
+                                                identity.reply_policy(),
+                                                call.arguments.get("path").and_then(Value::as_str),
+                                                row.tool_result_source,
+                                            )
+                                        },
                                         "attached ledger result",
                                     )
                                     .await;
@@ -2037,9 +2277,22 @@ impl LedgerEdge {
                         &response_key,
                         row.frame.as_ref(),
                     ) {
-                        let _ =
-                            send_reliable_writer_frame(&writer, &metrics, frame, "ledger replay")
-                                .await;
+                        let _ = send_reliable_writer_frame(
+                            &writer,
+                            &metrics,
+                            if carrier {
+                                WriterFrame::plain(frame)
+                            } else {
+                                WriterFrame::retained_tool_response_with_source(
+                                    frame,
+                                    identity.reply_policy(),
+                                    call.arguments.get("path").and_then(Value::as_str),
+                                    row.tool_result_source,
+                                )
+                            },
+                            "ledger replay",
+                        )
+                        .await;
                     }
                 }
                 Ok(Admission::Conflict) => {
@@ -2065,16 +2318,27 @@ impl LedgerEdge {
                         return;
                     }
                     let result = ledger_refusal_result(&call, response, &identity.project_root);
-                    if let Ok(mut frame) = build_tool_response_frame(
-                        decoded.frame.header.ver,
-                        route,
-                        decoded.frame.header.corr,
-                        decoded.frame.header.flags,
-                        &result,
-                        identity.trust,
-                    ) {
+                    let outgoing = if carrier {
+                        super::wire::build_carrier_response_frame(
+                            &decoded.frame,
+                            None,
+                            super::rich_ui::carrier::error_body(
+                                result.response.data["code"].as_str().unwrap_or("unknown"),
+                            ),
+                        )
+                    } else {
+                        build_tool_response_frame(
+                            decoded.frame.header.ver,
+                            route,
+                            decoded.frame.header.corr,
+                            decoded.frame.header.flags,
+                            &result,
+                            identity.reply_policy(),
+                        )
+                    };
+                    if let Ok(mut frame) = outgoing {
                         if edge.finish_waiting(&decoded.frame) {
-                            frame = Self::cancelled_frame(&decoded.frame).unwrap();
+                            frame = Self::cancelled_frame(&decoded.frame).unwrap().into();
                         }
                         let _ =
                             send_reliable_writer_frame(&writer, &metrics, frame, "ledger refusal")
@@ -2236,6 +2500,7 @@ impl LedgerEdge {
                         parsed_body: Default::default(),
                         confinement: None,
                         launch_restore: None,
+                        codemode_policies: None,
                     });
                 }
                 Err(error) => log::warn!("withdrawn call could not be ended: {error}"),
@@ -2613,6 +2878,11 @@ impl LedgerEdge {
                     continue;
                 }
                 let actual = actual.clone();
+                let (tool_body_for_job, projection_error) =
+                    match outgoing.tool_result_source_for_retention() {
+                        Ok(body) => (body, None),
+                        Err(error) => (None, Some(error.to_string())),
+                    };
                 let recorded = RecordedFrame {
                     ty: outgoing.header.ty,
                     body: copy_terminal_body(&outgoing.body),
@@ -2623,6 +2893,9 @@ impl LedgerEdge {
                     Lane::Mutating,
                     "ledger-settle".into(),
                     Box::new(move |ctx| {
+                        if let Some(error) = projection_error {
+                            return Response::error("ledger-settle", "database_unavailable", error);
+                        }
                         let Some(db) = ctx.db() else {
                             return Response::error(
                                 "ledger-settle",
@@ -2659,23 +2932,27 @@ impl LedgerEdge {
                         } else {
                             inferred
                         };
-                        match ledger::settle(
+                        match ledger::settle_with_tool_result_source(
                             &conn,
                             &call.key,
                             &record_for_job,
                             &outcome,
                             reason,
                             ledger::now_ms(),
+                            tool_body_for_job.as_deref(),
                         ) {
                             Ok(true) => {}
                             Ok(false)
-                                if ledger::get(&conn, &call.key)
+                                if ledger::get_for_replay(&conn, &call.key)
                                     .ok()
                                     .flatten()
-                                    .and_then(|row| row.frame)
-                                    .is_some_and(|frame| {
-                                        frame.ty == record_for_job.ty
-                                            && frame.body == record_for_job.body
+                                    .is_some_and(|row| {
+                                        row.tool_result_source.as_deref()
+                                            == tool_body_for_job.as_deref()
+                                            && row.frame.is_some_and(|frame| {
+                                                frame.ty == record_for_job.ty
+                                                    && frame.body == record_for_job.body
+                                            })
                                     }) => {}
                             result => {
                                 return Response::error(
@@ -2859,30 +3136,48 @@ fn admit_as(
     trusted: bool,
     role: CallerRole,
 ) -> Result<(), ErrorBody> {
+    admit_role_name(
+        &call.name,
+        disabled,
+        powershell_available,
+        session,
+        trusted,
+        role,
+    )?;
+    admit_arguments(call, role, true)
+}
+
+/// Role admission is separate from served-argument validation because carrier
+/// bindings and operation arguments are translated only after task ownership.
+pub(super) fn admit_role_name(
+    name: &str,
+    disabled: &[String],
+    powershell_available: bool,
+    session: &str,
+    trusted: bool,
+    role: CallerRole,
+) -> Result<(), ErrorBody> {
     if !METADATA
         .iter()
         .chain(PRESET_ONLY_METADATA)
-        .any(|(name, _, _)| *name == call.name)
+        .any(|(tool, _, _)| *tool == name)
     {
-        return Err(errors::unknown_tool(&call.name));
+        return Err(errors::unknown_tool(name));
     }
-    if role == CallerRole::Reader && !READER_TOOLS.contains(&call.name.as_str()) {
+    if role == CallerRole::Reader && !READER_TOOLS.contains(&name) {
         return Err(ErrorBody::new(
             errors::UNKNOWN_TOOL,
-            format!(
-                "tool {:?} is not served by the \"reader\" preset",
-                call.name
-            ),
+            format!("tool {:?} is not served by the \"reader\" preset", name),
         )
-        .with_detail(json!({"tool": call.name, "preset": CatalogPreset::Reader.name()})));
+        .with_detail(json!({"tool": name, "preset": CatalogPreset::Reader.name()})));
     }
-    if crate::tool_gate::refusal_by_name("v1-admission", &call.name, disabled).is_some() {
-        return Err(errors::tool_disabled(&call.name));
+    if crate::tool_gate::refusal_by_name("v1-admission", name, disabled).is_some() {
+        return Err(errors::tool_disabled(name));
     }
-    if call.name == "powershell" && !powershell_available {
+    if name == "powershell" && !powershell_available {
         return Err(
             ErrorBody::new(errors::TOOL_UNAVAILABLE, "PowerShell is not available")
-                .with_detail(json!({"tool": call.name, "reason": "under_review"})),
+                .with_detail(json!({"tool": name, "reason": "under_review"})),
         );
     }
     if session.is_empty() {
@@ -2891,9 +3186,17 @@ fn admit_as(
             "v1 execution requires a bound session",
         ));
     }
-    if let Some(error) = shell_capability_refusal(&call.name, trusted) {
+    if let Some(error) = shell_capability_refusal(name, trusted) {
         return Err(error);
     }
+    Ok(())
+}
+
+pub(super) fn admit_arguments(
+    call: &cortexkit_role_tool_provider::call::ToolCallRequest,
+    role: CallerRole,
+    check_pin: bool,
+) -> Result<(), ErrorBody> {
     // The worker preset serves every head tool plus the preset-only ones, so
     // its catalog holds the served schema of every admitted name.
     let served = served_tools(CatalogPreset::Worker)
@@ -2920,7 +3223,7 @@ fn admit_as(
             .find(|entry| entry.catalog.name == call.name)
             .map_or(tool.semantics, |entry| entry.catalog.semantics)
     };
-    if let Some(encoded) = &call.schema_pin {
+    if let Some(encoded) = call.schema_pin.as_ref().filter(|_| check_pin) {
         let pin = SchemaPin::parse(encoded)
             .map_err(|error| errors::invalid_request("schema_pin", error.to_string()))?;
         if pin.schema_digest != tool.schema_digest
@@ -2942,7 +3245,31 @@ fn admit_as(
         .arguments
         .as_object()
         .ok_or_else(|| errors::invalid_request("arguments", "arguments must be an object"))?;
-    let legacy = legacy_file_path_arguments(&call.name, arguments)?;
+    let properties = tool
+        .input_schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .expect("embedded schemas have properties");
+    let legacy = if call.name == "zoom" {
+        // Keep the existing refusal for mixed batch and top-level forms, even
+        // though the translator can combine them into a single batch.
+        if arguments.contains_key("batch") {
+            if let Some(key) = arguments.keys().find(|key| !properties.contains_key(*key)) {
+                return Err(errors::invalid_request(
+                    key,
+                    "argument is absent from the served schema",
+                ));
+            }
+        }
+        // Legacy zoom spellings are runtime aliases, not catalog properties.
+        // Check a normalized copy; dispatch still translates the original call.
+        let mut normalized = arguments.clone();
+        crate::subc_translate::normalize_zoom_aliases(&mut normalized)
+            .map_err(|error| errors::invalid_request("arguments", error.message))?;
+        Some(Value::Object(normalized))
+    } else {
+        legacy_file_path_arguments(&call.name, arguments)?
+    };
     let (arguments, checked) = match &legacy {
         Some(renamed) => (
             renamed
@@ -2952,11 +3279,6 @@ fn admit_as(
         ),
         None => (arguments, &call.arguments),
     };
-    let properties = tool
-        .input_schema
-        .get("properties")
-        .and_then(Value::as_object)
-        .expect("embedded schemas have properties");
     for key in arguments.keys() {
         if !properties.contains_key(key) {
             return Err(errors::invalid_request(
@@ -2968,15 +3290,11 @@ fn admit_as(
             return Err(errors::invalid_request(key, "host-only argument"));
         }
     }
-    let validator = served.validator.get_or_init(|| {
-        #[cfg(test)]
-        ADMISSION_WORK.with(|count| {
-            let (catalogs, validators) = count.get();
-            count.set((catalogs, validators + 1));
-        });
-        jsonschema::validator_for(&tool.input_schema)
-            .expect("embedded schemas are valid JSON schemas")
-    });
+    prepare_admission();
+    let validator = served
+        .validator
+        .get()
+        .expect("admission preparation compiles every served schema");
     if let Some(error) = validator.iter_errors(checked).next() {
         let field = error.instance_path.to_string();
         return Err(errors::invalid_request(
@@ -3192,6 +3510,7 @@ mod tests {
     fn warm_admission_does_not_rebuild_catalog_or_validator() {
         let request = call("read", json!({"filePath": "src/main.rs", "limit": 200}));
         admit(&request, false, &[], true, "session", true).unwrap();
+        let compiled = VALIDATORS_COMPILED.load(std::sync::atomic::Ordering::SeqCst);
         ADMISSION_WORK.with(|count| count.set((0, 0)));
         for _ in 0..12 {
             admit(&request, false, &[], true, "session", true).unwrap();
@@ -3201,6 +3520,11 @@ mod tests {
             work,
             (0, 0),
             "catalog builds, validator compilations: {work:?}"
+        );
+        assert_eq!(
+            VALIDATORS_COMPILED.load(std::sync::atomic::Ordering::SeqCst),
+            compiled,
+            "warm admission must not compile on another thread either"
         );
     }
 
@@ -3707,6 +4031,30 @@ mod tests {
         }
     }
 
+    /// AFT offers no default system text, so a system-text item without a
+    /// preset is refused, byte for byte as it was while the contract's decoder
+    /// still required the preset.
+    #[test]
+    fn system_text_without_a_preset_is_refused_as_before() {
+        for body in [
+            json!({"system_text": {"params": {}}}),
+            json!({"preset": "worker", "system_text": {"params": {"worker": true}}}),
+            // The old decoder refused the missing preset before the unknown
+            // catalog preset was ever looked at.
+            json!({"preset": "bogus", "system_text": {"params": {}}}),
+        ] {
+            let error = catalog(body, &[], true).unwrap_err();
+            assert_eq!(
+                serde_json::to_value(&error).unwrap(),
+                serde_json::to_value(errors::invalid_request(
+                    "arguments",
+                    "missing field `preset`"
+                ))
+                .unwrap()
+            );
+        }
+    }
+
     fn names(reply: &Value) -> Vec<String> {
         reply["tools"]
             .as_array()
@@ -3740,9 +4088,30 @@ mod tests {
     }
 
     #[test]
-    fn head_preset_is_byte_identical_to_the_catalog_without_a_preset() {
-        // An absent preset is `head`, and naming `head` must not move a byte
-        // or the fingerprint a runner froze before presets existed.
+    fn presetless_catalog_lists_exactly_the_served_presets() {
+        let answer = catalog(json!({}), &[], false).unwrap();
+        assert_eq!(answer["presets"], json!(["head", "worker", "reader"]));
+        println!("PRESETLESS_CATALOG_JSON={answer}");
+    }
+
+    #[test]
+    fn preset_specific_catalog_omits_presets() {
+        for preset in CatalogPreset::ALL {
+            let answer = catalog(json!({"preset": preset.name()}), &[], false).unwrap();
+            assert!(answer.get("presets").is_none(), "{}", preset.name());
+        }
+    }
+
+    #[test]
+    fn head_preset_matches_presetless_content_except_discovery_and_fingerprint() {
+        // Both requests serve head's tools and text. Only the preset-less
+        // answer lists presets, so its content fingerprint is different.
+        let without_discovery = |mut answer: Value| {
+            for field in ["presets", "generation", "catalog_digest"] {
+                answer.as_object_mut().unwrap().remove(field);
+            }
+            answer
+        };
         for available in [false, true] {
             for (worker, text) in [(false, "broca"), (true, "broca"), (false, "head")] {
                 let params = if text == "broca" {
@@ -3762,16 +4131,17 @@ mod tests {
                     available,
                 )
                 .unwrap();
+                assert_ne!(named["catalog_digest"], unnamed["catalog_digest"]);
                 assert_eq!(
-                    serde_json::to_vec(&named).unwrap(),
-                    serde_json::to_vec(&unnamed).unwrap(),
+                    without_discovery(named),
+                    without_discovery(unnamed),
                     "pwsh={available} worker={worker} text={text}"
                 );
             }
             let bare = catalog(json!({}), &[], available).unwrap();
             assert_eq!(
-                catalog(json!({"preset": "head"}), &[], available).unwrap(),
-                bare
+                without_discovery(catalog(json!({"preset": "head"}), &[], available).unwrap()),
+                without_discovery(bare.clone())
             );
             assert!(!names(&bare).contains(&"bash_watch".to_string()));
         }
@@ -4727,7 +5097,11 @@ mod tests {
 }
 
 #[cfg(test)]
-mod route_tests {
+pub(in crate::subc) mod route_tests {
+    mod carrier_samples;
+    #[path = "../../rich_ui/admission/route_tests.rs"]
+    mod operation_admission;
+
     use super::super::*;
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4798,9 +5172,10 @@ mod route_tests {
             trust: BindTrust::FirstParty,
             spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,
+            tool_result_body: false,
             disabled_tools: Arc::new(disabled),
             scope,
-            run_scope: OnceLock::new(),
+            run_scope: std::sync::OnceLock::new(),
             call_mode: subc_protocol::call_mode::CallMode::Classic,
             made_tool_call: AtomicBool::new(false),
             run_owner: None,
@@ -4827,9 +5202,6 @@ mod route_tests {
         metrics: &Arc<DispatchPathMetrics>,
         dispatch: DispatchFn,
     ) -> WriterFrame {
-        let executor = Arc::new(Executor::new());
-        assert!(executor.register_actor(identity.root.clone(), ctx));
-        let routes = HashMap::from([(route_key(41, 1), identity)]);
         let frame = Frame::build(
             FrameType::Request,
             control_flags(),
@@ -4839,12 +5211,26 @@ mod route_tests {
             serde_json::to_vec(&body).unwrap(),
         )
         .unwrap();
+        exchange_frame_with_actor(frame, identity, ctx, metrics, dispatch).await
+    }
+
+    async fn exchange_frame_with_actor(
+        frame: Frame,
+        identity: RouteIdentity,
+        ctx: Arc<AppContext>,
+        metrics: &Arc<DispatchPathMetrics>,
+        dispatch: DispatchFn,
+    ) -> WriterFrame {
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(identity.root.clone(), ctx));
+        let routes = HashMap::from([(route_key(41, 1), identity)]);
         // As on the frame loop, a scoped worker's saved confinement is read
         // off the loop first when memory cannot answer for it.
         let decoded = DecodedFrame {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame,
             phase_trace: PhaseTrace::new(Instant::now()),
         };
@@ -4856,23 +5242,44 @@ mod route_tests {
         exchange_decoded_with_actor(decoded, &routes, &executor, metrics, dispatch).await
     }
 
-    async fn exchange_decoded_with_actor(
+    pub(in crate::subc) async fn exchange_decoded_with_actor(
         decoded: DecodedFrame,
         routes: &HashMap<RouteChannel, RouteIdentity>,
         executor: &Arc<Executor>,
         metrics: &Arc<DispatchPathMetrics>,
         dispatch: DispatchFn,
     ) -> WriterFrame {
+        exchange_decoded_with_capabilities(
+            decoded,
+            routes,
+            executor,
+            metrics,
+            dispatch,
+            crate::subc::rich_ui::session::ProofCapabilities::from_manifest(
+                &manifest::build_manifest(),
+            ),
+        )
+        .await
+    }
+
+    pub(in crate::subc) async fn exchange_decoded_with_capabilities(
+        decoded: DecodedFrame,
+        routes: &HashMap<RouteChannel, RouteIdentity>,
+        executor: &Arc<Executor>,
+        metrics: &Arc<DispatchPathMetrics>,
+        dispatch: DispatchFn,
+        proofs: crate::subc::rich_ui::session::ProofCapabilities,
+    ) -> WriterFrame {
         let (writer, mut replies) = mpsc::channel(8);
         let (bash_tx, _bash_rx) = mpsc::channel(8);
         let (touch_tx, _touch_rx) = mpsc::channel(8);
-        let (deferred_tx, _deferred_rx) = mpsc::unbounded_channel();
+        let (deferred_tx, mut deferred_rx) = mpsc::unbounded_channel();
         let deferred_tx = super::super::DeferredResponseSender {
             entries: deferred_tx,
             wake: crate::response_finalize::DeferredResponseWake::default(),
         };
         let frame = decoded.frame;
-        handle_tool_call(
+        handle_tool_call_with_capabilities(
             &writer,
             &frame,
             None,
@@ -4903,13 +5310,34 @@ mod route_tests {
             1024 * 1024,
             &drain::ModuleDrainWindow::default(),
             None,
+            proofs,
         )
         .await
         .unwrap();
-        let reply = tokio::time::timeout(Duration::from_secs(3), replies.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let mut reply = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::select! {
+                reply = replies.recv() => reply.unwrap(),
+                entry = deferred_rx.recv() => {
+                    let mut entry = entry.expect("deferred tool setup");
+                    let ctx = executor.actor_context(&entry.root).unwrap();
+                    let response = loop {
+                        if let Some(response) = (entry.pending.poll)(&ctx) {
+                            break response;
+                        }
+                        deferred_tx.wake.notified().await;
+                    };
+                    deliver_resolved_subc_response(
+                        &writer, ResolvedSubcResponse { entry, response }, routes,
+                        &mut HashMap::new(), executor, &Arc::default(),
+                        &Arc::new(Notify::new()), metrics, 1024 * 1024,
+                    ).await.unwrap();
+                    replies.recv().await.unwrap()
+                }
+            }
+        })
+        .await
+        .unwrap();
+        reply.project_tool_result().unwrap();
         assert!(matches!(
             reply.header.ty,
             FrameType::Response | FrameType::Error | FrameType::StreamEnd
@@ -4920,6 +5348,777 @@ mod route_tests {
                 .is_err()
         );
         reply
+    }
+
+    fn occipital_identity(root: &ProjectRootId, role: RouteRole) -> RouteIdentity {
+        let mut identity = test_support::route_identity(root, "session-s");
+        let data = Arc::get_mut(&mut identity.0).unwrap();
+        data.role = role;
+        data.trust = BindTrust::Untrusted;
+        data.scope = Some(stamp("worker"));
+        data.spawn_principal = AuthenticatedPrincipal::RouteBind {
+            trust: crate::sandbox_spawn::PrincipalTrust::Untrusted,
+            route_channel: 41,
+            route_epoch: 1,
+            project_root: root.as_path().into(),
+            harness: data.harness.clone(),
+            session_id: data.session.clone(),
+            principal_id: Some("reserved:occipital".into()),
+        };
+        identity
+    }
+
+    #[tokio::test]
+    async fn occipital_refuses_unlisted_tools_before_dispatch() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        ACTIONS.store(0, Ordering::SeqCst);
+        let (_dir, root) = test_support::test_root("occipital-denied");
+        let mut names: Vec<_> = METADATA
+            .iter()
+            .map(|(name, _, _)| *name)
+            .filter(|name| {
+                !matches!(
+                    *name,
+                    "read"
+                        | "grep"
+                        | "glob"
+                        | "bash_status"
+                        | "outline"
+                        | "zoom"
+                        | "search"
+                        | "callgraph"
+                )
+            })
+            .collect();
+        names.extend([
+            "aft_inspect",
+            "aft_delete",
+            "aft_move",
+            "aft_import",
+            "aft_safety",
+            "future_tool",
+            "configure",
+            "grants.revoke",
+            "call.withdraw",
+        ]);
+        for role in [RouteRole::ToolProviderV1, RouteRole::Legacy] {
+            for name in &names {
+                let identity = occipital_identity(&root, role);
+                let reply = exchange_with_actor(
+                    json!({"name": name, "preset": "worker", "arguments": {}}),
+                    identity,
+                    test_support::test_ctx(),
+                    &Arc::new(DispatchPathMetrics::new()),
+                    |request, _| {
+                        ACTIONS.fetch_add(1, Ordering::SeqCst);
+                        Response::success(request.id, json!({}))
+                    },
+                )
+                .await;
+                let body: Value = serde_json::from_slice(&reply.body).unwrap();
+                assert_eq!(reply.header.ty, FrameType::Error, "{name}: {body}");
+                assert_eq!(body["code"], "carrier_read_only", "{name}: {body}");
+                assert_eq!(
+                    body["message"],
+                    format!(
+                        "This route is read-only: {name} is not available to the rich-UI provider."
+                    )
+                );
+                assert_eq!(ACTIONS.load(Ordering::SeqCst), 0, "{name} dispatched");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn occipital_allowed_reads_require_versioned_operations_on_v1() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        let (_dir, root) = test_support::test_root("occipital-allowed");
+        for role in [RouteRole::ToolProviderV1, RouteRole::Legacy] {
+            for (name, arguments, internal) in [
+                ("read", json!({"path":"main.rs"}), "read"),
+                ("aft_outline", json!({"target":"main.rs"}), "outline"),
+                (
+                    "aft_zoom",
+                    json!({"batch":[{"target":"main.rs","symbols":"main"}]}),
+                    "zoom",
+                ),
+                ("aft_search", json!({"query":"main"}), "semantic_search"),
+                ("grep", json!({"pattern":"main"}), "grep"),
+                ("glob", json!({"pattern":"*.rs"}), "glob"),
+                (
+                    "aft_callgraph",
+                    json!({"path":"main.rs","symbol":"main","op":"callers"}),
+                    "callers",
+                ),
+            ] {
+                *LAST_DISPATCH.lock().unwrap() = None;
+                let identity = occipital_identity(&root, role);
+                let reply = exchange_with_actor(
+                    json!({"name":name,"preset":"worker","arguments":arguments}),
+                    identity,
+                    test_support::test_ctx(),
+                    &Arc::new(DispatchPathMetrics::new()),
+                    |request, _| {
+                        assert!(matches!(
+                            crate::access_policy::current_ask_route(),
+                            crate::access_policy::AskRoute::Deny
+                        ));
+                        *LAST_DISPATCH.lock().unwrap() = Some(json!({
+                            "command":request.command, "session":request.session(),
+                        }));
+                        Response::success(request.id, json!({"marker":"session-read"}))
+                    },
+                )
+                .await;
+                let body: Value = serde_json::from_slice(&reply.body).unwrap();
+                assert_eq!(reply.header.ty, FrameType::Response, "{name}: {body}");
+                if role == RouteRole::ToolProviderV1 {
+                    assert_eq!(
+                        body,
+                        super::super::rich_ui::carrier::error_body("rich_ui_op_malformed")
+                    );
+                    assert_eq!(*LAST_DISPATCH.lock().unwrap(), None);
+                    continue;
+                }
+                assert_eq!(body["isError"], false, "{name}: {body}");
+                assert_eq!(
+                    *LAST_DISPATCH.lock().unwrap(),
+                    Some(json!({"command":internal,"session":"session-s"})),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn occipital_refuses_future_tools_by_default() {
+        let (_dir, root) = test_support::test_root("occipital-future-tool");
+        for role in [RouteRole::ToolProviderV1, RouteRole::Legacy] {
+            let reply = exchange_with_actor(
+                json!({"name":"future_tool","preset":"worker","arguments":{}}),
+                occipital_identity(&root, role),
+                test_support::test_ctx(),
+                &Arc::new(DispatchPathMetrics::new()),
+                |_, _| panic!("unknown tools must not dispatch"),
+            )
+            .await;
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(reply.header.ty, FrameType::Error, "{body}");
+            assert_eq!(body["code"], "carrier_read_only", "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn occipital_tool_refusal_precedes_target_refusal_for_both_result_bodies() {
+        let (_dir, root) = test_support::test_root("occipital-refusal-order");
+        for tool_result_body in [false, true] {
+            for name in ["write", "future_tool"] {
+                for target in ["https://example.com/doc", "issue://123", "pr://123"] {
+                    let mut identity = occipital_identity(&root, RouteRole::ToolProviderV1);
+                    Arc::get_mut(&mut identity.0).unwrap().tool_result_body = tool_result_body;
+                    let reply = exchange_with_actor(
+                        json!({"name":name,"preset":"worker","arguments":{"path":target,"content":"never written"}}),
+                        identity, test_support::test_ctx(), &Arc::new(DispatchPathMetrics::new()),
+                        |_, _| panic!("forbidden tool must not dispatch"),
+                    ).await;
+                    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+                    assert_eq!(reply.header.ty, FrameType::Error, "{body}");
+                    assert_eq!(body["code"], "carrier_read_only", "{body}");
+                    assert_eq!(body["message"], format!("This route is read-only: {name} is not available to the rich-UI provider."));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn occipital_unpublished_read_uses_closed_carrier_body() {
+        let _manifest = super::super::rich_ui::chunks::set_test_manifest_for_test(None);
+        let (_dir, root) = test_support::test_root("occipital-tool-result");
+        let mut identity = occipital_identity(&root, RouteRole::ToolProviderV1);
+        Arc::get_mut(&mut identity.0).unwrap().tool_result_body = true;
+        let reply = exchange_with_actor(
+            json!({"name":"read","preset":"worker","arguments":{"path":"local.txt","rich_ui_op":"read@1"}}),
+            identity,
+            test_support::test_ctx(),
+            &Arc::new(DispatchPathMetrics::new()),
+            |_, _| panic!("unpublished operations must not dispatch"),
+        )
+        .await;
+        assert_eq!(reply.header.ty, FrameType::Response);
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(
+            body,
+            super::super::rich_ui::carrier::error_body("operation_version_unsupported")
+        );
+        super::super::rich_ui::carrier::validate_body(None, &body).unwrap();
+    }
+
+    #[tokio::test]
+    async fn occipital_refuses_management_operations_and_spoofed_identity() {
+        let (_dir, root) = test_support::test_root("occipital-operations");
+        for operation in [
+            "grants.revoke",
+            "grants.list",
+            "call.withdraw",
+            "call.pull",
+            "configure",
+            "health.digest",
+            "bg_events",
+            "future.operation",
+        ] {
+            let reply = exchange_with_actor(
+                json!({"op":operation,"principal":"reserved:broca","params":{}}),
+                occipital_identity(&root, RouteRole::ToolProviderV1),
+                test_support::test_ctx(),
+                &Arc::new(DispatchPathMetrics::new()),
+                |_, _| panic!("refused operation must not dispatch"),
+            )
+            .await;
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(reply.header.ty, FrameType::Error, "{operation}: {body}");
+            assert_eq!(body["code"], "carrier_read_only", "{operation}: {body}");
+        }
+    }
+
+    async fn occipital_network_target_case(name: &str, target: &str, kind: &str) {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        ACTIONS.store(0, Ordering::SeqCst);
+        let (_dir, root) = test_support::test_root("occipital-network-target");
+        let arguments = match name {
+            "read" => json!({"path": target}),
+            "aft_outline" => json!({"target": target}),
+            "aft_zoom" => json!({"batch":[{"target":target,"symbols":"Overview"}]}),
+            _ => panic!("unexpected target-bearing tool"),
+        };
+        for role in [RouteRole::ToolProviderV1, RouteRole::Legacy] {
+            let reply = exchange_with_actor(
+                json!({"name":name,"preset":"worker","arguments":arguments}),
+                occipital_identity(&root, role),
+                test_support::test_ctx(),
+                &Arc::new(DispatchPathMetrics::new()),
+                |request, _| {
+                    ACTIONS.fetch_add(1, Ordering::SeqCst);
+                    Response::success(request.id, json!({}))
+                },
+            )
+            .await;
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(reply.header.ty, FrameType::Error, "{name} {target}: {body}");
+            assert_eq!(body["code"], "carrier_read_only", "{body}");
+            assert_eq!(body["message"], format!("This route is read-only: {kind} targets are not available to the rich-UI provider."));
+            assert_eq!(
+                ACTIONS.load(Ordering::SeqCst),
+                0,
+                "network target dispatched"
+            );
+        }
+    }
+
+    macro_rules! network_target_test {
+        ($test:ident, $tool:literal, $target:literal, $kind:literal) => {
+            #[tokio::test]
+            async fn $test() {
+                occipital_network_target_case($tool, $target, $kind).await;
+            }
+        };
+    }
+
+    network_target_test!(
+        occipital_denies_read_issue_target,
+        "read",
+        "issue://123",
+        "issue://"
+    );
+    network_target_test!(occipital_denies_read_pr_target, "read", "pr://123", "pr://");
+    network_target_test!(
+        occipital_denies_outline_http_target,
+        "aft_outline",
+        "http://example.com/doc",
+        "URL"
+    );
+    network_target_test!(
+        occipital_denies_outline_https_target,
+        "aft_outline",
+        "https://example.com/doc",
+        "URL"
+    );
+    network_target_test!(
+        occipital_denies_outline_issue_target,
+        "aft_outline",
+        "issue://123",
+        "issue://"
+    );
+    network_target_test!(
+        occipital_denies_outline_pr_target,
+        "aft_outline",
+        "pr://123",
+        "pr://"
+    );
+    network_target_test!(
+        occipital_denies_zoom_http_target,
+        "aft_zoom",
+        "http://example.com/doc",
+        "URL"
+    );
+    network_target_test!(
+        occipital_denies_zoom_https_target,
+        "aft_zoom",
+        "https://example.com/doc",
+        "URL"
+    );
+    network_target_test!(
+        occipital_denies_zoom_issue_target,
+        "aft_zoom",
+        "issue://123",
+        "issue://"
+    );
+    network_target_test!(
+        occipital_denies_zoom_pr_target,
+        "aft_zoom",
+        "pr://123",
+        "pr://"
+    );
+
+    #[tokio::test]
+    async fn occipital_network_target_aliases_cannot_bypass_admission() {
+        let (_dir, root) = test_support::test_root("occipital-target-aliases");
+        for (name, arguments) in [
+            ("read", json!({"path":"issue://123"})),
+            ("outline", json!({"target":["local.rs", "pr://123"]})),
+            (
+                "zoom",
+                json!({"path":"http://example.com/doc","symbol":"Overview"}),
+            ),
+            (
+                "zoom",
+                json!({"url":"https://example.com/doc","symbols":"Overview"}),
+            ),
+            ("zoom", json!({"path":"pr://123","symbol":"1"})),
+            (
+                "zoom",
+                json!({"targets":[{"url":"https://example.com/doc","symbol":"Overview"}]}),
+            ),
+            (
+                "zoom",
+                json!({"targets":{"path":"issue://123","symbol":"1"}}),
+            ),
+            (
+                "zoom",
+                json!({"batch":"[{\"target\":\"https://example.com/doc\",\"symbols\":\"Overview\"}]"}),
+            ),
+            (
+                "zoom",
+                json!({"batch":[{"target":"local.rs","symbols":"main"},{"url":"pr://123","symbols":"1"}]}),
+            ),
+        ] {
+            let reply = exchange_with_actor(
+                json!({"name":name,"preset":"worker","arguments":arguments}),
+                occipital_identity(&root, RouteRole::Legacy),
+                test_support::test_ctx(),
+                &Arc::new(DispatchPathMetrics::new()),
+                |_, _| panic!("remote target alias must not dispatch"),
+            )
+            .await;
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(reply.header.ty, FrameType::Error, "{name}: {body}");
+            assert_eq!(body["code"], "carrier_read_only", "{name}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn occipital_target_restrictions_do_not_affect_normal_routes() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        ACTIONS.store(0, Ordering::SeqCst);
+        let (_dir, root) = test_support::test_root("normal-network-target");
+        for (name, targets) in [
+            ("read", vec!["issue://123", "pr://123"]),
+            (
+                "outline",
+                vec![
+                    "http://example.com/doc",
+                    "https://example.com/doc",
+                    "issue://123",
+                    "pr://123",
+                ],
+            ),
+            (
+                "zoom",
+                vec![
+                    "http://example.com/doc",
+                    "https://example.com/doc",
+                    "issue://123",
+                    "pr://123",
+                ],
+            ),
+        ] {
+            for target in targets {
+                let arguments = match name {
+                    "read" => json!({"path": target}),
+                    "outline" => json!({"target": target}),
+                    _ => json!({"batch":[{"target":target,"symbols":"Overview"}]}),
+                };
+                let mut identity = test_support::route_identity(&root, "normal-session");
+                Arc::get_mut(&mut identity.0).unwrap().role = RouteRole::ToolProviderV1;
+                let reply = exchange_with_actor(
+                    json!({"name":name,"preset":"worker","arguments":arguments}),
+                    identity,
+                    test_support::test_ctx(),
+                    &Arc::new(DispatchPathMetrics::new()),
+                    |request, _| {
+                        ACTIONS.fetch_add(1, Ordering::SeqCst);
+                        Response::success(request.id, json!({}))
+                    },
+                )
+                .await;
+                let body: Value = serde_json::from_slice(&reply.body).unwrap();
+                assert_eq!(
+                    reply.header.ty,
+                    FrameType::Response,
+                    "{name} {target}: {body}"
+                );
+                assert_eq!(body["isError"], false, "{body}");
+            }
+        }
+        assert_eq!(ACTIONS.load(Ordering::SeqCst), 10);
+    }
+
+    #[tokio::test]
+    async fn occipital_catalog_is_filtered_before_digest_and_system_text() {
+        let (_dir, root) = test_support::test_root("occipital-catalog");
+        let ctx = test_support::test_ctx();
+        for preset in ["head", "worker"] {
+            let identity = occipital_identity(&root, RouteRole::ToolProviderV1);
+            let reply = exchange_with_actor(
+                json!({"op":"tool.catalog","preset":preset,"system_text":{"preset":preset}}),
+                identity.clone(),
+                ctx.clone(),
+                &Arc::new(DispatchPathMetrics::new()),
+                |_, _| panic!("catalog must not dispatch"),
+            )
+            .await;
+            let catalog: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(reply.header.ty, FrameType::Response, "{catalog}");
+            let names: std::collections::BTreeSet<_> = catalog["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["name"].as_str().unwrap())
+                .collect();
+            let expected: std::collections::BTreeSet<_> = [
+                "read",
+                "aft_outline",
+                "aft_zoom",
+                "aft_search",
+                "grep",
+                "glob",
+                "aft_callgraph",
+                "bash_status",
+                "bash_watch",
+            ]
+            .into_iter()
+            .collect();
+            assert_eq!(names, expected);
+            let text_names: std::collections::BTreeSet<_> = catalog["system_text"]["tool_names"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|name| name.as_str().unwrap())
+                .collect();
+            assert_eq!(text_names, expected);
+            let digest = remote_policy::catalog(
+                json!({"preset":preset,"system_text":{"preset":preset},"digest_only":true}),
+                &identity,
+                &ctx,
+            )
+            .unwrap();
+            assert_eq!(digest["catalog_digest"], catalog["catalog_digest"]);
+            let mut disabled = occipital_identity(&root, RouteRole::ToolProviderV1);
+            Arc::get_mut(&mut disabled.0).unwrap().disabled_tools = Arc::new(vec!["read".into()]);
+            let limited =
+                remote_policy::catalog(json!({"preset":preset}), &disabled, &ctx).unwrap();
+            assert!(!limited["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "read"));
+            assert_ne!(limited["catalog_digest"], catalog["catalog_digest"]);
+            assert!(remote_policy::catalog(
+                json!({"preset":preset,"params":{"mode":"full"}}),
+                &identity,
+                &ctx
+            )
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn occipital_caller_claim_does_not_restrict_other_principals() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        ACTIONS.store(0, Ordering::SeqCst);
+        let (_dir, root) = test_support::test_root("not-occipital");
+        let reply = exchange_with_actor(
+            json!({"name":"write", "preset":"worker", "arguments":{"path":"x","content":"x"}, "principal":"reserved:occipital"}),
+            test_support::route_identity(&root, "session-s"),
+            test_support::test_ctx(), &Arc::new(DispatchPathMetrics::new()),
+            |request, _| { ACTIONS.fetch_add(1, Ordering::SeqCst); Response::success(request.id, json!({})) },
+        ).await;
+        assert_eq!(reply.header.ty, FrameType::Response);
+        assert_eq!(ACTIONS.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn occipital_task_observation_is_limited_to_bound_session() {
+        use crate::bash_background::persistence::{
+            create_task_layout, write_task_at, PersistedTask,
+        };
+        use crate::bash_background::BgTaskStatus;
+
+        let (dir, root) = test_support::test_root("occipital-tasks");
+        let ctx = test_support::test_ctx();
+        let storage = dir.path().join("tasks");
+        for (session, id, output) in [
+            ("session-s", "bash-0123456789abcdef", "own-output-marker"),
+            (
+                "session-other",
+                "bash-fedcba9876543210",
+                "foreign-output-marker",
+            ),
+        ] {
+            // Allocate the bundle through the locked production path so the
+            // session directory is non-empty before the detached persisted-task
+            // GC from the first replay can see it. A bare task_paths +
+            // write_task leaves an empty session directory that the sweep can
+            // remove between creation and the first file write.
+            let task = create_task_layout(&storage, session, id).unwrap();
+            let paths = &task.paths;
+            let mut metadata = PersistedTask::starting(
+                id.into(),
+                session.into(),
+                "echo output".into(),
+                root.as_path().into(),
+                Some(root.as_path().into()),
+                None,
+                false,
+                false,
+            );
+            metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+            write_task_at(&task, &metadata).unwrap();
+            std::fs::write(&paths.stdout, output).unwrap();
+            std::fs::write(&paths.stderr, "").unwrap();
+            std::fs::write(&paths.exit, "0\n").unwrap();
+            ctx.bash_background()
+                .replay_session(&storage, session)
+                .unwrap();
+        }
+        for role in [RouteRole::ToolProviderV1, RouteRole::Legacy] {
+            for name in ["bash_status", "bash_watch"] {
+                for (id, own) in [
+                    ("bash-0123456789abcdef", true),
+                    ("bash-fedcba9876543210", false),
+                ] {
+                    let identity = occipital_identity(&root, role);
+                    let reply = exchange_with_actor(
+                        json!({"name":name,"preset":"worker","arguments":{"taskId":id}}),
+                        identity,
+                        ctx.clone(),
+                        &Arc::new(DispatchPathMetrics::new()),
+                        |request, ctx| crate::commands::bash_status::handle(&request, ctx),
+                    )
+                    .await;
+                    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+                    assert_eq!(reply.header.ty, FrameType::Response, "{name}: {body}");
+                    if role == RouteRole::ToolProviderV1 {
+                        assert_eq!(
+                            body,
+                            super::super::rich_ui::carrier::error_body("rich_ui_op_malformed")
+                        );
+                        continue;
+                    }
+                    let rendered = body.to_string();
+                    if own {
+                        assert_eq!(body["isError"], false, "{name}: {body}");
+                        assert!(rendered.contains("own-output-marker"), "{name}: {body}");
+                    } else {
+                        assert_eq!(body["isError"], true, "{name}: {body}");
+                        assert!(
+                            !rendered.contains("foreign-output-marker"),
+                            "{name}: {body}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn task_poll_identity(root: &ProjectRootId, session: &str, carrier: bool) -> RouteIdentity {
+        let mut identity = if carrier {
+            occipital_identity(root, RouteRole::ToolProviderV1)
+        } else {
+            test_support::route_identity(root, session)
+        };
+        let data = Arc::get_mut(&mut identity.0).unwrap();
+        // Exercise the observation handlers through the legacy decoder while
+        // v1 carrier operation versions remain unpublished.
+        data.role = if carrier {
+            RouteRole::Legacy
+        } else {
+            RouteRole::ToolProviderV1
+        };
+        data.scope = Some(stamp("worker"));
+        data.session = session.into();
+        if let AuthenticatedPrincipal::RouteBind { session_id, .. } = &mut data.spawn_principal {
+            *session_id = session.into();
+        }
+        identity
+    }
+
+    async fn task_poll_deadline_case(name: &str) {
+        use crate::bash_background::persistence::read_task;
+        for carrier in [true, false] {
+            let (dir, ctx, task) =
+                crate::bash_background::registry::default_kill_tests::wait_fixture(None);
+            ctx.update_config(|config| config.bash.worker_wait_max_ms = 3_600_000);
+            let root = ProjectRootId::from_path(dir.path()).unwrap();
+            let before = std::fs::read(&task.paths.json).unwrap();
+            let before_limit = read_task(&task.paths.json).unwrap().timeout_ms.unwrap();
+            let ctx = Arc::new(ctx);
+            let mut arguments = json!({"taskId":task.task_id});
+            if name == "bash_watch" {
+                arguments["timeoutMs"] = json!(1);
+            }
+            let reply = exchange_with_actor(
+                json!({"name":name,"preset":"worker","arguments":arguments}),
+                task_poll_identity(&root, &task.session_id, carrier),
+                ctx.clone(),
+                &Arc::new(DispatchPathMetrics::new()),
+                |request, ctx| crate::commands::bash_status::handle(&request, ctx),
+            )
+            .await;
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(reply.header.ty, FrameType::Response, "{name}: {body}");
+            assert_eq!(body["isError"], false, "{name}: {body}");
+            let after = read_task(&task.paths.json).unwrap();
+            let live_limit = ctx
+                .bash_background()
+                .hard_kill_deadline(&task.task_id, &task.session_id)
+                .unwrap()
+                .limit_ms;
+            if carrier {
+                assert_eq!(
+                    after.timeout_ms,
+                    Some(before_limit),
+                    "carrier {name} changed the persisted deadline"
+                );
+                assert_eq!(
+                    live_limit, before_limit,
+                    "carrier {name} changed the live deadline"
+                );
+                assert_eq!(
+                    std::fs::read(&task.paths.json).unwrap(),
+                    before,
+                    "carrier {name} rewrote task metadata"
+                );
+            } else {
+                assert!(
+                    after.timeout_ms.unwrap() > before_limit,
+                    "worker {name} did not persist its renewal"
+                );
+                assert!(live_limit > before_limit, "worker {name} did not renew");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn occipital_status_does_not_renew_but_worker_status_does() {
+        task_poll_deadline_case("bash_status").await;
+    }
+
+    #[tokio::test]
+    async fn occipital_watch_does_not_renew_but_worker_watch_does() {
+        task_poll_deadline_case("bash_watch").await;
+    }
+
+    #[tokio::test]
+    async fn occipital_watch_does_not_acknowledge_worker_completion() {
+        use crate::bash_background::{
+            persistence::{read_task, write_task},
+            BgTaskStatus,
+        };
+        for carrier in [true, false] {
+            let (dir, ctx, task) =
+                crate::bash_background::registry::default_kill_tests::wait_fixture(None);
+            {
+                let mut state = task.lock_state().unwrap();
+                state
+                    .metadata
+                    .mark_terminal(BgTaskStatus::Completed, Some(0), None);
+                state.metadata.completion_delivered = false;
+                write_task(&task.paths.json, &state.metadata).unwrap();
+            }
+            let root = ProjectRootId::from_path(dir.path()).unwrap();
+            let reply = exchange_with_actor(
+                json!({"name":"bash_watch","preset":"worker","arguments":{"taskId":task.task_id,"timeoutMs":1}}),
+                task_poll_identity(&root, &task.session_id, carrier), Arc::new(ctx),
+                &Arc::new(DispatchPathMetrics::new()),
+                |_, _| panic!("watch uses the deferred handler"),
+            ).await;
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(body["isError"], false, "{body}");
+            assert_eq!(
+                read_task(&task.paths.json).unwrap().completion_delivered,
+                !carrier,
+                "only the worker's watch may acknowledge its completion"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn occipital_cold_task_reads_do_not_register_or_rewrite_tasks() {
+        for name in ["bash_status", "bash_watch"] {
+            let (dir, original, task) =
+                crate::bash_background::registry::default_kill_tests::wait_fixture(None);
+            std::fs::write(&task.paths.stdout, "observed-output-marker").unwrap();
+            std::fs::write(&task.paths.stderr, "").unwrap();
+            let ctx = Arc::new(AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                original.config().as_ref().clone(),
+            ));
+            let root = ProjectRootId::from_path(dir.path()).unwrap();
+            let before = std::fs::read(&task.paths.json).unwrap();
+            let mut arguments = json!({"taskId":task.task_id});
+            if name == "bash_watch" {
+                arguments["pattern"] = json!("observed-output-marker");
+                arguments["timeoutMs"] = json!(100);
+            }
+            let reply = exchange_with_actor(
+                json!({"name":name,"preset":"worker","arguments":arguments}),
+                task_poll_identity(&root, &task.session_id, true),
+                ctx.clone(),
+                &Arc::new(DispatchPathMetrics::new()),
+                |request, ctx| crate::commands::bash_status::handle(&request, ctx),
+            )
+            .await;
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(reply.header.ty, FrameType::Response, "{name}: {body}");
+            assert_eq!(body["isError"], false, "{name}: {body}");
+            if name == "bash_watch" {
+                assert!(
+                    body.to_string().contains("observed-output-marker"),
+                    "{name}: {body}"
+                );
+            } else {
+                assert!(body.to_string().contains("running"), "{name}: {body}");
+            }
+            assert!(
+                ctx.bash_background().task_for_test(&task.task_id).is_none(),
+                "carrier {name} registered the task and could re-arm its durable watches"
+            );
+            assert_eq!(
+                std::fs::read(&task.paths.json).unwrap(),
+                before,
+                "carrier {name} rewrote the task bundle"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4970,6 +6169,7 @@ mod route_tests {
                 parsed_body: Default::default(),
                 confinement: None,
                 launch_restore: None,
+                codemode_policies: None,
                 frame: Frame::build(
                     FrameType::Request,
                     control_flags(),
@@ -5262,9 +6462,10 @@ mod route_tests {
             trust: BindTrust::FirstParty,
             spawn_principal: runner_restore_principal(&project),
             consumer_elicitation_capable: false,
+            tool_result_body: false,
             disabled_tools: Arc::default(),
             scope: None,
-            run_scope: OnceLock::new(),
+            run_scope: std::sync::OnceLock::new(),
             call_mode: subc_protocol::call_mode::CallMode::Classic,
             made_tool_call: AtomicBool::new(false),
             run_owner: None,
@@ -5456,13 +6657,13 @@ mod route_tests {
     }
 
     #[tokio::test]
-    async fn catalog_queues_behind_reads_but_not_database_or_cold_builds() {
+    async fn catalog_bypasses_reads_configure_warmup_and_cold_builds() {
         let (_dir, root) = test_support::test_root("catalog-pure-read");
         let (_heavy_dir, heavy_root) = test_support::test_root("catalog-cold-build");
         let executor = Arc::new(Executor::with_config(crate::executor::ExecutorConfig {
             pool_size: 6,
             read_cap: 1,
-            actor_cap: 2,
+            actor_cap: 3,
             heavy_permits: 1,
             drr_quantum: 1,
         }));
@@ -5483,6 +6684,19 @@ mod route_tests {
             }),
         );
         started.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (tail_started, started) = std::sync::mpsc::channel();
+        let (release_tail, tail_release) = std::sync::mpsc::channel();
+        let tail = executor.submit_maintenance_async(
+            root.clone(),
+            Lane::MaintenanceCommit,
+            "held-configure-warmup".into(),
+            Box::new(move |_| {
+                tail_started.send(()).unwrap();
+                let _ = tail_release.recv();
+                Response::success("tail", json!({}))
+            }),
+        );
+        started.recv_timeout(Duration::from_secs(3)).unwrap();
         let (read_started, started) = std::sync::mpsc::channel();
         let (release_read, read_release) = std::sync::mpsc::channel();
         let read = executor.submit_async(
@@ -5498,6 +6712,7 @@ mod route_tests {
         started.recv_timeout(Duration::from_secs(3)).unwrap();
         let (writer, mut replies) = mpsc::channel(8);
         let frame = Frame::build(FrameType::Request, control_flags(), 41, 1, 7, vec![]).unwrap();
+        let requested_at = Instant::now();
         submit_provider_read(
             &writer,
             &frame,
@@ -5507,21 +6722,29 @@ mod route_tests {
             &Arc::new(DispatchPathMetrics::new()),
             "tool.catalog",
             json!({}),
-            PhaseTrace::new(Instant::now()),
+            PhaseTrace::new(requested_at),
+            test_support::test_request_meta(),
         )
         .await
         .unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(80), replies.recv())
-                .await
-                .is_err(),
-            "catalogs must share existing read permits"
-        );
+        let reply = tokio::time::timeout(Duration::from_millis(500), replies.recv()).await;
+        let reply_elapsed = requested_at.elapsed();
+        if reply.is_err() {
+            eprintln!(
+                "catalog timeout: dispatch={:?} running={:?}",
+                executor.try_dispatch_liveness_snapshot(),
+                executor.try_take_long_running_interactive_jobs(Duration::ZERO)
+            );
+        }
+        // Release held work even on failure, so a regression cannot hang teardown.
         release_read.send(()).unwrap();
+        release_tail.send(()).unwrap();
+        release_heavy.send(()).unwrap();
         assert!(read.await.unwrap().success);
-        let reply = tokio::time::timeout(Duration::from_secs(3), replies.recv())
-            .await
-            .unwrap()
+        assert!(tail.await.unwrap().success);
+        assert!(heavy.await.unwrap().success);
+        let reply = reply
+            .expect("catalog must answer while index and warmup remain held")
             .unwrap();
         assert_eq!(reply.header.ty, FrameType::Response);
         let trace = reply
@@ -5529,35 +6752,17 @@ mod route_tests {
             .expect("tool.catalog replies must carry response timing");
         let now = Instant::now();
         let completed = trace
-            .finish(now, now, now, reply.frame.body.len())
+            .finish(now, now, now, reply.frame.body.len(), None)
             .expect("tool.catalog trace must have executor and writer timings");
-        assert!(completed.phases.total > Duration::from_millis(50));
-        assert!(completed.phases.queue > Duration::from_millis(50));
-        let _ = crate::logging::take_slow_tool_call_logs_for_test();
-        crate::log_ctx::with_session(Some(completed.session.clone()), || {
-            crate::logging::note_tool_call_trace(
-                &completed.name,
-                &completed.session,
-                &completed.root,
-                completed.channel,
-                completed.corr,
-                completed.phases,
-                crate::logging::ToolCallCaller::Agent,
-            );
-        });
-        let lines = crate::logging::take_slow_tool_call_logs_for_test();
-        let slow_line = lines
-            .iter()
-            .find(|line| line.contains("slow tool_call name=tool.catalog"))
-            .expect("delayed catalog response should produce a slow tool_call log");
-        assert!(slow_line.contains("session=catalog-session"));
-        assert!(slow_line.contains("queue="));
-        assert!(slow_line.contains("exec="));
-        assert!(slow_line.contains("egress="));
+        assert_eq!(completed.session, "catalog-session");
+        assert!(completed.phases.queue < Duration::from_millis(500));
+        eprintln!(
+            "catalog with index/warmup held: reply_ms={} queue_ms={}",
+            reply_elapsed.as_millis(),
+            completed.phases.queue.as_millis()
+        );
         assert!(ctx.database_runtime_pending("write"));
         assert_eq!(executor.heavy_permits(), 1);
-        release_heavy.send(()).unwrap();
-        assert!(heavy.await.unwrap().success);
     }
 
     /// Sends `body` through the ledger edge, the frame loop's first stop for a
@@ -5585,6 +6790,7 @@ mod route_tests {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -5748,14 +6954,304 @@ mod route_tests {
                 principal_id: Some("reserved:broca".into()),
             },
             consumer_elicitation_capable: false,
+            tool_result_body: false,
             disabled_tools: Arc::new(vec![]),
             scope: Some(stamp("worker")),
-            run_scope: OnceLock::new(),
+            run_scope: std::sync::OnceLock::new(),
             call_mode,
             made_tool_call: AtomicBool::new(false),
             run_owner: None,
         }));
         (project, storage, ctx, identity)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn direct_edit_carries_worker_and_untrusted_tool_policy_without_jailing_shared_services()
+    {
+        use crate::config::SandboxMode;
+        let _guard = EXCHANGE_LOCK.lock().await;
+        fn command_mode(policy: &crate::sandbox_spawn::ToolLaunchPolicy) -> String {
+            let command = policy
+                .command(std::ffi::OsStr::new("formatter-probe"), &[])
+                .unwrap();
+            if command.get_args().next() == Some(std::ffi::OsStr::new("sandbox-launch")) {
+                let profile: crate::sandbox_profile::SandboxProfile =
+                    serde_json::from_str(command.get_args().nth(2).unwrap().to_str().unwrap())
+                        .unwrap();
+                profile.mode.to_string()
+            } else {
+                "off".into()
+            }
+        }
+        fn observe(request: RawRequest, ctx: &AppContext) -> Response {
+            let policy = crate::sandbox_spawn::ToolLaunchPolicy::for_request(ctx);
+            let mode = command_mode(&policy);
+            // LSP startup and other shared services see the original scopes,
+            // not the formatter's per-call principal or worker jail.
+            assert!(!crate::sandbox_spawn::worker_jail_active());
+            assert_eq!(
+                crate::sandbox_spawn::current_authenticated_principal(),
+                AuthenticatedPrincipal::FirstParty
+            );
+            Response::success(request.id, json!({"tool_mode": mode}))
+        }
+        for (worker_mode, untrusted) in [
+            (SandboxMode::Off, false),
+            (SandboxMode::Relaxed, false),
+            (SandboxMode::Strict, false),
+            (SandboxMode::Relaxed, true),
+        ] {
+            let (_project, storage, ctx, mut identity) = worker_route(
+                RouteRole::ToolProviderV1,
+                subc_protocol::call_mode::CallMode::Classic,
+            );
+            let operator_binary = storage.path().join("operator-aft");
+            std::fs::write(&operator_binary, "operator executable fixture").unwrap();
+            let _launcher = crate::sandbox_spawn::install_sandbox_launcher_for_test(
+                &identity.project_root,
+                operator_binary.clone(),
+            );
+            ctx.update_config(|config| {
+                config.gh_shim.binary_path = Some(operator_binary);
+                config.sandbox.profile.head = if worker_mode == SandboxMode::Off {
+                    SandboxMode::Strict
+                } else {
+                    SandboxMode::Off
+                };
+                config.sandbox.profile.worker = worker_mode;
+            });
+            let data = Arc::get_mut(&mut identity.0).unwrap();
+            let mut scope = stamp("worker");
+            scope.owner = Principal::Reserved {
+                module_id: "prefrontal-core".into(),
+            };
+            data.scope = Some(scope);
+            if untrusted {
+                data.trust = BindTrust::Untrusted;
+                if let AuthenticatedPrincipal::RouteBind { trust, .. } = &mut data.spawn_principal {
+                    *trust = PrincipalTrust::Untrusted;
+                }
+            }
+            assert!(super::super::access_grants::alfonso_worker(&identity));
+            let expected = if untrusted {
+                SandboxMode::Strict
+            } else {
+                worker_mode
+            };
+            let run = PlainToolRun {
+                speech_seed: None,
+                bare_name: "write".into(),
+                arguments: json!({"path": "pin.rs", "content": "pub fn edited() {}\n"}),
+                format_context: Default::default(),
+                tool_call_context: ToolCallContext {
+                    project_root: identity.project_root.clone(),
+                    session_id: Some(identity.session.clone()),
+                    request_id: "tool-policy-dispatch".into(),
+                    diagnostics_on_edit: false,
+                    preview: false,
+                    edit_slot_survives: None,
+                    report_registration_downgrade: false,
+                    standard_edit_grammar: true,
+                    disabled_tools: None,
+                    worker_session: true,
+                    host_tool_names: None,
+                },
+                dispatch: observe,
+                bind_trust: identity.trust,
+                identity,
+                request_id: "tool-policy-dispatch".into(),
+                ledger_key: None,
+                io_budget: crate::bounded_io::Budget::after(Duration::from_secs(30)),
+                approved_io_window: None,
+                reply_deadline: Instant::now() + Duration::from_secs(30),
+            };
+            let (done, completion) = oneshot::channel();
+            let job = run.job(
+                crate::access_policy::AskRoute::Lowered,
+                PhaseTrace::new(Instant::now()),
+                done,
+            );
+            let reads = usize::from(
+                expected == SandboxMode::Strict
+                    || (expected == SandboxMode::Relaxed && !cfg!(target_os = "linux")),
+            );
+            crate::worker_jail_canary::with_test_preparation_home(storage.path(), reads, || {
+                let response = job(&ctx);
+                assert_eq!(
+                    response.data["tool_mode"],
+                    expected.to_string(),
+                    "{}",
+                    response.data
+                );
+            });
+            completion.await.unwrap();
+            // A later standalone/head request must not inherit the worker policy.
+            let head = crate::sandbox_spawn::ToolLaunchPolicy::for_request(&ctx);
+            assert_eq!(
+                command_mode(&head),
+                ctx.config().sandbox.profile.head.to_string()
+            );
+        }
+    }
+
+    /// Building a worker's formatter launch policy creates a private task
+    /// directory and a full sandbox profile, which used to happen before
+    /// dispatch on every mutating worker call. Calls that launch no formatter
+    /// or checker must not build it at all; a call that launches tools builds
+    /// it once and shares it across its commands; and a policy that cannot be
+    /// built refuses with exactly the text it gave when it was built up front.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_edit_builds_tool_launch_policy_only_when_a_tool_launches() {
+        use crate::sandbox_spawn::{SandboxTaskKind, ToolLaunchPolicy};
+        let _guard = EXCHANGE_LOCK.lock().await;
+        /// Content `launch` makes the call build a formatter command and,
+        /// through a second policy handle, a checker command (building a
+        /// command is what resolves the policy); any other content builds no
+        /// tool command.
+        fn observe(request: RawRequest, ctx: &AppContext) -> Response {
+            let policy = ToolLaunchPolicy::for_request(ctx);
+            if request.params["content"].as_str() != Some("launch") {
+                return Response::success(request.id, json!({"launched": false}));
+            }
+            let formatter = policy
+                .command(std::ffi::OsStr::new("formatter-probe"), &[])
+                .map(|_| ());
+            let nested = ToolLaunchPolicy::for_request(ctx);
+            let checker = nested
+                .command(std::ffi::OsStr::new("checker-probe"), &[])
+                .map(|_| ());
+            match (formatter, checker) {
+                (Ok(()), Ok(())) => Response::success(request.id, json!({"launched": true})),
+                (Err(formatter), Err(checker)) => {
+                    assert_eq!(formatter, checker);
+                    Response::success(request.id, json!({"refusal": formatter}))
+                }
+                other => panic!("one call's tools must share one policy: {other:?}"),
+            }
+        }
+        let (_project, storage, ctx, mut identity) = worker_route(
+            RouteRole::ToolProviderV1,
+            subc_protocol::call_mode::CallMode::Classic,
+        );
+        let operator_binary = storage.path().join("operator-aft");
+        std::fs::write(&operator_binary, "operator executable fixture").unwrap();
+        let _launcher = crate::sandbox_spawn::install_sandbox_launcher_for_test(
+            &identity.project_root,
+            operator_binary.clone(),
+        );
+        ctx.update_config(|config| {
+            config.gh_shim.binary_path = Some(operator_binary);
+            config.sandbox.profile.worker = crate::config::SandboxMode::Relaxed;
+        });
+        let data = Arc::get_mut(&mut identity.0).unwrap();
+        let mut scope = stamp("worker");
+        scope.owner = Principal::Reserved {
+            module_id: "prefrontal-core".into(),
+        };
+        data.scope = Some(scope);
+        assert!(super::super::access_grants::alfonso_worker(&identity));
+        let root = identity.project_root.clone();
+        crate::sandbox_spawn::install_sandbox_spawn_test_seam(root.clone());
+        let tool_policy_builds = || {
+            crate::sandbox_spawn::sandbox_spawn_test_observations(&root)
+                .into_iter()
+                .filter(|observation| observation.task_kind == SandboxTaskKind::ExternalTool)
+                .count()
+        };
+        let call = |content: &str, profile_reads: usize| -> Value {
+            let run = PlainToolRun {
+                speech_seed: None,
+                bare_name: "write".into(),
+                arguments: json!({"path": "pin.rs", "content": content}),
+                format_context: Default::default(),
+                tool_call_context: ToolCallContext {
+                    project_root: identity.project_root.clone(),
+                    session_id: Some(identity.session.clone()),
+                    request_id: "tool-policy-lazy".into(),
+                    diagnostics_on_edit: false,
+                    preview: false,
+                    edit_slot_survives: None,
+                    report_registration_downgrade: false,
+                    standard_edit_grammar: true,
+                    disabled_tools: None,
+                    worker_session: true,
+                    host_tool_names: None,
+                },
+                dispatch: observe,
+                bind_trust: identity.trust,
+                identity: identity.clone(),
+                request_id: "tool-policy-lazy".into(),
+                ledger_key: None,
+                io_budget: crate::bounded_io::Budget::after(Duration::from_secs(30)),
+                approved_io_window: None,
+                reply_deadline: Instant::now() + Duration::from_secs(30),
+            };
+            let (done, _completion) = oneshot::channel();
+            let job = run.job(
+                crate::access_policy::AskRoute::Lowered,
+                PhaseTrace::new(Instant::now()),
+                done,
+            );
+            // The fixture also asserts how many times a profile prepared the
+            // account-home canaries (only relaxed profiles off Linux do), so a
+            // call that launches nothing proves no profile was built here too.
+            crate::worker_jail_canary::with_test_preparation_home(
+                storage.path(),
+                profile_reads,
+                || job(&ctx).data,
+            )
+        };
+        let relaxed_profile_reads = usize::from(!cfg!(target_os = "linux"));
+
+        for _ in 0..5 {
+            let data = call("pub fn edited() {}\n", 0);
+            assert_eq!(data["launched"], false, "{data}");
+        }
+        assert_eq!(
+            tool_policy_builds(),
+            0,
+            "worker calls that launch no tool must not build a launch policy"
+        );
+
+        let data = call("launch", relaxed_profile_reads);
+        assert_eq!(data["launched"], true, "{data}");
+        assert_eq!(
+            tool_policy_builds(),
+            1,
+            "one call's formatter and checker must share one launch policy"
+        );
+
+        // A file where the task directories belong makes the policy's private
+        // tool directory impossible to create, so the policy refuses.
+        let task_root = storage.path().join("bash-tasks");
+        if task_root.is_dir() {
+            std::fs::remove_dir_all(&task_root).unwrap();
+        }
+        std::fs::write(&task_root, "not a directory").unwrap();
+        let data = call("launch", 0);
+        let built_up_front = crate::sandbox_spawn::with_authenticated_principal(
+            identity.spawn_principal.clone(),
+            || {
+                crate::sandbox_spawn::with_worker_jail(true, || {
+                    crate::log_ctx::with_session(Some(identity.session.clone()), || {
+                        ToolLaunchPolicy::resolve(&ctx)
+                    })
+                })
+            },
+        );
+        let expected = built_up_front
+            .command(std::ffi::OsStr::new("formatter-probe"), &[])
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            expected
+                .starts_with("sandbox_unavailable: failed to allocate a private tool directory"),
+            "{expected}"
+        );
+        assert_eq!(data["refusal"], expected, "{data}");
+        crate::sandbox_spawn::clear_sandbox_spawn_test_seam(&root);
     }
 
     /// Fetch the worker catalog with `confine: "root"`, which saves the fence.
@@ -6201,6 +7697,114 @@ mod route_tests {
         assert_eq!(known.header.ty, FrameType::Response);
     }
 
+    async fn assert_v1_zoom_alias_dispatch_matches_batch(target: &str, arguments: Value) {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        ACTIONS.store(0, Ordering::SeqCst);
+        let canonical = exchange(
+            json!({"name":"zoom", "arguments":{
+                "batch":[{"target":target,"symbols":"parse"}],
+                "contextLines":2,"callgraph":true
+            }}),
+            RouteRole::ToolProviderV1,
+            "session",
+            vec![],
+        )
+        .await;
+        assert_eq!(canonical.header.ty, FrameType::Response);
+        assert_eq!(ACTIONS.load(Ordering::SeqCst), 1);
+        let expected = LAST_DISPATCH.lock().unwrap().clone().unwrap();
+        assert_eq!(expected["command"], "zoom");
+
+        let reply = exchange(
+            json!({"name":"zoom", "arguments":arguments}),
+            RouteRole::ToolProviderV1,
+            "session",
+            vec![],
+        )
+        .await;
+        assert_eq!(
+            reply.header.ty,
+            FrameType::Response,
+            "legacy zoom arguments {arguments} were refused: {}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        assert_eq!(ACTIONS.load(Ordering::SeqCst), 2);
+        assert_eq!(*LAST_DISPATCH.lock().unwrap(), Some(expected));
+    }
+
+    #[tokio::test]
+    async fn v1_zoom_path_alias_dispatch_matches_batch() {
+        let target = std::env::current_dir().unwrap().join("zoom-alias.ts");
+        let target = target.to_str().unwrap();
+        assert_v1_zoom_alias_dispatch_matches_batch(
+            target,
+            json!({"path":target,"symbols":"parse","contextLines":2,"callgraph":true}),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn v1_zoom_targets_alias_dispatch_matches_batch() {
+        let target = std::env::current_dir().unwrap().join("zoom-alias.ts");
+        let target = target.to_str().unwrap();
+        assert_v1_zoom_alias_dispatch_matches_batch(
+            target,
+            json!({"targets":[{"path":target,"symbols":"parse"}],"contextLines":2,"callgraph":true}),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn v1_zoom_mixed_batch_and_path_keeps_refusal() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        ACTIONS.store(0, Ordering::SeqCst);
+        let reply = exchange(
+            json!({"name":"zoom", "arguments":{
+                "batch":[{"target":"module.ts","symbols":"parse"}],
+                "path":"other.ts","symbols":"parse"
+            }}),
+            RouteRole::ToolProviderV1,
+            "session",
+            vec![],
+        )
+        .await;
+        assert_eq!(reply.header.ty, FrameType::Error);
+        assert_eq!(
+            serde_json::to_value(error_body(&reply)).unwrap(),
+            serde_json::to_value(errors::invalid_request(
+                "path",
+                "argument is absent from the served schema"
+            ))
+            .unwrap()
+        );
+        assert_eq!(ACTIONS.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn v1_zoom_alias_with_unknown_field_keeps_refusal() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        ACTIONS.store(0, Ordering::SeqCst);
+        let reply = exchange(
+            json!({"name":"zoom", "arguments":{
+                "bogus":true,"path":"module.ts","symbols":"parse"
+            }}),
+            RouteRole::ToolProviderV1,
+            "session",
+            vec![],
+        )
+        .await;
+        assert_eq!(reply.header.ty, FrameType::Error);
+        assert_eq!(
+            serde_json::to_value(error_body(&reply)).unwrap(),
+            serde_json::to_value(errors::invalid_request(
+                "bogus",
+                "argument is absent from the served schema"
+            ))
+            .unwrap()
+        );
+        assert_eq!(ACTIONS.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn recognized_operations_and_v1_refusals_never_dispatch_legacy_actions() {
         let _guard = EXCHANGE_LOCK.lock().await;
@@ -6374,6 +7978,7 @@ mod ledger_terminal_tests {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -6440,6 +8045,7 @@ mod ledger_terminal_tests {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -6636,7 +8242,7 @@ mod ledger_terminal_tests {
         let (edge, mut ready) = LedgerEdge::new();
         let decoded = DecodedFrame {
             parsed_body: Default::default(),
-            confinement: None, launch_restore: None,
+            confinement: None, launch_restore: None, codemode_policies: None,
             frame: Frame::build(FrameType::Request, control_flags(), 42, 1, 7, serde_json::to_vec(&json!({"name":"read", "arguments":{"filePath":"README.md"}, "call_key":"drain-key"})).unwrap()).unwrap(),
             phase_trace: PhaseTrace::new(std::time::Instant::now()),
         };
@@ -6709,6 +8315,7 @@ mod ledger_terminal_tests {
                         parsed_body: Default::default(),
                         confinement: None,
                         launch_restore: None,
+                        codemode_policies: None,
                         frame: request(),
                         phase_trace: crate::run_tool_call::PhaseTrace::new(
                             std::time::Instant::now(),
@@ -6752,6 +8359,7 @@ mod ledger_terminal_tests {
                         parsed_body: Default::default(),
                         confinement: None,
                         launch_restore: None,
+                        codemode_policies: None,
                         frame: request(),
                         phase_trace: crate::run_tool_call::PhaseTrace::new(
                             std::time::Instant::now(),
@@ -6972,6 +8580,7 @@ mod authorization_failure_tests {
         let identity =
             test_support::route_identity_with_trust(root, "authorization", BindTrust::Untrusted);
         PendingBashAsk {
+            handles_progress: false,
             route: route_key(42, 3),
             tool_corr: 78,
             tool_flags: control_flags(),
@@ -6986,6 +8595,7 @@ mod authorization_failure_tests {
             arguments: json!({"command":"printf must-not-run"}),
             format_context: crate::subc_format::FormatContext::default(),
             cancel: bash::BashWaitCancel {
+                speech_seed: None,
                 run_scope: None,
                 scope: None,
                 late_results: false,
@@ -7054,6 +8664,7 @@ mod authorization_failure_tests {
         let allow = || DecodedFrame {
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             parsed_body: Default::default(),
             frame: Frame::build(
                 FrameType::Response,
@@ -7152,5 +8763,255 @@ mod authorization_failure_tests {
     #[tokio::test]
     async fn missing_authorization_database_resolves_one_ask_without_execution() {
         authorization_failure("missing-db").await;
+    }
+}
+
+#[cfg(test)]
+mod metadata_lane_tests {
+    use super::super::*;
+
+    #[tokio::test]
+    async fn cold_catalog_does_not_wait_for_admission_validator_preparation() {
+        const CHILD: &str = "AFT_TEST_COLD_CATALOG_VALIDATORS";
+        const NAME: &str = "subc::tool_provider::metadata_lane_tests::cold_catalog_does_not_wait_for_admission_validator_preparation";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "cold catalog child failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (entered, preparing) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        *super::VALIDATOR_BUILD_GATE.lock().unwrap() = Some((entered, held));
+        let preparation = std::thread::spawn(super::prepare_admission);
+        preparing
+            .recv_timeout(Duration::from_secs(30))
+            .expect("validator builder held before compiling");
+        let (_dir, root) = test_support::test_root("cold-catalog-validators");
+        let ctx = test_support::test_ctx();
+        ctx.mark_database_runtime_initializing_for_test();
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), ctx);
+        let mut replies_while_held = Vec::new();
+        for (corr, preset) in [(7, "head"), (8, "worker"), (9, "reader")] {
+            let (writer, mut replies) = mpsc::channel(8);
+            let frame =
+                Frame::build(FrameType::Request, control_flags(), 41, 1, corr, vec![]).unwrap();
+            let requested_at = Instant::now();
+            submit_provider_read(
+                &writer,
+                &frame,
+                test_support::route_identity(&root, "cold-preflight"),
+                &executor,
+                &Arc::default(),
+                &Arc::new(DispatchPathMetrics::new()),
+                "tool.catalog",
+                json!({"preset":preset}),
+                PhaseTrace::new(requested_at),
+                test_support::test_request_meta(),
+            )
+            .await
+            .unwrap();
+            let reply = tokio::time::timeout(Duration::from_millis(500), replies.recv()).await;
+            replies_while_held.push((preset, requested_at.elapsed(), reply));
+        }
+        let compiled = super::VALIDATORS_COMPILED.load(Ordering::SeqCst);
+        let preparation_started = Instant::now();
+        release.send(()).unwrap();
+        preparation
+            .join()
+            .expect("admission preparation completes after release");
+        let preparation_elapsed = preparation_started.elapsed();
+        for (preset, elapsed, reply) in replies_while_held {
+            let reply = reply
+                .expect("a cold catalog cannot depend on the held validator builder")
+                .unwrap();
+            assert_eq!(reply.header.ty, FrameType::Response, "{preset}");
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert!(!body["tools"].as_array().unwrap().is_empty(), "{preset}");
+            eprintln!(
+                "cold catalog while validator preparation held: preset={preset} reply_ms={}",
+                elapsed.as_millis()
+            );
+        }
+        assert_eq!(
+            compiled, 0,
+            "metadata must not compile call-admission validators"
+        );
+        assert!(super::VALIDATORS_COMPILED.load(Ordering::SeqCst) > 0);
+        let invalid =
+            serde_json::from_value(json!({"name":"read", "arguments":{"path":42}})).unwrap();
+        let error = super::admit(&invalid, false, &[], false, "cold-preflight", true).unwrap_err();
+        assert_eq!(error.code, "invalid_request");
+        assert_eq!(
+            cortexkit_role_tool_provider::errors::invalid_request_field(&error),
+            Some("path")
+        );
+        eprintln!(
+            "admission_prepare_after_release_ms={} validators={}",
+            preparation_elapsed.as_millis(),
+            super::VALIDATORS_COMPILED.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_admission_errors_keep_their_code_and_send_a_terminal() {
+        for missing_actor in [true, false] {
+            let (_dir, root) = test_support::test_root("provider-admission-error");
+            let executor = Arc::new(Executor::new());
+            if !missing_actor {
+                executor.register_actor(root.clone(), test_support::test_ctx());
+            }
+            let (writer, mut replies) = mpsc::channel(8);
+            let active = Arc::default();
+            let frame =
+                Frame::build(FrameType::Request, control_flags(), 41, 1, 7, vec![]).unwrap();
+            let mut meta = test_support::test_request_meta();
+            if !missing_actor {
+                meta.deadline =
+                    queued_call::Deadline::from_envelope(Instant::now(), &json!({"deadline_ms":1}));
+            }
+            submit_provider_read(
+                &writer,
+                &frame,
+                test_support::route_identity(&root, "preflight"),
+                &executor,
+                &active,
+                &Arc::new(DispatchPathMetrics::new()),
+                "tool.catalog",
+                json!({}),
+                PhaseTrace::new(Instant::now()),
+                meta,
+            )
+            .await
+            .unwrap();
+            let reply = tokio::time::timeout(Duration::from_millis(500), replies.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reply.header.ty, FrameType::Error);
+            assert_eq!(reply.header.corr, 7);
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(
+                body["code"],
+                if missing_actor {
+                    "actor_not_registered"
+                } else {
+                    "deadline_exceeded"
+                },
+                "{body}"
+            );
+            tokio::task::yield_now().await;
+            assert!(active.lock().unwrap().is_empty());
+            assert!(replies.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn started_metadata_keeps_reply_ownership_when_route_is_released() {
+        let (_dir, root) = test_support::test_root("started-metadata");
+        let executor = Executor::new();
+        executor.register_actor(root.clone(), test_support::test_ctx());
+        let active = Arc::default();
+        let route = route_key(41, 1);
+        let (entered, running) = oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let response = submit_active_tool_call(
+            &executor,
+            &active,
+            route,
+            7,
+            root,
+            Lane::ProviderMetadata,
+            "metadata".into(),
+            RouteDetachPolicy::RetainForReplay,
+            "tool.catalog",
+            test_support::test_request_meta(),
+            Box::new(move |_| {
+                let _ = entered.send(());
+                let _ = held.recv_timeout(Duration::from_secs(5));
+                assert!(!crate::executor::current_job_cancelled());
+                Response::success("metadata", json!({"answer":{}}))
+            }),
+        );
+        running.await.unwrap();
+        assert!(queued_call::release_route(
+            &active,
+            &executor,
+            route,
+            &PendingSubcResponses::default()
+        )
+        .is_empty());
+        assert_eq!(
+            apply_route_work_disposition(
+                &active,
+                &executor,
+                route,
+                RouteWorkDisposition::RetainStartedForReplay,
+                "Goodbye"
+            ),
+            1
+        );
+        release.send(()).unwrap();
+        assert!(response.await.unwrap().success);
+        assert!(claim_active_tool_call(&active, route, 7));
+        assert!(finish_active_tool_call(&active, route, 7));
+    }
+
+    #[tokio::test]
+    async fn queued_metadata_admission_budget_sends_a_terminal_without_waiting_for_the_lane() {
+        let (_dir, root) = test_support::test_root("metadata-admission-timeout");
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), test_support::test_ctx());
+        let (entered, running) = oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let blocker = executor.submit_async(
+            root.clone(),
+            Lane::ProviderMetadata,
+            "held-metadata".into(),
+            Box::new(move |_| {
+                let _ = entered.send(());
+                let _ = held.recv_timeout(Duration::from_secs(5));
+                Response::success("held", json!({}))
+            }),
+        );
+        running.await.unwrap();
+        let (writer, mut replies) = mpsc::channel(8);
+        let frame = Frame::build(FrameType::Request, control_flags(), 41, 1, 7, vec![]).unwrap();
+        let active = Arc::default();
+        submit_provider_read(
+            &writer,
+            &frame,
+            test_support::route_identity(&root, "preflight"),
+            &executor,
+            &active,
+            &Arc::new(DispatchPathMetrics::new()),
+            "tool.catalog",
+            json!({}),
+            PhaseTrace::new(Instant::now() - Duration::from_secs(2)),
+            test_support::test_request_meta(),
+        )
+        .await
+        .unwrap();
+        let reply = tokio::time::timeout(Duration::from_millis(500), replies.recv()).await;
+        release.send(()).unwrap();
+        assert!(blocker.await.unwrap().success);
+        let reply = reply
+            .expect("queued metadata must refuse before the held operation finishes")
+            .unwrap();
+        assert_eq!(reply.header.ty, FrameType::Error);
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["code"], "provider_busy", "{body}");
+        tokio::task::yield_now().await;
+        assert!(active.lock().unwrap().is_empty());
+        assert!(replies.try_recv().is_err());
     }
 }

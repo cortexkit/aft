@@ -49,6 +49,7 @@ import {
   resolveCortexKitStorageRoot,
   resolveIndexes,
   setActiveLogger,
+  shouldShowAnnouncement,
   unknownDisabledTools,
 } from "@cortexkit/aft-bridge";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -88,7 +89,10 @@ import { NPM_LSP_TABLE } from "./lsp-npm-table.js";
 import {
   type ConfigureWarning,
   deliverConfigureWarnings,
+  formatFeatureAnnouncement,
+  formatLspInstallSummary,
   sendFeatureAnnouncement,
+  sendLspInstallSummary,
 } from "./notifications.js";
 
 // Register our logger with @cortexkit/aft-bridge before any bridge code runs.
@@ -123,6 +127,7 @@ type BashLongRunningPayload = {
 };
 
 type BashPatternMatchPayload = {
+  batch?: import("@cortexkit/aft-bridge").BashWatchLineBatch;
   session_id: string;
   task_id: string;
   watch_id: string;
@@ -203,12 +208,12 @@ const PLUGIN_VERSION: string = (() => {
   }
 })();
 
-const ANNOUNCEMENT_VERSION = "0.62.0";
+const ANNOUNCEMENT_VERSION = "0.63.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Linux dev containers work again: a project at a bind-mount target such as `/workspace` is no longer refused as too broad.",
-  "Read a file as it is at any git revision with the opt-in `ref` argument on `read`, `aft_outline` and `aft_zoom` (set `revision_reads: true`).",
-  "`aft_safety` has a `purge` op that permanently removes a file from this session's undo backups and checkpoints, such as a secret written by mistake.",
-  "`aft_zoom` takes one `batch` of lookups mixing files and URLs, and many reported issues are fixed.",
+  "Cap a shell command's total memory, background and terminal commands included, with `bash.memory_limit_mib`.",
+  "Shell results can list or diff the files a command changed: set `bash.changed_files` to `list` or `diff`.",
+  "Put rebuildable caches on another disk with `storage.cache_dir`.",
+  "Call graphs mark callback references and link constructors, Python edits keep their indentation, and many reported issues are fixed.",
 ];
 
 /**
@@ -363,6 +368,11 @@ async function handleConfigureWarningsForSession(context: {
       storageDir: context.storageDir,
       pluginVersion: context.pluginVersion,
       projectRoot: context.projectRoot,
+      onDeferred: (warning) => {
+        const pending = pendingEagerWarnings.get(context.projectRoot) ?? [];
+        pending.push(warning);
+        pendingEagerWarnings.set(context.projectRoot, pending);
+      },
     },
     combinedWarnings,
   );
@@ -453,6 +463,25 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // spawned after shutdown has no owner left to stop it, so a headless
   // `pi -p` run would never exit.
   let hostShutdownStarted = false;
+  let activeSessionContext: ExtensionContext | undefined;
+  let announcementPending = false;
+  let pendingInstallSummary: Array<{ id: string; reason: string }> | undefined;
+  const bindNotificationContext = (context?: ExtensionContext): void => {
+    if (hostShutdownStarted || !context) return;
+    activeSessionContext = context;
+    if (announcementPending) {
+      announcementPending = !sendFeatureAnnouncement(
+        ANNOUNCEMENT_VERSION,
+        ANNOUNCEMENT_FEATURES,
+        ANNOUNCEMENT_FOOTER,
+        storageDir,
+        context,
+      );
+    }
+    if (pendingInstallSummary && sendLspInstallSummary(pendingInstallSummary, context)) {
+      pendingInstallSummary = undefined;
+    }
+  };
   const lspAutoInstall = !skipEagerStartup && (config.lsp?.auto_install ?? true);
   // When `lsp.auto_install: false`, leave the list empty so the Rust-side
   // `detect_missing_lsp_binaries` loop in configure.rs skips its built-in
@@ -731,11 +760,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
       // ─── Surface install outcomes once installs settle ───
       //
-      // There is no session to send an ignored message to the way the
-      // OpenCode plugin does, so we promote actionable skips from `log()`
-      // (verbose) to `warn()` (visible at WARN level) so users running with
-      // default logging see them. Routine skips (already-installed,
-      // not-relevant, disabled) stay out of the warning summary.
+      // The factory API has no UI. Deliver through the latest session context;
+      // retain a summary if the host is headless or its notification UI failed.
       const installCompletion = Promise.all([npmResult.installsComplete, ghResult.installsComplete])
         .then(async () => {
           return [
@@ -743,23 +769,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           ];
         })
         .then((updatedPaths) => {
-          const actionable = [...npmResult.skipped, ...ghResult.skipped].filter((s) => {
-            const r = s.reason.toLowerCase();
-            if (r === "auto_install: false") return false;
-            if (r === "disabled by config") return false;
-            if (r === "not relevant to project") return false;
-            if (r === "already installed") return false;
-            if (r === "another install in progress") return false;
-            return true;
-          });
-          if (actionable.length > 0) {
-            const lines = actionable.map((s) => `  • ${s.id}: ${s.reason}`).join("\n");
-            warn(
-              `[lsp] skipped or failed to install ${actionable.length} server(s):\n${lines}\n` +
-                'Pin a working version with `lsp.versions: { "<package>": "<version>" }` if grace is blocking, ' +
-                "or set `lsp.auto_install: false` to suppress.",
-            );
-          }
+          const skipped = [...npmResult.skipped, ...ghResult.skipped];
+          const summary = formatLspInstallSummary(skipped);
+          if (summary) warn(summary);
+          if (!sendLspInstallSummary(skipped, activeSessionContext) && !hostShutdownStarted)
+            pendingInstallSummary = skipped;
           return updatedPaths;
         })
         .catch((err) => {
@@ -927,13 +941,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   };
   ctx.startSessionWork = startSessionWork;
 
-  if (ANNOUNCEMENT_VERSION && ANNOUNCEMENT_FEATURES.length > 0) {
-    sendFeatureAnnouncement(
-      ANNOUNCEMENT_VERSION,
-      ANNOUNCEMENT_FEATURES,
-      ANNOUNCEMENT_FOOTER,
-      storageDir,
+  if (
+    ANNOUNCEMENT_VERSION &&
+    ANNOUNCEMENT_FEATURES.length > 0 &&
+    shouldShowAnnouncement(storageDir, "pi", ANNOUNCEMENT_VERSION)
+  ) {
+    log(
+      formatFeatureAnnouncement(ANNOUNCEMENT_VERSION, ANNOUNCEMENT_FEATURES, ANNOUNCEMENT_FOOTER),
     );
+    announcementPending = true;
   }
 
   ctx.ompRouter = await loadOmpInternalUrlRouter(pi);
@@ -949,6 +965,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       handler: (_event?: unknown, extCtx?: unknown) => unknown,
     ) => void
   )("session_start", (_event, extCtx) => {
+    bindNotificationContext(extCtx as ExtensionContext | undefined);
     const sessionID = extCtx ? resolveSessionId(extCtx as ExtensionContext) : undefined;
     recordSessionCwd((extCtx as ExtensionContext | undefined)?.cwd);
     observeFreshSessionStart(
@@ -970,13 +987,16 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
   // A host that runs an agent turn without having emitted `session_start`
   // still gets the session-scoped startup before the turn's first tool call.
-  (pi.on as (event: "before_agent_start", handler: () => undefined) => void)(
-    "before_agent_start",
-    () => {
-      startSessionWork();
-      return undefined;
-    },
-  );
+  (
+    pi.on as (
+      event: "before_agent_start",
+      handler: (_event?: unknown, extCtx?: ExtensionContext) => undefined,
+    ) => void
+  )("before_agent_start", (_event, extCtx) => {
+    bindNotificationContext(extCtx);
+    startSessionWork();
+    return undefined;
+  });
 
   // Workflow hints: short system-prompt block teaching token-efficient
   // AFT workflows. Hooked into Pi's `before_agent_start` event as a prompt
@@ -1022,12 +1042,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   (
     pi.on as (
       event: "turn_end",
-      handler: (
-        event: unknown,
-        ctx: Parameters<typeof resolveSessionId>[0] & { cwd: string },
-      ) => unknown,
+      handler: (event: unknown, ctx: ExtensionContext) => unknown,
     ) => void
   )("turn_end", async (_event, extCtx) => {
+    bindNotificationContext(extCtx);
     const sessionID = resolveSessionId(extCtx);
     setActiveSessionId(sessionID);
     await handleTurnEndBgCompletions({
@@ -1041,7 +1059,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       void handleConfigureWarningsForSession({
         projectRoot: extCtx.cwd,
         sessionId: sessionID,
-        client: pi,
+        client: extCtx,
         bridge,
         warnings: [],
         storageDir,
@@ -1076,6 +1094,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // Ctrl+C, OS shutdown) rather than through the session_shutdown lifecycle.
   const unregisterShutdownCleanup = registerShutdownCleanup(async () => {
     hostShutdownStarted = true;
+    activeSessionContext = undefined;
+    pendingInstallSummary = undefined;
     liveConfigReload.stop();
     try {
       await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
@@ -1089,6 +1109,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // Clean up bridges on session shutdown.
   pi.on("session_shutdown", async () => {
     hostShutdownStarted = true;
+    activeSessionContext = undefined;
+    pendingInstallSummary = undefined;
     liveConfigReload.stop();
     try {
       await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
@@ -1112,4 +1134,5 @@ export const __test__ = {
   handleConfigureWarningsForSession,
   shouldPrepareOnnxRuntime,
   createVersionMismatchHandler,
+  announcementVersion: ANNOUNCEMENT_VERSION,
 };

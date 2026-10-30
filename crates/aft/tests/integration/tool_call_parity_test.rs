@@ -11,7 +11,8 @@ use serde_json::{json, Map, Value};
 use super::helpers::AftProcess;
 
 const SESSION_ID: &str = "tool-call-parity-session";
-// Wait out delayed watcher notifications so they cannot skew only one parity call.
+// A clear probe must persist, but each compared reply must also be clear: an
+// idle maintenance drain can start after the last probe, even without OS events.
 const WATCHER_QUIET_WINDOW: Duration = Duration::from_millis(250);
 
 struct ParityCase {
@@ -65,13 +66,6 @@ fn run_tool_call_parity(glob_mtimes: GlobMtimeProfile, cases: Vec<ParityCase>) {
     );
 
     for case in cases {
-        wait_until_watcher_queries_are_current(
-            &mut direct_aft,
-            &mut tool_call_aft,
-            direct_project.path(),
-            tool_call_project.path(),
-            case.label,
-        );
         let request_id = format!("tool-call-parity-{}", case.label);
         let direct_request = direct_request(
             &request_id,
@@ -87,8 +81,24 @@ fn run_tool_call_parity(glob_mtimes: GlobMtimeProfile, cases: Vec<ParityCase>) {
             "arguments": case.arguments,
         });
 
-        let direct_response = send_json(&mut direct_aft, direct_request);
-        let tool_call_response = send_json(&mut tool_call_aft, tool_call_request);
+        let replay_safe = matches!(
+            case.tool,
+            "read" | "grep" | "glob" | "search" | "inspect" | "status" | "conflicts" | "zoom"
+        ) || (case.tool == "safety" && case.arguments["op"] == "list");
+        let direct_response = send_quiescent_parity_request(
+            &mut direct_aft,
+            direct_project.path(),
+            direct_request,
+            &format!("{}-direct", case.label),
+            replay_safe,
+        );
+        let tool_call_response = send_quiescent_parity_request(
+            &mut tool_call_aft,
+            tool_call_project.path(),
+            tool_call_request,
+            &format!("{}-tool-call", case.label),
+            replay_safe,
+        );
         if case.label == "status_snapshot" {
             assert_lifecycle_census_presence(&direct_response);
             assert_lifecycle_census_presence(&tool_call_response);
@@ -185,61 +195,87 @@ fn run_tool_call_parity(glob_mtimes: GlobMtimeProfile, cases: Vec<ParityCase>) {
     assert!(tool_call_aft.shutdown().success());
 }
 
-fn wait_until_watcher_queries_are_current(
-    direct_aft: &mut AftProcess,
-    tool_call_aft: &mut AftProcess,
-    direct_project: &Path,
-    tool_call_project: &Path,
-    case_label: &str,
-) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+#[derive(Clone, Copy)]
+enum ParityPoll {
+    Readiness,
+    Compared,
+}
+
+fn send_quiescent_parity_request(
+    aft: &mut AftProcess,
+    project: &Path,
+    request: Value,
+    label: &str,
+    replay_safe: bool,
+) -> Value {
     let readiness_arguments = json!({"pattern": "needle", "path": "src/search.txt"});
     let mut attempt = 0;
+    quiescent_parity_response(
+        label,
+        replay_safe,
+        |poll| {
+            match poll {
+                ParityPoll::Readiness => {
+                    attempt += 1;
+                    send_json(
+                        aft,
+                        direct_request(
+                            &format!("watcher-readiness-{label}-{attempt}"),
+                            "grep",
+                            &readiness_arguments,
+                            project,
+                        ),
+                    )
+                }
+                // Request IDs correlate replies; they are not new mutation attempts.
+                // Only read-only operations may be repeated after a pending snapshot.
+                ParityPoll::Compared => send_json(aft, request.clone()),
+            }
+        },
+        Instant::now,
+        || thread::sleep(Duration::from_millis(10)),
+    )
+}
+
+fn quiescent_parity_response(
+    label: &str,
+    replay_safe: bool,
+    mut send: impl FnMut(ParityPoll) -> Value,
+    mut now: impl FnMut() -> Instant,
+    mut pause: impl FnMut(),
+) -> Value {
+    let deadline = now() + Duration::from_secs(10);
     let mut quiet_since = None;
-
+    let mut last_pending_reply = None;
     loop {
-        attempt += 1;
-        let direct_response = send_json(
-            direct_aft,
-            direct_request(
-                &format!("watcher-readiness-{case_label}-{attempt}-direct"),
-                "grep",
-                &readiness_arguments,
-                direct_project,
-            ),
-        );
-        let tool_call_response = send_json(
-            tool_call_aft,
-            direct_request(
-                &format!("watcher-readiness-{case_label}-{attempt}-tool-call"),
-                "grep",
-                &readiness_arguments,
-                tool_call_project,
-            ),
-        );
+        let readiness = send(ParityPoll::Readiness);
         assert_eq!(
-            direct_response["success"], true,
-            "direct watcher readiness query failed before {case_label}: {direct_response:#}"
+            readiness["success"], true,
+            "watcher readiness query failed before {label}: {readiness:#}"
         );
-        assert_eq!(
-            tool_call_response["success"], true,
-            "tool_call watcher readiness query failed before {case_label}: {tool_call_response:#}"
-        );
-
-        let direct_pending = has_pending_watcher_changes(&direct_response);
-        let tool_call_pending = has_pending_watcher_changes(&tool_call_response);
         if watcher_quiet_window_elapsed(
             &mut quiet_since,
-            direct_pending || tool_call_pending,
-            Instant::now(),
+            has_pending_watcher_changes(&readiness),
+            now(),
         ) {
-            return;
+            let response = send(ParityPoll::Compared);
+            // A probe is only a snapshot. Do not compare a later reply that
+            // raced with a newly started maintenance drain, or hide its warning.
+            if !has_pending_watcher_changes(&response) {
+                return response;
+            }
+            assert!(
+                replay_safe,
+                "refusing to replay mutating parity request {label}: {response:#}"
+            );
+            last_pending_reply = Some(response);
+            quiet_since = None;
         }
         assert!(
-            Instant::now() < deadline,
-            "timed out waiting for watcher changes to be applied before {case_label}: direct pending={direct_pending}, response={direct_response:#}; tool_call pending={tool_call_pending}, response={tool_call_response:#}"
+            now() < deadline,
+            "timed out waiting for watcher quiescence before {label}: readiness={readiness:#}, last pending reply={last_pending_reply:#?}"
         );
-        thread::sleep(Duration::from_millis(10));
+        pause();
     }
 }
 
@@ -265,6 +301,277 @@ fn has_pending_watcher_changes(response: &Value) -> bool {
         .get("gaps")
         .and_then(Value::as_array)
         .is_some_and(|gaps| gaps.iter().any(|gap| gap["kind"] == "watcher_pending"))
+}
+
+fn watcher_parity_response(text: &str, pending: bool) -> Value {
+    let mut response = Response {
+        id: "watcher-parity-fixture".to_string(),
+        success: true,
+        data: json!({"text": text}),
+    };
+    // Use the production gap attachment and wire serialization, not a second
+    // hand-written definition of where a pending watcher gap should appear.
+    aft::response_finalize::attach_watcher_query_gap(&mut response, pending);
+    serde_json::to_value(response).expect("serialize watcher parity response")
+}
+
+#[test]
+fn parity_waits_for_actual_reply_after_a_clear_watcher_probe() {
+    use std::cell::Cell;
+    for route in ["direct", "tool_call"] {
+        let start = Instant::now();
+        let clock = Cell::new(0_u64);
+        let mut compared_at = Vec::new();
+        let response = quiescent_parity_response(
+            route,
+            true,
+            |poll| match poll {
+                ParityPoll::Readiness => watcher_parity_response("ready", false),
+                ParityPoll::Compared => {
+                    compared_at.push(clock.get());
+                    if compared_at.len() == 1 {
+                        watcher_parity_response("late maintenance snapshot", true)
+                    } else {
+                        watcher_parity_response("quiescent snapshot", false)
+                    }
+                }
+            },
+            || start + Duration::from_millis(clock.get()),
+            || clock.set(clock.get() + 125),
+        );
+        assert_eq!(
+            response["text"], "quiescent snapshot",
+            "{route} must not compare a pending reply"
+        );
+        assert!(!has_pending_watcher_changes(&response));
+        assert_eq!(
+            compared_at,
+            [250, 625],
+            "a late drain must restart the quiet interval for {route}"
+        );
+    }
+}
+
+#[cfg(feature = "test-timing-hooks")]
+#[test]
+fn parity_waits_for_real_maintenance_drain_between_calls() {
+    use aft::context::{default_language_provider_factory, AppContext};
+    use aft::executor::{Executor, Lane};
+    use aft::path_identity::ProjectRootId;
+    use aft::run_tool_call::{run_tool_call, ToolCallContext, ToolCallOutcome};
+    use aft::runtime_drain::{
+        drain_watcher_events_bounded, install_watcher_phase_commit_gate_for_test,
+        WATCHER_PATH_DRAIN_BATCH_CAP,
+    };
+    use aft::watcher_filter::WatcherDispatchEvent;
+    use std::cell::Cell;
+    use std::sync::Arc;
+
+    crate::helpers::disable_in_process_file_watcher();
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path().canonicalize().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let path = root.join("todos.rs");
+    fs::write(&path, "// TODO: maintenance parity\nfn main() {}\n").unwrap();
+    let mut config = aft::config::Config {
+        storage_dir: Some(storage.path().to_path_buf()),
+        ..aft::config::Config::default()
+    };
+    config.views.enabled = false;
+    config.indexes.trigram = false;
+    config.indexes.semantic = false;
+    config.indexes.callgraph = false;
+    let ctx = Arc::new(
+        AppContext::new(
+            default_language_provider_factory(),
+            crate::context_storage::isolate(config),
+        )
+        .with_test_checkpoint_store(),
+    );
+    let configure: aft::protocol::RawRequest = serde_json::from_value(json!({
+        "id": "configure-forced-pair", "command": "configure", "harness": "opencode",
+        "project_root": root, "storage_dir": storage.path(),
+        "config": crate::helpers::user_config(json!({
+            "indexes": {"trigram": false, "semantic": false, "callgraph": false},
+            "views": {"enabled": false}
+        }))
+    }))
+    .unwrap();
+    let configured = aft::commands::configure::handle_configure(&configure, &ctx);
+    assert!(configured.success, "{configured:?}");
+    ctx.isolate_cold_build_limiter_for_test(2);
+    ctx.set_harness(aft::harness::Harness::Opencode);
+    ctx.set_heavy_root_work_allowed(true);
+    assert!(
+        ctx.watcher_rx().lock().is_none(),
+        "no OS watcher is installed"
+    );
+    let arguments = json!({"sections": "todos", "scope": ".", "topK": 5});
+    let request: aft::protocol::RawRequest =
+        serde_json::from_value(direct_request("forced-pair", "inspect", &arguments, &root))
+            .unwrap();
+    let aft::response_finalize::DispatchOutcome::Deferred(mut pending) =
+        aft::commands::inspect::handle_inspect_deferred(&request, ctx.clone())
+    else {
+        panic!("native inspect should use its deferred producer")
+    };
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let direct = loop {
+        if let Some(response) = (pending.poll)(&ctx) {
+            break response;
+        }
+        assert!(Instant::now() < deadline, "direct inspect completion");
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(direct.success, "{direct:?}");
+    let expected = formatted_text_from_direct_response(
+        "inspect",
+        &arguments,
+        &root,
+        &serde_json::to_value(direct).unwrap(),
+    );
+    assert!(!expected.contains("Watcher changes pending"));
+    assert!(!ctx.watcher_query_has_pending_changes());
+
+    let executor = Executor::new();
+    let root_id = ProjectRootId::from_path(&root).unwrap();
+    executor.register_actor(root_id.clone(), ctx.clone());
+    let (events, receiver) = crossbeam_channel::unbounded();
+    *ctx.watcher_rx().lock() = Some(receiver);
+    let (entered, release) = install_watcher_phase_commit_gate_for_test(path.clone());
+    let start = Instant::now();
+    let clock = Cell::new(0_u64);
+    let mut compared = 0;
+    let response = quiescent_parity_response(
+        "forced-maintenance",
+        true,
+        |poll| match poll {
+            ParityPoll::Readiness => {
+                watcher_parity_response("ready", ctx.watcher_query_has_pending_changes())
+            }
+            ParityPoll::Compared => {
+                compared += 1;
+                let maintenance = if compared == 1 {
+                    // All readiness probes were clear. Start a real maintenance-lane
+                    // drain only between the direct reply and the tool_call reply.
+                    events
+                        .send(WatcherDispatchEvent::Paths(vec![path.clone()]))
+                        .unwrap();
+                    let pending = executor.submit_maintenance_async(
+                        root_id.clone(),
+                        Lane::MaintenanceCommit,
+                        "forced-watcher-drain".into(),
+                        Box::new(|ctx| {
+                            drain_watcher_events_bounded(ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+                            Response {
+                                id: "forced-watcher-drain".into(),
+                                success: true,
+                                data: json!({}),
+                            }
+                        }),
+                    );
+                    entered
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("maintenance drain reached its application gate");
+                    assert!(
+                        !ctx.watcher_drain_has_work(),
+                        "the receiver is empty and the continuation is owned by the drain"
+                    );
+                    assert!(
+                        ctx.watcher_query_has_pending_changes(),
+                        "the real drain is still in flight"
+                    );
+                    Some(pending)
+                } else {
+                    None
+                };
+                let outcome = run_tool_call(
+                    "inspect",
+                    arguments.clone(),
+                    &FormatContext::from_tool_call("inspect", &arguments, &root),
+                    &ToolCallContext {
+                        request_id: "forced-pair".into(),
+                        project_root: root.clone(),
+                        standard_edit_grammar: true,
+                        session_id: None,
+                        diagnostics_on_edit: false,
+                        preview: false,
+                        edit_slot_survives: None,
+                        report_registration_downgrade: false,
+                        disabled_tools: None,
+                        worker_session: false,
+                        host_tool_names: None,
+                    },
+                    &ctx,
+                    &|request, ctx| aft::commands::inspect::handle_inspect(&request, ctx),
+                    None,
+                    None,
+                );
+                let ToolCallOutcome::Unary(result) = outcome;
+                assert!(result.response.success, "{}", result.text);
+                if let Some(maintenance) = maintenance {
+                    assert!(
+                        result.text.contains("Watcher changes pending"),
+                        "a real drain must produce the production trailer"
+                    );
+                    release.send(()).unwrap();
+                    assert!(maintenance.blocking_recv().unwrap().success);
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while ctx.watcher_drain_has_work() {
+                        assert!(Instant::now() < deadline, "forced maintenance must finish");
+                        drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+                    }
+                    assert!(!ctx.watcher_query_has_pending_changes());
+                }
+                let mut wire = serde_json::to_value(result.response).unwrap();
+                wire["text"] = Value::String(result.text);
+                wire
+            }
+        },
+        || start + Duration::from_millis(clock.get()),
+        || clock.set(clock.get() + 125),
+    );
+    assert_eq!(
+        response["text"], expected,
+        "formatted text mismatch for inspect_todos after forced maintenance drain"
+    );
+    assert_eq!(compared, 2, "the pending real reply must not be compared");
+}
+
+#[test]
+#[should_panic(expected = "timed out waiting for watcher quiescence")]
+fn parity_wait_for_watcher_quiescence_has_a_deadline() {
+    use std::cell::Cell;
+    let start = Instant::now();
+    let clock = Cell::new(0_u64);
+    quiescent_parity_response(
+        "always-busy",
+        true,
+        |poll| match poll {
+            ParityPoll::Readiness => watcher_parity_response("ready", false),
+            ParityPoll::Compared => watcher_parity_response("still busy", true),
+        },
+        || start + Duration::from_secs(clock.get()),
+        || clock.set(clock.get() + 1),
+    );
+}
+
+#[test]
+#[should_panic(expected = "refusing to replay mutating parity request")]
+fn parity_wait_does_not_replay_mutating_requests() {
+    use std::cell::Cell;
+    let start = Instant::now();
+    let clock = Cell::new(0_u64);
+    quiescent_parity_response(
+        "write",
+        false,
+        |poll| match poll {
+            ParityPoll::Readiness => watcher_parity_response("ready", false),
+            ParityPoll::Compared => watcher_parity_response("must not write twice", true),
+        },
+        || start + Duration::from_secs(clock.get()),
+        || clock.set(clock.get() + 1),
+    );
 }
 
 #[test]

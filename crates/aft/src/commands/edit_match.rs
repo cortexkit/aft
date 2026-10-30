@@ -5,9 +5,10 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::access_policy::{AccessOperation, GrantKind};
 use crate::backup::CapturedRegularFile;
 use crate::context::AppContext;
-use crate::edit::{self, validate_syntax};
+use crate::edit::{self, validate_edited_file_syntax};
 use crate::format;
 
 use crate::protocol::{RawRequest, Response};
@@ -350,7 +351,9 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
     // format_skipped_reason: None` and bypassed the formatter entirely.
     // Agents that appended messy lines kept them messy with no signal.
     let config = ctx.config();
-    let (formatted, format_skipped_reason) = format::auto_format(path.as_path(), &config);
+    let tool_policy = &crate::sandbox_spawn::ToolLaunchPolicy::for_request(ctx);
+    let (formatted, format_skipped_reason) =
+        format::auto_format(tool_policy, path.as_path(), &config);
     drop(config);
 
     // Re-read final content AFTER formatting so the LSP sees the formatted
@@ -385,7 +388,7 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
     } else {
         final_content
             .as_deref()
-            .map(|content| edit::check_created_file_syntax(path.as_path(), content))
+            .map(|content| edit::check_created_file_syntax(tool_policy, path.as_path(), content))
     };
     let syntax_valid = match created_syntax {
         Some(check) => check.valid,
@@ -662,6 +665,44 @@ fn handle_glob_edit_match(
     replacement: &str,
     op_id: &str,
 ) -> Response {
+    let mut skipped_files = Vec::new();
+    let mut response = handle_glob_edit_match_inner(
+        req,
+        ctx,
+        pattern,
+        match_str,
+        replacement,
+        op_id,
+        &mut skipped_files,
+    );
+    if !skipped_files.is_empty() {
+        response.data["skipped_files"] = serde_json::json!(skipped_files);
+        response.data["complete"] = serde_json::json!(false);
+    }
+    response
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum GlobEditSkipReason {
+    DeniedFloor,
+}
+
+#[derive(serde::Serialize)]
+struct SkippedGlobEditFile {
+    file: String,
+    reason: GlobEditSkipReason,
+}
+
+fn handle_glob_edit_match_inner(
+    req: &RawRequest,
+    ctx: &AppContext,
+    pattern: &str,
+    match_str: &str,
+    replacement: &str,
+    op_id: &str,
+    skipped_files: &mut Vec<SkippedGlobEditFile>,
+) -> Response {
     // Resolve glob relative to project root (or cwd)
     let config = ctx.config();
     let root = config
@@ -698,6 +739,10 @@ fn handle_glob_edit_match(
         );
     }
 
+    let policy = match ctx.access_policy(&req.id) {
+        Ok(policy) => policy,
+        Err(response) => return response,
+    };
     let config = ctx.config();
     let mut file_results: Vec<serde_json::Value> = Vec::new();
     let mut total_replacements: usize = 0;
@@ -715,6 +760,22 @@ fn handle_glob_edit_match(
     let mut pending: Vec<PendingEdit> = Vec::new();
 
     for path in &paths {
+        // Floors protect content reads too. Root and write authorization belong
+        // after matching, so unrelated glob candidates do not require permission.
+        if policy
+            .capability_floor(
+                AccessOperation::Write,
+                GrantKind::File,
+                &crate::access_policy::policy_path(path),
+            )
+            .is_some()
+        {
+            skipped_files.push(SkippedGlobEditFile {
+                file: path.display().to_string(),
+                reason: GlobEditSkipReason::DeniedFloor,
+            });
+            continue;
+        }
         let (source, capture) = match CapturedRegularFile::read_text(path) {
             Ok(Some((capture, source))) => (source, Some(capture)),
             Ok(None) => match std::fs::read_to_string(path) {
@@ -733,15 +794,20 @@ fn handle_glob_edit_match(
             continue;
         }
 
+        let validated_path = match validate_glob_edit_path(ctx, &req.id, path) {
+            Ok(validated) => validated,
+            Err(resp) if resp.data["code"] == "denied_floor" => {
+                skipped_files.push(SkippedGlobEditFile {
+                    file: path.display().to_string(),
+                    reason: GlobEditSkipReason::DeniedFloor,
+                });
+                continue;
+            }
+            Err(resp) => return resp,
+        };
         let count = positions.len();
         let new_source = source.replace(match_str, replacement);
         let file_str = path.display().to_string();
-
-        // Backup before mutation
-        let validated_path = match validate_glob_edit_path(ctx, &req.id, path) {
-            Ok(validated) => validated,
-            Err(resp) => return resp,
-        };
 
         pending.push(PendingEdit {
             path: validated_path,
@@ -760,8 +826,9 @@ fn handle_glob_edit_match(
             &req.id,
             "match_not_found",
             format!(
-                "edit_match: '{}' not found in any files matching '{}'",
-                match_str, pattern
+                "edit_match: {} not found in any files matching '{}'",
+                crate::fuzzy_match::describe_searched_text(match_str),
+                pattern
             ),
         );
     }
@@ -818,6 +885,8 @@ fn handle_glob_edit_match(
         return edit::no_change_response(&req.id);
     }
     pending.retain(|edit| edit.original_source != edit.new_source);
+    let tool_policy = &crate::sandbox_spawn::ToolLaunchPolicy::for_request(ctx);
+
     let _mutation = crate::runtime_drain::record_file_mutation(
         ctx,
         pending.iter().map(|edit| edit.path.as_path()),
@@ -926,12 +995,13 @@ fn handle_glob_edit_match(
     let mut format_skip_reasons = std::collections::BTreeSet::new();
     for edit in &pending {
         let file_str = edit.path.display().to_string();
-        let (formatted, format_skipped_reason) = format::auto_format(&edit.path, &config);
+        let (formatted, format_skipped_reason) =
+            format::auto_format(tool_policy, &edit.path, &config);
         if let Some(reason) = &format_skipped_reason {
             format_skipped_count += 1;
             format_skip_reasons.insert(reason.clone());
         }
-        let syntax_valid = match validate_syntax(&edit.path) {
+        let syntax_valid = match validate_edited_file_syntax(&edit.path) {
             Ok(valid) => valid,
             Err(e) => {
                 if let Some(name) = &checkpoint_name {
@@ -1161,6 +1231,46 @@ mod tests {
 
     use super::{handle_edit_match, restore_glob_checkpoint};
 
+    /// A failed edit should name the miss, not paste the whole `match` text
+    /// back: the caller already has it, and a large one doubles its cost in
+    /// the transcript. The nearest-miss excerpt that follows is already
+    /// bounded (ten lines of at most 240 characters).
+    #[test]
+    fn not_found_error_does_not_repeat_a_large_match() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("small.rs");
+        fs::write(&path, "fn main() {\n    println!(\"hello\");\n}\n").unwrap();
+        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        let needle: String = (0..400)
+            .map(|index| format!("    let absent_{index} = 0;\n"))
+            .collect();
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "miss",
+            "command": "edit_match",
+            "file": path.display().to_string(),
+            "match": needle,
+            "replacement": "x",
+        }))
+        .unwrap();
+        let response = handle_edit_match(&request, &ctx);
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "match_not_found");
+        let message = response.data["message"].as_str().unwrap();
+        assert!(
+            !message.contains(&needle),
+            "{} byte match repeated in a {} byte error",
+            needle.len(),
+            message.len()
+        );
+        assert!(message.len() < 4 * 1024, "{} byte error", message.len());
+        assert!(
+            message.starts_with(
+                "edit_match: '    let absent_0 = 0;…' (400 lines, 9490 bytes) not found in "
+            ),
+            "{message}"
+        );
+    }
+
     /// A failed match with a 64 KiB or 256 KiB `match` against a large file
     /// used to spend seconds in the whitespace-reflow pass, whose window scan
     /// cost file lines × match lines. The pass now scans linearly: the reply
@@ -1216,7 +1326,8 @@ mod tests {
             assert_eq!(
                 response.data["message"].as_str().unwrap(),
                 format!(
-                    "edit_match: '{needle}' not found in {}{}",
+                    "edit_match: {} not found in {}{}",
+                    crate::fuzzy_match::describe_searched_text(&needle),
                     path.display(),
                     crate::fuzzy_match::render_edit_not_found_detail(&source, &needle, "x")
                 ),
@@ -1313,15 +1424,84 @@ mod tests {
         let backup = ctx.backup().lock();
         assert_eq!(
             backup.history(request.session(), &first)[0]
-                .content_bytes
+                .content_bytes()
+                .unwrap()
                 .as_ref(),
             b"first TARGET\n"
         );
         assert_eq!(
             backup.history(request.session(), &second)[0]
-                .content_bytes
+                .content_bytes()
+                .unwrap()
                 .as_ref(),
             b"second TARGET\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_edit_skips_non_matching_symlink_outside_project_root() {
+        assert_glob_edit_outside_symlink(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_edit_refuses_matching_symlink_outside_project_root() {
+        assert_glob_edit_outside_symlink(true);
+    }
+
+    #[cfg(unix)]
+    fn assert_glob_edit_outside_symlink(outside_matches: bool) {
+        let cache = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let inside_file = project.path().join("a.txt");
+        let outside_file = outside.path().join("outside.txt");
+        let outside_source = if outside_matches {
+            "outside TARGET\n"
+        } else {
+            "unrelated\n"
+        };
+        fs::write(&inside_file, "inside TARGET\n").unwrap();
+        fs::write(&outside_file, outside_source).unwrap();
+        std::os::unix::fs::symlink(&outside_file, project.path().join("z.txt")).unwrap();
+        let outside_modified = fs::metadata(&outside_file).unwrap().modified().unwrap();
+
+        let ctx = AppContext::new(
+            Box::new(StubProvider),
+            Config {
+                project_root: Some(project.path().to_path_buf()),
+                restrict_to_project_root: true,
+                ..Config::default()
+            },
+        );
+        ctx.checkpoint()
+            .lock()
+            .set_lock_path_for_test(cache.path().join("checkpoint.lock"));
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "glob-outside-symlink",
+            "command": "edit_match",
+            "file": "*.txt",
+            "match": "TARGET",
+            "replacement": "DONE",
+            "replace_all": true
+        }))
+        .unwrap();
+
+        let response = handle_edit_match(&request, &ctx);
+        if outside_matches {
+            assert!(!response.success, "{response:?}");
+            assert_eq!(response.data["code"], "path_outside_root", "{response:?}");
+            assert_eq!(fs::read_to_string(&inside_file).unwrap(), "inside TARGET\n");
+        } else {
+            assert!(response.success, "{response:?}");
+            assert_eq!(response.data["total_files"], 1, "{response:?}");
+            assert_eq!(fs::read_to_string(&inside_file).unwrap(), "inside DONE\n");
+        }
+        assert_eq!(fs::read_to_string(&outside_file).unwrap(), outside_source);
+        assert_eq!(
+            fs::metadata(&outside_file).unwrap().modified().unwrap(),
+            outside_modified
         );
     }
 
@@ -1396,12 +1576,20 @@ fn fuzzy_replacement_restores_newline(
         && !replacement.ends_with('\n')
 }
 
+/// Append the text that replaces the plan's match at `index`: the
+/// replacement re-indented by the match's indentation shift (see
+/// [`crate::fuzzy_match::ReindentPlan`]), with line separators adjusted so
+/// the match boundary neither loses nor doubles a newline. Fails with
+/// `ambiguous_indentation` when the shift cannot be determined without
+/// guessing.
 pub(crate) fn push_fuzzy_replacement(
     output: &mut String,
-    source: &str,
-    matched: &crate::fuzzy_match::FuzzyMatch,
-    replacement: &str,
-) {
+    plan: &crate::fuzzy_match::ReindentPlan<'_>,
+    index: usize,
+) -> Result<(), crate::error::AftError> {
+    let source = plan.source();
+    let matched = plan.matched(index);
+    let replacement = &*plan.replacement_for(index)?;
     let end = matched.byte_start + matched.byte_len;
     // When the match leaves the source line separator outside its span, a
     // replacement ending in a newline must not introduce a second separator.
@@ -1420,12 +1608,15 @@ pub(crate) fn push_fuzzy_replacement(
     if fuzzy_replacement_restores_newline(source, matched, replacement) {
         output.push('\n');
     }
+    Ok(())
 }
 
 pub(crate) fn apply_sorted_non_overlapping_fuzzy_matches(
     source: &str,
     matches: &[crate::fuzzy_match::FuzzyMatch],
+    needle: &str,
     replacement: &str,
+    path: Option<&Path>,
 ) -> Result<String, crate::error::AftError> {
     let mut removed_bytes = 0usize;
     let mut replacement_bytes = 0usize;
@@ -1447,9 +1638,11 @@ pub(crate) fn apply_sorted_non_overlapping_fuzzy_matches(
         .saturating_add(replacement_bytes);
     let mut result = String::with_capacity(capacity);
     let mut copied_through = 0usize;
-    for matched in matches {
+    // One plan covers all the matches, so finding string lines parses at most once.
+    let plan = crate::fuzzy_match::ReindentPlan::new(source, needle, replacement, path, matches);
+    for (index, matched) in matches.iter().enumerate() {
         result.push_str(&source[copied_through..matched.byte_start]);
-        push_fuzzy_replacement(&mut result, source, matched, replacement);
+        push_fuzzy_replacement(&mut result, &plan, index)?;
         copied_through = matched.byte_start + matched.byte_len;
     }
     result.push_str(&source[copied_through..]);
@@ -1532,8 +1725,8 @@ fn handle_single_file_edit_match(
             &req.id,
             "match_not_found",
             format!(
-                "edit_match: '{}' not found in {}{}",
-                match_str,
+                "edit_match: {} not found in {}{}",
+                crate::fuzzy_match::describe_searched_text(match_str),
                 file,
                 crate::fuzzy_match::render_edit_not_found_detail(&source, match_str, replacement,),
             ),
@@ -1630,7 +1823,9 @@ fn handle_single_file_edit_match(
         let result = match apply_sorted_non_overlapping_fuzzy_matches(
             &source,
             &fuzzy_matches,
+            match_str,
             replacement,
+            Some(path.as_path()),
         ) {
             Ok(updated) => updated,
             Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
@@ -1640,7 +1835,16 @@ fn handle_single_file_edit_match(
         let target_idx = occurrence.unwrap_or(0);
         let matched = &fuzzy_matches[target_idx];
         let mut effective_replacement = String::with_capacity(replacement.len().saturating_add(1));
-        push_fuzzy_replacement(&mut effective_replacement, &source, matched, replacement);
+        let plan = crate::fuzzy_match::ReindentPlan::new(
+            &source,
+            match_str,
+            replacement,
+            Some(path.as_path()),
+            std::slice::from_ref(matched),
+        );
+        if let Err(e) = push_fuzzy_replacement(&mut effective_replacement, &plan, 0) {
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
         (
             match edit::replace_byte_range(
                 &source,
@@ -1708,7 +1912,9 @@ fn handle_single_file_edit_match(
     };
 
     // Write, format, and validate via shared pipeline
+    let tool_policy = &crate::sandbox_spawn::ToolLaunchPolicy::for_request(ctx);
     let mut write_result = match edit::write_format_validate_observed(
+        tool_policy,
         path.as_path(),
         &new_source,
         &ctx.config(),
@@ -1800,6 +2006,52 @@ fn handle_single_file_edit_match(
 mod replace_all_tests {
     use super::*;
 
+    /// Finding which replacement lines sit inside string literals parses the
+    /// edited file once for all the matches of a replace-all, and not at
+    /// all when the file, the matched lines and the replacement hold no
+    /// string delimiter.
+    #[test]
+    fn replace_all_parses_for_string_lines_at_most_once() {
+        use crate::fuzzy_match::STRING_LINE_PARSES;
+        let path = Path::new("t.py");
+        for (line, needle, replacement, shifted, parses) in [
+            (
+                "    v = 'a'\n",
+                "v = 'a' ",
+                "v = 'b'\nw = 'c'",
+                "    v = 'b'\n    w = 'c'\n",
+                1,
+            ),
+            (
+                "    v = 1\n",
+                "v = 1 ",
+                "v = 2\nw = 3",
+                "    v = 2\n    w = 3\n",
+                0,
+            ),
+        ] {
+            let source = format!("def f():\n{}", line.repeat(1_000));
+            let matches = crate::fuzzy_match::find_all_fuzzy(&source, needle);
+            assert_eq!(matches.len(), 1_000);
+            assert_eq!(matches[0].pass, 3, "the loose pass must match");
+            STRING_LINE_PARSES.with(|count| count.set(0));
+            let result = apply_sorted_non_overlapping_fuzzy_matches(
+                &source,
+                &matches,
+                needle,
+                replacement,
+                Some(path),
+            )
+            .unwrap();
+            assert_eq!(result, format!("def f():\n{}", shifted.repeat(1_000)));
+            assert_eq!(
+                STRING_LINE_PARSES.with(|count| count.get()),
+                parses,
+                "parses for {needle:?}"
+            );
+        }
+    }
+
     fn frozen_reverse_apply(
         source: &str,
         matches: &[crate::fuzzy_match::FuzzyMatch],
@@ -1856,8 +2108,14 @@ mod replace_all_tests {
                 "fixture must exercise replace_all: {needle:?}"
             );
             let expected = frozen_reverse_apply(source, &matches, replacement);
-            let actual = apply_sorted_non_overlapping_fuzzy_matches(source, &matches, replacement)
-                .expect("one-pass replacement");
+            let actual = apply_sorted_non_overlapping_fuzzy_matches(
+                source,
+                &matches,
+                needle,
+                replacement,
+                None,
+            )
+            .expect("one-pass replacement");
             assert_eq!(actual.as_bytes(), expected.as_bytes(), "needle={needle:?}");
         }
     }
@@ -1869,7 +2127,7 @@ mod replace_all_tests {
         assert_eq!(matches.len(), 1_024);
 
         let (result, allocations) = crate::test_allocations::count(|| {
-            apply_sorted_non_overlapping_fuzzy_matches(&source, &matches, "new")
+            apply_sorted_non_overlapping_fuzzy_matches(&source, &matches, "old", "new", None)
                 .expect("one-pass replacement")
         });
 
@@ -2080,7 +2338,7 @@ mod audit_regressions {
         let store = ctx.backup().lock();
         let history = store.history(request.session(), &path);
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].content_bytes.as_ref(), b"before");
+        assert_eq!(history[0].content_bytes().unwrap().as_ref(), b"before");
     }
 
     struct PartialWriter {
@@ -2155,12 +2413,21 @@ mod audit_regressions {
         let matches = crate::fuzzy_match::find_all_fuzzy(source, "a\nb\n");
         assert_eq!(matches.len(), 1);
         assert_eq!(
-            super::apply_sorted_non_overlapping_fuzzy_matches(source, &matches, "x\r\ny\r\n")
-                .unwrap(),
+            super::apply_sorted_non_overlapping_fuzzy_matches(
+                source,
+                &matches,
+                "a\nb\n",
+                "x\r\ny\r\n",
+                None,
+            )
+            .unwrap(),
             "x\r\ny\r\nc\r\n"
         );
         assert_eq!(
-            super::apply_sorted_non_overlapping_fuzzy_matches(source, &matches, "x\ny\n").unwrap(),
+            super::apply_sorted_non_overlapping_fuzzy_matches(
+                source, &matches, "a\nb\n", "x\ny\n", None
+            )
+            .unwrap(),
             "x\ny\r\nc\r\n"
         );
     }

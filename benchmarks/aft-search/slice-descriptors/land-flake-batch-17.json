@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "flake-batch-17"
+  ],
+  "note": "Test-only: the move_file watched-events test counts FileEvents across notifications instead of notifications. No changed path matches RANKING_FENCE_PREFIXES."
+}

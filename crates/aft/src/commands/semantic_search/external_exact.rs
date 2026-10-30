@@ -212,6 +212,7 @@ pub(super) struct SweepOutcome {
     pub scan_stopped: bool,
     /// Whether a borrowed index was consulted.
     pub used_index: bool,
+    pub index_read_gap: Option<String>,
     /// Unchanged indexed files the index showed cannot contain a searched
     /// term, so they were not read.
     pub index_answered: usize,
@@ -224,7 +225,10 @@ pub(super) struct SweepOutcome {
 impl SweepOutcome {
     /// True when every file under the root was checked.
     pub(super) fn fully_covered(&self) -> bool {
-        !self.enumeration_stopped && !self.scan_stopped && self.oversized_skipped == 0
+        !self.enumeration_stopped
+            && !self.scan_stopped
+            && self.oversized_skipped == 0
+            && self.index_read_gap.is_none()
     }
 
     fn files_with_hits(&self) -> usize {
@@ -237,7 +241,7 @@ impl SweepOutcome {
 
     /// One plain-language line saying how much of the project was searched.
     pub(super) fn coverage_line(&self, root: &Path) -> String {
-        let source = if self.used_index {
+        let mut source = if self.used_index {
             format!(
                 "this project's own AFT index answered {} unchanged files without reading them and {} files were read from disk",
                 self.index_answered, self.files_read
@@ -245,6 +249,10 @@ impl SweepOutcome {
         } else {
             "no AFT index for this project was usable, so files were read from disk".to_string()
         };
+        if let Some(reason) = &self.index_read_gap {
+            source.push_str("; ");
+            source.push_str(reason);
+        }
         let oversized = if self.oversized_skipped > 0 {
             format!(
                 "; {} files larger than {} bytes were not searched",
@@ -335,7 +343,19 @@ pub(super) fn sweep(
 
     order_for_search(&mut files, root);
 
-    let candidates = index.map(|index| index_candidates(index, terms));
+    let candidates = match index
+        .map(|index| index_candidates(index, terms))
+        .transpose()
+    {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            outcome.used_index = false;
+            outcome.index_read_gap = Some(format!(
+                "Index source unavailable: {error}; verified-source sweep used"
+            ));
+            None
+        }
+    };
     let mut hits = Vec::new();
     for (class, path) in &files {
         if Instant::now() >= deadline || crate::executor::current_job_cancelled() {
@@ -405,13 +425,13 @@ fn stat_matches(entry: &FileEntry, path: &Path) -> bool {
 }
 
 /// Indexed files whose trigrams could contain any searched term.
-fn index_candidates(index: &SearchIndex, terms: &IdentifierTerms) -> HashSet<u32> {
+fn index_candidates(index: &SearchIndex, terms: &IdentifierTerms) -> std::io::Result<HashSet<u32>> {
     let mut candidates = HashSet::new();
     for term in terms.all_terms() {
         let query = decompose_regex(&regex::escape(term));
-        candidates.extend(index.candidates(&query));
+        candidates.extend(index.candidates(&query)?);
     }
-    candidates
+    Ok(candidates)
 }
 
 fn scan_content(
@@ -617,7 +637,7 @@ pub(super) fn reply(
             crate::list_surfaces::search::SEARCH_NARROW,
         ))
     };
-    let summary = serde_json::json!({
+    let mut summary = serde_json::json!({
         "identifier": terms.identifier,
         "variants": terms.variants,
         "exact_lines": exact_count,
@@ -639,6 +659,9 @@ pub(super) fn reply(
         // renderer that draws results from this JSON shows it too.
         "coverage": outcome.coverage_line(root),
     });
+    if let Some(reason) = &outcome.index_read_gap {
+        summary["index_read_gap"] = serde_json::json!(reason);
+    }
     SweepReply {
         results,
         text,
@@ -1319,7 +1342,7 @@ mod tests {
             let text = rendered_search_text(&ctx, session.path(), &root, query, subc);
             assert!(text.starts_with(&expected), "{text}");
             for forbidden in [
-                "fully degraded",
+                crate::subc_format::FILESYSTEM_SCAN_STATUS,
                 "Search status",
                 "[index: fallback]",
                 "[interpreted_as",

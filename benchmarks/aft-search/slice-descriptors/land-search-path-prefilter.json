@@ -1,0 +1,14 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/commands/semantic_search/memo.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/search_index.rs"
+  ],
+  "note": "engine_unwired: candidate-preserving filename prefilter; 103 real-query rows byte-identical (evaluate exit 0) Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}

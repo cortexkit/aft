@@ -252,7 +252,7 @@ mod signal_scope {
         }
     }
 
-    fn attack(fixture: &mut ProbeFixture, target: &str) -> Output {
+    fn probe_signal(fixture: &mut ProbeFixture, target: &str, signal: &str) -> Output {
         fixture.profile.rewind();
         let mut command = launcher_command(
             fixture.profile.fd(),
@@ -261,11 +261,71 @@ mod signal_scope {
                 "--noprofile",
                 "--norc",
                 "-c",
-                &format!("kill -9 -- {target}"),
+                &format!("kill -{signal} -- {target}"),
             ],
         );
         command.env("HOME", &fixture.outside_home);
         command.output().expect("launch signal probe")
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_signal_zero_allows_unrelated_same_uid() {
+        let mut fixture = ProbeFixture::with_worker_jail(true);
+        let mut victim = Victim::new();
+        let output = probe_signal(&mut fixture, &victim.0.id().to_string(), "0");
+        victim.assert_alive();
+        assert!(
+            output.status.success(),
+            "outside-process existence probe failed: {output:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_signal_zero_to_unrelated_same_uid_is_refused_by_landlock() {
+        // Landlock has no per-signal exception, so the existence probe is
+        // refused like a real signal; docs/config.md states this limit.
+        if !signal_scope_available() {
+            return;
+        }
+        let mut fixture = ProbeFixture::with_worker_jail(true);
+        let mut victim = Victim::new();
+        let output = probe_signal(&mut fixture, &victim.0.id().to_string(), "0");
+        assert_refused(output, &mut victim);
+    }
+
+    #[test]
+    fn native_signal_term_refuses_unrelated_same_uid() {
+        if !signal_scope_available() {
+            return;
+        }
+        let mut fixture = ProbeFixture::with_worker_jail(true);
+        let mut victim = Victim::new();
+        let output = probe_signal(&mut fixture, &victim.0.id().to_string(), "TERM");
+        assert_refused(output, &mut victim);
+    }
+
+    #[test]
+    fn native_signal_stop_refuses_unrelated_same_uid() {
+        if !signal_scope_available() {
+            return;
+        }
+        let mut fixture = ProbeFixture::with_worker_jail(true);
+        let mut victim = Victim::new();
+        let output = probe_signal(&mut fixture, &victim.0.id().to_string(), "STOP");
+        assert_refused(output, &mut victim);
+    }
+
+    #[test]
+    fn native_signal_cont_refuses_unrelated_same_uid() {
+        if !signal_scope_available() {
+            return;
+        }
+        let mut fixture = ProbeFixture::with_worker_jail(true);
+        let mut victim = Victim::new();
+        let output = probe_signal(&mut fixture, &victim.0.id().to_string(), "CONT");
+        assert_refused(output, &mut victim);
     }
 
     fn assert_refused(output: Output, victim: &mut Victim) {
@@ -292,7 +352,7 @@ mod signal_scope {
         }
         let mut fixture = ProbeFixture::with_worker_jail(true);
         let mut victim = Victim::new();
-        let output = attack(&mut fixture, &victim.0.id().to_string());
+        let output = probe_signal(&mut fixture, &victim.0.id().to_string(), "KILL");
         assert_refused(output, &mut victim);
     }
 
@@ -321,7 +381,7 @@ mod signal_scope {
             .read_line(&mut ready)
             .expect("wait for sandbox entry");
         assert_eq!(ready.trim(), "ready", "first sandbox did not start");
-        let output = attack(&mut fixture, &victim.0.id().to_string());
+        let output = probe_signal(&mut fixture, &victim.0.id().to_string(), "KILL");
         assert_refused(output, &mut victim);
     }
 
@@ -334,7 +394,7 @@ mod signal_scope {
         fixture.profile.rewind();
         let output = launcher_command(fixture.profile.fd(), &[
             "/bin/bash", "--noprofile", "--norc", "-c",
-            "sleep 2 >/dev/null 2>&1 & p=$!; kill -9 \"$p\" || exit 90; wait \"$p\"; test \"$?\" = 137",
+            "sleep 2 >/dev/null 2>&1 & p=$!; kill -0 \"$p\" || exit 89; kill -9 \"$p\" || exit 90; wait \"$p\"; test \"$?\" = 137",
         ])
         .env("HOME", &fixture.outside_home)
         .output()
@@ -352,7 +412,7 @@ mod signal_scope {
         }
         let mut fixture = ProbeFixture::new();
         let mut victim = Victim::new();
-        let output = attack(&mut fixture, &victim.0.id().to_string());
+        let output = probe_signal(&mut fixture, &victim.0.id().to_string(), "KILL");
         assert!(
             output.status.success(),
             "operator signal unexpectedly refused: {output:?}"

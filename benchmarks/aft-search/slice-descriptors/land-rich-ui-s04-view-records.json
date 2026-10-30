@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "rich-ui-s04-view-records"
+  ],
+  "note": "Rich UI slice 4: terminal bash view records keyed by the call's schema pin, template retention, and record delivery on tool-result routes. View-record writing stays off in production until the manifest is published. No search, ranking or routing code changes."
+}

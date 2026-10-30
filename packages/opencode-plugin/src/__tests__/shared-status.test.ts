@@ -271,3 +271,52 @@ describe("semantic index status as this harness imports it", () => {
     expect(formatStatusMarkdown(status)).not.toContain("loading");
   });
 });
+
+describe("operator semantic coordination status", () => {
+  const cases = [
+    [
+      "Waiting for another AFT process that is embedding the same new code; results will follow.",
+      undefined,
+    ],
+    [
+      "Can't coordinate embedding with other AFT processes: permission denied. Retrying in 4s.",
+      4000,
+    ],
+    [
+      "Can't coordinate embedding with other AFT processes: permission denied. Retrying in 1m 20s.",
+      80000,
+    ],
+    [
+      "Can't coordinate embedding with other AFT processes: permission denied. No retry is scheduled.",
+      null,
+    ],
+  ] as const;
+  for (const [line, retryInMs] of cases) {
+    test(`coerces and renders the exact operator line: ${line}`, () => {
+      const error =
+        retryInMs === undefined
+          ? undefined
+          : {
+              state: "error",
+              kind: "storage",
+              reason: "Can't coordinate embedding with other AFT processes",
+              detail: "permission denied",
+              retryable: retryInMs !== null,
+              retry_scheduled: retryInMs !== null,
+              retry_in_ms: retryInMs,
+            };
+      const status = coerceAftStatus({
+        project_root: "/project",
+        cache_role: "main",
+        semantic_index: { status: "ready", pending_reason: line, coordination_error: error },
+      });
+      expect(status.semantic_index.status).toBe("ready");
+      expect(status.semantic_index.pending_reason).toBe(line);
+      expect(status.semantic_index.coordination_error).toEqual(error);
+      expect(formatSemanticIndexLabel(status.semantic_index)).toBe(`ready — ${line}`);
+      expect(formatStatusDialogMessage(status)).toContain(line);
+      expect(formatStatusMarkdown(status)).toContain(line);
+      expect(formatSemanticIndexStatus(status.semantic_index.status, null, null)).toBe("ready");
+    });
+  }
+});

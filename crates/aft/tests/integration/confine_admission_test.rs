@@ -86,20 +86,39 @@ fn held_aft_db_lock_does_not_stop_the_frame_loop_while_worker_confinement_is_rea
             } = open_fake_daemon_session(input).await;
             std::fs::write(root1.join("admitted.txt"), "worker-read-admitted\n").unwrap();
             bind_scoped_worker(&mut stream, &root1).await;
-            // This harness configures no persistence for its binds, so give
-            // the root the aft.db handle a daemon bind opens for it.
+            // The ACK precedes asynchronous database and scope registration.
+            // A health round-trip lets the loop submit scope-bind; a mutating
+            // lane barrier then waits for that job before we hold its database.
             let ctx = root_context(&executor, &root1);
-            assert!(ctx.db().is_none());
-            let storage = tempfile::tempdir().unwrap();
-            ctx.set_db(Arc::new(Mutex::new(
-                aft::db::open(&storage.path().join("aft.db")).unwrap(),
-            )));
+            send_control_request(&mut stream, 30_001, ModuleControlRequest::HealthCheck {}).await;
+            loop {
+                let frame = read_frame_timeout(&mut stream, "configured root health").await;
+                if frame.header.channel == 0 && frame.header.corr == 30_001 {
+                    assert_eq!(frame.header.ty, FrameType::Response);
+                    break;
+                }
+            }
+            let ready = executor.submit_async(
+                ProjectRootId::from_path(&root1).unwrap(),
+                aft::executor::Lane::Mutating,
+                "confine-fixture-ready".into(),
+                Box::new(|_| Response::success("confine-fixture-ready", json!({}))),
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_secs(10), ready)
+                    .await
+                    .expect("scope registration did not settle")
+                    .unwrap()
+                    .success
+            );
+            let db = ctx
+                .db()
+                .expect("configured aft.db must be available after scope-bind");
 
             // Hold the aft.db lock on another thread, as a catalog job's
             // policy freeze does while SQLite waits for its write lock. The
             // holder lets go on its own after a bound, so a frame loop that
             // does block fails the timing check below instead of hanging.
-            let db = ctx.db().unwrap();
             let (held_tx, held_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
             let holder = thread::spawn(move || {

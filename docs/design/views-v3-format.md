@@ -108,16 +108,16 @@ this shipped-release exception: it cannot delete or corrupt v3; at worst its
 space estimate refuses a migration that could have fit. Forged v2 `view_dir`
 paths remain a corrupt-metadata caveat only, not an ordinary routing path.
 
-**Required before v3 registration in current code — slice 3a-2:** treat
-`blobs/v3` consistently in migration sizing and copying. V3 is rebuildable, so
-leave it out of **both** the source-size/free-space accounting and the migration
-items rather than copying it. Add a test seeding a v3 family/member tree which
-proves it contributes no migration byte requirement, is not copied, and remains
-unchanged at the source. Preserve accounting for actual migrated items and the
-existing destination-volume checks. This foundation does not edit
-`migrate_storage.rs` or `legacy_partitions.rs`; that follow-up requires its own
-file-fence grant. The exception must not be mistaken for a claim that current
-migration behavior already meets the requirement.
+**Completed in slice 3a-2:** current migration excludes the source-root-relative
+`blobs/v3` subtree from **both** source-size/free-space accounting and recursive
+copying. V3 is rebuildable and remains at the source. The change landed in
+`2cb838f2436f7d22ad4aee18043085a1d93539b2` (through #675); the test in
+`crates/aft/src/migrate_storage.rs` seeds an 8 GiB v3 payload, admits migration
+with space for only the actual migration fixtures, and verifies that no v3
+target is created and the source payload is unchanged. Accounting for actual
+migration items and destination-volume checks is preserved. This current-main
+fix does not change the explicit-migration exception in the two shipped
+releases audited above.
 
 ## Floor domains and publication protocol
 
@@ -419,9 +419,15 @@ post-checkpoint empty file.
   `reader-floor.json` untouched; at the re-check it may leave `blobs/v3/`, the
   lock file and an empty registry, but no reservation row or plane store.
 - Assumptions: different storage roots on one device are not coordinated. On
-  non-unix the probe reports unsupported, so every reservation is refused as
-  `device_free_space_floor` (unverified on a native non-unix run).
-- Wiring these budgets into `DiskBudget` (`views/eviction.rs`) is slice 4's job.
+  Windows the probe is `GetDiskFreeSpaceExW` (caller-available bytes and
+  total bytes of the nearest existing ancestor); other non-unix targets
+  report unsupported, so every reservation there is refused as
+  `device_free_space_floor`. The Windows probe is compile-checked only so
+  far; a native Windows run is still owed.
+- `DiskBudget::admit_v3`/`extend_v3` (`views/eviction.rs`) admit v3
+  reservations against the family hard limit (refused as
+  `storage_gap:v3_family_hard_limit`, never a legacy fallback) and flag
+  usage above the 2 GiB target so the caller runs the family's v3 sweep.
 
 ## Retention collector
 
@@ -522,12 +528,416 @@ of bytes and `st_mode` over `blobs/v3/` must be unchanged, and no v3 member
 may appear in a v2 registry. The tests are `#[ignore]`d (they take seven and
 thirteen minutes) and need `AFT_V0_60_0_BINARY`.
 
-## Deferred to slice 4
+## Base-reference protocol (registry 2/2)
 
-The manifest base header with PublishedFrontier, tombstones and
-readiness_overrides, donor seal records, the symbol plane, the v3 import
-ledger, persisted stat evidence, staging names and token rows.
+Source: `views/base_refs.rs`, `views/base_sweep.rs`, `views/base_builder.rs`.
+A 1/1 registry is upgraded in one barrier transaction, only by a writer that
+first raised the `views_v3_registry` floor to 2
+(`blob_store::v3::open_base_refs_registry`). Registries created by the copy
+path stay 1/1 until then. The added schema text is:
+
+```sql
+CREATE TABLE base_refs (worker_scope TEXT NOT NULL, base_scope TEXT NOT NULL, nonce TEXT NOT NULL,
+ membership_digest TEXT NOT NULL, worker_generation TEXT,
+ state TEXT NOT NULL CHECK(state IN ('intent','orphaned','published')),
+ owner_pid INTEGER NOT NULL, owner_start INTEGER NOT NULL, updated_epoch INTEGER NOT NULL,
+ PRIMARY KEY(worker_scope, base_scope, nonce));
+CREATE INDEX base_refs_by_base ON base_refs(base_scope);
+CREATE TABLE base_builds (base_scope TEXT NOT NULL PRIMARY KEY,
+ owner_pid INTEGER NOT NULL, owner_start INTEGER NOT NULL, owner_token TEXT NOT NULL,
+ attempt INTEGER NOT NULL CHECK(attempt>=1),
+ state TEXT NOT NULL CHECK(state IN ('building','serving')), heartbeat_at_ms INTEGER NOT NULL);
+CREATE TABLE strict_rebuild (worker_scope TEXT NOT NULL, worker_generation TEXT NOT NULL,
+ reason TEXT NOT NULL, recorded_epoch INTEGER NOT NULL, PRIMARY KEY(worker_scope, worker_generation));
+CREATE TABLE base_sweeps (base_scope TEXT NOT NULL PRIMARY KEY,
+ unreferenced_sweeps INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE sweep_state (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+ gc_epoch INTEGER NOT NULL, lease_pid INTEGER, lease_start INTEGER, reconcile_cursor TEXT,
+ dangling_base_edges INTEGER NOT NULL DEFAULT 0, live_base_cap_hits INTEGER NOT NULL DEFAULT 0);
+```
+
+- **Identity.** The membership digest is BLAKE3 over the length-prefixed
+  tag `aft/views-v3/base-membership/1`, the entry count, then per path (in
+  path order) the path bytes, an entry-kind byte, and mode, content hash,
+  size and resolution-input flag (regular files), target bytes (symlinks),
+  OID (gitlinks) or name (synthetic entries). Readiness is excluded. A
+  manifest with `head_tree`, any `git_oid`, a `base` header, tombstones or
+  overrides is not a base. The identity digest (tag
+  `aft/views-v3/base-identity/1`) covers family, all producers, the ignore
+  fingerprint, the platform family, `head_tree:none` and the membership
+  digest. The base scope is `base-m1-<identity hex>`. A second, tree-keyed
+  base kind (`base-t1-`) is defined in *Tree-keyed bases and blob receipts*
+  below; a scope is never relabelled from one kind to the other.
+- **Authentication.** Every consumer resolves a base by pin-then-verify and
+  recomputes both digests from the pinned manifest; a `BaseHeader` is
+  checked against that result, never trusted. `bound_generation` is
+  diagnostic.
+- **Markers.** A `BaseRefMarker` is a read marker in `M/readers/<G>/`, where
+  `M` is the base's member directory and `G` its current generation, whose
+  file also carries a per-acquisition `nonce` (omitted, and so unchanged,
+  for ordinary readers).
+- **Sweep.** Runs under the reservation lock; marks current, read-marked
+  and pinned generations; reconciles at most 256 rows / 25 ms per pass from
+  a wrap-around position kept in `sweep_state.reconcile_cursor`; reclaims a
+  base after two consecutive unreferenced sweeps. The plane-row sweep keeps
+  its resume position at `retention/cursors/v3-plane-rows/<family>.json`
+  (format 1) when the retention collector runs it.
+- **Segments.** v3 generations carry no trigram segment: v3 has no segment
+  rows, files or segment collection. A reader assembles the base
+  generation's segment in memory from the base's stored trigram payloads
+  (shared through the segment cache while an index holds it) and loads the worker's changed
+  entries as the usual overlay. No new on-disk rows were added for this.
+- **Derived graphs.** A base's derived call graph is
+  `M/derived-<generation>-a<attempt>-<owner_token>.sqlite`, named by the
+  existing `M/derived-<generation>.ref` owner-reference file, and is built
+  only once every callgraph member of that generation is ready. A worker's
+  derived graph covers its composed generation and lives in its own member
+  directory under the usual `derived-<generation>.sqlite` name; while the
+  base's graph is pending the worker has none.
+
+## Deferred implementation register
+
+This register assigns the remaining formats **before their owners write them**.
+These are forward format assignments, not a claim that the schemas or files
+already exist. No 3a or 3b implementation is deferred here. Storage paths below
+are relative to `<storage>`; implementation-source paths are repository-relative
+(`gc/family.rs` abbreviates `crates/aft/src/gc/family.rs`). Define
+`F = blobs/v3/<family>` and `M = F/views/<scope>` for either a base or a worker.
+No storage artifact is assigned beneath `<storage>/views/v3`. The opening
+contract is [views-slice4-opening.md](views-slice4-opening.md).
+
+### Versions and upgrade boundaries
+
+- The implemented registry remains `views_v3_registry` format/schema **1/1**.
+  Reserve **2/2** for slice 4's base-reference protocol, **3/3** for 4v's token
+  and stat-evidence protocol and **4/4** for slice 5's donor-seal protocol.
+  Version 5/5, earlier reserved for slice 6a's symbol and import protocol, is
+  **not used**: the import ledger is a sidecar file and the symbol plane is an
+  ordinary plane store (see *Import ledger and symbol plane* below), so neither
+  changes the registry schema. These versions gate the whole member
+  protocol, including its sidecars; a version can advance without adding a
+  registry table. An owning slice
+  installs its complete schema through an explicit versioned upgrade, never a
+  lazy `CREATE TABLE` on read. Later versions preserve the earlier contracts;
+  an older reader refuses an unsupported version rather than interpreting it.
+- `views_v3_store` remains format/schema **1/1**, with the existing layout-tag
+  dispatch (new stores use layout 2). Sweeping rows and adding a symbol-plane
+  instance do not change the payload/digest schema or convert existing stores.
+- A v3 generation manifest uses **manifest format 3**, distinct from legacy
+  manifest format 2. Its path retains the existing
+  `manifest-<generation>.json` naming convention but lives only in `M`. Sidecar
+  formats below start at **1** and are not new `PersistedStore` names. Local
+  artifact versions are independent of registry/floor numbers: the manifest
+  records `format_version: 3`; new JSON sidecars and the plane-sweep cursor
+  record `format_version: 1`; stat-evidence SQLite records format/schema 1/1
+  in its `format_meta` singleton. The staging-name protocol's version 1 is a
+  naming contract, not a file header, and is identified by registry version 2.
+  Registry and plane format/schema numbers remain in their existing
+  `format_meta`; reader-floor requirements remain in `reader-floor.json`.
+  An incompatible artifact change requires a new local version and a
+  registry-floor version that makes unsupported readers refuse.
+- Every artifact publication uses the combined v3 floor boundary. Slice 4
+  requests registry floor 2 before its artifacts; 4v requests 3 before stat
+  evidence or tokens; 5 requests 4 before donor/seal publication. Slice 6a
+  writes its symbol plane and import ledger only inside
+  `blob_store::v3::publish`, which requests registry floor 1 and store floor 1
+  before creating either file. Every publisher also requests store floor 1.
+  These are future written versions, not changes to today's startup baseline.
+
+### Assigned paths and owners
+
+| Owner | Item and path | Assigned format / schema | Required contract |
+|---|---|---|---|
+| 4 | `M/manifest-<generation>.json`: optional `base` header and `PublishedFrontier` | Manifest 3, registry floor 2 | `base` records scope, membership digest, identity digest and diagnostic bound generation. The frontier records delta cut version, watcher epoch, publication time and optional verified `{E0, F, delivery_seq}`. No separate binding file; no base-reference chains. |
+| 4 | `entries`, `tombstones`, `readiness_overrides` in that same manifest | Manifest 3, registry floor 2 | Sections are disjoint. Tombstones mask inherited deletions. Override Ready keys participate in `ready_keys()`, marking and live-pin trimming. Slice-4 identity is membership-keyed, `head_tree=None`, with no proven `git_oid`. |
+| 4 | `F/members.sqlite`: `base_refs`, `base_builds`, `strict_rebuild`, base unreferenced counts, sweep epoch and reconciliation resume state | `views_v3_registry` 2/2 | Exact-generation edges, per-acquisition nonce, owner-token/attempt CAS, bounded epoch-aware reconciliation and two-sweep reclaim. A live claim holds an empty base. Published and intent rows have explicit terminal cleanup. |
+| 4 | `M/staging/a<attempt>-<owner_token>-<nonce>/`; `M/derived-<generation>-a<attempt>-<owner_token>.sqlite` and associated temporary/WAL/SHM names | Staging-name protocol 1, registry floor 2 | Every base-build staging and derived name carries the attempt and owner token. Never reuse a dead attempt's name. Reclaim only after its owner is known dead; a live claim is not abandoned work. |
+| 4 | Plane-row sweep over `F/{semantic,callgraph,trigram}.sqlite`; progress at `retention/cursors/v3-plane-rows/<family>.json` | Store 1/1; cursor 1; registry 2/2 for sweep coordination | Implement in `gc/family.rs` and `storage_retention.rs`. Mark the composed depth-one closure, including overrides, then delete only unmarked eligible rows under the epoch/lease protocol. Bound the producing iterator and deadline; resume rather than treating a partial scan as complete. Include later registered planes when they exist. |
+| 4 | `DiskBudget` wiring in `crates/aft/src/views/eviction.rs`, using `F/members.sqlite` reservations/accounting and the existing namespace inventory | Registry 2/2; no separate budget file or new config format | Preserve allocated-byte charging, the 2 GiB family target, 4 GiB hard/namespace limits and max(4 GiB, 5%) device floor. Refuse with the named storage gap and no legacy fallback. |
+| 4v | `M/stat-evidence-<generation>.sqlite` | Stat-evidence 1/1, registry floor 3 | Generation-paired path/root/file identity, size/times, stable content digest, proven Git OID if any, observation-time conversion-policy digest and per-plane keys. No stat-cache or current-policy-only proof. |
+| 4v | `M/tree-proof.sqlite` in a `base-t1-` member | Tree proof 1/1, registry floor 3 | Full-index tree descriptor proven from the coherent index and counted `rev-parse HEAD^{tree}`, plus one byte-bound Git-blob receipt per base member. Never a header string or a stat-cache tuple. See *Tree-keyed bases and blob receipts*. |
+| 4v | `F/members.sqlite`: `view_tokens` rows | `views_v3_registry` 3/3 | Single-use advisory token bound to identity at first consumption, with expiry and consume state. Stored in daemon storage, never the checkout. Stat evidence and tokens do not replace freshness validation. |
+| 5 | `M/donor-<generation>-<fingerprint>.seal.json` beside `M/donor-<generation>-<fingerprint>.sqlite` | Donor seal 1, registry floor 4 | Atomically publish fingerprint, size and `journal_mode=DELETE` only after the detached donor is checkpointed and synced and has no WAL/SHM. A published manifest names only a completed seal. Never copy/clone a live SQLite file set. |
+| 6a | `F/symbol.sqlite` | `views_v3_store` 1/1, new-store layout 2; store floor 1 | The v3 symbol plane uses the same immutable `payload`/`payload_digest` contract and reservation protocol. No in-place legacy conversion. Implemented; see *Import ledger and symbol plane*. |
+| 6a | `F/imports.sqlite` (sidecar, not a registry table) | Import ledger 1/1, `application_id` `0x41465449`; registry stays 1/1 or 2/2 | Record completion/rejection per legacy key, artifact, compatible producer and destination plane, with owner-token claim/recovery semantics. Import into v3 only, stream inputs above 1 GiB and retain legacy bytes. Implemented; see *Import ledger and symbol plane*. |
+
+#### Stat evidence and advisory tokens
+
+Registry 3/3 is an exact-predecessor upgrade of 2/2 under the v3 reservation
+barrier, after raising only `views_v3_registry` to 3 and `views_v3_store` to 1.
+It adds `view_tokens(nonce TEXT PRIMARY KEY, root BLOB NOT NULL,
+expected_tree TEXT NOT NULL, minted_ms INTEGER NOT NULL, expires_ms INTEGER NOT NULL,
+bound_root BLOB, bound_gitdir BLOB, consumed_ms INTEGER)`. Root is the canonical
+future checkout path. The two bound identity blobs and consume time are all
+NULL at mint and all set in one first-consumption transaction. A consumed row
+is retained until expiry so replay and identity mismatch can be distinguished;
+neither can authorize verification or publication. The lifetime is ten minutes.
+Identity blobs are versioned JSON, not a Git stat-cache tuple. Older registry
+readers supporting at most 2 refuse registry 3; v1/v2 store formats are unchanged.
+
+Stat-evidence 1/1 uses `application_id=0x41465445`, `PRAGMA user_version=1`, and
+`evidence_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+format_version INTEGER NOT NULL, schema_version INTEGER NOT NULL,
+generation TEXT NOT NULL, root BLOB NOT NULL, policy TEXT NOT NULL)` plus
+`stat_evidence(path BLOB PRIMARY KEY, record BLOB NOT NULL)`. Records are
+versioned JSON containing root/file identity, size, mtime, ctime or Windows
+ChangeTime, observation time, content digest, an optional proven Git OID,
+the policy digest paired with that observation, and per-plane keys. The file
+is staged and synced before the generation pointer CAS and is reusable only
+when its generation, root, policy, file identity, timestamps and racy checks
+all agree. Missing, corrupt or future evidence means reading source again.
+Evidence does not upgrade membership-keyed bases to tree-keyed identities.
+
+Evidence staging is `M/.stat-evidence-<generation>.sqlite.tmp.<nonce>` (and
+SQLite's `-journal`, `-wal`, `-shm` suffixes if present), so a crashed write has
+an attributable generation. The prepared-generation pin is acquired before
+the manifest or evidence is exposed and remains held through publication.
+The existing generation sweep discovers the permanent database and these
+temporaries and retires them in the same pin-checked claim as the generation;
+its existing moved-file/unlink accounting includes their bytes. Current and
+pinned generations retain evidence and staging regardless of age. Abandoned
+staging is removed only when its generation retires, never by a second sweep
+or by a timer that can bypass a live pin.
+
+Policy capture uses counted `git config --list --show-origin -z` **and**
+`git var GIT_ATTR_SYSTEM` / `git var GIT_ATTR_GLOBAL`, rather than guessing
+an installation prefix for attribute sources. This supersedes the earlier
+config-only query wording in the views design. Every successful spawn,
+including an unsupported-variable exit, contributes to `git_subprocesses`
+in the process work counters. Either source query failing disables stat reuse
+and takes strict reconciliation. Measurements of these additional queries
+belong to the later performance gate.
+
+The registry-version increments above are serial handoffs, not permission for
+an earlier slice to write a later owner's rows. Owners implement and test their
+assigned schema and encoding before publishing any such bytes. Registration
+does not enable a production path: unrouted entrypoints remain reachable only
+through the marker-gated harness. Existing cursor paths for family discovery
+and member retention remain unchanged.
 
 Slice 4's binder must honour the `evicting` contract above: when it finds its
 member in `evicting`, it never uses that view directory, and either treats the
 member as absent and publishes a fresh one or waits for the eviction to finish.
+
+#### Tree-keyed bases and blob receipts
+
+Source: `git_index_reader.rs` (tree computation and blob object IDs),
+`views/base_refs.rs` (identity), `views/tree_base.rs` (builder),
+`views/verification.rs` (proof file and bind-time checks).
+
+**Identity.** A base manifest whose header carries `head_tree` is a
+tree-keyed base; one without it keeps the membership identity above,
+unchanged. A tree-keyed manifest has only regular entries, each with a
+`git_oid`, and no `base` header, tombstones or overrides. Its tree-membership
+digest is BLAKE3 over the length-prefixed tag
+`aft/views-v3/base-tree-membership/1`, the entry count, then per path (in path
+order) the path bytes, kind byte 1, mode, content hash, size,
+resolution-input flag and the `git_oid` text. Every OID and the tree are
+lowercase hex of one length (40 for SHA-1, 64 for SHA-256). The identity digest
+(tag `aft/views-v3/base-identity-tree/1`) covers family, all producers, the
+ignore fingerprint, the platform family, the object format name (`sha1` or
+`sha256`), `head_tree:<hex>` and the tree-membership digest. The scope is
+`base-t1-<identity hex>`. The membership digest still refuses any manifest
+with `head_tree` or a `git_oid`, and membership resolution still requires the
+`base-m1-` prefix.
+
+The identity only names the tree a base claims. Header fields never prove it.
+Trust needs the proof file below and a live check against Git at bind time.
+Without both, a tree-keyed base is treated like a membership base: every path
+takes the full check.
+
+**Older readers.** A tree-keyed base is published only after the registry floor
+is raised to 3, so readers that support at most registry 2 refuse the domain.
+A registry-3 reader without this section refuses the scope: membership
+resolution rejects the `base-t1-` prefix, and `membership_digest` rejects the
+manifest. Such a reader never authenticates a tree-keyed base as
+membership-keyed. Its sweep records the base's edges as `base_corrupt` (strict
+rebuild for those workers) and can then reclaim the base as unreferenced. That
+costs a rebuild in a mixed-version fleet; it does not change any answer.
+
+**Builder.** The claim owner reads a coherent index snapshot. It computes the
+full index tree in Git's object format and compares it with a counted
+`git rev-parse HEAD^{tree}`. The computation refuses unmerged stages,
+assume-valid, skip-worktree and intent-to-add entries, and duplicate paths. It
+also refuses file/directory conflicts, empty, `.` or `..` components, any
+component equal to `.git` (ASCII case-insensitive), and modes other than
+100644, 100755, 120000 and 160000. Split and sparse indexes were already
+refused by the reader. Every member is a walker-admitted path with a stage-0
+regular index entry. It is read with the same native stat before and after
+the read. The bytes are hashed as BLAKE3 content and as Git's
+`blob <length>\0<bytes>` object. The blob OID must equal the index entry's. On
+unix the executable bit must agree with the index mode. A failure of any check
+for any member means no tree-keyed base: the bind builds a membership base as
+before. The conversion policy must be reusable (see *Stat evidence*). The
+receipt pairs the policy digest captured for this build with that read, never
+with an older index tuple.
+
+**Proof file `M/tree-proof.sqlite`.** One per tree-keyed base member. The
+base's identity and membership never change across readiness successors, so
+one proof serves every generation of the scope. It is written once by the
+claim owner, after the member is registered and the registry floor is 3, and
+before the first publication. After that it is never rewritten.
+`application_id=0x41465454`, `PRAGMA user_version=1`, `journal_mode=DELETE`:
+
+```sql
+CREATE TABLE proof_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+ format_version INTEGER NOT NULL, schema_version INTEGER NOT NULL,
+ base_scope TEXT NOT NULL, identity_digest TEXT NOT NULL, membership_digest TEXT NOT NULL,
+ object_format TEXT NOT NULL, head_tree TEXT NOT NULL, root BLOB NOT NULL,
+ policy TEXT NOT NULL, receipts_digest TEXT NOT NULL);
+CREATE TABLE blob_receipts(path BLOB PRIMARY KEY, record BLOB NOT NULL);
+```
+
+Format/schema are 1/1. `root` is the versioned JSON root identity used by stat
+evidence. A receipt record is versioned JSON (`version: 1`): mode, size,
+content digest, Git blob OID, the native stat observed around the read,
+observation time (rounded down to the second), policy digest and delivery
+sequence. `receipts_digest` is BLAKE3 over the tag `aft/views-v3/tree-receipts/1`,
+the receipt count, then each path and its record bytes, length-prefixed and in
+path order.
+
+Staging is `M/.tree-proof.sqlite.tmp.<nonce>`. It is synced, renamed into place
+and followed by a directory sync. A failed writer removes its own staging. A
+crash can leave one staging file, which stays until the member is reclaimed.
+The generation sweep does not match either name. Both are member files, so
+the existing per-member accounting counts them, and whole-base reclaim removes
+them. A reader reads the proof only while it holds the authenticated base's
+exact-generation read marker.
+
+**Bind-time check.** A worker whose durable generation names a `base-t1-` base
+resolves that base (pin-then-verify) and reads the proof. The bind refuses the
+proof unless all of these hold:
+
+- the file's application ID, version and format/schema are as above;
+- `receipts_digest` matches the stored receipts;
+- scope, identity and membership digests equal the authenticated base;
+- head tree and object format equal the base manifest;
+- the root identity and policy digest equal the current bind guard, and the
+  current policy is reusable;
+- every base member has exactly one receipt, and each receipt's mode, size,
+  content and OID equal its manifest entry.
+
+Git must then agree now. The guard's counted `rev-parse HEAD^{tree}` must name
+the proof's tree. A coherent index read now must compute that same tree. Each
+receipt's path must have a stage-0 index entry with no exception flag, the
+same mode and the receipt's OID. A receipt that passes is only a candidate.
+The stat-evidence reuse rules still decide each path: equal native stat and
+file identity, mtime before the observation second, no watcher delivery for
+the path, matching disk state, and ready, present plane keys. Any failed check
+means that path, or with a refused proof every path, takes the full check.
+
+## Import ledger and symbol plane
+
+Sources: `crates/aft/src/migration/v3_import.rs` (decoders, staging,
+registration), `crates/aft/src/migration/v3_ledger.rs` (ledger and driver),
+`crates/aft/src/migration/v3_symbols.rs` (symbol importer) and
+`crates/aft/src/views/symbol_store.rs` (symbol plane). Imports write only
+under `blobs/v3/<family>/` and their own staging directory; they never write
+a v1 or v2 row, manifest, pointer or schema, and never move, change or delete
+a legacy file.
+
+### Symbol plane `F/symbol.sqlite`
+
+- An ordinary v3 plane store (`views_v3_store` 1/1, layout 2, `store_meta.plane
+  = 'symbol'`), opened and written through the same `blob_store::v3`
+  connections, `Publication` and `PlaneReader` as the other planes:
+  `FamilyPlane::Symbol`. It is a v3-only plane: it is not in
+  `FamilyPlane::ALL` (which manifests, v2 stores, v2 GC and eviction
+  iterate) but is in `FamilyPlane::V3_STORES`, which the v3 plane-row sweep
+  and `v3_format_report` use. No manifest entry records symbol readiness.
+- Key: BLAKE3 over the tag `aft/views-v3/symbol/v1`, then the content hash
+  (32 bytes), the language id (the parser's `LangId` name, for example
+  `Rust`) and the producer id, each preceded by its
+  length as a big-endian u64. The producer id is
+  `aft-symbols/extraction-<SCHEMA_VERSION>` (`symbol_cache_disk::SCHEMA_VERSION`,
+  bumped on any grammar, query or extractor change), so a parser or schema
+  change produces a different key and misses. A source hash alone is never
+  a key.
+- Payload (payload schema 1): `u8` layout 1, then three length-prefixed
+  (`u32` LE) fields: producer id, language id, and the symbols as the JSON
+  array `symbols.bin` stores. A reader checks the layout, producer and
+  language against its key's inputs before decoding.
+- **GC.** Manifests never name symbol rows, so the sweep does not use marking
+  for them: it deletes a symbol row only when its `ref_epoch` is more than
+  `SYMBOL_RETENTION_SWEEPS` (8) sweep epochs old. A lookup that uses a row
+  touches it inside a publication, which restamps it.
+- **Residency.** Decoded symbol lists are shared as `Arc<Vec<Symbol>>`
+  through a process-wide cache in `views/symbol_store.rs`, bounded at 64 MiB
+  of estimated bytes; eviction from it never touches stored rows.
+- **Floor and accounting.** Written only inside `v3::publish` (registry floor
+  1, store floor 1, a reservation per batch); its bytes are part of the
+  family's namespace inventory like any plane store.
+
+### Import ledger `F/imports.sqlite`
+
+A sidecar SQLite file, not a registry table: `members.sqlite` and its
+version are unchanged. It is created, and every row transition is written,
+inside a `v3::publish` call (64 KiB reservation), so the file exists only
+after the v3 floor is raised and each write holds the reservation lock.
+Readers (status, prune eligibility, retention) use this process's ledger
+connection when it has one; otherwise they copy the database and its WAL to a
+private temporary directory and read the copy, so a read never writes under
+the storage root. `aft cache prune-legacy` reads `members.sqlite` the same way.
+
+```sql
+CREATE TABLE format_meta (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+ format_version INTEGER NOT NULL, schema_version INTEGER NOT NULL, schema_text TEXT NOT NULL);
+CREATE TABLE imports (legacy_key TEXT NOT NULL, artifact TEXT NOT NULL,
+ producer TEXT NOT NULL, plane TEXT NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('claimed','staged','validated','registered','done','rejected')),
+ attempt INTEGER NOT NULL CHECK(attempt>=1), owner_pid INTEGER, owner_start INTEGER, owner_token TEXT,
+ source_hash BLOB, source_len INTEGER, staged_hash BLOB,
+ imported INTEGER NOT NULL DEFAULT 0, skipped INTEGER NOT NULL DEFAULT 0,
+ reason TEXT, updated_ms INTEGER NOT NULL, completed_ms INTEGER,
+ PRIMARY KEY(legacy_key, artifact, producer, plane));
+```
+
+Format/schema 1/1, `application_id` `0x41465449` ("AFTI"), WAL,
+`synchronous=FULL`. A newer format is refused by name. `artifact` is
+`trigram` (`index/<key>/cache.bin`), `semantic` (`semantic/<key>/semantic.bin`)
+or `symbols` (`symbols/<key>/symbols.bin`); `producer` is the trigram policy
+fingerprint, the semantic producer id or the symbol producer id; `plane` is
+the destination plane. A row completes only its own (artifact, producer,
+plane): a semantic-only completion never suppresses a trigram or symbol
+import, and a producer change starts a new row.
+
+- **States.** `claimed → staged → validated → registered → done`, or
+  `rejected{reason}` from any non-terminal state. Each transition is one
+  `BEGIN IMMEDIATE` compare-and-set on the row's state and owner token. A
+  live owner makes other callers back off; a dead or released owner's row is
+  taken over with `attempt + 1` and resumes from its durable state,
+  repeating at most one idempotent step.
+- **staged:** the canonical conversion is streamed to
+  `<storage>/migration/v3/<family>/<legacy_key>/<artifact>-<plane>-<staged
+  hash prefix>.bundle` (temp, fsync, rename, directory sync), with the
+  legacy source's BLAKE3 and length recorded. Old binaries never look under
+  `migration/v3`. A bundle is a magic `AFTIMP03`, the artifact byte, entries
+  (`u8` 1, path, content hash, size, key, payload), then `u8` 0, the entry
+  count and a BLAKE3 of every earlier byte.
+- **validated:** the bundle is re-read and every key re-derived, and the
+  legacy source is re-hashed and must still be the converted bytes.
+- **registered:** every payload is in the destination plane, written in
+  batches of at most 32 MiB, each one `v3::publish` with a reservation of
+  twice its bytes plus 1 MiB. A refused reservation reports the plane's
+  named storage gap `storage_gap:<refusal>` (`v3_namespace_budget`,
+  `device_free_space_floor`, `reservation_ledger_unreadable`); the row keeps
+  its state with the owner released and the reason recorded, so a later
+  run resumes. Nothing falls back to a legacy reader.
+- **done:** the staging bundle is removed.
+
+Inputs have no size limit. The decoders stream: the trigram `cache.bin`
+is checksummed in one sequential pass, its postings are counted per file in
+one pass over the posting blob, then inverted in file-id ranges whose
+postings fit a working-set budget (64 MiB by default), one more pass per
+range; `semantic.bin` is decoded one file's rows at a
+time. Memory is bounded by the per-file tables (path, size and hash per
+file) plus the budget, never by the input size. The `semantic.bin` decoder
+is read-only and refuses trailing bytes (appended segments or a torn tail)
+rather than repairing or folding them; a path whose rows are not
+contiguous is skipped and left for the plane to embed.
+
+Imported trigram and semantic rows are not named by any manifest until a
+base or worker build reuses them (`contains`, then `put_or_touch`). A v3
+plane-row sweep that runs between the import and that build may collect
+them; the build then recomputes those files. Imported symbol rows follow the
+symbol plane's epoch rule above.

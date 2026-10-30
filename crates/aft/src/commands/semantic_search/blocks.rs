@@ -529,9 +529,7 @@ impl BlockBuilder {
                     .exact
                     .iter()
                     .map(|(_, _, exact)| &exact.evidence)
-                    .min_by(|left, right| {
-                        exact_evidence_rank(left).cmp(&exact_evidence_rank(right))
-                    })
+                    .min_by(|left, right| exact_evidence_cmp(left, right))
                     .ok_or_else(|| BlockBuildError::MissingExactEvidence(identity.path.clone()))?;
                 (
                     CandidateResult::new_exact(
@@ -699,20 +697,14 @@ fn identity_of_result(result: &CandidateResult) -> CandidateIdentity {
     }
 }
 
-fn exact_evidence_rank(evidence: &EvidenceDescriptor) -> (usize, usize, usize, usize) {
-    use super::evidence_descriptor::EvidenceKind;
+fn exact_evidence_cmp(left: &EvidenceDescriptor, right: &EvidenceDescriptor) -> std::cmp::Ordering {
+    super::comparator::compare_exact_strength(left, right)
+}
 
-    let kind = match evidence.kind {
-        EvidenceKind::Definition => 0,
-        EvidenceKind::E1 => 1,
-        EvidenceKind::Anchored => 2,
-        EvidenceKind::E2 => 3,
-        EvidenceKind::None => usize::MAX,
-    };
-    (
-        kind,
-        usize::MAX - evidence.occurrences.unwrap_or(0),
-        usize::MAX - evidence.matched_span.unwrap_or(0),
-        evidence.window_lines.unwrap_or(usize::MAX),
-    )
+#[cfg(test)]
+#[test]
+fn audit01_block_evidence_prefers_smaller_gap() {
+    let near = EvidenceDescriptor::for_anchored(20, 1, true, false);
+    let far = EvidenceDescriptor::for_anchored(20, 2, true, false);
+    assert_eq!(exact_evidence_cmp(&near, &far), std::cmp::Ordering::Less);
 }

@@ -1,0 +1,15 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/search_index.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/commands/semantic_search/exact_lane.rs"
+  ],
+  "slices": [
+    "views-g-donors-callgraph"
+  ],
+  "note": "Views-on call-graph reads route through the checkout's v3 view with sealed base donors. Step G touches no ranking-fence file; the fence files in this diff come from step F below it in the stack. Views are default-off, so the benchmark runs the views-off path and ranked rows must remain byte-identical to the committed reference."
+}

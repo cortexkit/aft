@@ -48,7 +48,7 @@ fn s4_shift_views_off_preserves_incoming_identity_and_cold_parity() {
         let conn = store.conn.lock().unwrap();
         assert!(
             conn.query_row(
-                "SELECT count(DISTINCT caller_file) FROM refs WHERE kind='value_ref' AND target_file='hub.rs'",
+                "SELECT count(DISTINCT caller_file) FROM refs WHERE kind='callback_ref' AND target_file='hub.rs'",
                 [],
                 |r| r.get::<_, usize>(0)
             )

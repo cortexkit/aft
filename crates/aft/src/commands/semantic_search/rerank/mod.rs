@@ -448,6 +448,9 @@ pub(crate) fn rerank_block_zero(
 /// The backend this search may use, read from the context's slot without I/O
 /// and without waiting. Tests may install one for their own thread instead.
 pub(crate) fn installed_backend(ctx: &crate::context::AppContext) -> slot::Installed {
+    if let Some(reason) = ctx.cache_unavailable_reason() {
+        return slot::Installed::NotReady(format!("cache_dir_unavailable: {reason}"));
+    }
     #[cfg(test)]
     if let Some(selected) = tests::test_backend_override() {
         return slot::Installed::Ready(selected);
@@ -566,19 +569,32 @@ fn short_reason(reason: &str) -> String {
 /// are always kept whole. The result depends only on the project root, the
 /// entry, the prose and the file, never on which page is being served.
 pub(crate) fn candidate_text(project_root: &Path, result: &CandidateResult, prose: &str) -> String {
-    let source = std::fs::read(&result.path)
-        .map(|bytes| String::from_utf8_lossy(&bytes).replace("\r\n", "\n"))
-        .unwrap_or_default();
+    let bytes = std::fs::read(&result.path).unwrap_or_default();
+    let (raw_line, selected) = if let Some(range) = result.symbol_range {
+        let start = floor_raw_boundary(&bytes, range.start.min(bytes.len()));
+        let end = floor_raw_boundary(&bytes, range.end.min(bytes.len())).max(start);
+        (
+            bytes[..start].iter().filter(|&&byte| byte == b'\n').count(),
+            &bytes[start..end],
+        )
+    } else {
+        (0, bytes.as_slice())
+    };
+    // Stored ranges address raw bytes; decoding and newline normalization
+    // must happen after slicing, including when earlier bytes are invalid UTF-8.
+    let source = String::from_utf8_lossy(selected).replace("\r\n", "\n");
     let (line, name, body): (usize, String, Vec<&str>) = match result.symbol_range {
-        Some(range) => {
-            let start = floor_char_boundary(&source, range.start.min(source.len()));
-            let end = floor_char_boundary(&source, range.end.min(source.len())).max(start);
-            let lines = source[start..end].lines().collect::<Vec<_>>();
+        Some(_) => {
+            let lines = source.lines().collect::<Vec<_>>();
             let name = declared_name(&lines).unwrap_or_else(|| file_stem(&result.path));
-            (source[..start].matches('\n').count(), name, lines)
+            (raw_line, name, lines)
         }
         None => {
-            let matched = super::matching_line_from_source(&result.path, prose, None)
+            // Match against the same raw bytes used for the body, preserving
+            // strict UTF-8 admission without reopening every whole-file entry.
+            let matched = std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|source| super::matching_line_in_text(source, prose, None))
                 .map(|(line, _)| line as usize);
             let first = matched.map_or(0, |line| line.saturating_sub(FILE_CONTEXT_LINES_ABOVE));
             let name =
@@ -608,6 +624,13 @@ pub(crate) fn candidate_text(project_root: &Path, result: &CandidateResult, pros
         text.push_str(&line[..floor_char_boundary(line, line.len().min(room))]);
     }
     text
+}
+
+fn floor_raw_boundary(bytes: &[u8], mut at: usize) -> usize {
+    while at > 0 && at < bytes.len() && bytes[at] & 0xc0 == 0x80 {
+        at -= 1;
+    }
+    at
 }
 
 fn display_path(project_root: &Path, path: &Path) -> String {

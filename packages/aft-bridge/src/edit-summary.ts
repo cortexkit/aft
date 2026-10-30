@@ -25,8 +25,8 @@ export interface EditSummaryInput {
   replacements?: number;
   /** Number of edits applied in batch mode (Rust `edits_applied`). */
   edits_applied?: number;
-  fuzzy_match?: { pass: number; replaced_text: string[] };
-  fuzzy_matches?: Array<{ pass: number; replaced_text: string[] }>;
+  fuzzy_match?: { pass: number; replaced_text: string[]; notice?: string };
+  fuzzy_matches?: Array<{ pass: number; replaced_text: string[]; notice?: string }>;
   /** True when a new file was created (append/write create path). */
   created?: boolean;
   /** True when the post-write content is byte-identical to before. */
@@ -98,8 +98,15 @@ export function formatEditSummary(data: EditSummaryInput): string {
   let s = `Edited (${detail}).`;
   if (data.formatted) s += formatAutoFormattedSuffix(data);
   const fuzzy = data.fuzzy_matches ?? (data.fuzzy_match ? [data.fuzzy_match] : []);
+  // The notice wording comes from the Rust producer (fuzzy_match.rs
+  // loose_match_notice); older producers without it get the bare pass number.
+  // A notice identical to the previous one is not repeated, matching the Rust
+  // reply formatter.
+  let previousNotice: string | undefined;
   for (const match of fuzzy) {
-    s += `\nFuzzy match (pass ${match.pass}).`;
+    const notice = match.notice ?? `Fuzzy match (pass ${match.pass}).`;
+    if (notice !== previousNotice) s += `\n${notice}`;
+    previousNotice = notice;
     for (const [index, text] of match.replaced_text.entries()) {
       s += `\nReplaced text ${index + 1}: ${text}`;
     }

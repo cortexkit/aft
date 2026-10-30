@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-#[cfg(debug_assertions)]
+#[cfg(all(test, debug_assertions))]
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::{Instant, UNIX_EPOCH};
@@ -27,7 +27,7 @@ thread_local! {
 }
 
 #[cfg(debug_assertions)]
-static FILE_READS: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> = OnceLock::new();
+static FILE_READS: super::read_counts::FileReadCounts = super::read_counts::FileReadCounts::new();
 
 #[derive(Debug, Clone)]
 struct TodoItem {
@@ -75,7 +75,10 @@ fn run_todos_scan_with_memo(job: &InspectJob, memo: &Tier1FileMemo<FileScan>) ->
             if cancelled() {
                 return None;
             }
-            Some(memo.get_or_insert_with(path, |path| scan_file(path, &job.project_root)))
+            // Overlapping project roots can scan the same source file. Keep
+            // TODO paths root-independent in the file memo; aggregation below
+            // formats them relative to the root making this request.
+            Some(memo.get_or_insert_with(path, |path| scan_file(path, Path::new(""))))
         })
         .collect();
     if cancelled() {
@@ -93,12 +96,19 @@ fn run_todos_scan_with_memo(job: &InspectJob, memo: &Tier1FileMemo<FileScan>) ->
     let mut all_items = Vec::new();
     let mut excluded = ExcludedTestTally::default();
     for scan in per_file {
+        let file = scan
+            .scanned_file
+            .as_ref()
+            .map(|path| display_file_path(&job.project_root, path));
         if let Some(path) = scan.scanned_file {
             scanned_files.push(path);
         }
         // Markers in test trees (generated fixtures, mutation notes in test
         // comments) are not product work items; tally them separately.
-        for item in scan.items {
+        for mut item in scan.items {
+            if let Some(file) = &file {
+                item.file.clone_from(file);
+            }
             if is_test_tree_file(&item.file) {
                 excluded.record(&item.file);
             } else {
@@ -706,15 +716,8 @@ fn truncate_text(text: &str) -> String {
     text.chars().take(MAX_TEXT_CHARS).collect()
 }
 #[cfg(debug_assertions)]
-fn debug_file_reads() -> &'static Mutex<BTreeMap<PathBuf, usize>> {
-    FILE_READS.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-#[cfg(debug_assertions)]
 fn bump_file_read_count(path: &Path) {
-    if let Ok(mut reads) = debug_file_reads().lock() {
-        *reads.entry(path.to_path_buf()).or_default() += 1;
-    }
+    FILE_READS.record(path);
 }
 
 #[cfg(debug_assertions)]
@@ -723,9 +726,7 @@ pub fn reset_file_read_count_for_debug(project_root: &Path) {
     // Normalized like the scanned paths themselves: bare canonicalize is
     // verbatim on Windows and the starts_with filter would miss every entry.
     let project_root = crate::inspect::job::canonicalize_normalized(project_root);
-    if let Ok(mut reads) = debug_file_reads().lock() {
-        reads.retain(|path, _| !path.starts_with(&project_root));
-    }
+    FILE_READS.reset(project_root);
 }
 
 #[cfg(debug_assertions)]
@@ -734,16 +735,7 @@ pub fn file_read_count_for_debug(project_root: &Path) -> usize {
     // Normalized like the scanned paths themselves: bare canonicalize is
     // verbatim on Windows and the starts_with filter would miss every entry.
     let project_root = crate::inspect::job::canonicalize_normalized(project_root);
-    debug_file_reads()
-        .lock()
-        .map(|reads| {
-            reads
-                .iter()
-                .filter(|(path, _)| path.starts_with(&project_root))
-                .map(|(_, count)| *count)
-                .sum()
-        })
-        .unwrap_or_default()
+    FILE_READS.count(&project_root)
 }
 
 #[cfg(all(test, debug_assertions))]
@@ -752,11 +744,40 @@ mod tests {
     use std::sync::{Arc, RwLock};
 
     use super::*;
+
+    #[test]
+    fn audit05_todo_read_tracking_is_root_opt_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.rs");
+        fs::write(&path, "// TODO: marker\n").unwrap();
+        let _ = read_text_file(&path);
+        assert_eq!(file_read_count_for_debug(dir.path()), 0);
+        reset_file_read_count_for_debug(dir.path());
+        let _ = read_text_file(&path);
+        assert_eq!(file_read_count_for_debug(dir.path()), 1);
+    }
     use crate::config::Config;
     use crate::inspect::{InspectCategory, JobKey, JobScope};
     use crate::parser::SymbolCache;
 
     const OVER_DEFAULT_MEMO_CAPACITY: usize = 4_097;
+
+    #[test]
+    fn audit05_memo_paths_are_relative_to_each_root() {
+        let dir = tempfile::tempdir().expect("project");
+        let parent = dir.path();
+        let nested = parent.join("nested");
+        fs::create_dir_all(nested.join("src")).expect("test directory");
+        let file = nested.join("src/task.rs");
+        fs::write(&file, "// TODO: examine marker\n").expect("source");
+        let memo = Tier1FileMemo::default();
+        let first = run_todos_scan_with_memo(&todos_job(parent, vec![file.clone()]), &memo);
+        let second = run_todos_scan_with_memo(&todos_job(&nested, vec![file]), &memo);
+        let first = first.outcome.expect("parent scan").aggregate;
+        let second = second.outcome.expect("nested scan").aggregate;
+        assert_eq!(first["items"][0]["file"], "nested/src/task.rs");
+        assert_eq!(second["items"][0]["file"], "src/task.rs");
+    }
 
     fn todos_job(root: &Path, scope_files: Vec<PathBuf>) -> InspectJob {
         let scope = JobScope::for_project(root.to_path_buf());

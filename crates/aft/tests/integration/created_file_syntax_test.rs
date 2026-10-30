@@ -93,6 +93,61 @@ fn write_new_valid_file_has_no_syntax_line() {
     assert!(aft.shutdown().success());
 }
 
+/// A real script that `bash -n` accepts but tree-sitter-bash rejects, for its
+/// escaped `[ ... \< ... ]` comparison on line 19.
+#[cfg(unix)]
+const BASH_GRAMMAR_GAP: &str = include_str!("../fixtures/aft-window-6deceda4.sh");
+/// Truly broken: the second `case` item lacks its `)`. The recovery ERROR
+/// starts on line 3; bash and the reply both name line 5.
+#[cfg(unix)]
+const BROKEN_BASH: &str = "set -u\necho a\ncase x in\n  a) echo ;;\n  b echo ;;\nesac\n";
+
+#[cfg(unix)]
+#[test]
+fn bash_grammar_gap_written_or_appended_is_not_called_broken() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut aft = configured(dir.path());
+    for (name, arguments) in [
+        (
+            "write",
+            json!({ "path": "window.sh", "content": BASH_GRAMMAR_GAP }),
+        ),
+        (
+            "edit",
+            json!({ "path": "appended.sh", "appendContent": BASH_GRAMMAR_GAP }),
+        ),
+    ] {
+        let resp = tool_call(&mut aft, "bash-gap", name, arguments);
+        assert_eq!(resp["syntax_valid"], true, "{resp:?}");
+        assert!(resp.get("syntax_error_line").is_none(), "{resp:?}");
+        assert!(!text(&resp).contains("Syntax check"), "{}", text(&resp));
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_broken_written_or_appended_reports_real_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut aft = configured(dir.path());
+    for (name, arguments) in [
+        (
+            "write",
+            json!({ "path": "broken.sh", "content": BROKEN_BASH }),
+        ),
+        (
+            "edit",
+            json!({ "path": "appended.sh", "appendContent": BROKEN_BASH }),
+        ),
+    ] {
+        let resp = tool_call(&mut aft, "bash-broken", name, arguments);
+        assert_eq!(resp["syntax_valid"], false, "{resp:?}");
+        assert_eq!(resp["syntax_error_line"], 5, "{resp:?}");
+        assert!(text(&resp).ends_with(&syntax_notice(5)), "{resp:?}");
+    }
+    assert!(aft.shutdown().success());
+}
+
 #[test]
 fn existing_clean_file_broken_by_write_or_edit_keeps_rollback_reply() {
     let dir = tempfile::tempdir().unwrap();

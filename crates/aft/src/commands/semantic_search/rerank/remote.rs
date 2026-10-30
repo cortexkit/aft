@@ -258,15 +258,18 @@ pub(crate) mod tests {
     }
     #[test]
     fn remote_http_refusal_and_deadline() {
-        for (status, delay) in [(401, Duration::ZERO), (200, Duration::from_millis(150))] {
+        // The refusal case gets a generous deadline: it checks how a 401 is
+        // classified, and a loaded runner can take longer than 100 ms to
+        // answer, which would turn it into a timeout. Only the slow-reply case
+        // tests the deadline itself.
+        for (status, delay, deadline) in [
+            (401, Duration::ZERO, Duration::from_secs(10)),
+            (200, Duration::from_millis(150), Duration::from_millis(100)),
+        ] {
             let (endpoint, server) = serve("{}", status, delay);
             let backend = RemoteReranker::new(&endpoint, "m".into(), None, None).unwrap();
             let error = backend
-                .score(
-                    "q",
-                    &[RerankDoc { text: "a" }],
-                    Instant::now() + Duration::from_millis(100),
-                )
+                .score("q", &[RerankDoc { text: "a" }], Instant::now() + deadline)
                 .unwrap_err();
             if status == 401 {
                 assert!(matches!(error, RerankError::Refused(_)));

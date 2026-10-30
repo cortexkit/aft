@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "flake-batch-15"
+  ],
+  "note": "Test-only: the tier-2 inspect integration test waits up to 60 s for a cold call-graph build. No changed path matches RANKING_FENCE_PREFIXES."
+}

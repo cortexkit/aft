@@ -17,8 +17,15 @@ pub const TIER2_REFRESH_STORM_PATH_THRESHOLD: usize = 200;
 // as the limiter stays full.
 pub const TIER2_REFRESH_DEFERRAL_BACKOFF: Duration = Duration::from_secs(30);
 /// A foreign cache writer can release its lease without any input changing.
-/// Retry at most once every 30 seconds, even after repeated lease timeouts.
+/// Initial fallback delay; lease-release notifications can wake a retry sooner.
 pub const TIER2_CACHE_WRITER_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+pub const TIER2_CACHE_WRITER_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
+
+pub fn tier2_cache_writer_retry_backoff(timeouts: u32) -> Duration {
+    TIER2_CACHE_WRITER_RETRY_BACKOFF
+        .saturating_mul(1u32 << timeouts.saturating_sub(1).min(16))
+        .min(TIER2_CACHE_WRITER_RETRY_BACKOFF_MAX)
+}
 /// Minimum gap between two roots' first (cold-cache) Tier-2 refreshes.
 ///
 /// Every root configured in the same burst (all sessions rebinding after a

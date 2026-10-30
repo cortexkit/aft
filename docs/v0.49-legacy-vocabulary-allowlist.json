@@ -172,39 +172,6 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/commands/trace_to_symbol.rs",
-      "line": 80,
-      "column": 43,
-      "token": "toFile",
-      "text": "format!(\"trace_to_symbol: toFile not found: {}\", to_file),",
-      "location": "line 80, column 43",
-      "ordinal": 1,
-      "class": "rust-compatibility",
-      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
-    },
-    {
-      "path": "crates/aft/src/commands/trace_to_symbol.rs",
-      "line": 144,
-      "column": 76,
-      "token": "toFile",
-      "text": "\"trace_to_symbol: target symbol '{}' is not defined in toFile: {}\",",
-      "location": "line 144, column 76",
-      "ordinal": 1,
-      "class": "rust-compatibility",
-      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
-    },
-    {
-      "path": "crates/aft/src/commands/trace_to_symbol.rs",
-      "line": 174,
-      "column": 94,
-      "token": "toFile",
-      "text": "\"trace_to_symbol: target symbol '{}' exists in multiple files; pass 'toFile' to disambiguate\",",
-      "location": "line 174, column 94",
-      "ordinal": 1,
-      "class": "rust-compatibility",
-      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
-    },
-    {
       "path": "crates/aft/src/commands/undo.rs",
       "line": 20,
       "column": 72,
@@ -1162,28 +1129,6 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_format.rs",
-      "line": 3266,
-      "column": 23,
-      "token": "toFile",
-      "text": "\"Pass toFile to disambiguate\"",
-      "location": "line 3266, column 23",
-      "ordinal": 1,
-      "class": "rust-compatibility",
-      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
-    },
-    {
-      "path": "crates/aft/src/subc_format.rs",
-      "line": 3268,
-      "column": 45,
-      "token": "toFile",
-      "text": "\"Try one of these files for toFile\"",
-      "location": "line 3268, column 45",
-      "ordinal": 1,
-      "class": "rust-compatibility",
-      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
-    },
-    {
       "path": "crates/aft/src/subc_translate.rs",
       "line": 137,
       "column": 36,
@@ -1622,20 +1567,6 @@
     {
       "path": "crates/aft/tests/fixtures/subc_parity/format/apply_patch_format_success/input.json",
       "token": "filePath",
-      "location": "file-level",
-      "class": "compatibility-fixture",
-      "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
-    },
-    {
-      "path": "crates/aft/tests/fixtures/subc_parity/format/callgraph_ambiguous_target_error/expected.txt",
-      "token": "toFile",
-      "location": "file-level",
-      "class": "compatibility-fixture",
-      "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
-    },
-    {
-      "path": "crates/aft/tests/fixtures/subc_parity/format/callgraph_ambiguous_target_error/input.json",
-      "token": "toFile",
       "location": "file-level",
       "class": "compatibility-fixture",
       "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
@@ -4240,28 +4171,6 @@
       "text": "delete record.filePath;",
       "location": "line 427, column 19",
       "ordinal": 2,
-      "class": "internal-compatibility",
-      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
-    },
-    {
-      "path": "packages/aft-bridge/src/tool-format.ts",
-      "line": 71,
-      "column": 19,
-      "token": "toFile",
-      "text": "? \"Pass toFile to disambiguate\"",
-      "location": "line 71, column 19",
-      "ordinal": 1,
-      "class": "internal-compatibility",
-      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
-    },
-    {
-      "path": "packages/aft-bridge/src/tool-format.ts",
-      "line": 72,
-      "column": 41,
-      "token": "toFile",
-      "text": ": \"Try one of these files for toFile\";",
-      "location": "line 72, column 41",
-      "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
@@ -7664,19 +7573,8 @@
       "line": 708,
       "column": 108,
       "token": "filePath",
-      "text": "{ name: \"callgraph_ambiguous_target_error\", tool_name: \"callgraph\", agent_args: { op: \"trace_to_symbol\", filePath: \"src/main.ts\", symbol: \"run\", toSymbol: \"leaf\" }, native_response_json: { id: \"1\", success: false, code: \"ambiguous_target\", message: \"trace_to_symbol: target symbol 'leaf' exists in multiple files; pass 'toFile' to disambiguate\", candidates: [{ file: `${PROJECT_ROOT}/src/leaf.ts`, line: 3, symbol: \"leaf\" }, { file: `${PROJECT_ROOT}/src/other_leaf.ts`, line: 9, symbol: \"leaf\" }] } },",
+      "text": "{ name: \"callgraph_ambiguous_target_error\", tool_name: \"callgraph\", agent_args: { op: \"trace_to_symbol\", filePath: \"src/main.ts\", symbol: \"run\", toSymbol: \"leaf\" }, native_response_json: { id: \"1\", success: false, code: \"ambiguous_target\", message: \"trace_to_symbol: target symbol 'leaf' exists in multiple files; pass 'toPath' to disambiguate\", candidates: [{ file: `${PROJECT_ROOT}/src/leaf.ts`, line: 3, symbol: \"leaf\" }, { file: `${PROJECT_ROOT}/src/other_leaf.ts`, line: 9, symbol: \"leaf\" }] } },",
       "location": "line 708, column 108",
-      "ordinal": 1,
-      "class": "audit-implementation",
-      "reason": "The audit or capture implementation names the vocabulary it checks."
-    },
-    {
-      "path": "scripts/capture-subc-parity.ts",
-      "line": 708,
-      "column": 323,
-      "token": "toFile",
-      "text": "{ name: \"callgraph_ambiguous_target_error\", tool_name: \"callgraph\", agent_args: { op: \"trace_to_symbol\", filePath: \"src/main.ts\", symbol: \"run\", toSymbol: \"leaf\" }, native_response_json: { id: \"1\", success: false, code: \"ambiguous_target\", message: \"trace_to_symbol: target symbol 'leaf' exists in multiple files; pass 'toFile' to disambiguate\", candidates: [{ file: `${PROJECT_ROOT}/src/leaf.ts`, line: 3, symbol: \"leaf\" }, { file: `${PROJECT_ROOT}/src/other_leaf.ts`, line: 9, symbol: \"leaf\" }] } },",
-      "location": "line 708, column 323",
       "ordinal": 1,
       "class": "audit-implementation",
       "reason": "The audit or capture implementation names the vocabulary it checks."

@@ -1,0 +1,7 @@
+[
+  {"request":{"method":"agent.set_session_network","params":{"harness":"broca","network":"yes","session":"broca-live"}},"principal":{"kind":"reserved","moduleId":"prefrontal-core"},"reply":{"result":{"network":"yes","since_ms":700}}},
+  {"request":{"method":"agent.set_session_network","params":{"harness":"broca","network":"yes","session":"broca-live"}},"principal":{"kind":"reserved","moduleId":"prefrontal-core"},"reply":{"result":{"network":"yes","since_ms":700}}},
+  {"request":{"method":"agent.set_session_network","params":{"harness":"broca","network":"no","session":"broca-live"}},"principal":{"kind":"reserved","moduleId":"prefrontal-core"},"reply":{"result":{"network":"no","since_ms":710}}},
+  {"request":{"method":"agent.set_session_network","params":{"harness":"broca","network":"yes","session":"broca-ended"}},"principal":{"kind":"reserved","moduleId":"prefrontal-core"},"reply":{"code":"network_history_full","detail":null,"message":"this session's network history already holds 1024 entries"}},
+  {"request":{"method":"agent.set_session_network","params":{"harness":"broca","network":"no","session":"never-registered"}},"principal":{"kind":"reserved","moduleId":"prefrontal-core"},"reply":{"code":"not_found","detail":null,"message":"no agent session is registered under this harness and session"}}
+]

@@ -240,11 +240,12 @@ def semantic_bin_metrics(path: Path) -> JsonObject:
         _, offset = _take(data, offset, dimension * 4)
 
     if version >= 8:
-        _, offset = _take(data, offset, 8)  # total skipped rows
-        refused_files, offset = _u32(data, offset)
-        for _ in range(refused_files):
-            offset = _skip_string(data, offset)
-            _, offset = _take(data, offset, 8)  # refused rows in this file
+        _, offset = _take(data, offset, 8)  # total skipped chunks
+        for _ in range(2):  # provider refusal and input-limit file tables
+            skipped_files, offset = _u32(data, offset)
+            for _ in range(skipped_files):
+                offset = _skip_string(data, offset)
+                _, offset = _take(data, offset, 8)  # skipped chunks in this file
     if offset != len(data):
         raise ValueError(f"semantic.bin trailing bytes: {len(data) - offset}")
     return {

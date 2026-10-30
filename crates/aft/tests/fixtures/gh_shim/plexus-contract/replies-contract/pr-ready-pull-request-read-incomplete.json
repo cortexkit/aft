@@ -1,0 +1,45 @@
+{
+  "github_reads": [
+    {
+      "request_body": null,
+      "request_line": "GET /repos/org/repo/pulls/7 HTTP/1.1",
+      "response": {
+        "base": {
+          "repo": {
+            "url": "https://api.github.com/repos/org/repo"
+          }
+        },
+        "html_url": "https://github.com/org/repo/pull/7",
+        "number": 7,
+        "user": {
+          "login": "app-fixture[bot]",
+          "type": "Bot"
+        }
+      },
+      "status": 200
+    }
+  ],
+  "name": "pr-ready-pull-request-read-incomplete",
+  "reply": {
+    "repo_binding_generation": 1,
+    "result": {
+      "refusal_code": "pre_dispatch_read_incomplete{reason: invalid_response}",
+      "retry_same_nonce": true,
+      "status": "refused"
+    }
+  },
+  "request": {
+    "gh_route_schema": 1,
+    "manifest_version": 22,
+    "metadata": {
+      "agent_id": "alfonso-aft",
+      "pid": 4242
+    },
+    "number": "7",
+    "operation": "gh.route",
+    "repository": "org/repo",
+    "rung_as_of_unix_secs": 1793066213,
+    "undo": false,
+    "verb": "pr ready"
+  }
+}

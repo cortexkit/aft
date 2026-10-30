@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "rich-ui-s07-session-reads"
+  ],
+  "note": "Rich UI slice 7: carrier session-role and policy-route resolution, session reads under the session's policy, and a carrier-only guard that keeps saved agent grants from widening carrier reads. Publication stays off. No changed path matches RANKING_FENCE_PREFIXES."
+}

@@ -16,9 +16,30 @@ OMP uses this same CortexKit user file; register its Pi-compatible plugin with `
 
 `bash.worker_wait_max_ms` bounds blocking `bash` calls in every session, including heads (`wait: true`, or foreground calls forced to block, such as when `bash.subagent_background` is false). It also bounds delegated (subagent) `bash_watch` calls, including an explicit timeout. Head watches still use `bash.watch_sync_max_ms`. At the limit the command is not killed: it keeps running in the background, and the caller gets its task id, elapsed time and latest output, so it can inspect it, wait again where `bash_watch` is available, or `bash_kill` it. Blocking calls and worker watches push the command's default 30-minute hard kill to at least this long after the wait; an explicit command `timeout` is never extended. The default is `1800000` (30 minutes); a value below `60000` is a config error that drops the `bash` block, not a silent clamp. User and project config may both set it, and harness blocks override it like the other `bash` keys. The key was originally worker-only; its name is retained so existing user and project configurations keep working when blocking head calls use it too.
 
-`bash.env` adds fixed variables to every shell command from user config only (for example, `"env": { "TZ": "UTC" }`). Project config cannot set environment values. Per-call `env` entries override these defaults, and user-config changes apply to future commands without a restart. Loader, shell/interpreter startup, `PATH`, and other protected variables are rejected while loading config. The first bash reply in each session lists the configured keys only, never their values. When a command starts while the same trimmed command is already running in the same project and canonical working directory, AFT adds a warning with its task ID, age, and whether it belongs to this session; the command still runs.
+`bash.changed_files` lists the project files that changed while a shell command ran. Only user configuration can turn it on; a project can only set `"off"`.
+
+- `"off"` (default): nothing is recorded.
+- `"list"`: each changed path, marked added, modified or deleted.
+- `"diff"`: the list plus a short diff for clean tracked text files, against the version git had when the command started.
+
+The list covers a time window, so changes made by other processes in that window can appear. It comes from the file watcher, so paths the watcher excludes (`.git`, `target`, `node_modules`, ignore rules) are not listed. Before reporting, AFT confirms the watcher has caught up by creating and removing an empty marker file (in `.git/`, or the project root when `.git` is not a folder), waiting at most 300 ms; if it can't confirm, the result says the list may be incomplete. Background commands report in their completion notice, and `runon` commands report only changes seen in the local project. Limits: 40 files and 64 KiB per report, 200 lines and 32 KiB per file diff. Files over 256 KiB, binary files and files that already had uncommitted changes are listed without a diff.
+
+`bash.env` adds fixed variables to every local shell command (for example, `"env": { "TZ": "UTC" }`). Both tiers accept it, with one shape:
+
+- **User tier** always applies. **Project tier** applies only while the project is on the filter trust list (`aft doctor filters trust`), checked on every command, and a linked worktree inherits its main checkout's trust. Untrusting a project takes effect on the next command, with no reload.
+- On the same name, **the user value wins** and the project value is ignored; a project can add names but cannot undo a user's. A harness block's `bash.env` merges its names into that tier's base map instead of replacing it.
+- Refused names reject the whole config, naming the key: names that hijack startup, redirect a lookup root, inject into an interpreter or Git, or drive AFT, the sandbox, or a build worker are refused at both tiers, and credentials, identity, proxy, and TLS-trust names are refused at the project tier only. Matching is case-insensitive on every platform.
+- `bash.runon_env` (user tier only) lists the `bash.env` names whose value also goes to a `runon` build-server job. Every other value applies to local commands only, a project's values are never sent, and the job's disclosure names what it did not receive.
+
+Per-call `env` entries and the command's own `export` both override configured values, and config changes apply to future commands without a restart. The first bash reply in each session lists the applied names with their tier, never their values, and says when a project map was ignored as untrusted or shadowed by a user value. When a command starts while the same trimmed command is already running in the same project and canonical working directory, AFT adds a warning with its task ID, age, and whether it belongs to this session; the command still runs.
 
 On Linux, user config may set `bash.linux_scope: true` to launch non-PTY tool shells through `systemd-run --user --scope --collect --quiet`. The default is `false`. AFT uses the scope only when `systemd-run` exists and the user manager is reachable; otherwise it falls back to the normal process-group-isolated spawn and writes one informational log line. Native-sandbox launches also use the normal spawn because their launcher cannot contact the user manager. Project config cannot enable or disable this host-level containment option.
+
+`bash.memory_limit_mib` optionally caps aggregate memory for each local command, including foreground, background, and PTY commands. It is off by default; set a positive integer in MiB (for example, `4096` for 4 GiB; maximum `4294967295`) in user config. Projects may tighten the cap, never raise or remove it. Changes affect future commands; there is no per-call override. Remote `runon` jobs use the build server's own limits and are not covered.
+
+- **Linux:** cgroup v2 `memory.max` (using a delegated transient systemd user scope when needed); if unavailable, the result explicitly names the process-group RSS watcher fallback.
+- **Windows:** a job-object aggregate memory limit refuses allocations; AFT stops the job when a limit notification or peak accounting confirms the cap was hit.
+- **macOS:** a physical-footprint process-group watcher samples every 500 ms. Fast allocations can overshoot for a fraction of a second, and processes that leave the group are not counted. The Linux watcher has the same limits. Watcher scans are bounded to 4096 processes and stop the command explicitly if accounting cannot complete.
 
 On macOS, `bash.disclaim_privacy: true` makes agent shells (including background, PTY, and governed `gh` commands) responsible for their own privacy permissions instead of inheriting the supervisor's grants. It defaults to `false`; user config controls it and project config may only turn it on. It is live-reloadable for future commands, not already-running children, and accepted but inert on other platforms. Disclaimed shells cannot rely on inherited access to protected folders such as `~/Downloads`; agents should use AFT's in-process `read` tool for those files (`grep` and `glob` are also unaffected). If macOS cannot apply the responsibility attribute, AFT refuses the command with `privacy disclaim unavailable` rather than running it with inherited grants. Effective per-root settings appear in health, and the first disclaimed command logs an informational message per session.
 
@@ -74,11 +95,43 @@ Storage resolution is identical for plugins, standalone binaries, and warmup:
 
 AFT caches the login-shell PATH probe in `<storage_dir>/effective-path.json`. The cache records the shell startup files and is invalidated when one is created, removed, or changes size or modification time. A cached timeout stores a null PATH, so a blocked shell profile delays only the first launch after its startup files change; AFT refreshes the cache in a detached helper for a later launch.
 
+### Rebuildable cache root (`storage.cache_dir`)
+
+Set this **at the top level of the user config only** to keep large, rebuildable artifacts on a separate local volume, for example a no-backup APFS volume:
+
+```jsonc
+{
+  "storage": { "cache_dir": "/Volumes/AFT-Caches" }
+}
+```
+
+The path must already exist and be absolute after home-directory expansion (`~` alone or a path beginning with `~/` or `~\`). AFT never creates this directory. It creates only its owner-only `aft/` namespace inside it (0700 directories and 0600 files on Unix). Existing namespaces must have an ownership marker whose random registration ID and directory identity match this storage root's durable registration; copying a marker into an unrelated directory cannot enroll it. Cache locations cannot overlap the durable storage root or an artifact namespace belonging to any configured storage root. Project values and **all harness overrides, including user harness overrides**, are dropped with a dropped-key notice: one storage root has one cache location, so borrowers on different harnesses see the same owner artifacts. A change takes effect on configure/reconnect, not a live config reload.
+
+A path that runs through symlinks (macOS `/var` or `/tmp`, a symlinked home, an alias of a `/Volumes` mount) is resolved once when the directory is first used and pinned by device and inode; if the configured spelling later names a different directory, caches turn off as below. The same applies to a storage root reached through a symlink. Inside AFT's own folders symlinks are never followed. A missing directory, non-directory, failed write probe, changed remembered directory identity, or unusable namespace emits `cache_dir_unavailable`: `storage.cache_dir <path> is unavailable (<reason>); AFT is running without its caches until it is back.` There is **no fallback to the storage root**. Trigram, semantic, callgraph, views/blobs, symbol-disk and inspect lanes do not open or build disk caches. Search still returns its bounded fallback walk with an honest partial trailer; semantic/callgraph and health report the typed unavailable reason. Every configure re-checks the directory. The background index coordinator probes immediately on its first check and then at most once a minute for each storage/cache-directory identity pair. It verifies each context's ownership before resuming caches through configure; the warning/reason clears when usable. An unreadable user config, one that does not parse, or one whose `storage` section or any `harnesses.<name>.storage` override is invalid emits `cache_dir_config_unknown` (the reason names the failing section) and keeps caches off rather than assuming the setting was unset; repair the user config and reconnect to revalidate its cache location. An invalid value in any other section is reported by normal config validation and leaves caches on.
+
+After first successful use, AFT remembers the configured directory's device/inode identity (Windows volume serial/file id) and volume UUID when available in durable `retention/cache-parents.json`, not on the cache volume. A mismatch reports `cache_dir is not the volume it was` and keeps caches off; selecting a new path starts fresh. On macOS, `/Volumes` itself is refused, and a path below `/Volumes/<name>` on the system or Data volume is treated as an unmounted-volume stub, even on first use. First enrollment requires a cache parent on a different device from the durable storage root (or its nearest existing ancestor). A same-device directory, including an unmounted mount-point stub outside `/Volumes`, is refused with `cache_dir_on_storage_device`, visible in configure warnings, health/memory census and doctor. A previously registered parent still has to pass the saved-identity check on every bind.
+
+The artifact root, `<storage.cache_dir>/aft`, contains `views/`, `blobs/`, `callgraph/`, `semantic/` (including local embedding and reranker models), `index/`, `symbols/` and `inspect/`. Views and blobs always share this root and volume. Writer leases, reader markers, publication temporaries and retention trash stay beside their cache artifacts, so moving caches does not introduce cross-volume publish or retirement renames. Health, memory census and `aft doctor` report the cache location. `AFT_CACHE_DIR` still controls downloaded binaries and language-server packages; it is not this setting.
+
+Leaving the setting unset preserves the existing layout for a storage root that has never used a cache directory. Once a storage root has kept its caches in a cache directory, removing the setting (or losing it to a typo or a missing user config) keeps caches off with `cache_dir_unavailable`: `storage.cache_dir is not set, but this storage root's caches live on <parent>; set it again, or set "cache_dir": null to move caches back to the primary disk.` Set `"storage": { "cache_dir": null }` to deliberately return caches to the storage root. Storage sections and storage-like misspellings (such as `storge` or `cachedir`) are `invalid_cache_config` errors, not defaults. Unknown sections whose values contain `cache_dir` and section names within two single-character edits of `storage` are treated as storage-like; unrelated unknown keys retain the existing warning/partial-load behavior. The distinct process-state name `storage_dir` is not interpreted as a cache-parent selector. Durable state stays in the storage root selected above: `aft.db` and its WAL/SHM, checkpoints, harness backups and bash tasks, shims, retention metadata, artifact-owner manifests, dSYMs, logs, `engram-catalog.json` and `trusted-filter-projects.json`. ENGRAM's catalog remains relative to that storage root and declares only folders that actually exist there; caches on another volume are not catalog entries.
+
+Changing the setting builds fresh caches; nothing is migrated. Stop AFT sessions using the storage root being cleaned. Updated cache-using processes, including standalone sessions and `aft index`, hold a shared kernel lock at `<storage_dir>/retention/daemon-use.lock` before cache access; the main process retains it until the main process exits. Configuration snapshots hold a lease for any additional storage root they select. Cleanup takes the same lock exclusively before preparing cache namespaces and retains it across inventory, confirmation and deletion. For this release's upgrade window, a conservative host-wide subc-daemon check additionally refuses cleanup while a daemon is running, including older daemon versions that do not hold the root lock. Stop those daemons before cleanup. `aft doctor --fix` reclaims only `views/`, `blobs/`, `callgraph/`, `semantic/`, `index/`, `symbols/` and `inspect/` inside recorded, marked, inactive artifact roots. It never removes unmarked folders under the durable storage root.
+
+For the original storage-root caches, run the separate `aft doctor --clean-old-caches` operation (native `aft clean-old-caches`). This is an explicit, confirmation-gated exception for old unmarked caches: **only** `views/`, `blobs/`, `callgraph/`, `semantic/`, `index/`, `symbols/` and `inspect/` directly under the resolved durable storage root are eligible. The root must already contain a regular `aft.db` or its matching AFT owner marker; cleanup cannot create its own ownership proof. It must not be the active artifact root, and `storage.cache_dir` must be active, enrolled and on a different device. Harness folders, other names and durable state are never selected. Symlinked or foreign-device domains, nested mounts and hardlinked files refuse the operation. The prompt lists every exact candidate path and byte size plus the total, then requires the exact word `delete`; without a terminal, explicit `--yes` is required. See `aft doctor --clean-old-caches --help` for this exception and its prerequisites.
+
+Both operations preflight every root and candidate before deleting anything, refuse live daemons independently of cache leases, and delete through pinned directory handles. Cache directory/file creation also walks from the admitted root handle, refusing symlinks and foreign mounts below it; a pathname is not reused as creation authority after that walk. Root/candidate symlinks, changed identities, nested mounts and aliases of durable or active directories refuse cleanup. Preflight is read-only and refuses symlinks, special files and linked coordination files anywhere it inspects; marker inspection and any marker sweeping use bounded, no-follow, directory-handle-relative operations. Existing coordination files also refuse cleanup rather than being reclaimed or heartbeated: stop their owner and repair stale locks before retrying. Each context holds `.aft-in-use.lock` shared while using a root, including retired roots with in-flight readers; cache/semantic/symbol/writer locks and pins provide additional protection. Unavailable configured roots refuse cleanup altogether. Partial failures report completed removals and partial-directory progress. On Windows filesystems without POSIX delete disposition, an accepted legacy disposition counts as removed with a `removed_with_warning` entry explaining that removal remains pending until handles close. Root directories and durable state are never removed; ordinary startup and plain `aft doctor` do not delete caches.
+
+Background retirement records the validated source and top-level member identities in `.aft-retirement.json` before moving data into domain- or mount-local trash. The reaper checks that proof on every retry and keeps it until the payload has been removed, so interrupted unlinks can resume without trusting a replacement directory. Unverified or pre-existing trash without a matching proof is retained rather than guessed to be safe. Mount-local pending hints remain on durable storage and are cleared only after the matching trash generation and its directory barriers have completed.
+
+Protection censuses, size inventories and recursive removal each have a 64-level depth limit, a one-million-entry budget and a 60-second traversal deadline. An incomplete census or inventory refuses deletion, including when durable state contains a nested mount whose identities cannot safely be enumerated. A removal that exceeds its budget after preflight stops and reports any partial progress; inspect the oversized tree before retrying.
+
 ## Uninstall paths
 
 Delete the user and project config files listed above, then delete the data roots below. A non-empty environment override takes precedence over the corresponding default.
 
 **Shared storage root** (`AFT_STORAGE_DIR`): if unset, AFT uses `XDG_DATA_HOME/cortexkit/aft/` when `XDG_DATA_HOME` is set. Otherwise, POSIX uses `~/.local/share/cortexkit/aft/`; Windows uses `%LOCALAPPDATA%/cortexkit/aft/`, then `%APPDATA%/cortexkit/aft/`, then `%USERPROFILE%/AppData/Local/cortexkit/aft/`. This root contains indexes, databases, background-task records, logs, and backup history.
+
+**Rebuildable artifact namespaces** (`storage.cache_dir`): if configured, also remove the registered `<storage.cache_dir>/aft/` namespace and any inactive namespaces recorded in the storage root. Do not delete the cache parent itself: it may contain unrelated data.
 
 **Downloaded-binary and LSP cache** (`AFT_CACHE_DIR`): if unset, POSIX uses `${XDG_CACHE_HOME}/aft/` when `XDG_CACHE_HOME` is set, otherwise `~/.cache/aft/`. Windows uses `%LOCALAPPDATA%/aft/`, then `%APPDATA%/aft/`, then `%USERPROFILE%/AppData/Local/aft/`. The `bin/`, `lsp-packages/`, and `lsp-binaries/` subdirectories are under this root.
 
@@ -115,6 +168,10 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
    // Edit/read surface: "default" (default) or "hashline". User and project
    // tiers both accept this key; ordinary project-over-user precedence applies.
    "edit_mode": "default",
+
+   // Optional existing rebuildable-cache parent, user base only. Omit to keep
+   // the default storage-root layout. See "Rebuildable cache root" above.
+   // "storage": { "cache_dir": "/existing/cache-parent" },
 
   // Auto-format files after edits. Default: false. When enabled, formatting is
   // queued and runs after ~90s without further edits to the file.
@@ -320,10 +377,15 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     // Runtime gate. Default true.
     "enabled": true,
 
-    // Fixed extra variables for every shell command. User-tier only; project
-    // config cannot set environment values. Per-call env overrides these.
-    // Protected loader, shell/interpreter startup and PATH variables are refused.
+    // Fixed extra variables for every local shell command. A project's names
+    // apply only while the project is trusted; a user value wins on the same
+    // name. Per-call env and the command's own export override these.
+    // Startup hooks, lookup roots, interpreter injectors and protected
+    // variables are refused.
     "env": { "TZ": "UTC" },
+
+    // User-tier only: bash.env names that also go to a runon job.
+    "runon_env": ["TZ"],
 
     // Rewrite common shell commands (cat / grep / find / sed / ls / rg / cat >>)
     // to AFT tools. Adds a footer hint nudging the agent to call the AFT tool
@@ -369,13 +431,16 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     // detach (the token is stripped before the model sees the message).
     "detach_on_user_message": true,
     // Read-only schema trailers after missing-table/column errors. Default true;
-    // user and project tiers. SQLite on Unix; literal paths only (no variables,
-    // globs or memory databases; file: URIs require mode=ro, and startup -cmd/
-    // -init flags are skipped because they may change the connection).
+    // user and project tiers. SQLite on Unix; literal paths, a leading `~`,
+    // or an in-command `VAR=value` assignment referenced as `$VAR` (no globs,
+    // command substitution or memory databases; file: URIs require mode=ro,
+    // and startup -cmd/ -init flags are skipped because they may change
+    // the connection).
     // Finished commands only, including
     // background completions, independent of compression. Probe: same launch
     // sandbox, 1.5s timeout, 256 KiB output cap; trailer: 2 KiB with omissions.
     "db_schema_hints": true,
+    "changed_files": "off",
 
     // Maximum time a synchronous bash_watch call may wait. Defaults to 120000ms;
     // values outside 1000..=1800000 are clamped with a warning. Sync waits are
@@ -608,6 +673,18 @@ With `subc.connection_file` set, background shell completions and pattern matche
 
 After a Location reload or host restart, AFT restores subscriptions in the background for up to 20 of that Location directory's newest sessions whose last update was within 24 hours. Recovery is sequential and does not delay Location startup or inspect another workspace's sessions. Sessions outside that window or cap recover on their next tool call or prompt.
 
+## OpenCode TUI preferences
+
+The AFT sidebar and the OpenCode 2 prompt footer read their display settings from the `aft` entry of OpenCode's shared `tui-preferences.jsonc`, not from `aft.jsonc`. The file is `$OPENCODE_CONFIG_DIR/tui-preferences.jsonc` when that variable is set, otherwise `$XDG_CONFIG_HOME/opencode/tui-preferences.jsonc` (default `~/.config/opencode/tui-preferences.jsonc`); `OPENCODE_TUI_PREFERENCES_FILE` names a different file. Edits take effect while OpenCode is running, without a restart.
+
+`footer` (default `true`) controls the AFT health line in the OpenCode 2 prompt footer (`AFT E0 W0 | D0 U0 C1 | T0`). Set it to `false` to remove the line; the sidebar and `/aft-status` are unaffected. A value other than `true` or `false` is ignored and the line stays on. OpenCode 1 has no AFT footer line, so the key has no effect there.
+
+```jsonc
+{
+  "aft": { "footer": false }
+}
+```
+
 ## Git co-authorship
 
 `git.co_author` controls commit attribution for AFT-spawned agent children. `"off"` is the default, `"auto"` derives the repository's bound agent from the gh-shim manifest and cached GitHub numeric ID, and an explicit `"Name <email>"` value is used verbatim. When enabled, AFT selects a complete dispatcher set through child-only `GIT_CONFIG_*` variables; it does not edit global or repository Git configuration. The dispatchers are identical for every project and storage root, so AFT writes them once per user to a directory named by a hash of their content, `<aft-cache>/git-hooks/<content-hash>`, where `<aft-cache>` is `AFT_CACHE_DIR` when set, otherwise `%LOCALAPPDATA%\aft` on Windows and `$XDG_CACHE_HOME/aft` or `~/.cache/aft` elsewhere (`<storage_root>/git-hooks/<content-hash>` when no home directory is known). The set is created atomically and never rewritten while intact, so each hook version is a single new executable per user. Each dispatcher preserves arguments, stdin, and exit status while chaining to the first executable repository hook from local `core.hooksPath`, the repository's Git directory, or `.githooks`. The `prepare-commit-msg` dispatcher adds attribution first so the repository hook can validate or amend it. AFT quarantines unknown or modified entries in its managed directory and regenerates the expected dispatchers before child launch. Project config may override this attribution key because attribution is not a trust boundary.
@@ -639,6 +716,8 @@ These are the defaults. Stamped Alfonso workers use `worker`; heads, unstamped r
 - **`strict`** retains the existing native jail: writes are limited to the project, private task temp, configured write grants and build caches. Stamped workers additionally get narrowly scoped shared Git metadata and operator-configured build-target grants. Their sccache channels and rustc wrappers remain blocked because a compile server could write outside that jail. Strict's existing secret floor, socket denies and platform limitations are unchanged.
 
 Sandboxed commands receive `/private/tmp/aft-w/<hex>` on macOS (`/tmp/aft-w/<hex>` on Linux) through `TMPDIR`, `TMP` and `TEMP`. The AFT-managed `gh` shim (the command wrapper that routes GitHub operations through AFT's permission checks) stays first on the command PATH, Git co-author hooks still run, and child environments do not inherit daemon credentials.
+
+**Worker signals:** on macOS, worker commands in both `strict` and `relaxed` can signal only processes that the same command started. On Linux, both modes enforce this limit only when the kernel supports Landlock signal scoping (ABI 6 or newer); older kernels do not enforce it, and the command reports `signal_scope=not_enforced`. To stop a process from an earlier command, use `bash_kill`. On macOS a `kill -0` existence check of any process still works. On Linux kernels that enforce the limit, Landlock has no exception for it, so `kill -0` of a process outside the command fails with `EPERM`. That error still means the process exists; only `ESRCH` means it is gone.
 
 **Worker `gh` fence:** strict Linux/macOS and relaxed macOS worker shells deny a canary under the account home returned by the password database, and under the daemon's `HOME` when its canonical path differs. Launch refuses if the password-database account home cannot be resolved or its canary cannot be prepared, a grant overlaps a canary, or any canary remains readable after sandbox application. Head shells retain read access to both canaries. macOS permits only marker/ancestor metadata for the probe, not data reads or writes.
 

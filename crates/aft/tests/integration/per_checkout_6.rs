@@ -271,11 +271,14 @@ fn per_checkout_6_child() {
     };
     let storage = PathBuf::from(std::env::var("PC6_STORAGE").unwrap());
     let registry = FamilyRegistry::open(&storage, FAMILY).unwrap();
+    // A production process binds its durable owner before it may remove a
+    // view directory; this child stands in for one.
+    registry.bind_durable_storage_for_tests(&storage).unwrap();
     match scenario.as_str() {
         // Holds a session on `held` until killed.
         "hold" => {
             let view = registry
-                .register_view("held", &root_of(&storage, "held"))
+                .register_view_with_storage(registry.storage(), "held", &root_of(&storage, "held"))
                 .unwrap();
             publish(&view, &[("held.txt", b"held by a live process\n")]);
             park(&storage);
@@ -284,7 +287,7 @@ fn per_checkout_6_child() {
         // Re-binds `held` after its eviction, publishes, and exits normally.
         "rebind" => {
             let view = registry
-                .register_view("held", &root_of(&storage, "held"))
+                .register_view_with_storage(registry.storage(), "held", &root_of(&storage, "held"))
                 .unwrap();
             publish(&view, &[("held.txt", b"held again after a restart\n")]);
         }
@@ -338,7 +341,7 @@ fn another_processes_session_blocks_eviction_until_it_dies_and_a_restart_rebinds
     wait_for_file(&mut holder, &storage.path().join("ready"));
     let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
     let idle = registry
-        .register_view("idle", &root_of(storage.path(), "idle"))
+        .register_view_with_storage(registry.storage(), "idle", &root_of(storage.path(), "idle"))
         .unwrap();
     publish(&idle, &[("idle.txt", b"nobody uses this\n")]);
     drop(idle);
@@ -385,11 +388,19 @@ fn a_kill_during_eviction_keeps_held_data_and_the_next_pass_finishes() {
         let storage = tempdir().unwrap();
         let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
         let kept = registry
-            .register_view("kept", &root_of(storage.path(), "kept"))
+            .register_view_with_storage(
+                registry.storage(),
+                "kept",
+                &root_of(storage.path(), "kept"),
+            )
             .unwrap();
         let kept_generation = publish(&kept, &[("kept.txt", b"kept by a session\n")]);
         let victim = registry
-            .register_view("victim", &root_of(storage.path(), "victim"))
+            .register_view_with_storage(
+                registry.storage(),
+                "victim",
+                &root_of(storage.path(), "victim"),
+            )
             .unwrap();
         publish(&victim, &[("victim.txt", b"evicted\n")]);
         let victim_dir = victim.view_dir().to_path_buf();
@@ -486,7 +497,11 @@ fn a_kill_during_segment_deletion_then_recreation_finishes_safely() {
         let storage = tempdir().unwrap();
         let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
         let view = registry
-            .register_view("view", &root_of(storage.path(), "view"))
+            .register_view_with_storage(
+                registry.storage(),
+                "view",
+                &root_of(storage.path(), "view"),
+            )
             .unwrap();
         let old = publish(&view, old_files);
         let current = publish(&view, &[("new.txt", b"current content\n")]);
@@ -542,7 +557,7 @@ fn a_segment_adopted_while_another_process_deletes_it_survives() {
     let storage = tempdir().unwrap();
     let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
     let view = registry
-        .register_view("view", &root_of(storage.path(), "view"))
+        .register_view_with_storage(registry.storage(), "view", &root_of(storage.path(), "view"))
         .unwrap();
     let old = publish(&view, old_files);
     publish(&view, &[("new.txt", b"current content\n")]);

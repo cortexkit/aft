@@ -118,7 +118,9 @@ export interface ToolRuntime {
    * of a resumed session rather than the session's project.
    */
   directoryIsSessionRoot?: boolean;
-  /** Effect-owned cancellation is explicit so V1 ToolContext signals remain unchanged. */
+  /** The OpenCode 1 SDK aborts this signal when the user cancels the tool call. */
+  abort?: AbortSignal;
+  /** The OpenCode 2 execution fiber owns this signal; it takes precedence over the SDK signal. */
   effectAbort?: AbortSignal;
   ask?: ToolContext["ask"];
 }
@@ -317,7 +319,9 @@ export async function callBridge(
   const sendOptions = {
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     configureWarningClient: ctx.client,
-    ...(runtime.effectAbort ? { abortSignal: runtime.effectAbort } : {}),
+    ...((runtime.effectAbort ?? runtime.abort)
+      ? { abortSignal: runtime.effectAbort ?? runtime.abort }
+      : {}),
     ...options,
   };
   markBridgeStart();
@@ -377,7 +381,9 @@ export async function callToolCall(
   const sendOptions = {
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     configureWarningClient: ctx.client,
-    ...(runtime.effectAbort ? { abortSignal: runtime.effectAbort } : {}),
+    ...((runtime.effectAbort ?? runtime.abort)
+      ? { abortSignal: runtime.effectAbort ?? runtime.abort }
+      : {}),
     // The caller's role travels in the tool_call envelope, beside the session,
     // and so do the host's names for AFT's tools (OpenCode 2 only).
     ...(workerSession ? { workerSession: true } : {}),

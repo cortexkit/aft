@@ -1,0 +1,12 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/search_index.rs"
+  ],
+  "note": "engine_unwired: the indexed grep verification read now goes through the storage-floor guard and reports skipped live databases; search routing and ranking are unchanged, so benchmark rows must remain byte-identical."
+}

@@ -65,6 +65,13 @@ RANKING_FENCE_PREFIXES = (
     # query runs and which candidates they produce, so a change there moves
     # search results just as a scoring change does.
     "crates/aft/src/search_b2/",
+    # The semantic index chunks each file on the symbols parser.rs extracts:
+    # its grammars, queries and extractors decide which symbols exist and
+    # which lines each one spans, and those lines become the chunk text that
+    # is embedded and ranked. A parser-only change therefore moves ranked rows.
+    # symbols.rs stays out: it only defines the Symbol and Range types and
+    # their serialization, and never decides where a range starts or ends.
+    "crates/aft/src/parser.rs",
     # Only the plugin files that shape an aft_search request or its rendering
     # are ranking surface; the rest of each plugin (bash, read, edit, wakes)
     # cannot move a search score and must not demand a ranking descriptor.

@@ -9,23 +9,20 @@
 //! Background threads spawned during request handling (search-index pre-warm,
 //! semantic-index build) **must** capture the session id before spawning and
 //! re-install it on the new thread via [`set_session`] or [`with_session`].
+//!
+//! A line logged outside any session scope carries no session tag. Threads
+//! such as the request loop, the subc frame loop and executor workers serve
+//! many sessions in turn, so "the last session this thread served" says
+//! nothing about who owns a later between-request line; tagging with it sent
+//! operators to the wrong session. Code that logs about a specific session
+//! from such a thread (a pending bind, a background task) must enter that
+//! session's scope with [`with_session`] first.
 
 use std::cell::RefCell;
 
 thread_local! {
     /// Current session id for log tagging. `None` means "no session context".
     static CURRENT_SESSION: RefCell<Option<String>> = const { RefCell::new(None) };
-
-    /// Most-recent non-None session id observed on this thread. Used as a
-    /// fallback for between-request log sites that have no inherent session
-    /// (filesystem watcher invalidation, gitignore rebuilds triggered by
-    /// the OS, etc.) so their lines still carry a session tag.
-    ///
-    /// This is best-effort: in a multi-session setup the tag may attribute
-    /// project-wide events to whichever session was active most recently.
-    /// That's acceptable because the vast majority of AFT users have one
-    /// active session per project and the alternative is an untagged line.
-    static LAST_SESSION: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 /// Set the current thread-local session id.
@@ -33,11 +30,6 @@ thread_local! {
 /// Call this at the start of a background thread that captured the session id
 /// from the parent request loop.
 pub fn set_session(session: Option<String>) {
-    if let Some(sid) = session.as_deref() {
-        LAST_SESSION.with(|s| {
-            *s.borrow_mut() = Some(sid.to_string());
-        });
-    }
     CURRENT_SESSION.with(|s| {
         *s.borrow_mut() = session;
     });
@@ -47,10 +39,6 @@ struct SessionGuard(Option<String>);
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        // Restore CURRENT_SESSION directly (don't go through set_session,
-        // which would also overwrite LAST_SESSION — the guard's job is to
-        // restore the previous CURRENT_SESSION value, not to alter the
-        // last-session fallback).
         CURRENT_SESSION.with(|s| {
             *s.borrow_mut() = self.0.take();
         });
@@ -75,21 +63,12 @@ pub fn current_session() -> Option<String> {
 }
 
 /// Return the current session id prefix string, e.g. `"[ses_abcd1234] "`,
-/// or an empty string if no session id has ever been observed on this thread.
-///
-/// Resolution order:
-///   1. Current request's session (set via `with_session`).
-///   2. Most-recent session observed on this thread (fallback for
-///      between-request log sites like watcher invalidation that have no
-///      inherent session context).
+/// or an empty string when no session scope is active on this thread.
 ///
 /// The stored session id may already carry the `ses_` prefix (OpenCode's
 /// real session IDs do); detect that and avoid double-prefixing.
 pub fn session_prefix() -> String {
-    let sid_opt = CURRENT_SESSION
-        .with(|s| s.borrow().clone())
-        .or_else(|| LAST_SESSION.with(|s| s.borrow().clone()));
-    match sid_opt.as_deref() {
+    match current_session().as_deref() {
         Some(sid) if sid.starts_with("ses_") => format!("[{}] ", sid),
         Some(sid) => format!("[ses_{}] ", sid),
         None => String::new(),
@@ -108,22 +87,18 @@ fn write_session_message(
     message: std::fmt::Arguments<'_>,
 ) -> std::fmt::Result {
     CURRENT_SESSION.with(|current| {
-        LAST_SESSION.with(|last| {
-            let current = current.borrow();
-            let last = last.borrow();
-            if let Some(sid) = current.as_deref().or(last.as_deref()) {
-                writer.write_str(if sid.starts_with("ses_") {
-                    "["
-                } else {
-                    "[ses_"
-                })?;
-                writer.write_str(sid)?;
-                writer.write_str("] ")?;
-            }
-            Ok(())
-        })
+        if let Some(sid) = current.borrow().as_deref() {
+            writer.write_str(if sid.starts_with("ses_") {
+                "["
+            } else {
+                "[ses_"
+            })?;
+            writer.write_str(sid)?;
+            writer.write_str("] ")?;
+        }
+        Ok(())
     })?;
-    // Release the session borrows before user-provided Display implementations
+    // Release the session borrow before user-provided Display implementations
     // run; formatting a message may itself change the logging context.
     writer.write_fmt(message)
 }
@@ -277,15 +252,12 @@ mod tests {
         }
     }
 
-    /// Reset both thread-locals so each test starts from a clean slate.
-    /// Rust runs tests on a thread pool — without this helper a previous
-    /// test in the same thread could leak its LAST_SESSION value into
-    /// the next one.
+    /// Reset the thread-local so each test starts from a clean slate.
+    /// Rust runs tests on a thread pool, and a test that panics inside
+    /// `set_session` (rather than `with_session`) could otherwise leak its
+    /// session into the next test on the same thread.
     fn reset_session_state() {
         CURRENT_SESSION.with(|s| {
-            *s.borrow_mut() = None;
-        });
-        LAST_SESSION.with(|s| {
             *s.borrow_mut() = None;
         });
     }
@@ -328,12 +300,7 @@ mod tests {
             assert_eq!(session_prefix(), "[ses_abcd1234] ");
         });
 
-        // After exiting with_session, CURRENT is None but LAST_SESSION
-        // still carries "abcd1234" — the prefix falls back to it.
-        assert_eq!(session_prefix(), "[ses_abcd1234] ");
-
-        // Truly empty starting state: no prefix.
-        reset_session_state();
+        // Once the scope has ended there is no session context, so no prefix.
         assert_eq!(session_prefix(), "");
     }
 
@@ -354,46 +321,48 @@ mod tests {
         CURRENT_SESSION.with(|s| {
             assert_eq!(s.borrow().as_deref(), Some("direct"));
         });
+        assert_eq!(session_prefix(), "[ses_direct] ");
         set_session(None);
         CURRENT_SESSION.with(|s| {
             assert!(s.borrow().is_none());
         });
-        // LAST_SESSION still remembers it for the fallback.
-        LAST_SESSION.with(|s| {
-            assert_eq!(s.borrow().as_deref(), Some("direct"));
-        });
+        assert_eq!(session_prefix(), "");
     }
 
-    /// Regression: between-request log sites (filesystem watcher
-    /// invalidation, gitignore rebuilds) run outside a `with_session`
-    /// scope but should still carry a session tag derived from the most
-    /// recent active session on this thread. Without the LAST_SESSION
-    /// fallback these lines appeared untagged in the plugin log.
+    /// A line logged after a session scope ends, on a thread that served that
+    /// session, carries no session tag. Threads like the request loop and the
+    /// subc frame loop serve many sessions in turn, so tagging an unscoped
+    /// line with the previous session (as an earlier fallback did) attributed
+    /// project-wide or other-session events to whichever session ran last.
     #[test]
-    fn session_prefix_falls_back_to_last_session_after_with_session_exits() {
+    fn unscoped_line_after_scope_ends_carries_no_session() {
         reset_session_state();
 
-        // Simulate a request handled on this thread.
         with_session(Some("ses_first".to_string()), || {
-            assert_eq!(session_prefix(), "[ses_first] ");
+            assert_eq!(
+                format_session_message(format_args!("inside")),
+                "[ses_first] inside"
+            );
         });
 
-        // CURRENT_SESSION is now None, but a between-request log site
-        // should still get a tag from LAST_SESSION.
         assert!(current_session().is_none());
-        assert_eq!(session_prefix(), "[ses_first] ");
+        assert_eq!(
+            format_session_message(format_args!("invalidated 1 files")),
+            "invalidated 1 files"
+        );
     }
 
+    /// A thread that served session A and then logs about session B inside
+    /// B's scope tags the line with B only.
     #[test]
-    fn last_session_updates_with_each_with_session_call() {
+    fn scoped_line_carries_its_own_session_not_the_previous_one() {
         reset_session_state();
 
-        with_session(Some("ses_first".to_string()), || {});
-        assert_eq!(session_prefix(), "[ses_first] ");
-
-        with_session(Some("ses_second".to_string()), || {});
-        // Newer session wins as the fallback.
-        assert_eq!(session_prefix(), "[ses_second] ");
+        with_session(Some("ses_A".to_string()), || {});
+        let line = with_session(Some("ses_B".to_string()), || {
+            format_session_message(format_args!("pending bind"))
+        });
+        assert_eq!(line, "[ses_B] pending bind");
     }
 
     #[test]
@@ -410,17 +379,19 @@ mod tests {
         );
     }
 
+    /// `with_session(None, ...)` (synthetic or system requests with no
+    /// session id) runs its closure with no session tag, even nested inside
+    /// a real session's scope, and restores that scope afterwards.
     #[test]
-    fn with_session_none_does_not_clear_last_session() {
+    fn with_session_none_runs_untagged_and_restores_outer_scope() {
         reset_session_state();
 
-        with_session(Some("ses_real".to_string()), || {});
-        assert_eq!(session_prefix(), "[ses_real] ");
-
-        // A subsequent `with_session(None, ...)` call (which can happen
-        // for synthetic / system requests with no session_id) must not
-        // erase the fallback tag from earlier real traffic.
-        with_session(None, || {});
-        assert_eq!(session_prefix(), "[ses_real] ");
+        with_session(Some("ses_real".to_string()), || {
+            with_session(None, || {
+                assert_eq!(session_prefix(), "");
+            });
+            assert_eq!(session_prefix(), "[ses_real] ");
+        });
+        assert_eq!(session_prefix(), "");
     }
 }

@@ -83,6 +83,43 @@ function firstBridgeConfigure(pool: bridge.AftTransportPool, root: string): Over
 }
 
 describe.serial("OpenCode 2 boot resolves ONNX Runtime through the shared bootstrap", () => {
+  test("V2 failed tool construction releases the acquired pool and consumers", async () => {
+    let releases = 0;
+    let disposals = 0;
+    const pool = { setConfigureOverride: () => {} };
+    const dependencies = {
+      ...inertV2Surface,
+      loadConfig: () => ({ indexes: { semantic: false }, disabled_tools: [] }),
+      configLoadErrors: () => [],
+      migrateConfigLocations: () => [],
+      resolveVersion: () => "test",
+      resolveBinary: async () => "/never-spawned-aft",
+      ensureStorageMigrated: async () => {},
+      resolveStorageRoot: () => "/isolated/storage",
+      buildConfigureParams: () => ({}),
+      startLspAutoInstall: () => null,
+      isOrtAutoDownloadSupported: () => false,
+      acquireBridge: async () => pool,
+      releaseBridge: async (released: unknown) => {
+        expect(released).toBe(pool);
+        releases++;
+      },
+      toolConsumers: () => ({
+        dispose: () => {
+          disposals++;
+        },
+      }),
+      buildToolMap: () => {
+        throw new Error("tool construction failed");
+      },
+    };
+    await expect(
+      Effect.runPromise(Effect.scoped(makeServerEffect(dependencies)(v2Host("/project")))),
+    ).rejects.toThrow("tool construction failed");
+    expect(releases).toBe(1);
+    expect(disposals).toBe(1);
+  });
+
   test("the first bridge the V2 entry builds carries _ort_dylib_dir", async () => {
     tempDir = mkdtempSync(join(tmpdir(), "aft-v2-ort-"));
     const project = join(tempDir, "project");

@@ -29,6 +29,17 @@ function hasMeaningfulProjectSearchFallback(
   return trimmedQuery.length > 0 && trimmedQuery !== pathArg && trimmedQuery !== externalRoot;
 }
 
+/**
+ * Ends the refusal of a rule-denied external `path`: that root was not
+ * searched, and how to search the current project instead.
+ */
+const DENIED_PATH_NOT_SEARCHED =
+  "{root} was not searched. To search the current project instead, call aft_search again without `path`.";
+
+function deniedPathNotSearched(root: string): string {
+  return DENIED_PATH_NOT_SEARCHED.replace("{root}", () => root);
+}
+
 const GENERATION_CHANGED_DISCLOSURE = "index changed - order re-derived";
 
 type SearchContinuityBySession = Map<string, Map<string, string>>;
@@ -203,34 +214,18 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
       if (pathArg) {
         const externalDenied = await assertAftSearchExternalPermission(ctx, context, pathArg);
         if (externalDenied) {
+          // A session rule denied this root, so it is refused, never answered
+          // from another root: a count from the current project would read as
+          // an answer about the path the caller named. When the query is
+          // meaningful in the current project too, the refusal says how to
+          // search there instead.
           if (
             externalDenied.kind === "rule_denied" &&
             hasMeaningfulProjectSearchFallback(permissionSubject, pathArg, externalDenied.root)
           ) {
-            const fallbackResponse = await callToolCall(ctx, context, "search", rawArgs, {
-              abortSignal: context.abort,
-            });
-            if (fallbackResponse.success === false) {
-              const message =
-                typeof fallbackResponse.text === "string" && fallbackResponse.text.length > 0
-                  ? fallbackResponse.text
-                  : typeof fallbackResponse.message === "string" &&
-                      fallbackResponse.message.length > 0
-                    ? fallbackResponse.message
-                    : "semantic_search failed";
-              throw new Error(message);
-            }
-            const fallbackNotice = `${externalDenied.message}; searching the project index only`;
-            const fallbackText = fallbackResponse.text;
-            const responseWithNotice = {
-              ...fallbackResponse,
-              text: fallbackText ? `${fallbackNotice}\n\n${fallbackText}` : fallbackNotice,
-            };
-            return surfaceSearchText(
-              responseWithNotice,
-              continuity,
-              context.sessionID ?? "unknown-session",
-              continuityKey(sessionProjectRoot, continuitySubject, includeTests, topK),
+            return permissionDeniedResponse(
+              `${externalDenied.message}. ${deniedPathNotSearched(externalDenied.root)}`,
+              context,
             );
           }
           return permissionDeniedResponse(externalDenied.message, context);

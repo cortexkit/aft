@@ -1,0 +1,15 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/search_index.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/commands/semantic_search/exact_lane.rs"
+  ],
+  "slices": [
+    "views-steps-c-to-g"
+  ],
+  "note": "Views cutover steps C, C part 2, E, D, F, tree-proven bases and G landed as one PR (each reviewed and gated on its own stacked PR, #997-#1026). Fence hits come from step F (lexical routing through views) and G (call-graph routing); with views off every route is unchanged, so ranked rows must stay byte-identical to the committed reference. The views-on parity tests compare grep, glob and search answers against the legacy index."
+}

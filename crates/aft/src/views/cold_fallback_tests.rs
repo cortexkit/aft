@@ -576,6 +576,217 @@ fn stale_build_output_republishes_an_unchanged_manifest() {
 }
 
 #[test]
+fn callgraph_previous_store_version_rebuilds_existing_view() {
+    let project = repository(4);
+    let storage = tempfile::tempdir().unwrap();
+    let (view, owner) = publish_marked_base(project.path(), storage.path());
+    let previous = blake3::hash(
+        b"callgraph_store:v2:positional:raw-ref:v19-position-independent-node-identities",
+    )
+    .to_hex()
+    .to_string();
+    let connection = Connection::open(&owner).unwrap();
+    connection
+        .execute(
+            "UPDATE meta SET v = ?1 WHERE k = 'fingerprint'",
+            [&previous],
+        )
+        .unwrap();
+    connection
+        .execute("UPDATE meta SET v = '2' WHERE k = 'schema_version'", [])
+        .unwrap();
+    drop(connection);
+    assert!(!crate::callgraph_store::manifest_view_database_ready(
+        view.view_dir(),
+        view.current_generation().unwrap().as_deref().unwrap(),
+        Instant::now() + crate::db::STEADY_BUSY_TIMEOUT
+    )
+    .unwrap());
+
+    let report = publish_checkout(&request(project.path(), storage.path(), "head-1", &[])).unwrap();
+    assert!(
+        report.published,
+        "an unchanged manifest must rebuild incompatible graph data"
+    );
+    let derived = view
+        .derived_path(report.generation.as_deref().unwrap())
+        .unwrap();
+    assert!(!has_marker(&derived), "old derived rows must not be reused");
+    assert!(crate::callgraph_store::manifest_view_database_ready(
+        view.view_dir(),
+        report.generation.as_deref().unwrap(),
+        Instant::now() + crate::db::STEADY_BUSY_TIMEOUT
+    )
+    .unwrap());
+}
+
+#[test]
+fn callgraph_previous_producer_reextracts_callbacks_and_inline_test_status() {
+    use crate::blob_store::{BlobPlane, BlobStore, CallgraphKey};
+    use crate::callgraph_store::join::{BlobRefKind, CallgraphBlob};
+    use crate::commands::callgraph_store_adapter::{callers_result, impact_result};
+
+    let project = repository(1);
+    let source = "fn transform() {}\n#[test]\nfn checks() { spawn(transform); }\n";
+    fs::create_dir(project.path().join("src")).unwrap();
+    fs::write(project.path().join("src/lib.rs"), source).unwrap();
+    git(project.path(), &["add", "."]);
+    git(
+        project.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "rust fixture",
+        ],
+    );
+    let storage = tempfile::tempdir().unwrap();
+    let (view, owner) = publish_marked_base(project.path(), storage.path());
+    let generation = view.current_generation().unwrap().unwrap();
+    let old_producer = "ruled-callgraph-v10-go-alias-and-heading-ranges";
+    let old_key = CallgraphKey::from_bytes(source.as_bytes(), "rust", old_producer).full_key();
+    let current_key =
+        CallgraphKey::from_bytes(source.as_bytes(), "rust", crate::views::callgraph::PRODUCER)
+            .full_key();
+    // An old producer name still runs today's extractor. Remove the evidence
+    // the old extractor lacked before seeding its immutable blob.
+    let mut old_payload: serde_json::Value = serde_json::from_slice(
+        &CallgraphBlob::extract(source, "rust", old_producer)
+            .unwrap()
+            .to_bytes()
+            .unwrap(),
+    )
+    .unwrap();
+    old_payload["refs"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|reference| reference["kind"] != "callback_ref");
+    for symbol in old_payload["symbols"].as_array_mut().unwrap() {
+        symbol.as_object_mut().unwrap().remove("is_test");
+    }
+    let mut blobs = BlobStore::open(storage.path(), FAMILY, BlobPlane::Callgraph).unwrap();
+    blobs
+        .put(&old_key, &serde_json::to_vec(&old_payload).unwrap())
+        .unwrap();
+    let blob_path = blobs.path().to_path_buf();
+    drop(blobs);
+    // Reusing a compatible current blob is correct; force that cache lookup to miss.
+    Connection::open(blob_path)
+        .unwrap()
+        .execute(
+            "DELETE FROM blob_payloads WHERE full_key = ?1",
+            [current_key.as_bytes().as_slice()],
+        )
+        .unwrap();
+
+    let manifest = view.load_manifest(&generation).unwrap();
+    let old_manifest = Manifest::new(manifest.entries().map(|(path, entry)| {
+        let mut entry = entry.clone();
+        if path.as_bytes() == b"src/lib.rs" {
+            let ManifestEntry::Regular { planes, .. } = &mut entry else {
+                panic!("regular Rust fixture")
+            };
+            planes.callgraph = Some(old_key.to_hex());
+        }
+        (path.clone(), entry)
+    }))
+    .unwrap();
+    fs::write(
+        view.manifest_path(&generation).unwrap(),
+        old_manifest.to_json_bytes().unwrap(),
+    )
+    .unwrap();
+    crate::views::assembly::release_manifest_cache(view.view_dir());
+    Connection::open(owner)
+        .unwrap()
+        .execute(
+            "UPDATE meta SET v = 'old-build-output' WHERE k = 'fingerprint'",
+            [],
+        )
+        .unwrap();
+
+    let report = publish_checkout(&request(project.path(), storage.path(), "head-1", &[])).unwrap();
+    assert!(report.published);
+    let manifest = view
+        .load_manifest(report.generation.as_deref().unwrap())
+        .unwrap();
+    let ManifestEntry::Regular { planes, .. } = manifest
+        .get(&RelPath::new(b"src/lib.rs".to_vec()).unwrap())
+        .unwrap()
+    else {
+        panic!("regular Rust fixture")
+    };
+    assert_eq!(
+        planes.callgraph.as_deref(),
+        Some(current_key.to_hex().as_str())
+    );
+    let blobs = BlobStore::open(storage.path(), FAMILY, BlobPlane::Callgraph).unwrap();
+    let current = CallgraphBlob::from_bytes(&blobs.get(&current_key).unwrap().unwrap()).unwrap();
+    let parse = current.parse().unwrap();
+    assert!(parse
+        .refs
+        .iter()
+        .any(|reference| reference.kind == BlobRefKind::CallbackRef));
+    assert_eq!(
+        parse
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "checks")
+            .unwrap()
+            .is_test,
+        Some(true)
+    );
+    let store = crate::callgraph_store::ReadonlyCallGraphStore::open_manifest_view(
+        project.path().to_path_buf(),
+        FAMILY.into(),
+        view.view_dir().to_path_buf(),
+        report.generation.as_deref().unwrap(),
+        None,
+    )
+    .unwrap();
+    for (op, result, expected) in [
+        (
+            "callers",
+            serde_json::to_value(
+                callers_result(&store, Path::new("src/lib.rs"), "transform", 5, true).unwrap(),
+            )
+            .unwrap(),
+            "1 caller (1 by callback reference) · 1 file group\nsrc/lib.rs\n  ↳ checks:3 (callback reference)",
+        ),
+        (
+            "impact",
+            serde_json::to_value(
+                impact_result(&store, Path::new("src/lib.rs"), "transform", 5, true).unwrap(),
+            )
+            .unwrap(),
+            // Impact shows the caller's source line whenever the file still
+            // matches the store, as the views-off render does
+            // (callgraph_regression_tests). A v1 view used to fail that check
+            // because it records each file's call-graph blob key, not its
+            // content hash, which hid the row.
+            "1 affected site (1 by callback reference) · 1 file\nsrc/lib.rs:3\n  ↳ checks (callback reference)\n  fn checks() { spawn(transform); }",
+        ),
+        (
+            "callers",
+            serde_json::to_value(
+                callers_result(&store, Path::new("src/lib.rs"), "transform", 5, false).unwrap(),
+            )
+            .unwrap(),
+            "0 callers · 0 file groups\n1 callers in tests hidden — includeTests: true shows them",
+        ),
+    ] {
+        assert_eq!(
+            crate::subc_format::format_callgraph(op, &result, false),
+            expected
+        );
+    }
+}
+
+#[test]
 fn stale_build_output_does_not_seed_an_incremental_diff() {
     let project = repository(4);
     let storage = tempfile::tempdir().unwrap();

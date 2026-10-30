@@ -1,0 +1,230 @@
+{
+  "identity": {
+    "schema": "aft.bash.view",
+    "version": 1
+  },
+  "publication": "Interchange schema admits host running placeholders; AFT-emitted stored records are finished with task_id/schema_pin/endReason non-null. Only terminal observations carry an AFT record.",
+  "schema": {
+    "type": "record",
+    "fields": {
+      "schema": {
+        "type": "string",
+        "maxBytes": 64,
+        "enum": [
+          "aft.bash.view"
+        ]
+      },
+      "version": {
+        "type": "integer",
+        "min": 1,
+        "max": 1
+      },
+      "task_id": {
+        "type": "string",
+        "maxBytes": 1024,
+        "nullable": true
+      },
+      "schema_pin": {
+        "type": "string",
+        "maxBytes": 1024,
+        "nullable": true
+      },
+      "phase": {
+        "type": "string",
+        "maxBytes": 64,
+        "enum": [
+          "running",
+          "finished"
+        ]
+      },
+      "exitCode": {
+        "type": "integer",
+        "min": -9007199254740991,
+        "max": 9007199254740991,
+        "nullable": true
+      },
+      "durationMs": {
+        "type": "integer",
+        "min": 0,
+        "max": 9007199254740991,
+        "nullable": true
+      },
+      "outputBytes": {
+        "type": "integer",
+        "min": 0,
+        "max": 9007199254740991,
+        "nullable": true
+      },
+      "endReason": {
+        "type": "string",
+        "maxBytes": 64,
+        "enum": [
+          "completed",
+          "failed",
+          "killed",
+          "timed_out",
+          "fate_unknown"
+        ],
+        "nullable": true
+      },
+      "templates": {
+        "type": "record",
+        "fields": {
+          "row": {
+            "type": "string",
+            "maxBytes": 71
+          },
+          "page": {
+            "type": "string",
+            "maxBytes": 71
+          }
+        }
+      }
+    }
+  },
+  "fields": [
+    {
+      "key": "schema",
+      "source": "literal aft.bash.view",
+      "required": true,
+      "nullable": false
+    },
+    {
+      "key": "version",
+      "source": "literal 1",
+      "required": true,
+      "nullable": false
+    },
+    {
+      "key": "task_id",
+      "source": "BgTaskSnapshot.info.task_id or PersistedTask.task_id (mod.rs:908-918; persistence.rs:1555)",
+      "required": true,
+      "nullable": true
+    },
+    {
+      "key": "schema_pin",
+      "source": "ToolCallRequest.schema_pin of the original viewed bash call, retained with the task; never the observing status/watch call pin",
+      "required": true,
+      "nullable": true
+    },
+    {
+      "key": "phase",
+      "source": "host running placeholder or finished record; AFT emits finished only",
+      "required": true,
+      "nullable": false
+    },
+    {
+      "key": "exitCode",
+      "source": "BgTaskSnapshot.exit_code or PersistedTask.exit_code (registry.rs:696; persistence.rs:1581-1583); null when unknown, Windows remote codes may exceed i32::MAX",
+      "required": true,
+      "nullable": true
+    },
+    {
+      "key": "durationMs",
+      "source": "BgTaskSnapshot.info.duration_ms or PersistedTask.duration_ms (persistence.rs:1572); null when unknown",
+      "required": true,
+      "nullable": true
+    },
+    {
+      "key": "outputBytes",
+      "source": "BashTaskRow.output_bytes from PersistedTask::to_bash_task_row/capture_output_bytes (persistence.rs:1810,1839,1932-1946): sum retained stdout+stderr lengths or PTY length, null when no length is readable; never preview text length",
+      "required": true,
+      "nullable": true
+    },
+    {
+      "key": "endReason",
+      "source": "serialized terminal BgTaskStatus, not free-text status_reason",
+      "required": true,
+      "nullable": true
+    },
+    {
+      "key": "templates",
+      "source": "the row/page template digests selected with the original bash pin, persisted first-write-wins",
+      "required": true,
+      "nullable": false
+    },
+    {
+      "key": "templates.row",
+      "source": "stored row template digest",
+      "required": true,
+      "nullable": false
+    },
+    {
+      "key": "templates.page",
+      "source": "stored page template digest",
+      "required": true,
+      "nullable": false
+    }
+  ],
+  "omissions": {
+    "mode": "No foreground/background/promoted launch-provenance field is frozen. BgTaskInfo.mode is pipe/pty capture mode, not launch provenance. An observer of a recovered task cannot infer launch provenance from it.",
+    "running": "Host running placeholder is valid interchange data with every terminal field null; it is never an AFT-emitted persisted record.",
+    "specialReasons": "Memory-cap and scope-revocation narratives are not distinct BgTaskStatus variants; do not parse free-text status_reason into new endReason codes.",
+    "output": "No command, description, workdir, output text, output preview, match data or arbitrary status_reason is included."
+  },
+  "vectors": [
+    {
+      "schema": "aft.bash.view",
+      "version": 1,
+      "task_id": "task-normalized",
+      "schema_pin": "tp1:bash:029ddfaa46f2b46b773e15231b41cf5c86acd1ed1668068236039c1edb978aca:2",
+      "phase": "finished",
+      "exitCode": 0,
+      "durationMs": 23,
+      "outputBytes": 6,
+      "endReason": "completed",
+      "templates": {
+        "row": "sha256:8d24a49c634fec87ca0a206512495cff90965f793495aab2ad3639dbda557694",
+        "page": "sha256:f84280c59910b9937b2c2339af3600c8da1c3044369f774d47021afbd584baeb"
+      }
+    },
+    {
+      "schema": "aft.bash.view",
+      "version": 1,
+      "task_id": "task-normalized",
+      "schema_pin": "tp1:bash:029ddfaa46f2b46b773e15231b41cf5c86acd1ed1668068236039c1edb978aca:2",
+      "phase": "finished",
+      "exitCode": null,
+      "durationMs": null,
+      "outputBytes": null,
+      "endReason": "fate_unknown",
+      "templates": {
+        "row": "sha256:8d24a49c634fec87ca0a206512495cff90965f793495aab2ad3639dbda557694",
+        "page": "sha256:f84280c59910b9937b2c2339af3600c8da1c3044369f774d47021afbd584baeb"
+      }
+    }
+  ],
+  "provenance": {
+    "terminalStatus": "crates/aft/src/bash_background/mod.rs:920-943; five terminal BgTaskStatus values",
+    "snapshot": "crates/aft/src/bash_background/registry.rs:687-755",
+    "persistedTask": "crates/aft/src/bash_background/persistence.rs:1549-1673",
+    "outputBytes": "crates/aft/src/bash_background/persistence.rs:1804-1842,1932-1946",
+    "launchMode": "PersistedTask.mode is BgMode::Pipes/Pty (persistence.rs:1534-1540,1565); notify_on_completion and cancelled_call_unannounced are not a durable three-way launch classification",
+    "scopeReason": "registry.rs:196,8352 stores scope_revoked as status_reason, not a distinct BgTaskStatus"
+  },
+  "emissionRule": {
+    "phase": "finished",
+    "nonNull": [
+      "task_id",
+      "schema_pin",
+      "endReason"
+    ],
+    "validator": "operations::validate_view_record(value, true)"
+  },
+  "digestRule": "templates.row and templates.page must each be exactly 71 ASCII bytes: sha256: followed by 64 lowercase hexadecimal digits of the canonical published template file. The bounded schema has no pattern construct; operations::valid_template_digest and validate_view_record enforce spelling.",
+  "hostRunningVector": {
+    "schema": "aft.bash.view",
+    "version": 1,
+    "task_id": null,
+    "schema_pin": null,
+    "phase": "running",
+    "exitCode": null,
+    "durationMs": null,
+    "outputBytes": null,
+    "endReason": null,
+    "templates": {
+      "row": "sha256:8d24a49c634fec87ca0a206512495cff90965f793495aab2ad3639dbda557694",
+      "page": "sha256:f84280c59910b9937b2c2339af3600c8da1c3044369f774d47021afbd584baeb"
+    }
+  }
+}

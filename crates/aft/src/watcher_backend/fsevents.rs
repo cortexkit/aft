@@ -5,7 +5,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fsevent_sys as fs;
 use fsevent_sys::core_foundation as cf;
@@ -21,6 +21,35 @@ use crate::watcher_filter::{
 
 const FSEVENTS_LATENCY_SECONDS: f64 = 0.03;
 const BACKEND_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const FLUSH_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+#[derive(Clone)]
+enum NativeEventSender {
+    Events(mpsc::Sender<notify::Result<Event>>),
+    Batches(mpsc::Sender<Vec<notify::Result<Event>>>),
+}
+
+impl NativeEventSender {
+    fn send_batch(&self, events: Vec<notify::Result<Event>>) -> Result<(), ()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        match self {
+            Self::Events(sender) => {
+                for event in events {
+                    sender.send(event).map_err(|_| ())?;
+                }
+                Ok(())
+            }
+            Self::Batches(sender) => sender.send(events).map_err(|_| ()),
+        }
+    }
+
+    #[cfg(test)]
+    fn send(&self, event: notify::Result<Event>) -> Result<(), ()> {
+        self.send_batch(vec![event])
+    }
+}
 
 #[cfg(test)]
 struct HandoffWriteForTest {
@@ -63,7 +92,9 @@ pub(crate) struct ProjectWatcher {
     shutdown: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
     #[cfg(test)]
-    raw_sender: mpsc::Sender<notify::Result<Event>>,
+    raw_sender: NativeEventSender,
+    #[cfg(test)]
+    batch_lstats: Arc<std::sync::Mutex<Vec<(usize, usize)>>>,
 }
 
 impl ProjectWatcher {
@@ -80,6 +111,7 @@ impl ProjectWatcher {
         // rather than on the backend thread after spawn.
         let generation = matcher_generation.load(Ordering::Acquire);
         let counters = crate::context::watcher_counters_for_root(&root);
+        let flush_rx = counters.bash_flush.register_native();
         let mut planning = crate::watcher_filter::WatcherExclusionRetry::default();
         let outcome = planning
             .attempt(&root, generation, &counters, || {
@@ -94,6 +126,7 @@ impl ProjectWatcher {
         super::log_exclusions(&root, &exclusions, generation);
 
         let (backend_tx, backend_rx) = mpsc::channel();
+        let backend_tx = NativeEventSender::Batches(backend_tx);
         #[cfg(test)]
         let stream_sender_for_test = backend_tx.clone();
         // Capture the journal cursor before starting the first stream. If no
@@ -101,7 +134,7 @@ impl ProjectWatcher {
         // every event that might be waiting in the old stream's latency window.
         let last_delivered_id =
             Arc::new(AtomicU64::new(unsafe { fs::FSEventsGetCurrentEventId() }));
-        let stream = FsEventsStream::start(
+        let stream = FsEventsStream::start_with_sender(
             &root,
             &exclusion_paths,
             backend_tx.clone(),
@@ -120,11 +153,32 @@ impl ProjectWatcher {
             .into_iter()
             .filter(|path| path.exists())
             .collect::<Vec<_>>();
-        let mut external_watcher = DirectoryWatcher::new(backend_tx, Arc::clone(&counters));
+        let mut external_watcher = DirectoryWatcher {
+            stream: None,
+            sender: backend_tx.clone(),
+            counters: Arc::clone(&counters),
+        };
         external_watcher.watch_paths(&extra_watch_paths)?;
+        let git_directory = root.join(".git");
+        // Auxiliary streams have independent callback ordering. The marker must
+        // share the recursive stream that observes the command's project writes.
+        let git_watched = !exclusion_state.paths().contains(&git_directory);
+        counters.bash_flush.set_marker_directory(
+            if git_watched
+                && std::fs::symlink_metadata(&git_directory).is_ok_and(|metadata| metadata.is_dir())
+            {
+                git_directory
+            } else {
+                root.clone()
+            },
+        );
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
+        #[cfg(test)]
+        let batch_lstats = Arc::new(std::sync::Mutex::new(Vec::new()));
+        #[cfg(test)]
+        let thread_lstats = Arc::clone(&batch_lstats);
         let join = thread::Builder::new()
             .name("aft-fsevents-backend".to_string())
             .spawn(move || {
@@ -134,8 +188,38 @@ impl ProjectWatcher {
                 let mut exclusion_state = exclusion_state;
                 let mut dropped_paths = watcher_exclusion_paths(&plan.dropped);
                 let mut observed_generation = observed_generation;
+                let mut active_flushes: Vec<super::flush::FlushRequest> = Vec::new();
+                let mut next_flush = Instant::now();
 
                 while !thread_shutdown.load(Ordering::Acquire) {
+                    for request in flush_rx.try_iter() {
+                        #[cfg(test)]
+                        if request.marker_id.is_none() && Instant::now() < request.deadline {
+                            unsafe {
+                                fs::FSEventStreamFlushSync(stream.stream as fs::FSEventStreamRef);
+                            }
+                            if let Some(flushed) = request.flushed {
+                                let _ = flushed.send(());
+                            }
+                            continue;
+                        }
+                        active_flushes.push(request);
+                    }
+                    active_flushes.retain(|request| {
+                        Instant::now() < request.deadline
+                            && request
+                                .marker_id
+                                .is_some_and(|id| counters.bash_flush.is_pending(id))
+                    });
+                    if !active_flushes.is_empty() && Instant::now() >= next_flush {
+                        // FlushSync only drains events already in the service pipeline.
+                        // Retry while the marker is pending, never treating a flush alone
+                        // as proof that the filesystem service delivered earlier writes.
+                        unsafe {
+                            fs::FSEventStreamFlushSync(stream.stream as fs::FSEventStreamRef);
+                        }
+                        next_flush = Instant::now() + FLUSH_RETRY_INTERVAL;
+                    }
                     let generation = matcher_generation.load(Ordering::Acquire);
                     let previous_paths = exclusion_state.paths();
                     if let Some(update) = planning.replacement(
@@ -195,41 +279,67 @@ impl ProjectWatcher {
                         }
                     }
 
-                    match backend_rx.recv_timeout(BACKEND_POLL_INTERVAL) {
-                        Ok(event) => {
-                            if let Ok(event) = &event {
-                                if !exclusion_state.refresh_event(event).is_empty() {
-                                    let paths = exclusion_state.paths();
-                                    if let Err(error) = replace_stream_exclusions(
-                                        &mut stream,
-                                        &root,
-                                        &paths,
-                                        &last_delivered_id,
-                                        &tx,
-                                    ) {
-                                        let _ = tx.send(Err(error));
-                                        return;
-                                    }
-                                    counters.set_backend_exclusions(
-                                        observed_generation.unwrap_or(0),
-                                        paths,
-                                        dropped_paths.clone(),
-                                    );
-                                    // Writes made while a newly local directory still
-                                    // had an external exclusion may be missing from
-                                    // its replacement event; rescan to recover them.
-                                    if tx
-                                        .send(Ok(Event::new(EventKind::Other)
-                                            .set_flag(Flag::Rescan)
-                                            .set_info("rescan: external watcher boundary changed")))
-                                        .is_err()
-                                    {
-                                        return;
-                                    }
+                    let wait = if active_flushes.is_empty() {
+                        BACKEND_POLL_INTERVAL
+                    } else {
+                        next_flush
+                            .saturating_duration_since(Instant::now())
+                            .min(BACKEND_POLL_INTERVAL)
+                    };
+                    match backend_rx.recv_timeout(wait) {
+                        Ok(events) => {
+                            // The native callback only translates and hands off a
+                            // batch. Filesystem topology probes belong here, once
+                            // per distinct covering directory, off its run loop.
+                            #[cfg(test)]
+                            let probes_before = crate::watcher_filter::EXCLUSION_TEST_LSTATS
+                                .with(|calls| calls.get());
+                            let changed = !exclusion_state
+                                .refresh_events(
+                                    events.iter().filter_map(|event| event.as_ref().ok()),
+                                )
+                                .is_empty();
+                            #[cfg(test)]
+                            thread_lstats.lock().unwrap().push((
+                                events.len(),
+                                crate::watcher_filter::EXCLUSION_TEST_LSTATS
+                                    .with(|calls| calls.get())
+                                    - probes_before,
+                            ));
+                            if changed {
+                                let paths = exclusion_state.paths();
+                                if let Err(error) = replace_stream_exclusions(
+                                    &mut stream,
+                                    &root,
+                                    &paths,
+                                    &last_delivered_id,
+                                    &tx,
+                                ) {
+                                    let _ = tx.send(Err(error));
+                                    return;
+                                }
+                                counters.set_backend_exclusions(
+                                    observed_generation.unwrap_or(0),
+                                    paths,
+                                    dropped_paths.clone(),
+                                );
+                                // Writes made while a newly local directory had
+                                // an external exclusion may not be reported by
+                                // the event signaling its directory replacement;
+                                // rescan to recover those writes.
+                                if tx
+                                    .send(Ok(Event::new(EventKind::Other)
+                                        .set_flag(Flag::Rescan)
+                                        .set_info("rescan: external watcher boundary changed")))
+                                    .is_err()
+                                {
+                                    return;
                                 }
                             }
-                            if tx.send(event).is_err() {
-                                return;
+                            for event in events {
+                                if tx.send(event).is_err() {
+                                    return;
+                                }
                             }
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -244,6 +354,8 @@ impl ProjectWatcher {
             join: Some(join),
             #[cfg(test)]
             raw_sender: stream_sender_for_test,
+            #[cfg(test)]
+            batch_lstats,
         })
     }
 }
@@ -258,7 +370,7 @@ fn replace_stream_exclusions(
     let since_when = last_delivered_id.load(Ordering::Acquire);
     #[cfg(test)]
     write_during_stream_handoff_for_test(root);
-    let replacement = FsEventsStream::start(
+    let replacement = FsEventsStream::start_with_sender(
         root,
         paths,
         stream.sender(),
@@ -297,7 +409,7 @@ impl Drop for ProjectWatcher {
 /// its immediate children.
 pub(crate) struct DirectoryWatcher {
     stream: Option<FsEventsStream>,
-    sender: mpsc::Sender<notify::Result<Event>>,
+    sender: NativeEventSender,
     counters: Arc<crate::context::WatcherCounters>,
 }
 
@@ -308,7 +420,7 @@ impl DirectoryWatcher {
     ) -> Self {
         Self {
             stream: None,
-            sender,
+            sender: NativeEventSender::Events(sender),
             counters,
         }
     }
@@ -346,16 +458,34 @@ impl DirectoryWatcher {
 }
 
 struct FsEventsStream {
+    stream: usize,
     run_loop: usize,
     join: Option<JoinHandle<()>>,
-    sender: mpsc::Sender<notify::Result<Event>>,
+    sender: NativeEventSender,
 }
 
 impl FsEventsStream {
+    #[cfg(test)]
     fn start(
         root: &Path,
         exclusions: &[PathBuf],
         sender: mpsc::Sender<notify::Result<Event>>,
+        since_when: fs::FSEventStreamEventId,
+        last_delivered_id: Arc<AtomicU64>,
+    ) -> notify::Result<Self> {
+        Self::start_with_sender(
+            root,
+            exclusions,
+            NativeEventSender::Events(sender),
+            since_when,
+            last_delivered_id,
+        )
+    }
+
+    fn start_with_sender(
+        root: &Path,
+        exclusions: &[PathBuf],
+        sender: NativeEventSender,
         since_when: fs::FSEventStreamEventId,
         last_delivered_id: Arc<AtomicU64>,
     ) -> notify::Result<Self> {
@@ -373,7 +503,7 @@ impl FsEventsStream {
     fn start_paths(
         paths: &[PathBuf],
         exclusions: &[PathBuf],
-        sender: mpsc::Sender<notify::Result<Event>>,
+        sender: NativeEventSender,
         since_when: fs::FSEventStreamEventId,
         last_delivered_id: Arc<AtomicU64>,
         nonrecursive_paths: Option<Vec<PathBuf>>,
@@ -489,13 +619,14 @@ impl FsEventsStream {
         }
 
         Ok(Self {
+            stream: stream_address,
             run_loop,
             join: Some(join),
             sender,
         })
     }
 
-    fn sender(&self) -> mpsc::Sender<notify::Result<Event>> {
+    fn sender(&self) -> NativeEventSender {
         self.sender.clone()
     }
 }
@@ -516,7 +647,7 @@ impl Drop for FsEventsStream {
 }
 
 struct CallbackContext {
-    sender: mpsc::Sender<notify::Result<Event>>,
+    sender: NativeEventSender,
     last_delivered_id: Arc<AtomicU64>,
     nonrecursive_paths: Option<Vec<PathBuf>>,
     #[cfg(test)]
@@ -540,6 +671,9 @@ extern "C" fn callback(
     unsafe {
         let context = &*(info as *const CallbackContext);
         let paths = event_paths as *const *const libc::c_char;
+        let mut events = Vec::new();
+        let mut wrapped = false;
+        let mut delivered_id = 0;
         for index in 0..event_count {
             let bytes = CStr::from_ptr(*paths.add(index)).to_bytes().to_vec();
             let path = PathBuf::from(OsString::from_vec(bytes));
@@ -569,18 +703,25 @@ extern "C" fn callback(
                 {
                     continue;
                 }
-                if context.sender.send(Ok(event)).is_err() {
-                    return;
-                }
+                events.push(Ok(event));
             }
             if has_flag(flags, fs::kFSEventStreamEventFlagEventIdsWrapped) {
-                context.last_delivered_id.store(0, Ordering::Release);
+                wrapped = true;
+                delivered_id = 0;
             } else if !has_flag(flags, fs::kFSEventStreamEventFlagHistoryDone) {
-                context
-                    .last_delivered_id
-                    .fetch_max(*event_ids.add(index), Ordering::Release);
+                delivered_id = delivered_id.max(*event_ids.add(index));
             }
         }
+        if context.sender.send_batch(events).is_err() {
+            return;
+        }
+        // Publish the replay cursor only after handing off the entire batch.
+        if wrapped {
+            context.last_delivered_id.store(0, Ordering::Release);
+        }
+        context
+            .last_delivered_id
+            .fetch_max(delivered_id, Ordering::Release);
     }
 }
 
@@ -1128,7 +1269,7 @@ mod tests {
         // Each acknowledged rescan republishes an unchanged matcher, as a real
         // overflow drain does, exercising the replacement-stream decision too.
         let mut context = CallbackContext {
-            sender,
+            sender: NativeEventSender::Events(sender),
             last_delivered_id: Arc::new(AtomicU64::new(0)),
             nonrecursive_paths: None,
             replay_stream: false,
@@ -1175,12 +1316,162 @@ mod tests {
     }
 
     #[test]
+    fn watcher_backend_topology_batch_stats_follow_covering_directories() {
+        const EVENTS: usize = 512;
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let mut builder = GitignoreBuilder::new(&root);
+        builder.add_line(None, "target/").unwrap();
+        let matcher = Arc::new(RwLock::new(Some(Arc::new(builder.build().unwrap()))));
+        let (tx, rx) = mpsc::channel();
+        let watcher = ProjectWatcher::create(
+            root.clone(),
+            Vec::new(),
+            tx,
+            matcher,
+            Arc::new(AtomicU64::new(0)),
+        )
+        .unwrap();
+        assert!(crate::context::watcher_counters_for_root(&root)
+            .backend_exclusions()
+            .paths
+            .contains(&target));
+        let events: Vec<_> = (0..EVENTS)
+            .map(|index| {
+                Ok(Event::new(EventKind::Create(CreateKind::File))
+                    .add_path(target.join(format!("object-{index}.o"))))
+            })
+            .collect();
+        watcher.raw_sender.send_batch(events).unwrap();
+        for index in 0..EVENTS {
+            let event = rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+            assert_eq!(event.kind, EventKind::Create(CreateKind::File));
+            assert_eq!(event.paths, vec![target.join(format!("object-{index}.o"))]);
+        }
+        let batches = watcher.batch_lstats.lock().unwrap();
+        let probes: Vec<_> = batches
+            .iter()
+            .filter(|(events, _)| *events == EVENTS)
+            .map(|(_, probes)| *probes)
+            .collect();
+        assert_eq!(
+            probes,
+            vec![1],
+            "one covering directory lstat for a complete native batch: {batches:?}"
+        );
+    }
+
+    #[test]
+    fn watcher_callback_hands_off_one_batch_without_lstat() {
+        const EVENTS: usize = 512;
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let names: Vec<_> = (0..EVENTS)
+            .map(|index| {
+                std::ffi::CString::new(
+                    root.join(format!("target/object-{index}.o"))
+                        .as_os_str()
+                        .as_encoded_bytes(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let paths: Vec<_> = names.iter().map(|name| name.as_ptr()).collect();
+        let flags = vec![
+            fs::kFSEventStreamEventFlagItemCreated
+                | fs::kFSEventStreamEventFlagItemIsFile;
+            EVENTS
+        ];
+        let ids: Vec<_> = (1..=EVENTS as u64).collect();
+        let (sender, rx) = mpsc::channel();
+        let cursor = Arc::new(AtomicU64::new(0));
+        let mut context = CallbackContext {
+            sender: NativeEventSender::Batches(sender),
+            last_delivered_id: Arc::clone(&cursor),
+            nonrecursive_paths: None,
+            replay_stream: false,
+        };
+        crate::watcher_filter::EXCLUSION_TEST_LSTATS.with(|calls| calls.set(0));
+        callback(
+            ptr::null_mut(),
+            (&mut context as *mut CallbackContext).cast(),
+            EVENTS,
+            paths.as_ptr().cast_mut().cast(),
+            flags.as_ptr(),
+            ids.as_ptr(),
+        );
+        crate::watcher_filter::EXCLUSION_TEST_LSTATS.with(|calls| assert_eq!(calls.get(), 0));
+        let batch = rx.try_recv().unwrap();
+        assert_eq!(batch.len(), EVENTS);
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        for (index, event) in batch.into_iter().enumerate() {
+            let event = event.unwrap();
+            assert_eq!(event.kind, EventKind::Create(CreateKind::File));
+            assert_eq!(
+                event.paths,
+                vec![root.join(format!("target/object-{index}.o"))]
+            );
+            assert!(!event.need_rescan());
+        }
+        assert_eq!(cursor.load(Ordering::Acquire), EVENTS as u64);
+
+        let flags = [
+            fs::kFSEventStreamEventFlagItemCreated
+                | fs::kFSEventStreamEventFlagItemModified
+                | fs::kFSEventStreamEventFlagItemIsFile,
+            fs::kFSEventStreamEventFlagHistoryDone,
+            fs::kFSEventStreamEventFlagEventIdsWrapped,
+            fs::kFSEventStreamEventFlagItemCreated | fs::kFSEventStreamEventFlagItemIsFile,
+        ];
+        let ids = [1024, 4096, 4, 5];
+        callback(
+            ptr::null_mut(),
+            (&mut context as *mut CallbackContext).cast(),
+            flags.len(),
+            paths.as_ptr().cast_mut().cast(),
+            flags.as_ptr(),
+            ids.as_ptr(),
+        );
+        let events: Vec<_> = rx
+            .try_recv()
+            .unwrap()
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].kind, EventKind::Create(CreateKind::File));
+        assert_eq!(
+            events[1].kind,
+            EventKind::Modify(ModifyKind::Data(DataChange::Content))
+        );
+        assert!(events[2].need_rescan());
+        assert_eq!(events[3].kind, EventKind::Create(CreateKind::File));
+        assert_eq!(
+            cursor.load(Ordering::Acquire),
+            5,
+            "a wrapped ID resets the cursor before later records advance it"
+        );
+        callback(
+            ptr::null_mut(),
+            (&mut context as *mut CallbackContext).cast(),
+            1,
+            paths.as_ptr().cast_mut().cast(),
+            &fs::kFSEventStreamEventFlagHistoryDone,
+            &4096,
+        );
+        assert_eq!(cursor.load(Ordering::Acquire), 5);
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
     fn watcher_auxiliary_stream_filters_children_but_preserves_drop_controls() {
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
         let (sender, rx) = mpsc::channel();
         let mut context = CallbackContext {
-            sender,
+            sender: NativeEventSender::Events(sender),
             last_delivered_id: Arc::new(AtomicU64::new(0)),
             nonrecursive_paths: Some(vec![root.clone()]),
             replay_stream: false,
@@ -1587,6 +1878,7 @@ mod tests {
                 Ok(
                     WatcherDispatchEvent::Paths(_)
                     | WatcherDispatchEvent::ContentOnlyPaths(_)
+                    | WatcherDispatchEvent::CookieObserved(_)
                     | WatcherDispatchEvent::IgnoreRulesChanged { .. }
                     | WatcherDispatchEvent::RootDeleted,
                 ) => {}

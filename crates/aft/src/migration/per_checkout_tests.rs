@@ -215,6 +215,149 @@ fn a_snapshot_of_another_model_is_rejected() {
 }
 
 #[test]
+fn summary_budget_marker_is_the_only_ignored_fingerprint_field() {
+    let configured = fingerprint().as_string();
+    let mut stored: serde_json::Value = serde_json::from_str(&configured).unwrap();
+    stored["file_summary_budget_limited"] = serde_json::json!(true);
+    assert!(crate::migration::fingerprint_is_compatible(
+        &stored.to_string(),
+        &configured
+    ));
+    for (field, value) in [
+        ("model", serde_json::json!("another-model")),
+        ("dimension", serde_json::json!(999)),
+        ("other_summary_rule", serde_json::json!(true)),
+    ] {
+        let mut other = stored.clone();
+        other[field] = value;
+        assert!(
+            !crate::migration::fingerprint_is_compatible(&other.to_string(), &configured),
+            "ignored {field}"
+        );
+    }
+    stored["file_summary_budget_limited"] = serde_json::json!("not-a-boolean");
+    assert!(!crate::migration::fingerprint_is_compatible(
+        &stored.to_string(),
+        &configured
+    ));
+}
+
+#[test]
+fn small_cap_legacy_import_preserves_rows_for_summary_only_repair() {
+    for segmented in [false, true] {
+        let (_project, storage, root, identity) =
+            crate::semantic_index::saved_pre_budget_summary_fixture(true);
+        let path = storage.path().join("semantic/summary-budget/semantic.bin");
+        let producer = SemanticProducer::current(identity.as_string(), identity.embed_text_caps);
+        let mut old = fs::read(&path).unwrap();
+        if segmented {
+            let index =
+                SemanticIndex::read_from_disk(storage.path(), "summary-budget", &root, false, None)
+                    .unwrap();
+            index.extend_dirty_paths_for_test([root.join("summary.rs")]);
+            let (frame, _) = index.segment_frames_for_test(&index, 1).unwrap();
+            old.extend(frame);
+            fs::write(&path, &old).unwrap();
+        }
+        let (bundle, skipped) = convert_semantic(&old, &root, &producer).unwrap();
+        assert_eq!(
+            bundle.entries.len(),
+            1,
+            "a changed summary must not discard reusable symbols"
+        );
+        assert_eq!(skipped, 0);
+        let payload_producer = crate::semantic_index::ViewPayloadProducer {
+            chunker_version: &producer.chunker_version,
+            template_version: &producer.template_version,
+            model_fingerprint: &producer.model_fingerprint,
+        };
+        let run = crate::semantic_index::SemanticVectors::decode_view_payload_for_summary_repair(
+            &bundle.entries[0].payload,
+            Path::new("summary.rs"),
+            &payload_producer,
+        )
+        .unwrap();
+        assert_eq!(run.chunk_count(), 2);
+        let original = SemanticIndex::from_bytes(&old, &root)
+            .unwrap()
+            .entry_vectors_for_test()
+            .into_iter()
+            .find(|(_, name, _)| name == "exported")
+            .unwrap()
+            .2;
+        let imported = run
+            .embedded_texts_and_vectors()
+            .find(|(text, _)| !text.contains("kind:file-summary"))
+            .unwrap()
+            .1;
+        assert_eq!(imported.as_ref(), original.as_slice());
+        let source = fs::read(root.join("summary.rs")).unwrap();
+        let relative = RelPath::new(b"summary.rs".to_vec()).unwrap();
+        let legacy = crate::blob_store::SemanticKey::from_bytes(
+            &source,
+            relative.as_bytes(),
+            &producer.chunker_version,
+            &producer.template_version,
+            &producer.model_fingerprint,
+        )
+        .full_key();
+        assert_eq!(bundle.entries[0].key, *legacy.as_bytes());
+        assert_ne!(
+            bundle.entries[0].key,
+            *producer.key(&source, &relative).as_bytes()
+        );
+
+        let (fixed, changed) = SemanticIndex::read_from_disk_with_summary_repair(
+            storage.path(),
+            "summary-budget",
+            &root,
+            false,
+            Some(&identity.as_string()),
+            &mut |texts: Vec<String>| Ok(texts.iter().map(|_| vec![1.0; 4]).collect()),
+            16,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(changed);
+        assert!(fixed.write_to_disk(storage.path(), "summary-budget"));
+        let (fixed, skipped) =
+            convert_semantic(&fs::read(path).unwrap(), &root, &producer).unwrap();
+        assert_eq!(skipped, 0);
+        assert_eq!(fixed.entries.len(), 1);
+        assert_eq!(
+            fixed.entries[0].key,
+            *producer.key(&source, &relative).as_bytes()
+        );
+        let run = crate::semantic_index::SemanticVectors::decode_view_payload_for_summary_repair(
+            &fixed.entries[0].payload,
+            Path::new("summary.rs"),
+            &payload_producer,
+        )
+        .unwrap();
+        assert!(run
+            .embedded_texts_and_vectors()
+            .all(|(text, _)| text.chars().count() <= 70));
+    }
+}
+
+#[test]
+fn small_cap_legacy_import_rejects_other_summary_text_changes() {
+    let (_project, storage, root, identity) =
+        crate::semantic_index::saved_pre_budget_summary_fixture(true);
+    let mut bytes = fs::read(storage.path().join("semantic/summary-budget/semantic.bin")).unwrap();
+    let tag = b"kind:file-summary";
+    let offset = bytes
+        .windows(tag.len())
+        .position(|window| window == tag)
+        .unwrap();
+    bytes[offset..offset + tag.len()].copy_from_slice(b"kind:fake-summary");
+    let producer = SemanticProducer::current(identity.as_string(), identity.embed_text_caps);
+    let (bundle, skipped) = convert_semantic(&bytes, &root, &producer).unwrap();
+    assert!(bundle.entries.is_empty());
+    assert_eq!(skipped, 1);
+}
+
+#[test]
 fn semantic_import_keeps_the_first_vector_payload_and_imports_other_keys() {
     let (dir, root) = fixture();
     let storage = dir.path().join("storage");
@@ -223,7 +366,9 @@ fn semantic_import_keeps_the_first_vector_payload_and_imports_other_keys() {
     let (bundle, _) = convert_semantic(&snapshot, &root, &producer).unwrap();
     assert!(bundle.entries.len() >= 2);
     let registry = FamilyRegistry::open(&storage, "family").unwrap();
-    let registration = registry.register_view("scope", &root).unwrap();
+    let registration = registry
+        .register_view_with_storage(registry.storage(), "scope", &root)
+        .unwrap();
     let store = registration.open_store(FamilyPlane::Semantic).unwrap();
     let first = &bundle.entries[0];
     let relative = segment_store::rel_path_to_os(&first.rel_path).unwrap();
@@ -257,6 +402,7 @@ fn semantic_import_keeps_the_first_vector_payload_and_imports_other_keys() {
     fs::write(&legacy, &snapshot).unwrap();
     let report = run_import(
         &ImportRequest {
+            durable_storage: storage.clone(),
             storage: storage.clone(),
             family: "family".into(),
             legacy_key: "legacy".into(),
@@ -313,7 +459,9 @@ fn semantic_import_rejects_only_the_unusable_key() {
         let (bundle, _) = convert_semantic(&snapshot, &root, &producer).unwrap();
         assert!(bundle.entries.len() >= 2);
         let registry = FamilyRegistry::open(&storage, "family").unwrap();
-        let registration = registry.register_view("scope", &root).unwrap();
+        let registration = registry
+            .register_view_with_storage(registry.storage(), "scope", &root)
+            .unwrap();
         let store = registration.open_store(FamilyPlane::Semantic).unwrap();
         let first = &bundle.entries[0];
         let key = FamilyKey::new(FamilyPlane::Semantic, first.key);
@@ -329,6 +477,7 @@ fn semantic_import_rejects_only_the_unusable_key() {
         fs::write(&legacy, snapshot).unwrap();
         let report = run_import(
             &ImportRequest {
+                durable_storage: storage.clone(),
                 storage: storage.clone(),
                 family: "family".into(),
                 legacy_key: "legacy".into(),
@@ -532,6 +681,7 @@ fn old_sweeps_do_not_reach_v2_and_the_import_keeps_the_legacy_set() {
     ];
     let producer = producer();
     let request = ImportRequest {
+        durable_storage: storage.clone(),
         storage: storage.clone(),
         family: key.to_owned(),
         legacy_key: key.to_owned(),
@@ -557,12 +707,17 @@ fn old_sweeps_do_not_reach_v2_and_the_import_keeps_the_legacy_set() {
         "the import never writes the legacy set"
     );
 
+    // Complete the new V2 publication pass before auditing only the legacy
+    // sweeps below; those old entry points must still never reach V2 storage.
+    crate::views::wait_for_generation_maintenance_for_test(&storage.join("views/v2/scope"));
     let v2_before = [
         snapshot_tree(&storage.join("blobs").join("v2")),
         snapshot_tree(&storage.join("views").join("v2")),
         snapshot_tree(&storage.join("migration")),
     ];
-    crate::search_index::sweep_orphaned_index_dirs(&storage);
+    crate::search_index::sweep_orphaned_index_dirs(&crate::root_cache::StoragePaths::same(
+        &storage,
+    ));
     let _ = crate::artifact_owner::sweep_orphaned_owner_manifests(&storage);
     let old_view = crate::views::ViewStore::open(&storage, "scope").unwrap();
     old_view.sweep_generations().unwrap();

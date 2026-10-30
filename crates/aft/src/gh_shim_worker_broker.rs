@@ -40,6 +40,11 @@ pub(crate) const CHILD_KEYS: [&str; 5] = [
 const MAX_FRAME: usize = 65_536;
 #[cfg(unix)]
 const MAX_RESPONSE: usize = 2_097_152;
+// A UTF-8 body byte can expand to six JSON bytes (for example, NUL becomes
+// \u0000). Leave one request frame for the typed result's metadata and wrapper.
+#[cfg(unix)]
+const MAX_ENCODED_RESPONSE: usize =
+    crate::gh_shim::read_contract::MAX_REPLY_BYTES as usize * 6 + MAX_FRAME;
 #[cfg(unix)]
 const FRAME_DEADLINE: Duration = Duration::from_secs(2);
 #[cfg(unix)]
@@ -521,12 +526,97 @@ async fn connection(
     let Ok(response) = response else {
         return;
     };
-    let body = json!({"status": if response.ok { "ok" } else { "error" }, "data": response.data});
-    if let Ok(bytes) = serde_json::to_vec(&body) {
-        if bytes.len() <= MAX_RESPONSE {
-            let _ = tokio::time::timeout(FRAME_DEADLINE, write_frame(&mut stream, &bytes)).await;
+    let _ = tokio::time::timeout(FRAME_DEADLINE, write_reply(&mut stream, response)).await;
+}
+
+#[cfg(unix)]
+async fn write_reply<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    mut response: RelayReply,
+) -> std::io::Result<()> {
+    if response.ok && response.data["isError"] == false {
+        if let Some(result) = response.data.get("result") {
+            let body = result.get("body").unwrap_or(result);
+            let size = match body.as_str() {
+                Some(text) => text.len(),
+                None => serde_json::to_vec(body)
+                    .map_err(std::io::Error::other)?
+                    .len(),
+            };
+            let cap = crate::gh_shim::read_contract::MAX_REPLY_BYTES;
+            if size as u64 > cap {
+                response = RelayReply {
+                    ok: false,
+                    data: json!({"refusal_code":"response_too_large","message":format!(
+                        "worker read response is {size} bytes; cap is {cap} bytes (1 MiB); narrow the request"
+                    )}),
+                };
+            }
         }
     }
+    // Plexus also returns human-readable and structured copies of the result.
+    // The worker decoder only consumes these three contract fields; carrying
+    // the duplicate bodies can overflow the wire cap below the 1 MiB body cap.
+    if response.data["isError"].is_boolean() {
+        if let Some(data) = response.data.as_object_mut() {
+            data.retain(|key, _| matches!(key.as_str(), "isError" | "result" | "error"));
+        }
+    }
+    let body = json!({"status": if response.ok { "ok" } else { "error" }, "data": response.data});
+    let mut bytes = serde_json::to_vec(&body).map_err(std::io::Error::other)?;
+    if bytes.len() > MAX_ENCODED_RESPONSE {
+        bytes = serde_json::to_vec(&json!({
+            "status":"error",
+            "data":{"refusal_code":"response_too_large","message":format!(
+                "encoded worker read reply is {} bytes; wire cap is {MAX_ENCODED_RESPONSE} bytes (read body cap is {} bytes)",
+                bytes.len(), crate::gh_shim::read_contract::MAX_REPLY_BYTES
+            )}
+        }))
+        .map_err(std::io::Error::other)?;
+    }
+    if bytes.len() <= MAX_RESPONSE {
+        return write_frame(writer, &bytes).await;
+    }
+    // Keep individual frames bounded while allowing the worst-case JSON
+    // encoding of a valid body. Both peers enforce the aggregate byte count.
+    write_frame(
+        writer,
+        &serde_json::to_vec(&json!({"status":"chunked","bytes":bytes.len()}))
+            .map_err(std::io::Error::other)?,
+    )
+    .await?;
+    for chunk in bytes.chunks(MAX_FRAME) {
+        write_frame(writer, chunk).await?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn read_reply<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Result<Value, String> {
+    let bytes = read_frame(reader, MAX_RESPONSE)
+        .await
+        .map_err(|error| format!("worker read broker reply failed: {error}"))?;
+    let reply: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| "worker read broker reply malformed".to_string())?;
+    if reply["status"] != "chunked" {
+        return Ok(reply);
+    }
+    let size = reply["bytes"]
+        .as_u64()
+        .ok_or_else(|| "worker read broker chunk length malformed".to_string())?;
+    if size == 0 || size > MAX_ENCODED_RESPONSE as u64 {
+        return Err(format!(
+            "worker read broker chunked reply is {size} bytes; cap is {MAX_ENCODED_RESPONSE} bytes"
+        ));
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    while bytes.len() < size as usize {
+        let chunk = read_frame(reader, MAX_FRAME.min(size as usize - bytes.len()))
+            .await
+            .map_err(|error| format!("worker read broker reply chunk failed: {error}"))?;
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| "worker read broker reply malformed".to_string())
 }
 
 #[cfg(unix)]
@@ -538,7 +628,7 @@ pub(crate) async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
     if size == 0 || size > cap {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "invalid broker frame size",
+            format!("broker frame is {size} bytes; cap is {cap} bytes (size must be nonzero)"),
         ));
     }
     let mut bytes = vec![0; size];
@@ -677,11 +767,7 @@ pub(crate) fn request(
                 write_frame(&mut stream, &bytes)
                     .await
                     .map_err(|_| "worker read broker write failed")?;
-                let bytes = read_frame(&mut stream, MAX_RESPONSE)
-                    .await
-                    .map_err(|_| "worker read broker reply unavailable")?;
-                let reply: Value = serde_json::from_slice(&bytes)
-                    .map_err(|_| "worker read broker reply malformed")?;
+                let reply = read_reply(&mut stream).await?;
                 match reply["status"].as_str() {
                     Some("ok") => reply
                         .get("data")

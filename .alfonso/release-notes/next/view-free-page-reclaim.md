@@ -1,1 +1,0 @@
-- A shared index store that is over its disk limit only because of free space inside its files now gives that space back to the filesystem a little each pass, instead of re-reading every entry and deleting reusable ones every ten minutes.

@@ -37,6 +37,13 @@ pub const CANARY_FILE: &str = "canary";
 const CANARY_CONTENTS: &[u8] =
     b"AFT worker-jail canary. Worker shells cannot read this file; the gh shim uses that to recognize them.\n";
 
+/// Public only so integration tests use the same account-home lookup as the sandbox.
+#[doc(hidden)]
+#[cfg(unix)]
+pub fn account_home() -> std::io::Result<PathBuf> {
+    crate::production_storage::account_home()
+}
+
 /// The canary directory for one account home.
 pub fn dir_for_home(home: &Path) -> PathBuf {
     home.join(CANARY_DIR_FROM_HOME)
@@ -114,11 +121,60 @@ pub fn prepare(home: &Path) -> Result<PathBuf, String> {
 /// for heads so a missing canary cannot block an operator shell.
 #[cfg(unix)]
 pub fn prepare_homes(daemon_home: &Path, fenced: bool) -> Result<Vec<PathBuf>, String> {
-    prepare_homes_with_account(
-        daemon_home,
-        crate::production_storage::account_home(),
-        fenced,
-    )
+    #[cfg(not(test))]
+    let account = crate::production_storage::account_home();
+    #[cfg(test)]
+    let account = TEST_PREPARATION_HOME.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        match slot.as_mut() {
+            Some((home, reads)) => {
+                *reads += 1;
+                Ok(home.clone())
+            }
+            None => crate::production_storage::account_home(),
+        }
+    });
+    prepare_homes_with_account(daemon_home, account, fenced)
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static TEST_PREPARATION_HOME: std::cell::RefCell<Option<(PathBuf, usize)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A fixture must observe every expected preparation on the installing thread.
+/// A spawned thread that misses this override therefore fails the fixture's
+/// read-count assertion instead of silently testing the real account home.
+#[cfg(all(test, unix))]
+pub(crate) fn with_test_preparation_home<R>(
+    home: &Path,
+    expected_reads: usize,
+    run: impl FnOnce() -> R,
+) -> R {
+    struct Restore {
+        previous: Option<(PathBuf, usize)>,
+        expected_reads: usize,
+        _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let current = TEST_PREPARATION_HOME.with(|slot| slot.replace(self.previous.take()));
+            if !std::thread::panicking() {
+                assert_eq!(
+                    current.unwrap().1,
+                    self.expected_reads,
+                    "account-home preparation escaped its fixture thread or did not run"
+                );
+            }
+        }
+    }
+    let previous = TEST_PREPARATION_HOME.with(|slot| slot.replace(Some((home.to_path_buf(), 0))));
+    let _restore = Restore {
+        previous,
+        expected_reads,
+        _same_thread: std::marker::PhantomData,
+    };
+    run()
 }
 
 #[cfg(unix)]
@@ -499,6 +555,14 @@ mod tests {
             .len(),
             1
         );
+    }
+
+    #[test]
+    fn unwritable_account_home_refuses_fenced_workers() {
+        let fixture = tempfile::tempdir().unwrap();
+        let account = fixture.path().join("account");
+        std::fs::write(&account, "not a directory").unwrap();
+        assert!(prepare_homes_with_account(fixture.path(), Ok(account), true).is_err());
     }
 
     #[test]

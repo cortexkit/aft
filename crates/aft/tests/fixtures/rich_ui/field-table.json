@@ -1,0 +1,809 @@
+{
+  "bash_output": {
+    "operation": {
+      "args": {
+        "fields": {
+          "cursor": {
+            "maxBytes": 1024,
+            "optional": true,
+            "type": "string"
+          },
+          "limit": {
+            "max": 200,
+            "min": 1,
+            "optional": true,
+            "type": "integer"
+          }
+        },
+        "type": "record"
+      },
+      "bound": {
+        "task": "call"
+      },
+      "class": "command.output",
+      "id": "bash_output",
+      "item": {
+        "fields": {
+          "bytes": {
+            "max": 8192,
+            "min": 1,
+            "type": "integer"
+          },
+          "stream": {
+            "enum": [
+              "stdout",
+              "stderr",
+              "pty"
+            ],
+            "maxBytes": 64,
+            "type": "string"
+          },
+          "text": {
+            "maxBytes": 8192,
+            "type": "string"
+          },
+          "continued": {
+            "type": "boolean"
+          },
+          "firstAvailableOffset": {
+            "type": "integer",
+            "min": 0,
+            "max": 9007199254740991,
+            "nullable": true
+          },
+          "prefixDropped": {
+            "type": "boolean"
+          }
+        },
+        "type": "record"
+      },
+      "kind": "page",
+      "limits": {
+        "argsBytes": 8192,
+        "timeoutMs": 30000
+      },
+      "page": {
+        "cursorBytes": 1024,
+        "itemKey": null,
+        "limitMax": 200,
+        "pageBytes": 262144,
+        "total": false
+      },
+      "profiles": [
+        "tool_page"
+      ],
+      "scope": "call",
+      "target": {
+        "module": "aft",
+        "tool": "bash_status"
+      },
+      "version": 1
+    },
+    "fields": [
+      {
+        "key": "bytes",
+        "source": "source bytes consumed by this part, including its terminator only on the final part",
+        "required": true,
+        "nullable": false,
+        "placement": "items"
+      },
+      {
+        "key": "stream",
+        "source": "artifact stream",
+        "required": true,
+        "nullable": false,
+        "placement": "items"
+      },
+      {
+        "key": "text",
+        "source": "one lossy UTF-8 decoded physical line or whole-unit part, without LF/CRLF terminator",
+        "required": true,
+        "nullable": false,
+        "placement": "items"
+      },
+      {
+        "key": "next",
+        "source": "task/session-bound opaque cursor of per-stream positions plus incremented monotonic read sequence; changes even without position progress; null only at terminal drain",
+        "required": true,
+        "nullable": true,
+        "placement": "next"
+      },
+      {
+        "key": "continued",
+        "source": "true when more parts of this same physical line follow; false on the last part",
+        "required": true,
+        "nullable": false,
+        "placement": "items"
+      },
+      {
+        "key": "firstAvailableOffset",
+        "source": "durable per-stream cumulative dropped-prefix base; null only for legacy trimmed tasks with unknown original origin",
+        "required": true,
+        "nullable": true,
+        "placement": "items"
+      },
+      {
+        "key": "prefixDropped",
+        "source": "true after any prefix trim (including legacy unknown origin); false only with a verified original base of zero",
+        "required": true,
+        "nullable": false,
+        "placement": "items"
+      }
+    ]
+  },
+  "bash_status": {
+    "operation": {
+      "args": {
+        "fields": {},
+        "type": "record"
+      },
+      "bound": {
+        "task": "call"
+      },
+      "class": "command.status",
+      "id": "bash_status",
+      "kind": "query",
+      "limits": {
+        "answerBytes": 1048576,
+        "argsBytes": 8192,
+        "minRefreshSeconds": 2,
+        "timeoutMs": 30000
+      },
+      "profiles": [
+        "tool_page"
+      ],
+      "result": {
+        "fields": {
+          "exitCode": {
+            "max": 9007199254740991,
+            "min": -9007199254740991,
+            "nullable": true,
+            "type": "integer"
+          },
+          "running": {
+            "type": "boolean"
+          }
+        },
+        "type": "record"
+      },
+      "scope": "call",
+      "target": {
+        "module": "aft",
+        "tool": "bash_status"
+      },
+      "version": 1
+    },
+    "fields": [
+      {
+        "key": "exitCode",
+        "source": "exit_code",
+        "required": true,
+        "nullable": true,
+        "placement": "result"
+      },
+      {
+        "key": "running",
+        "source": "!BgTaskStatus::is_terminal(status)",
+        "required": true,
+        "nullable": false,
+        "placement": "result"
+      }
+    ]
+  },
+  "bash_watch": {
+    "operation": {
+      "args": {
+        "fields": {
+          "pattern": {
+            "maxBytes": 1024,
+            "type": "string"
+          },
+          "regex": {
+            "optional": true,
+            "type": "boolean"
+          },
+          "timeoutMs": {
+            "max": 20000,
+            "min": 1,
+            "optional": true,
+            "type": "integer"
+          }
+        },
+        "type": "record"
+      },
+      "bound": {
+        "task": "call"
+      },
+      "class": "command.watch",
+      "id": "bash_watch",
+      "kind": "query",
+      "limits": {
+        "answerBytes": 1048576,
+        "argsBytes": 8192,
+        "minRefreshSeconds": 2,
+        "timeoutMs": 30000
+      },
+      "profiles": [
+        "tool_page"
+      ],
+      "result": {
+        "fields": {
+          "exitCode": {
+            "max": 9007199254740991,
+            "min": -9007199254740991,
+            "nullable": true,
+            "type": "integer"
+          },
+          "running": {
+            "type": "boolean"
+          },
+          "waited": {
+            "fields": {
+              "limit_ms": {
+                "max": 20000,
+                "min": 1,
+                "type": "integer"
+              },
+              "reason": {
+                "enum": [
+                  "match",
+                  "exit",
+                  "timeout"
+                ],
+                "maxBytes": 64,
+                "type": "string"
+              }
+            },
+            "type": "record"
+          }
+        },
+        "type": "record"
+      },
+      "scope": "call",
+      "target": {
+        "module": "aft",
+        "tool": "bash_watch"
+      },
+      "version": 1
+    },
+    "fields": [
+      {
+        "key": "exitCode",
+        "source": "exit_code",
+        "required": true,
+        "nullable": true,
+        "placement": "result"
+      },
+      {
+        "key": "running",
+        "source": "!BgTaskStatus::is_terminal(status)",
+        "required": true,
+        "nullable": false,
+        "placement": "result"
+      },
+      {
+        "key": "waited",
+        "source": "waited",
+        "required": true,
+        "nullable": false,
+        "placement": "result"
+      },
+      {
+        "key": "waited.limit_ms",
+        "source": "waited.limit_ms",
+        "required": true,
+        "nullable": false,
+        "placement": "result"
+      },
+      {
+        "key": "waited.reason",
+        "source": "waited.reason",
+        "required": true,
+        "nullable": false,
+        "placement": "result"
+      }
+    ]
+  },
+  "callgraph": {
+    "operation": {
+      "args": {
+        "fields": {
+          "depth": {
+            "max": 9007199254740991,
+            "min": 1,
+            "optional": true,
+            "type": "integer"
+          },
+          "expression": {
+            "maxBytes": 8192,
+            "optional": true,
+            "type": "string"
+          },
+          "includeTests": {
+            "optional": true,
+            "type": "boolean"
+          },
+          "includeUnresolved": {
+            "optional": true,
+            "type": "boolean"
+          },
+          "op": {
+            "enum": [
+              "callers",
+              "impact",
+              "call_tree",
+              "trace_to",
+              "trace_to_symbol",
+              "trace_data"
+            ],
+            "maxBytes": 64,
+            "type": "string"
+          },
+          "path": {
+            "maxBytes": 8192,
+            "type": "string"
+          },
+          "symbol": {
+            "maxBytes": 8192,
+            "type": "string"
+          },
+          "toPath": {
+            "maxBytes": 8192,
+            "optional": true,
+            "type": "string"
+          },
+          "toSymbol": {
+            "maxBytes": 8192,
+            "optional": true,
+            "type": "string"
+          }
+        },
+        "type": "record"
+      },
+      "bound": {},
+      "class": "code.search",
+      "id": "callgraph",
+      "kind": "query",
+      "limits": {
+        "answerBytes": 1048576,
+        "argsBytes": 8192,
+        "minRefreshSeconds": 2,
+        "timeoutMs": 30000
+      },
+      "profiles": [
+        "show_ui"
+      ],
+      "result": {
+        "fields": {
+          "text": {
+            "maxBytes": 1048576,
+            "type": "string"
+          }
+        },
+        "type": "record"
+      },
+      "scope": "session",
+      "target": {
+        "module": "aft",
+        "tool": "callgraph"
+      },
+      "version": 1
+    },
+    "fields": [
+      {
+        "key": "text",
+        "source": "text (tool_call formatted handler reply)",
+        "required": true,
+        "nullable": false,
+        "placement": "result"
+      }
+    ]
+  },
+  "glob": {
+    "operation": {
+      "args": {
+        "fields": {
+          "path": {
+            "maxBytes": 8192,
+            "optional": true,
+            "type": "string"
+          },
+          "pattern": {
+            "maxBytes": 8192,
+            "type": "string"
+          }
+        },
+        "type": "record"
+      },
+      "bound": {},
+      "class": "code.search",
+      "id": "glob",
+      "kind": "query",
+      "limits": {
+        "answerBytes": 1048576,
+        "argsBytes": 8192,
+        "minRefreshSeconds": 2,
+        "timeoutMs": 30000
+      },
+      "profiles": [
+        "show_ui"
+      ],
+      "result": {
+        "fields": {
+          "text": {
+            "maxBytes": 1048576,
+            "type": "string"
+          }
+        },
+        "type": "record"
+      },
+      "scope": "session",
+      "target": {
+        "module": "aft",
+        "tool": "glob"
+      },
+      "version": 1
+    },
+    "fields": [
+      {
+        "key": "text",
+        "source": "text (tool_call formatted handler reply)",
+        "required": true,
+        "nullable": false,
+        "placement": "result"
+      }
+    ]
+  },
+  "grep": {
+    "operation": {
+      "args": {
+        "fields": {
+          "include": {
+            "maxBytes": 8192,
+            "optional": true,
+            "type": "string"
+          },
+          "offset": {
+            "max": 100000,
+            "min": 0,
+            "optional": true,
+            "type": "integer"
+          },
+          "path": {
+            "maxBytes": 8192,
+            "optional": true,
+            "type": "string"
+          },
+          "pattern": {
+            "maxBytes": 8192,
+            "type": "string"
+          }
+        },
+        "type": "record"
+      },
+      "bound": {},
+      "class": "code.search",
+      "id": "grep",
+      "kind": "query",
+      "limits": {
+        "answerBytes": 1048576,
+        "argsBytes": 8192,
+        "minRefreshSeconds": 2,
+        "timeoutMs": 30000
+      },
+      "profiles": [
+        "show_ui"
+      ],
+      "result": {
+        "fields": {
+          "text": {
+            "maxBytes": 1048576,
+            "type": "string"
+          }
+        },
+        "type": "record"
+      },
+      "scope": "session",
+      "target": {
+        "module": "aft",
+        "tool": "grep"
+      },
+      "version": 1
+    },
+    "fields": [
+      {
+        "key": "text",
+        "source": "text (tool_call formatted handler reply)",
+        "required": true,
+        "nullable": false,
+        "placement": "result"
+      }
+    ]
+  },
+  "outline": {
+    "operation": {
+      "args": {
+        "fields": {
+          "files": {
+            "optional": true,
+            "type": "boolean"
+          },
+          "includeTests": {
+            "optional": true,
+            "type": "boolean"
+          },
+          "target": {
+            "maxBytes": 8192,
+            "type": "string"
+          }
+        },
+        "type": "record"
+      },
+      "bound": {},
+      "class": "code.outline",
+      "id": "outline",
+      "kind": "query",
+      "limits": {
+        "answerBytes": 1048576,
+        "argsBytes": 8192,
+        "minRefreshSeconds": 2,
+        "timeoutMs": 30000
+      },
+      "profiles": [
+        "show_ui"
+      ],
+      "result": {
+        "fields": {
+          "text": {
+            "maxBytes": 1048576,
+            "type": "string"
+          }
+        },
+        "type": "record"
+      },
+      "scope": "session",
+      "target": {
+        "module": "aft",
+        "tool": "outline"
+      },
+      "version": 1
+    },
+    "fields": [
+      {
+        "key": "text",
+        "source": "text (tool_call formatted handler reply)",
+        "required": true,
+        "nullable": false,
+        "placement": "result"
+      }
+    ]
+  },
+  "read": {
+    "operation": {
+      "args": {
+        "fields": {
+          "endLine": {
+            "max": 9007199254740991,
+            "min": 1,
+            "optional": true,
+            "type": "integer"
+          },
+          "limit": {
+            "max": 9007199254740991,
+            "min": 1,
+            "optional": true,
+            "type": "integer"
+          },
+          "offset": {
+            "max": 9007199254740991,
+            "min": 1,
+            "optional": true,
+            "type": "integer"
+          },
+          "path": {
+            "maxBytes": 8192,
+            "type": "string"
+          },
+          "startLine": {
+            "max": 9007199254740991,
+            "min": 1,
+            "optional": true,
+            "type": "integer"
+          }
+        },
+        "type": "record"
+      },
+      "bound": {},
+      "class": "files.read",
+      "id": "read",
+      "kind": "query",
+      "limits": {
+        "answerBytes": 1048576,
+        "argsBytes": 8192,
+        "minRefreshSeconds": 2,
+        "timeoutMs": 30000
+      },
+      "profiles": [
+        "show_ui"
+      ],
+      "result": {
+        "fields": {
+          "text": {
+            "maxBytes": 1048576,
+            "type": "string"
+          }
+        },
+        "type": "record"
+      },
+      "scope": "session",
+      "target": {
+        "module": "aft",
+        "tool": "read"
+      },
+      "version": 1
+    },
+    "fields": [
+      {
+        "key": "text",
+        "source": "text (tool_call formatted handler reply)",
+        "required": true,
+        "nullable": false,
+        "placement": "result"
+      }
+    ]
+  },
+  "search": {
+    "operation": {
+      "args": {
+        "fields": {
+          "includeTests": {
+            "optional": true,
+            "type": "boolean"
+          },
+          "offset": {
+            "max": 100000,
+            "min": 0,
+            "optional": true,
+            "type": "integer"
+          },
+          "path": {
+            "maxBytes": 8192,
+            "optional": true,
+            "type": "string"
+          },
+          "pattern": {
+            "maxBytes": 8192,
+            "optional": true,
+            "type": "string"
+          },
+          "query": {
+            "maxBytes": 8192,
+            "optional": true,
+            "type": "string"
+          },
+          "topK": {
+            "max": 50,
+            "min": 1,
+            "optional": true,
+            "type": "integer"
+          }
+        },
+        "type": "record"
+      },
+      "bound": {},
+      "class": "code.search",
+      "id": "search",
+      "kind": "query",
+      "limits": {
+        "answerBytes": 1048576,
+        "argsBytes": 8192,
+        "minRefreshSeconds": 2,
+        "timeoutMs": 30000
+      },
+      "profiles": [
+        "show_ui"
+      ],
+      "result": {
+        "fields": {
+          "text": {
+            "maxBytes": 1048576,
+            "type": "string"
+          }
+        },
+        "type": "record"
+      },
+      "scope": "session",
+      "target": {
+        "module": "aft",
+        "tool": "search"
+      },
+      "version": 1
+    },
+    "fields": [
+      {
+        "key": "text",
+        "source": "text (tool_call formatted handler reply)",
+        "required": true,
+        "nullable": false,
+        "placement": "result"
+      }
+    ]
+  },
+  "zoom": {
+    "operation": {
+      "args": {
+        "fields": {
+          "batch": {
+            "items": {
+              "fields": {
+                "symbols": {
+                  "items": {
+                    "maxBytes": 8192,
+                    "type": "string"
+                  },
+                  "maxItems": 200,
+                  "type": "list"
+                },
+                "target": {
+                  "maxBytes": 8192,
+                  "type": "string"
+                }
+              },
+              "type": "record"
+            },
+            "maxItems": 200,
+            "type": "list"
+          },
+          "callgraph": {
+            "optional": true,
+            "type": "boolean"
+          },
+          "contextLines": {
+            "max": 9007199254740991,
+            "min": 1,
+            "optional": true,
+            "type": "integer"
+          }
+        },
+        "type": "record"
+      },
+      "bound": {},
+      "class": "code.outline",
+      "id": "zoom",
+      "kind": "query",
+      "limits": {
+        "answerBytes": 1048576,
+        "argsBytes": 8192,
+        "minRefreshSeconds": 2,
+        "timeoutMs": 30000
+      },
+      "profiles": [
+        "show_ui"
+      ],
+      "result": {
+        "fields": {
+          "text": {
+            "maxBytes": 1048576,
+            "type": "string"
+          }
+        },
+        "type": "record"
+      },
+      "scope": "session",
+      "target": {
+        "module": "aft",
+        "tool": "zoom"
+      },
+      "version": 1
+    },
+    "fields": [
+      {
+        "key": "text",
+        "source": "text (tool_call formatted handler reply)",
+        "required": true,
+        "nullable": false,
+        "placement": "result"
+      }
+    ]
+  }
+}

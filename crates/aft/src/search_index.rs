@@ -87,6 +87,8 @@ const POSTING_BYTES: usize = 6;
 const ARTIFACT_CACHE_KEY_MEMO_FILE: &str = "cache-keys.json";
 const ARTIFACT_CACHE_KEY_MEMO_EVICTION_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const ARTIFACT_CACHE_KEY_MEMO_READ_REFRESH_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const LEGACY_IDENTITY_MEMO_MAX_AGE: Duration = Duration::from_secs(10 * 60);
+const LEGACY_IDENTITY_MEMO_MAX_STORAGE_ROOTS: usize = 4;
 #[cfg(test)]
 const INDEX_ORPHAN_MIN_AGE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 #[cfg(test)]
@@ -154,6 +156,15 @@ struct ArtifactCacheKeyMemoEntry {
 #[derive(Default)]
 struct ArtifactCacheKeyMemoState {
     by_storage_root: BTreeMap<PathBuf, BTreeMap<String, ArtifactCacheKeyMemoEntry>>,
+}
+
+#[cfg(test)]
+type AfterLegacyMemoRename = Box<dyn FnOnce(&Path)>;
+#[cfg(test)]
+thread_local! {
+    static LEGACY_MEMO_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LEGACY_MEMO_CANONICALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static AFTER_LEGACY_MEMO_RENAME: std::cell::RefCell<Option<AfterLegacyMemoRename>> = const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Default)]
@@ -303,6 +314,47 @@ impl<'a> BorrowedIndexLoadBudget<'a> {
     }
 }
 
+/// Borrowed-load record reads observed per fixture root. A borrowed reload
+/// parses on a background thread, so a thread-local counter on the searching
+/// thread cannot see it; each test registers its own temporary root and the
+/// read loop bumps only that root's counter. Asserting the count stayed at or
+/// below the entry budget proves the reload stopped at the entry budget,
+/// which a wall-clock bound cannot show on a loaded machine.
+#[cfg(test)]
+static BORROWED_LOAD_RECORDS_READ_PROBES: OnceLock<Mutex<HashMap<PathBuf, Arc<AtomicUsize>>>> =
+    OnceLock::new();
+
+/// Register `root` for borrowed-load record observation and return its
+/// counter. Callers remove the probe with
+/// [`unobserve_borrowed_load_records_read_for_test`] after the assertion.
+#[cfg(test)]
+pub(crate) fn observe_borrowed_load_records_read_for_test(root: &Path) -> Arc<AtomicUsize> {
+    let counter = Arc::new(AtomicUsize::new(0));
+    BORROWED_LOAD_RECORDS_READ_PROBES
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap()
+        .insert(root.to_path_buf(), Arc::clone(&counter));
+    counter
+}
+
+/// Stop observing borrowed-load record reads for `root`.
+#[cfg(test)]
+pub(crate) fn unobserve_borrowed_load_records_read_for_test(root: &Path) {
+    if let Some(probes) = BORROWED_LOAD_RECORDS_READ_PROBES.get() {
+        probes.lock().unwrap().remove(root);
+    }
+}
+
+#[cfg(test)]
+fn note_borrowed_load_record_read_for_test(project_root: &Path) {
+    if let Some(probes) = BORROWED_LOAD_RECORDS_READ_PROBES.get() {
+        if let Some(counter) = probes.lock().unwrap().get(project_root) {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
 /// Read an artifact pointer without allowing a writer to strand an interactive request.
 ///
 /// Index refreshes publish through `RwLock`s and can legitimately hold a write guard while
@@ -358,7 +410,7 @@ impl CacheLock {
         crate::private_storage::open_keyed_dir(cache_dir, "index")?;
         let _acquire_guard = CACHE_LOCK_ACQUIRE_MUTEX
             .lock()
-            .map_err(|_| std::io::Error::other("search cache lock acquisition mutex poisoned"))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         fs_lock::try_acquire(&path, timeout)
             .map(|guard| Self {
                 _guard: Some(guard),
@@ -381,6 +433,86 @@ fn artifact_write_allowed(project_root: &Path, cache_dir: &Path, write_path: &Pa
         // A cache written by a newer build is never replaced (and no build or
         // lock is started for it): that build's data outlives a rollback.
         && SearchIndex::check_disk_cache_format(cache_dir).is_ok()
+}
+
+/// Revokes only legacy search publication when a checkout switches to views.
+/// Shared holders cover the final rename, not the build or serialization, so
+/// ordinary legacy publications never wait for one another.
+pub(crate) struct LegacySearchPublicationGate {
+    allowed: std::sync::atomic::AtomicBool,
+    publication: parking_lot::RwLock<()>,
+    #[cfg(test)]
+    before_publish: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl Default for LegacySearchPublicationGate {
+    fn default() -> Self {
+        Self {
+            allowed: std::sync::atomic::AtomicBool::new(true),
+            publication: parking_lot::RwLock::new(()),
+            #[cfg(test)]
+            before_publish: Default::default(),
+        }
+    }
+}
+
+thread_local! {
+    static LEGACY_SEARCH_PUBLICATION: std::cell::RefCell<Option<Arc<LegacySearchPublicationGate>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) struct LegacySearchPublicationScope {
+    previous: Option<Arc<LegacySearchPublicationGate>>,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for LegacySearchPublicationScope {
+    fn drop(&mut self) {
+        LEGACY_SEARCH_PUBLICATION.with(|slot| slot.replace(self.previous.take()));
+    }
+}
+
+impl LegacySearchPublicationGate {
+    pub(crate) fn allowed(&self) -> bool {
+        self.allowed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn revoke(&self) {
+        let _publication = self.publication.write();
+        self.allowed
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn install(self: &Arc<Self>) -> LegacySearchPublicationScope {
+        LegacySearchPublicationScope {
+            previous: LEGACY_SEARCH_PUBLICATION.with(|slot| slot.replace(Some(self.clone()))),
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    fn publish(&self, operation: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = self.before_publish.lock().take() {
+            hook();
+        }
+        let _publication = self.publication.read();
+        if !self.allowed() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "legacy search publication revoked by views",
+            ));
+        }
+        operation()
+    }
+}
+
+fn publish_legacy_search_cache(
+    operation: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let gate = LEGACY_SEARCH_PUBLICATION.with(|slot| slot.borrow().clone());
+    match gate {
+        Some(gate) => gate.publish(operation),
+        None => operation(),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -412,6 +544,20 @@ pub struct SearchIndex {
     base_file_count: u32,
     delta_packed_bytes: usize,
     compaction_state: Arc<Mutex<CompactionState>>,
+    /// The `cache.bin` this index last wrote itself, and the header values it
+    /// wrote there. `None` for an index read from disk or built in memory.
+    published_cache: Option<PublishedCache>,
+}
+
+/// Where an index wrote its own cache, and the header fields that a rewrite
+/// from the index would take from mutable index state.
+#[derive(Clone, Debug)]
+struct PublishedCache {
+    cache_dir: PathBuf,
+    /// Stored the way the header stores it: no head is an empty string.
+    git_head: String,
+    ignore_fingerprint: String,
+    max_file_size: u64,
 }
 
 // A query must observe postings and superseded base files from one version;
@@ -645,6 +791,23 @@ impl SearchIndex {
             || self.path_to_id.len() != self.base_file_count as usize
     }
 
+    /// True when `write_to_disk(cache_dir, git_head)` would only rewrite the
+    /// cache this index already wrote there: same files, postings, HEAD,
+    /// ignore fingerprint and size limit, and no change since. A cold build
+    /// writes `cache.bin` itself, so callers that persist right after one can
+    /// skip a second full rewrite of the same bytes.
+    pub(crate) fn disk_cache_is_current(&self, cache_dir: &Path, git_head: Option<&str>) -> bool {
+        let Some(published) = self.published_cache.as_ref() else {
+            return false;
+        };
+        published.cache_dir == cache_dir
+            && published.git_head == git_head.unwrap_or_default()
+            && !self.ignore_rules_fingerprint.is_empty()
+            && published.ignore_fingerprint == self.ignore_rules_fingerprint
+            && published.max_file_size == self.max_file_size
+            && !self.has_pending_disk_changes()
+    }
+
     /// Returns an immutable snapshot for queries. Callers must obtain the
     /// snapshot while holding the RwLock that protects the SearchIndex, then
     /// drop the guard before running expensive operations such as grep, glob, or
@@ -674,10 +837,10 @@ impl SearchIndex {
         query_trigrams: &[u32],
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
         max_files: usize,
-    ) -> Vec<(PathBuf, f32)> {
+    ) -> std::io::Result<Vec<(PathBuf, f32)>> {
         self.snapshot()
             .lexical_rank_with_stats(query_trigrams, candidate_filter, max_files)
-            .files
+            .map(|result| result.files)
     }
 
     pub fn is_ready(&self) -> bool {
@@ -690,7 +853,7 @@ impl SearchIndex {
         query_trigrams: &[u32],
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
         depth: usize,
-    ) -> LexicalRankResult {
+    ) -> std::io::Result<LexicalRankResult> {
         self.snapshot()
             .lexical_rank_at_depth(query_trigrams, candidate_filter, depth)
     }
@@ -701,7 +864,7 @@ impl SearchIndex {
         query_trigrams: &[u32],
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
         depth: usize,
-    ) -> LexicalRankResult {
+    ) -> std::io::Result<LexicalRankResult> {
         self.snapshot()
             .lexical_rank_at_depth(query_trigrams, candidate_filter, depth)
     }
@@ -712,7 +875,7 @@ impl SearchIndex {
         query: &str,
         search_root: &Path,
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
-    ) -> Vec<ExactPassMatch> {
+    ) -> std::io::Result<Vec<ExactPassMatch>> {
         self.snapshot()
             .whole_corpus_exact_pass(query, search_root, candidate_filter)
     }
@@ -724,18 +887,79 @@ impl SearchIndex {
         query_trigrams: &[u32],
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
         max_files: usize,
-    ) -> LexicalRankResult {
+    ) -> std::io::Result<LexicalRankResult> {
         self.snapshot()
             .lexical_rank_with_stats(query_trigrams, candidate_filter, max_files)
     }
 }
 
 impl SearchIndexSnapshot {
+    pub(crate) fn content_generation(&self) -> String {
+        let mut digest = blake3::Hasher::new();
+        digest.update(&self.max_file_size.to_be_bytes());
+        for file in self.files.iter() {
+            let path = file.path.as_os_str().as_encoded_bytes();
+            digest.update(&(path.len() as u64).to_be_bytes());
+            digest.update(path);
+            digest.update(file.content_hash.as_bytes());
+        }
+        digest.finalize().to_hex().to_string()
+    }
+
+    /// Reuses the query engine over already verified, in-memory posting rows.
+    /// This is a read projection, not a mutable index: it has no cache file or
+    /// persistence path. Missing postings require direct verification by grep.
+    pub(crate) fn from_verified_rows(
+        root: &Path,
+        max_file_size: u64,
+        rows: impl IntoIterator<Item = (FileEntry, Option<Vec<(u32, u8, u8)>>)>,
+    ) -> Self {
+        let mut files = Vec::new();
+        let mut paths = HashMap::new();
+        let mut counts = Vec::new();
+        let mut unindexed = HashSet::new();
+        let mut delta = DeltaState::default();
+        for (file, records) in rows {
+            let id = u32::try_from(files.len()).expect("view file id exceeds u32");
+            paths.insert(file.path.clone(), id);
+            files.push(file);
+            counts.push(records.as_ref().map_or(0, |records| records.len() as u32));
+            if let Some(records) = records {
+                for (trigram, next_mask, loc_mask) in records {
+                    delta.postings.entry(trigram).or_default().push(Posting {
+                        file_id: id,
+                        next_mask,
+                        loc_mask,
+                    });
+                }
+            } else {
+                unindexed.insert(id);
+            }
+        }
+        Self {
+            base: None,
+            delta: Arc::new(delta),
+            files: Arc::new(files),
+            path_to_id: Arc::new(paths),
+            ready: true,
+            project_root: root.to_path_buf(),
+            max_file_size,
+            file_trigram_count: Arc::new(counts),
+            unindexed_files: Arc::new(unindexed),
+        }
+    }
+
     pub(crate) fn file_modified(&self, path: &Path) -> Option<SystemTime> {
         self.path_to_id
             .get(path)
             .and_then(|id| self.files.get(*id as usize))
             .map(|file| file.modified)
+    }
+
+    /// The files this snapshot answers for, with the size and content hash it
+    /// records for each and the modification time observed when it was built.
+    pub(crate) fn file_entries(&self) -> &[FileEntry] {
+        &self.files
     }
     /// Number of unique trigrams in the combined base index and delta postings.
     pub fn trigram_count(&self) -> usize {
@@ -793,9 +1017,9 @@ impl SearchIndexSnapshot {
         query_trigrams: &[u32],
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
         max_files: usize,
-    ) -> LexicalRankResult {
+    ) -> std::io::Result<LexicalRankResult> {
         if query_trigrams.is_empty() || max_files == 0 {
-            return LexicalRankResult::default();
+            return Ok(LexicalRankResult::default());
         }
 
         let mut non_zero: Vec<(u32, usize)> = query_trigrams
@@ -806,7 +1030,7 @@ impl SearchIndexSnapshot {
             })
             .collect();
         if non_zero.is_empty() {
-            return LexicalRankResult::default();
+            return Ok(LexicalRankResult::default());
         }
 
         non_zero.sort_unstable_by_key(|(_, posting_count)| *posting_count);
@@ -817,7 +1041,7 @@ impl SearchIndexSnapshot {
         // needs every query trigram. Materialize all lists once per query so both
         // phases reuse the same disk-backed postings instead of rereading them for
         // every candidate. Memory remains bounded by the query's posting lists.
-        let postings_by_trigram = materialize_query_postings(self, query_trigrams);
+        let postings_by_trigram = materialize_query_postings(self, query_trigrams)?;
         let mut candidate_ids = BTreeSet::new();
         for (trigram, _) in non_zero.iter().take(selected_count) {
             if let Some(postings) = postings_by_trigram.get(trigram) {
@@ -857,10 +1081,10 @@ impl SearchIndexSnapshot {
         });
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         ranked.truncate(max_files);
-        LexicalRankResult {
+        Ok(LexicalRankResult {
             files: ranked,
             engine_capped,
-        }
+        })
     }
 
     /// Evaluates lexical candidates and scores them up to the specified depth limit, applying an optional candidate filter.
@@ -869,9 +1093,9 @@ impl SearchIndexSnapshot {
         query_trigrams: &[u32],
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
         depth: usize,
-    ) -> LexicalRankResult {
+    ) -> std::io::Result<LexicalRankResult> {
         if query_trigrams.is_empty() || depth == 0 {
-            return LexicalRankResult::default();
+            return Ok(LexicalRankResult::default());
         }
 
         let mut non_zero: Vec<(u32, usize)> = query_trigrams
@@ -882,11 +1106,11 @@ impl SearchIndexSnapshot {
             })
             .collect();
         if non_zero.is_empty() {
-            return LexicalRankResult::default();
+            return Ok(LexicalRankResult::default());
         }
 
         non_zero.sort_unstable_by_key(|(_, posting_count)| *posting_count);
-        let postings_by_trigram = materialize_query_postings(self, query_trigrams);
+        let postings_by_trigram = materialize_query_postings(self, query_trigrams)?;
 
         let initial_selected = non_zero.len().min(3);
         let mut candidate_ids = BTreeSet::new();
@@ -941,10 +1165,10 @@ impl SearchIndexSnapshot {
         });
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         ranked.truncate(depth);
-        LexicalRankResult {
+        Ok(LexicalRankResult {
             files: ranked,
             engine_capped,
-        }
+        })
     }
 
     /// Score the union of the three rarest nonempty postings without ranking
@@ -954,14 +1178,14 @@ impl SearchIndexSnapshot {
         &self,
         query_trigrams: &[u32],
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
-    ) -> Vec<(PathBuf, f32)> {
+    ) -> std::io::Result<Vec<(PathBuf, f32)>> {
         let mut seen = HashSet::with_capacity(query_trigrams.len());
         let unique = query_trigrams
             .iter()
             .copied()
             .filter(|trigram| seen.insert(*trigram))
             .collect::<Vec<_>>();
-        let postings = materialize_query_postings(self, &unique);
+        let postings = materialize_query_postings(self, &unique)?;
         let mut memberships = postings
             .iter()
             .filter(|(_, ids)| !ids.is_empty())
@@ -988,7 +1212,7 @@ impl SearchIndexSnapshot {
             counts.candidates_sorted += ranked.len()
         });
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        ranked
+        Ok(ranked)
     }
 
     /// Discovers and ranks lexical candidates up to the specified depth limit, applying an optional candidate filter.
@@ -997,8 +1221,43 @@ impl SearchIndexSnapshot {
         query_trigrams: &[u32],
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
         depth: usize,
-    ) -> LexicalRankResult {
+    ) -> std::io::Result<LexicalRankResult> {
         self.lexical_rank_at_depth(query_trigrams, candidate_filter, depth)
+    }
+
+    /// Indexed files under `search_root` that may hold `phrase`, compared
+    /// ASCII case-insensitively with runs of whitespace treated alike. A file
+    /// holding the phrase holds each of its whitespace-separated pieces, so
+    /// the trigram postings of those pieces bound the set; no file is read.
+    /// `None` when no piece is long enough to have a trigram, so any file
+    /// could hold it.
+    pub fn files_possibly_holding_phrase(
+        &self,
+        phrase: &str,
+        search_root: &Path,
+    ) -> std::io::Result<Option<Vec<PathBuf>>> {
+        let mut ids: Option<Vec<u32>> = None;
+        for piece in phrase.split_whitespace().filter(|piece| piece.len() >= 3) {
+            let piece_ids = self.candidates(&decompose_regex(&regex::escape(piece)))?;
+            ids = Some(match ids {
+                Some(ids) => intersect_sorted_ids(&ids, &piece_ids),
+                None => piece_ids,
+            });
+        }
+        let search_root_canon = canonicalize_for_search_membership(search_root);
+        let Some(ids) = ids else { return Ok(None) };
+        Ok(Some(
+            ids.into_iter()
+                .filter_map(|id| self.files.get(id as usize))
+                .map(|file| &file.path)
+                .filter(|path| !path.as_os_str().is_empty())
+                .filter(|path| {
+                    is_within_search_root(search_root, path)
+                        || is_within_search_root(&search_root_canon, path)
+                })
+                .cloned()
+                .collect(),
+        ))
     }
 
     /// Whole-corpus exact pass over the trigram index in ready mode.
@@ -1009,7 +1268,7 @@ impl SearchIndexSnapshot {
         query: &str,
         search_root: &Path,
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
-    ) -> Vec<ExactPassMatch> {
+    ) -> std::io::Result<Vec<ExactPassMatch>> {
         self.whole_corpus_exact_pass_scoped(
             query,
             search_root,
@@ -1027,7 +1286,9 @@ impl SearchIndexSnapshot {
         search_root: &Path,
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
         scope: &ExactEvidenceScope,
-    ) -> Vec<ExactPassMatch> {
+    ) -> std::io::Result<Vec<ExactPassMatch>> {
+        #[cfg(test)]
+        let measured_start = Instant::now();
         let phrase = exact_lane::exact_phrase(query);
         let norm_phrase = exact_lane::normalize_exact_phrase(phrase);
         let content_tokens = exact_lane::exact_verification_tokens(query);
@@ -1040,14 +1301,14 @@ impl SearchIndexSnapshot {
         // (a) Verbatim phrase trigrams
         if phrase.len() >= 3 {
             let phrase_query = decompose_regex(&regex::escape(phrase));
-            candidate_file_ids.extend(self.candidates(&phrase_query));
+            candidate_file_ids.extend(self.candidates(&phrase_query)?);
         }
 
         // (b) Content tokens trigrams (for E2 window match)
         if content_tokens.len() >= 2 {
             for token in &content_tokens {
                 if token.len() >= 3 {
-                    match self.files_possibly_containing(token, &mut literal_postings) {
+                    match self.files_possibly_containing(token, &mut literal_postings)? {
                         Some(ids) => candidate_file_ids.extend(ids.iter().copied()),
                         None => candidate_file_ids.extend(self.active_file_ids()),
                     }
@@ -1059,12 +1320,16 @@ impl SearchIndexSnapshot {
         // contain the receiver, so files holding the member name are
         // candidates too. Verification gives them definition evidence only
         // when they declare it.
-        let member_file_ids = member.as_ref().map(|member| {
+        let member_file_ids = if let Some(member) = member.as_ref() {
             let member_query = decompose_regex(&regex::escape(&member.member));
-            self.candidates(&member_query)
-                .into_iter()
-                .collect::<BTreeSet<_>>()
-        });
+            Some(
+                self.candidates(&member_query)?
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+            )
+        } else {
+            None
+        };
         if let Some(ids) = &member_file_ids {
             candidate_file_ids.extend(ids.iter().copied());
         }
@@ -1080,7 +1345,7 @@ impl SearchIndexSnapshot {
 
         let unscoped_candidates = candidate_file_ids.len();
         if let Some(bound) =
-            self.exact_evidence_bound(scope, &norm_phrase, &content_tokens, &mut literal_postings)
+            self.exact_evidence_bound(scope, &norm_phrase, &content_tokens, &mut literal_postings)?
         {
             // The evidence bound is built from the query's own words, which a
             // member's declaration does not contain, so member files stay.
@@ -1134,18 +1399,19 @@ impl SearchIndexSnapshot {
             };
             bytes_read += file.bytes.len();
             let text = String::from_utf8_lossy(&file.bytes);
+            let digest = blake3::hash(&file.bytes);
+            files_hashed += 1;
 
-            if let Some(candidates) = exact_lane::verify_exact_matches_in_text_with_member(
+            if let Some(candidates) = exact_lane::verify_cached_exact_matches_in_text_with_member(
                 &file_entry.path,
                 &text,
+                digest,
                 &norm_phrase,
                 &content_tokens,
                 member.as_ref().map(|member| member.member.as_str()),
             ) {
-                // Only a matching file needs its digest: the memo re-checks
-                // the digests of the files it serves, never of the rest.
-                files_hashed += 1;
-                let digest = blake3::hash(&file.bytes).to_hex().to_string();
+                // The same digest addresses prepared text and backs memo checks.
+                let digest = digest.to_hex().to_string();
                 for mut cand in candidates {
                     cand.evidence.generated = file.generated;
                     matches.push(ExactPassMatch {
@@ -1158,6 +1424,13 @@ impl SearchIndexSnapshot {
             }
         }
 
+        #[cfg(test)]
+        crate::search_hot_path_measurements::record(|counts| {
+            counts.exact_passes += 1;
+            counts.exact_pass_candidates += candidate_count;
+            counts.exact_pass_reads += files_read;
+            counts.exact_pass_micros += measured_start.elapsed().as_micros() as usize;
+        });
         crate::slog_debug!(
             "exact pass: {} of {} candidate files kept for {:?}, {} read, {} bytes, {} hashed, {} matches in {:?}",
             candidate_count,
@@ -1169,44 +1442,39 @@ impl SearchIndexSnapshot {
             matches.len(),
             started.elapsed()
         );
-        matches
+        Ok(matches)
     }
 
-    /// The sorted ids of every file that can hold evidence `scope` keeps, or
-    /// `None` when the index cannot rule any file out.
-    ///
-    /// Each kind of evidence needs certain words in the file, compared ASCII
-    /// case-insensitively like the trigram index: a verbatim phrase needs every
-    /// word of the phrase, a window needs every query word, and a declaration
-    /// needs the query word it is named after plus, when the scope lists
-    /// identifier words, one of those words. Phrase words are checked one by
-    /// one because the phrase is compared after collapsing whitespace, so a
-    /// hit may span a line break that the phrase's own trigrams would miss.
     fn exact_evidence_bound(
         &self,
         scope: &ExactEvidenceScope,
         norm_phrase: &str,
         content_tokens: &[String],
         literal_postings: &mut HashMap<String, Option<Vec<u32>>>,
-    ) -> Option<Vec<u32>> {
+    ) -> std::io::Result<Option<Vec<u32>>> {
         let (keeps_window, declaration_mentions) = match scope {
-            ExactEvidenceScope::All => return None,
+            ExactEvidenceScope::All => return Ok(None),
             ExactEvidenceScope::Phrase => (false, None),
             ExactEvidenceScope::PhraseAndWindow => (true, None),
             ExactEvidenceScope::DefinitionsMentioning(tokens) => (true, Some(tokens.as_slice())),
         };
-
         let mut bound = Vec::new();
         if !norm_phrase.is_empty() {
-            let phrase_files =
-                self.files_possibly_containing_all(norm_phrase.split(' '), literal_postings)?;
+            let Some(phrase_files) =
+                self.files_possibly_containing_all(norm_phrase.split(' '), literal_postings)?
+            else {
+                return Ok(None);
+            };
             bound = union_sorted_ids(&bound, &phrase_files);
         }
         if keeps_window && content_tokens.len() >= 2 {
-            let window_files = self.files_possibly_containing_all(
+            let Some(window_files) = self.files_possibly_containing_all(
                 content_tokens.iter().map(String::as_str),
                 literal_postings,
-            )?;
+            )?
+            else {
+                return Ok(None);
+            };
             bound = union_sorted_ids(&bound, &window_files);
         }
         if let Some(mentions) = declaration_mentions {
@@ -1214,32 +1482,30 @@ impl SearchIndexSnapshot {
                 let named = self.files_possibly_containing_any(
                     content_tokens.iter().map(String::as_str),
                     literal_postings,
-                );
+                )?;
                 let mentioning = self.files_possibly_containing_any(
                     mentions.iter().map(String::as_str),
                     literal_postings,
-                );
+                )?;
                 let declaration_files = match (named, mentioning) {
                     (Some(named), Some(mentioning)) => intersect_sorted_ids(&named, &mentioning),
                     (Some(files), None) | (None, Some(files)) => files,
-                    (None, None) => return None,
+                    (None, None) => return Ok(None),
                 };
                 bound = union_sorted_ids(&bound, &declaration_files);
             }
         }
-        Some(bound)
+        Ok(Some(bound))
     }
 
-    /// Files containing every one of `words`, or `None` when no word is long
-    /// enough to have a trigram.
     fn files_possibly_containing_all<'a>(
         &self,
         words: impl Iterator<Item = &'a str>,
         literal_postings: &mut HashMap<String, Option<Vec<u32>>>,
-    ) -> Option<Vec<u32>> {
+    ) -> std::io::Result<Option<Vec<u32>>> {
         let mut files: Option<Vec<u32>> = None;
         for word in words {
-            let Some(word_files) = self.files_possibly_containing(word, literal_postings) else {
+            let Some(word_files) = self.files_possibly_containing(word, literal_postings)? else {
                 continue;
             };
             files = Some(match files {
@@ -1250,41 +1516,39 @@ impl SearchIndexSnapshot {
                 break;
             }
         }
-        files
+        Ok(files)
     }
 
-    /// Files containing at least one of `words`, or `None` when some word is
-    /// too short to have a trigram and so could be in any file.
     fn files_possibly_containing_any<'a>(
         &self,
         words: impl Iterator<Item = &'a str>,
         literal_postings: &mut HashMap<String, Option<Vec<u32>>>,
-    ) -> Option<Vec<u32>> {
+    ) -> std::io::Result<Option<Vec<u32>>> {
         let mut files = Vec::new();
         for word in words {
-            let word_files = self.files_possibly_containing(word, literal_postings)?;
+            let Some(word_files) = self.files_possibly_containing(word, literal_postings)? else {
+                return Ok(None);
+            };
             files = union_sorted_ids(&files, word_files);
         }
-        Some(files)
+        Ok(Some(files))
     }
 
-    /// The sorted ids of files that may contain `literal`, ASCII
-    /// case-insensitively, from its trigram postings; `None` when the literal
-    /// has no trigram. Lookups are cached per pass because one word can serve
-    /// several kinds of evidence.
     fn files_possibly_containing<'a>(
         &self,
         literal: &str,
         literal_postings: &'a mut HashMap<String, Option<Vec<u32>>>,
-    ) -> Option<&'a Vec<u32>> {
-        literal_postings
-            .entry(literal.to_string())
-            .or_insert_with(|| {
-                let query = decompose_regex(&regex::escape(literal));
-                (!query.and_trigrams.is_empty() || !query.or_groups.is_empty())
-                    .then(|| self.candidates(&query))
-            })
-            .as_ref()
+    ) -> std::io::Result<Option<&'a Vec<u32>>> {
+        if !literal_postings.contains_key(literal) {
+            let query = decompose_regex(&regex::escape(literal));
+            let postings = if !query.and_trigrams.is_empty() || !query.or_groups.is_empty() {
+                Some(self.candidates(&query)?)
+            } else {
+                None
+            };
+            literal_postings.insert(literal.to_string(), postings);
+        }
+        Ok(literal_postings.get(literal).and_then(Option::as_ref))
     }
 }
 
@@ -1314,6 +1578,10 @@ pub struct GrepMatch {
 
 #[derive(Clone, Debug)]
 pub struct GrepResult {
+    /// Index sources whose posting evidence could not be read. Successful
+    /// sources may still supply matches, but their merged reply is incomplete.
+    pub(crate) index_sources_unavailable: bool,
+    pub index_read_gaps: Vec<String>,
     pub matches: Vec<GrepMatch>,
     pub total_matches: usize,
     pub files_searched: usize,
@@ -1699,6 +1967,7 @@ impl SearchIndex {
             base_file_count: 0,
             delta_packed_bytes: 0,
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
+            published_cache: None,
         }
     }
 
@@ -1713,6 +1982,24 @@ impl SearchIndex {
         Self {
             project_root: root.to_path_buf(),
             ready: true,
+            ..Self::new()
+        }
+    }
+
+    /// A read-only index over a snapshot projected from a published view.
+    /// It is never written or persisted; its holder replaces it with the
+    /// next publication instead of applying file changes to it.
+    pub(crate) fn from_view_snapshot(snapshot: SearchIndexSnapshot) -> Self {
+        Self {
+            base: snapshot.base,
+            delta: snapshot.delta,
+            files: snapshot.files,
+            path_to_id: snapshot.path_to_id,
+            ready: snapshot.ready,
+            project_root: snapshot.project_root,
+            max_file_size: snapshot.max_file_size,
+            file_trigram_count: snapshot.file_trigram_count,
+            unindexed_files: snapshot.unindexed_files,
             ..Self::new()
         }
     }
@@ -1969,7 +2256,7 @@ impl SearchIndex {
         let chunk_size = pool_size.saturating_mul(4).clamp(1, 32);
         let pool = match rayon::ThreadPoolBuilder::new()
             .num_threads(pool_size)
-            .thread_name(|index| format!("aft-search-build-{index}"))
+            .thread_name(|index| format!("aft-rayon-search-build-{index}"))
             .stack_size(8 * 1024 * 1024)
             .build()
         {
@@ -2249,7 +2536,7 @@ impl SearchIndex {
         exclude: &[String],
         search_root: &Path,
         max_results: usize,
-    ) -> GrepResult {
+    ) -> std::io::Result<GrepResult> {
         self.snapshot().grep(
             pattern,
             case_sensitive,
@@ -2267,7 +2554,7 @@ impl SearchIndex {
         exclude: &[String],
         search_root: &Path,
         max_results: usize,
-    ) -> GrepResult {
+    ) -> std::io::Result<GrepResult> {
         self.snapshot()
             .search_grep(pattern, include, exclude, search_root, max_results)
     }
@@ -2276,7 +2563,7 @@ impl SearchIndex {
         self.snapshot().glob(pattern, search_root)
     }
 
-    pub fn candidates(&self, query: &RegexQuery) -> Vec<u32> {
+    pub fn candidates(&self, query: &RegexQuery) -> std::io::Result<Vec<u32>> {
         self.snapshot().candidates(query)
     }
 
@@ -2319,6 +2606,12 @@ impl SearchIndex {
                 self.file_trigram_count = Arc::new(plan.file_trigram_count);
                 self.git_head = plan.git_head.filter(|head| !head.is_empty());
                 self.ignore_rules_fingerprint = plan.ignore_fingerprint;
+                self.published_cache = Some(PublishedCache {
+                    cache_dir: cache_dir.to_path_buf(),
+                    git_head: self.git_head.clone().unwrap_or_default(),
+                    ignore_fingerprint: self.ignore_rules_fingerprint.clone(),
+                    max_file_size: self.max_file_size,
+                });
                 true
             }
             Err(error) => {
@@ -2333,6 +2626,9 @@ impl SearchIndex {
     /// a reload would read it rather than rebuild. Reads a few header bytes
     /// only; it does not load or verify postings.
     pub(crate) fn disk_cache_header_valid(cache_dir: &Path) -> bool {
+        if crate::root_cache::check_cache_access(cache_dir).is_err() {
+            return false;
+        }
         (|| -> Option<bool> {
             let cache_file = open_cache_file_read(&cache_dir.join("cache.bin")).ok()?;
             if cache_file.metadata().ok()?.len() < 16 {
@@ -2469,6 +2765,7 @@ impl SearchIndex {
         ignore_rules_load_policy: IgnoreRulesLoadPolicy,
         borrowed_load_budget: Option<&BorrowedIndexLoadBudget>,
     ) -> Option<(Self, bool)> {
+        crate::root_cache::check_cache_access(cache_dir).ok()?;
         debug_assert!(current_canonical_root.is_absolute());
         // A newer build's cache is refused by name before its payload is read;
         // callers see a miss, and every write path refuses to replace it.
@@ -2622,6 +2919,10 @@ impl SearchIndex {
             if unindexed[0] == 1 {
                 unindexed_files.insert(file_id_u32);
             }
+            #[cfg(test)]
+            if borrowed_load_budget.is_some() {
+                note_borrowed_load_record_read_for_test(&project_root);
+            }
         }
 
         if !reader_has_remaining(&mut reader, postings_body_end, 8).ok()? {
@@ -2706,6 +3007,10 @@ impl SearchIndex {
                 offset,
                 count,
             });
+            #[cfg(test)]
+            if borrowed_load_budget.is_some() {
+                note_borrowed_load_record_read_for_test(&project_root);
+            }
         }
 
         let base = BasePostings {
@@ -2751,6 +3056,7 @@ impl SearchIndex {
             base_file_count: u32::try_from(file_count).ok()?,
             delta_packed_bytes: 0,
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
+            published_cache: None,
         };
 
         if migrated_counts && allow_legacy_repair {
@@ -3001,6 +3307,7 @@ impl SearchIndex {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn rebuild_or_refresh_with_strategy(
         root: &Path,
         max_file_size: u64,
@@ -3161,7 +3468,11 @@ impl SearchIndex {
     }
 
     #[cfg(test)]
-    fn postings_for_trigram(&self, trigram: u32, filter: Option<PostingFilter>) -> Vec<u32> {
+    fn postings_for_trigram(
+        &self,
+        trigram: u32,
+        filter: Option<PostingFilter>,
+    ) -> std::io::Result<Vec<u32>> {
         self.snapshot().postings_for_trigram(trigram, filter)
     }
 
@@ -3309,7 +3620,7 @@ impl SearchIndexSnapshot {
         exclude: &[String],
         search_root: &Path,
         max_results: usize,
-    ) -> GrepResult {
+    ) -> std::io::Result<GrepResult> {
         match pattern_compile::compile(
             pattern,
             CompileOpts {
@@ -3321,7 +3632,7 @@ impl SearchIndexSnapshot {
                 self.search_grep(&compiled, include, exclude, search_root, max_results)
             }
             CompileResult::InvalidPattern { .. } | CompileResult::UnsupportedSyntax { .. } => {
-                self.empty_grep_result()
+                Ok(self.empty_grep_result())
             }
         }
     }
@@ -3333,9 +3644,9 @@ impl SearchIndexSnapshot {
         exclude: &[String],
         search_root: &Path,
         max_results: usize,
-    ) -> GrepResult {
+    ) -> std::io::Result<GrepResult> {
         self.search_grep_profiled(pattern, include, exclude, search_root, max_results, None)
-            .0
+            .map(|result| result.0)
     }
 
     pub(crate) fn search_grep_bounded(
@@ -3348,7 +3659,7 @@ impl SearchIndexSnapshot {
         path_exclusion: Option<GrepPathExclusion>,
         max_files: usize,
         budget: Duration,
-    ) -> GrepResult {
+    ) -> std::io::Result<GrepResult> {
         let filters = build_path_filters(include, exclude).unwrap_or_default();
         let query = decompose_grep_pattern(pattern);
         self.search_grep_profiled_with_filters_and_query_and_limits(
@@ -3363,7 +3674,7 @@ impl SearchIndexSnapshot {
             GrepScanOrder::Arrival,
             PATH_ORDER_BATCH_ROW_BUDGET,
         )
-        .0
+        .map(|result| result.0)
     }
 
     pub(crate) fn search_grep_profiled(
@@ -3374,7 +3685,7 @@ impl SearchIndexSnapshot {
         search_root: &Path,
         max_results: usize,
         path_exclusion: Option<GrepPathExclusion>,
-    ) -> (GrepResult, GrepQueryPhaseTimings) {
+    ) -> std::io::Result<(GrepResult, GrepQueryPhaseTimings)> {
         let filters = build_path_filters(include, exclude).unwrap_or_default();
         self.search_grep_profiled_with_filters(
             pattern,
@@ -3392,7 +3703,7 @@ impl SearchIndexSnapshot {
         search_root: &Path,
         max_results: usize,
         path_exclusion: Option<GrepPathExclusion>,
-    ) -> (GrepResult, GrepQueryPhaseTimings) {
+    ) -> std::io::Result<(GrepResult, GrepQueryPhaseTimings)> {
         let query_started = Instant::now();
         let query = decompose_grep_pattern(pattern);
         let query_decomposition = query_started.elapsed();
@@ -3403,9 +3714,9 @@ impl SearchIndexSnapshot {
             search_root,
             max_results,
             path_exclusion,
-        );
+        )?;
         timings.trigram_lookup += query_decomposition;
-        (result, timings)
+        Ok((result, timings))
     }
 
     /// Search with a query decomposed once by the caller and reused across roots.
@@ -3417,7 +3728,7 @@ impl SearchIndexSnapshot {
         search_root: &Path,
         max_results: usize,
         path_exclusion: Option<GrepPathExclusion>,
-    ) -> (GrepResult, GrepQueryPhaseTimings) {
+    ) -> std::io::Result<(GrepResult, GrepQueryPhaseTimings)> {
         self.search_grep_profiled_with_filters_and_query_in_order(
             pattern,
             query,
@@ -3441,7 +3752,7 @@ impl SearchIndexSnapshot {
         max_results: usize,
         path_exclusion: Option<GrepPathExclusion>,
         order: GrepScanOrder,
-    ) -> (GrepResult, GrepQueryPhaseTimings) {
+    ) -> std::io::Result<(GrepResult, GrepQueryPhaseTimings)> {
         self.search_grep_profiled_with_filters_and_query_in_order_with_row_budget(
             pattern,
             query,
@@ -3468,7 +3779,7 @@ impl SearchIndexSnapshot {
         path_exclusion: Option<GrepPathExclusion>,
         order: GrepScanOrder,
         row_budget: usize,
-    ) -> (GrepResult, GrepQueryPhaseTimings) {
+    ) -> std::io::Result<(GrepResult, GrepQueryPhaseTimings)> {
         self.search_grep_profiled_with_filters_and_query_and_limits(
             pattern,
             query,
@@ -3500,7 +3811,7 @@ impl SearchIndexSnapshot {
         scan_budget: Duration,
         order: GrepScanOrder,
         row_budget: usize,
-    ) -> (GrepResult, GrepQueryPhaseTimings) {
+    ) -> std::io::Result<(GrepResult, GrepQueryPhaseTimings)> {
         self.search_grep_profiled_with_filters_and_query_and_limits_with_deadline(
             pattern,
             query,
@@ -3529,7 +3840,7 @@ impl SearchIndexSnapshot {
         make_deadline: impl FnOnce() -> GrepScanDeadline,
         order: GrepScanOrder,
         row_budget: usize,
-    ) -> (GrepResult, GrepQueryPhaseTimings) {
+    ) -> std::io::Result<(GrepResult, GrepQueryPhaseTimings)> {
         let _io_scope = crate::bounded_io::enter_if_absent(scan_budget);
         let matcher = match pattern {
             CompiledPattern::Literal(literal) => SearchMatcher::Literal(literal.clone()),
@@ -3541,7 +3852,7 @@ impl SearchIndexSnapshot {
         let job_cancellation = crate::executor::current_job_cancellation();
         let trigram_started = Instant::now();
         let fully_degraded = query.and_trigrams.is_empty() && query.or_groups.is_empty();
-        let candidate_ids = self.candidates(query);
+        let candidate_ids = self.candidates(query)?;
         let trigram_lookup = trigram_started.elapsed();
 
         let candidate_filter_started = Instant::now();
@@ -3578,6 +3889,7 @@ impl SearchIndexSnapshot {
         let stop_scan = Arc::new(AtomicBool::new(false));
         let deadline = make_deadline();
         let io_budget = crate::bounded_io::current();
+        let floor_disclosure = crate::context::confinement::capture();
         let verification_claims = AtomicUsize::new(0);
         let claim_verification = || {
             let Some(max_files) = max_files else {
@@ -3621,6 +3933,7 @@ impl SearchIndexSnapshot {
                             let file_truncated = AtomicBool::new(false);
                             let rows = search_candidate_file(
                                 file,
+                                &floor_disclosure,
                                 &matcher,
                                 allowance,
                                 allowance,
@@ -3648,6 +3961,7 @@ impl SearchIndexSnapshot {
                     let file_truncated = AtomicBool::new(false);
                     let rows = search_candidate_file(
                         batch[file],
+                        &floor_disclosure,
                         &matcher,
                         need,
                         need,
@@ -3717,6 +4031,7 @@ impl SearchIndexSnapshot {
                         }
                         search_candidate_file(
                             file,
+                            &floor_disclosure,
                             &matcher,
                             max_results,
                             stop_after,
@@ -3750,6 +4065,7 @@ impl SearchIndexSnapshot {
                 }
                 matches.extend(search_candidate_file(
                     file,
+                    &floor_disclosure,
                     &matcher,
                     max_results,
                     stop_after,
@@ -3801,6 +4117,8 @@ impl SearchIndexSnapshot {
             .collect();
 
         let result = GrepResult {
+            index_sources_unavailable: false,
+            index_read_gaps: Vec::new(),
             total_matches: total_matches.load(Ordering::Relaxed),
             matches,
             files_searched: files_searched.load(Ordering::Relaxed),
@@ -3828,7 +4146,7 @@ impl SearchIndexSnapshot {
             candidate_count,
             bytes_verified: bytes_verified.load(Ordering::Relaxed),
         };
-        (result, phases)
+        Ok((result, phases))
     }
 
     /// Find every matching line in the candidate files the trigram index admits,
@@ -3852,7 +4170,7 @@ impl SearchIndexSnapshot {
         limits: GrepExaminationLimits,
         examine_priority: &(dyn Fn(&Path) -> u8 + Sync),
         keep_past_limit: &(dyn Fn(&GrepMatch) -> bool + Sync),
-    ) -> GrepFileCollection {
+    ) -> std::io::Result<GrepFileCollection> {
         let matcher = match pattern {
             CompiledPattern::Literal(literal) => SearchMatcher::Literal(literal.clone()),
             CompiledPattern::Regex { compiled, .. } => SearchMatcher::Regex(compiled.clone()),
@@ -3862,7 +4180,7 @@ impl SearchIndexSnapshot {
         let fully_degraded = query.and_trigrams.is_empty() && query.or_groups.is_empty();
 
         let mut candidates: Vec<(u8, &FileEntry)> = self
-            .candidates(&query)
+            .candidates(&query)?
             .into_iter()
             .filter_map(|file_id| self.files.get(file_id as usize))
             .filter(|file| !file.path.as_os_str().is_empty())
@@ -3938,7 +4256,7 @@ impl SearchIndexSnapshot {
             .filter_map(|file| file)
             .collect();
 
-        GrepFileCollection {
+        Ok(GrepFileCollection {
             files,
             candidate_files,
             files_examined: files_examined.load(Ordering::Relaxed),
@@ -3951,11 +4269,13 @@ impl SearchIndexSnapshot {
                 IndexStatus::Building
             },
             missing_on_disk: missing_on_disk.load(Ordering::Relaxed),
-        }
+        })
     }
 
     fn empty_grep_result(&self) -> GrepResult {
         GrepResult {
+            index_sources_unavailable: false,
+            index_read_gaps: Vec::new(),
             matches: Vec::new(),
             total_matches: 0,
             files_searched: 0,
@@ -4054,19 +4374,21 @@ impl SearchIndexSnapshot {
         )
     }
 
-    pub fn candidates(&self, query: &RegexQuery) -> Vec<u32> {
+    pub fn candidates(&self, query: &RegexQuery) -> std::io::Result<Vec<u32>> {
         if query.and_trigrams.is_empty() && query.or_groups.is_empty() {
-            return self.active_file_ids();
+            return Ok(self.active_file_ids());
         }
 
         let mut and_trigrams = query.and_trigrams.clone();
-        and_trigrams.sort_unstable_by_key(|trigram| self.posting_count(*trigram));
+        // Each count may read the base lookup table, so compute it once per
+        // trigram rather than once per comparison.
+        and_trigrams.sort_by_cached_key(|trigram| self.posting_count(*trigram));
 
         let mut current: Option<Vec<u32>> = None;
 
         for trigram in and_trigrams {
             let filter = query.and_filters.get(&trigram).copied();
-            let matches = self.postings_for_trigram(trigram, filter);
+            let matches = self.postings_for_trigram(trigram, filter)?;
             current = Some(match current.take() {
                 Some(existing) => intersect_sorted_ids(&existing, &matches),
                 None => matches,
@@ -4085,7 +4407,7 @@ impl SearchIndexSnapshot {
 
             for trigram in group {
                 let filter = filters.and_then(|filters| filters.get(trigram).copied());
-                let matches = self.postings_for_trigram(*trigram, filter);
+                let matches = self.postings_for_trigram(*trigram, filter)?;
                 if group_matches.is_empty() {
                     group_matches = matches;
                 } else {
@@ -4110,10 +4432,12 @@ impl SearchIndexSnapshot {
             current = union_sorted_ids(&current, &unindexed);
         }
 
-        current
+        Ok(current)
     }
 
     fn posting_count(&self, trigram: u32) -> usize {
+        #[cfg(test)]
+        POSTING_COUNT_CALLS.with(|calls| calls.set(calls.get() + 1));
         let base_count = self
             .base
             .as_ref()
@@ -4130,6 +4454,8 @@ impl SearchIndexSnapshot {
     }
 
     fn is_active_file(&self, file_id: u32) -> bool {
+        #[cfg(test)]
+        SUPERSEDED_LOOKUPS.with(|count| count.set(count.get() + 1));
         if self.delta.superseded.contains(&file_id) {
             return false;
         }
@@ -4139,12 +4465,14 @@ impl SearchIndexSnapshot {
             .unwrap_or(false)
     }
 
-    fn postings_for_trigram(&self, trigram: u32, filter: Option<PostingFilter>) -> Vec<u32> {
+    fn postings_for_trigram(
+        &self,
+        trigram: u32,
+        filter: Option<PostingFilter>,
+    ) -> std::io::Result<Vec<u32>> {
         #[cfg(debug_assertions)]
         POSTINGS_FOR_TRIGRAM_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
-
         let mut matches = Vec::new();
-
         if let Some(base_entry) = self
             .base
             .as_ref()
@@ -4152,12 +4480,19 @@ impl SearchIndexSnapshot {
         {
             if let Some(base) = &self.base {
                 matches.reserve(base_entry.count as usize);
-                let _ = base.for_each_posting(base_entry, |file_id, next_mask, loc_mask| {
-                    if crate::executor::current_job_cancelled() {
-                        return false;
-                    }
-                    if self.delta.superseded.contains(&file_id) {
-                        return true;
+                let mut posting_index = 0usize;
+                base.for_each_posting(base_entry, |file_id, next_mask, loc_mask| {
+                    // Check cancellation on the same 64-record cadence as the
+                    // delta loop below. Superseded files are dropped by
+                    // `is_active_file`, so no separate lookup is needed here.
+                    let checkpoint = posting_index % BORROWED_INDEX_CHECKPOINT_INTERVAL == 0;
+                    posting_index += 1;
+                    if checkpoint {
+                        #[cfg(test)]
+                        BASE_CANCELLATION_CHECKS.with(|count| count.set(count.get() + 1));
+                        if crate::executor::current_job_cancelled() {
+                            return false;
+                        }
                     }
                     let posting = Posting {
                         file_id,
@@ -4171,10 +4506,12 @@ impl SearchIndexSnapshot {
                         matches.push(file_id);
                     }
                     true
-                });
+                }).map_err(|error| std::io::Error::new(error.kind(), format!(
+                    "lexical postings read failed for trigram {trigram:#08x} ({} stored file records): {error}",
+                    base_entry.count,
+                )))?;
             }
         }
-
         if let Some(postings) = self.delta.postings.get(&trigram) {
             matches.reserve(postings.len());
             for (posting_index, posting) in postings.iter().enumerate() {
@@ -4191,12 +4528,11 @@ impl SearchIndexSnapshot {
                 }
             }
         }
-
         if matches.len() > 1 {
             matches.sort_unstable();
             matches.dedup();
         }
-        matches
+        Ok(matches)
     }
 }
 
@@ -4228,6 +4564,7 @@ enum MatchVisit {
 
 fn search_candidate_file(
     file: &FileEntry,
+    floor_disclosure: &crate::context::confinement::Fence,
     matcher: &SearchMatcher,
     max_results: usize,
     stop_after: usize,
@@ -4257,6 +4594,9 @@ fn search_candidate_file(
     let content = match read_indexed_file_bytes(&file.path, deadline.read_at) {
         Ok(content) => content,
         Err(error) => {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                floor_disclosure.record_matched_source_exclusion(&file.path);
+            }
             if error.kind() == std::io::ErrorKind::TimedOut {
                 deadline.reached.store(true, Ordering::Relaxed);
                 engine_capped.store(true, Ordering::Relaxed);
@@ -4605,7 +4945,7 @@ fn read_search_corpus_file_with_metadata(
     }
 
     #[cfg(test)]
-    crate::search_hot_path_measurements::record_file_read();
+    crate::search_hot_path_measurements::record_file_read_path(path);
     // Bound the read itself as well as admission: the file can grow after stat.
     let mut bytes =
         Vec::with_capacity(usize::try_from(metadata.size.min(max_file_size)).unwrap_or(0));
@@ -4933,6 +5273,10 @@ impl PartialOrd for HeapItem {
 type RefreshReadProbe = (Arc<AtomicUsize>, Arc<AtomicBool>);
 #[cfg(test)]
 static REFRESH_READ_PROBES: OnceLock<Mutex<BTreeMap<PathBuf, RefreshReadProbe>>> = OnceLock::new();
+#[cfg(test)]
+thread_local! {
+    static FAIL_STREAMING_BUILD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[cfg(test)]
 fn note_refresh_read_for_test(root: &Path) {
@@ -4960,22 +5304,25 @@ fn build_streaming_index(
         crate::cold_build_limiter::progress::StartLog::Info,
     );
     crate::cold_build_limiter::progress::phase("enumerating", None);
+    #[cfg(test)]
+    if FAIL_STREAMING_BUILD.replace(false) {
+        return Err(std::io::Error::other("injected streaming cache failure"));
+    }
     crate::private_storage::open_keyed_dir(cache_dir, "index")?;
     sweep_stale_search_build_dirs(cache_dir);
     let project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let ignore_fingerprint = ignore_rules_fingerprint_cancellable(&project_root, keep_going)
         .ok_or(std::io::ErrorKind::Interrupted)?;
     let filters = PathFilters::default();
-    let paths =
-        walk_build_files_cancellable(&project_root, &filters, keep_going).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Interrupted, "search refresh superseded")
-        })?;
-    crate::cold_build_limiter::progress::phase("indexing", Some(paths.len()));
+    let mut walk = BuildFileWalk::new(&project_root, &filters);
+    // The walk and the indexing now run together, so the file total is known
+    // only once the walk ends; it is reported then.
+    crate::cold_build_limiter::progress::phase("indexing", None);
     let pool_size = search_index_build_pool_size();
     let chunk_size = pool_size.saturating_mul(4).clamp(1, 32);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(pool_size)
-        .thread_name(|index| format!("aft-search-build-{index}"))
+        .thread_name(|index| format!("aft-rayon-search-build-{index}"))
         .stack_size(8 * 1024 * 1024)
         .build()
         .ok();
@@ -4994,8 +5341,20 @@ fn build_streaming_index(
     let mut file_trigram_count = Vec::new();
     let mut indexed = 0usize;
 
+    // Read once at publish time and shared by the written cache and the
+    // returned index, so the two always agree on HEAD.
+    let mut git_head: Option<String> = None;
     let build_result = (|| -> std::io::Result<BasePostings> {
-        for chunk in paths.chunks(chunk_size) {
+        while !walk.is_finished() {
+            let chunk = walk.next_chunk(chunk_size, keep_going).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::Interrupted, "search refresh superseded")
+            })?;
+            if walk.is_finished() {
+                crate::cold_build_limiter::progress::remaining(chunk.len());
+            }
+            if chunk.is_empty() {
+                continue;
+            }
             if !keep_going() {
                 return Err(std::io::ErrorKind::Interrupted.into());
             }
@@ -5019,18 +5378,22 @@ fn build_streaming_index(
                 None => prepare_chunk(),
             };
 
-            for (path, prepared) in chunk.iter().zip(prepared) {
+            let chunk_len = chunk.len();
+            for (mut path, prepared) in chunk.into_iter().zip(prepared) {
+                // The walk's paths carry spare capacity. The index keeps them
+                // for its lifetime, so trim them to their length first.
+                path.shrink_to_fit();
                 match prepared {
                     PreparedSearchPath::Indexed(file) => {
                         let file_id = u32::try_from(files.len())
                             .map_err(|_| std::io::Error::other("too many files to index"))?;
+                        path_to_id.insert(path.clone(), file_id);
                         files.push(FileEntry {
-                            path: path.clone(),
+                            path,
                             size: file.metadata.size,
                             modified: file.metadata.modified,
                             content_hash: file.content_hash,
                         });
-                        path_to_id.insert(path.clone(), file_id);
                         file_trigram_count.push(file.trigram_map.len() as u32);
                         for (trigram, filter) in file.trigram_map {
                             block.push(SpillRecord {
@@ -5045,13 +5408,13 @@ fn build_streaming_index(
                     PreparedSearchPath::Unindexed(metadata) => {
                         let file_id = u32::try_from(files.len())
                             .map_err(|_| std::io::Error::other("too many files to index"))?;
+                        path_to_id.insert(path.clone(), file_id);
                         files.push(FileEntry {
-                            path: path.clone(),
+                            path,
                             size: metadata.size,
                             modified: metadata.modified,
                             content_hash: cache_freshness::zero_hash(),
                         });
-                        path_to_id.insert(path.clone(), file_id);
                         unindexed_files.insert(file_id);
                         file_trigram_count.push(0);
                         indexed += 1;
@@ -5067,7 +5430,7 @@ fn build_streaming_index(
                     spill_seq += 1;
                 }
             }
-            crate::cold_build_limiter::progress::advance(chunk.len());
+            crate::cold_build_limiter::progress::advance(chunk_len);
         }
 
         crate::cold_build_limiter::progress::phase("publishing", None);
@@ -5080,38 +5443,47 @@ fn build_streaming_index(
             sources.push(Box::new(SpillSegmentSource::open(path)?));
         }
 
+        git_head = current_git_head(&project_root);
+        // The tables move into the plan and back out after the write. Cloning
+        // them held a second copy of every path while the cache was written.
         let plan = CacheWritePlan {
             project_root: project_root.clone(),
-            git_head: current_git_head(&project_root),
+            git_head: git_head.clone(),
             ignore_fingerprint: ignore_fingerprint.clone(),
             max_file_size,
-            files: files.clone(),
-            path_to_id: path_to_id.clone(),
-            unindexed_files: unindexed_files.clone(),
-            file_trigram_count: file_trigram_count.clone(),
-            id_map: Arc::new(
-                (0..files.len())
-                    .filter_map(|id| {
-                        let id = u32::try_from(id).ok()?;
-                        Some((id, id))
-                    })
-                    .collect(),
-            ),
+            files: std::mem::take(&mut files),
+            path_to_id: std::mem::take(&mut path_to_id),
+            unindexed_files: std::mem::take(&mut unindexed_files),
+            file_trigram_count: std::mem::take(&mut file_trigram_count),
+            // Only a rewrite of an existing index renumbers files. A cold
+            // build's ids are already the cache's ids, and the writer never
+            // reads this map, so it stays empty.
+            id_map: Arc::new(HashMap::new()),
         };
-        write_cache_file_from_sources(
+        let written = write_cache_file_from_sources(
             cache_dir,
             &plan,
             &mut sources,
             crate::write_ledger::Domain::SearchIndexBuild,
             keep_going,
-        )
+        );
+        files = plan.files;
+        path_to_id = plan.path_to_id;
+        unindexed_files = plan.unindexed_files;
+        file_trigram_count = plan.file_trigram_count;
+        written
     })();
 
     let _ = fs::remove_dir_all(&spill_dir);
     let base = build_result?;
     let base_file_count =
         u32::try_from(files.len()).map_err(|_| std::io::Error::other("too many files to index"))?;
-    let git_head = current_git_head(&project_root);
+    let published_cache = Some(PublishedCache {
+        cache_dir: cache_dir.to_path_buf(),
+        git_head: git_head.clone().unwrap_or_default(),
+        ignore_fingerprint: ignore_fingerprint.clone(),
+        max_file_size,
+    });
     let index = SearchIndex {
         base: Some(Arc::new(base)),
         delta: Arc::new(DeltaState::default()),
@@ -5130,6 +5502,7 @@ fn build_streaming_index(
         base_file_count,
         delta_packed_bytes: 0,
         compaction_state: Arc::new(Mutex::new(CompactionState::default())),
+        published_cache,
     };
     Ok((index, indexed))
 }
@@ -5170,8 +5543,7 @@ fn write_cache_file_from_sources(
         write_u64(&mut writer, 0)?;
 
         let postings_section_start = writer.stream_position()?;
-        let postings_header = build_postings_header_bytes(plan, keep_going)?;
-        write_search_build_bytes(&mut writer, &postings_header, keep_going)?;
+        write_postings_header(&mut writer, plan, keep_going)?;
         let postings_blob_len_patch = writer.stream_position()?;
         write_u64(&mut writer, 0)?;
         let postings_blob_start = writer.stream_position()?;
@@ -5210,14 +5582,18 @@ fn write_cache_file_from_sources(
         drop(writer);
 
         check_search_build(keep_going)?;
-        fs::rename(&tmp_cache, &cache_path)?;
-        // Credit the bytes handed to the kernel; this cache is not a durable log.
-        crate::write_ledger::credit(
-            domain,
-            plan.project_root.display().to_string(),
-            file_bytes,
-            file_bytes,
-        );
+        publish_legacy_search_cache(|| {
+            fs::rename(&tmp_cache, &cache_path)?;
+            // Account inside the publication fence so a completed views bind
+            // cannot be followed by credit for an older legacy publication.
+            crate::write_ledger::credit(
+                domain,
+                plan.project_root.display().to_string(),
+                file_bytes,
+                file_bytes,
+            );
+            Ok(())
+        })?;
         let file = open_cache_file_read(&cache_path)?;
         Ok(BasePostings {
             file: Arc::new(file),
@@ -5314,14 +5690,16 @@ fn write_search_build_bytes(
     Ok(())
 }
 
-fn build_postings_header_bytes(
+/// Writes the file table straight to the cache writer. Building it in memory
+/// first held another copy of every relative path while the cache was written.
+fn write_postings_header(
+    writer: &mut impl Write,
     plan: &CacheWritePlan,
     keep_going: &dyn Fn() -> bool,
-) -> std::io::Result<Vec<u8>> {
+) -> std::io::Result<()> {
     check_search_build(keep_going)?;
-    let mut writer = BufWriter::new(Cursor::new(Vec::new()));
     writer.write_all(INDEX_MAGIC)?;
-    write_u32(&mut writer, INDEX_VERSION)?;
+    write_u32(writer, INDEX_VERSION)?;
 
     let head = plan.git_head.as_deref().unwrap_or_default();
     let root = plan.project_root.to_string_lossy();
@@ -5334,11 +5712,11 @@ fn build_postings_header_bytes(
     let file_count = u32::try_from(plan.files.len())
         .map_err(|_| std::io::Error::other("too many files to cache"))?;
 
-    write_u32(&mut writer, head_len)?;
-    write_u32(&mut writer, root_len)?;
-    write_u32(&mut writer, ignore_fingerprint_len)?;
-    write_u64(&mut writer, plan.max_file_size)?;
-    write_u32(&mut writer, file_count)?;
+    write_u32(writer, head_len)?;
+    write_u32(writer, root_len)?;
+    write_u32(writer, ignore_fingerprint_len)?;
+    write_u64(writer, plan.max_file_size)?;
+    write_u32(writer, file_count)?;
     writer.write_all(head.as_bytes())?;
     writer.write_all(root.as_bytes())?;
     writer.write_all(plan.ignore_fingerprint.as_bytes())?;
@@ -5369,19 +5747,15 @@ fn build_postings_header_bytes(
         };
 
         writer.write_all(&[unindexed])?;
-        write_u32(&mut writer, path_len)?;
-        write_u64(&mut writer, file.size)?;
-        write_u64(&mut writer, modified.as_secs())?;
-        write_u32(&mut writer, modified.subsec_nanos())?;
+        write_u32(writer, path_len)?;
+        write_u64(writer, file.size)?;
+        write_u64(writer, modified.as_secs())?;
+        write_u32(writer, modified.subsec_nanos())?;
         writer.write_all(file.content_hash.as_bytes())?;
         writer.write_all(path.as_bytes())?;
     }
 
-    writer.flush()?;
-    Ok(writer
-        .into_inner()
-        .map_err(|error| std::io::Error::other(error.to_string()))?
-        .into_inner())
+    Ok(())
 }
 
 fn build_lookup_section_bytes(
@@ -6213,30 +6587,40 @@ pub fn query_trigrams_from_tokens(tokens: &[&str]) -> Vec<u32> {
     out
 }
 
-pub fn lexical_score(index: &SearchIndex, query_trigrams: &[u32], file_id: u32) -> f32 {
+pub fn lexical_score(
+    index: &SearchIndex,
+    query_trigrams: &[u32],
+    file_id: u32,
+) -> std::io::Result<f32> {
     lexical_score_snapshot(&index.snapshot(), query_trigrams, file_id)
 }
 
 fn materialize_query_postings(
     index: &SearchIndexSnapshot,
     query_trigrams: &[u32],
-) -> HashMap<u32, Vec<u32>> {
+) -> std::io::Result<HashMap<u32, Vec<u32>>> {
     let mut postings_by_trigram = HashMap::with_capacity(query_trigrams.len());
     for &trigram in query_trigrams {
-        postings_by_trigram
-            .entry(trigram)
-            .or_insert_with(|| index.postings_for_trigram(trigram, None));
+        if let std::collections::hash_map::Entry::Vacant(entry) = postings_by_trigram.entry(trigram)
+        {
+            entry.insert(index.postings_for_trigram(trigram, None)?);
+        }
     }
-    postings_by_trigram
+    Ok(postings_by_trigram)
 }
 
 fn lexical_score_snapshot(
     index: &SearchIndexSnapshot,
     query_trigrams: &[u32],
     file_id: u32,
-) -> f32 {
-    let postings_by_trigram = materialize_query_postings(index, query_trigrams);
-    lexical_score_from_postings(index, query_trigrams, &postings_by_trigram, file_id)
+) -> std::io::Result<f32> {
+    let postings_by_trigram = materialize_query_postings(index, query_trigrams)?;
+    Ok(lexical_score_from_postings(
+        index,
+        query_trigrams,
+        &postings_by_trigram,
+        file_id,
+    ))
 }
 
 fn lexical_score_from_postings(
@@ -6302,7 +6686,7 @@ fn lexical_rank_with_stats_reference(
 
     let mut candidate_ids = BTreeSet::new();
     for (trigram, _) in non_zero.iter().take(selected_count) {
-        candidate_ids.extend(index.postings_for_trigram(*trigram, None));
+        candidate_ids.extend(index.postings_for_trigram(*trigram, None).unwrap());
     }
     let pre_filter_candidate_count = candidate_ids.len();
     let engine_capped = pre_filter_candidate_count > candidate_cap;
@@ -6349,7 +6733,7 @@ fn lexical_score_snapshot_reference(
 
     let mut hits = 0u32;
     for &trigram in query_trigrams {
-        let postings = index.postings_for_trigram(trigram, None);
+        let postings = index.postings_for_trigram(trigram, None).unwrap();
         if postings.binary_search(&file_id).is_ok() {
             hits += 1;
         }
@@ -6390,29 +6774,65 @@ pub(crate) fn walk_project_files(root: &Path, filters: &PathFilters) -> Vec<Path
         .expect("unbounded project walk cannot exceed a file limit")
 }
 
+/// The cold build's file walk, read a chunk at a time. The streaming build
+/// indexes each chunk before asking for the next one, so it never holds the
+/// whole root's path list: on a root with a million files that list alone was
+/// several hundred megabytes. Files come out in the same order as one
+/// collected walk, so file ids and the written cache do not change.
+struct BuildFileWalk<'a> {
+    root: &'a Path,
+    filters: &'a PathFilters,
+    walker: ignore::Walk,
+    finished: bool,
+}
+
+impl<'a> BuildFileWalk<'a> {
+    fn new(root: &'a Path, filters: &'a PathFilters) -> Self {
+        Self {
+            root,
+            filters,
+            walker: project_walk_builder(root).build(),
+            finished: false,
+        }
+    }
+
+    /// True once the walk has returned its last file.
+    fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// The next `max` admitted files, or fewer when the walk ends first.
+    /// `keep_going` is checked before every walk entry, as the collected walk
+    /// did, and a cancelled walk returns `None`.
+    fn next_chunk(&mut self, max: usize, keep_going: &dyn Fn() -> bool) -> Option<Vec<PathBuf>> {
+        let mut paths = Vec::new();
+        while paths.len() < max && !self.finished {
+            if !keep_going() {
+                return None;
+            }
+            let Some(entry) = self.walker.next() else {
+                self.finished = true;
+                break;
+            };
+            let Ok(entry) = entry else {
+                continue;
+            };
+            if entry.file_type().is_some_and(|kind| kind.is_file())
+                && self.filters.matches(self.root, entry.path())
+            {
+                paths.push(entry.into_path());
+            }
+        }
+        Some(paths)
+    }
+}
+
 fn walk_build_files_cancellable(
     root: &Path,
     filters: &PathFilters,
     keep_going: &dyn Fn() -> bool,
 ) -> Option<Vec<PathBuf>> {
-    let mut paths = Vec::new();
-    let mut walker = project_walk_builder(root).build();
-    loop {
-        if !keep_going() {
-            return None;
-        }
-        let Some(entry) = walker.next() else {
-            return Some(paths);
-        };
-        let Ok(entry) = entry else {
-            continue;
-        };
-        if entry.file_type().is_some_and(|kind| kind.is_file())
-            && filters.matches(root, entry.path())
-        {
-            paths.push(entry.into_path());
-        }
-    }
+    BuildFileWalk::new(root, filters).next_chunk(usize::MAX, keep_going)
 }
 
 pub fn walk_project_files_bounded_default(
@@ -6452,6 +6872,8 @@ where
     )
 }
 
+// Only the ordering regression needs the unfiltered, mtime-sorted walk.
+#[cfg(test)]
 pub(crate) fn walk_project_files_from(
     filter_root: &Path,
     search_root: &Path,
@@ -6459,6 +6881,28 @@ pub(crate) fn walk_project_files_from(
 ) -> Vec<PathBuf> {
     walk_project_files_from_inner(filter_root, search_root, filters, None, true)
         .expect("unbounded project walk cannot exceed a file limit")
+}
+
+/// Enumerate the same live tree and order as `walk_project_files_from`, but
+/// retain only matching paths before building metadata and display sort keys.
+pub(crate) fn walk_project_files_from_matching<F>(
+    filter_root: &Path,
+    search_root: &Path,
+    filters: &PathFilters,
+    matches_file: F,
+) -> Vec<PathBuf>
+where
+    F: Fn(&Path) -> bool,
+{
+    walk_project_files_from_inner_matching(
+        filter_root,
+        search_root,
+        filters,
+        None,
+        matches_file,
+        true,
+    )
+    .expect("unbounded project walk cannot exceed a file limit")
 }
 
 fn walk_project_files_from_inner(
@@ -6509,10 +6953,35 @@ fn project_walk_builder_pruned(
     // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
     // the daemon, so never open directories outside this walk root's filesystem.
     builder.same_file_system(true).hidden(false);
+    // Nested linked worktrees of this repository index again under their own
+    // roots; prune them here so every walk sharing this builder skips them.
+    // The named root itself is always admitted (depth 0), so an explicitly
+    // targeted walk inside a worktree still reads it.
+    let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(search_root);
     crate::context::apply_project_ignore_rules(&mut builder, search_root).filter_entry(
-        move |entry| project_walk_admits_entry(entry, excludes) && descend(entry.path()),
+        move |entry| {
+            project_walk_admits_entry(entry, excludes)
+                && descend(entry.path())
+                && !is_nested_worktree_entry(entry, &worktrees)
+        },
     );
     builder
+}
+
+/// True when `entry` is a directory below the walk root that is itself a
+/// nested linked worktree of this repository, which the walk must prune.
+/// Shared by every walker built on the project walk; the depth check keeps
+/// an explicitly named root (depth 0) admitted.
+pub(crate) fn is_nested_worktree_entry(
+    entry: &ignore::DirEntry,
+    worktrees: &crate::project_content::NestedWorktreeBoundary,
+) -> bool {
+    entry.depth() > 0
+        && entry
+            .file_type()
+            .as_ref()
+            .is_some_and(std::fs::FileType::is_dir)
+        && worktrees.is_nested_worktree_root(entry.path())
 }
 
 /// The membership rule the project walk applies to each entry on top of the
@@ -6954,8 +7423,12 @@ where
 {
     let builder = project_walk_builder(search_root);
 
+    #[cfg(test)]
+    crate::search_hot_path_measurements::record(|counts| counts.project_walks += 1);
     let mut files = Vec::new();
     for entry in builder.build().filter_map(|entry| entry.ok()) {
+        #[cfg(test)]
+        crate::search_hot_path_measurements::record(|counts| counts.project_walk_entries += 1);
         if !entry
             .file_type()
             .map_or(false, |file_type| file_type.is_file())
@@ -6964,6 +7437,8 @@ where
         }
         let path = entry.into_path();
         if filters.matches(filter_root, &path) && matches_file(&path) {
+            #[cfg(test)]
+            crate::search_hot_path_measurements::record(|counts| counts.project_walk_files += 1);
             files.push(path);
             if max_files.is_some_and(|limit| files.len() > limit) {
                 return Err(files.len());
@@ -6988,7 +7463,7 @@ pub(crate) fn read_searchable_text(path: &Path) -> Option<String> {
 /// Read an indexed file for grep verification. Keep the original I/O error so
 /// callers distinguish a missing entry from blocked access or a scan timeout.
 fn read_indexed_file_bytes(path: &Path, deadline: Option<Instant>) -> std::io::Result<Vec<u8>> {
-    crate::bounded_io::read(path, deadline)
+    crate::project_content::read_bounded(path, deadline, false)
 }
 
 /// Whether an I/O error says the path does not exist (including a path whose
@@ -7042,9 +7517,27 @@ pub(crate) fn take_present_on_disk<T>(
     path_of: impl Fn(&T) -> &Path,
     surface: &str,
 ) -> PresentOnDisk<T> {
+    match take_present_on_disk_with_admission(items, limit, path_of, surface, |_| {
+        Ok::<_, std::convert::Infallible>(true)
+    }) {
+        Ok((present, _)) => present,
+        Err(error) => match error {},
+    }
+}
+
+/// Apply admission only to the bounded page/refill window. The untouched tail
+/// remains unexamined, so callers cannot advertise it as an admitted total.
+pub(crate) fn take_present_on_disk_with_admission<T, E>(
+    items: impl IntoIterator<Item = T>,
+    limit: usize,
+    path_of: impl Fn(&T) -> &Path,
+    surface: &str,
+    mut admit: impl FnMut(&T) -> Result<bool, E>,
+) -> Result<(PresentOnDisk<T>, usize), E> {
     let stat_budget = limit.saturating_add(MISSING_ON_DISK_REFILL_BUDGET);
     let mut present = Vec::new();
     let mut dropped = 0usize;
+    let mut rejected = 0usize;
     let mut unexamined = 0usize;
     let mut stats = 0usize;
     let mut budget_exhausted = false;
@@ -7065,8 +7558,10 @@ pub(crate) fn take_present_on_disk<T>(
             if dropped_examples.len() < 3 {
                 dropped_examples.push(path_of(&item).display().to_string());
             }
-        } else {
+        } else if admit(&item)? {
             present.push(item);
+        } else {
+            rejected += 1;
         }
     }
     if dropped > 0 {
@@ -7075,12 +7570,15 @@ pub(crate) fn take_present_on_disk<T>(
             dropped_examples.join(", ")
         );
     }
-    PresentOnDisk {
-        present,
-        dropped,
-        unexamined,
-        budget_exhausted,
-    }
+    Ok((
+        PresentOnDisk {
+            present,
+            dropped,
+            unexamined,
+            budget_exhausted,
+        },
+        rejected,
+    ))
 }
 
 pub(crate) fn relative_to_root(root: &Path, path: &Path) -> PathBuf {
@@ -7660,7 +8158,344 @@ pub(crate) fn artifact_cache_key_for_bind_profiled(
     Ok(Some(key))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LegacyMemoStamp {
+    identity: crate::file_identity::FileIdentity,
+    len: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+
+impl LegacyMemoStamp {
+    fn new(metadata: &fs::Metadata, identity: crate::file_identity::FileIdentity) -> Option<Self> {
+        if identity == crate::file_identity::FileIdentity::Unavailable {
+            return None;
+        }
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Some(Self {
+            identity,
+            len: metadata.len(),
+            modified: metadata.modified().ok()?,
+            #[cfg(unix)]
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+
+    fn at(path: &Path) -> Option<Self> {
+        let (metadata, identity) = crate::file_identity::metadata(path).ok()?;
+        Self::new(&metadata, identity)
+    }
+
+    fn of_file(file: &File) -> Option<Self> {
+        Self::new(
+            &file.metadata().ok()?,
+            crate::file_identity::FileIdentity::of_file(file),
+        )
+    }
+}
+
+struct LegacyMemoIndex {
+    stamp: Option<LegacyMemoStamp>,
+    built_at: Instant,
+    entries: Vec<(String, ArtifactCacheKeyMemoEntry, PathBuf)>,
+    aliases: BTreeMap<PathBuf, Vec<usize>>,
+}
+
+fn canonical_legacy_memo_spelling(spelling: &str) -> PathBuf {
+    #[cfg(test)]
+    LEGACY_MEMO_CANONICALIZATIONS.with(|count| count.set(count.get() + 1));
+    crate::root_identity::canonical_root(Path::new(spelling))
+}
+
+impl LegacyMemoIndex {
+    fn build(
+        entries: BTreeMap<String, ArtifactCacheKeyMemoEntry>,
+        stamp: Option<LegacyMemoStamp>,
+    ) -> Self {
+        #[cfg(test)]
+        LEGACY_MEMO_BUILDS.with(|count| count.set(count.get() + 1));
+        let mut aliases: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
+        let entries = entries
+            .into_iter()
+            .enumerate()
+            .map(|(index, (spelling, entry))| {
+                let canonical = canonical_legacy_memo_spelling(&spelling);
+                aliases.entry(canonical.clone()).or_default().push(index);
+                (spelling, entry, canonical)
+            })
+            .collect();
+        Self {
+            stamp,
+            built_at: Instant::now(),
+            entries,
+            aliases,
+        }
+    }
+
+    fn apply_write(
+        &mut self,
+        entries: &BTreeMap<String, ArtifactCacheKeyMemoEntry>,
+        stamp: LegacyMemoStamp,
+    ) {
+        let mut previous = std::mem::take(&mut self.entries).into_iter().peekable();
+        let mut aliases: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
+        let mut updated = Vec::with_capacity(entries.len());
+        for (spelling, entry) in entries {
+            while previous.peek().is_some_and(|(old, _, _)| old < spelling) {
+                previous.next();
+            }
+            let old = previous
+                .peek()
+                .is_some_and(|(old, _, _)| old == spelling)
+                .then(|| previous.next().unwrap());
+            let canonical = match old {
+                Some((_, old, canonical))
+                    if old.key == entry.key
+                        && old.git_root_commit == entry.git_root_commit
+                        && old.recorded_at_ms == entry.recorded_at_ms =>
+                {
+                    canonical
+                }
+                _ => canonical_legacy_memo_spelling(spelling),
+            };
+            aliases
+                .entry(canonical.clone())
+                .or_default()
+                .push(updated.len());
+            updated.push((spelling.clone(), entry.clone(), canonical));
+        }
+        // Recreate bucket membership in spelling order after removals/changes.
+        // Lookup folds these current entries, so conflict and validation results
+        // are recomputed, not retained from an earlier version of a bucket.
+        self.entries = updated;
+        self.aliases = aliases;
+        self.stamp = Some(stamp);
+        // Keep built_at: writes must not postpone discovery of new aliases among
+        // unchanged spellings by extending their ten-minute lifetime.
+    }
+
+    fn lookup(
+        &self,
+        root: &Path,
+        raw_key: &str,
+    ) -> std::io::Result<Option<ArtifactCacheKeyMemoEntry>> {
+        let canonical = crate::root_identity::canonical_root(root);
+        let mut candidates = self.aliases.get(&canonical).cloned().unwrap_or_default();
+        if let Ok(raw) = self
+            .entries
+            .binary_search_by(|(spelling, _, _)| spelling.as_str().cmp(raw_key))
+        {
+            if let Err(position) = candidates.binary_search(&raw) {
+                candidates.insert(position, raw);
+            }
+        }
+        let mut found: Option<&ArtifactCacheKeyMemoEntry> = None;
+        for index in candidates {
+            let (spelling, entry, indexed_root) = &self.entries[index];
+            let current = crate::root_identity::canonical_root(Path::new(spelling));
+            // Keep the exact-spelling shortcut while its path mapping is
+            // unchanged, but not after it moves away from the query root.
+            if current != canonical && !(spelling == raw_key && current == *indexed_root) {
+                continue;
+            }
+            if !artifact_key_looks_valid(&entry.key) || entry.git_root_commit.trim().is_empty() {
+                return Err(std::io::Error::other(
+                    "legacy repository identity memo is invalid",
+                ));
+            }
+            if found.is_some_and(|previous| previous.git_root_commit != entry.git_root_commit) {
+                return Err(std::io::Error::other(
+                    "canonical root aliases have conflicting repository identities",
+                ));
+            }
+            found = Some(entry);
+        }
+        Ok(found.cloned())
+    }
+}
+
+#[derive(Default)]
+struct LegacyMemoSlotState {
+    snapshot: Mutex<Option<LegacyMemoIndex>>,
+    // A tiny mirror lets registry cleanup inspect age without waiting for the
+    // snapshot lock, which can be held during filesystem work.
+    snapshot_built_at: Mutex<Option<Instant>>,
+}
+
+type LegacyMemoSlot = Arc<LegacyMemoSlotState>;
+
+struct LegacyMemoSlotGuard<'a> {
+    snapshot: std::sync::MutexGuard<'a, Option<LegacyMemoIndex>>,
+    snapshot_built_at: &'a Mutex<Option<Instant>>,
+}
+
+impl LegacyMemoSlotState {
+    fn lock(&self) -> std::sync::LockResult<LegacyMemoSlotGuard<'_>> {
+        match self.snapshot.lock() {
+            Ok(snapshot) => Ok(LegacyMemoSlotGuard {
+                snapshot,
+                snapshot_built_at: &self.snapshot_built_at,
+            }),
+            Err(error) => Err(std::sync::PoisonError::new(LegacyMemoSlotGuard {
+                snapshot: error.into_inner(),
+                snapshot_built_at: &self.snapshot_built_at,
+            })),
+        }
+    }
+
+    fn snapshot_expired(&self, now: Instant) -> bool {
+        self.snapshot_built_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some_and(|built_at| {
+                now.saturating_duration_since(built_at) >= LEGACY_IDENTITY_MEMO_MAX_AGE
+            })
+    }
+}
+
+impl std::ops::Deref for LegacyMemoSlotGuard<'_> {
+    type Target = Option<LegacyMemoIndex>;
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
+impl std::ops::DerefMut for LegacyMemoSlotGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.snapshot
+    }
+}
+
+impl Drop for LegacyMemoSlotGuard<'_> {
+    fn drop(&mut self) {
+        // Publish age as the snapshot lock is released, without requiring the
+        // registry to acquire the lock used for filesystem work.
+        *self
+            .snapshot_built_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            self.snapshot.as_ref().map(|index| index.built_at);
+    }
+}
+
+/// Retain at most four storage-root indexes, ordered by last slot acquisition,
+/// and remove expired snapshots on every registry touch. A representative
+/// 3,000-entry, 1.09 MB memo measured about 3.3 MiB of retained index heap on
+/// 64-bit macOS; pathname lengths affect that footprint. In-flight callers may
+/// keep an evicted slot alive until their current operation finishes.
+#[derive(Default)]
+struct LegacyMemoIndexes {
+    // Least recently used first; the cache is deliberately tiny.
+    roots: Vec<(PathBuf, LegacyMemoSlot)>,
+}
+
+impl LegacyMemoIndexes {
+    fn slot(&mut self, path: PathBuf) -> (LegacyMemoSlot, Vec<LegacyMemoSlot>) {
+        let now = Instant::now();
+        let mut retired = Vec::new();
+        self.roots.retain(|(_, slot)| {
+            if slot.snapshot_expired(now) {
+                retired.push(slot.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if let Some(position) = self.roots.iter().position(|(root, _)| root == &path) {
+            let entry = self.roots.remove(position);
+            let slot = entry.1.clone();
+            self.roots.push(entry);
+            return (slot, retired);
+        }
+        let slot = LegacyMemoSlot::default();
+        self.roots.push((path, slot.clone()));
+        if self.roots.len() > LEGACY_IDENTITY_MEMO_MAX_STORAGE_ROOTS {
+            retired.push(self.roots.remove(0).1);
+        }
+        (slot, retired)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static LEGACY_MEMO_INDEXES_OVERRIDE: std::cell::RefCell<Option<Arc<Mutex<LegacyMemoIndexes>>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn legacy_identity_memo_indexes() -> Arc<Mutex<LegacyMemoIndexes>> {
+    #[cfg(test)]
+    if let Some(indexes) = LEGACY_MEMO_INDEXES_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        return indexes;
+    }
+    static INDEXES: OnceLock<Arc<Mutex<LegacyMemoIndexes>>> = OnceLock::new();
+    INDEXES.get_or_init(Default::default).clone()
+}
+
+fn legacy_identity_memo_slot(storage: &Path) -> LegacyMemoSlot {
+    let indexes = legacy_identity_memo_indexes();
+    let (slot, retired) = {
+        indexes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .slot(artifact_cache_key_memo_path(storage))
+    };
+    // Release the registry before freeing an index's strings and path tables.
+    drop(retired);
+    slot
+}
+
+/// Cache canonical spellings by the memo file's identity, length and times;
+/// apply AFT writes incrementally and rebuild after ten minutes even if the file
+/// is unchanged.
+/// Revalidate matched spellings on every lookup so a moved alias cannot return
+/// its former root's identity. Newly matching spellings, including new conflicts,
+/// can be missed until refresh; the age limit bounds that discovery delay.
 fn legacy_identity_memo(
+    root: &Path,
+    raw_key: &str,
+    storage: &Path,
+) -> std::io::Result<Option<ArtifactCacheKeyMemoEntry>> {
+    let path = artifact_cache_key_memo_path(storage);
+    let slot = legacy_identity_memo_slot(storage);
+    // Only this storage's first build is serialized. Do not take the ordinary
+    // process memo mutex while resolving every legacy spelling's filesystem path.
+    let mut cached = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let stamp = LegacyMemoStamp::at(&path);
+    if let Some(index) = cached.as_ref().filter(|index| {
+        stamp.is_some()
+            && index.stamp == stamp
+            && index.built_at.elapsed() < LEGACY_IDENTITY_MEMO_MAX_AGE
+    }) {
+        return index.lookup(root, raw_key);
+    }
+    *cached = None;
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let before = LegacyMemoStamp::of_file(&file);
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let entries = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+    let index = LegacyMemoIndex::build(entries, before);
+    let result = index.lookup(root, raw_key);
+    // Read and canonicalization can race a writer. Return the opened snapshot,
+    // as a full scan would, but never cache it under a replacement's stamp.
+    if before.is_some()
+        && before == LegacyMemoStamp::of_file(&file)
+        && before == LegacyMemoStamp::at(&path)
+    {
+        *cached = Some(index);
+    }
+    result
+}
+
+#[cfg(test)]
+fn legacy_identity_memo_full_scan(
     root: &Path,
     raw_key: &str,
     storage: &Path,
@@ -7774,6 +8609,11 @@ pub(crate) fn resolve_root_identity_for_bind(
     persist: bool,
     force: bool,
 ) -> Result<crate::root_identity::BoundIdentity, ArtifactCacheKeyProbeError> {
+    // A `storage.cache_dir` cache root keeps no identity records; resolve and
+    // save them on the durable root that owns it, where configure memoizes
+    // the key. Any other root, and every root without `cache_dir`, is used
+    // as given.
+    let storage_root: &Path = &crate::root_cache::identity_storage_root(storage_root);
     let mut git_unavailable = false;
     let mut choose = |pin: crate::root_identity::LegacyPin,
                       saved: Option<&crate::root_identity::Identity>|
@@ -7946,8 +8786,10 @@ pub fn artifact_cache_key_memoized_only(project_root: &Path) -> Option<String> {
     map.get(project_root).cloned()
 }
 
+/// `storage_dir` is the cache artifact root (see
+/// [`crate::bash_background::cache_artifact_root`]), not the durable root.
 pub fn resolve_cache_dir_with_key(project_key: &str, storage_dir: Option<&Path>) -> PathBuf {
-    crate::bash_background::storage_dir(storage_dir)
+    crate::bash_background::cache_artifact_root(storage_dir)
         .join("index")
         .join(project_key)
 }
@@ -8249,13 +9091,50 @@ fn write_artifact_cache_key_memo_file(
             .as_nanos()
     ));
     let bytes = serde_json::to_vec_pretty(entries).map_err(std::io::Error::other)?;
-    {
-        let mut file = crate::private_storage::create(&temp_path)?;
-        file.write_all(&bytes)?;
-    }
+    let mut file = crate::private_storage::create(&temp_path)?;
+    file.write_all(&bytes)?;
+    // Close write handles before sampling the published times: Windows may
+    // defer its last-write timestamp until then. A read handle keeps the same
+    // file's identity available through rename without delaying that update.
+    let identity = crate::file_identity::FileIdentity::of_file(&file);
+    let published_file = File::open(&temp_path).ok().filter(|opened| {
+        identity != crate::file_identity::FileIdentity::Unavailable
+            && crate::file_identity::FileIdentity::of_file(opened) == identity
+    });
+    drop(file);
+    let slot = legacy_identity_memo_slot(storage_root);
+    let mut cached = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous_stamp = LegacyMemoStamp::at(&path);
+    let can_advance = cached.as_ref().is_some_and(|index| {
+        previous_stamp.is_some()
+            && index.stamp == previous_stamp
+            && index.built_at.elapsed() < LEGACY_IDENTITY_MEMO_MAX_AGE
+    });
     if let Err(error) = fs::rename(&temp_path, &path) {
         let _ = fs::remove_file(&temp_path);
         return Err(error);
+    }
+    #[cfg(test)]
+    if let Some(hook) = AFTER_LEGACY_MEMO_RENAME.with(|slot| slot.borrow_mut().take()) {
+        hook(&path);
+    }
+    // Keep the written file open across rename. A stamp sampled only from the
+    // destination could belong to another writer's replacement, not these bytes.
+    let published_stamp = published_file.as_ref().and_then(LegacyMemoStamp::of_file);
+    if can_advance && published_stamp.is_some() && published_stamp == LegacyMemoStamp::at(&path) {
+        cached
+            .as_mut()
+            .unwrap()
+            .apply_write(entries, published_stamp.unwrap());
+        if published_stamp != published_file.as_ref().and_then(LegacyMemoStamp::of_file)
+            || published_stamp != LegacyMemoStamp::at(&path)
+        {
+            *cached = None;
+        }
+    } else {
+        *cached = None;
     }
     Ok(())
 }
@@ -8270,9 +9149,9 @@ fn artifact_key_looks_valid(key: &str) -> bool {
 // Retained for isolated cache-lock fixtures; production eviction is scheduled
 // through storage_retention rather than inferring abandonment from payload age.
 #[cfg(test)]
-pub(crate) fn sweep_orphaned_index_dirs(storage_root: &Path) {
-    let index_root = storage_root.join("index");
-    let referenced_keys = match referenced_artifact_cache_keys(storage_root) {
+pub(crate) fn sweep_orphaned_index_dirs(storage_root: &crate::root_cache::StoragePaths) {
+    let index_root = storage_root.artifacts.join("index");
+    let referenced_keys = match referenced_artifact_cache_keys(&storage_root.durable) {
         Ok(keys) => keys,
         Err(error) => {
             crate::slog_warn!(
@@ -10175,7 +11054,9 @@ fn git_diff_within_path_limit(diff: &[u8], limit: usize) -> bool {
         })
 }
 
-fn line_starts_bytes(content: &[u8]) -> Vec<usize> {
+pub(crate) fn line_starts_bytes(content: &[u8]) -> Vec<usize> {
+    #[cfg(test)]
+    LINE_STARTS_BUILDS.with(|count| count.set(count.get() + 1));
     let mut starts = vec![0usize];
     for (index, byte) in content.iter().copied().enumerate() {
         if byte == b'\n' {
@@ -10187,6 +11068,10 @@ fn line_starts_bytes(content: &[u8]) -> Vec<usize> {
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static LINE_STARTS_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static POSTING_COUNT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SUPERSEDED_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BASE_CANCELLATION_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Called on every `line_details_bytes` call on this thread, so tests can
     /// count line-detail work or act at a chosen point inside a scan.
     static LINE_DETAILS_PROBE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
@@ -10203,10 +11088,19 @@ fn grep_scan_test_now() -> Instant {
 /// holding `offset`, plus the byte offset where the next line starts (the
 /// end of `content` for the last line). The text is bounded the way grep
 /// prints it, see [`bounded_grep_line_text_bytes`].
-fn line_details_bytes(
+pub(crate) fn line_details_bytes(
     content: &[u8],
     line_starts: &[usize],
     offset: usize,
+) -> (u32, u32, String, usize) {
+    line_details_bytes_with_cr_policy(content, line_starts, offset, false)
+}
+
+pub(crate) fn line_details_bytes_with_cr_policy(
+    content: &[u8],
+    line_starts: &[usize],
+    offset: usize,
+    trim_all_cr: bool,
 ) -> (u32, u32, String, usize) {
     #[cfg(test)]
     LINE_DETAILS_PROBE.with(|probe| {
@@ -10227,8 +11121,12 @@ fn line_details_bytes(
         None => (content.len(), content.len()),
     };
     let mut line_slice = &content[line_start..line_end];
-    if line_slice.ends_with(b"\r") {
+    // Fallback trims every trailing CR; indexed grep removes only the CR in CRLF.
+    while line_slice.ends_with(b"\r") {
         line_slice = &line_slice[..line_slice.len() - 1];
+        if !trim_all_cr {
+            break;
+        }
     }
     let line_text = bounded_grep_line_text_bytes(line_slice);
     let column = String::from_utf8_lossy(&content[line_start..offset])
@@ -10343,12 +11241,808 @@ pub(crate) fn audit_work() -> AuditWork {
 
 #[cfg(test)]
 mod tests {
+    fn lexical_views_paused_legacy_publication(turn_views_on: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let cache = temp.path().join("cache");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.rs"), "old_marker\n").unwrap();
+        let mut initial = SearchIndex::build_with_limit_serial(&root, 1024);
+        assert!(initial.write_to_disk(&cache, None));
+        let original = fs::read(cache.join("cache.bin")).unwrap();
+        fs::write(root.join("a.rs"), "new_marker\n").unwrap();
+        let context = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                ..Default::default()
+            },
+        );
+        let gate = context.legacy_search_publication_gate();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *gate.before_publish.lock() = Some(Box::new(move || {
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+        let build_root = root.clone();
+        let build_cache = cache.clone();
+        let build_gate = gate.clone();
+        let build = std::thread::spawn(move || {
+            let _publication = build_gate.install();
+            SearchIndex::build_with_limit_to_cache_dir_cancellable(
+                &build_root,
+                1024,
+                &build_cache,
+                &|| true,
+            )
+        });
+        ready_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        if turn_views_on {
+            context.update_config(|config| config.views.enabled = true);
+            assert!(!gate.allowed());
+        } else {
+            context.update_config(|config| config.search_index_max_file_size += 1);
+            context.advance_configure_generation();
+            context.mark_subc_unbound();
+            assert!(gate.allowed());
+        }
+        release_tx.send(()).unwrap();
+        let result = build.join().unwrap();
+        if turn_views_on {
+            assert!(result.is_none());
+            assert_eq!(fs::read(cache.join("cache.bin")).unwrap(), original);
+            context.update_config(|config| config.views.enabled = false);
+            assert!(context.legacy_search_publication_gate().allowed());
+            assert!(
+                !gate.allowed(),
+                "old workers stay revoked after views are disabled"
+            );
+        } else {
+            assert!(result.is_some_and(|index| index.is_ready()));
+            assert_ne!(fs::read(cache.join("cache.bin")).unwrap(), original);
+        }
+        assert!(fs::read_dir(&cache).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("cache.bin.tmp.")));
+    }
+
+    #[test]
+    fn lexical_views_cutover_revokes_admitted_legacy_cache_rename() {
+        lexical_views_paused_legacy_publication(true);
+    }
+
+    #[test]
+    fn lexical_views_off_preserves_admitted_publication_after_reconfigure_and_unbind() {
+        lexical_views_paused_legacy_publication(false);
+    }
+
+    struct IsolatedLegacyMemoIndexes {
+        indexes: Arc<Mutex<super::LegacyMemoIndexes>>,
+        previous: Option<Arc<Mutex<super::LegacyMemoIndexes>>>,
+    }
+
+    impl Drop for IsolatedLegacyMemoIndexes {
+        fn drop(&mut self) {
+            super::LEGACY_MEMO_INDEXES_OVERRIDE.with(|slot| {
+                *slot.borrow_mut() = self.previous.take();
+            });
+        }
+    }
+
+    // Isolate cache-policy tests from unrelated parallel tests' storage
+    // roots while exercising the same slot-selection and lookup code.
+    fn isolated_legacy_memo_indexes() -> IsolatedLegacyMemoIndexes {
+        let indexes = Arc::new(Mutex::new(super::LegacyMemoIndexes::default()));
+        install_legacy_memo_indexes(indexes)
+    }
+
+    fn install_legacy_memo_indexes(
+        indexes: Arc<Mutex<super::LegacyMemoIndexes>>,
+    ) -> IsolatedLegacyMemoIndexes {
+        let previous = super::LEGACY_MEMO_INDEXES_OVERRIDE
+            .with(|slot| slot.borrow_mut().replace(indexes.clone()));
+        IsolatedLegacyMemoIndexes { indexes, previous }
+    }
+
+    #[test]
+    fn legacy_identity_memo_retains_four_storage_roots_by_recency() {
+        let cache = isolated_legacy_memo_indexes();
+        let fixture = tempfile::tempdir().unwrap();
+        let roots: Vec<_> = (0..5)
+            .map(|index| {
+                let storage = fixture.path().join(format!("storage-{index}"));
+                fs::create_dir(&storage).unwrap();
+                let query = storage.join("checkout");
+                let memo = BTreeMap::from([(
+                    query.to_string_lossy().into_owned(),
+                    legacy_memo_entry(&format!("commit-{index}")),
+                )]);
+                fs::write(
+                    super::artifact_cache_key_memo_path(&storage),
+                    serde_json::to_vec(&memo).unwrap(),
+                )
+                .unwrap();
+                (storage, query)
+            })
+            .collect();
+        super::LEGACY_MEMO_BUILDS.with(|count| count.set(0));
+        for (storage, query) in &roots[..4] {
+            super::legacy_identity_memo(query, &query.to_string_lossy(), storage).unwrap();
+        }
+        let (storage, query) = &roots[0];
+        super::legacy_identity_memo(query, &query.to_string_lossy(), storage).unwrap();
+        let (storage, query) = &roots[4];
+        super::legacy_identity_memo(query, &query.to_string_lossy(), storage).unwrap();
+        assert_eq!(super::LEGACY_IDENTITY_MEMO_MAX_STORAGE_ROOTS, 4);
+        let indexes = cache.indexes.lock().unwrap();
+        assert_eq!(
+            indexes.roots.len(),
+            4,
+            "five touched storage roots must retain only four indexes"
+        );
+        assert!(
+            !indexes
+                .roots
+                .iter()
+                .any(|(path, _)| path == &super::artifact_cache_key_memo_path(&roots[1].0)),
+            "the refreshed first root must survive instead of the least recently used second root"
+        );
+        drop(indexes);
+        assert_eq!(super::LEGACY_MEMO_BUILDS.with(|count| count.get()), 5);
+        let (storage, query) = &roots[1];
+        let actual = legacy_memo_value(super::legacy_identity_memo(
+            query,
+            &query.to_string_lossy(),
+            storage,
+        ));
+        let expected = legacy_memo_value(super::legacy_identity_memo_full_scan(
+            query,
+            &query.to_string_lossy(),
+            storage,
+        ));
+        assert_eq!(actual, expected);
+        assert_eq!(
+            super::LEGACY_MEMO_BUILDS.with(|count| count.get()),
+            6,
+            "an evicted root must rebuild on its next lookup"
+        );
+        assert_eq!(cache.indexes.lock().unwrap().roots.len(), 4);
+    }
+
+    #[test]
+    fn legacy_identity_memo_registry_touch_drops_expired_snapshot() {
+        let cache = isolated_legacy_memo_indexes();
+        let storage = tempfile::tempdir().unwrap();
+        let query = storage.path().join("checkout");
+        let raw = query.to_string_lossy().into_owned();
+        let memo = BTreeMap::from([(raw.clone(), legacy_memo_entry("root-commit"))]);
+        fs::write(
+            super::artifact_cache_key_memo_path(storage.path()),
+            serde_json::to_vec(&memo).unwrap(),
+        )
+        .unwrap();
+        super::LEGACY_MEMO_BUILDS.with(|count| count.set(0));
+        let first = legacy_memo_value(super::legacy_identity_memo(&query, &raw, storage.path()));
+        let slot = super::legacy_identity_memo_slot(storage.path());
+        slot.lock().unwrap().as_mut().unwrap().built_at =
+            Instant::now() - super::LEGACY_IDENTITY_MEMO_MAX_AGE;
+        let released = Arc::downgrade(&slot);
+        drop(slot);
+        super::legacy_identity_memo_slot(&storage.path().join("different-storage"));
+        assert!(
+            !cache
+                .indexes
+                .lock()
+                .unwrap()
+                .roots
+                .iter()
+                .any(|(path, _)| path == &super::artifact_cache_key_memo_path(storage.path())),
+            "touching another root must remove an expired snapshot"
+        );
+        assert!(
+            released.upgrade().is_none(),
+            "the expired index must actually be released, not merely ignored"
+        );
+        assert_eq!(
+            legacy_memo_value(super::legacy_identity_memo(&query, &raw, storage.path())),
+            first
+        );
+        assert_eq!(super::LEGACY_MEMO_BUILDS.with(|count| count.get()), 2);
+    }
+
+    #[test]
+    fn legacy_identity_memo_registry_touch_does_not_wait_for_busy_snapshot() {
+        let cache = isolated_legacy_memo_indexes();
+        let storage = tempfile::tempdir().unwrap();
+        let query = storage.path().join("checkout");
+        let raw = query.to_string_lossy().into_owned();
+        let memo = BTreeMap::from([(raw.clone(), legacy_memo_entry("root-commit"))]);
+        fs::write(
+            super::artifact_cache_key_memo_path(storage.path()),
+            serde_json::to_vec(&memo).unwrap(),
+        )
+        .unwrap();
+        super::legacy_identity_memo(&query, &raw, storage.path()).unwrap();
+        let slot = super::legacy_identity_memo_slot(storage.path());
+        slot.lock().unwrap().as_mut().unwrap().built_at =
+            Instant::now() - super::LEGACY_IDENTITY_MEMO_MAX_AGE;
+        let held = slot.lock().unwrap();
+        let shared = cache.indexes.clone();
+        let other = storage.path().join("different-storage");
+        let (finished, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _cache = install_legacy_memo_indexes(shared);
+            super::legacy_identity_memo_slot(&other);
+            finished.send(()).unwrap();
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(2));
+        drop(held);
+        worker.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "registry cleanup waited for a snapshot's filesystem-work lock"
+        );
+        assert!(
+            !cache
+                .indexes
+                .lock()
+                .unwrap()
+                .roots
+                .iter()
+                .any(|(path, _)| path == &super::artifact_cache_key_memo_path(storage.path())),
+            "even a busy expired snapshot must lose the registry's reference"
+        );
+    }
+
+    /// Measure retained allocator bytes in an isolated native invocation. JSON
+    /// bytes are prepared before the first sample; parsing and resolved-path
+    /// ownership are included, while temporary allocations freed by build are not.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "manual isolated native legacy memo retained-heap measurement"]
+    fn legacy_identity_memo_index_retained_heap_probe() {
+        fn heap() -> u64 {
+            crate::memory::AllocatorObservation::measure()
+                .snapshot
+                .bytes_in_use
+                .expect("macOS allocator in-use bytes")
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let memo: BTreeMap<_, _> = (0..3000)
+            .map(|index| {
+                let parent = fixture
+                    .path()
+                    .join(format!("removed/checkouts/worker-{index:04}"));
+                let padding =
+                    "p".repeat(240_usize.saturating_sub(parent.to_string_lossy().len() + 9));
+                let path = parent.join(padding).join("project");
+                (
+                    path.to_string_lossy().into_owned(),
+                    super::ArtifactCacheKeyMemoEntry {
+                        key: "0123456789abcdef".into(),
+                        git_root_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+                        recorded_at_ms: crate::pins::now_ms(),
+                    },
+                )
+            })
+            .collect();
+        let bytes = serde_json::to_vec(&memo).unwrap();
+        drop(memo);
+        assert!(
+            (1_000_000..1_200_000).contains(&bytes.len()),
+            "representative memo must be about one MB: {}",
+            bytes.len()
+        );
+        heap();
+        let before = heap();
+        let entries = serde_json::from_slice(&bytes).unwrap();
+        let index = super::LegacyMemoIndex::build(entries, None);
+        std::hint::black_box(&index);
+        let retained = heap();
+        assert_eq!(index.entries.len(), 3000);
+        assert_eq!(index.aliases.len(), 3000);
+        drop(index);
+        let released = heap();
+        assert!(retained > before);
+        assert!(
+            released <= before + 128 * 1024,
+            "dropping the measured index must release its retained heap"
+        );
+        eprintln!("legacy_memo_heap_probe entries=3000 json_bytes={} before_in_use={before} retained_in_use={retained} dropped_in_use={released} retained_delta={} released_delta={}", bytes.len(), retained - before, retained - released);
+    }
+
+    fn legacy_memo_entry(commit: &str) -> super::ArtifactCacheKeyMemoEntry {
+        super::ArtifactCacheKeyMemoEntry {
+            key: "0123456789abcdef".into(),
+            git_root_commit: commit.into(),
+            recorded_at_ms: 1,
+        }
+    }
+
+    fn legacy_memo_value(
+        result: std::io::Result<Option<super::ArtifactCacheKeyMemoEntry>>,
+    ) -> Result<Option<(String, String, u64)>, (std::io::ErrorKind, String)> {
+        result
+            .map(|entry| {
+                entry.map(|entry| (entry.key, entry.git_root_commit, entry.recorded_at_ms))
+            })
+            .map_err(|error| (error.kind(), error.to_string()))
+    }
+
+    #[test]
+    fn legacy_identity_memo_rebuilds_on_same_size_same_time_replacement() {
+        let _cache = isolated_legacy_memo_indexes();
+        let storage = tempfile::tempdir().unwrap();
+        let root = storage.path().join("checkout");
+        let raw = root.to_string_lossy().into_owned();
+        let mut entries = BTreeMap::from([(raw.clone(), legacy_memo_entry("old"))]);
+        super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+        assert_eq!(
+            super::legacy_identity_memo(&root, &raw, storage.path())
+                .unwrap()
+                .unwrap()
+                .git_root_commit,
+            "old"
+        );
+        entries.get_mut(&raw).unwrap().git_root_commit = "new".into();
+        let bytes = serde_json::to_vec_pretty(&entries).unwrap();
+        crate::file_identity::replace_keeping_times(
+            &super::artifact_cache_key_memo_path(storage.path()),
+            &bytes,
+        );
+        assert_eq!(
+            super::legacy_identity_memo(&root, &raw, storage.path())
+                .unwrap()
+                .unwrap()
+                .git_root_commit,
+            "new"
+        );
+    }
+
+    #[test]
+    fn legacy_identity_memo_own_write_advances_snapshot() {
+        let _cache = isolated_legacy_memo_indexes();
+        let storage = tempfile::tempdir().unwrap();
+        let root = storage.path().join("checkout");
+        let raw = root.to_string_lossy().into_owned();
+        let mut entries = BTreeMap::from([(raw.clone(), legacy_memo_entry("old"))]);
+        super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+        super::LEGACY_MEMO_BUILDS.with(|count| count.set(0));
+        super::LEGACY_MEMO_CANONICALIZATIONS.with(|count| count.set(0));
+        super::legacy_identity_memo(&root, &raw, storage.path()).unwrap();
+        let slot = super::legacy_identity_memo_slot(storage.path());
+        let built_at = slot.lock().unwrap().as_ref().unwrap().built_at;
+        entries.get_mut(&raw).unwrap().git_root_commit = "new".into();
+        super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+        assert_eq!(
+            super::legacy_identity_memo(&root, &raw, storage.path())
+                .unwrap()
+                .unwrap()
+                .git_root_commit,
+            "new"
+        );
+        assert_eq!(super::LEGACY_MEMO_BUILDS.with(|count| count.get()), 1,
+            "an own write must update the existing index rather than force the next root to rebuild it");
+        assert_eq!(
+            slot.lock().unwrap().as_ref().unwrap().built_at,
+            built_at,
+            "own writes must not extend the age of unchanged canonical spellings"
+        );
+        assert_eq!(
+            super::LEGACY_MEMO_CANONICALIZATIONS.with(|count| count.get()),
+            2
+        );
+        let added = storage.path().join("new-checkout");
+        let added_raw = added.to_string_lossy().into_owned();
+        entries.insert(added_raw.clone(), legacy_memo_entry("added"));
+        super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+        assert_eq!(
+            super::legacy_identity_memo(&added, &added_raw, storage.path())
+                .unwrap()
+                .unwrap()
+                .git_root_commit,
+            "added"
+        );
+        assert_eq!(
+            super::LEGACY_MEMO_CANONICALIZATIONS.with(|count| count.get()),
+            3
+        );
+        entries.remove(&raw);
+        super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+        assert!(super::legacy_identity_memo(&root, &raw, storage.path())
+            .unwrap()
+            .is_none());
+        super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+        assert_eq!(super::LEGACY_MEMO_BUILDS.with(|count| count.get()), 1);
+        assert_eq!(
+            super::LEGACY_MEMO_CANONICALIZATIONS.with(|count| count.get()),
+            3,
+            "removed and unchanged spellings need no canonicalization on own writes"
+        );
+    }
+
+    #[test]
+    fn legacy_identity_memo_own_write_rebuilds_uncertain_or_old_snapshot() {
+        let _cache = isolated_legacy_memo_indexes();
+        for reason in ["expired", "unknown", "external"] {
+            let storage = tempfile::tempdir().unwrap();
+            let root = storage.path().join("checkout");
+            let raw = root.to_string_lossy().into_owned();
+            let mut entries = BTreeMap::from([(raw.clone(), legacy_memo_entry("old"))]);
+            super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+            super::LEGACY_MEMO_BUILDS.with(|count| count.set(0));
+            super::legacy_identity_memo(&root, &raw, storage.path()).unwrap();
+            let slot = super::legacy_identity_memo_slot(storage.path());
+            match reason {
+                "expired" => {
+                    slot.lock().unwrap().as_mut().unwrap().built_at =
+                        Instant::now() - super::LEGACY_IDENTITY_MEMO_MAX_AGE
+                }
+                "unknown" => slot.lock().unwrap().as_mut().unwrap().stamp = None,
+                _ => {
+                    let external = BTreeMap::from([(raw.clone(), legacy_memo_entry("ext"))]);
+                    crate::file_identity::replace_keeping_times(
+                        &super::artifact_cache_key_memo_path(storage.path()),
+                        &serde_json::to_vec_pretty(&external).unwrap(),
+                    );
+                }
+            }
+            entries.get_mut(&raw).unwrap().git_root_commit = "new".into();
+            super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+            let current = super::legacy_identity_memo_slot(storage.path());
+            assert!(
+                current.lock().unwrap().is_none(),
+                "{reason} snapshot must not be advanced"
+            );
+            if reason == "expired" {
+                assert!(
+                    !Arc::ptr_eq(&slot, &current),
+                    "expiry removes the registry entry even while an old caller holds its slot"
+                );
+            }
+            assert_eq!(
+                super::legacy_identity_memo(&root, &raw, storage.path())
+                    .unwrap()
+                    .unwrap()
+                    .git_root_commit,
+                "new"
+            );
+            assert_eq!(
+                super::LEGACY_MEMO_BUILDS.with(|count| count.get()),
+                2,
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_identity_memo_own_write_does_not_stamp_an_external_replacement() {
+        let _cache = isolated_legacy_memo_indexes();
+        let storage = tempfile::tempdir().unwrap();
+        let root = storage.path().join("checkout");
+        let raw = root.to_string_lossy().into_owned();
+        let mut entries = BTreeMap::from([(raw.clone(), legacy_memo_entry("old"))]);
+        super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+        super::legacy_identity_memo(&root, &raw, storage.path()).unwrap();
+        let external = BTreeMap::from([(raw.clone(), legacy_memo_entry("ext"))]);
+        let replacement = serde_json::to_vec_pretty(&external).unwrap();
+        super::AFTER_LEGACY_MEMO_RENAME.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |path| {
+                crate::file_identity::replace_keeping_times(path, &replacement);
+            }))
+        });
+        entries.get_mut(&raw).unwrap().git_root_commit = "own".into();
+        super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+        assert!(super::legacy_identity_memo_slot(storage.path())
+            .lock()
+            .unwrap()
+            .is_none());
+        let indexed = super::legacy_identity_memo(&root, &raw, storage.path());
+        assert_eq!(
+            indexed.as_ref().unwrap().as_ref().unwrap().git_root_commit,
+            "ext"
+        );
+        assert_eq!(
+            legacy_memo_value(indexed),
+            legacy_memo_value(super::legacy_identity_memo_full_scan(
+                &root,
+                &raw,
+                storage.path()
+            ))
+        );
+    }
+
+    #[test]
+    fn legacy_identity_memo_rechecks_in_place_edits_deletion_and_invalid_json() {
+        let _cache = isolated_legacy_memo_indexes();
+        let storage = tempfile::tempdir().unwrap();
+        let root = storage.path().join("checkout");
+        let raw = root.to_string_lossy().into_owned();
+        let path = super::artifact_cache_key_memo_path(storage.path());
+        let mut entries = BTreeMap::from([(raw.clone(), legacy_memo_entry("old"))]);
+        super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+        super::legacy_identity_memo(&root, &raw, storage.path()).unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        entries.get_mut(&raw).unwrap().git_root_commit = "new".into();
+        fs::write(&path, serde_json::to_vec_pretty(&entries).unwrap()).unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified + Duration::from_secs(1)))
+            .unwrap();
+        assert_eq!(
+            super::legacy_identity_memo(&root, &raw, storage.path())
+                .unwrap()
+                .unwrap()
+                .git_root_commit,
+            "new"
+        );
+        fs::remove_file(&path).unwrap();
+        assert!(super::legacy_identity_memo(&root, &raw, storage.path())
+            .unwrap()
+            .is_none());
+        fs::write(&path, b"not json").unwrap();
+        assert_eq!(
+            legacy_memo_value(super::legacy_identity_memo(&root, &raw, storage.path())),
+            legacy_memo_value(super::legacy_identity_memo_full_scan(
+                &root,
+                &raw,
+                storage.path()
+            ))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_identity_memo_revalidates_retargeted_matches() {
+        let _cache = isolated_legacy_memo_indexes();
+        for conflict in [false, true] {
+            let storage = tempfile::tempdir().unwrap();
+            let root = storage.path().join("checkout");
+            let other = storage.path().join("other");
+            fs::create_dir(&root).unwrap();
+            fs::create_dir(&other).unwrap();
+            let alias = storage.path().join("alias");
+            std::os::unix::fs::symlink(&root, &alias).unwrap();
+            let raw = root.to_string_lossy().into_owned();
+            let alias_raw = alias.to_string_lossy().into_owned();
+            let mut entries =
+                BTreeMap::from([(alias_raw.clone(), legacy_memo_entry("alias-commit"))]);
+            if conflict {
+                entries.insert(raw.clone(), legacy_memo_entry("root-commit"));
+            }
+            super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+            let first = super::legacy_identity_memo(&root, &raw, storage.path());
+            if conflict {
+                assert!(first
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("conflicting repository identities"));
+            } else {
+                assert_eq!(first.unwrap().unwrap().git_root_commit, "alias-commit");
+            }
+            fs::remove_file(&alias).unwrap();
+            std::os::unix::fs::symlink(&other, &alias).unwrap();
+            let result = super::legacy_identity_memo(&root, &raw, storage.path()).unwrap();
+            if conflict {
+                assert_eq!(result.unwrap().git_root_commit, "root-commit");
+            } else {
+                assert!(
+                    result.is_none(),
+                    "retargeted alias must not return its former identity"
+                );
+                assert!(
+                    super::legacy_identity_memo(&root, &alias_raw, storage.path())
+                        .unwrap()
+                        .is_none(),
+                    "raw-spelling shortcut must not bypass revalidation"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_identity_memo_age_refresh_discovers_new_aliases() {
+        let _cache = isolated_legacy_memo_indexes();
+        for conflict in [false, true] {
+            let storage = tempfile::tempdir().unwrap();
+            let root = storage.path().join("checkout");
+            fs::create_dir(&root).unwrap();
+            let alias = storage.path().join("formerly-missing");
+            let raw = root.to_string_lossy().into_owned();
+            let mut entries = BTreeMap::from([(
+                alias.to_string_lossy().into_owned(),
+                legacy_memo_entry("root-commit"),
+            )]);
+            if conflict {
+                entries.insert(raw.clone(), legacy_memo_entry("other-commit"));
+            }
+            super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+            let before =
+                legacy_memo_value(super::legacy_identity_memo(&root, &raw, storage.path()));
+            assert_eq!(
+                before,
+                legacy_memo_value(super::legacy_identity_memo_full_scan(
+                    &root,
+                    &raw,
+                    storage.path()
+                ))
+            );
+            std::os::unix::fs::symlink(&root, &alias).unwrap();
+            assert_eq!(legacy_memo_value(super::legacy_identity_memo(&root, &raw, storage.path())), before,
+                "new aliases and conflicts are discovered at refresh rather than by rescanning every miss");
+            let slot = super::legacy_identity_memo_slot(storage.path());
+            slot.lock().unwrap().as_mut().unwrap().built_at =
+                Instant::now() - super::LEGACY_IDENTITY_MEMO_MAX_AGE;
+            let refreshed = super::legacy_identity_memo(&root, &raw, storage.path());
+            if conflict {
+                assert!(refreshed
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("conflicting repository identities"));
+            } else {
+                assert_eq!(refreshed.unwrap().unwrap().git_root_commit, "root-commit");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_identity_memo_index_matches_randomized_full_scan() {
+        let _cache = isolated_legacy_memo_indexes();
+        fn next(seed: &mut u64) -> u64 {
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *seed
+        }
+        let storage = tempfile::tempdir().unwrap();
+        let roots: Vec<_> = (0..9)
+            .map(|index| {
+                let root = storage.path().join(format!("checkout-{index}"));
+                fs::create_dir(&root).unwrap();
+                root
+            })
+            .collect();
+        let mut queries = roots.clone();
+        let mut spellings = Vec::new();
+        for (index, root) in roots[..8].iter().enumerate() {
+            spellings.push(root.clone());
+            spellings.push(root.join("."));
+            let missing = storage.path().join(format!("gone-{index}/nested/project"));
+            queries.push(missing.clone());
+            spellings.push(missing);
+            #[cfg(unix)]
+            {
+                let alias = storage.path().join(format!("symlink-{index}"));
+                std::os::unix::fs::symlink(root, &alias).unwrap();
+                spellings.push(alias.clone());
+                spellings.push(alias.join("missing/project"));
+                queries.push(root.join("missing/project"));
+            }
+        }
+        let mut seed = 0x615f_726f_6f74_u64;
+        for round in 0..32 {
+            let mut entries = BTreeMap::new();
+            for _ in 0..48 {
+                let spelling = &spellings[next(&mut seed) as usize % spellings.len()];
+                let mut entry = legacy_memo_entry(&format!("root-{}", next(&mut seed) % 3));
+                entry.recorded_at_ms = next(&mut seed);
+                entry.key = format!("{:016x}", next(&mut seed));
+                if next(&mut seed) % 11 == 0 {
+                    entry.key = "invalid".into();
+                }
+                entries.insert(spelling.to_string_lossy().into_owned(), entry);
+            }
+            let fixed = roots[8].to_string_lossy().into_owned();
+            let alias = roots[8].join(".").to_string_lossy().into_owned();
+            entries.insert(fixed.clone(), legacy_memo_entry("fixed-root"));
+            let mut second = legacy_memo_entry("fixed-root");
+            second.key = "fedcba9876543210".into();
+            match round % 4 {
+                0 => second.git_root_commit = "conflicting-root".into(),
+                1 => {}
+                2 => second.git_root_commit = " ".into(),
+                _ => second.key = "invalid".into(),
+            }
+            entries.insert(alias.clone(), second);
+            for write in 0..4 {
+                let selected = spellings[next(&mut seed) as usize % spellings.len()]
+                    .to_string_lossy()
+                    .into_owned();
+                match write {
+                    0 => {}
+                    1 => {
+                        entries.insert(selected, legacy_memo_entry("changed-root"));
+                    }
+                    2 => {
+                        entries.remove(&selected);
+                    }
+                    _ => {
+                        entries.insert(alias.clone(), legacy_memo_entry("fixed-root"));
+                    }
+                }
+                super::write_artifact_cache_key_memo_file(storage.path(), &entries).unwrap();
+                for root in &queries {
+                    let raw = root.to_string_lossy();
+                    let indexed =
+                        legacy_memo_value(super::legacy_identity_memo(root, &raw, storage.path()));
+                    let scanned = legacy_memo_value(super::legacy_identity_memo_full_scan(
+                        root,
+                        &raw,
+                        storage.path(),
+                    ));
+                    assert_eq!(
+                        indexed, scanned,
+                        "round={round} write={write} root={root:?}"
+                    );
+                }
+                let unrelated = storage.path().join("unrelated-query");
+                assert_eq!(
+                    legacy_memo_value(super::legacy_identity_memo(
+                        &unrelated,
+                        &fixed,
+                        storage.path()
+                    )),
+                    legacy_memo_value(super::legacy_identity_memo_full_scan(
+                        &unrelated,
+                        &fixed,
+                        storage.path()
+                    )),
+                    "exact raw spellings must retain the full scan's shortcut"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_identity_memo_repeated_misses_share_snapshot() {
+        let _cache = isolated_legacy_memo_indexes();
+        let storage = tempfile::tempdir().unwrap();
+        let root = storage.path().join("new-checkout");
+        let entries = BTreeMap::from([(
+            storage
+                .path()
+                .join("removed/checkouts/old")
+                .to_string_lossy()
+                .into_owned(),
+            super::ArtifactCacheKeyMemoEntry {
+                key: "0123456789abcdef".into(),
+                git_root_commit: "root-commit".into(),
+                recorded_at_ms: 1,
+            },
+        )]);
+        fs::write(
+            super::artifact_cache_key_memo_path(storage.path()),
+            serde_json::to_vec(&entries).unwrap(),
+        )
+        .unwrap();
+        super::LEGACY_MEMO_BUILDS.with(|count| count.set(0));
+        for _ in 0..2 {
+            assert!(
+                super::legacy_identity_memo(&root, "new-checkout", storage.path())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            super::LEGACY_MEMO_BUILDS.with(|count| count.get()),
+            1,
+            "unchanged memo misses must share the canonical-alias snapshot"
+        );
+    }
+
     /// Measures the compatibility lookup independently of Git and durable writes.
     /// Missing checkout spellings exercise the canonical-ancestor fallback used
     /// when old worktrees have been removed. No live cache memo is read.
     #[test]
     #[ignore = "manual native legacy identity memo timing probe"]
     fn legacy_identity_memo_native_probe() {
+        let _cache = isolated_legacy_memo_indexes();
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path().join("checkout");
         fs::create_dir(&root).unwrap();
@@ -10372,16 +12066,89 @@ mod tests {
                 .collect();
             let bytes = serde_json::to_vec(&memo).unwrap();
             fs::write(super::artifact_cache_key_memo_path(fixture.path()), &bytes).unwrap();
+            super::LEGACY_MEMO_BUILDS.with(|count| count.set(0));
             for sample in 0..8 {
                 let started = std::time::Instant::now();
                 assert!(super::legacy_identity_memo(&root, &raw_key, fixture.path())
                     .unwrap()
                     .is_none());
                 eprintln!(
-                    "legacy_memo_probe entries={entries} bytes={} sample={sample} elapsed_us={}",
+                    "legacy_memo_probe entries={entries} bytes={} sample={sample} phase={} builds={} elapsed_us={}",
                     bytes.len(),
+                    if sample == 0 { "first" } else { "repeated_miss" },
+                    super::LEGACY_MEMO_BUILDS.with(|count| count.get()),
                     started.elapsed().as_micros()
                 );
+            }
+        }
+    }
+
+    /// Model serial lookups of previously unseen checkout roots: warm the alias
+    /// index, record another checkout through the memo writer, then query a new root.
+    /// Storage and checkout spellings are isolated fixtures, never live state.
+    #[test]
+    #[ignore = "manual native own-write and new-root memo timing probe"]
+    fn legacy_identity_memo_own_write_native_probe() {
+        let _cache = isolated_legacy_memo_indexes();
+        for entries in [2048, 8192] {
+            let storage = tempfile::tempdir().unwrap();
+            let memo: BTreeMap<_, _> = (0..entries)
+                .map(|index| {
+                    (
+                        storage
+                            .path()
+                            .join(format!("removed/checkouts/worker-{index}/project"))
+                            .to_string_lossy()
+                            .into_owned(),
+                        super::ArtifactCacheKeyMemoEntry {
+                            key: "0123456789abcdef".into(),
+                            git_root_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+                            recorded_at_ms: crate::pins::now_ms(),
+                        },
+                    )
+                })
+                .collect();
+            fs::write(
+                super::artifact_cache_key_memo_path(storage.path()),
+                serde_json::to_vec(&memo).unwrap(),
+            )
+            .unwrap();
+            super::LEGACY_MEMO_BUILDS.with(|count| count.set(0));
+            super::LEGACY_MEMO_CANONICALIZATIONS.with(|count| count.set(0));
+            let first = storage.path().join("initial-new-root");
+            assert!(
+                super::legacy_identity_memo(&first, &first.to_string_lossy(), storage.path())
+                    .unwrap()
+                    .is_none()
+            );
+            for sample in 0..8 {
+                let bound = storage.path().join(format!("bound-{sample}"));
+                let next = storage.path().join(format!("next-{sample}"));
+                fs::create_dir(&bound).unwrap();
+                fs::create_dir(&next).unwrap();
+                let started = Instant::now();
+                let mut timings = super::ArtifactCacheKeyTimings::default();
+                super::record_artifact_cache_key_memo_profiled(
+                    storage.path(),
+                    &bound.to_string_lossy(),
+                    &format!("{sample:016x}"),
+                    "0123456789abcdef0123456789abcdef01234567",
+                    &mut timings,
+                )
+                .unwrap();
+                let write_elapsed = started.elapsed();
+                let lookup = Instant::now();
+                assert!(super::legacy_identity_memo(
+                    &next,
+                    &next.to_string_lossy(),
+                    storage.path()
+                )
+                .unwrap()
+                .is_none());
+                eprintln!("own_write_probe entries={entries} sample={sample} write_us={} next_lookup_us={} total_us={} builds={} canonicalizations={}",
+                    write_elapsed.as_micros(), lookup.elapsed().as_micros(), started.elapsed().as_micros(),
+                    super::LEGACY_MEMO_BUILDS.with(|count| count.get()),
+                    super::LEGACY_MEMO_CANONICALIZATIONS.with(|count| count.get()));
             }
         }
     }
@@ -10396,6 +12163,143 @@ mod tests {
                 loc_mask: (trigram % 127) as u8,
             })
             .collect()
+    }
+
+    /// A tree that spans several walk chunks and has every kind of file the
+    /// build records: indexed, binary (unindexed) and over the size limit.
+    fn chunked_build_fixture(root: &Path) {
+        for dir in 0..5 {
+            let dir_path = root.join(format!("dir_{dir}")).join("nested");
+            fs::create_dir_all(&dir_path).unwrap();
+            for file in 0..30 {
+                fs::write(
+                    dir_path.join(format!("file_{file:02}.rs")),
+                    format!("fn marker_{dir}_{file}() {{ let shared_token = {file}; }}\n"),
+                )
+                .unwrap();
+            }
+        }
+        fs::write(root.join("binary.bin"), [0u8, 159, 146, 150, 0, 1, 2]).unwrap();
+        fs::write(root.join("large.txt"), "shared_token ".repeat(200)).unwrap();
+    }
+
+    #[test]
+    fn issue1007_chunked_build_walk_matches_collected_walk_and_cancels() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        chunked_build_fixture(&root);
+        let filters = PathFilters::default();
+        let collected = walk_build_files_cancellable(&root, &filters, &|| true).unwrap();
+        assert!(collected.len() > 100, "fixture must span several chunks");
+
+        let mut walk = BuildFileWalk::new(&root, &filters);
+        let mut chunked = Vec::new();
+        while !walk.is_finished() {
+            let chunk = walk.next_chunk(7, &|| true).unwrap();
+            assert!(chunk.len() <= 7);
+            chunked.extend(chunk);
+        }
+        assert_eq!(chunked, collected, "chunks must keep the walk's order");
+
+        let calls = AtomicUsize::new(0);
+        let mut walk = BuildFileWalk::new(&root, &filters);
+        assert!(walk.next_chunk(5, &|| true).is_some());
+        assert!(walk
+            .next_chunk(usize::MAX, &|| calls.fetch_add(1, Ordering::SeqCst) < 3)
+            .is_none());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "checked before every entry"
+        );
+    }
+
+    #[test]
+    fn issue1007_cold_build_cache_reloads_identically() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        chunked_build_fixture(&root);
+        let cache = tempfile::tempdir().unwrap();
+        let built = SearchIndex::build_with_limit_to_cache_dir(&root, 1024, cache.path());
+        assert_eq!(built.unindexed_files.len(), 2, "binary and oversize files");
+
+        // The built index lists files in walk order with dense ids.
+        let walked =
+            walk_build_files_cancellable(&root, &PathFilters::default(), &|| true).unwrap();
+        let built_paths: Vec<_> = built.files.iter().map(|file| file.path.clone()).collect();
+        assert_eq!(built_paths, walked);
+        for (id, file) in built.files.iter().enumerate() {
+            assert_eq!(built.path_to_id.get(&file.path), Some(&(id as u32)));
+        }
+
+        let reloaded = SearchIndex::read_from_disk(cache.path(), &root).expect("cache reloads");
+        // A loaded cache serves queries once configure verifies it; mark it
+        // ready the same way so both answer from their postings.
+        let mut reloaded = reloaded;
+        reloaded.ready = true;
+        assert!(built.ready);
+        assert_eq!(reloaded.files.len(), built.files.len());
+        for (left, right) in built.files.iter().zip(reloaded.files.iter()) {
+            assert_eq!(left.path, right.path);
+            assert_eq!(left.size, right.size);
+            assert_eq!(left.modified, right.modified);
+            assert_eq!(left.content_hash, right.content_hash);
+        }
+        assert_eq!(*reloaded.path_to_id, *built.path_to_id);
+        assert_eq!(*reloaded.unindexed_files, *built.unindexed_files);
+        assert_eq!(*reloaded.file_trigram_count, *built.file_trigram_count);
+        assert_eq!(reloaded.git_head, built.git_head);
+        for pattern in ["shared_token", "marker_3_17", "fn marker_", "absent_text"] {
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    built.grep(pattern, true, &[], &[], &root, 1000).unwrap()
+                ),
+                format!(
+                    "{:?}",
+                    reloaded.grep(pattern, true, &[], &[], &root, 1000).unwrap()
+                ),
+                "grep {pattern}"
+            );
+        }
+
+        // Rewriting the reloaded index through the base+delta writer gives
+        // the cold build's bytes, so the moved tables and the streamed header
+        // wrote the same cache a full rewrite does.
+        let rewrite = tempfile::tempdir().unwrap();
+        let head = reloaded.stored_git_head().map(str::to_owned);
+        assert!(reloaded.write_to_disk(rewrite.path(), head.as_deref()));
+        assert_eq!(
+            fs::read(cache.path().join("cache.bin")).unwrap(),
+            fs::read(rewrite.path().join("cache.bin")).unwrap()
+        );
+    }
+
+    #[test]
+    fn issue1007_disk_cache_is_current_only_for_unchanged_cold_build() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        chunked_build_fixture(&root);
+        let cache = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let mut index = SearchIndex::build_with_limit_to_cache_dir(&root, 1024, cache.path());
+        let head = index.stored_git_head().map(str::to_owned);
+        assert!(index.disk_cache_is_current(cache.path(), head.as_deref()));
+        assert!(!index.disk_cache_is_current(other.path(), head.as_deref()));
+        assert!(!index.disk_cache_is_current(cache.path(), Some("another-head")));
+
+        let reloaded = SearchIndex::read_from_disk(cache.path(), &root).unwrap();
+        assert!(
+            !reloaded.disk_cache_is_current(cache.path(), head.as_deref()),
+            "an index read from disk never wrote the cache itself"
+        );
+
+        fs::write(root.join("added.rs"), "fn added_after_build() {}\n").unwrap();
+        index.update_file(&root.join("added.rs"));
+        assert!(index.has_pending_disk_changes());
+        assert!(!index.disk_cache_is_current(cache.path(), head.as_deref()));
+        assert!(index.write_to_disk(cache.path(), head.as_deref()));
+        assert!(index.disk_cache_is_current(cache.path(), head.as_deref()));
     }
 
     #[test]
@@ -10532,6 +12436,7 @@ mod tests {
         assert_eq!(
             original
                 .candidates(&decompose_regex("original_marker"))
+                .expect("candidates from a test index")
                 .len(),
             1
         );
@@ -10543,15 +12448,16 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let blocked = cache.path().join("not-a-directory");
-        fs::write(&blocked, "blocks streaming cache creation").unwrap();
         fs::write(root.join("source.rs"), "fn marker() {}\n").unwrap();
+        // A malformed cache path is rejected at admission, before streaming.
+        // Fail after admission so this still exercises cancellation in fallback.
+        FAIL_STREAMING_BUILD.set(true);
         let probes = AtomicUsize::new(0);
         let (result, events) = crate::logging::capture_index_events(|| {
             SearchIndex::build_with_limit_to_cache_dir_cancellable(
                 &root,
                 1024 * 1024,
-                &blocked,
+                cache.path(),
                 &|| probes.fetch_add(1, Ordering::SeqCst) < 2,
             )
         });
@@ -11005,6 +12911,339 @@ mod tests {
     }
 
     #[test]
+    fn audit10_7_posting_failure_is_not_a_complete_empty_grep_reply() {
+        let (_directory, context, _) = unreadable_postings_fixture();
+        let request = crate::protocol::RawRequest {
+            id: "posting-failure".to_string(),
+            command: "grep".to_string(),
+            session_id: None,
+            lsp_hints: None,
+            params: serde_json::json!({"pattern":"needle", "max_results":10}),
+        };
+        let response = crate::commands::grep::handle_grep(&request, &context);
+        assert!(
+            !response.success,
+            "unreadable lexical evidence was accepted: {:?}",
+            response.data
+        );
+        assert!(response.data.to_string().contains("lexical postings"));
+    }
+
+    fn unreadable_postings_fixture() -> (tempfile::TempDir, crate::context::AppContext, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        let source = root.join("lib.rs");
+        fs::write(&source, "pub fn needleHandler() {}\n").unwrap();
+        let mut index = SearchIndex::build_with_limit(&root, 1024 * 1024);
+        let path = directory.path().join("unreadable-postings.bin");
+        fs::write(&path, []).unwrap();
+        let CompileResult::Ok(pattern) =
+            pattern_compile::compile("needleHandler", CompileOpts::default())
+        else {
+            panic!("literal must compile")
+        };
+        let query = decompose_grep_pattern(&pattern);
+        let mut lookup = query
+            .and_trigrams
+            .iter()
+            .copied()
+            .map(|trigram| LookupEntry {
+                trigram,
+                offset: 0,
+                count: 1,
+            })
+            .collect::<Vec<_>>();
+        lookup.sort_unstable_by_key(|entry| entry.trigram);
+        index.base = Some(Arc::new(BasePostings {
+            file: Arc::new(fs::File::open(path).unwrap()),
+            postings_blob_start: 0,
+            postings_blob_len: POSTING_BYTES as u64,
+            lookup: Arc::new(lookup),
+        }));
+        index.delta = Arc::new(DeltaState::default());
+        let context = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                ..Default::default()
+            },
+        );
+        *context.search_index().write().unwrap() = Some(index);
+        (directory, context, root)
+    }
+
+    #[test]
+    fn audit10_7_partial_grep_keeps_readable_sources_even_without_matches() {
+        let (_directory, context, root) = unreadable_postings_fixture();
+        let explicit = root.join("explicit.rs");
+        for content in ["no matches\n", "needle\n"] {
+            fs::write(&explicit, content).unwrap();
+            let request = crate::protocol::RawRequest {
+                id: "partial-posting-failure".to_string(),
+                command: "grep".to_string(),
+                session_id: None,
+                lsp_hints: None,
+                params: serde_json::json!({"pattern":"needle", "max_results":10, "path":[root, explicit]}),
+            };
+            let response = crate::commands::grep::handle_grep(&request, &context);
+            assert!(
+                response.success,
+                "readable explicit scope was discarded: {:?}",
+                response.data
+            );
+            assert_eq!(response.data["complete"], false);
+            assert_eq!(
+                response.data["matches"].as_array().unwrap().len(),
+                usize::from(content == "needle\n")
+            );
+            assert!(response.data["index_read_gap"]
+                .to_string()
+                .contains("lexical postings"));
+        }
+    }
+
+    #[test]
+    fn audit10_7_rank_and_exact_queries_propagate_posting_io_errors() {
+        let (_directory, context, root) = unreadable_postings_fixture();
+        let guard = context.search_index().read().unwrap();
+        let snapshot = guard.as_ref().unwrap().snapshot();
+        let query = query_trigrams_from_tokens(&["needle"]);
+        for error in [
+            snapshot
+                .lexical_rank_with_stats(&query, None, 10)
+                .unwrap_err(),
+            snapshot
+                .lexical_rank_at_depth(&query, None, 10)
+                .unwrap_err(),
+            snapshot
+                .whole_corpus_exact_pass("needle", &root, None)
+                .unwrap_err(),
+            snapshot
+                .files_possibly_holding_phrase("needle", &root)
+                .unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("lexical postings"));
+        }
+    }
+
+    #[test]
+    fn audit10_7_search_discloses_posting_failure_with_verified_exact_fallback() {
+        let (_directory, context, _) = unreadable_postings_fixture();
+        let request = crate::protocol::RawRequest {
+            id: "search-posting-failure".to_string(),
+            command: "semantic_search".to_string(),
+            session_id: None,
+            lsp_hints: None,
+            params: serde_json::json!({"query":"needleHandler", "topK":10}),
+        };
+        let response = crate::commands::semantic_search::handle_semantic_search(&request, &context);
+        assert!(
+            response.success,
+            "readable exact fallback discarded: {:?}",
+            response.data
+        );
+        assert_eq!(response.data["complete"], false);
+        assert!(response.data["index_read_gap"]
+            .to_string()
+            .contains("lexical postings"));
+        assert!(
+            response.data["text"].as_str().unwrap().contains("lib.rs"),
+            "{:?}",
+            response.data
+        );
+    }
+
+    #[test]
+    fn audit10_7_split_search_discloses_posting_failure() {
+        let (_directory, context, _) = unreadable_postings_fixture();
+        let request = crate::protocol::RawRequest {
+            id: "split-posting-failure".to_string(),
+            command: "semantic_search".to_string(),
+            session_id: None,
+            lsp_hints: None,
+            params: serde_json::json!({"query":"find handler implementation", "pattern":"needleHandler", "topK":10}),
+        };
+        let response = crate::commands::semantic_search::handle_semantic_search(&request, &context);
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["complete"], false);
+        assert!(
+            response.data["index_read_gap"]
+                .to_string()
+                .contains("lexical postings"),
+            "{:?}",
+            response.data
+        );
+    }
+
+    fn audit10_7_after_regex_lock_timeout<T>(
+        context: &crate::context::AppContext,
+        action: impl FnOnce() -> T,
+    ) -> T {
+        let (start, begin) = std::sync::mpsc::channel();
+        let (held, acquired) = std::sync::mpsc::channel();
+        let (release, finish) = std::sync::mpsc::channel();
+        let (released, dropped) = std::sync::mpsc::channel();
+        let timeouts = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = timeouts.clone();
+        let result = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                if begin.recv().is_ok() {
+                    let guard = context.search_index().write().unwrap();
+                    let _ = held.send(());
+                    let _ = finish.recv();
+                    drop(guard);
+                    let _ = released.send(());
+                }
+            });
+            crate::commands::semantic_search::with_regex_route_lock_hook_for_test(
+                move |timed_out| {
+                    if timed_out {
+                        observed.set(observed.get() + 1);
+                        release.send(()).unwrap();
+                        dropped.recv().unwrap();
+                    } else {
+                        start.send(()).unwrap();
+                        acquired.recv().unwrap();
+                    }
+                },
+                action,
+            )
+        });
+        assert_eq!(
+            timeouts.get(),
+            1,
+            "the ranked route must time out before fallback"
+        );
+        result
+    }
+
+    #[test]
+    fn audit10_7_pattern_lock_timeout_fallback_rejects_unreadable_postings() {
+        let (_directory, context, _) = unreadable_postings_fixture();
+        let request = crate::protocol::RawRequest {
+            id: "pattern-lock-timeout".to_string(),
+            command: "semantic_search".to_string(),
+            session_id: None,
+            lsp_hints: None,
+            params: serde_json::json!({"pattern":"needleHandler", "topK":10}),
+        };
+        let response = audit10_7_after_regex_lock_timeout(&context, || {
+            crate::commands::semantic_search::handle_semantic_search(&request, &context)
+        });
+        assert!(
+            !response.success,
+            "unreadable postings became a complete empty reply: {:?}",
+            response.data
+        );
+        assert!(response.data.to_string().contains("lexical postings"));
+    }
+
+    #[test]
+    fn audit10_7_split_lock_timeout_fallback_preserves_posting_read_gaps() {
+        let (_directory, context, _) = unreadable_postings_fixture();
+        let request = crate::protocol::RawRequest {
+            id: "split-lock-timeout".to_string(),
+            command: "semantic_search".to_string(),
+            session_id: None,
+            lsp_hints: None,
+            params: serde_json::json!({"query":"how is work scheduled", "pattern":"needleHandler", "topK":10}),
+        };
+        let response = audit10_7_after_regex_lock_timeout(&context, || {
+            crate::commands::semantic_search::handle_semantic_search(&request, &context)
+        });
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["complete"], false);
+        assert!(
+            response.data["index_read_gap"]
+                .to_string()
+                .contains("lexical postings"),
+            "{:?}",
+            response.data
+        );
+        assert_eq!(response.data["pattern_summary"]["examination_capped"], true);
+    }
+
+    #[test]
+    fn audit10_search_lock_poison_recovers() {
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = super::CACHE_LOCK_ACQUIRE_MUTEX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            panic!("simulate acquisition panic");
+        });
+        assert!(poisoned.is_err());
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let cache_dir = storage.path().join("index").join("poison");
+        let lock = super::CacheLock::acquire(&cache_dir, project.path()).unwrap();
+        assert!(lock._guard.is_some());
+    }
+
+    #[test]
+    fn audit10_candidate_sort_counts_each_trigram_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = super::SearchIndex::new();
+        let path = dir.path().join("empty-postings.bin");
+        std::fs::write(&path, []).unwrap();
+        index.base = Some(std::sync::Arc::new(super::BasePostings {
+            file: std::sync::Arc::new(std::fs::File::open(path).unwrap()),
+            postings_blob_start: 0,
+            postings_blob_len: 0,
+            lookup: std::sync::Arc::new(
+                (0..32)
+                    .map(|trigram| super::LookupEntry {
+                        trigram,
+                        offset: 0,
+                        count: 0,
+                    })
+                    .collect(),
+            ),
+        }));
+        let query = super::RegexQuery {
+            and_trigrams: (0..32).rev().collect(),
+            and_filters: std::collections::HashMap::new(),
+            or_groups: Vec::new(),
+            or_filters: Vec::new(),
+        };
+        super::POSTING_COUNT_CALLS.with(|calls| calls.set(0));
+        assert!(index.snapshot().candidates(&query).unwrap().is_empty());
+        super::POSTING_COUNT_CALLS.with(|calls| assert_eq!(calls.get(), 32));
+    }
+
+    #[test]
+    fn audit10_base_postings_use_bounded_cancellation_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = super::SearchIndex::new();
+        let mut bytes = Vec::new();
+        for i in 0..200u32 {
+            index.index_file(&dir.path().join(format!("file_{i}.rs")), b"needle");
+            bytes.extend_from_slice(&i.to_le_bytes());
+            bytes.extend_from_slice(&[255, 255]);
+        }
+        let path = dir.path().join("postings.bin");
+        std::fs::write(&path, &bytes).unwrap();
+        index.base = Some(std::sync::Arc::new(super::BasePostings {
+            file: std::sync::Arc::new(std::fs::File::open(path).unwrap()),
+            postings_blob_start: 0,
+            postings_blob_len: bytes.len() as u64,
+            lookup: std::sync::Arc::new(vec![super::LookupEntry {
+                trigram: 7,
+                offset: 0,
+                count: 200,
+            }]),
+        }));
+        index.delta = std::sync::Arc::new(super::DeltaState::default());
+        super::BASE_CANCELLATION_CHECKS.with(|count| count.set(0));
+        super::SUPERSEDED_LOOKUPS.with(|count| count.set(0));
+        assert_eq!(
+            index.snapshot().postings_for_trigram(7, None).unwrap(),
+            (0..200).collect::<Vec<_>>()
+        );
+        super::BASE_CANCELLATION_CHECKS.with(|count| assert_eq!(count.get(), 4));
+        super::SUPERSEDED_LOOKUPS.with(|count| assert_eq!(count.get(), 200));
+    }
+
+    #[test]
     fn perf_audit_empty_filters_skip_path_keys() {
         let root = Path::new("/project");
         audit_work_reset();
@@ -11143,18 +13382,29 @@ mod tests {
             "{} file slots for one live file",
             index.files.len()
         );
-        assert_eq!(before.candidates(&decompose_regex("old_marker")).len(), 1);
         assert_eq!(
-            index.candidates(&decompose_regex("new_marker_255")).len(),
+            before
+                .candidates(&decompose_regex("old_marker"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            index
+                .candidates(&decompose_regex("new_marker_255"))
+                .unwrap()
+                .len(),
             1
         );
         let reference = SearchIndex::build_with_limit_serial(dir.path(), DEFAULT_MAX_FILE_SIZE);
         assert_eq!(
             index
                 .grep("new_marker_255", true, &[], &[], dir.path(), 100)
+                .unwrap()
                 .matches,
             reference
                 .grep("new_marker_255", true, &[], &[], dir.path(), 100)
+                .unwrap()
                 .matches
         );
     }
@@ -11636,7 +13886,9 @@ mod tests {
             candidate_filter,
             max_files,
         );
-        let actual = snapshot.lexical_rank_with_stats(query_trigrams, candidate_filter, max_files);
+        let actual = snapshot
+            .lexical_rank_with_stats(query_trigrams, candidate_filter, max_files)
+            .unwrap();
         assert_eq!(actual.files, expected.files);
         assert_eq!(actual.engine_capped, expected.engine_capped);
         actual
@@ -12091,7 +14343,7 @@ mod tests {
             ..RegexQuery::default()
         };
 
-        let candidates = index.candidates(&query);
+        let candidates = index.candidates(&query).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(index.files[candidates[0] as usize].path, alpha);
     }
@@ -12118,11 +14370,13 @@ mod tests {
         assert_eq!(
             index
                 .postings_for_trigram(trigram, Some(matching_filter))
+                .unwrap()
                 .len(),
             1
         );
         assert!(index
             .postings_for_trigram(trigram, Some(non_matching_filter))
+            .unwrap()
             .is_empty());
     }
 
@@ -12166,7 +14420,7 @@ mod tests {
             for filter in filters {
                 let expected =
                     postings_for_trigram_materialized_reference(&snapshot, trigram, filter);
-                let actual = snapshot.postings_for_trigram(trigram, filter);
+                let actual = snapshot.postings_for_trigram(trigram, filter).unwrap();
                 assert_eq!(
                     actual, expected,
                     "trigram={trigram:#08x}, filter={filter:?}"
@@ -12177,14 +14431,16 @@ mod tests {
             }
         }
 
-        let unfiltered = snapshot.postings_for_trigram(base_and_delta, None);
-        let loc_only = snapshot.postings_for_trigram(
-            base_and_delta,
-            Some(PostingFilter {
-                next_mask: 0,
-                loc_mask: mask_for_position(31),
-            }),
-        );
+        let unfiltered = snapshot.postings_for_trigram(base_and_delta, None).unwrap();
+        let loc_only = snapshot
+            .postings_for_trigram(
+                base_and_delta,
+                Some(PostingFilter {
+                    next_mask: 0,
+                    loc_mask: mask_for_position(31),
+                }),
+            )
+            .unwrap();
         assert_eq!(loc_only, unfiltered);
     }
 
@@ -12212,7 +14468,7 @@ mod tests {
         let new_id = *index.path_to_id.get(&a).expect("re-added file id");
         assert!(new_id >= index.base_file_count);
         let abc = pack_trigram(b'a', b'b', b'c');
-        let ids = index.postings_for_trigram(abc, None);
+        let ids = index.postings_for_trigram(abc, None).unwrap();
         assert_eq!(ids, {
             let mut expected = vec![b_id, new_id];
             expected.sort_unstable();
@@ -12306,35 +14562,36 @@ mod tests {
         let old_trigram = pack_trigram(b'o', b'l', b'd');
         let new_trigram = pack_trigram(b'n', b'e', b'w');
         assert_eq!(
-            before_edit.postings_for_trigram(old_trigram, None),
+            before_edit.postings_for_trigram(old_trigram, None).unwrap(),
             vec![old_file_id]
         );
         assert!(before_edit
             .postings_for_trigram(new_trigram, None)
+            .unwrap()
             .is_empty());
         assert!(after_edit
             .postings_for_trigram(old_trigram, None)
+            .unwrap()
             .is_empty());
         assert_eq!(
-            after_edit.postings_for_trigram(new_trigram, None),
+            after_edit.postings_for_trigram(new_trigram, None).unwrap(),
             vec![new_file_id]
         );
 
-        let dirty_result = index.read().expect("read dirty index").grep(
-            "new_generation",
-            true,
-            &[],
-            &[],
-            &project,
-            100,
-        );
+        let dirty_result = index
+            .read()
+            .expect("read dirty index")
+            .grep("new_generation", true, &[], &[], &project, 100)
+            .unwrap();
         let reference_cache = dir.path().join("reference-cache");
         let reference = SearchIndex::build_with_limit_to_cache_dir(
             &project,
             DEFAULT_MAX_FILE_SIZE,
             &reference_cache,
         );
-        let reference_result = reference.grep("new_generation", true, &[], &[], &project, 100);
+        let reference_result = reference
+            .grep("new_generation", true, &[], &[], &project, 100)
+            .unwrap();
         assert_eq!(dirty_result.matches, reference_result.matches);
         assert_eq!(dirty_result.total_matches, reference_result.total_matches);
     }
@@ -12371,7 +14628,8 @@ mod tests {
         reset_postings_for_trigram_count_for_debug();
         let result = index
             .snapshot()
-            .lexical_rank_with_stats(&query, None, 1_000);
+            .lexical_rank_with_stats(&query, None, 1_000)
+            .unwrap();
 
         assert!(result.files.len() > 1);
         assert_eq!(
@@ -12420,11 +14678,14 @@ mod tests {
         assert!(index.delta.postings.is_empty());
         assert!(index.delta.superseded.is_empty());
         assert_eq!(
-            index.postings_for_trigram(pack_trigram(b'a', b'b', b'c'), None),
+            index
+                .postings_for_trigram(pack_trigram(b'a', b'b', b'c'), None)
+                .unwrap(),
             vec![0]
         );
         assert!(index
             .postings_for_trigram(pack_trigram(b'd', b'e', b'f'), None)
+            .unwrap()
             .is_empty());
     }
 
@@ -12571,7 +14832,9 @@ mod tests {
         );
         assert_eq!(loaded.trigram_count(), index.trigram_count());
         assert_eq!(
-            loaded.postings_for_trigram(pack_trigram(b'a', b'b', b'c'), None),
+            loaded
+                .postings_for_trigram(pack_trigram(b'a', b'b', b'c'), None)
+                .unwrap(),
             vec![0]
         );
         assert_eq!(
@@ -12669,7 +14932,9 @@ mod tests {
         assert!(refreshed
             .path_to_id
             .contains_key(&canonical_project.join("untracked.txt")));
-        let matches = refreshed.grep("after local edit", true, &[], &[], &canonical_project, 10);
+        let matches = refreshed
+            .grep("after local edit", true, &[], &[], &canonical_project, 10)
+            .expect("grep over a test index");
         assert_eq!(matches.matches.len(), 1);
     }
 
@@ -12800,7 +15065,9 @@ mod tests {
         )
         .expect("each edited file must count once against the warm budget");
         assert_eq!(refreshed.git_head.as_deref(), Some(current.as_str()));
-        let result = refreshed.grep("QuotedPathNeedle", true, &[], &[], &canonical_project, 10);
+        let result = refreshed
+            .grep("QuotedPathNeedle", true, &[], &[], &canonical_project, 10)
+            .expect("grep over a test index");
         assert_eq!(result.total_matches, names.len());
     }
 
@@ -12847,7 +15114,9 @@ mod tests {
             Some(WARM_GIT_DIFF_PATH_LIMIT),
         )
         .expect("warm refresh");
-        let new = refreshed.grep("QuotedNew", true, &[], &[], &canonical_project, 10);
+        let new = refreshed
+            .grep("QuotedNew", true, &[], &[], &canonical_project, 10)
+            .expect("grep over a test index");
         let mut found: Vec<_> = new
             .matches
             .iter()
@@ -12857,7 +15126,9 @@ mod tests {
         let mut expected: Vec<_> = names.iter().map(std::ffi::OsString::from).collect();
         expected.sort();
         assert_eq!(found, expected, "every committed edit must be searchable");
-        let old = refreshed.grep("QuotedOld", true, &[], &[], &canonical_project, 10);
+        let old = refreshed
+            .grep("QuotedOld", true, &[], &[], &canonical_project, 10)
+            .expect("grep over a test index");
         assert_eq!(old.total_matches, 0, "no stale content may remain");
     }
 
@@ -12922,14 +15193,20 @@ mod tests {
                 vec![canonical_project.join("inside.rs")],
                 "{lane}: nothing outside the root may enter the index"
             );
-            let new = index.grep("SubdirNew", true, &[], &[], &canonical_project, 10);
+            let new = index
+                .grep("SubdirNew", true, &[], &[], &canonical_project, 10)
+                .expect("grep over a test index");
             assert_eq!(
                 new.total_matches, 1,
                 "{lane}: the edit under the root is searchable"
             );
-            let old = index.grep("SubdirOld", true, &[], &[], &canonical_project, 10);
+            let old = index
+                .grep("SubdirOld", true, &[], &[], &canonical_project, 10)
+                .expect("grep over a test index");
             assert_eq!(old.total_matches, 0, "{lane}: no stale content may remain");
-            let outside = index.grep("Outside", true, &[], &[], &canonical_project, 10);
+            let outside = index
+                .grep("Outside", true, &[], &[], &canonical_project, 10)
+                .expect("grep over a test index");
             assert_eq!(
                 outside.total_matches, 0,
                 "{lane}: outside content stays out"
@@ -13663,7 +15940,7 @@ mod tests {
         );
         write_cache_key_memo(storage.path(), &memo);
 
-        sweep_orphaned_index_dirs(storage.path());
+        sweep_orphaned_index_dirs(&crate::root_cache::StoragePaths::same(storage.path()));
 
         assert!(
             !aged_orphan.exists(),
@@ -14517,6 +16794,67 @@ mod tests {
         assert!(error.detail().contains("Too many open files"));
     }
 
+    /// With `storage.cache_dir` set to a cache root outside the storage root,
+    /// a search index written in a newer format on the cache root is refused,
+    /// and its refusal belongs to the durable storage root that owns the cache
+    /// root: health and status list it there, under the project's key, and a
+    /// replacement with a current-format header clears it. Paths under the
+    /// durable root itself are never re-spelled.
+    #[test]
+    fn cache_root_index_refusal_is_listed_and_cleared_under_its_storage_root() {
+        let storage = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config {
+            storage_dir: Some(storage.path().to_path_buf()),
+            cache_dir: Some(cache.path().to_path_buf()),
+            ..crate::config::Config::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        let durable = crate::bash_background::storage_dir(config.storage_dir.as_deref());
+        let artifacts = crate::root_cache::cache_root(&config);
+        assert!(!artifacts.starts_with(&durable));
+        let key = "cache-dir-refusal-key";
+        assert!(crate::root_cache::durable_route(&durable.join("index").join(key)).is_none());
+
+        let cache_dir = artifacts.join("index").join(key);
+        fs::create_dir_all(&cache_dir).unwrap();
+        let cache_bin = cache_dir.join("cache.bin");
+        let write_header = |version: u32| {
+            let mut bytes = CACHE_MAGIC.to_le_bytes().to_vec();
+            bytes.extend(version.to_le_bytes());
+            fs::write(&cache_bin, bytes).unwrap();
+        };
+        let listed_under_storage = || {
+            crate::persisted_format::refusals_under(&durable)
+                .into_iter()
+                .filter(|refusal| {
+                    refusal.store == crate::persisted_format::PersistedStore::SearchIndex
+                        && refusal.path == cache_bin
+                })
+                .count()
+        };
+
+        write_header(INDEX_FORMAT_VERSION + 1);
+        crate::persisted_format::preflight_project_artifacts(&durable, &artifacts, key);
+        let refused = SearchIndex::check_disk_cache_format(&cache_dir)
+            .expect_err("a newer-format index on the cache root is refused");
+        assert_eq!(refused.path, cache_bin);
+        assert_eq!(listed_under_storage(), 1);
+        let (owned, _) = crate::persisted_format::refusals_for_push(&durable, Some(key));
+        assert!(
+            owned.iter().any(|refusal| refusal.path == cache_bin),
+            "status attributes the refusal to this project on its storage root: {owned:?}"
+        );
+
+        write_header(INDEX_FORMAT_VERSION);
+        assert!(SearchIndex::check_disk_cache_format(&cache_dir).is_ok());
+        assert_eq!(listed_under_storage(), 0);
+        assert!(crate::persisted_format::refusal_covering(
+            crate::persisted_format::PersistedStore::SearchIndex,
+            &cache_bin
+        )
+        .is_none());
+    }
     #[test]
     fn artifact_cache_key_concurrent_memo_writes_keep_valid_json() {
         let _probe_lock = git_root_commit_probe_override_lock_for_test();
@@ -14608,7 +16946,9 @@ mod tests {
             Some(baseline),
             None,
         );
-        let result = refreshed.grep("newtoken", true, &[], &[], &project, 10);
+        let result = refreshed
+            .grep("newtoken", true, &[], &[], &project, 10)
+            .unwrap();
 
         assert_eq!(result.total_matches, 1);
     }
@@ -14625,6 +16965,7 @@ mod tests {
         assert_eq!(
             indexed
                 .grep("unchanged-limit-token", true, &[], &[], &project, 10)
+                .unwrap()
                 .total_matches,
             1
         );
@@ -14651,6 +16992,7 @@ mod tests {
         assert_eq!(
             raised
                 .grep("unchanged-limit-token", true, &[], &[], &project, 10)
+                .unwrap()
                 .total_matches,
             1
         );
@@ -14677,6 +17019,7 @@ mod tests {
         assert_eq!(
             refreshed
                 .grep("unchangedtoken", true, &[], &[], &project, 10)
+                .unwrap()
                 .total_matches,
             1
         );
@@ -14711,7 +17054,7 @@ mod tests {
         fs::write(docs.join("guide.md"), "SearchIndex guide\n").expect("write docs file");
 
         let index = SearchIndex::build(&project);
-        let result = index.grep("SearchIndex", true, &[], &[], &src, 10);
+        let result = index.grep("SearchIndex", true, &[], &[], &src, 10).unwrap();
 
         assert_eq!(result.files_searched, 1);
         assert_eq!(result.files_with_matches, 1);
@@ -14730,7 +17073,7 @@ mod tests {
         fs::write(src.join("main.rs"), "SearchIndex SearchIndex\n").expect("write src file");
 
         let index = SearchIndex::build(&project);
-        let result = index.grep("SearchIndex", true, &[], &[], &src, 10);
+        let result = index.grep("SearchIndex", true, &[], &[], &src, 10).unwrap();
 
         assert_eq!(result.total_matches, 1);
         assert_eq!(result.matches.len(), 1);
@@ -14746,13 +17089,15 @@ mod tests {
         let index = SearchIndex::build(&project);
         assert!(index.is_ready());
 
-        let whitespace = index.grep(r"^\s+[0-9]+ pass", true, &[], &[], &project, 10);
+        let whitespace = index
+            .grep(r"^\s+[0-9]+ pass", true, &[], &[], &project, 10)
+            .unwrap();
         assert_eq!(whitespace.matches.len(), 1);
         assert_eq!(whitespace.matches[0].line, 2);
         assert_eq!(whitespace.matches[0].line_text, "  566 pass");
         assert_eq!(whitespace.matches[0].match_text, "  566 pass");
 
-        let negated_class = index.grep(r"[^x]+", true, &[], &[], &project, 10);
+        let negated_class = index.grep(r"[^x]+", true, &[], &[], &project, 10).unwrap();
         assert_eq!(negated_class.matches.len(), 1);
         assert_eq!(negated_class.matches[0].line, 2);
         assert_eq!(negated_class.matches[0].match_text, "  566 pass");
@@ -14761,7 +17106,9 @@ mod tests {
             .iter()
             .all(|matched| !matched.match_text.contains('\n')));
 
-        let explicit_newline = index.grep(r"pass\nx", true, &[], &[], &project, 10);
+        let explicit_newline = index
+            .grep(r"pass\nx", true, &[], &[], &project, 10)
+            .unwrap();
         assert!(explicit_newline.matches.is_empty());
 
         let regex = match pattern_compile::compile(r"[^x]+", CompileOpts::default()) {
@@ -14791,7 +17138,9 @@ mod tests {
             CompileResult::Ok(pattern) => pattern,
             other => panic!("compile literal newline: {other:?}"),
         };
-        let result = index.search_grep(&literal_newline, &[], &[], &project, 10);
+        let result = index
+            .search_grep(&literal_newline, &[], &[], &project, 10)
+            .unwrap();
         assert!(result.matches.is_empty());
     }
 
@@ -14804,7 +17153,9 @@ mod tests {
         std::fs::write(&file, "foo hit\nbar\nprefix foo hit\nbar\n")
             .expect("write cross-line fixture");
         let index = SearchIndex::build(&project);
-        let result = index.grep(r"foo.*\nbar|hit", true, &[], &[], &project, 10);
+        let result = index
+            .grep(r"foo.*\nbar|hit", true, &[], &[], &project, 10)
+            .unwrap();
 
         assert_eq!(result.matches.len(), 2);
         assert_eq!(result.matches[0].line, 1);
@@ -14824,7 +17175,7 @@ mod tests {
         fs::write(&file, "äbc\n").expect("write unicode file");
 
         let index = SearchIndex::build(&project);
-        let result = index.grep("Äbc", false, &[], &[], &project, 10);
+        let result = index.grep("Äbc", false, &[], &[], &project, 10).unwrap();
 
         assert_eq!(result.total_matches, 1);
         assert_eq!(result.matches.len(), 1);
@@ -14855,7 +17206,7 @@ mod tests {
             }
             other => panic!("expected literal pattern for {needle:?}, got {other:?}"),
         };
-        let result = index.search_grep(&pattern, &[], &[], &project, 10);
+        let result = index.search_grep(&pattern, &[], &[], &project, 10).unwrap();
 
         assert_eq!(result.index_status, IndexStatus::Ready);
         assert!(
@@ -15043,6 +17394,7 @@ mod tests {
                 GrepScanOrder::Arrival,
                 PATH_ORDER_BATCH_ROW_BUDGET,
             )
+            .unwrap()
             .0
     }
 
@@ -15334,7 +17686,9 @@ mod tests {
             Some(baseline),
             None,
         );
-        let result = refreshed.grep("bravo", true, &[], &[], &project, 10);
+        let result = refreshed
+            .grep("bravo", true, &[], &[], &project, 10)
+            .unwrap();
         let canonical_file = fs::canonicalize(&file).expect("canonicalize edited file");
         let refreshed_id = *refreshed
             .path_to_id
@@ -15344,9 +17698,11 @@ mod tests {
         assert_eq!(result.total_matches, 1);
         assert!(refreshed
             .postings_for_trigram(pack_trigram(b'b', b'r', b'a'), None)
+            .unwrap()
             .contains(&refreshed_id));
         assert!(!refreshed
             .postings_for_trigram(pack_trigram(b'a', b'l', b'p'), None)
+            .unwrap()
             .contains(&refreshed_id));
     }
 
@@ -15359,7 +17715,7 @@ mod tests {
         fs::write(src.join("main.rs"), "SearchIndex\nSearchIndex\n").expect("write src file");
 
         let index = SearchIndex::build(&project);
-        let result = index.grep("SearchIndex", true, &[], &[], &src, 1);
+        let result = index.grep("SearchIndex", true, &[], &[], &src, 1).unwrap();
 
         assert_eq!(result.total_matches, 2);
         assert_eq!(result.matches.len(), 1);
@@ -15500,8 +17856,12 @@ mod tests {
             assert_eq!(serial_file.content_hash, parallel_file.content_hash);
         }
 
-        let serial_grep = serial.grep("aft_perf_marker_17", true, &[], &[], &project, 10);
-        let parallel_grep = parallel.grep("aft_perf_marker_17", true, &[], &[], &project, 10);
+        let serial_grep = serial
+            .grep("aft_perf_marker_17", true, &[], &[], &project, 10)
+            .unwrap();
+        let parallel_grep = parallel
+            .grep("aft_perf_marker_17", true, &[], &[], &project, 10)
+            .unwrap();
         assert_eq!(serial_grep.matches, parallel_grep.matches);
         assert_eq!(serial_grep.total_matches, parallel_grep.total_matches);
         assert_eq!(serial_grep.files_searched, parallel_grep.files_searched);
@@ -15558,6 +17918,54 @@ mod tests {
             walker_dirs < 50,
             "ignore walker should not descend deeply into ignored tree (dirs={walker_dirs})"
         );
+    }
+
+    #[test]
+    fn matching_project_walk_preserves_filtered_mtime_order() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, age) in [
+            ("src/a/retry.rs", 0),
+            ("src/b/retry.rs", 0),
+            ("src/c/retry.rs", 1),
+            ("tests/retry.rs", 2),
+            ("src/unrelated.rs", 3),
+        ] {
+            let path = dir.path().join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "pub fn fixture() {}\n").unwrap();
+            filetime::set_file_mtime(
+                &path,
+                filetime::FileTime::from_unix_time(1_700_000_000 + age, 0),
+            )
+            .unwrap();
+        }
+        for suffix in ["retry.rs", "a/retry.rs", "missing.rs"] {
+            for include_tests in [false, true] {
+                let matches = |path: &Path| {
+                    let relative = path.strip_prefix(dir.path()).unwrap();
+                    (include_tests || !relative.starts_with("tests"))
+                        && relative
+                            .to_string_lossy()
+                            .replace('\\', "/")
+                            .ends_with(suffix)
+                };
+                let expected =
+                    walk_project_files_from(dir.path(), dir.path(), &PathFilters::default())
+                        .into_iter()
+                        .filter(|path| matches(path))
+                        .collect::<Vec<_>>();
+                let actual = walk_project_files_from_matching(
+                    dir.path(),
+                    dir.path(),
+                    &PathFilters::default(),
+                    matches,
+                );
+                assert_eq!(
+                    actual, expected,
+                    "suffix={suffix}, include_tests={include_tests}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -15723,7 +18131,9 @@ mod tests {
             .expect("write");
         }
         let index = SearchIndex::build_with_limit(dir.path(), DEFAULT_MAX_FILE_SIZE);
-        let result = index.grep("needle_token", false, &[], &[], dir.path(), 1000);
+        let result = index
+            .grep("needle_token", false, &[], &[], dir.path(), 1000)
+            .unwrap();
         assert!(
             result.matches.len() >= 40,
             "expected a match per file, got {}",
@@ -15803,10 +18213,12 @@ mod tests {
             .postings
             .insert(shared_trigram, optimized);
 
-        let actual = index.candidates(&RegexQuery {
-            and_trigrams: vec![shared_trigram],
-            ..RegexQuery::default()
-        });
+        let actual = index
+            .candidates(&RegexQuery {
+                and_trigrams: vec![shared_trigram],
+                ..RegexQuery::default()
+            })
+            .unwrap();
         let expected = reference
             .into_iter()
             .map(|posting| posting.file_id)
@@ -16074,7 +18486,7 @@ mod warm_reload_verification_tests {
                         "NewAliasNeedle",
                     ] {
                         assert_eq!(
-                            refreshed.grep(needle, true, &[], &[], &scope, 10).matches.len(),
+                            refreshed.grep(needle, true, &[], &[], &scope, 10).expect("grep over a test index").matches.len(),
                             1,
                             "ready index must find {needle} through {scope:?} (persisted={persisted}, strategy={strategy:?})"
                         );
@@ -16121,6 +18533,7 @@ mod warm_reload_verification_tests {
                     assert_eq!(
                         refreshed
                             .grep("unchanged", true, &[], &[], refresh_root, 10)
+                            .expect("grep over a test index")
                             .matches
                             .len(),
                         1
@@ -16227,6 +18640,7 @@ mod warm_reload_verification_tests {
             assert_eq!(
                 refreshed
                     .grep("afterx", true, &[], &[], &root, 10)
+                    .expect("grep over a test index")
                     .matches
                     .len(),
                 1
@@ -16574,7 +18988,9 @@ mod project_ignore_rule_tests {
 
     fn indexed_needle_files(root: &Path) -> BTreeSet<String> {
         let index = SearchIndex::build(root);
-        let result = index.grep(fixture::NEEDLE, true, &[], &[], root, 1000);
+        let result = index
+            .grep(fixture::NEEDLE, true, &[], &[], root, 1000)
+            .unwrap();
         let files = result
             .matches
             .iter()

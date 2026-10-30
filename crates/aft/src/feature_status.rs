@@ -198,6 +198,9 @@ pub fn observed_index_status(ctx: &AppContext, plane: IndexPlane) -> IndexObserv
             unavailable_reason: Some(cause::ROOT_TOO_BROAD.into()),
         };
     }
+    if let Some(reason) = ctx.cache_unavailable_reason() {
+        return IndexObservation::unavailable(crate::root_cache::cache_status_code(&reason));
+    }
     // Configure forces every index off for a HOME root (degraded mode). That
     // is not the user's resolved choice, so report it as unavailable with its
     // cause rather than as configured off.
@@ -233,7 +236,7 @@ pub fn storage_refusal(
     plane: IndexPlane,
 ) -> Option<crate::persisted_format::UnsupportedPersistedFormat> {
     use crate::persisted_format::{refusal_covering, PersistedStore};
-    let storage = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+    let storage = ctx.cache_dir();
     let key = ctx
         .canonical_cache_root_opt()
         .and_then(|root| ctx.cached_artifact_cache_key(&root));
@@ -268,6 +271,13 @@ pub fn storage_refusal(
 // index is being replaced or updated, which reports as building.
 
 fn observe_trigram(ctx: &AppContext) -> IndexObservation {
+    if ctx.lexical_views_enabled() {
+        return if ctx.lexical_view_is_ready() {
+            IndexObservation::ready()
+        } else {
+            IndexObservation::building()
+        };
+    }
     let resident = match ctx.search_index().try_read() {
         Ok(guard) => guard.as_ref().map(|index| index.ready),
         Err(std::sync::TryLockError::Poisoned(poisoned)) => {
@@ -308,8 +318,10 @@ fn trigram_disk_cache_valid(ctx: &AppContext) -> bool {
     let Some(key) = ctx.cached_artifact_cache_key(&root) else {
         return false;
     };
-    let cache_dir =
-        crate::search_index::resolve_cache_dir_with_key(&key, ctx.config().storage_dir.as_deref());
+    let cache_dir = crate::search_index::resolve_cache_dir_with_key(
+        &key,
+        ctx.config().cache_storage_dir().as_deref(),
+    );
     crate::search_index::SearchIndex::disk_cache_header_valid(&cache_dir)
 }
 
@@ -327,6 +339,18 @@ fn observe_semantic(ctx: &AppContext) -> IndexObservation {
         .is_some_and(|health| !health.available)
     {
         return IndexObservation::unavailable(cause::SEMANTIC_BACKEND_UNAVAILABLE);
+    }
+    // A started views-on lane serves only from its checkout view. Until that
+    // view is loaded the lane is loading or failed, whatever the shared status
+    // was last set to.
+    match ctx.checkout_semantic().try_state() {
+        None | Some(Some(crate::views::semantic_runtime::CheckoutSemanticState::Loading)) => {
+            return IndexObservation::building();
+        }
+        Some(Some(crate::views::semantic_runtime::CheckoutSemanticState::Unavailable(reason))) => {
+            return IndexObservation::unavailable(semantic_failure_cause(ctx, &reason));
+        }
+        Some(_) => {}
     }
     let resident = match ctx.semantic_index().try_read() {
         Ok(guard) => guard.is_some(),
@@ -349,6 +373,15 @@ fn observe_semantic(ctx: &AppContext) -> IndexObservation {
 
 /// Classify a failed semantic build into a named cause.
 pub fn semantic_failure_cause(ctx: &AppContext, message: &str) -> &'static str {
+    if let Some(reason) = ctx.cache_unavailable_reason() {
+        return crate::root_cache::cache_status_code(&reason);
+    }
+    if message.contains(crate::root_cache::CACHE_DIR_BUSY) {
+        return crate::root_cache::CACHE_DIR_BUSY;
+    }
+    if message.contains(crate::root_cache::CACHE_DIR_UNAVAILABLE) {
+        return crate::root_cache::CACHE_DIR_UNAVAILABLE;
+    }
     if crate::semantic_admission::is_not_opened_status(message) {
         return cause::SEMANTIC_NOT_OPENED;
     }
@@ -382,6 +415,13 @@ pub const fn local_semantic_platform_supported() -> bool {
 }
 
 fn observe_callgraph(ctx: &AppContext) -> IndexObservation {
+    if ctx.callgraph_views_enabled() {
+        return if ctx.callgraph_view_is_ready() {
+            IndexObservation::ready()
+        } else {
+            IndexObservation::building()
+        };
+    }
     let resident = match ctx.callgraph_store().try_read() {
         Ok(guard) => guard.is_some(),
         Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().is_some(),
@@ -419,6 +459,9 @@ pub fn callgraph_access_observation(
         CallgraphStoreAccess::Off => IndexObservation::off(),
         CallgraphStoreAccess::Ready(_) => IndexObservation::ready(),
         CallgraphStoreAccess::Building => IndexObservation::building(),
+        CallgraphStoreAccess::Error(error) if error.is_transient_lock_contention() => {
+            IndexObservation::building()
+        }
         CallgraphStoreAccess::Suspended(_) => IndexObservation::unavailable(cause::BUILD_SUSPENDED),
         CallgraphStoreAccess::Unavailable | CallgraphStoreAccess::Error(_) => {
             match observed_index_status(ctx, IndexPlane::Callgraph) {
@@ -442,6 +485,7 @@ pub fn observe_callgraph_query(ctx: &AppContext) -> IndexObservation {
 /// transient busy or locked error while opening the published view database.
 pub fn observe_callgraph_query_with_contention(ctx: &AppContext) -> (IndexObservation, bool) {
     let served_by_view = ctx.checkout_query_runtime_active()
+        || ctx.callgraph_views_enabled()
         || (ctx.config().views.enabled
             && ctx
                 .pinned_view_runtime()

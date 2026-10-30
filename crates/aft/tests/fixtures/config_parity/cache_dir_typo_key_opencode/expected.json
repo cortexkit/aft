@@ -1,0 +1,5 @@
+{
+  "rejected": [
+    "invalid_cache_config: unknown field `cachedir`"
+  ]
+}

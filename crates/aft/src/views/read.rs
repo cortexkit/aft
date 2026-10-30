@@ -238,11 +238,6 @@ pub(crate) fn open_published_callgraph(
     ReadonlyCallGraphStore::open_manifest_view(project_root, family, view_dir, generation, pin)
 }
 
-/// Why a linked worktree's own generation cannot answer call-graph queries:
-/// it was published without a derived database, which is built on first use.
-pub(crate) const CALLGRAPH_NOT_BUILT: &str =
-    "this checkout's call graph has not been built yet; the first query that needs it starts the build";
-
 /// True when `generation` has a call-graph database to read: its own derived
 /// file, or the checkout-wide `derived.sqlite` that older publications used,
 /// when that holds a ready graph. A linked worktree publishes generations
@@ -519,7 +514,7 @@ pub(crate) fn callgraph_paths_match(
 /// Content verification for an opted-in ruled callgraph generation. Legacy
 /// payload keys are intentionally incompatible with its dispatch-hint producer.
 pub fn callgraph_paths_match_v2(
-    manifest: &super::manifest_v2::ManifestV2,
+    manifest: &super::snapshot::ComposedGeneration,
     root: &std::path::Path,
     paths: &[PathBuf],
 ) -> super::Result<bool> {
@@ -574,7 +569,7 @@ pub fn open_foreign_generation(
     reader: &super::registry::ReaderRegistration,
     scope: &str,
     producers: &super::manifest_v2::Producers,
-) -> super::Result<Option<std::sync::Arc<super::snapshot::OpenGeneration>>> {
+) -> super::Result<Option<std::sync::Arc<super::snapshot::ComposedGeneration>>> {
     let protected = reader.protect_current(scope).map_err(|error| {
         super::ViewError::InvalidManifest(format!("foreign view {scope} unavailable: {error}"))
     })?;
@@ -589,8 +584,17 @@ pub fn open_foreign_generation(
         })?;
     let manifest = store.load_manifest_v2(protected.generation())?;
     manifest.ensure_producers(producers)?;
+    if manifest.base_header().is_some() {
+        // A base reference is valid only in a v3 worker manifest under
+        // `blobs/v3/<family>/views/<scope>`, opened through
+        // `open_foreign_v3_generation`. A v2 view naming a base is a corrupt
+        // edge: its header cannot be authenticated, and it is never trusted.
+        return Err(super::ViewError::InvalidManifest(format!(
+            "foreign view {scope} names a base outside the v3 namespace; refusing an unauthenticated base header"
+        )));
+    }
     Ok(Some(std::sync::Arc::new(
-        super::snapshot::OpenGeneration::new(
+        super::snapshot::ComposedGeneration::new(
             protected.generation().to_owned(),
             manifest,
             Some(super::snapshot::Residency::Protected(protected)),
@@ -598,8 +602,82 @@ pub fn open_foreign_generation(
     )))
 }
 
+/// Opens a v3 worker's published generation for a foreign or parent-folder
+/// reader: a dual pin-then-verify of the worker and, through the authenticated
+/// base resolver, of the base it names. The bundle owns both markers and its
+/// answers carry the worker's `PublishedFrontier`. A base that stays missing or
+/// moving through every attempt is reported unavailable, never replaced.
+// No production caller until the parent-folder and foreign-reader routing
+// slices select v3 workers; tests exercise it now.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn open_foreign_v3_generation(
+    storage: &std::path::Path,
+    family: &str,
+    scope: &str,
+    producers: &super::manifest_v2::Producers,
+) -> super::Result<Option<std::sync::Arc<super::snapshot::ComposedGeneration>>> {
+    super::base_refs::open_foreign_v3(storage, family, scope, producers).map_err(|error| {
+        super::ViewError::InvalidManifest(format!("foreign view {scope} unavailable: {error}"))
+    })
+}
+
 #[cfg(test)]
 mod producer_tests {
+
+    #[test]
+    fn foreign_open_refuses_unauthenticated_base_headers() {
+        use crate::views::manifest_v2::{
+            BaseHeader, GenerationName, ManifestHeader, ManifestV2, Producers, PublishV2,
+        };
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let registry =
+            crate::views::registry::FamilyRegistry::open(storage.path(), "unverified-base")
+                .unwrap();
+        let owner = registry
+            .register_view_with_storage(storage.path(), "worker", root.path())
+            .unwrap();
+        let producers = Producers {
+            trigram: "tri".into(),
+            semantic: None,
+            callgraph: "graph".into(),
+        };
+        let manifest = ManifestV2::new_v3(
+            ManifestHeader {
+                producers: producers.clone(),
+                head_tree: None,
+                ignore_fingerprint: None,
+                segment: None,
+            },
+            Some(BaseHeader {
+                scope: "not-authenticated".into(),
+                membership_digest: "11".repeat(32),
+                identity_digest: "22".repeat(32),
+                bound_generation: "diagnostic-only".into(),
+            }),
+            Default::default(),
+        );
+        // Seed an untrusted persisted header directly, bypassing the owner loader's refusal.
+        let store = owner.view_store().unwrap();
+        let name = GenerationName::for_manifest(&manifest).unwrap();
+        let prepared = store.prepare_v2(&name, None, &manifest, None).unwrap();
+        assert_eq!(
+            store.commit_v2(prepared, None).unwrap(),
+            PublishV2::Published
+        );
+        let reader = registry.register_reader("unverified-header").unwrap();
+        let error = super::open_foreign_generation(&reader, "worker", &producers).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("refusing an unauthenticated base header"),
+            "{error}"
+        );
+        assert_eq!(
+            store.current_generation_read_only().unwrap(),
+            Some(name.to_string())
+        );
+    }
 
     #[test]
     fn untracked_language_paths_do_not_read_source() {
@@ -649,6 +727,7 @@ mod producer_tests {
                 ),
             )
             .unwrap();
+        let manifest = super::super::snapshot::ComposedGeneration::new("test", manifest, None);
         assert!(callgraph_paths_match_v2(&manifest, root.path(), &[absolute.clone()]).unwrap());
         std::fs::write(&absolute, b"fn changed() {}").unwrap();
         assert!(!callgraph_paths_match_v2(&manifest, root.path(), &[absolute]).unwrap());

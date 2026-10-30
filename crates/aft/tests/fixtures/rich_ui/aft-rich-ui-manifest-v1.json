@@ -1,0 +1,291 @@
+{
+  "format": "aft-rich-ui-manifest-v1",
+  "publication": "injected-test-manifest",
+  "manifestDigest": "sha256:3e11d5d9c9f14be5bf59f5eec229643e5c2e481ef7736e081d63fe1701b30f56",
+  "vectors": [
+    {
+      "name": "read",
+      "request": {
+        "name": "read",
+        "arguments": {
+          "path": "${FIXTURE_ROOT}/main.rs",
+          "startLine": 1,
+          "endLine": 2,
+          "rich_ui_op": "read@1"
+        }
+      },
+      "reply": {
+        "content": [
+          {
+            "type": "text",
+            "text": ""
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "text": "1: pub fn session_marker() -> u32 { session_leaf() }\n2: pub fn session_leaf() -> u32 { 42 }\n"
+        }
+      }
+    },
+    {
+      "name": "outline",
+      "request": {
+        "name": "outline",
+        "arguments": {
+          "target": "main.rs",
+          "rich_ui_op": "outline@1"
+        }
+      },
+      "reply": {
+        "content": [
+          {
+            "type": "text",
+            "text": ""
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "text": "main.rs\n  pub fn session_marker() -> u32 { session_leaf() } 1:1\n  pub fn session_leaf() -> u32 { 42 } 2:2\n"
+        }
+      }
+    },
+    {
+      "name": "zoom",
+      "request": {
+        "name": "zoom",
+        "arguments": {
+          "batch": [
+            {
+              "target": "main.rs",
+              "symbols": [
+                "session_marker"
+              ]
+            }
+          ],
+          "rich_ui_op": "zoom@1"
+        }
+      },
+      "reply": {
+        "content": [
+          {
+            "type": "text",
+            "text": ""
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "text": "main.rs:1-1 [function session_marker]\n\n1: pub fn session_marker() -> u32 { session_leaf() }\n2: pub fn session_leaf() -> u32 { 42 }"
+        }
+      }
+    },
+    {
+      "name": "search",
+      "request": {
+        "name": "search",
+        "arguments": {
+          "pattern": "session_marker",
+          "topK": 3,
+          "rich_ui_op": "search@1"
+        }
+      },
+      "reply": {
+        "content": [
+          {
+            "type": "text",
+            "text": ""
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "text": "main.rs\n1: pub fn session_marker() -> u32 { session_leaf() }\n\n1 files match (1 matching lines); one result per file, definitions first.\n[interpreted_as: regex]\ntrigram: ready\nsemantic: unavailable: disabled"
+        }
+      }
+    },
+    {
+      "name": "grep",
+      "request": {
+        "name": "grep",
+        "arguments": {
+          "pattern": "session_marker",
+          "include": "main.rs",
+          "rich_ui_op": "grep@1"
+        }
+      },
+      "reply": {
+        "content": [
+          {
+            "type": "text",
+            "text": ""
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "text": "main.rs\n1: pub fn session_marker() -> u32 { session_leaf() }\n\nFound 1 match in 1 file"
+        }
+      }
+    },
+    {
+      "name": "glob",
+      "request": {
+        "name": "glob",
+        "arguments": {
+          "pattern": "main.rs",
+          "rich_ui_op": "glob@1"
+        }
+      },
+      "reply": {
+        "content": [
+          {
+            "type": "text",
+            "text": ""
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "text": "1 file matching main.rs\n\nmain.rs"
+        }
+      }
+    },
+    {
+      "name": "callgraph",
+      "request": {
+        "name": "callgraph",
+        "arguments": {
+          "op": "callers",
+          "path": "main.rs",
+          "symbol": "session_leaf",
+          "rich_ui_op": "callgraph@1"
+        }
+      },
+      "reply": {
+        "content": [
+          {
+            "type": "text",
+            "text": ""
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "text": "1 caller · 1 file group\nmain.rs\n  ↳ session_marker:1"
+        }
+      }
+    },
+    {
+      "name": "bash_status",
+      "request": {
+        "name": "bash_status",
+        "arguments": {
+          "task": "sample-CALL",
+          "rich_ui_op": "bash_status@1"
+        }
+      },
+      "reply": {
+        "content": [
+          {
+            "type": "text",
+            "text": ""
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "exitCode": 0,
+          "running": false
+        }
+      }
+    },
+    {
+      "name": "bash_output",
+      "request": {
+        "name": "bash_status",
+        "arguments": {
+          "limit": 200,
+          "task": "sample-CALL",
+          "rich_ui_op": "bash_output@1"
+        }
+      },
+      "reply": {
+        "content": [
+          {
+            "type": "text",
+            "text": ""
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "items": [
+            {
+              "bytes": 4,
+              "continued": false,
+              "firstAvailableOffset": null,
+              "prefixDropped": true,
+              "stream": "stdout",
+              "text": "one\n"
+            },
+            {
+              "bytes": 4,
+              "continued": false,
+              "firstAvailableOffset": null,
+              "prefixDropped": true,
+              "stream": "stderr",
+              "text": "two\n"
+            }
+          ],
+          "next": null
+        }
+      }
+    },
+    {
+      "name": "bash_watch",
+      "request": {
+        "name": "bash_watch",
+        "arguments": {
+          "pattern": "one",
+          "timeoutMs": 1,
+          "task": "sample-CALL",
+          "rich_ui_op": "bash_watch@1"
+        }
+      },
+      "reply": {
+        "content": [
+          {
+            "type": "text",
+            "text": ""
+          }
+        ],
+        "isError": false,
+        "structuredContent": {
+          "exitCode": 0,
+          "running": false,
+          "waited": {
+            "limit_ms": 1,
+            "reason": "match"
+          }
+        }
+      }
+    },
+    {
+      "name": "read_missing",
+      "request": {
+        "name": "read",
+        "arguments": {
+          "path": "missing.rs",
+          "rich_ui_op": "read@1"
+        }
+      },
+      "reply": {
+        "content": [
+          {
+            "type": "text",
+            "text": "read_blocked"
+          }
+        ],
+        "isError": true,
+        "structuredContent": {
+          "success": false,
+          "code": "read_blocked",
+          "message": "The requested read could not be completed."
+        }
+      }
+    }
+  ]
+}

@@ -4,7 +4,7 @@
     "id": "1",
     "success": false,
     "code": "ambiguous_target",
-    "message": "trace_to_symbol: target symbol 'leaf' exists in multiple files; pass 'toFile' to disambiguate",
+    "message": "trace_to_symbol: target symbol 'leaf' exists in multiple files; pass 'toPath' to disambiguate",
     "candidates": [
       {
         "file": "<PROJECT_ROOT>/src/leaf.ts",

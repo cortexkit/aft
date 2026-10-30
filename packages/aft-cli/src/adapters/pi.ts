@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   execSync,
   resolveAftLogPath,
@@ -128,13 +129,11 @@ function piEntryMatchesAft(entry: string): boolean {
   let resolved: string | null = null;
   if (entry.startsWith("file:")) {
     try {
-      // Strip `file:` prefix manually — fileURLToPath would require `file://`.
-      const stripped = entry.slice("file:".length);
-      resolved = stripped.startsWith("//") ? stripped.slice(2) : stripped;
+      resolved = fileURLToPath(entry);
     } catch {
       return false;
     }
-  } else if (entry.startsWith("/")) {
+  } else if (isAbsolute(entry)) {
     resolved = entry;
   } else if (entry.length > 0) {
     // Relative path — resolve against the Pi agent dir (matches Pi's
@@ -193,7 +192,7 @@ export class PiAdapter implements HarnessAdapter {
       // itself is always the last semver-looking token. Take the first line that
       // looks like a version.
       const semverLine = text.split(/\r?\n/).find((l) => /^\d+\.\d+\.\d+/.test(l.trim()));
-      return semverLine?.trim() ?? text ?? null;
+      return semverLine?.trim() ?? (text || null);
     } catch {
       return null;
     }
@@ -258,6 +257,10 @@ export class PiAdapter implements HarnessAdapter {
     }
   }
 
+  getConfiguredPluginEntry(): string | undefined {
+    return readPiExtensionIndex().installed.find(piEntryMatchesAft);
+  }
+
   getPluginCacheInfo(): PluginCacheInfo {
     // Pi manages user-scoped npm packages below its agent directory rather than
     // the project or the process-wide npm root. Read the installed manifest so
@@ -268,24 +271,28 @@ export class PiAdapter implements HarnessAdapter {
       join(getPiAgentDir(), "node_modules", "@cortexkit", "aft-pi", "package.json"),
       join(getPiAgentDir(), "extensions", "node_modules", "@cortexkit", "aft-pi", "package.json"),
     ];
+    let readError: string | undefined;
     for (const candidate of candidates) {
-      if (!existsSync(candidate)) continue;
       try {
         const pkg = JSON.parse(readFileSync(candidate, "utf-8")) as { version?: unknown };
         const cached = typeof pkg.version === "string" ? pkg.version : undefined;
         return {
           path: candidate,
           cached,
+          readError,
           latest: undefined,
           exists: true,
         };
-      } catch {
-        // next
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          readError ??= error instanceof Error ? error.message : String(error);
+        }
       }
     }
     return {
       path: join(getPiAgentDir(), "npm", "node_modules", "@cortexkit", "aft-pi", "package.json"),
-      exists: false,
+      exists: readError !== undefined,
+      readError,
     };
   }
 

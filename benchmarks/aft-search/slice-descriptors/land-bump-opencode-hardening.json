@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "bump-opencode-hardening"
+  ],
+  "note": "CI-only: the OpenCode bump workflow validates release versions before shell use, passes them through quoted environment variables and pins its actions to commit SHAs. No changed path matches RANKING_FENCE_PREFIXES."
+}

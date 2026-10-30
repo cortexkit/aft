@@ -36,6 +36,10 @@ pub const CONFIG_RELOAD_DEBOUNCE: Duration = Duration::from_millis(150);
 /// File name both config tiers use.
 const CONFIG_FILE_NAME: &str = "aft.jsonc";
 
+/// Largest config file a live reload accepts, the same bound the bind-time
+/// read applies. An oversized or invalid file is reported instead of applied.
+const CONFIG_READ_LIMIT: usize = 1024 * 1024;
+
 fn process_epoch() -> Instant {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     *EPOCH.get_or_init(Instant::now)
@@ -113,6 +117,7 @@ pub struct TierSource {
 /// the files changed and which changed keys are still waiting for a connect.
 #[derive(Debug, Clone)]
 pub struct ConfigSources {
+    pub(crate) prepared_bind_snapshot_id: Option<u64>,
     pub user: TierSource,
     pub project: TierSource,
     /// The resolver output of the last configure, before configure's own
@@ -133,10 +138,21 @@ impl ConfigSources {
         tiers: &[ConfigTier],
         connected: &Config,
     ) -> Self {
-        let owns_user_watch = user_config_path.is_some() && process_user_config_path().is_none();
-        let user_path = user_config_path.or_else(process_user_config_path);
         let project_path =
             crate::subc_config::project_config_read_path(project_root, connected.harness.as_ref());
+        Self::from_observed_paths(user_config_path, project_path, tiers, connected)
+    }
+
+    /// Record the source paths selected by a trusted local observation without
+    /// probing them again. Reload must watch the same files that supplied tiers.
+    pub(crate) fn from_observed_paths(
+        user_config_path: Option<PathBuf>,
+        project_path: PathBuf,
+        tiers: &[ConfigTier],
+        connected: &Config,
+    ) -> Self {
+        let owns_user_watch = user_config_path.is_some() && process_user_config_path().is_none();
+        let user_path = user_config_path.or_else(process_user_config_path);
         let source_for = |tier: &'static str, path: Option<PathBuf>| {
             let used = tiers.iter().find(|candidate| candidate.tier == tier);
             let from_file = match (used, path.as_ref()) {
@@ -152,6 +168,7 @@ impl ConfigSources {
             }
         };
         Self {
+            prepared_bind_snapshot_id: None,
             user: source_for("user", user_path),
             project: source_for("project", Some(project_path)),
             connected: connected.clone(),
@@ -244,7 +261,11 @@ pub fn finish_configure(ctx: &AppContext, success: bool) {
     ctx.begin_configure_ack_step("config_sources_commit");
     {
         let _reload = ctx.config_live().reload_lock.lock();
+        let snapshot_id = sources.prepared_bind_snapshot_id.unwrap_or(0);
         *ctx.config_live().sources.lock() = Some(sources);
+        ctx.config_live()
+            .applied_bind_snapshot
+            .store(snapshot_id, Ordering::Release);
         // A connect resolves the files afresh; nothing it applied is held.
         ctx.config_live()
             .project_hold_active
@@ -257,6 +278,7 @@ pub fn finish_configure(ctx: &AppContext, success: bool) {
 /// Per-root live reload state, owned by the root's `AppContext`.
 #[derive(Default)]
 pub struct ConfigLiveState {
+    applied_bind_snapshot: AtomicU64,
     signal: Arc<ConfigReloadSignal>,
     sources: parking_lot::Mutex<Option<ConfigSources>>,
     watches: parking_lot::Mutex<ContextWatches>,
@@ -284,6 +306,16 @@ struct ContextWatches {
 }
 
 impl ConfigLiveState {
+    pub(crate) fn applied_bind_snapshot(&self) -> Option<u64> {
+        match self.applied_bind_snapshot.load(Ordering::Acquire) {
+            0 => None,
+            id => Some(id),
+        }
+    }
+
+    pub(crate) fn clear_applied_bind_snapshot(&self) {
+        self.applied_bind_snapshot.store(0, Ordering::Release);
+    }
     pub fn signal(&self) -> Arc<ConfigReloadSignal> {
         Arc::clone(&self.signal)
     }
@@ -451,15 +483,16 @@ fn read_tier(recorded: &TierSource) -> TierRead {
     let Some(path) = recorded.path.as_ref() else {
         return TierRead::Use(recorded.clone());
     };
-    match std::fs::read(path) {
-        Ok(bytes) => match String::from_utf8(bytes) {
-            Ok(text) => TierRead::Use(TierSource {
-                text: Some(text),
-                from_file: true,
-                ..recorded.clone()
-            }),
-            Err(_) => TierRead::Error(format!("{} is not valid UTF-8", path.display())),
-        },
+    // Shared open plus a bounded read, so a file that a tool or editor is
+    // replacing is never held against that replacement on Windows.
+    let read = crate::config::open_config_file(path)
+        .and_then(|file| crate::subc_config::read_bounded_config(file, CONFIG_READ_LIMIT));
+    match read {
+        Ok(text) => TierRead::Use(TierSource {
+            text: Some(text),
+            from_file: true,
+            ..recorded.clone()
+        }),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if recorded.tier == "project" && recorded.from_file && recorded.text.is_some() {
                 // A successfully absent project file removes that tier. The
@@ -515,7 +548,11 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
 
     let (user, project) = match (read_tier(&sources.user), read_tier(&sources.project)) {
         (TierRead::Use(user), TierRead::Use(project)) => (user, project),
-        (TierRead::Error(reason), _) | (_, TierRead::Error(reason)) => {
+        (TierRead::Error(reason), _) => {
+            ctx.update_config(|config| config.cache_config_unknown = Some(reason.clone()));
+            return keep_last_good(ctx, &root_label, reason);
+        }
+        (_, TierRead::Error(reason)) => {
             return keep_last_good(ctx, &root_label, reason);
         }
     };
@@ -534,6 +571,14 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
             record.project.from_file = project.from_file;
         }
         state.last_error.lock().take();
+        // A failed read did not change the last-good text. Restoring those exact
+        // bytes must revalidate the cache root rather than retain its error flag.
+        if ctx.config_unpinned().cache_config_unknown.is_some() {
+            ctx.update_config(|config| {
+                config.cache_config_unknown = None;
+                crate::root_cache::prepare_cache_root(config);
+            });
+        }
         return ReloadOutcome::Unchanged;
     }
     let project_changed = project.text != sources.project.text;
@@ -549,6 +594,13 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
     let harness = ctx.config_unpinned().harness.clone();
     for tier in &tiers {
         if let Some(reason) = crate::config_resolve::strict_tier_error(tier, harness.as_ref()) {
+            // An invalid edit keeps the last good config; caches turn off only
+            // when the edit leaves the cache location itself unknown.
+            if tier.tier == "user" {
+                if let Some(unknown) = crate::config_resolve::cache_location_config_error(tier) {
+                    ctx.update_config(|config| config.cache_config_unknown = Some(unknown));
+                }
+            }
             return keep_last_good(ctx, &root_label, reason);
         }
     }
@@ -614,9 +666,23 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
         }
     };
 
+    // The files resolved cleanly, so the cache location is known again even
+    // though the text differs from the last good text. Clear the flag an
+    // earlier unreadable or invalid user file set and recheck the cache
+    // location the session connected with. Only the flag is cleared: a
+    // changed `storage.cache_dir` stays deferred until the next connect.
+    if ctx.config_unpinned().cache_config_unknown.is_some() {
+        ctx.update_config(|config| {
+            config.cache_config_unknown = None;
+            crate::root_cache::prepare_cache_root(config);
+        });
+    }
+
     {
         let mut record = state.sources.lock();
+        state.clear_applied_bind_snapshot();
         if let Some(record) = record.as_mut() {
+            record.prepared_bind_snapshot_id = None;
             record.user = user;
             // While a project loosening is held, keep the project text the
             // held values came from as the reference, so later reloads keep
@@ -901,6 +967,7 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     later!("bash.compress", experimental_bash_compress);
     later!("bash.background", experimental_bash_background);
     live!("bash.linux_scope", bash.linux_scope);
+    live!("bash.memory_limit_mib", bash.memory_limit_mib);
     live!("bash.disclaim_privacy", bash.disclaim_privacy);
     live!("bash.foreground_wait_window_ms", foreground_wait_window_ms);
     live!("bash.host_fallback", bash.host_fallback);
@@ -909,7 +976,13 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     live!("bash.worker_wait_max_ms", bash.worker_wait_max_ms);
     later!("bash.detach_on_user_message", bash.detach_on_user_message);
     live!("bash.db_schema_hints", bash.db_schema_hints);
+    live!("bash.changed_files", bash.changed_files);
     live!("bash.env", bash.env);
+    // A project's `bash.env` values and the user's runon allowlist apply to
+    // every later command, so an edit or a deletion must take effect without a
+    // reconfigure instead of waiting for the next connection.
+    live!("bash.project_env", bash.project_env);
+    live!("bash.runon_env", bash.runon_env);
     later!("bash.powershell_tool", bash.powershell_tool);
     live!(
         "bash.long_running_reminder_enabled",
@@ -920,6 +993,8 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
         bash_long_running_reminder_interval_ms
     );
     // LSP.
+    later!("storage.cache_dir", cache_dir);
+    later!("storage.cache_dir: null", cache_dir_opt_out);
     later!("lsp.servers", lsp_servers);
     later!("lsp.disabled", disabled_lsp);
     later!("experimental.lsp_ty", experimental_lsp_ty);
@@ -978,10 +1053,18 @@ fn classification_is_exhaustive(config: &Config) {
         lsp_auto_install_binaries: _,
         lsp_inflight_installs: _,
         storage_dir: _,
+        storage_lease: _,
+        cache_unavailable: _,
+        cache_config_unknown: _,
+        cache_dir_configured: _,
+        cache_epoch: _,
+        cache_lease: _,
         harness: _,
         diagnostic_cache_size: _,
         aft_search_registered: _,
         // Classified in `apply_live_config`.
+        cache_dir: _,
+        cache_dir_opt_out: _,
         formatter_timeout_secs: _,
         type_checker_timeout_secs: _,
         format_on_edit: _,
@@ -1027,6 +1110,7 @@ fn classification_is_exhaustive(config: &Config) {
         callgraph: _,
     } = indexes;
     let crate::config::BashConfig {
+        changed_files: _,
         enabled: _,
         host_fallback: _,
         runon_enabled: _,
@@ -1035,9 +1119,12 @@ fn classification_is_exhaustive(config: &Config) {
         watch_sync_max_ms: _,
         worker_wait_max_ms: _,
         linux_scope: _,
+        memory_limit_mib: _,
         disclaim_privacy: _,
         powershell_tool: _,
         env: _,
+        project_env: _,
+        runon_env: _,
     } = bash;
     let crate::config::SandboxConfig {
         profile: _,
@@ -1057,6 +1144,7 @@ fn classification_is_exhaustive(config: &Config) {
         max_files: _,
         subc_connection_file: _,
         // Set by configure after resolving; process state.
+        local_cache_dir: _,
         route_project_root: _,
         route_harness: _,
     } = semantic;
@@ -1432,7 +1520,7 @@ impl DirAttachment {
 type DirIdentity = (u64, u64);
 
 #[cfg(unix)]
-fn dir_identity(path: &Path) -> Option<DirIdentity> {
+pub(crate) fn dir_identity(path: &Path) -> Option<DirIdentity> {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(path)
         .ok()
@@ -1445,7 +1533,7 @@ fn dir_identity(path: &Path) -> Option<DirIdentity> {
 /// entry that last had it, so a directory renamed aside and recreated looks
 /// unchanged by that measure.
 #[cfg(windows)]
-fn dir_identity(path: &Path) -> Option<DirIdentity> {
+pub(crate) fn dir_identity(path: &Path) -> Option<DirIdentity> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -1454,6 +1542,8 @@ fn dir_identity(path: &Path) -> Option<DirIdentity> {
         FILE_SHARE_WRITE, OPEN_EXISTING,
     };
 
+    // A deep storage or cache path is past the plain-path limit of CreateFileW.
+    let path = crate::windows_path::win32_call_path(path);
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the call;
     // the remaining arguments are plain flags and null pointers, and the
@@ -1491,7 +1581,7 @@ fn dir_identity(path: &Path) -> Option<DirIdentity> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn dir_identity(_path: &Path) -> Option<DirIdentity> {
+pub(crate) fn dir_identity(_path: &Path) -> Option<DirIdentity> {
     None
 }
 

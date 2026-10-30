@@ -1,0 +1,10 @@
+{
+  "request_frame": {
+    "header_hex": "510000000200002900010000000700000000000000",
+    "body_utf8": "{\"name\":\"read\",\"preset\":\"worker\",\"arguments\":{\"path\":\"main.rs\"},\"op\":\"tool.call\"}"
+  },
+  "reply_frame": {
+    "header_hex": "c50000000201002900010000000700000000000000",
+    "body_utf8": "{\"content\":[{\"type\":\"text\",\"text\":\"rich_ui_op_malformed\"}],\"isError\":true,\"structuredContent\":{\"success\":false,\"code\":\"rich_ui_op_malformed\",\"message\":\"A versioned rich UI operation is required.\"}}"
+  }
+}

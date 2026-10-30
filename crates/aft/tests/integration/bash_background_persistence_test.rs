@@ -870,6 +870,7 @@ fn bash_status_same_session_cold_bridge_replays_from_disk() {
             project.path().to_path_buf(),
             Default::default(),
             aft::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             storage.path().to_path_buf(),
             10,
             true,
@@ -907,6 +908,7 @@ fn bash_status_cross_session_same_project_finds_task_by_id() {
             project.path().to_path_buf(),
             Default::default(),
             aft::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             storage.path().to_path_buf(),
             10,
             true,
@@ -1127,6 +1129,239 @@ fn foreign_replay_retires_orphan_when_gc_already_removed_its_layout() {
 }
 
 #[test]
+fn foreign_harness_replay_retires_missing_layout_once() {
+    init_test_logger();
+    let storage = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let task_id = "bash-00000000000002a1";
+    let paths = task_paths(storage.path(), "retired-session", task_id).unwrap();
+    let mut metadata = PersistedTask::starting(
+        task_id.to_string(),
+        "retired-session".to_string(),
+        "true".to_string(),
+        project.path().to_path_buf(),
+        Some(project.path().to_path_buf()),
+        None,
+        true,
+        true,
+    );
+    metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+    let conn = Arc::new(Mutex::new(
+        aft::db::open(&storage.path().join("aft.db")).unwrap(),
+    ));
+    aft::db::bash_tasks::upsert_bash_task(
+        &conn.lock().unwrap(),
+        &metadata.to_bash_task_row("pi", &paths).unwrap(),
+    )
+    .unwrap();
+    let registry = registry();
+    registry.set_harness(aft::harness::Harness::Opencode);
+    registry.set_db_pool(Arc::clone(&conn));
+    for _ in 0..5 {
+        registry
+            .replay_session_for_project(storage.path(), "current-session", project.path())
+            .unwrap();
+    }
+    assert!(
+        aft::db::bash_tasks::get_bash_task(
+            &conn.lock().unwrap(),
+            "pi",
+            "retired-session",
+            task_id,
+        )
+        .unwrap()
+        .is_none(),
+        "retirement must delete the stored harness's row, not the current route's row"
+    );
+    let warnings = take_logs()
+        .into_iter()
+        .filter(|line| line.contains(task_id) && line.contains("reaped"))
+        .collect::<Vec<_>>();
+    assert_eq!(warnings.len(), 1, "retirement must warn once: {warnings:?}");
+}
+
+#[test]
+fn replay_delete_failure_keeps_later_live_tasks_and_retries_orphan() {
+    struct KillOnDrop<'a> {
+        registry: &'a BgTaskRegistry,
+        task_id: String,
+    }
+    impl Drop for KillOnDrop<'_> {
+        fn drop(&mut self) {
+            let _ = self.registry.kill(&self.task_id, "live-session");
+        }
+    }
+
+    for resident in [false, true] {
+        init_test_logger();
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let orphan_id = if resident {
+            "bash-00000000000002a3"
+        } else {
+            "bash-00000000000002a2"
+        };
+        let paths = task_paths(storage.path(), "orphan-session", orphan_id).unwrap();
+        let mut orphan = PersistedTask::starting(
+            orphan_id.to_string(),
+            "orphan-session".to_string(),
+            "true".to_string(),
+            project.path().to_path_buf(),
+            Some(project.path().to_path_buf()),
+            None,
+            true,
+            true,
+        );
+        orphan.started_at = 1;
+        orphan.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        let conn = Arc::new(Mutex::new(
+            aft::db::open(&storage.path().join("aft.db")).unwrap(),
+        ));
+        aft::db::bash_tasks::upsert_bash_task(
+            &conn.lock().unwrap(),
+            &orphan.to_bash_task_row("pi", &paths).unwrap(),
+        )
+        .unwrap();
+        let replayer = registry();
+        replayer.set_harness(aft::harness::Harness::Opencode);
+        replayer.set_db_pool(Arc::clone(&conn));
+        if resident {
+            write_task(&paths.json, &orphan).unwrap();
+            fs::write(&paths.stdout, "").unwrap();
+            fs::write(&paths.stderr, "").unwrap();
+            replayer
+                .replay_session_for_project(storage.path(), "orphan-session", project.path())
+                .unwrap();
+            assert!(replayer
+                .list(0)
+                .iter()
+                .any(|task| task.info.task_id == orphan_id));
+            fs::remove_dir_all(&paths.dir).unwrap();
+        }
+
+        let owner = registry();
+        owner.set_harness(aft::harness::Harness::Pi);
+        owner.set_db_pool(Arc::clone(&conn));
+        let live_id = owner
+            .spawn(
+                aft::sandbox_spawn::SpawnPlan::Unsandboxed,
+                "sleep 60",
+                "live-session".to_string(),
+                project.path().to_path_buf(),
+                Default::default(),
+                aft::bash_background::HardKill::After(Duration::from_secs(90)),
+                None,
+                storage.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(project.path().to_path_buf()),
+            )
+            .unwrap();
+        let _cleanup = KillOnDrop {
+            registry: &owner,
+            task_id: live_id.clone(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let row = aft::db::bash_tasks::get_bash_task(
+                &conn.lock().unwrap(),
+                "pi",
+                "live-session",
+                &live_id,
+            )
+            .unwrap();
+            if row.is_some_and(|row| row.status == "running") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "live task was not persisted as running"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!replayer
+            .list(0)
+            .iter()
+            .any(|task| task.info.task_id == live_id));
+        {
+            let db = conn.lock().unwrap();
+            let rows = aft::db::bash_tasks::list_replayable_bash_tasks_for_project(
+                &db,
+                "pi",
+                &aft::path_identity::project_scope_key(project.path()),
+            )
+            .unwrap();
+            assert_eq!(rows[0].task_id, orphan_id);
+            assert_eq!(rows[1].task_id, live_id);
+            // Reject only this delete so reads and recovery of later rows stay usable.
+            db.execute_batch(&format!(
+                "CREATE TRIGGER reject_orphan_delete BEFORE DELETE ON bash_tasks
+                 WHEN OLD.task_id = '{orphan_id}'
+                 BEGIN SELECT RAISE(FAIL, 'orphan_delete_busy'); END;"
+            ))
+            .unwrap();
+        }
+        let _ = take_logs();
+        replayer
+            .replay_session_for_project(storage.path(), "current-session", project.path())
+            .expect("one failed orphan delete must not abort the batch");
+        let live = replayer
+            .list(0)
+            .into_iter()
+            .find(|task| task.info.task_id == live_id)
+            .expect("the live row after the orphan must be rehydrated without status recovery");
+        assert_eq!(live.info.status, BgTaskStatus::Running);
+        let logs = take_logs();
+        assert_eq!(
+            logs.iter()
+                .filter(|line| line.contains(orphan_id) && line.contains("orphan_delete_busy"))
+                .count(),
+            1,
+            "the failed delete should warn once: {logs:?}"
+        );
+        assert!(!logs
+            .iter()
+            .any(|line| line.contains(orphan_id)
+                && line.contains("orphaned completion already reaped")));
+        assert!(aft::db::bash_tasks::get_bash_task(
+            &conn.lock().unwrap(),
+            "pi",
+            "orphan-session",
+            orphan_id
+        )
+        .unwrap()
+        .is_some());
+
+        conn.lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_orphan_delete;")
+            .unwrap();
+        for _ in 0..2 {
+            replayer
+                .replay_session_for_project(storage.path(), "current-session", project.path())
+                .unwrap();
+        }
+        assert!(aft::db::bash_tasks::get_bash_task(
+            &conn.lock().unwrap(),
+            "pi",
+            "orphan-session",
+            orphan_id
+        )
+        .unwrap()
+        .is_none());
+        let logs = take_logs();
+        assert_eq!(
+            logs.iter()
+                .filter(|line| line.contains(orphan_id)
+                    && line.contains("orphaned completion already reaped"))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
 fn foreign_session_replay_retires_completion_but_preserves_status_control() {
     let project = tempfile::tempdir().unwrap();
     let storage = spawn_storage_dir("storage");
@@ -1190,6 +1425,7 @@ fn bash_status_cross_session_different_project_returns_not_found() {
             project_a.path().to_path_buf(),
             Default::default(),
             aft::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             storage.path().to_path_buf(),
             10,
             true,
@@ -1377,6 +1613,7 @@ fn bash_kill_cross_session_still_returns_not_found() {
             project.path().to_path_buf(),
             Default::default(),
             aft::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             storage.path().to_path_buf(),
             10,
             true,
@@ -1426,6 +1663,7 @@ fn bash_promote_cross_session_still_returns_not_found() {
             project.path().to_path_buf(),
             Default::default(),
             aft::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             storage.path().to_path_buf(),
             10,
             false,
@@ -1667,6 +1905,7 @@ fn cleanup_finished_deletes_disk_bundle_of_delivered_terminal() {
             project.path().to_path_buf(),
             Default::default(),
             aft::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             storage.path().to_path_buf(),
             10,
             true,
@@ -1718,6 +1957,7 @@ fn cleanup_finished_does_not_block_other_registry_operations_during_delete() {
             project.path().to_path_buf(),
             Default::default(),
             aft::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             storage.path().to_path_buf(),
             10,
             true,
@@ -1733,6 +1973,7 @@ fn cleanup_finished_does_not_block_other_registry_operations_during_delete() {
             project.path().to_path_buf(),
             Default::default(),
             aft::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             storage.path().to_path_buf(),
             10,
             true,
@@ -1835,6 +2076,7 @@ fn cleanup_finished_retains_undelivered_terminals() {
             project.path().to_path_buf(),
             Default::default(),
             aft::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             storage.path().to_path_buf(),
             10,
             true,
@@ -3530,6 +3772,7 @@ fn bash_kill_preserves_real_exit_code_when_marker_present() {
             project.path().to_path_buf(),
             Default::default(),
             aft::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             storage.path().to_path_buf(),
             10,
             true,
@@ -3560,6 +3803,7 @@ fn failed_spawn_cleans_up_bundle() {
             missing_workdir,
             Default::default(),
             aft::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             storage.path().to_path_buf(),
             10,
             true,
@@ -3625,6 +3869,7 @@ fn background_bash_uses_bash_syntax_when_available() {
             project.path().to_path_buf(),
             Default::default(),
             aft::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
             storage.path().to_path_buf(),
             10,
             true,
@@ -3840,8 +4085,14 @@ fn redaction_replay_shows_ticket_only_output_without_exposing_ticket() {
     let release = project.path().join("release-ticket");
     let release_guard = ReleaseOnDrop::new(release.clone());
     let ticket_path = project.path().join("seen-ticket");
+    // The child publishes the ticket with a rename: `wait_for_path` returns as
+    // soon as the path exists, and a plain `>` redirect creates the file
+    // before printf has written to it.
+    let ticket_staging = project.path().join("seen-ticket.partial");
     let command = format!(
-        "printf '%s' \"$AFT_GH_SHIM_TICKET\" > {}; while [ ! -e {} ]; do sleep 0.05; done; printf 'ticket=%s md5=0123456789abcdef0123456789abcdef\\n' \"$AFT_GH_SHIM_TICKET\"",
+        "printf '%s' \"$AFT_GH_SHIM_TICKET\" > {}; mv {} {}; while [ ! -e {} ]; do sleep 0.05; done; printf 'ticket=%s md5=0123456789abcdef0123456789abcdef\\n' \"$AFT_GH_SHIM_TICKET\"",
+        shell_quote_path(&ticket_staging),
+        shell_quote_path(&ticket_staging),
         shell_quote_path(&ticket_path),
         shell_quote_path(&release),
     );
@@ -3962,7 +4213,15 @@ fn redaction_replay_withholds_new_secret_output() {
     drop(release_guard);
     let pattern = wait_for_pattern_frame(&mut restored, &watched);
     assert_eq!(pattern["match_text"], "<REDACTED_SECRET>");
-    assert!(pattern["context"].as_str().unwrap().contains("bash_status"));
+    // A watch usually fires while its task runs, when bash_status shows no
+    // output, so the withheld notice names the output file instead.
+    let context = pattern["context"].as_str().unwrap();
+    assert!(
+        context.contains("secret values aren't available after the daemon restarted"),
+        "{context}"
+    );
+    assert!(context.contains("Output file: "), "{context}");
+    assert!(!context.contains("bash_status"), "{context}");
     assert!(!pattern.to_string().contains(SECRET));
     wait_for_status(&mut restored, SESSION, &id, "completed");
     let drained = drain(&mut restored, SESSION);
@@ -4091,6 +4350,27 @@ fn per_match_ack_wire_reports_settlement_only_after_last_terminal_watch() {
     assert_eq!(second["success"], true);
     drop(release_guard);
     wait_for_status(&mut aft, SESSION, &task_id, "completed");
+    // Terminal status is a snapshot, not a delivery barrier. Pattern frames
+    // follow durable match writes, so observe both watches before testing drain.
+    let mut awaiting_watch_ids = vec![
+        first["watch_id"].as_str().unwrap(),
+        second["watch_id"].as_str().unwrap(),
+    ];
+    assert_ne!(awaiting_watch_ids[0], awaiting_watch_ids[1]);
+    let started = Instant::now();
+    while !awaiting_watch_ids.is_empty() {
+        if let Some(frame) = aft.try_read_next_timeout(Duration::from_millis(200)) {
+            if frame["type"] == "bash_pattern_match" && frame["task_id"] == task_id {
+                if let Some(watch_id) = frame["watch_id"].as_str() {
+                    awaiting_watch_ids.retain(|awaiting| *awaiting != watch_id);
+                }
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "timed out waiting for persisted pattern frames for {task_id}: {awaiting_watch_ids:?}"
+        );
+    }
     let pending = drain(&mut aft, SESSION)["pending_matches"]
         .as_array()
         .unwrap()

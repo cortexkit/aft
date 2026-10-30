@@ -111,6 +111,138 @@ fn translated_zoom(
     aft.send(&serde_json::Value::Object(request).to_string())
 }
 
+fn translated_outline(
+    aft: &mut AftProcess,
+    project: &Path,
+    target: serde_json::Value,
+) -> serde_json::Value {
+    let translated =
+        aft::subc_translate::subc_translate("outline", &json!({"target": target}), project)
+            .unwrap();
+    let mut request = translated.args;
+    request.insert("id".into(), json!("translated-outline"));
+    request.insert("command".into(), json!(translated.command));
+    request.insert("allow_private".into(), json!(true));
+    aft.send(&serde_json::Value::Object(request).to_string())
+}
+
+#[test]
+fn outline_url_array_fetches_each_html_target_like_a_single_url() {
+    let project = TempDir::new().unwrap();
+    let storage = TempDir::new().unwrap();
+    let server = spawn_mock_server(2, |path, stream| {
+        let body = match path.as_str() {
+            "/docs/first.html" => {
+                b"<html><body><h1>First document</h1><h2>First section</h2></body></html>"
+                    .as_slice()
+            }
+            "/docs/second.html" => {
+                b"<html><body><h1>Second document</h1><h2>Second section</h2></body></html>"
+                    .as_slice()
+            }
+            _ => panic!("unexpected URL: {path}"),
+        };
+        write_response(stream, "200 OK", "text/html", body);
+    });
+    let first = server.url("/docs/first.html");
+    let second = server.url("/docs/second.html");
+    let mut aft = configure_with_storage(project.path(), storage.path());
+    let response = translated_outline(&mut aft, project.path(), json!([first, second]));
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(response["complete"], true, "{response:#}");
+    assert_eq!(response["files_shown"], 2, "{response:#}");
+    assert_eq!(response["skipped_files"], json!([]), "{response:#}");
+    assert_eq!(response["content_files"], json!([]), "{response:#}");
+    let text = response["text"].as_str().unwrap();
+    for (url, heading) in [(&first, "First section"), (&second, "Second section")] {
+        assert!(text.contains(url), "{text}");
+        assert!(text.contains(heading), "{text}");
+        let single = translated_outline(&mut aft, project.path(), json!(url));
+        assert_eq!(single["success"], true, "{single:#}");
+        assert!(
+            text.contains(single["text"].as_str().unwrap()),
+            "{response:#}"
+        );
+    }
+    assert!(!text.contains(storage.path().to_str().unwrap()), "{text}");
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn outline_url_array_can_mix_a_json_url_and_a_local_file() {
+    let project = TempDir::new().unwrap();
+    let storage = TempDir::new().unwrap();
+    let file = project.path().join("module.ts");
+    fs::write(&file, "export function localFunction() {}\n").unwrap();
+    let server = spawn_mock_server(1, |path, stream| {
+        assert_eq!(path, "/data.json");
+        write_response(
+            stream,
+            "200 OK",
+            "application/json",
+            br#"{"remote_value": 42}"#,
+        );
+    });
+    let url = server.url("/data.json");
+    let mut aft = configure_with_storage(project.path(), storage.path());
+    let response = translated_outline(&mut aft, project.path(), json!([url, "module.ts"]));
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(response["complete"], true, "{response:#}");
+    assert_eq!(response["files_shown"], 2, "{response:#}");
+    assert_eq!(response["skipped_files"], json!([]), "{response:#}");
+    assert_eq!(response["content_files"], json!([file]), "{response:#}");
+    let text = response["text"].as_str().unwrap();
+    for expected in [url.as_str(), "remote_value", "module.ts", "localFunction"] {
+        assert!(text.contains(expected), "{text}");
+    }
+    let single = translated_outline(&mut aft, project.path(), json!(url));
+    assert_eq!(single["success"], true, "{single:#}");
+    assert!(
+        text.contains(single["text"].as_str().unwrap()),
+        "{response:#}"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn outline_url_array_skips_unfetchable_url_with_its_fetch_reason() {
+    let project = TempDir::new().unwrap();
+    let storage = TempDir::new().unwrap();
+    let file = project.path().join("kept.ts");
+    fs::write(&file, "export function kept() {}\n").unwrap();
+    let server = spawn_mock_server(2, |path, stream| {
+        assert_eq!(path, "/missing.md");
+        write_response(stream, "404 Not Found", "text/plain", b"missing");
+    });
+    let url = server.url("/missing.md");
+    let mut aft = configure_with_storage(project.path(), storage.path());
+    let response = translated_outline(&mut aft, project.path(), json!([url, "kept.ts"]));
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(response["complete"], false, "{response:#}");
+    assert_eq!(response["files_shown"], 1, "{response:#}");
+    assert_eq!(response["content_files"], json!([file]), "{response:#}");
+    let skipped = response["skipped_files"].as_array().unwrap();
+    assert_eq!(skipped.len(), 1, "{response:#}");
+    assert_eq!(skipped[0]["file"], url, "{response:#}");
+    let reason = skipped[0]["reason"].as_str().unwrap();
+    let fetch_message = format!("HTTP 404 Not Found fetching {url}");
+    assert_eq!(reason, format!("url_fetch_failed: {fetch_message}"));
+    let single = translated_outline(&mut aft, project.path(), json!(url));
+    assert_eq!(single["success"], false, "{single:#}");
+    assert!(
+        reason.contains(single["code"].as_str().unwrap()),
+        "{response:#}"
+    );
+    assert!(
+        single["message"]
+            .as_str()
+            .unwrap()
+            .starts_with(&fetch_message),
+        "{single:#}"
+    );
+    assert!(aft.shutdown().success());
+}
+
 #[test]
 fn translated_zoom_http_path_fetches_local_heading() {
     let project = TempDir::new().unwrap();

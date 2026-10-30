@@ -1,0 +1,23 @@
+{
+  "name": "refused-resolve-thread-unknown-target-field",
+  "request": {
+    "operation": "gh.route",
+    "gh_route_schema": 1,
+    "action": "graphql resolvereviewthread",
+    "target": {
+      "thread_id": "PRRT_kwDOAbc123",
+      "comment_id": "99"
+    },
+    "body": {},
+    "repository": "cortexkit/aft",
+    "manifest_version": 22,
+    "rung_as_of_unix_secs": 1793066213,
+    "metadata": {
+      "agent_id": "alfonso-aft",
+      "pid": 4242
+    }
+  },
+  "expect": {
+    "refused": "request_field_forbidden{field: comment_id}"
+  }
+}

@@ -25,6 +25,12 @@ import {
 const initialBinary = await prepareBinary();
 const maybeDescribe = describe.skipIf(!initialBinary.binaryPath);
 
+// Every test here starts a real AFT binary and a real shell. On a loaded
+// Windows runner the first test pays cold start: the binary load, its
+// antivirus scan and PowerShell's first launch together can exceed bun's 5 s
+// default. This is a positive wait for work to finish, so it can be generous.
+const E2E_TEST_TIMEOUT_MS = 30_000;
+
 // On Windows, PowerShell can emit CRLF (`\r\n`) line endings. AFT normalizes
 // terminal previews for text renderers, but host-fallback output remains native
 // shell text. Normalize assertions only when line ending is incidental to the
@@ -151,8 +157,10 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
       directory: options.directory ?? h.tempDir,
       worktree: options.worktree ?? h.tempDir,
       abort: new AbortController().signal,
-      metadata: (data: Record<string, unknown>) => {
-        lastMetadata = data;
+      // OpenCode 1's ctx.metadata takes { title?, metadata? }; keep the
+      // metadata part the way the host would show it.
+      metadata: (update: { metadata?: Record<string, unknown> }) => {
+        lastMetadata = update.metadata ?? {};
       },
       ask: options.ask ?? noopAsk,
       callID: `call-${Date.now()}`,
@@ -177,16 +185,50 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     expect(commands).not.toContain("bash_promote");
   }
 
+  skipOnWindows(
+    "unknown-cwd commands still obey the host rm deny rule",
+    async () => {
+      const { h, bash } = await pluginHarness({ bash_permissions: true });
+      await mkdir(join(h.tempDir, "build"));
+      const marker = join(h.tempDir, "build", "keep.txt");
+      await writeFile(marker, "must not delete");
+      const resources: string[] = [];
+      const ask: ToolContext["ask"] = async (input) => {
+        if (input.permission !== "bash") return;
+        resources.push(...input.patterns);
+        // Host policy: deny `rm *`, and allow every other command by default.
+        if (input.patterns.some((resource) => resource.startsWith("rm "))) {
+          throw new Error("rm denied by host rule");
+        }
+      };
+      await withEnv({ DEST: h.tempDir }, async () => {
+        await expect(
+          callPluginBash(bash, h, { command: 'cd "$DEST" && rm -rf build' }, { ask }),
+        ).rejects.toThrow("rm denied by host rule");
+      });
+      expect(resources).toContain("rm -rf build");
+      expect(await readFile(marker, "utf8")).toBe("must not delete");
+    },
+    E2E_TEST_TIMEOUT_MS,
+  );
+
   async function bridgeBashToTerminal(
     h: E2EHarness,
     args: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
     const launched = await h.bridge.send("bash", args);
     expect(launched.success).toBe(true);
-    expect(launched.status).toBe("running");
+    // A fast command (git init, git status) can finish before the launch
+    // reply is built, so the reply may already say completed. Either way the
+    // task id is there, and bash_status below reads the same final status.
+    expect(["running", "completed"]).toContain(launched.status);
+    expect(typeof launched.task_id).toBe("string");
     const taskId = launched.task_id as string;
     const started = Date.now();
-    while (Date.now() - started < 5_000) {
+    // A positive wait for a short command to finish. Windows runners start
+    // PowerShell slowly and can run git several times slower under load, so a
+    // 5 s bound failed there (git status took over 5 s); a hang still fails here.
+    while (Date.now() - started < 20_000) {
       const status = await h.bridge.send("bash_status", { task_id: taskId });
       if (status.status !== "running") return status;
       await new Promise((resolve) => setTimeout(resolve, 50));
@@ -194,23 +236,27 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     throw new Error(`timed out waiting for ${taskId}`);
   }
 
-  test("foreground returns raw output text (not a JSON envelope)", async () => {
-    const { h, bash, bridgeCalls } = await pluginHarness();
+  test(
+    "foreground returns raw output text (not a JSON envelope)",
+    async () => {
+      const { h, bash, bridgeCalls } = await pluginHarness();
 
-    const result = await callPluginBash(bash, h, { command: "echo hello" });
+      const result = await callPluginBash(bash, h, { command: "echo hello" });
 
-    // Agent-visible output is bash text — NOT a JSON literal that the model
-    // would have to JSON.parse before reading.
-    // The line after the output names the finished task.
-    expect(eol(result.output)).toMatch(/^hello\n\[task bash-[0-9a-f]+\]$/);
-    // Exit code, truncation, etc. land in metadata for the UI.
-    expect(result.metadata.exit).toBe(0);
-    expectNoClientPollOrPromote(bridgeCalls);
-    expect(bridgeCalls[0].params).toMatchObject({
-      foreground_orchestrate: true,
-      block_to_completion: false,
-    });
-  });
+      // Agent-visible output is bash text — NOT a JSON literal that the model
+      // would have to JSON.parse before reading.
+      // The line after the output names the finished task.
+      expect(eol(result.output)).toMatch(/^hello\n\[task bash-[0-9a-f]+\]$/);
+      // Exit code, truncation, etc. land in metadata for the UI.
+      expect(result.metadata.exit).toBe(0);
+      expectNoClientPollOrPromote(bridgeCalls);
+      expect(bridgeCalls[0].params).toMatchObject({
+        foreground_orchestrate: true,
+        block_to_completion: false,
+      });
+    },
+    E2E_TEST_TIMEOUT_MS,
+  );
 
   skipOnWindows("OpenCode hoisted bash renders CRLF output as text lines", async () => {
     const { h, bash } = await pluginHarness();
@@ -225,23 +271,30 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     expect(result.metadata.exit).toBe(0);
   });
 
-  test("non-zero exit appends [exit code: N] to agent-visible output", async () => {
-    const { h, bash, bridgeCalls } = await pluginHarness();
+  test(
+    "non-zero exit appends [exit code: N] to agent-visible output",
+    async () => {
+      const { h, bash, bridgeCalls } = await pluginHarness();
 
-    const result = await callPluginBash(bash, h, { command: "false" });
+      const result = await callPluginBash(bash, h, { command: "false" });
 
-    // The agent must be able to detect command failure from the text itself,
-    // because metadata is UI-only and not echoed back to the model.
-    expect(result.output).toMatch(/^\n\[exit code: 1\]\n\[task bash-[0-9a-f]+\]$/);
-    expect(result.metadata.exit).toBe(1);
-    expectNoClientPollOrPromote(bridgeCalls);
-  });
+      // The agent must be able to detect command failure from the text itself,
+      // because metadata is UI-only and not echoed back to the model.
+      expect(result.output).toMatch(/^\n\[exit code: 1\]\n\[task bash-[0-9a-f]+\]$/);
+      expect(result.metadata.exit).toBe(1);
+      expectNoClientPollOrPromote(bridgeCalls);
+    },
+    E2E_TEST_TIMEOUT_MS,
+  );
 
   test("foreground promotion returns server text and does not call bash_status or bash_promote", async () => {
     const { h, bash, bridgeCalls } = await pluginHarness({ experimental_bash_background: true });
 
+    // The command must still be running when the 25 ms wait window ends. A
+    // 0.2 s command finished first on a loaded runner and came back as a
+    // completed result, which is correct product behaviour, so give it seconds.
     const result = await withEnv({ AFT_TEST_FOREGROUND_WAIT_MS: "25" }, async () =>
-      callPluginBash(bash, h, { command: "sleep 0.2 && echo late" }),
+      callPluginBash(bash, h, { command: "sleep 5 && echo late" }),
     );
 
     expect(result.output).toContain("promoted to background");
@@ -349,8 +402,8 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
       directory: h.tempDir,
       worktree: h.tempDir,
       abort: new AbortController().signal,
-      metadata: (data: Record<string, unknown>) => {
-        metadata = data;
+      metadata: (update: { metadata?: Record<string, unknown> }) => {
+        metadata = update.metadata ?? {};
       },
       ask: noopAsk,
       callID: "call-watch",
@@ -402,15 +455,19 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     expect(result.metadata.exit).toBe(0);
   });
 
-  test("foreground timeout returns timed-out process exit without throwing", async () => {
-    const h = await harness();
+  test(
+    "foreground timeout returns timed-out process exit without throwing",
+    async () => {
+      const h = await harness();
 
-    const response = await bridgeBashToTerminal(h, { command: "sleep 5", timeout: 100 });
+      const response = await bridgeBashToTerminal(h, { command: "sleep 5", timeout: 100 });
 
-    expect(response.success).toBe(true);
-    expect(response.status).toBe("timed_out");
-    expect(response.exit_code).toBe(124);
-  });
+      expect(response.success).toBe(true);
+      expect(response.status).toBe("timed_out");
+      expect(response.exit_code).toBe(124);
+    },
+    E2E_TEST_TIMEOUT_MS,
+  );
 
   skipOnWindows("rewrites cat to read with footer hint when enabled", async () => {
     const h = await harness({ experimental_bash_rewrite: true });
@@ -461,16 +518,20 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     expect(String(response.output_preview)).not.toContain("Prefer `read` tool over bash.");
   });
 
-  test("generic compressor strips ANSI and collapses four-plus duplicate lines", async () => {
-    const h = await harness({ experimental_bash_compress: true });
+  test(
+    "generic compressor strips ANSI and collapses four-plus duplicate lines",
+    async () => {
+      const h = await harness({ experimental_bash_compress: true });
 
-    const response = await bridgeBashToTerminal(h, {
-      command: "printf '\\033[31mred\\033[0m\\nred\\nred\\nred\\nred\\n'",
-    });
+      const response = await bridgeBashToTerminal(h, {
+        command: "printf '\\033[31mred\\033[0m\\nred\\nred\\nred\\nred\\n'",
+      });
 
-    expect(response.success).toBe(true);
-    expect(String(response.output_preview)).toContain("red");
-  });
+      expect(response.success).toBe(true);
+      expect(String(response.output_preview)).toContain("red");
+    },
+    E2E_TEST_TIMEOUT_MS,
+  );
 
   test("git status compressor summarizes large status sections", async () => {
     const h = await harness({ experimental_bash_compress: true });
@@ -505,53 +566,65 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     expect(String(response.output_preview)).toContain("raw_14.txt");
   }, 30_000);
 
-  test("background spawn returns task_id immediately", async () => {
-    const h = await harness({ experimental_bash_background: true });
-    const started = Date.now();
+  test(
+    "background spawn returns task_id immediately",
+    async () => {
+      const h = await harness({ experimental_bash_background: true });
+      const started = Date.now();
 
-    const response = await h.bridge.send("bash", {
-      command: "sleep 1 && echo done",
-      background: true,
-    });
+      const response = await h.bridge.send("bash", {
+        command: "sleep 1 && echo done",
+        background: true,
+      });
 
-    expect(response.success).toBe(true);
-    expect(response.status).toBe("running");
-    expect(typeof response.task_id).toBe("string");
-    // Typically returns in <100ms locally; assert only a generous deadlock bound
-    // so CI load does not turn latency into correctness.
-    expect(Date.now() - started).toBeLessThan(10_000);
-  });
+      expect(response.success).toBe(true);
+      expect(response.status).toBe("running");
+      expect(typeof response.task_id).toBe("string");
+      // Typically returns in <100ms locally; assert only a generous deadlock bound
+      // so CI load does not turn latency into correctness.
+      expect(Date.now() - started).toBeLessThan(10_000);
+    },
+    E2E_TEST_TIMEOUT_MS,
+  );
 
-  test("bash_status reports running then completed output", async () => {
-    const h = await harness({ experimental_bash_background: true });
-    const spawned = await h.bridge.send("bash", {
-      command: "sleep 0.3 && echo done",
-      background: true,
-    });
-    const taskId = String(spawned.task_id);
+  test(
+    "bash_status reports running then completed output",
+    async () => {
+      const h = await harness({ experimental_bash_background: true });
+      const spawned = await h.bridge.send("bash", {
+        command: "sleep 0.3 && echo done",
+        background: true,
+      });
+      const taskId = String(spawned.task_id);
 
-    const running = await h.bridge.send("bash_status", { task_id: taskId });
-    expect(running.success).toBe(true);
-    expect(running.status).toBe("running");
+      const running = await h.bridge.send("bash_status", { task_id: taskId });
+      expect(running.success).toBe(true);
+      expect(running.status).toBe("running");
 
-    const completed = await waitForStatus(h, taskId, "completed");
-    expect(completed.exit_code).toBe(0);
-    // CRLF-tolerant: PowerShell emits "done\r\n" on Windows.
-    expect(eol(String(completed.output_preview))).toBe("done\n");
-  });
+      const completed = await waitForStatus(h, taskId, "completed");
+      expect(completed.exit_code).toBe(0);
+      // CRLF-tolerant: PowerShell emits "done\r\n" on Windows.
+      expect(eol(String(completed.output_preview))).toBe("done\n");
+    },
+    E2E_TEST_TIMEOUT_MS,
+  );
 
-  test("bash_kill terminates a running task", async () => {
-    const h = await harness({ experimental_bash_background: true });
-    const spawned = await h.bridge.send("bash", { command: "sleep 60", background: true });
-    const taskId = String(spawned.task_id);
+  test(
+    "bash_kill terminates a running task",
+    async () => {
+      const h = await harness({ experimental_bash_background: true });
+      const spawned = await h.bridge.send("bash", { command: "sleep 60", background: true });
+      const taskId = String(spawned.task_id);
 
-    const killed = await h.bridge.send("bash_kill", { task_id: taskId });
-    const status = await h.bridge.send("bash_status", { task_id: taskId });
+      const killed = await h.bridge.send("bash_kill", { task_id: taskId });
+      const status = await h.bridge.send("bash_status", { task_id: taskId });
 
-    expect(killed.success).toBe(true);
-    expect(killed.status).toBe("killed");
-    expect(status.status).toBe("killed");
-  });
+      expect(killed.success).toBe(true);
+      expect(killed.status).toBe("killed");
+      expect(status.status).toBe("killed");
+    },
+    E2E_TEST_TIMEOUT_MS,
+  );
 
   test("background completions are no longer appended by the bash adapter", async () => {
     const { h, bash } = await pluginHarness({ experimental_bash_background: true });
@@ -583,29 +656,33 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     expect(result.output).not.toContain("bg-done");
   }, 60_000);
 
-  test("permission ask round-trip invokes OpenCode ctx.ask", async () => {
-    const { h, bash, bridgeCalls } = await pluginHarness({ bash_permissions: true });
-    const ask = mockAsk();
+  test(
+    "permission ask round-trip invokes OpenCode ctx.ask",
+    async () => {
+      const { h, bash, bridgeCalls } = await pluginHarness({ bash_permissions: true });
+      const ask = mockAsk();
 
-    // The isolated test home can live inside the repository on Windows. Select
-    // a nonexistent Git directory for this command only: ancestor discovery
-    // cannot turn the intended command failure into a successful status query,
-    // and bridge configuration still sees an ordinary project directory.
-    const command = "git --git-dir=missing-repository status";
-    const result = await callPluginBash(bash, h, { command }, { ask });
+      // The isolated test home can live inside the repository on Windows. Select
+      // a nonexistent Git directory for this command only: ancestor discovery
+      // cannot turn the intended command failure into a successful status query,
+      // and bridge configuration still sees an ordinary project directory.
+      const command = "git --git-dir=missing-repository status";
+      const result = await callPluginBash(bash, h, { command }, { ask });
 
-    // Real git status fails on the missing repository — exit 128 surfaces
-    // in the agent-visible output AND in the metadata.
-    expect(result.metadata.exit).toBe(128);
-    expect(result.output).toContain("[exit code: 128]");
-    expect(ask).toHaveBeenCalledTimes(1);
-    expect(ask.mock.calls[0][0]).toMatchObject({
-      permission: "bash",
-      patterns: ["git --git-dir=missing-repository status"],
-      always: ["git --git-dir=missing-repository *"],
-    });
-    expect(nonConfigureCommands(bridgeCalls)).toEqual(["bash", "bash"]);
-  });
+      // Real git status fails on the missing repository — exit 128 surfaces
+      // in the agent-visible output AND in the metadata.
+      expect(result.metadata.exit).toBe(128);
+      expect(result.output).toContain("[exit code: 128]");
+      expect(ask).toHaveBeenCalledTimes(1);
+      expect(ask.mock.calls[0][0]).toMatchObject({
+        permission: "bash",
+        patterns: ["git --git-dir=missing-repository status"],
+        always: ["git --git-dir=missing-repository *"],
+      });
+      expect(nonConfigureCommands(bridgeCalls)).toEqual(["bash", "bash"]);
+    },
+    E2E_TEST_TIMEOUT_MS,
+  );
 
   // ─────────────────────────────────────────────────────────────────────────
   // Permission flow regression coverage (Oracle audit v0.19.5..HEAD).
@@ -629,139 +706,159 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
   //   5. Multiple asks     → bash asks are grouped and awaited before bash runs.
   // ─────────────────────────────────────────────────────────────────────────
 
-  test("Promise-returning ask resolves cleanly and bash runs (allow path)", async () => {
-    const { h, bash } = await pluginHarness();
+  test(
+    "Promise-returning ask resolves cleanly and bash runs (allow path)",
+    async () => {
+      const { h, bash } = await pluginHarness();
 
-    let askInvoked = false;
-    // A bare async lambda mirrors what OpenCode 1.15.5 does for an "allow"
-    // decision: ask() returns Promise<void> that resolves with no error. If
-    // runAsk regresses to a no-op or fire-and-forget, the body never runs
-    // and `askInvoked` stays false — the assertion below catches that class
-    // of regression even though the bash command itself would still succeed
-    // by accident.
-    const ask = mock(async (_input: unknown) => {
-      askInvoked = true;
-    }) as ToolContext["ask"];
+      let askInvoked = false;
+      // A bare async lambda mirrors what OpenCode 1.15.5 does for an "allow"
+      // decision: ask() returns Promise<void> that resolves with no error. If
+      // runAsk regresses to a no-op or fire-and-forget, the body never runs
+      // and `askInvoked` stays false — the assertion below catches that class
+      // of regression even though the bash command itself would still succeed
+      // by accident.
+      const ask = mock(async (_input: unknown) => {
+        askInvoked = true;
+      }) as ToolContext["ask"];
 
-    const result = await callPluginBash(bash, h, { command: "echo allowed" }, { ask });
+      const result = await callPluginBash(bash, h, { command: "echo allowed" }, { ask });
 
-    expect(askInvoked).toBe(true);
-    // CRLF-tolerant: PowerShell emits "allowed\r\n" on Windows. The permission
-    // flow (ask invoked, command ran) is the contract — not the line ending.
-    expect(eol(result.output)).toMatch(/^allowed\n\[task bash-[0-9a-f]+\]$/);
-    expect(result.metadata.exit).toBe(0);
-  });
+      expect(askInvoked).toBe(true);
+      // CRLF-tolerant: PowerShell emits "allowed\r\n" on Windows. The permission
+      // flow (ask invoked, command ran) is the contract — not the line ending.
+      expect(eol(result.output)).toMatch(/^allowed\n\[task bash-[0-9a-f]+\]$/);
+      expect(result.metadata.exit).toBe(0);
+    },
+    E2E_TEST_TIMEOUT_MS,
+  );
 
-  test("rejecting ask propagates as a thrown Error (deny path)", async () => {
-    const { h, bash } = await pluginHarness();
+  test(
+    "rejecting ask propagates as a thrown Error (deny path)",
+    async () => {
+      const { h, bash } = await pluginHarness();
 
-    // A rejected Promise mirrors what OpenCode does when a permission rule
-    // denies the request. The plugin must surface this back through
-    // bash.execute as a thrown Error so OpenCode's tool runner records it
-    // as a deny — NOT silently let bash run anyway. The original bug report
-    // was exactly "`bash: { '*': deny }` doesn't deny".
-    const ask = mock(async (_input: unknown) => {
-      throw new Error("Permission denied by user");
-    }) as ToolContext["ask"];
+      // A rejected Promise mirrors what OpenCode does when a permission rule
+      // denies the request. The plugin must surface this back through
+      // bash.execute as a thrown Error so OpenCode's tool runner records it
+      // as a deny — NOT silently let bash run anyway. The original bug report
+      // was exactly "`bash: { '*': deny }` doesn't deny".
+      const ask = mock(async (_input: unknown) => {
+        throw new Error("Permission denied by user");
+      }) as ToolContext["ask"];
 
-    let captured: unknown;
-    try {
-      await callPluginBash(bash, h, { command: "echo should-not-run" }, { ask });
-      throw new Error("expected bash.execute to throw on deny");
-    } catch (err) {
-      captured = err;
-    }
+      let captured: unknown;
+      try {
+        await callPluginBash(bash, h, { command: "echo should-not-run" }, { ask });
+        throw new Error("expected bash.execute to throw on deny");
+      } catch (err) {
+        captured = err;
+      }
 
-    expect(captured).toBeInstanceOf(Error);
-    expect((captured as Error).message).toContain("Permission denied by user");
-    // The ask must have actually been consulted — a fix that catches the deny
-    // BEFORE consulting ask would also fail this assertion.
-    expect(ask).toHaveBeenCalledTimes(1);
-  });
+      expect(captured).toBeInstanceOf(Error);
+      expect((captured as Error).message).toContain("Permission denied by user");
+      // The ask must have actually been consulted — a fix that catches the deny
+      // BEFORE consulting ask would also fail this assertion.
+      expect(ask).toHaveBeenCalledTimes(1);
+    },
+    E2E_TEST_TIMEOUT_MS,
+  );
 
-  test("permissions_granted skips ctx.ask entirely", async () => {
-    const { h } = await pluginHarness();
+  test(
+    "permissions_granted skips ctx.ask entirely",
+    async () => {
+      const { h } = await pluginHarness();
 
-    // Bypass the bash tool's plugin-side permission loop and call the bridge
-    // directly with `permissions_granted` so we can assert that pre-granted
-    // patterns short-circuit the Rust scanner without ever asking the user.
-    // This proves the Rust side of the fail-closed gate (zero-asks → deny)
-    // does NOT trigger when patterns are already trusted.
-    const response = await h.bridge.send("bash", {
-      command: "git status",
-      permissions_requested: true,
-      permissions_granted: ["git status *"],
-    });
+      // Bypass the bash tool's plugin-side permission loop and call the bridge
+      // directly with `permissions_granted` so we can assert that pre-granted
+      // patterns short-circuit the Rust scanner without ever asking the user.
+      // This proves the Rust side of the fail-closed gate (zero-asks → deny)
+      // does NOT trigger when patterns are already trusted.
+      const response = await h.bridge.send("bash", {
+        command: "git status",
+        permissions_requested: true,
+        permissions_granted: ["git status *"],
+      });
 
-    expect(response.success).toBe(true);
-    expect(response.code).not.toBe("permission_required");
-  });
+      expect(response.success).toBe(true);
+      expect(response.code).not.toBe("permission_required");
+    },
+    E2E_TEST_TIMEOUT_MS,
+  );
 
-  test("multiple bash permission asks are grouped before bash runs", async () => {
-    const { h, bash } = await pluginHarness();
+  test(
+    "multiple bash permission asks are grouped before bash runs",
+    async () => {
+      const { h, bash } = await pluginHarness();
 
-    // `find . | xargs grep foo` produces multiple Rust bash asks. OpenCode's
-    // adapter should collapse them into ONE host prompt that still carries all
-    // scanned patterns before the second bridge call runs the command.
-    let askCount = 0;
-    let askInput: { permission?: string; patterns?: string[]; always?: string[] } | undefined;
-    const ask = mock(async (input: unknown) => {
-      askCount += 1;
-      askInput = input as { permission?: string; patterns?: string[]; always?: string[] };
-    });
+      // `find . | xargs grep foo` produces multiple Rust bash asks. OpenCode's
+      // adapter should collapse them into ONE host prompt that still carries all
+      // scanned patterns before the second bridge call runs the command.
+      let askCount = 0;
+      let askInput: { permission?: string; patterns?: string[]; always?: string[] } | undefined;
+      const ask = mock(async (input: unknown) => {
+        askCount += 1;
+        askInput = input as { permission?: string; patterns?: string[]; always?: string[] };
+      });
 
-    await callPluginBash(
-      bash,
-      h,
-      { command: "find . | xargs grep foo" },
-      { ask: ask as unknown as ToolContext["ask"] },
-    );
-
-    expect(askCount).toBe(1);
-    expect(ask.mock.calls.length).toBe(1);
-    expect(askInput?.permission).toBe("bash");
-    expect(askInput?.patterns?.length ?? 0).toBeGreaterThanOrEqual(2);
-    expect(askInput?.always?.length ?? 0).toBeGreaterThanOrEqual(2);
-  });
-
-  test("Rust scan fail-closed wildcard ask propagates through the plugin layer", async () => {
-    const { h, bash } = await pluginHarness();
-
-    // Inputs like `((i++))` parse cleanly in tree-sitter-bash but produce
-    // ZERO `command` nodes. The Rust scanner's fail-closed branch must emit
-    // a wildcard "*" ask in that case (Oracle audit MEDIUM #2). The plugin
-    // layer must then forward that ask to ctx.ask through the same Promise
-    // path — proving the scanner+plugin chain doesn't silently let
-    // command-less inputs bypass `bash: { "*": deny }`. Reject after the ask
-    // is observed so the assertion covers the permission path without waiting
-    // for a platform shell to execute this intentionally odd input.
-    let askInput: { patterns: string[]; permission: string } | undefined;
-    const ask = mock(async (input: unknown) => {
-      askInput = input as { patterns: string[]; permission: string };
-      throw new Error("wildcard ask observed");
-    });
-
-    let captured: unknown;
-    try {
       await callPluginBash(
         bash,
         h,
-        { command: "((i++))" },
+        { command: "find . | xargs grep foo" },
         { ask: ask as unknown as ToolContext["ask"] },
       );
-    } catch (err) {
-      captured = err;
-    }
 
-    expect(captured).toBeInstanceOf(Error);
-    expect((captured as Error).message).toContain("wildcard ask observed");
-    expect(ask).toHaveBeenCalled();
-    expect(askInput).toBeDefined();
-    expect(askInput?.permission).toBe("bash");
-    // Wildcard or literal echo of the input — either is acceptable as long
-    // as the agent is forced to consult OpenCode's permission rules.
-    expect(askInput?.patterns.length ?? 0).toBeGreaterThan(0);
-  });
+      expect(askCount).toBe(1);
+      expect(ask.mock.calls.length).toBe(1);
+      expect(askInput?.permission).toBe("bash");
+      expect(askInput?.patterns?.length ?? 0).toBeGreaterThanOrEqual(2);
+      expect(askInput?.always?.length ?? 0).toBeGreaterThanOrEqual(2);
+    },
+    E2E_TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "Rust scan fail-closed wildcard ask propagates through the plugin layer",
+    async () => {
+      const { h, bash } = await pluginHarness();
+
+      // Inputs like `((i++))` parse cleanly in tree-sitter-bash but produce
+      // ZERO `command` nodes. The Rust scanner's fail-closed branch must emit
+      // a wildcard "*" ask in that case (Oracle audit MEDIUM #2). The plugin
+      // layer must then forward that ask to ctx.ask through the same Promise
+      // path — proving the scanner+plugin chain doesn't silently let
+      // command-less inputs bypass `bash: { "*": deny }`. Reject after the ask
+      // is observed so the assertion covers the permission path without waiting
+      // for a platform shell to execute this intentionally odd input.
+      let askInput: { patterns: string[]; permission: string } | undefined;
+      const ask = mock(async (input: unknown) => {
+        askInput = input as { patterns: string[]; permission: string };
+        throw new Error("wildcard ask observed");
+      });
+
+      let captured: unknown;
+      try {
+        await callPluginBash(
+          bash,
+          h,
+          { command: "((i++))" },
+          { ask: ask as unknown as ToolContext["ask"] },
+        );
+      } catch (err) {
+        captured = err;
+      }
+
+      expect(captured).toBeInstanceOf(Error);
+      expect((captured as Error).message).toContain("wildcard ask observed");
+      expect(ask).toHaveBeenCalled();
+      expect(askInput).toBeDefined();
+      expect(askInput?.permission).toBe("bash");
+      // Wildcard or literal echo of the input — either is acceptable as long
+      // as the agent is forced to consult OpenCode's permission rules.
+      expect(askInput?.patterns.length ?? 0).toBeGreaterThan(0);
+    },
+    E2E_TEST_TIMEOUT_MS,
+  );
 });
 
 test("OpenCode executes project-enabled host fallback when the bridge binary is missing", async () => {

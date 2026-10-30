@@ -725,13 +725,19 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // --- Write, format, and validate ---
     let _mutation = crate::runtime_drain::record_file_mutation(ctx, [path.as_path()]);
-    let mut write_result =
-        match edit::write_format_validate(&path, &new_source, &ctx.config(), &req.params) {
-            Ok(r) => r,
-            Err(e) => {
-                return Response::error(&req.id, e.code(), e.to_string());
-            }
-        };
+    let tool_policy = &crate::sandbox_spawn::ToolLaunchPolicy::for_request(ctx);
+    let mut write_result = match edit::write_format_validate(
+        tool_policy,
+        &path,
+        &new_source,
+        &ctx.config(),
+        &req.params,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
+    };
 
     if let Ok(final_content) = std::fs::read_to_string(&path) {
         write_result.lsp_outcome = ctx.lsp_post_write(&path, &final_content, &req.params);

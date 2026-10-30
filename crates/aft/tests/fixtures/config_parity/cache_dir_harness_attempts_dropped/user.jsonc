@@ -1,0 +1,12 @@
+{
+  "storage": {
+    "cache_dir": "{ABSOLUTE_ROOT}/aft-cache"
+  },
+  "harnesses": {
+    "pi": {
+      "storage": {
+        "cache_dir": "/pi-cache"
+      }
+    }
+  }
+}

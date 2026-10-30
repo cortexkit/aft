@@ -1,0 +1,21 @@
+{
+  "operations": [
+    "bash_status",
+    "bash_output",
+    "bash_watch"
+  ],
+  "bound": {
+    "task": "call"
+  },
+  "wire_argument": "task",
+  "value": "viewed bash call key, not task id or frame call_key",
+  "translation": "taskId after read-only ownership lookup",
+  "missing": "args_invalid",
+  "taskId": "args_invalid",
+  "session_fields": [
+    "session",
+    "session_id",
+    "sessionId"
+  ],
+  "session_field_code": "bound_field_supplied"
+}

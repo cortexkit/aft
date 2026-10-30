@@ -100,6 +100,19 @@ test-group = 'storm'
 [[profile.default.overrides]]
 filter = 'test(/^(callgraph_store::refresh_worker_tests::stopping_a_readiness_watch|config_live::tests::stopping_a_config_directory_watch)_never_stalls_other_file_io$/)'
 threads-required = 'num-test-threads'
+# Start these first. Nextest starts tests in order, so a test that needs every
+# thread waits until all running tests finish, leaving threads idle. At the
+# start of a run every thread is free, so nothing waits.
+priority = 100
+
+# One test (about 250 s on macOS and 280 s on Windows CI runners) is longer
+# than every other test in its hash shard combined. Started late, it runs on
+# alone after the rest finish, so its shard ends minutes after the others.
+# Started right after the whole-pool tests above, it overlaps the rest of the
+# shard instead.
+[[profile.default.overrides]]
+filter = 'test(=views::assembly::manifest_incremental::tests::views_incremental_random_sequences_equal_full_rebuild)'
+priority = 90
 
 # Unit targets need a hard per-test bound because they previously ran as one
 # libtest process: one nonterminating worker hid the test name until CI killed

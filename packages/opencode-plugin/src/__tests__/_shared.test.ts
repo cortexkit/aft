@@ -4,14 +4,40 @@ import { homedir } from "node:os";
 import { resolve, sep } from "node:path";
 import { tool } from "@opencode-ai/plugin";
 import {
+  callBridge,
+  callToolCall,
   coerceOptionalInt,
   decodeFileUrl,
   expandTilde,
   optionalInt,
   resolvePathFromProjectRoot,
 } from "../tools/_shared.js";
+import type { PluginContext } from "../types.js";
 
 const z = tool.schema;
+
+for (const dispatch of [callBridge, callToolCall]) {
+  test(`generic ${dispatch.name} forwards V1 caller abort and honors explicit overrides`, async () => {
+    const signals: unknown[] = [];
+    const send = async (...args: any[]) => {
+      signals.push(args[args.length - 1]?.abortSignal);
+      return {};
+    };
+    const ctx = {
+      client: {},
+      config: {},
+      pool: { getBridge: () => ({ send, toolCall: send }) },
+    } as unknown as PluginContext;
+    const caller = new AbortController().signal;
+    const override = new AbortController().signal;
+    const effect = new AbortController().signal;
+    const runtime = { directory: process.cwd(), abort: caller };
+    await dispatch(ctx, runtime, "read", {});
+    await dispatch(ctx, runtime, "read", {}, { abortSignal: override });
+    await dispatch(ctx, { ...runtime, effectAbort: effect }, "read", {});
+    expect(signals).toEqual([caller, override, effect]);
+  });
+}
 
 describe("optionalInt", () => {
   test("accepts integers in range and undefined", () => {

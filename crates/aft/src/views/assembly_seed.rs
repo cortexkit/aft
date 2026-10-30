@@ -5,6 +5,9 @@ use std::process::Stdio;
 pub(super) struct DerivedSeed {
     pub path: PathBuf,
     pub manifest: Manifest,
+    /// Found by the derived-output index with an identity equal to the
+    /// target's, so the patch only restamps the manifest fingerprint.
+    pub exact: bool,
     _pin: crate::pins::QueryPin,
     _owner_pin: Option<crate::pins::QueryPin>,
 }
@@ -50,41 +53,7 @@ pub(super) fn sibling_checkout_seed(
         {
             continue;
         }
-        let seed = (|| {
-            let pin = crate::pins::QueryPin::acquire(view.view_dir(), &generation)
-                .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
-            match crate::callgraph_store::manifest_view_database_ready(
-                view.view_dir(),
-                &generation,
-                deadline,
-            ) {
-                Ok(true) => {}
-                Ok(false) => return Ok(None),
-                Err(crate::callgraph_store::CallGraphStoreError::Sqlite(error)) => {
-                    return Err(ViewError::Sqlite(error))
-                }
-                Err(error) => return Err(ViewError::InvalidManifest(error.to_string())),
-            }
-            let owner = view.derived_owner(&generation)?;
-            let owner_pin = (owner != generation)
-                .then(|| crate::pins::QueryPin::acquire(view.view_dir(), &owner))
-                .transpose()
-                .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
-            let manifest = view.load_manifest(&owner)?;
-            let path = view.derived_path(&generation)?;
-            log::info!(
-                "view derived seed: scope={} donor_scope={} generation={generation}",
-                request.scope,
-                scope
-            );
-            Ok(Some(DerivedSeed {
-                path,
-                manifest,
-                _pin: pin,
-                _owner_pin: owner_pin,
-            }))
-        })();
-        match seed {
+        match seed_from(request, &scope, &view, &generation, deadline) {
             Ok(Some(seed)) => return Ok(Some(seed)),
             Ok(None) => {}
             // An optional unreadable or busy sibling does not hide an older,
@@ -96,6 +65,145 @@ pub(super) fn sibling_checkout_seed(
         }
     }
     Ok(None)
+}
+
+/// Pin `generation` of the donor `view` and return it as a seed when it
+/// passes the reader's readiness check; `None` when it is not ready.
+fn seed_from(
+    request: &AssemblyRequest,
+    scope: &str,
+    view: &ViewStore,
+    generation: &str,
+    deadline: Instant,
+) -> Result<Option<DerivedSeed>> {
+    let pin = crate::pins::QueryPin::acquire(view.view_dir(), generation)
+        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+    match crate::callgraph_store::manifest_view_database_ready(
+        view.view_dir(),
+        generation,
+        deadline,
+    ) {
+        Ok(true) => {}
+        Ok(false) => return Ok(None),
+        Err(crate::callgraph_store::CallGraphStoreError::Sqlite(error)) => {
+            return Err(ViewError::Sqlite(error))
+        }
+        Err(error) => return Err(ViewError::InvalidManifest(error.to_string())),
+    }
+    let owner = view.derived_owner(generation)?;
+    let owner_pin = (owner != generation)
+        .then(|| crate::pins::QueryPin::acquire(view.view_dir(), &owner))
+        .transpose()
+        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+    let manifest = view.load_manifest(&owner)?;
+    let path = view.derived_path(generation)?;
+    log::info!(
+        "view derived seed: scope={} donor_scope={} generation={generation}",
+        request.scope,
+        scope
+    );
+    Ok(Some(DerivedSeed {
+        path,
+        manifest,
+        exact: false,
+        _pin: pin,
+        _owner_pin: owner_pin,
+    }))
+}
+
+/// A donor from the family's derived-output index (see `derived_index`):
+/// the newest ready output whose identity equals what `manifest` builds, or
+/// else the ready recent output with the smallest diff to `manifest` that the
+/// incremental cutoff admits. `None` when the index has neither.
+///
+/// Rows whose scope no longer serves a ready database at the recorded
+/// generation are removed. Rows that only fail on contention are kept.
+pub(super) fn indexed_seed(
+    request: &AssemblyRequest,
+    index: &Path,
+    manifest: &Manifest,
+    deadline: Instant,
+) -> Result<Option<DerivedSeed>> {
+    let identity = super::derived_index::identity(&request.family, manifest);
+    let candidates = match super::derived_index::candidates(index, &identity, &request.scope) {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            log::debug!("view derived index unavailable: {error}");
+            return Ok(None);
+        }
+    };
+    let forget = |candidate: &super::derived_index::Candidate| {
+        if let Err(error) =
+            super::derived_index::forget(index, &candidate.scope, &candidate.generation)
+        {
+            log::debug!(
+                "view derived index row kept: scope={} error={error}",
+                candidate.scope
+            );
+        }
+    };
+    let mut nearest: Option<(usize, DerivedSeed)> = None;
+    for candidate in candidates {
+        let Some(view) =
+            ViewStore::existing_dir(request.storage.join("views").join(&candidate.scope))
+        else {
+            forget(&candidate);
+            continue;
+        };
+        match view.current_generation_read_only() {
+            Ok(Some(current)) if current == candidate.generation => {}
+            Ok(_) => {
+                forget(&candidate);
+                continue;
+            }
+            Err(_) => continue,
+        }
+        let seed = match seed_from(
+            request,
+            &candidate.scope,
+            &view,
+            &candidate.generation,
+            deadline,
+        ) {
+            Ok(Some(seed)) => seed,
+            Ok(None) => {
+                forget(&candidate);
+                continue;
+            }
+            Err(error) => {
+                log::debug!(
+                    "view derived seed unavailable: donor_scope={} error={error}",
+                    candidate.scope
+                );
+                continue;
+            }
+        };
+        // The identity only chooses the donor. The patch still starts from
+        // the donor's own manifest and refuses a copy whose fingerprint
+        // differs from it, so a row whose identity lies costs a patch.
+        if candidate.exact
+            && super::super::materialization::manifest_callgraph_equivalent(
+                &seed.manifest,
+                manifest,
+            )
+        {
+            return Ok(Some(DerivedSeed {
+                exact: true,
+                ..seed
+            }));
+        }
+        let size = super::super::materialization::manifest_diff_size(&seed.manifest, manifest);
+        if super::diff_exceeds_incremental_cutoff(size) {
+            continue;
+        }
+        if nearest
+            .as_ref()
+            .is_none_or(|(changed, _)| size.changed < *changed)
+        {
+            nearest = Some((size.changed, seed));
+        }
+    }
+    Ok(nearest.map(|(_, seed)| seed))
 }
 
 /// Every worktree of the repository `root` belongs to, main worktree first.

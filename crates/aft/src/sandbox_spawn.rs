@@ -5,9 +5,7 @@
 //! detached pipes or PTY. Foreground orchestration uses the detached registry
 //! too, so it does not create a third process-creation path.
 //!
-//! AFT also starts processes for its own implementation. Those are outside this
-//! seam because they do not execute an agent command: external formatters,
-//! linters, and type checkers in `format`; LSP servers and Windows LSP cleanup in
+//! Other implementation processes remain outside this seam: LSP servers and Windows LSP cleanup in
 //! `lsp::client` and `lsp::child_registry`; git probes in `search_index`,
 //! `readonly_artifacts`, `commands::configure`, and `commands::conflicts`; login
 //! shell PATH discovery in `effective_path`; and Windows process liveness or
@@ -16,6 +14,8 @@
 //! in-process and creates no child. Keeping this inventory here makes the
 //! agent-command boundary explicit without accidentally applying agent policy to
 //! AFT's internal tooling.
+//! Formatters, their version probes, and checkers do execute project code, so
+//! [`ToolLaunchPolicy`] carries the session shell's launch policy to those tools.
 
 use std::cell::RefCell;
 #[cfg(any(test, target_os = "linux"))]
@@ -206,10 +206,12 @@ pub enum SandboxTaskKind {
     BashForeground,
     BashBackground,
     BashPty,
+    ExternalTool,
 }
 
 #[cfg(unix)]
 struct PreparedTaskInner {
+    secret_runtime: Mutex<Option<crate::bash_background::secrets::SharedRuntime>>,
     paths: crate::bash_background::persistence::TaskPaths,
     dirs: crate::bash_background::persistence::TaskDirs,
     digest: blake3::Hash,
@@ -258,6 +260,24 @@ pub(crate) struct PayloadInvocation {
 
 #[cfg(unix)]
 impl PreparedTask {
+    pub(crate) fn set_secret_runtime(
+        &self,
+        runtime: crate::bash_background::secrets::SharedRuntime,
+    ) {
+        *self
+            .0
+            .secret_runtime
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(runtime);
+    }
+
+    pub(crate) fn secret_runtime(&self) -> Option<crate::bash_background::secrets::SharedRuntime> {
+        self.0
+            .secret_runtime
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
     #[cfg(test)]
     pub(crate) fn paths(&self) -> &crate::bash_background::persistence::TaskPaths {
         &self.0.paths
@@ -348,6 +368,9 @@ struct SavedLocalLaunch {
     command: Vec<u8>,
     payload_digest: [u8; 32],
     linux_scope: bool,
+    // Snapshots without a stored ceiling represent originally uncapped launches.
+    #[serde(default)]
+    memory_limit_mib: Option<u64>,
 }
 
 #[cfg(unix)]
@@ -361,6 +384,7 @@ pub(crate) fn save_local_launch(
     principal: &AuthenticatedPrincipal,
     shell: &Path,
     linux_scope: bool,
+    memory_limit_mib: Option<u64>,
 ) -> Result<String, String> {
     let prepared = plan
         .prepared_task()
@@ -396,6 +420,7 @@ pub(crate) fn save_local_launch(
         command: prepared.0.command_bytes.as_ref().clone(),
         payload_digest: *prepared.0.digest.as_bytes(),
         linux_scope,
+        memory_limit_mib,
     };
     let bytes = serde_json::to_vec(&snapshot).map_err(|e| e.to_string())?;
     let mut file = crate::bash_background::persistence::create_control_file(
@@ -419,7 +444,16 @@ pub(crate) fn save_local_launch(
 pub(crate) fn restore_local_launch(
     task: &crate::bash_background::persistence::ResolvedTask,
     expected: &str,
-) -> Result<(SpawnPlan, PathBuf, HashMap<String, String>, bool), String> {
+) -> Result<
+    (
+        SpawnPlan,
+        PathBuf,
+        HashMap<String, String>,
+        bool,
+        Option<u64>,
+    ),
+    String,
+> {
     let mut file =
         crate::bash_background::persistence::open_control_file(task, REMOTE_LOCAL_LAUNCH)
             .map_err(|e| e.to_string())?;
@@ -476,6 +510,7 @@ pub(crate) fn restore_local_launch(
         snapshot.shell_path,
         env,
         snapshot.linux_scope,
+        snapshot.memory_limit_mib,
     ))
 }
 
@@ -534,6 +569,12 @@ impl SpawnPlan {
         }
         Vec::new()
     }
+    pub(crate) fn changed_files_read_profile(&self) -> Option<&SandboxProfile> {
+        match self.policy() {
+            Self::Launcher { profile, .. } => Some(profile),
+            _ => None,
+        }
+    }
 
     pub(crate) fn refusal_code(&self) -> Option<&'static str> {
         match self.policy() {
@@ -566,6 +607,58 @@ impl SpawnPlan {
     pub(crate) fn enforces_shell_containment(&self) -> bool {
         cfg!(any(target_os = "linux", target_os = "macos"))
             && matches!(self.policy(), Self::Launcher { profile, .. } if profile.mode == SandboxMode::Strict)
+    }
+
+    /// A launcher alone is not a memory boundary. Linux also needs Yama on
+    /// the daemon side; reading it in the launcher would be too late to ask
+    /// for consent safely. Windows has no enforcing backend.
+    #[cfg(unix)]
+    pub(crate) fn protects_secret_memory(&self) -> bool {
+        let Self::Launcher { profile, .. } = self.policy() else {
+            return false;
+        };
+        if profile.v != crate::sandbox_profile::SANDBOX_PROFILE_VERSION
+            || !profile.temp_dir.is_absolute()
+            || std::fs::canonicalize(&profile.temp_dir).ok().as_ref() != Some(&profile.temp_dir)
+            || profile
+                .read_deny
+                .iter()
+                .any(|deny| profile.temp_dir.starts_with(deny))
+        {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            profile.mode == SandboxMode::Strict
+                && secret_ptrace_scope_safe(
+                    std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+                        .ok()
+                        .as_deref(),
+                )
+        }
+        #[cfg(target_os = "macos")]
+        {
+            profile.mode == SandboxMode::Strict
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            false
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn enable_secret_proxy(&mut self, port: u16) -> Result<(), ()> {
+        match self {
+            Self::Prepared { plan, .. } => plan.enable_secret_proxy(port),
+            Self::Launcher { profile, .. } => {
+                if cfg!(target_os = "macos") && profile.loopback_tcp_connect_deny.contains(&port) {
+                    return Err(());
+                }
+                profile.secret_proxy = true;
+                Ok(())
+            }
+            _ => Err(()),
+        }
     }
 
     /// Why a jailed worker's shell launched under this plan must not receive
@@ -639,6 +732,13 @@ impl SpawnPlan {
             mismatch_class: None,
         }
     }
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn secret_ptrace_scope_safe(value: Option<&str>) -> bool {
+    value
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .is_some_and(|value| value > 0)
 }
 
 /// One resolver invocation captured by the project-keyed test seam.
@@ -1085,6 +1185,7 @@ fn verify_payload(
         .seek(SeekFrom::Start(0))
         .map_err(|error| format!("failed to rewind environment payload: {error}"))?;
     Ok(PreparedTask(Arc::new(PreparedTaskInner {
+        secret_runtime: Mutex::new(None),
         paths: task.paths,
         dirs: task.dirs,
         digest,
@@ -1722,7 +1823,7 @@ fn build_native_profile(
                     git_policy
                         .hooks
                         .iter()
-                        .filter(|path| path.is_dir())
+                        .filter(|path| profile_candidate_is_dir(path))
                         .cloned(),
                 );
                 policy
@@ -1734,8 +1835,8 @@ fn build_native_profile(
                     .read_metadata_allow
                     .extend(git_policy.metadata_allow.iter().cloned());
                 for (key, path) in &git_policy.configured_paths {
-                    if (key == "core.excludesFile" && path.is_file())
-                        || (key != "core.excludesFile" && path.is_dir())
+                    if (key == "core.excludesFile" && profile_candidate_is_file(path))
+                        || (key != "core.excludesFile" && profile_candidate_is_dir(path))
                     {
                         policy.private_stores.read_allow.push(path.clone());
                         if key == "core.excludesFile"
@@ -1762,7 +1863,7 @@ fn build_native_profile(
         let storage = ctx.storage_dir();
         let mut managed_paths = Vec::new();
         if ctx.config().github.shim {
-            managed_paths.push(storage.join(crate::agent_child_env::SHIMS_DIR_NAME));
+            managed_paths.push(crate::pinned_executable::shims_dir(&storage));
             managed_paths.push(crate::agent_child_env::shim_binary(&ctx.config())?);
         }
         if ctx.config().git.co_author != "off" {
@@ -1773,7 +1874,7 @@ fn build_native_profile(
         }
         // Governance injection materializes these before resolving a spawn.
         // Do not grant a missing shim directory or a broad binary parent.
-        managed_paths.retain(|path| path.exists());
+        managed_paths.retain(|path| profile_candidate_exists(path));
         shell_write_deny.extend(managed_paths);
 
         let mut cache_roots = vec![
@@ -1794,7 +1895,9 @@ fn build_native_profile(
             home.join("Library/Caches/uv"),
             home.join("Library/Caches/go-build"),
         ]);
-        cache_roots.retain(|path| path.is_dir());
+        #[cfg(test)]
+        cache_roots.extend(candidate_snapshot::cache_candidates());
+        cache_roots.retain(|path| profile_candidate_is_dir(path));
         // A jailed worker's shell keeps writes to its worktree, plus what normal
         // builds and commits need, all taken from operator configuration.
         let jail = worker_jail_active()
@@ -2050,7 +2153,7 @@ fn build_relaxed_profile(
             {
                 let mut metadata = Vec::new();
                 if let Some((_, path)) = configured_git_path(root, key, &mut metadata)? {
-                    if path.is_dir() {
+                    if profile_candidate_is_dir(&path) {
                         stores.read_allow.push(path);
                     }
                     stores.read_metadata_allow.extend(metadata);
@@ -2078,21 +2181,23 @@ fn build_relaxed_profile(
     }
     let storage = ctx.storage_dir();
     for path in [
-        storage.join(crate::agent_child_env::SHIMS_DIR_NAME),
+        crate::pinned_executable::shims_dir(&storage),
         crate::agent_child_env::managed_git_hooks_dir(&storage),
     ] {
-        if path.exists() {
+        if profile_candidate_exists(&path) {
             stores.read_allow.push(path.clone());
         }
         write_deny.push(path);
     }
     if let Ok(binary) = crate::agent_child_env::shim_binary(&ctx.config()) {
-        if binary.exists() {
+        if profile_candidate_exists(&binary) {
             stores.read_allow.push(binary.clone());
         }
         write_deny.push(binary);
     }
-    stores.read_allow.retain(|path| path.exists());
+    stores
+        .read_allow
+        .retain(|path| profile_candidate_exists(path));
     writable.extend(write_grants.iter().cloned());
     stores.write_allow.extend(write_grants);
     stores
@@ -2121,6 +2226,7 @@ fn build_relaxed_profile(
             .extend(crate::worker_jail_canary::prepare_homes(home, false)?);
     }
     let mut profile = SandboxProfile {
+        secret_proxy: false,
         v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
         mode: SandboxMode::Relaxed,
         worker_jail: false,
@@ -2622,10 +2728,10 @@ fn worker_jail_grants(
     };
 
     let cargo_home = absolute_env_path("CARGO_HOME").unwrap_or_else(|| home.join(".cargo"));
-    if cargo_home.is_dir() {
+    if profile_candidate_is_dir(&cargo_home) {
         for cache in ["registry", "git"] {
             let cache = cargo_home.join(cache);
-            if std::fs::create_dir_all(&cache).is_ok() {
+            if create_profile_candidate_dir(&cache) {
                 grants.caches.push(cache);
             }
         }
@@ -2634,10 +2740,10 @@ fn worker_jail_grants(
             .extend(CARGO_HOME_FILES.iter().map(|name| cargo_home.join(name)));
     }
     let rustup_home = absolute_env_path("RUSTUP_HOME").unwrap_or_else(|| home.join(".rustup"));
-    if rustup_home.is_dir() {
+    if profile_candidate_is_dir(&rustup_home) {
         for cache in ["downloads", "tmp"] {
             let cache = rustup_home.join(cache);
-            if std::fs::create_dir_all(&cache).is_ok() {
+            if create_profile_candidate_dir(&cache) {
                 grants.caches.push(cache);
             }
         }
@@ -2686,10 +2792,10 @@ fn worker_jail_grants(
         if !seen.insert(path.clone()) {
             continue;
         }
-        let Ok(config_path) = path.canonicalize() else {
+        let Ok(config_path) = canonicalize_profile_candidate(&path) else {
             continue;
         };
-        if !config_path.is_file()
+        if !profile_candidate_is_file(&config_path)
             || project_roots
                 .iter()
                 .any(|root| config_path.starts_with(root))
@@ -2730,7 +2836,7 @@ fn worker_jail_grants(
             );
             continue;
         }
-        if std::fs::create_dir_all(&target).is_ok() {
+        if create_profile_candidate_dir(&target) {
             grants.roots.push(target);
         }
     }
@@ -2748,10 +2854,12 @@ fn add_build_slot_grants(
     policy: &crate::access_policy::AccessPolicy,
     grants: &mut WorkerJailGrants,
 ) {
-    let Ok(wrapper) = wrapper.canonicalize() else {
+    let Ok(wrapper) = canonicalize_profile_candidate(wrapper) else {
         return;
     };
-    if wrapper.file_name() != Some(OsStr::new("prefrontal-build-slot")) || !wrapper.is_file() {
+    if wrapper.file_name() != Some(OsStr::new("prefrontal-build-slot"))
+        || !profile_candidate_is_file(&wrapper)
+    {
         return;
     }
     let Some(dir) = wrapper.parent() else {
@@ -2784,7 +2892,7 @@ fn add_build_slot_grants(
     };
     if paths
         .iter()
-        .any(|path| !path.is_file() || !path.starts_with(dir))
+        .any(|path| !profile_candidate_is_file(path) || !path.starts_with(dir))
     {
         return;
     }
@@ -2834,7 +2942,7 @@ fn linked_git_grants(git_policies: &[GitPolicy]) -> Vec<PathBuf> {
             ["objects", "refs", "logs"]
                 .into_iter()
                 .map(|store| common_dir.join(store))
-                .filter(|store| store.is_dir()),
+                .filter(|store| profile_candidate_is_dir(store)),
         );
     }
     roots
@@ -3210,13 +3318,7 @@ impl GitPolicyInputs {
         let target = match path.canonicalize() {
             Ok(target) => target,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return (!path.ancestors().any(|ancestor| {
-                    self.files
-                        .get(ancestor)
-                        .and_then(Option::as_ref)
-                        .is_some_and(|identity| identity.symlink)
-                }))
-                .then_some(());
+                return self.watch_absent(path);
             }
             Err(_) => return None,
         };
@@ -3226,6 +3328,61 @@ impl GitPolicyInputs {
                     .entry(ancestor.to_path_buf())
                     .or_insert(git_input_identity(ancestor).ok()?);
             }
+            let resolved = (path.to_path_buf(), target);
+            if !self.resolved_paths.contains(&resolved) {
+                self.resolved_paths.push(resolved);
+            }
+        }
+        Some(())
+    }
+
+    /// Watch a config input that does not exist yet, such as Git's compiled-in
+    /// system config `/etc/gitconfig` on macOS, where `/etc` is a symlink to
+    /// `private/etc` and the file is usually absent.
+    ///
+    /// Sandbox invariant: a cached policy may be reused only while every input
+    /// Git would read is provably unchanged; anything this cannot prove leaves
+    /// the policy uncached, so the next spawn resolves it again from Git.
+    ///
+    /// An absent path is provable. `watch` already recorded `None` as the
+    /// path's own identity, and the identity check uses `lstat`, which follows
+    /// every symlink before the last component when it runs. So creating the
+    /// file, or retargeting a symlinked ancestor at a directory that holds
+    /// it, turns that `None` into `Some` and invalidates the entry. The
+    /// resolved location is also recorded so revalidation re-resolves it.
+    ///
+    /// The one case `lstat` cannot see is a dangling symlink in the path: the
+    /// link's own identity stays the same when its target is created later.
+    /// Return `None` (do not cache) when the first missing component exists
+    /// as such a link, or when the existing prefix cannot be resolved.
+    fn watch_absent(&mut self, path: &Path) -> Option<()> {
+        let mut prefix = path.to_path_buf();
+        let mut tail = Vec::new();
+        let resolved_prefix = loop {
+            tail.push(prefix.file_name()?.to_owned());
+            if !prefix.pop() {
+                return None;
+            }
+            match prefix.canonicalize() {
+                Ok(resolved) => break resolved,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return None,
+            }
+        };
+        match std::fs::symlink_metadata(resolved_prefix.join(tail.last()?)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return None,
+        }
+        for ancestor in resolved_prefix.ancestors() {
+            self.files
+                .entry(ancestor.to_path_buf())
+                .or_insert(git_input_identity(ancestor).ok()?);
+        }
+        let mut target = resolved_prefix;
+        for component in tail.iter().rev() {
+            target.push(component);
+        }
+        if target != path {
             let resolved = (path.to_path_buf(), target);
             if !self.resolved_paths.contains(&resolved) {
                 self.resolved_paths.push(resolved);
@@ -3571,10 +3728,16 @@ thread_local! {
     static GIT_POLICY_BENCH_OLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Every Git subprocess the policy resolver starts, for tests that measure
+/// whether a resolution reused the cache.
+#[cfg(all(test, unix))]
+static GIT_POLICY_SPAWNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 #[cfg(unix)]
 fn git_policy_output(project_root: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
     #[cfg(test)]
     {
+        GIT_POLICY_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let delay = with_git_policy_test_state(project_root, |state| {
             state.calls += 1;
             state.delay_ms
@@ -3867,7 +4030,9 @@ fn resolve_git_policy_uncached(
     } else {
         &[]
     } {
-        if let Some((input, path)) = configured_git_path(project_root, key, &mut metadata_allow)? {
+        if let Some((input, path)) =
+            configured_git_path_with_inputs(project_root, key, &mut metadata_allow, &mut inputs)?
+        {
             if let Some(inputs) = &mut inputs {
                 inputs.resolved_paths.push((input, path.clone()));
             }
@@ -3878,9 +4043,6 @@ fn resolve_git_policy_uncached(
     // in hooks/excludes paths cannot leave a deny pointing at the old target.
     if let Some(inputs) = &mut inputs {
         inputs.resolved_paths.push((hooks_input, hooks.clone()));
-    }
-    if !metadata_allow.is_empty() {
-        inputs = None;
     }
     let linked = (git_dir != common_dir).then(|| (git_dir.clone(), common_dir.clone()));
     let read_roots = {
@@ -3984,6 +4146,16 @@ fn configured_git_path(
     key: &str,
     metadata_allow: &mut Vec<PathBuf>,
 ) -> Result<Option<(PathBuf, PathBuf)>, String> {
+    configured_git_path_with_inputs(project_root, key, metadata_allow, &mut None)
+}
+
+#[cfg(unix)]
+fn configured_git_path_with_inputs(
+    project_root: &Path,
+    key: &str,
+    metadata_allow: &mut Vec<PathBuf>,
+    inputs: &mut Option<GitPolicyInputs>,
+) -> Result<Option<(PathBuf, PathBuf)>, String> {
     if !project_root.join(".git").exists() || !crate::developer_tools::git_usable() {
         return Ok(None);
     }
@@ -4020,6 +4192,16 @@ fn configured_git_path(
             } else {
                 project_root.join(path)
             };
+            // Watch the literal path before deriving metadata grants. Canonical
+            // target equality alone cannot detect a symlink replaced by a
+            // directory (or the reverse) that still reaches the same target.
+            // Unprovable identities keep the whole policy uncached.
+            if inputs
+                .as_mut()
+                .is_some_and(|inputs| inputs.watch(&path).is_none())
+            {
+                *inputs = None;
+            }
             for ancestor in path.ancestors() {
                 if std::fs::symlink_metadata(ancestor)
                     .is_ok_and(|metadata| metadata.file_type().is_symlink())
@@ -4105,6 +4287,240 @@ trait ReadDirectoryLister {
     fn children(&mut self, parent: &Path) -> std::io::Result<Vec<ListedReadChild>>;
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod fixed_read_inventory {
+    use super::*;
+
+    type Inventory = Arc<BTreeMap<PathBuf, Vec<ListedReadChild>>>;
+
+    thread_local! {
+        static CURRENT: RefCell<Option<Inventory>> = const { RefCell::new(None) };
+    }
+
+    pub(super) struct Scope {
+        previous: Option<Inventory>,
+        _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            CURRENT.with(|slot| slot.replace(self.previous.take()));
+        }
+    }
+
+    pub(super) fn install(root: &Path) -> Scope {
+        fn capture(
+            root: &Path,
+            directories: &mut BTreeMap<PathBuf, Vec<ListedReadChild>>,
+        ) -> std::io::Result<()> {
+            let children = SecureReadDirectoryLister.children(root)?;
+            for child in &children {
+                if child.is_dir {
+                    capture(&child.path, directories)?;
+                }
+            }
+            directories.insert(root.to_path_buf(), children);
+            Ok(())
+        }
+
+        let root = root.canonicalize().unwrap();
+        let mut directories = BTreeMap::new();
+        capture(&root, &mut directories).expect("capture the immutable profile fixture");
+        // This fixture's filesystem contains its own entries and the ancestor
+        // chain needed to reach them, not other tests' home or temp directories.
+        for child in root.ancestors() {
+            if let Some(parent) = child.parent() {
+                directories
+                    .entry(parent.to_path_buf())
+                    .or_default()
+                    .push(ListedReadChild {
+                        path: child.to_path_buf(),
+                        is_dir: true,
+                    });
+            }
+        }
+        let previous = CURRENT.with(|slot| slot.replace(Some(Arc::new(directories))));
+        Scope {
+            previous,
+            _same_thread: std::marker::PhantomData,
+        }
+    }
+
+    pub(super) struct FixtureLister(Inventory);
+
+    impl ReadDirectoryLister for FixtureLister {
+        fn children(&mut self, parent: &Path) -> std::io::Result<Vec<ListedReadChild>> {
+            // An unlisted directory is empty in this fixed fixture universe.
+            Ok(self.0.get(parent).cloned().unwrap_or_default())
+        }
+    }
+
+    pub(super) fn current() -> Option<FixtureLister> {
+        CURRENT.with(|slot| slot.borrow().clone().map(FixtureLister))
+    }
+}
+
+#[cfg(all(test, unix))]
+mod candidate_snapshot {
+    // Both policies make their own decisions against the same optional-path
+    // facts, including file/dir kind, canonicalization and creation outcomes.
+    // No computed profile fields or comparison results are cached here.
+    use super::*;
+
+    struct ObservedPath {
+        exists: bool,
+        directory: bool,
+        file: bool,
+        canonical: Result<PathBuf, (std::io::ErrorKind, String)>,
+    }
+
+    struct Snapshot {
+        candidates: [PathBuf; 2],
+        paths: Mutex<BTreeMap<PathBuf, Arc<ObservedPath>>>,
+        created: Mutex<BTreeMap<PathBuf, bool>>,
+    }
+
+    impl Snapshot {
+        fn path(&self, path: &Path) -> Arc<ObservedPath> {
+            self.paths
+                .lock()
+                .unwrap()
+                .entry(path.to_path_buf())
+                .or_insert_with(|| {
+                    let metadata = std::fs::metadata(path);
+                    let canonical = match &metadata {
+                        Ok(_) => path.canonicalize(),
+                        Err(error) => Err(std::io::Error::new(error.kind(), error.to_string())),
+                    }
+                    .map_err(|error| (error.kind(), error.to_string()));
+                    Arc::new(ObservedPath {
+                        exists: metadata.is_ok(),
+                        directory: metadata.as_ref().is_ok_and(|value| value.is_dir()),
+                        file: metadata.as_ref().is_ok_and(|value| value.is_file()),
+                        canonical,
+                    })
+                })
+                .clone()
+        }
+    }
+
+    thread_local! {
+        static CURRENT: RefCell<Option<Arc<Snapshot>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) struct Scope {
+        previous: Option<Arc<Snapshot>>,
+        _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            CURRENT.with(|slot| slot.replace(self.previous.take()));
+        }
+    }
+
+    pub(super) fn install(root: &Path) -> Scope {
+        let snapshot = Arc::new(Snapshot {
+            candidates: [root.join("fixed-cache-marker"), root.join(".cargo/git")],
+            paths: Mutex::new(BTreeMap::new()),
+            created: Mutex::new(BTreeMap::new()),
+        });
+        for path in &snapshot.candidates {
+            snapshot.path(path);
+        }
+        let previous = CURRENT.with(|slot| slot.replace(Some(snapshot)));
+        Scope {
+            previous,
+            _same_thread: std::marker::PhantomData,
+        }
+    }
+
+    fn current() -> Option<Arc<Snapshot>> {
+        CURRENT.with(|slot| slot.borrow().clone())
+    }
+
+    pub(super) fn cache_candidates() -> Vec<PathBuf> {
+        current()
+            .map(|snapshot| snapshot.candidates.to_vec())
+            .unwrap_or_default()
+    }
+
+    pub(super) fn is_dir(path: &Path) -> Option<bool> {
+        current().map(|snapshot| snapshot.path(path).directory)
+    }
+
+    pub(super) fn is_file(path: &Path) -> Option<bool> {
+        current().map(|snapshot| snapshot.path(path).file)
+    }
+
+    pub(super) fn exists(path: &Path) -> Option<bool> {
+        current().map(|snapshot| snapshot.path(path).exists)
+    }
+
+    pub(super) fn canonicalize(path: &Path) -> Option<std::io::Result<PathBuf>> {
+        current().map(|snapshot| match &snapshot.path(path).canonical {
+            Ok(path) => Ok(path.clone()),
+            Err((kind, message)) => Err(std::io::Error::new(*kind, message.clone())),
+        })
+    }
+
+    pub(super) fn create_dir(path: &Path) -> Option<bool> {
+        current().map(|snapshot| {
+            let mut created = snapshot.created.lock().unwrap();
+            *created
+                .entry(path.to_path_buf())
+                .or_insert_with(|| std::fs::create_dir_all(path).is_ok())
+        })
+    }
+}
+
+// Optional policy inputs share one observation in the parity fixture. Required
+// project/task roots and production launches still use their normal validation.
+#[cfg(unix)]
+fn profile_candidate_is_dir(path: &Path) -> bool {
+    #[cfg(test)]
+    if let Some(value) = candidate_snapshot::is_dir(path) {
+        return value;
+    }
+    path.is_dir()
+}
+
+#[cfg(any(unix, test))]
+fn profile_candidate_is_file(path: &Path) -> bool {
+    #[cfg(all(test, unix))]
+    if let Some(value) = candidate_snapshot::is_file(path) {
+        return value;
+    }
+    path.is_file()
+}
+
+#[cfg(unix)]
+fn profile_candidate_exists(path: &Path) -> bool {
+    #[cfg(test)]
+    if let Some(value) = candidate_snapshot::exists(path) {
+        return value;
+    }
+    path.exists()
+}
+
+#[cfg(unix)]
+fn canonicalize_profile_candidate(path: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(value) = candidate_snapshot::canonicalize(path) {
+        return value;
+    }
+    path.canonicalize()
+}
+
+#[cfg(unix)]
+fn create_profile_candidate_dir(path: &Path) -> bool {
+    #[cfg(test)]
+    if let Some(value) = candidate_snapshot::create_dir(path) {
+        return value;
+    }
+    std::fs::create_dir_all(path).is_ok()
+}
+
 #[cfg(target_os = "linux")]
 fn build_linux_profile(
     profile: SandboxProfile,
@@ -4133,10 +4549,6 @@ fn build_linux_profile(
         "/dev/tty",
         "/dev/ptmx",
         "/dev/pts",
-        "/dev/fd",
-        "/dev/stdin",
-        "/dev/stdout",
-        "/dev/stderr",
     ] {
         if let Some(path) = canonicalize_existing_static(Path::new(path))? {
             intended.push(IntendedReadGrant {
@@ -4146,6 +4558,9 @@ fn build_linux_profile(
             });
         }
     }
+    // Do not canonicalize /dev/fd or the stdio links in the daemon: they name
+    // its /proc/<pid>/fd entries, which a non-dumpable daemon hides from the
+    // launcher. The /proc rule and payload/device rules cover child targets.
     if let Some(path) = canonicalize_existing_static(Path::new("/var"))? {
         intended.push(IntendedReadGrant {
             path,
@@ -4153,6 +4568,11 @@ fn build_linux_profile(
             force_children: true,
             mandatory: true,
         });
+    }
+
+    #[cfg(test)]
+    if let Some(mut inventory) = fixed_read_inventory::current() {
+        return compute_linux_profile(profile, home, git_read_roots, &intended, &mut inventory);
     }
 
     compute_linux_profile(
@@ -4201,7 +4621,7 @@ fn compute_linux_profile(
                     .writable_files
                     .iter()
                     .map(PathBuf::as_path)
-                    .filter(|file| file.is_file()),
+                    .filter(|file| profile_candidate_is_file(file)),
             )
             .map(|path| IntendedReadGrant {
                 path: path.to_path_buf(),
@@ -4237,7 +4657,7 @@ fn compute_linux_profile(
         .data_policy
         .read_allow
         .iter()
-        .filter(|path| !profile.writable_files.contains(path) || path.is_file())
+        .filter(|path| !profile.writable_files.contains(path) || profile_candidate_is_file(path))
         .map(|path| IntendedReadGrant {
             path: path.clone(),
             force_children: false,
@@ -4904,6 +5324,23 @@ pub(crate) fn cleanup_task_temp_dir(path: &Path) -> std::io::Result<()> {
     }
     // Older persisted tasks kept their temporary files inside the IO bundle.
     if is_managed_task_temp_dir(path) {
+        #[cfg(unix)]
+        {
+            // Pinned and symlink-safe, restoring owner access to read-only
+            // directories the command left behind; see `task_temp::remove`.
+            let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+                return Ok(());
+            };
+            let result =
+                crate::bash_background::persistence::PinnedDir::open(parent).and_then(|parent| {
+                    crate::bash_background::persistence::remove_directory_tree_at(&parent, name)
+                });
+            return match result {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                result => result,
+            };
+        }
+        #[cfg(not(unix))]
         return match std::fs::remove_dir_all(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             result => result,
@@ -4993,7 +5430,7 @@ fn native_launcher_path(ctx: &AppContext) -> std::io::Result<PathBuf> {
         }
     }
     let _ = ctx;
-    std::env::current_exe()
+    crate::pinned_executable::path()
 }
 
 /// Use the real aft executable for an in-process integration fixture. The test
@@ -5504,6 +5941,14 @@ pub(crate) fn apply_sandbox_environment(
             }
         }
     }
+    #[cfg(unix)]
+    if let Some(runtime) = plan.prepared_task().and_then(PreparedTask::secret_runtime) {
+        let runtime = runtime.lock().unwrap_or_else(|p| p.into_inner());
+        for key in crate::bash_background::secrets::REMOVE_KEYS {
+            command.env_remove(key);
+        }
+        command.envs(runtime.exec_environment());
+    }
 }
 
 /// Install after all environment/session/fd adapters and before spawning.
@@ -5593,6 +6038,16 @@ pub(crate) fn pty_command_for_plan(
             command.env(key, value);
         }
     }
+    #[cfg(unix)]
+    if let Some(runtime) = plan.prepared_task().and_then(PreparedTask::secret_runtime) {
+        let runtime = runtime.lock().unwrap_or_else(|p| p.into_inner());
+        for key in crate::bash_background::secrets::REMOVE_KEYS {
+            command.env_remove(key);
+        }
+        for (key, value) in runtime.exec_environment() {
+            command.env(key, value);
+        }
+    }
     Ok((command, profile_handle))
 }
 
@@ -5639,6 +6094,287 @@ fn command_argv_for_plan(
         }
         #[cfg(unix)]
         SpawnPlan::Prepared { .. } => unreachable!("policy() unwraps prepared plans"),
+    }
+}
+
+/// A request's shell policy for project-controlled formatters and checkers.
+///
+/// A policy is either resolved when it is made ([`Self::resolve`]), or it is a
+/// tool call's deferred policy ([`Self::for_session`], handed to the call's
+/// commands by [`Self::for_request`]) that is resolved the first time one of
+/// the call's tools is actually launched. Resolving a worker's policy creates
+/// a private task directory and builds a full sandbox profile (access grants
+/// from aft.db, Git policy, temporary directories), so most edits, which
+/// launch no formatter or checker, must not pay for it.
+pub struct ToolLaunchPolicy<'ctx> {
+    /// The context a deferred policy is resolved against; `None` when the
+    /// policy was resolved up front.
+    ctx: Option<&'ctx AppContext>,
+    request: std::rc::Rc<RequestToolLaunch>,
+}
+
+/// One request's launch policy, shared by every command the request runs so
+/// they launch tools under one policy and one private task directory.
+pub(crate) struct RequestToolLaunch {
+    /// The principal and worker-jail flag to resolve for. `None` when
+    /// `resolved` was filled when the policy was made.
+    deferred: Option<(AuthenticatedPrincipal, bool)>,
+    resolved: std::cell::OnceCell<ResolvedToolLaunch>,
+}
+
+/// A resolved launch policy. The owner keeps the private task directory alive
+/// across all of the request's tools, then removes it even on refusal or an
+/// early return.
+pub(crate) struct ResolvedToolLaunch {
+    plan: SpawnPlan,
+    environment: HashMap<String, String>,
+    task: Option<crate::bash_background::persistence::ResolvedTask>,
+}
+
+thread_local! {
+    static CURRENT_TOOL_POLICY: RefCell<Option<std::rc::Rc<RequestToolLaunch>>> = const { RefCell::new(None) };
+}
+
+impl Drop for ResolvedToolLaunch {
+    fn drop(&mut self) {
+        self.plan.cleanup_unspawned();
+        if let Some(task) = &self.task {
+            let _ = crate::bash_background::persistence::delete_resolved_task(task);
+        }
+    }
+}
+
+impl ResolvedToolLaunch {
+    fn resolve(ctx: &AppContext) -> Self {
+        let principal = current_authenticated_principal();
+        let mode = effective_sandbox_mode(ctx, &principal);
+        let mut environment = HashMap::new();
+        apply_worker_jail_environment(&mut environment, mode);
+        let mut policy = Self {
+            plan: SpawnPlan::Unsandboxed,
+            environment,
+            task: None,
+        };
+        let needs_layout = cfg!(unix) && (mode != SandboxMode::Off || worker_jail_active());
+        if needs_layout {
+            let session = crate::log_ctx::current_session().unwrap_or_else(|| "aft-tools".into());
+            match crate::bash_background::persistence::allocate_task_layout(
+                &ctx.storage_dir(),
+                &session,
+            ) {
+                Ok(task) => policy.task = Some(task),
+                Err(error) => {
+                    policy.plan = SpawnPlan::Refused {
+                        code: "sandbox_unavailable",
+                        message: format!("failed to allocate a private tool directory: {error}"),
+                        mismatch_class: None,
+                    };
+                    return policy;
+                }
+            }
+        }
+        let io_dir = policy
+            .task
+            .as_ref()
+            .map(|task| task.paths.io_dir.as_path())
+            .unwrap_or(Path::new(""));
+        policy.plan = resolve_sandbox_spawn(
+            ctx,
+            &principal,
+            RequestedSandboxTier::Native,
+            SandboxTaskKind::ExternalTool,
+            io_dir,
+            None,
+        );
+        policy
+    }
+}
+
+impl RequestToolLaunch {
+    fn resolved(resolved: ResolvedToolLaunch) -> Self {
+        Self {
+            deferred: None,
+            resolved: std::cell::OnceCell::from(resolved),
+        }
+    }
+}
+
+impl<'ctx> ToolLaunchPolicy<'ctx> {
+    /// Direct tools carry only their formatter-and-checker launch policy across
+    /// dispatch. General sandbox scopes must not cover dispatch: it can start
+    /// shared LSP servers.
+    pub(crate) fn with_current<R>(
+        policy: Option<std::rc::Rc<RequestToolLaunch>>,
+        run: impl FnOnce() -> R,
+    ) -> R {
+        struct Restore(Option<std::rc::Rc<RequestToolLaunch>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                CURRENT_TOOL_POLICY.with(|slot| {
+                    slot.replace(self.0.take());
+                });
+            }
+        }
+        let previous = CURRENT_TOOL_POLICY.with(|slot| slot.replace(policy));
+        let _restore = Restore(previous);
+        run()
+    }
+
+    /// The policy for a command's tools: the tool call's policy installed by
+    /// [`Self::with_current`], or else one resolved now from the current
+    /// principal and worker-jail scope.
+    pub(crate) fn for_request(ctx: &'ctx AppContext) -> Self {
+        match CURRENT_TOOL_POLICY.with(|slot| slot.borrow().clone()) {
+            Some(request) => Self {
+                ctx: Some(ctx),
+                request,
+            },
+            None => ToolLaunchPolicy::resolve(ctx),
+        }
+    }
+
+    /// A tool call's policy for `principal`, resolved only when one of the
+    /// call's tools is launched. Resolution then runs with `principal` and
+    /// the worker-jail flag installed, exactly as if it had run here, and
+    /// with nothing else changed: dispatch itself keeps its own scopes.
+    pub(crate) fn for_session(
+        principal: AuthenticatedPrincipal,
+        worker: bool,
+    ) -> std::rc::Rc<RequestToolLaunch> {
+        std::rc::Rc::new(RequestToolLaunch {
+            deferred: Some((principal, worker)),
+            resolved: std::cell::OnceCell::new(),
+        })
+    }
+
+    /// Resolve the policy now for the current principal and worker-jail scope.
+    pub(crate) fn resolve(ctx: &AppContext) -> ToolLaunchPolicy<'static> {
+        ToolLaunchPolicy {
+            ctx: None,
+            request: std::rc::Rc::new(RequestToolLaunch::resolved(ResolvedToolLaunch::resolve(
+                ctx,
+            ))),
+        }
+    }
+
+    /// This policy as one [`Self::with_current`] can install.
+    #[cfg(all(test, unix))]
+    pub(crate) fn shared(&self) -> std::rc::Rc<RequestToolLaunch> {
+        std::rc::Rc::clone(&self.request)
+    }
+
+    /// The resolved policy, resolving a deferred one on first use.
+    fn launch(&self) -> &ResolvedToolLaunch {
+        self.request.resolved.get_or_init(|| {
+            match (self.ctx, self.request.deferred.clone()) {
+                (Some(ctx), Some((principal, worker))) => {
+                    with_authenticated_principal(principal, || {
+                        with_worker_jail(worker, || ResolvedToolLaunch::resolve(ctx))
+                    })
+                }
+                // Unreachable by construction: a deferred policy is only
+                // handed out by `for_request`, which supplies the context.
+                // Refuse rather than launch a tool under no policy.
+                _ => ResolvedToolLaunch {
+                    plan: SpawnPlan::Refused {
+                        code: "sandbox_unavailable",
+                        message: "the tool launch policy has no context to resolve against"
+                            .to_string(),
+                        mismatch_class: None,
+                    },
+                    environment: HashMap::new(),
+                    task: None,
+                },
+            }
+        })
+    }
+
+    #[cfg(all(test, unix))]
+    fn resolved_for_test(&self) -> &ResolvedToolLaunch {
+        self.launch()
+    }
+
+    #[cfg(test)]
+    fn resolved_mut_for_test(&mut self) -> &mut ResolvedToolLaunch {
+        self.launch();
+        std::rc::Rc::get_mut(&mut self.request)
+            .expect("a test policy is not shared")
+            .resolved
+            .get_mut()
+            .expect("the policy was just resolved")
+    }
+
+    pub(crate) fn command(&self, program: &OsStr, args: &[OsString]) -> Result<Command, String> {
+        self.command_with_base_environment(program, args, false)
+    }
+
+    /// Bash syntax checks must not read daemon-provided shell startup hooks.
+    /// Clear inherited state before installing any policy-required environment.
+    pub(crate) fn command_with_clean_environment(
+        &self,
+        program: &OsStr,
+        args: &[OsString],
+    ) -> Result<Command, String> {
+        self.command_with_base_environment(program, args, true)
+    }
+
+    fn command_with_base_environment(
+        &self,
+        program: &OsStr,
+        args: &[OsString],
+        clean: bool,
+    ) -> Result<Command, String> {
+        let launch = self.launch();
+        // Host grants bind one approved shell command, never an edit's tools.
+        if matches!(launch.plan.policy(), SpawnPlan::Host { .. }) {
+            return Err(
+                "sandbox_unavailable: host escalation cannot run a formatter or checker".into(),
+            );
+        }
+        if let SpawnPlan::Refused { code, message, .. } = launch.plan.policy() {
+            return Err(format!("{code}: {message}"));
+        }
+        let (program, args, _profile_handle) =
+            command_argv_for_plan(&launch.plan, program, args, Path::new(""), None)?;
+        #[cfg(windows)]
+        let mut command = if crate::windows_command::is_batch_file(Path::new(&program)) {
+            crate::windows_command::batch_command(Path::new(&program), &args)
+                .map_err(|error| error.to_string())?
+        } else {
+            let mut command = crate::effective_path::new_command(program).build();
+            command.args(args);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = crate::effective_path::new_command(program).build();
+            command.args(args);
+            command
+        };
+        if clean {
+            command.env_clear();
+            if let Some(path) = std::env::var_os("PATH") {
+                command.env("PATH", path);
+            }
+        }
+        apply_sandbox_environment(&launch.plan, &mut command, &launch.environment);
+        #[cfg(unix)]
+        if !matches!(launch.plan.policy(), SpawnPlan::Unsandboxed) {
+            disclaim_command_for_plan(&launch.plan, &mut command, &launch.environment)?;
+        }
+        Ok(command)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unconfined_for_test() -> ToolLaunchPolicy<'static> {
+        ToolLaunchPolicy {
+            ctx: None,
+            request: std::rc::Rc::new(RequestToolLaunch::resolved(ResolvedToolLaunch {
+                plan: SpawnPlan::Unsandboxed,
+                environment: HashMap::new(),
+                task: None,
+            })),
+        }
     }
 }
 
@@ -6045,6 +6781,16 @@ pub(crate) mod environment_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_bash_yama_fail_closed() {
+        for value in [None, Some(""), Some("broken"), Some("0"), Some("-1")] {
+            assert!(!secret_ptrace_scope_safe(value));
+        }
+        for value in ["1", " 2\n", "3"] {
+            assert!(secret_ptrace_scope_safe(Some(value)));
+        }
+    }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -7109,6 +7855,84 @@ mod git_policy_cache_tests {
     }
 
     #[test]
+    fn git_policy_cache_configured_symlink_paths_hit_and_retarget_safely() {
+        use std::os::unix::fs::symlink;
+
+        for key in [
+            "core.hooksPath",
+            "mason.originalHooksPath",
+            "core.excludesFile",
+        ] {
+            let fixture = Fixture::new();
+            let first = fixture.root.join("first");
+            let second = fixture.root.join("second");
+            for target in [&first, &second] {
+                std::fs::create_dir(target).unwrap();
+                std::fs::write(target.join("policy"), "policy contents").unwrap();
+            }
+            let alias = fixture.root.join("alias");
+            symlink(&first, &alias).unwrap();
+            assert!(
+                git_policy_output(&fixture.root, &["config", key, "alias/policy"])
+                    .unwrap()
+                    .status
+                    .success()
+            );
+            let (original, cold) = fixture.resolve();
+            assert!(cold > 0);
+            assert!(original.metadata_allow.contains(&alias));
+            assert!(original
+                .configured_paths
+                .contains(&(key.into(), first.join("policy"))));
+            assert_eq!(fixture.resolve().1, 0, "{key} must cache symlink grants");
+
+            std::fs::remove_file(&alias).unwrap();
+            symlink(&second, &alias).unwrap();
+            let (changed, calls) = fixture.resolve();
+            assert!(calls > 0, "{key} retarget must invalidate");
+            assert!(changed
+                .configured_paths
+                .contains(&(key.into(), second.join("policy"))));
+            assert!(!changed
+                .configured_paths
+                .contains(&(key.into(), first.join("policy"))));
+            assert_eq!(fixture.resolve().1, 0);
+        }
+    }
+
+    #[test]
+    fn git_policy_cache_metadata_grant_identity_changes_with_same_target_invalidate() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        std::fs::create_dir(fixture.root.join("real")).unwrap();
+        std::fs::create_dir(fixture.root.join("real/hooks")).unwrap();
+        let alias = fixture.root.join("alias");
+        symlink(fixture.root.join("real"), &alias).unwrap();
+        assert!(
+            git_policy_output(&fixture.root, &["config", "core.hooksPath", "alias/hooks"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let (original, _) = fixture.resolve();
+        assert_eq!(fixture.resolve().1, 0);
+        assert!(original.metadata_allow.contains(&alias));
+
+        // Keep the canonical hooks target, but move the metadata grant to a
+        // different component. Reusing the old grant would widen the profile.
+        std::fs::remove_file(&alias).unwrap();
+        std::fs::create_dir(&alias).unwrap();
+        symlink(fixture.root.join("real/hooks"), alias.join("hooks")).unwrap();
+        let (changed, calls) = fixture.resolve();
+        assert!(calls > 0);
+        assert_eq!(changed.hooks, original.hooks);
+        assert!(!changed.metadata_allow.contains(&alias));
+        assert!(changed.metadata_allow.contains(&alias.join("hooks")));
+        assert_eq!(fixture.resolve().1, 0);
+    }
+
+    #[test]
     fn git_policy_cache_review_branch_switch_refreshes_hooks() {
         let fixture = Fixture::new();
         let included = fixture.root.join("branch-config");
@@ -7975,6 +8799,279 @@ mod git_policy_cache_tests {
         );
     }
 
+    fn set_system_config(fixture: &Fixture, path: &Path) {
+        fixture.state(|state| {
+            for (key, value) in &mut state.environment {
+                if key == "GIT_CONFIG_SYSTEM" {
+                    *value = path.as_os_str().to_owned();
+                }
+            }
+        });
+    }
+
+    fn has_original_hooks(policy: &GitPolicy, path: PathBuf) -> bool {
+        policy
+            .configured_paths
+            .contains(&("mason.originalHooksPath".into(), path))
+    }
+
+    /// macOS Git reads `/etc/gitconfig` through the `/etc -> private/etc`
+    /// symlink, and that file is normally absent. Such an input must not stop
+    /// the policy from being cached, yet creating the file must still be seen.
+    #[test]
+    fn git_policy_cache_absent_config_behind_symlinked_directory_is_cached() {
+        let fixture = Fixture::new();
+        let real_etc = fixture.root.join("private-etc");
+        std::fs::create_dir(&real_etc).unwrap();
+        std::os::unix::fs::symlink("private-etc", fixture.root.join("etc")).unwrap();
+        set_system_config(&fixture, &fixture.root.join("etc/gitconfig"));
+        assert!(fixture.resolve().1 > 0);
+        assert_eq!(
+            fixture.resolve().1,
+            0,
+            "an absent config behind a symlinked directory must not defeat the cache"
+        );
+
+        // Created through the real directory: neither the symlink nor the
+        // directory inode changes, only the configured path's own lstat.
+        std::fs::write(
+            real_etc.join("gitconfig"),
+            "[mason]\n originalHooksPath = system-hooks\n",
+        )
+        .unwrap();
+        let (policy, calls) = fixture.resolve();
+        assert!(calls > 0, "creating the absent config must invalidate");
+        assert!(has_original_hooks(
+            &policy,
+            fixture.root.join("system-hooks")
+        ));
+        assert_eq!(fixture.resolve().1, 0);
+
+        std::fs::remove_file(real_etc.join("gitconfig")).unwrap();
+        assert!(
+            fixture.resolve().1 > 0,
+            "removing the config must invalidate"
+        );
+        assert_eq!(fixture.resolve().1, 0);
+
+        let other_etc = fixture.root.join("other-etc");
+        std::fs::create_dir(&other_etc).unwrap();
+        std::fs::write(
+            other_etc.join("gitconfig"),
+            "[mason]\n originalHooksPath = retargeted-hooks\n",
+        )
+        .unwrap();
+        std::fs::remove_file(fixture.root.join("etc")).unwrap();
+        std::os::unix::fs::symlink("other-etc", fixture.root.join("etc")).unwrap();
+        let (policy, calls) = fixture.resolve();
+        assert!(
+            calls > 0,
+            "retargeting the symlinked directory must invalidate"
+        );
+        assert!(has_original_hooks(
+            &policy,
+            fixture.root.join("retargeted-hooks")
+        ));
+    }
+
+    /// Retarget the symlinked directory that holds an absent system config at
+    /// a directory where that config already exists. Git then reads the new
+    /// file, so the cached policy must be resolved again. Then retarget it at
+    /// a missing directory: a dangling link must never be cached.
+    #[test]
+    fn git_policy_cache_retargeted_config_directory_symlink_invalidates() {
+        let fixture = Fixture::new();
+        // Leave core.hooksPath unset locally so the system config decides it.
+        std::fs::write(
+            fixture.root.join(".git/config"),
+            "[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+        )
+        .unwrap();
+        let dir_a = fixture.root.join("dir-a");
+        let dir_b = fixture.root.join("dir-b");
+        let b_hooks = fixture.root.join("b-hooks");
+        std::fs::create_dir(&dir_a).unwrap();
+        std::fs::create_dir(&dir_b).unwrap();
+        std::fs::create_dir(&b_hooks).unwrap();
+        std::fs::write(
+            dir_b.join("gitconfig"),
+            format!("[core]\n hooksPath = {}\n", b_hooks.display()),
+        )
+        .unwrap();
+        let link = fixture.root.join("link");
+        std::os::unix::fs::symlink("dir-a", &link).unwrap();
+        set_system_config(&fixture, &link.join("gitconfig"));
+        let retarget = |target: &str| {
+            let staged = fixture.root.join("link.next");
+            std::os::unix::fs::symlink(target, &staged).unwrap();
+            std::fs::rename(&staged, &link).unwrap();
+        };
+
+        let (first, cold) = fixture.resolve();
+        assert!(cold > 0);
+        assert_ne!(first.hooks, vec![b_hooks.clone()]);
+        assert_eq!(fixture.resolve().1, 0, "the absent config must be cached");
+
+        retarget("dir-b");
+        let (policy, calls) = fixture.resolve();
+        assert!(
+            calls > 0,
+            "retargeting the config directory must invalidate"
+        );
+        assert_eq!(policy.hooks, vec![b_hooks.clone()]);
+        assert_eq!(fixture.resolve().1, 0);
+
+        retarget("dir-missing");
+        let (policy, calls) = fixture.resolve();
+        assert!(
+            calls > 0,
+            "retargeting to a dangling directory must invalidate"
+        );
+        assert_ne!(policy.hooks, vec![b_hooks.clone()]);
+        assert!(
+            fixture.resolve().1 > 0,
+            "a config behind a dangling directory symlink must not be cached"
+        );
+    }
+
+    /// A dangling symlink keeps its own identity when its target is created,
+    /// so a policy that depends on one is never reused.
+    #[test]
+    fn git_policy_cache_dangling_config_symlink_is_never_cached() {
+        let fixture = Fixture::new();
+        std::os::unix::fs::symlink("missing-system", fixture.root.join("system-link")).unwrap();
+        set_system_config(&fixture, &fixture.root.join("system-link"));
+        assert!(fixture.resolve().1 > 0);
+        assert!(
+            fixture.resolve().1 > 0,
+            "a dangling config symlink must not be cached"
+        );
+        std::fs::write(
+            fixture.root.join("missing-system"),
+            "[mason]\n originalHooksPath = dangling-hooks\n",
+        )
+        .unwrap();
+        assert!(has_original_hooks(
+            &fixture.resolve().0,
+            fixture.root.join("dangling-hooks")
+        ));
+    }
+
+    #[test]
+    fn git_policy_cache_replaced_git_directory_invalidates() {
+        let fixture = Fixture::new();
+        fixture.resolve();
+        assert_eq!(fixture.resolve().1, 0);
+        let replacement = fixture.root.join("replacement");
+        std::fs::create_dir(&replacement).unwrap();
+        assert!(git_policy_output(&replacement, &["init", "--quiet"])
+            .unwrap()
+            .status
+            .success());
+        std::fs::write(
+            replacement.join(".git/config"),
+            "[core]\n bare = false\n hooksPath = replaced-hooks\n",
+        )
+        .unwrap();
+        std::fs::rename(fixture.root.join(".git"), fixture.root.join("old-git")).unwrap();
+        std::fs::rename(replacement.join(".git"), fixture.root.join(".git")).unwrap();
+        let (policy, calls) = fixture.resolve();
+        assert!(calls > 0, "a replaced .git directory must invalidate");
+        assert_eq!(policy.hooks, vec![fixture.root.join("replaced-hooks")]);
+        assert_eq!(fixture.resolve().1, 0);
+    }
+
+    /// Measure policy resolution on a real checkout named by
+    /// AFT_GIT_POLICY_BENCH_ROOT: cold (cache cleared) against warm (cached).
+    #[test]
+    #[ignore = "manual measurement against a real checkout; run alone with --nocapture"]
+    fn real_checkout_git_policy_cost() {
+        crate::effective_path::initialize_process_path();
+        let root = PathBuf::from(std::env::var_os("AFT_GIT_POLICY_BENCH_ROOT").unwrap());
+        for worker in [true, false] {
+            let environment = git_policy_environment(&root);
+            let key = git_policy_cache_key(&root, &environment, worker);
+            eprintln!("worker={worker} cacheable_key={}", key.is_some());
+            let mut cold = Vec::new();
+            let mut warm = Vec::new();
+            for _ in 0..10 {
+                if let Some(key) = &key {
+                    git_policy_cache().lock().unwrap().remove(key);
+                }
+                let spawns = GIT_POLICY_SPAWNS.load(std::sync::atomic::Ordering::SeqCst);
+                let started = Instant::now();
+                with_worker_jail(worker, || resolve_git_policy(&root)).unwrap();
+                cold.push((
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    GIT_POLICY_SPAWNS.load(std::sync::atomic::Ordering::SeqCst) - spawns,
+                ));
+                let spawns = GIT_POLICY_SPAWNS.load(std::sync::atomic::Ordering::SeqCst);
+                let started = Instant::now();
+                with_worker_jail(worker, || resolve_git_policy(&root)).unwrap();
+                warm.push((
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    GIT_POLICY_SPAWNS.load(std::sync::atomic::Ordering::SeqCst) - spawns,
+                ));
+            }
+            if let Some(cached) = key
+                .as_ref()
+                .and_then(|key| git_policy_cache().lock().unwrap().get(key))
+            {
+                eprintln!(
+                    "worker={worker} revalidation: lstat_inputs={} re_resolved_paths={}",
+                    cached.inputs.files.len(),
+                    cached.inputs.resolved_paths.len()
+                );
+            }
+            for (label, samples) in [("cold", cold), ("warm", warm)] {
+                let mut times = samples.iter().map(|(ms, _)| *ms).collect::<Vec<_>>();
+                times.sort_by(f64::total_cmp);
+                eprintln!(
+                    "worker={worker} {label}: median_ms={:.3} max_ms={:.3} git_spawns={:?}",
+                    times[5],
+                    times[9],
+                    samples
+                        .iter()
+                        .map(|(_, spawns)| *spawns)
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    /// Count mandatory cold work across real linked worktrees, then revisit
+    /// every root to distinguish worktree churn from repeated-start misses.
+    #[test]
+    #[ignore = "manual measurement; AFT_GIT_POLICY_BENCH_ROOTS_DIR contains linked worktrees"]
+    fn real_checkout_many_worktrees_git_policy_cost() {
+        crate::effective_path::initialize_process_path();
+        let directory = PathBuf::from(std::env::var_os("AFT_GIT_POLICY_BENCH_ROOTS_DIR").unwrap());
+        let mut roots = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|root| root.join(".git").is_file())
+            .collect::<Vec<_>>();
+        roots.sort();
+        assert!(!roots.is_empty());
+        for label in ["first", "second"] {
+            let before = GIT_POLICY_SPAWNS.load(std::sync::atomic::Ordering::SeqCst);
+            let started = Instant::now();
+            for root in &roots {
+                with_worker_jail(true, || resolve_git_policy(root)).unwrap();
+            }
+            let elapsed = started.elapsed();
+            let spawns = GIT_POLICY_SPAWNS.load(std::sync::atomic::Ordering::SeqCst) - before;
+            eprintln!(
+                "worker=true {label}: roots={} total_ms={:.3} git_spawns={spawns}",
+                roots.len(),
+                elapsed.as_secs_f64() * 1000.0
+            );
+            if label == "second" {
+                assert_eq!(spawns, 0, "revisiting unchanged roots must not spawn git");
+            }
+        }
+    }
+
     /// Compare the old explicit-PATH fork with inherited-PATH helper launches.
     /// This measures jail policy preparation without entering a nested sandbox.
     #[cfg(target_os = "macos")]
@@ -8268,6 +9365,427 @@ mod policy_tests {
             platform_sandbox_plan(SandboxMode::Relaxed, RequestedSandboxTier::Native, true),
             None
         );
+    }
+
+    #[cfg(unix)]
+    fn normalized_tool_profile(profile: &SandboxProfile) -> serde_json::Value {
+        fn normalize(value: &mut serde_json::Value, temp: &str) {
+            match value {
+                serde_json::Value::String(text) => *text = text.replace(temp, "<private-temp>"),
+                serde_json::Value::Array(values) => {
+                    values.iter_mut().for_each(|value| normalize(value, temp))
+                }
+                serde_json::Value::Object(values) => {
+                    values.values_mut().for_each(|value| normalize(value, temp))
+                }
+                _ => {}
+            }
+        }
+        let mut value = serde_json::to_value(profile).unwrap();
+        normalize(&mut value, &profile.temp_dir.to_string_lossy());
+        value
+    }
+
+    #[cfg(unix)]
+    enum PolicyParityPhase {
+        BeforeTool,
+        BetweenBuilds,
+    }
+
+    #[cfg(unix)]
+    fn assert_tool_shell_policy_parity(mut hook: impl FnMut(&Path, PolicyParityPhase)) {
+        #[cfg(target_os = "linux")]
+        let root = tempfile::Builder::new()
+            .prefix("aft-policy-parity-")
+            .tempdir_in(absolute_env_path("HOME").expect("profile tests require an absolute HOME"))
+            .unwrap();
+        #[cfg(not(target_os = "linux"))]
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let account = root.path().join("account");
+        std::fs::create_dir(&account).unwrap();
+        std::fs::create_dir(root.path().join("store")).unwrap();
+        let cache_marker = root.path().join("fixed-cache-marker");
+        std::fs::create_dir(&cache_marker).unwrap();
+        let cache_marker = cache_marker.canonicalize().unwrap();
+        #[cfg(target_os = "linux")]
+        let marker = root.path().join("fixed-inventory-marker");
+        #[cfg(target_os = "linux")]
+        std::fs::create_dir(&marker).unwrap();
+        #[cfg(target_os = "linux")]
+        let marker = marker.canonicalize().unwrap();
+        let ctx = context(project.clone());
+        let operator_binary = root.path().join("operator-aft");
+        std::fs::write(&operator_binary, "operator executable fixture").unwrap();
+        let _launcher = install_sandbox_launcher_for_test(&project, operator_binary.clone());
+        ctx.update_config(|config| {
+            config.storage_dir = Some(root.path().join("store"));
+            config.gh_shim.binary_path = Some(operator_binary);
+        });
+        let untrusted = AuthenticatedPrincipal::RouteBind {
+            trust: PrincipalTrust::Untrusted,
+            route_channel: 7,
+            route_epoch: 1,
+            project_root: project,
+            harness: "mcp:test".into(),
+            session_id: "tool-policy".into(),
+            principal_id: Some("unverified".into()),
+        };
+        let _candidates = candidate_snapshot::install(root.path());
+        #[cfg(target_os = "linux")]
+        let _inventory = fixed_read_inventory::install(root.path());
+        for jailed in [false, true] {
+            for mode in [SandboxMode::Off, SandboxMode::Relaxed, SandboxMode::Strict] {
+                for principal in [AuthenticatedPrincipal::FirstParty, untrusted.clone()] {
+                    ctx.update_config(|config| {
+                        config.sandbox.profile.head =
+                            if jailed { SandboxMode::Strict } else { mode };
+                        config.sandbox.profile.worker =
+                            if jailed { mode } else { SandboxMode::Off };
+                    });
+                    hook(root.path(), PolicyParityPhase::BeforeTool);
+                    let reads = if principal_requires_strict(&principal)
+                        || mode == SandboxMode::Strict
+                        || (mode == SandboxMode::Relaxed && (!jailed || !cfg!(target_os = "linux")))
+                    {
+                        2
+                    } else {
+                        0
+                    };
+                    crate::worker_jail_canary::with_test_preparation_home(&account, reads, || {
+                        with_authenticated_principal(principal.clone(), || {
+                            with_worker_jail(jailed, || {
+                                let policy = ToolLaunchPolicy::resolve(&ctx);
+                                let io = policy
+                                    .resolved_for_test()
+                                    .task
+                                    .as_ref()
+                                    .map(|task| task.paths.io_dir.as_path())
+                                    .unwrap_or(Path::new(""));
+                                hook(root.path(), PolicyParityPhase::BetweenBuilds);
+                                let shell = resolve_sandbox_spawn(
+                                    &ctx,
+                                    &principal,
+                                    RequestedSandboxTier::Native,
+                                    SandboxTaskKind::BashForeground,
+                                    io,
+                                    None,
+                                );
+                                match (&policy.resolved_for_test().plan, &shell) {
+                                    (SpawnPlan::Unsandboxed, SpawnPlan::Unsandboxed) => {
+                                        assert_eq!(mode, SandboxMode::Off);
+                                        assert!(!jailed);
+                                        assert!(!principal_requires_strict(&principal));
+                                    }
+                                    (
+                                        SpawnPlan::Launcher { profile: tool, .. },
+                                        SpawnPlan::Launcher { profile: bash, .. },
+                                    ) => {
+                                        let expected = if principal_requires_strict(&principal) {
+                                            SandboxMode::Strict
+                                        } else {
+                                            mode
+                                        };
+                                        assert_eq!(tool.mode, expected);
+                                        if expected == SandboxMode::Strict {
+                                            assert!(tool.cache_roots.contains(&cache_marker));
+                                            assert!(bash.cache_roots.contains(&cache_marker));
+                                        }
+                                        #[cfg(target_os = "linux")]
+                                        if expected == SandboxMode::Strict {
+                                            assert!(tool.read_allow.contains(&marker));
+                                            assert!(bash.read_allow.contains(&marker));
+                                        }
+                                        assert_eq!(
+                                            normalized_tool_profile(tool),
+                                            normalized_tool_profile(bash)
+                                        );
+                                    }
+                                    other => panic!(
+                                    "tool and shell must resolve the same launch policy: {other:?}"
+                                ),
+                                }
+                                shell.cleanup_unspawned();
+                            })
+                        })
+                    });
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_policy_matches_session_shell_for_every_role_and_untrusted_bind() {
+        assert_tool_shell_policy_parity(|_, _| {});
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tool_policy_matches_session_shell_despite_directory_churn_between_builds() {
+        let mut changes = 0;
+        assert_tool_shell_policy_parity(|root, phase| {
+            let before = root.join("inventory-before");
+            let after = root.join("inventory-after");
+            match phase {
+                PolicyParityPhase::BeforeTool => {
+                    if after.exists() {
+                        std::fs::remove_dir(&after).unwrap();
+                    }
+                    std::fs::create_dir(&before).unwrap();
+                }
+                PolicyParityPhase::BetweenBuilds => {
+                    std::fs::remove_dir(&before).unwrap();
+                    std::fs::create_dir(&after).unwrap();
+                    changes += 1;
+                }
+            }
+        });
+        assert_eq!(
+            changes, 12,
+            "the hook must run between every pair of builds"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_policy_matches_session_shell_despite_cache_candidate_creation_between_builds() {
+        let mut changes = 0;
+        assert_tool_shell_policy_parity(|root, phase| {
+            let candidate = root.join(".cargo/git");
+            match phase {
+                PolicyParityPhase::BeforeTool => {
+                    if candidate.exists() {
+                        std::fs::remove_dir_all(&candidate).unwrap();
+                    }
+                }
+                PolicyParityPhase::BetweenBuilds => {
+                    std::fs::create_dir_all(&candidate).unwrap();
+                    assert!(candidate.is_dir());
+                    changes += 1;
+                }
+            }
+        });
+        assert_eq!(changes, 12);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_policy_filters_environment_and_cleans_private_task_directory() {
+        assert!(
+            std::env::var_os("CARGO_MANIFEST_DIR").is_some(),
+            "cargo must supply the daemon-only environment canary"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let ctx = context(project);
+        ctx.update_config(|config| config.storage_dir = Some(root.path().join("store")));
+        let launcher = root.path().join("launcher");
+        std::fs::write(&launcher, "#!/bin/sh\nshift 4\nexec \"$@\"\n").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut policy = ToolLaunchPolicy::resolve(&ctx);
+        let temp = match &mut policy.resolved_mut_for_test().plan {
+            SpawnPlan::Launcher {
+                profile,
+                launcher_path,
+            } => {
+                *launcher_path = launcher;
+                profile.temp_dir.clone()
+            }
+            other => panic!("strict tools need a launcher: {other:?}"),
+        };
+        let io = policy
+            .resolved_for_test()
+            .task
+            .as_ref()
+            .unwrap()
+            .paths
+            .io_dir
+            .clone();
+        for capture in [false, true] {
+            let result = if capture {
+                crate::format::run_external_tool_capture(
+                    &policy,
+                    "/bin/sh",
+                    &["-c", "env; exit 3"],
+                    None,
+                    10,
+                )
+            } else {
+                crate::format::run_external_tool(&policy, "/bin/sh", &["-c", "env"], None, 10)
+            }
+            .unwrap();
+            assert_eq!(result.exit_code, if capture { 3 } else { 0 });
+            assert!(
+                !result
+                    .stdout
+                    .lines()
+                    .any(|line| line.starts_with("CARGO_MANIFEST_DIR=")),
+                "{}",
+                result.stdout
+            );
+            assert!(
+                result
+                    .stdout
+                    .lines()
+                    .any(|line| line == format!("TMPDIR={}", temp.display())),
+                "{}",
+                result.stdout
+            );
+        }
+        assert!(io.exists() && temp.exists());
+        drop(policy);
+        assert!(!io.exists() && !temp.exists());
+    }
+
+    #[test]
+    fn tool_policy_refuses_host_escalation() {
+        let mut policy = ToolLaunchPolicy::unconfined_for_test();
+        policy.resolved_mut_for_test().plan = SpawnPlan::Host {
+            shell_path: PathBuf::from("sh"),
+            environment: BTreeMap::new(),
+        };
+        assert!(policy
+            .command(OsStr::new("formatter"), &[])
+            .unwrap_err()
+            .contains("host escalation"));
+    }
+
+    #[cfg(unix)]
+    fn assert_scoped_profile_grants(profile: &SandboxProfile, write: &Path, read: &Path) {
+        assert!(
+            profile
+                .writable_roots
+                .contains(&write.canonicalize().unwrap()),
+            "{:?}",
+            profile.writable_roots
+        );
+        // Seatbelt uses these read exceptions directly; Landlock also lowers
+        // them into its top-level allowlist during Linux profile construction.
+        assert!(
+            profile
+                .data_policy
+                .read_allow
+                .contains(&read.canonicalize().unwrap()),
+            "{:?}",
+            profile.data_policy.read_allow
+        );
+    }
+
+    #[cfg(unix)]
+    fn assert_scoped_tool_grant_fixture(root: &Path, persist_aliases: bool) {
+        use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+        use crate::db::access_grants::{self, ScopeKey};
+        let project = root.join("project");
+        let store = root.join("store");
+        let write = root.join("approved-write");
+        let read = root.join("approved-read");
+        let common_temp = root.join("common-temp");
+        for path in [&project, &store, &write, &read, &common_temp] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let ctx = context(project);
+        ctx.update_config(|config| config.storage_dir = Some(store.clone()));
+        let scope = ScopeKey {
+            owner: "reserved:prefrontal-core".into(),
+            scope_ref: "tool-policy".into(),
+            epoch: 1,
+        };
+        let conn = crate::db::open(&store.join("aft.db")).unwrap();
+        access_grants::register_scope(&conn, &scope, None, &ctx.config()).unwrap();
+        for (path, operation) in [
+            (&write, AccessOperation::Write),
+            (&read, AccessOperation::Read),
+        ] {
+            access_grants::insert(
+                &conn,
+                &scope,
+                &AccessGrant {
+                    path: path.clone(),
+                    operation,
+                    kind: GrantKind::Subtree,
+                },
+            )
+            .unwrap();
+            if persist_aliases {
+                // Keep the alias in storage so replay, not just insertion,
+                // must resolve the persisted path to the same directory.
+                assert_ne!(*path, path.canonicalize().unwrap());
+                assert_eq!(conn.execute(
+                    "UPDATE access_grants SET path=?1 WHERE owner=?2 AND scope_ref=?3 AND epoch=?4 AND path=?5",
+                    rusqlite::params![path.to_string_lossy(), scope.owner, scope.scope_ref, scope.epoch.to_string(), path.canonicalize().unwrap().to_string_lossy()],
+                ).unwrap(), 1);
+            }
+        }
+        if persist_aliases {
+            let stored = access_grants::list(&conn, &scope).unwrap();
+            assert!(stored.iter().any(|grant| grant.path == write));
+            assert!(stored.iter().any(|grant| grant.path == read));
+        }
+        ctx.set_db(Arc::new(std::sync::Mutex::new(conn)));
+        let policy = crate::access_policy::with_scope(Some(scope.clone()), || {
+            ToolLaunchPolicy::resolve(&ctx)
+        });
+        let SpawnPlan::Launcher { profile, .. } = &policy.resolved_for_test().plan else {
+            panic!(
+                "a scoped strict tool must get its shell profile: {:?}",
+                policy.resolved_for_test().plan
+            );
+        };
+        assert_scoped_profile_grants(profile, &write, &read);
+        #[cfg(target_os = "linux")]
+        assert!(
+            profile.read_allow.contains(&read.canonicalize().unwrap()),
+            "{:?}",
+            profile.read_allow
+        );
+        if persist_aliases {
+            // Seatbelt consumes the common profile without Landlock's lowering.
+            let common = crate::access_policy::with_scope(Some(scope), || {
+                ctx.access_policy("")
+                    .unwrap()
+                    .compile_shell(common_temp, Vec::new(), Vec::new())
+                    .unwrap()
+                    .canonicalize_for_launch()
+                    .unwrap()
+            });
+            assert!(common.read_allow.is_empty());
+            let transferred: SandboxProfile =
+                serde_json::from_slice(&serde_json::to_vec(&common).unwrap()).unwrap();
+            assert_scoped_profile_grants(
+                &transferred.canonicalize_for_launch().unwrap(),
+                &write,
+                &read,
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_policy_keeps_session_grants_that_config_alone_cannot_recover() {
+        let root = tempfile::tempdir().unwrap();
+        assert_scoped_tool_grant_fixture(root.path(), false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_policy_keeps_session_grants_stored_under_var_folders_alias() {
+        // Reproduce /var -> /private/var beneath a fixture root on every Unix host.
+        let root = tempfile::tempdir().unwrap();
+        let canonical_root = root.path().canonicalize().unwrap();
+        let real = canonical_root.join("private/var/folders");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(
+            canonical_root.join("private/var"),
+            canonical_root.join("var"),
+        )
+        .unwrap();
+        let alias = canonical_root.join("var/folders");
+        assert_eq!(alias.canonicalize().unwrap(), real);
+        assert_scoped_tool_grant_fixture(&alias, true);
     }
 
     #[test]
@@ -9754,6 +11272,7 @@ mod read_allow_tests {
         let binary = format!("{data}/bin/ck-aft");
         let connection = PathBuf::from("/home/alice/daemon/connection.json");
         let profile = SandboxProfile {
+            secret_proxy: false,
             v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
             mode: crate::config::SandboxMode::Strict,
             worker_jail: false,
@@ -10386,6 +11905,7 @@ mod worker_gh_fence_tests {
 
     fn fenced_profile(canary_dir: &Path) -> SandboxProfile {
         SandboxProfile {
+            secret_proxy: false,
             v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
             mode: crate::config::SandboxMode::Strict,
             worker_jail: true,

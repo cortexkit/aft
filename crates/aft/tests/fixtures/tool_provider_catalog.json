@@ -16,8 +16,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "961a91509a919c3db0a4119057647877aad8b024ada13f9835aa7a9175565f40",
-      "catalog_digest": "961a91509a919c3db0a4119057647877aad8b024ada13f9835aa7a9175565f40",
+      "generation": "c621e6a29d07b643da41d02373808e183753d3e4d6137bce1c3a05f1e9ad3755",
+      "catalog_digest": "c621e6a29d07b643da41d02373808e183753d3e4d6137bce1c3a05f1e9ad3755",
       "tools": [
         {
           "name": "status",
@@ -27,6 +27,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -47,6 +48,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -128,6 +130,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -178,6 +181,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -209,6 +213,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -291,6 +296,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -318,6 +324,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -356,6 +363,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -385,6 +393,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -433,6 +442,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -478,6 +488,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -542,6 +553,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -602,6 +614,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -672,6 +685,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -695,6 +709,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -759,6 +774,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -826,6 +842,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -860,6 +877,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -891,6 +909,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -977,6 +996,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -1020,12 +1040,13 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -1037,6 +1058,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -1061,6 +1094,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -1087,6 +1121,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -1169,7 +1204,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -1189,8 +1229,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "c98777f802921783b10bfc34f47d52257156117624e30f8192e5fef2ca717bc0",
-      "catalog_digest": "c98777f802921783b10bfc34f47d52257156117624e30f8192e5fef2ca717bc0",
+      "generation": "1b3ece74b8988a4b946169e8a3c765f9b093814ed8c8d7640cc64a21b904c580",
+      "catalog_digest": "1b3ece74b8988a4b946169e8a3c765f9b093814ed8c8d7640cc64a21b904c580",
       "tools": [
         {
           "name": "status",
@@ -1200,6 +1240,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -1220,6 +1261,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -1301,6 +1343,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -1351,6 +1394,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -1382,6 +1426,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -1464,6 +1509,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -1491,6 +1537,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -1529,6 +1576,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -1558,6 +1606,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -1606,6 +1655,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -1651,6 +1701,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -1715,6 +1766,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -1775,6 +1827,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -1845,6 +1898,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -1868,6 +1922,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -1932,6 +1987,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -1999,6 +2055,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -2033,6 +2090,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -2064,6 +2122,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -2150,6 +2209,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -2193,12 +2253,13 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -2210,6 +2271,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -2234,6 +2307,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -2260,6 +2334,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -2342,7 +2417,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -2364,8 +2444,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "a6f6d1a9342c0fd26951b657abc85e0180a6fdc4e6bf81ef82182f7d54ac4d38",
-      "catalog_digest": "a6f6d1a9342c0fd26951b657abc85e0180a6fdc4e6bf81ef82182f7d54ac4d38",
+      "generation": "1ad048c2ff6adbe3ffa9c7bc9f789d4b5fc86e6a5eb1d9de7e8040162eb85f35",
+      "catalog_digest": "1ad048c2ff6adbe3ffa9c7bc9f789d4b5fc86e6a5eb1d9de7e8040162eb85f35",
       "tools": [
         {
           "name": "status",
@@ -2375,6 +2455,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -2396,6 +2477,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -2446,6 +2528,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -2477,6 +2560,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -2559,6 +2643,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -2586,6 +2671,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -2624,6 +2710,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -2653,6 +2740,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -2701,6 +2789,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -2746,6 +2835,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -2810,6 +2900,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -2870,6 +2961,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -2940,6 +3032,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -2963,6 +3056,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -3027,6 +3121,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -3094,6 +3189,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -3128,6 +3224,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -3159,6 +3256,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -3245,6 +3343,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -3288,12 +3387,13 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -3305,6 +3405,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -3329,6 +3441,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -3355,6 +3468,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -3436,7 +3550,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -3458,8 +3577,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "dd7d6b4f4c1205d7ec55d9aef9e4eabe928a87519c50fc52c8aa5adfbc43f0c0",
-      "catalog_digest": "dd7d6b4f4c1205d7ec55d9aef9e4eabe928a87519c50fc52c8aa5adfbc43f0c0",
+      "generation": "90b7a2729864ce8f7dffc0b3c1ab3613755b6b76dd50950bacb01fc92edaf5a8",
+      "catalog_digest": "90b7a2729864ce8f7dffc0b3c1ab3613755b6b76dd50950bacb01fc92edaf5a8",
       "tools": [
         {
           "name": "status",
@@ -3469,6 +3588,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -3489,6 +3609,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -3570,6 +3691,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -3620,6 +3742,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -3651,6 +3774,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -3733,6 +3857,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -3760,6 +3885,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -3798,6 +3924,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -3827,6 +3954,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -3875,6 +4003,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -3939,6 +4068,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -3999,6 +4129,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -4069,6 +4200,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -4092,6 +4224,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -4156,6 +4289,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -4223,6 +4357,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -4257,6 +4392,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -4288,6 +4424,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -4374,6 +4511,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -4417,12 +4555,13 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -4434,6 +4573,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -4458,6 +4609,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -4484,6 +4636,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -4565,7 +4718,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -4587,8 +4745,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "1db5222be9c7a1c92b3e4ecb25d37d650196afa78a927dcb3c1d6b730b0e624c",
-      "catalog_digest": "1db5222be9c7a1c92b3e4ecb25d37d650196afa78a927dcb3c1d6b730b0e624c",
+      "generation": "e1c063e9bc26a653697afc6c257010ec570dd63c560e7a8bbc9d3c23d504ee74",
+      "catalog_digest": "e1c063e9bc26a653697afc6c257010ec570dd63c560e7a8bbc9d3c23d504ee74",
       "tools": [
         {
           "name": "status",
@@ -4598,6 +4756,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -4618,6 +4777,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -4699,6 +4859,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -4749,6 +4910,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -4780,6 +4942,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -4862,6 +5025,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -4889,6 +5053,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -4927,6 +5092,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -4956,6 +5122,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -5001,6 +5168,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -5065,6 +5233,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -5125,6 +5294,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -5195,6 +5365,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -5218,6 +5389,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -5282,6 +5454,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -5349,6 +5522,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -5383,6 +5557,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -5414,6 +5589,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -5500,6 +5676,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -5543,12 +5720,13 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -5560,6 +5738,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -5584,6 +5774,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -5610,6 +5801,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -5691,7 +5883,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -5714,8 +5911,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "1d49cc21f0988b3331f22768c407be9b4208271d4705e3b4dd2fde89af51b570",
-      "catalog_digest": "1d49cc21f0988b3331f22768c407be9b4208271d4705e3b4dd2fde89af51b570",
+      "generation": "a22c252064e236f622232985f3fe96fb6c1043165209a4b79e63e49098b1f449",
+      "catalog_digest": "a22c252064e236f622232985f3fe96fb6c1043165209a4b79e63e49098b1f449",
       "tools": [
         {
           "name": "status",
@@ -5725,6 +5922,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -5745,6 +5943,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -5826,6 +6025,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -5876,6 +6076,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -5907,6 +6108,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -5989,6 +6191,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -6016,6 +6219,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -6054,6 +6258,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -6083,6 +6288,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -6131,6 +6337,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -6196,6 +6403,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -6266,6 +6474,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -6289,6 +6498,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -6353,6 +6563,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -6420,6 +6631,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -6454,6 +6666,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -6485,6 +6698,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -6571,6 +6785,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -6614,12 +6829,13 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -6631,6 +6847,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -6655,6 +6883,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -6681,6 +6910,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -6761,7 +6991,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -6784,8 +7019,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "d6c293db3c53b9f838209d0e4ad17d1d4108d8f30197032c870c1ab29343699e",
-      "catalog_digest": "d6c293db3c53b9f838209d0e4ad17d1d4108d8f30197032c870c1ab29343699e",
+      "generation": "7fe28a424ad3ba01136b69644285a7674e001d7fc57521a72bf67790609d8a26",
+      "catalog_digest": "7fe28a424ad3ba01136b69644285a7674e001d7fc57521a72bf67790609d8a26",
       "tools": [
         {
           "name": "status",
@@ -6795,6 +7030,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -6815,6 +7051,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -6896,6 +7133,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -6946,6 +7184,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -6977,6 +7216,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -7059,6 +7299,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -7086,6 +7327,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -7124,6 +7366,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -7153,6 +7396,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -7198,6 +7442,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -7263,6 +7508,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -7333,6 +7579,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -7356,6 +7603,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -7420,6 +7668,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -7487,6 +7736,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -7521,6 +7771,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -7552,6 +7803,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -7638,6 +7890,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -7681,12 +7934,13 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -7698,6 +7952,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -7722,6 +7988,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -7748,6 +8015,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -7828,7 +8096,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -7851,8 +8124,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "d502b937ae1b9b97610d3abb4dcc52b8531cea2f560cae14eebe98271b70cb38",
-      "catalog_digest": "d502b937ae1b9b97610d3abb4dcc52b8531cea2f560cae14eebe98271b70cb38",
+      "generation": "9d0c2c1e4c88456e228d3c60957362c0c4ef37c0248a5f915038692b2247f8b0",
+      "catalog_digest": "9d0c2c1e4c88456e228d3c60957362c0c4ef37c0248a5f915038692b2247f8b0",
       "tools": [
         {
           "name": "status",
@@ -7862,6 +8135,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -7882,6 +8156,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -7963,6 +8238,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -8013,6 +8289,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -8044,6 +8321,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -8126,6 +8404,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -8153,6 +8432,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -8191,6 +8471,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -8220,6 +8501,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -8267,6 +8549,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -8327,6 +8610,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -8397,6 +8681,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -8420,6 +8705,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -8484,6 +8770,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -8551,6 +8838,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -8585,6 +8873,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -8616,6 +8905,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -8702,6 +8992,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -8745,12 +9036,13 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -8762,6 +9054,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -8786,6 +9090,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -8812,6 +9117,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -8892,7 +9198,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -8915,8 +9226,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "9c4baee0720a1c88bb85140844450d0a3d32077e43445a5083e0ad675db165f7",
-      "catalog_digest": "9c4baee0720a1c88bb85140844450d0a3d32077e43445a5083e0ad675db165f7",
+      "generation": "2cef50c1c131899ed951a620e0ff8311e74c339e2a97f33bcfe24a04adfdd460",
+      "catalog_digest": "2cef50c1c131899ed951a620e0ff8311e74c339e2a97f33bcfe24a04adfdd460",
       "tools": [
         {
           "name": "status",
@@ -8926,6 +9237,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -8946,6 +9258,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -9027,6 +9340,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -9077,6 +9391,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -9108,6 +9423,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -9190,6 +9506,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -9217,6 +9534,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -9255,6 +9573,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -9284,6 +9603,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -9328,6 +9648,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -9388,6 +9709,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -9458,6 +9780,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -9481,6 +9804,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -9545,6 +9869,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -9612,6 +9937,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -9646,6 +9972,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -9677,6 +10004,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -9763,6 +10091,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -9806,12 +10135,13 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -9823,6 +10153,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -9847,6 +10189,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -9873,6 +10216,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -9953,7 +10297,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -9973,8 +10322,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "51626b400394e0f9b33404de09d0bea0b4c237242783d398ef896e2b27752592",
-      "catalog_digest": "51626b400394e0f9b33404de09d0bea0b4c237242783d398ef896e2b27752592",
+      "generation": "2b3c5656f572647d340078589532de676a8a71938305ad7ae02380d0f2ec921d",
+      "catalog_digest": "2b3c5656f572647d340078589532de676a8a71938305ad7ae02380d0f2ec921d",
       "tools": [
         {
           "name": "status",
@@ -9984,6 +10333,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -10004,6 +10354,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -10080,6 +10431,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -10158,6 +10510,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -10208,6 +10561,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -10239,6 +10593,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -10321,6 +10676,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -10348,6 +10704,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -10386,6 +10743,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -10415,6 +10773,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -10463,6 +10822,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -10508,6 +10868,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -10572,6 +10933,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -10632,6 +10994,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -10702,6 +11065,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -10725,6 +11089,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -10789,6 +11154,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -10856,6 +11222,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -10890,6 +11257,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -10921,6 +11289,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -11007,6 +11376,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -11050,12 +11420,13 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -11067,6 +11438,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -11091,6 +11474,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -11117,6 +11501,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -11200,7 +11585,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -11220,8 +11610,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "39732ae163fc8398a36976f286465ef0101f0c1f8276a713084be33481aaac5d",
-      "catalog_digest": "39732ae163fc8398a36976f286465ef0101f0c1f8276a713084be33481aaac5d",
+      "generation": "762051e55fed01e192c15a1c46c624ab624ad10e6b6f62f681c30d9a7125364f",
+      "catalog_digest": "762051e55fed01e192c15a1c46c624ab624ad10e6b6f62f681c30d9a7125364f",
       "tools": [
         {
           "name": "status",
@@ -11231,6 +11621,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -11251,6 +11642,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -11327,6 +11719,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -11405,6 +11798,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -11455,6 +11849,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -11486,6 +11881,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -11568,6 +11964,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -11595,6 +11992,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -11633,6 +12031,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -11662,6 +12061,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -11710,6 +12110,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -11755,6 +12156,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -11819,6 +12221,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -11879,6 +12282,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -11949,6 +12353,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -11972,6 +12377,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -12036,6 +12442,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -12103,6 +12510,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -12137,6 +12545,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -12168,6 +12577,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -12254,6 +12664,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -12297,12 +12708,13 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -12314,6 +12726,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -12338,6 +12762,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -12364,6 +12789,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -12447,7 +12873,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -12469,8 +12900,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "876944415f75df567d24b55f9b6ffbeacf8ae687e3e60bd92d14d68a0a5d39ea",
-      "catalog_digest": "876944415f75df567d24b55f9b6ffbeacf8ae687e3e60bd92d14d68a0a5d39ea",
+      "generation": "16b786700d65c0a8cf5d85f391175635dde44667e5e3a3296f44cd72c77ad269",
+      "catalog_digest": "16b786700d65c0a8cf5d85f391175635dde44667e5e3a3296f44cd72c77ad269",
       "tools": [
         {
           "name": "status",
@@ -12480,6 +12911,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -12496,6 +12928,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -12574,6 +13007,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -12624,6 +13058,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -12655,6 +13090,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -12737,6 +13173,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -12764,6 +13201,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -12802,6 +13240,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -12831,6 +13270,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -12879,6 +13319,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -12924,6 +13365,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -12988,6 +13430,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -13048,6 +13491,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -13118,6 +13562,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -13141,6 +13586,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -13205,6 +13651,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -13272,6 +13719,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -13306,6 +13754,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -13337,6 +13786,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -13423,6 +13873,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -13466,12 +13917,13 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -13483,6 +13935,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -13507,6 +13971,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -13533,6 +13998,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -13615,7 +14081,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -13637,8 +14108,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "df3d3c24d56e17fcea874217afd152dad3299096c2341ad7215d375afb83fdf7",
-      "catalog_digest": "df3d3c24d56e17fcea874217afd152dad3299096c2341ad7215d375afb83fdf7",
+      "generation": "7a268824e9c7b27ad062a87368944391e45434eeddbcac435b19d54dd52737ba",
+      "catalog_digest": "7a268824e9c7b27ad062a87368944391e45434eeddbcac435b19d54dd52737ba",
       "tools": [
         {
           "name": "status",
@@ -13648,6 +14119,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -13668,6 +14140,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -13744,6 +14217,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -13822,6 +14296,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -13872,6 +14347,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -13903,6 +14379,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -13985,6 +14462,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -14012,6 +14490,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -14050,6 +14529,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -14079,6 +14559,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -14127,6 +14608,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -14191,6 +14673,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -14251,6 +14734,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -14321,6 +14805,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -14344,6 +14829,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -14408,6 +14894,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -14475,6 +14962,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -14509,6 +14997,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -14540,6 +15029,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -14626,6 +15116,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -14669,12 +15160,13 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -14686,6 +15178,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -14710,6 +15214,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -14736,6 +15241,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -14818,7 +15324,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -14840,8 +15351,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "3f8f576b81db8d9fe2dc85165190d090773b54e768d307e01fd212c5e65dd5b7",
-      "catalog_digest": "3f8f576b81db8d9fe2dc85165190d090773b54e768d307e01fd212c5e65dd5b7",
+      "generation": "87d80fc4163856625d6e5f24729dc120ead10c5d8d598958331f18a04fddf4d4",
+      "catalog_digest": "87d80fc4163856625d6e5f24729dc120ead10c5d8d598958331f18a04fddf4d4",
       "tools": [
         {
           "name": "status",
@@ -14851,6 +15362,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -14871,6 +15383,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -14947,6 +15460,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -15025,6 +15539,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -15075,6 +15590,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -15106,6 +15622,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -15188,6 +15705,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -15215,6 +15733,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -15253,6 +15772,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -15282,6 +15802,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -15327,6 +15848,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -15391,6 +15913,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -15451,6 +15974,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -15521,6 +16045,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -15544,6 +16069,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -15608,6 +16134,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -15675,6 +16202,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -15709,6 +16237,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -15740,6 +16269,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -15826,6 +16356,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -15869,12 +16400,13 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -15886,6 +16418,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -15910,6 +16454,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -15936,6 +16481,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -16018,7 +16564,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -16041,8 +16592,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "d18017ea80eda4a37ac7e4192f6a4a75f30d36be95f0259208030e3ac5a724ac",
-      "catalog_digest": "d18017ea80eda4a37ac7e4192f6a4a75f30d36be95f0259208030e3ac5a724ac",
+      "generation": "5ce1f0b73d818cc8ab742ffdb48feec3c50562e6983431cb894898112e4de92a",
+      "catalog_digest": "5ce1f0b73d818cc8ab742ffdb48feec3c50562e6983431cb894898112e4de92a",
       "tools": [
         {
           "name": "status",
@@ -16052,6 +16603,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -16072,6 +16624,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -16148,6 +16701,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -16226,6 +16780,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -16276,6 +16831,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -16307,6 +16863,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -16389,6 +16946,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -16416,6 +16974,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -16454,6 +17013,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -16483,6 +17043,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -16531,6 +17092,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -16596,6 +17158,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -16666,6 +17229,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -16689,6 +17253,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -16753,6 +17318,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -16820,6 +17386,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -16854,6 +17421,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -16885,6 +17453,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -16971,6 +17540,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -17014,12 +17584,13 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -17031,6 +17602,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -17055,6 +17638,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -17081,6 +17665,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -17162,7 +17747,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -17185,8 +17775,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "01b1e5674c804e6184530e097db4057f78a8377d78eb89e93830f19bf60c51b8",
-      "catalog_digest": "01b1e5674c804e6184530e097db4057f78a8377d78eb89e93830f19bf60c51b8",
+      "generation": "404493cd9d2a9e68b5a396740fd39db1cab540f1d6d96ec595b51c20175d23cf",
+      "catalog_digest": "404493cd9d2a9e68b5a396740fd39db1cab540f1d6d96ec595b51c20175d23cf",
       "tools": [
         {
           "name": "status",
@@ -17196,6 +17786,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -17216,6 +17807,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -17292,6 +17884,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -17370,6 +17963,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -17420,6 +18014,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -17451,6 +18046,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -17533,6 +18129,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -17560,6 +18157,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -17598,6 +18196,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -17627,6 +18226,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -17672,6 +18272,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -17737,6 +18338,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -17807,6 +18409,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -17830,6 +18433,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -17894,6 +18498,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -17961,6 +18566,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -17995,6 +18601,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -18026,6 +18633,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -18112,6 +18720,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -18155,12 +18764,13 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -18172,6 +18782,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -18196,6 +18818,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -18222,6 +18845,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -18303,7 +18927,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -18326,8 +18955,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "7ed453611394c6f17658110934453be5b2be85eb949d7bd0127709fe48d1bd28",
-      "catalog_digest": "7ed453611394c6f17658110934453be5b2be85eb949d7bd0127709fe48d1bd28",
+      "generation": "e4d7a59eed06c1146b53260b7ca2c4b3309dacde65ee49d7ca7a9e9f5a2d90f4",
+      "catalog_digest": "e4d7a59eed06c1146b53260b7ca2c4b3309dacde65ee49d7ca7a9e9f5a2d90f4",
       "tools": [
         {
           "name": "status",
@@ -18337,6 +18966,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -18357,6 +18987,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -18433,6 +19064,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -18511,6 +19143,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -18561,6 +19194,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -18592,6 +19226,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -18674,6 +19309,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -18701,6 +19337,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -18739,6 +19376,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -18768,6 +19406,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -18815,6 +19454,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -18875,6 +19515,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -18945,6 +19586,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -18968,6 +19610,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -19032,6 +19675,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -19099,6 +19743,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -19133,6 +19778,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -19164,6 +19810,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -19250,6 +19897,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -19293,12 +19941,13 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -19310,6 +19959,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -19334,6 +19995,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -19360,6 +20022,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -19441,7 +20104,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   },
   {
@@ -19464,8 +20132,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "a0e89e82a3d4a57e443ced913c2c3de00146adf8bdd3fe0ad4e93828ba143717",
-      "catalog_digest": "a0e89e82a3d4a57e443ced913c2c3de00146adf8bdd3fe0ad4e93828ba143717",
+      "generation": "411b938e273cda011b8808cc6551e6c12ce9bfdf66c91e85e0bd740fe02cfc1e",
+      "catalog_digest": "411b938e273cda011b8808cc6551e6c12ce9bfdf66c91e85e0bd740fe02cfc1e",
       "tools": [
         {
           "name": "status",
@@ -19475,6 +20143,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -19495,6 +20164,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -19571,6 +20241,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -19649,6 +20320,7 @@
             "prepend",
             "append"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.read/v1"
           ],
@@ -19699,6 +20371,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -19730,6 +20403,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -19812,6 +20486,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.edit/v1"
           ],
@@ -19839,6 +20514,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -19877,6 +20553,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.search/v1"
           ],
@@ -19906,6 +20583,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.outline/v1"
           ],
@@ -19950,6 +20628,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -20010,6 +20689,7 @@
             "codemode",
             "flow"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -20080,6 +20760,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -20103,6 +20784,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -20167,6 +20849,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -20234,6 +20917,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -20268,6 +20952,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "code.files/v1"
           ],
@@ -20299,6 +20984,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -20385,6 +21071,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -20428,12 +21115,13 @@
         },
         {
           "name": "bash_status",
-          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "schema_digest": "d6a69ca626fb7e4e733a2e253e23deec542462ec598c417265f2846303c16f1c",
           "semantics": 1,
           "modes": [
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -20445,6 +21133,18 @@
               "taskId": {
                 "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
                 "type": "string"
+              },
+              "outputOffset": {
+                "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "stderrOffset": {
+                "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "outputMode": {
                 "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
@@ -20469,6 +21169,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -20495,6 +21196,7 @@
             "classic",
             "codemode"
           ],
+          "result_format": "tool-result/v1",
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -20576,7 +21278,12 @@
       },
       "capabilities": {
         "late_results": true
-      }
+      },
+      "presets": [
+        "head",
+        "worker",
+        "reader"
+      ]
     }
   }
 ]

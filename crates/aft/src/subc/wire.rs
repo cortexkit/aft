@@ -90,6 +90,7 @@ impl ToolResponseWriteTrace {
         write_started: std::time::Instant,
         write_finished: std::time::Instant,
         frame_bytes: usize,
+        prepare_cpu: Option<std::time::Duration>,
     ) -> Option<CompletedToolResponseTrace> {
         let phases = self.phase_trace.finish(ToolCallEgressTiming {
             enqueued: self.enqueued_at?,
@@ -101,6 +102,7 @@ impl ToolResponseWriteTrace {
             writer_active_at_enqueue: self.writer_active_at_enqueue,
             writer_queue_was_full: self.writer_queue_was_full,
             reserve_timeouts: self.reserve_timeouts,
+            prepare_cpu,
         })?;
         Some(CompletedToolResponseTrace {
             name: self.name,
@@ -132,8 +134,21 @@ enum WriterFrameBody {
 pub(super) struct WriterFrame {
     /// The route-specific header. Shared Push bodies remain outside this frame.
     pub(super) frame: Frame,
-    body: WriterFrameBody,
+    body_storage: WriterFrameBody,
     pub(super) tool_response_trace: Option<ToolResponseWriteTrace>,
+    result_projection: Option<(ToolResponsePolicy, usize, Option<ToolCallResult>)>,
+    prepared_projection: Option<Arc<Vec<u8>>>,
+    ack_receipt: Option<(
+        super::a0_egress::AckPublication,
+        tokio::sync::oneshot::Sender<Result<bool, SubcError>>,
+    )>,
+    ack_completion: Option<super::a0_egress::AckCompletion>,
+}
+
+impl From<Frame> for WriterFrame {
+    fn from(frame: Frame) -> Self {
+        Self::plain(frame)
+    }
 }
 
 impl std::ops::Deref for WriterFrame {
@@ -148,8 +163,12 @@ impl WriterFrame {
     pub(super) fn plain(frame: Frame) -> Self {
         Self {
             frame,
-            body: WriterFrameBody::Owned,
+            body_storage: WriterFrameBody::Owned,
             tool_response_trace: None,
+            result_projection: None,
+            prepared_projection: None,
+            ack_receipt: None,
+            ack_completion: None,
         }
     }
 
@@ -157,17 +176,306 @@ impl WriterFrame {
         debug_assert_eq!(frame.header.len as usize, body.len());
         Self {
             frame,
-            body: WriterFrameBody::SharedPush(body),
+            body_storage: WriterFrameBody::SharedPush(body),
             tool_response_trace: None,
+            result_projection: None,
+            prepared_projection: None,
+            ack_receipt: None,
+            ack_completion: None,
         }
     }
 
-    fn traced_tool_response(frame: Frame, trace: ToolResponseWriteTrace) -> Self {
-        Self {
-            frame,
-            body: WriterFrameBody::Owned,
-            tool_response_trace: Some(trace),
+    pub(super) fn with_ack_receipt(
+        frame: Frame,
+        publication: super::a0_egress::AckPublication,
+    ) -> (
+        Self,
+        tokio::sync::oneshot::Receiver<Result<bool, SubcError>>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut outgoing = Self::plain(frame);
+        outgoing.ack_receipt = Some((publication, tx));
+        (outgoing, rx)
+    }
+
+    pub(super) fn begin_ack_write(&mut self) -> bool {
+        if self
+            .ack_receipt
+            .as_ref()
+            .is_some_and(|(publication, _)| !publication.begin_write())
+        {
+            let publication = &self.ack_receipt.as_ref().unwrap().0;
+            if let Ok(Some(error)) = publication.error_frame(&self.frame) {
+                // When the bind is retracted, replace its queued writer frame
+                // with the error frame in place. Keeping its queue position
+                // prevents candidate refusals overtaking the bind's error.
+                self.frame = error;
+                return true;
+            }
+            return false;
         }
+        true
+    }
+
+    pub(super) fn finish_ack_write(&mut self, written: bool) {
+        let retracted = self
+            .ack_receipt
+            .as_ref()
+            .is_some_and(|(publication, _)| publication.is_retracted());
+        if written {
+            if let Some((publication, _)) = self.ack_receipt.as_ref() {
+                if retracted {
+                    publication.finished(false);
+                } else {
+                    publication.written();
+                }
+            }
+        }
+        if written {
+            if let Some(completion) = self.ack_completion.take() {
+                completion.publish(retracted);
+            }
+        } else {
+            self.ack_completion.take();
+        }
+        if let Some((publication, receipt)) = self.ack_receipt.take() {
+            let _ = publication;
+            let _ = receipt.send(if written {
+                Ok(true)
+            } else {
+                Err(SubcError::WriterClosed)
+            });
+        }
+    }
+
+    pub(super) fn set_ack_completion(&mut self, completion: super::a0_egress::AckCompletion) {
+        self.ack_completion = Some(completion);
+    }
+
+    fn traced_tool_response(frame: impl Into<Self>, trace: ToolResponseWriteTrace) -> Self {
+        let mut outgoing = frame.into();
+        outgoing.tool_response_trace = Some(trace);
+        outgoing
+    }
+
+    pub(super) fn retained_tool_response(
+        frame: Frame,
+        policy: ToolResponsePolicy,
+        image_alt: Option<&str>,
+    ) -> Self {
+        let mut outgoing = Self::plain(frame);
+        if policy.tool_result_body {
+            let source = if outgoing.header.ty == FrameType::Response {
+                if outgoing.frame.body.len() >= super::result_body::MAX_RESULT_BYTES {
+                    let response = super::result_body::too_large(
+                        "retained-tool-reply",
+                        outgoing.frame.body.len(),
+                        "narrow the call with paths, pattern, or offset/limit",
+                    );
+                    Some(ToolCallResult {
+                        text: response.data["message"].as_str().unwrap().into(),
+                        response,
+                    })
+                } else {
+                    retained_tool_result(&outgoing.frame.body)
+                        .ok()
+                        .map(|mut result| {
+                            if let Some(parts) = result
+                                .response
+                                .data
+                                .get_mut("attachments")
+                                .and_then(Value::as_array_mut)
+                            {
+                                for part in parts.iter_mut().filter(|part| part["kind"] == "image")
+                                {
+                                    part["alt"] = serde_json::json!(
+                                        image_alt.unwrap_or("image from retained tool reply")
+                                    );
+                                }
+                            }
+                            result
+                        })
+                }
+            } else {
+                None
+            };
+            outgoing.result_projection = Some((policy, MAX_FRAME_BODY_LEN as usize, source));
+        }
+        outgoing
+    }
+
+    pub(super) fn retained_tool_response_with_source(
+        frame: Frame,
+        policy: ToolResponsePolicy,
+        image_alt: Option<&str>,
+        source: Option<Vec<u8>>,
+    ) -> Self {
+        let Some(source) =
+            source.filter(|_| policy.tool_result_body && frame.header.ty == FrameType::Response)
+        else {
+            return Self::retained_tool_response(frame, policy, image_alt);
+        };
+        let rendered = super::retained_result::render(
+            &source,
+            &frame.body,
+            !matches!(policy.trust, BindTrust::Untrusted),
+            super::result_body::MAX_RESULT_BYTES,
+        );
+        let refusal = match rendered {
+            Ok(rendered) if rendered.size < super::result_body::MAX_RESULT_BYTES => {
+                let valid = serde_json::from_slice::<
+                    cortexkit_role_tool_provider::result::ToolResult,
+                >(&rendered.bytes)
+                .ok()
+                .is_some_and(|result| {
+                    cortexkit_role_tool_provider::result::validate(&result).is_ok()
+                });
+                if valid {
+                    let mut outgoing = Self::plain(frame);
+                    outgoing.prepared_projection = Some(Arc::new(rendered.bytes));
+                    return outgoing;
+                }
+                Response::error(
+                    "retained-tool-reply",
+                    super::result_body::FALLBACK_ERROR_CODE,
+                    "retained tool reply could not be decoded",
+                )
+            }
+            Ok(rendered) => super::result_body::too_large(
+                "response_too_large",
+                rendered.size,
+                "narrow the call with paths, pattern, or offset/limit",
+            ),
+            Err(_) => Response::error(
+                "retained-tool-reply",
+                super::result_body::FALLBACK_ERROR_CODE,
+                "retained tool reply could not be decoded",
+            ),
+        };
+        let result = ToolCallResult {
+            text: refusal.data["message"].as_str().unwrap().into(),
+            response: refusal,
+        };
+        build_tool_response_frame(
+            frame.header.ver,
+            super::route_key(frame.header.channel, frame.header.epoch),
+            frame.header.corr,
+            frame.header.flags,
+            &result,
+            policy,
+        )
+        .expect("bounded retained-result refusal must serialize")
+    }
+
+    /// Retain a bounded trust-independent source, not the first consumer's view.
+    /// Rendered text is inherited from the unchanged legacy frame where possible;
+    /// each image payload is stored once, with raw JSON fields preserved exactly.
+    pub(super) fn tool_result_source_for_retention(
+        &mut self,
+    ) -> Result<Option<Vec<u8>>, SubcError> {
+        let Some((mut projected, result, policy, body_limit)) = self.take_projected_result()?
+        else {
+            return Ok(None);
+        };
+        let limit = crate::db::call_ledger::MAX_TOOL_RESULT_SOURCE_BYTES;
+        let mut source = super::retained_result::encode(&result, &self.frame.body, limit)
+            .map_err(SubcError::Json)?;
+        if source.size >= limit {
+            let response = super::result_body::too_large(
+                "response_too_large",
+                source.size,
+                "narrow the call with paths, pattern, or offset/limit",
+            );
+            let fallback = ToolCallResult {
+                text: response.data["message"].as_str().unwrap().into(),
+                response,
+            };
+            let header = &self.frame.header;
+            let (frame, fallback) = build_result_body_frame(
+                header.ver,
+                super::route_key(header.channel, header.epoch),
+                header.corr,
+                header.flags,
+                fallback,
+                policy.trust,
+                body_limit,
+            )?;
+            projected = frame;
+            source = super::retained_result::encode(&fallback, &self.frame.body, limit)
+                .map_err(SubcError::Json)?;
+        }
+        debug_assert!(source.size < limit);
+        self.prepared_projection = Some(Arc::new(projected.body));
+        Ok(Some(source.bytes))
+    }
+
+    /// The ledger proxy forwards legacy response bytes unchanged. The final
+    /// transport writer projects the reply after the ledger has persisted those bytes.
+    pub(super) fn project_tool_result(&mut self) -> Result<(), SubcError> {
+        self.prepare_tool_result()?;
+        let Some(body) = self.prepared_projection.take() else {
+            return Ok(());
+        };
+        if self.frame.header.ty != FrameType::Response {
+            return Ok(());
+        }
+        let body = Arc::try_unwrap(body).unwrap_or_else(|body| body.as_ref().clone());
+        let header = &self.frame.header;
+        self.frame = Frame::build_with_version(
+            header.ver,
+            header.ty,
+            header.flags,
+            header.channel,
+            header.epoch,
+            header.corr,
+            body,
+        )
+        .map_err(SubcError::FrameBuild)?;
+        Ok(())
+    }
+
+    fn prepare_tool_result(&mut self) -> Result<(), SubcError> {
+        if let Some((projected, _, _, _)) = self.take_projected_result()? {
+            self.prepared_projection = Some(Arc::new(projected.body));
+        }
+        Ok(())
+    }
+
+    fn take_projected_result(
+        &mut self,
+    ) -> Result<Option<(Frame, ToolCallResult, ToolResponsePolicy, usize)>, SubcError> {
+        let Some((policy, limit, source)) = self.result_projection.take() else {
+            return Ok(None);
+        };
+        if self.frame.header.ty != FrameType::Response {
+            return Ok(None);
+        }
+        let mut result = match source {
+            Some(result) => result,
+            None => retained_tool_result(&self.frame.body)?,
+        };
+        if let Err(reason) = complete_image_dimensions(&mut result) {
+            let text = format!("Attachment omitted: {reason}");
+            result = ToolCallResult {
+                response: Response::error(
+                    "image-reply",
+                    super::result_body::FALLBACK_ERROR_CODE,
+                    &text,
+                ),
+                text,
+            };
+        }
+        let header = &self.frame.header;
+        let projected = build_result_body_frame(
+            header.ver,
+            super::route_key(header.channel, header.epoch),
+            header.corr,
+            header.flags,
+            result,
+            policy.trust,
+            limit,
+        )?;
+        Ok(Some((projected.0, projected.1, policy, limit)))
     }
 
     pub(super) fn frame(&self) -> &Frame {
@@ -175,7 +483,7 @@ impl WriterFrame {
     }
 
     pub(super) fn body(&self) -> &[u8] {
-        match &self.body {
+        match &self.body_storage {
             WriterFrameBody::Owned => &self.frame.body,
             WriterFrameBody::SharedPush(body) => body,
         }
@@ -183,7 +491,7 @@ impl WriterFrame {
 
     #[cfg(test)]
     pub(super) fn shared_push_body_strong_count(&self) -> Option<usize> {
-        match &self.body {
+        match &self.body_storage {
             WriterFrameBody::Owned => None,
             WriterFrameBody::SharedPush(body) => Some(Arc::strong_count(body)),
         }
@@ -251,7 +559,7 @@ fn enqueue_writer_item(
     permit.send(item);
 }
 
-fn try_enqueue_writer_item(
+pub(super) fn try_enqueue_writer_item(
     tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     mut item: WriterFrame,
@@ -292,7 +600,7 @@ pub(super) fn try_enqueue_shared_push_frame(
     try_enqueue_writer_item(tx, metrics, WriterFrame::shared_push(frame, body))
 }
 
-async fn send_reliable_writer_item(
+pub(super) async fn send_reliable_writer_item(
     tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     mut item: WriterFrame,
@@ -338,16 +646,16 @@ async fn send_reliable_writer_item(
 pub(super) async fn send_reliable_writer_frame(
     tx: &WriterSender,
     metrics: &DispatchPathMetrics,
-    frame: Frame,
+    frame: impl Into<WriterFrame>,
     context: &'static str,
 ) -> Result<(), SubcError> {
-    send_reliable_writer_item(tx, metrics, WriterFrame::plain(frame), context).await
+    send_reliable_writer_item(tx, metrics, frame.into(), context).await
 }
 
 pub(super) async fn send_traced_tool_response_frame(
     tx: &WriterSender,
     metrics: &DispatchPathMetrics,
-    frame: Frame,
+    frame: impl Into<WriterFrame>,
     trace: ToolResponseWriteTrace,
 ) -> Result<(), SubcError> {
     send_reliable_writer_item(
@@ -539,7 +847,7 @@ fn serialize_tool_response_body(
     result: &ToolCallResult,
     include_structured: bool,
 ) -> Result<Vec<u8>, serde_json::Error> {
-    serialize_tool_response_body_with_text(result, include_structured, &result.text, false)
+    serialize_tool_response_body_with_text(result, include_structured, &result.text, false, false)
 }
 
 fn serialize_tool_response_body_with_text(
@@ -547,6 +855,7 @@ fn serialize_tool_response_body_with_text(
     include_structured: bool,
     rendered_text: &str,
     transport_truncated: bool,
+    tool_result_body: bool,
 ) -> Result<Vec<u8>, serde_json::Error> {
     let data_capacity = result
         .response
@@ -580,17 +889,54 @@ fn serialize_tool_response_body_with_text(
     let encoded_text_start = body.len();
     serde_json::to_writer(&mut body, rendered_text)?;
     let encoded_text_end = body.len();
-    body.extend_from_slice(b"}],\"isError\":");
+    body.push(b'}');
+    if tool_result_body {
+        if let Some(attachments) = result.response.data["attachments"].as_array() {
+            for image in attachments.iter().filter(|part| part["kind"] == "image") {
+                body.extend_from_slice(b",{\"type\":\"image\",\"data\":");
+                serde_json::to_writer(&mut body, &image["data"])?;
+                body.extend_from_slice(b",\"mimeType\":");
+                serde_json::to_writer(&mut body, &image["mime"])?;
+                body.extend_from_slice(b",\"width\":");
+                serde_json::to_writer(&mut body, &image["width"])?;
+                body.extend_from_slice(b",\"height\":");
+                serde_json::to_writer(&mut body, &image["height"])?;
+                body.extend_from_slice(b",\"alt\":");
+                serde_json::to_writer(&mut body, &image["alt"])?;
+                body.push(b'}');
+            }
+        }
+    }
+    body.extend_from_slice(b"],\"isError\":");
     body.extend_from_slice(if result.response.success {
         b"false"
     } else {
         b"true"
     });
 
+    if tool_result_body && !result.response.success {
+        body.extend_from_slice(b",\"errorCode\":");
+        serde_json::to_writer(
+            &mut body,
+            &super::result_body::error_code(result.response.data["code"].as_str()),
+        )?;
+    }
+
     if include_structured {
         body.extend_from_slice(b",\"structuredContent\":{\"id\":");
         let data = result.response.data.as_object();
-        match data.and_then(|data| data.get("id")) {
+        let response_id = data.and_then(|data| data.get("id"));
+        // Early orchestration errors have no native dispatch. Pin only their
+        // outgoing ID too; the remaining legacy/result body is serialized normally.
+        #[cfg(feature = "test-conformance-result-inputs")]
+        let fixture_id = serde_json::json!("conformance-result-probe");
+        #[cfg(feature = "test-conformance-result-inputs")]
+        let response_id = if std::env::var_os("AFT_TEST_CONFORMANCE_RESPONSE_ID").is_some() {
+            Some(&fixture_id)
+        } else {
+            response_id
+        };
+        match response_id {
             Some(value) => serde_json::to_writer(&mut body, value)?,
             None => serde_json::to_writer(&mut body, &result.response.id)?,
         }
@@ -703,26 +1049,148 @@ fn response_too_large_frame(
     .expect("fixed response_too_large envelope must fit the protocol frame limit")
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct ToolResponsePolicy {
+    pub(super) trust: BindTrust,
+    pub(super) tool_result_body: bool,
+}
+
+impl From<BindTrust> for ToolResponsePolicy {
+    fn from(trust: BindTrust) -> Self {
+        Self {
+            trust,
+            tool_result_body: false,
+        }
+    }
+}
+
+impl From<&super::RouteIdentity> for ToolResponsePolicy {
+    fn from(identity: &super::RouteIdentity) -> Self {
+        Self {
+            trust: identity.trust,
+            tool_result_body: identity.tool_result_body,
+        }
+    }
+}
+
 pub(super) fn build_tool_response_frame(
     ver: u8,
     route: RouteChannel,
     corr: u64,
     flags: Flags,
     result: &ToolCallResult,
-    trust: BindTrust,
-) -> Result<Frame, SubcError> {
+    policy: impl Into<ToolResponsePolicy>,
+) -> Result<WriterFrame, SubcError> {
     build_tool_response_frame_with_limit(
         ver,
         route,
         corr,
         flags,
         result,
-        trust,
+        policy,
         MAX_FRAME_BODY_LEN as usize,
     )
 }
 
+/// Carrier bodies are already closed and validated. Keep them out of the
+/// ordinary serializer, which adds id, success and rendered text fields.
+pub(super) fn build_carrier_response_frame(
+    request: &Frame,
+    entry: Option<&Value>,
+    body: Value,
+) -> Result<WriterFrame, SubcError> {
+    if super::rich_ui::carrier::validate_body(entry, &body).is_err() {
+        return build_carrier_response_frame(
+            request,
+            None,
+            super::rich_ui::carrier::error_body("result_schema_mismatch"),
+        );
+    }
+    Ok(WriterFrame::plain(
+        Frame::build_with_version(
+            request.header.ver,
+            FrameType::Response,
+            request.header.flags,
+            request.header.channel,
+            request.header.epoch,
+            request.header.corr,
+            serde_json::to_vec(&body).map_err(SubcError::Json)?,
+        )
+        .map_err(SubcError::FrameBuild)?,
+    ))
+}
+
 pub(super) fn build_tool_response_frame_with_limit(
+    ver: u8,
+    route: RouteChannel,
+    corr: u64,
+    flags: Flags,
+    result: &ToolCallResult,
+    policy: impl Into<ToolResponsePolicy>,
+    max_body_len: usize,
+) -> Result<WriterFrame, SubcError> {
+    let ToolResponsePolicy {
+        trust,
+        tool_result_body,
+    } = policy.into();
+    let policy = ToolResponsePolicy {
+        trust,
+        tool_result_body,
+    };
+    if !tool_result_body {
+        return build_legacy_tool_response_frame(
+            ver,
+            route,
+            corr,
+            flags,
+            result,
+            trust,
+            max_body_len,
+        )
+        .map(WriterFrame::plain);
+    }
+    let mut source = ToolCallResult {
+        text: result.text.clone(),
+        response: Response {
+            id: result.response.id.clone(),
+            success: result.response.success,
+            data: result.response.data.clone(),
+        },
+    };
+    // Image paths are send-only metadata, not a change to the legacy structured
+    // payload retained by the call ledger.
+    let alts: Vec<_> = source
+        .response
+        .data
+        .get_mut("attachments")
+        .and_then(Value::as_array_mut)
+        .map(|parts| {
+            parts
+                .iter_mut()
+                .map(|part| part.as_object_mut().and_then(|part| part.remove("alt")))
+                .collect()
+        })
+        .unwrap_or_default();
+    let frame =
+        build_legacy_tool_response_frame(ver, route, corr, flags, &source, trust, max_body_len)?;
+    if let Some(parts) = source
+        .response
+        .data
+        .get_mut("attachments")
+        .and_then(Value::as_array_mut)
+    {
+        for (part, alt) in parts.iter_mut().zip(alts) {
+            if let Some(alt) = alt {
+                part["alt"] = alt;
+            }
+        }
+    }
+    let mut outgoing = WriterFrame::plain(frame);
+    outgoing.result_projection = Some((policy, max_body_len, Some(source)));
+    Ok(outgoing)
+}
+
+fn build_legacy_tool_response_frame(
     ver: u8,
     route: RouteChannel,
     corr: u64,
@@ -756,6 +1224,7 @@ pub(super) fn build_tool_response_frame_with_limit(
         include_structured,
         &rendered_text,
         transport_truncated,
+        false,
     )
     .map_err(SubcError::Json)?;
 
@@ -800,6 +1269,119 @@ pub(super) fn build_tool_response_frame_with_limit(
             include_structured,
         )),
     }
+}
+
+fn retained_tool_result(body: &[u8]) -> Result<ToolCallResult, SubcError> {
+    let mut envelope: Value = serde_json::from_slice(body).map_err(SubcError::Json)?;
+    let text = envelope["content"]
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| part["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let data = envelope
+        .as_object_mut()
+        .and_then(|body| body.remove("structuredContent"))
+        .filter(Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    Ok(ToolCallResult {
+        text,
+        response: Response {
+            id: data["id"].as_str().unwrap_or("retained-tool-reply").into(),
+            success: envelope["isError"] != true,
+            data,
+        },
+    })
+}
+
+fn complete_image_dimensions(result: &mut ToolCallResult) -> Result<(), String> {
+    use base64::Engine;
+    let Some(parts) = result
+        .response
+        .data
+        .get_mut("attachments")
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    for part in parts.iter_mut().filter(|part| part["kind"] == "image") {
+        if part["width"].as_u64().is_some_and(|value| value > 0)
+            && part["height"].as_u64().is_some_and(|value| value > 0)
+        {
+            continue;
+        }
+        // Older GitHub-read sidecars contain raw image data but no dimensions.
+        // Read the image header, without decoding or allocating a pixel buffer.
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(part["data"].as_str().unwrap_or(""))
+            .map_err(|error| error.to_string())?;
+        let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|error| error.to_string())?
+            .into_dimensions()
+            .map_err(|error| error.to_string())?;
+        if width == 0 || height == 0 {
+            return Err("image has no pixels".into());
+        }
+        part["width"] = serde_json::json!(width);
+        part["height"] = serde_json::json!(height);
+    }
+    Ok(())
+}
+
+fn build_result_body_frame(
+    ver: u8,
+    route: RouteChannel,
+    corr: u64,
+    flags: Flags,
+    mut result: ToolCallResult,
+    trust: BindTrust,
+    max_body_len: usize,
+) -> Result<(Frame, ToolCallResult), SubcError> {
+    let include_structured = !matches!(trust, BindTrust::Untrusted);
+    let mut body = serialize_tool_response_body_with_text(
+        &result,
+        include_structured,
+        &result.text,
+        false,
+        true,
+    )
+    .map_err(SubcError::Json)?;
+    // The result contract is strictly below 3 MiB, independently of the transport cap.
+    if body.len() >= super::result_body::MAX_RESULT_BYTES || body.len() > max_body_len {
+        let response = super::result_body::too_large(
+            "response_too_large",
+            body.len(),
+            "narrow the call with paths, pattern, or offset/limit",
+        );
+        result = ToolCallResult {
+            text: response.data["message"].as_str().unwrap().into(),
+            response,
+        };
+        body = serialize_tool_response_body_with_text(
+            &result,
+            include_structured,
+            &result.text,
+            false,
+            true,
+        )
+        .map_err(SubcError::Json)?;
+    }
+    Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        flags,
+        route.channel,
+        route.epoch,
+        corr,
+        body,
+    )
+    .map(|frame| (frame, result))
+    .map_err(SubcError::FrameBuild)
 }
 
 pub(super) fn build_error_frame(
@@ -869,7 +1451,9 @@ pub(super) fn response_is_fatal_panic(response: &Response) -> bool {
 
 #[derive(Debug)]
 pub enum SubcError {
+    RuntimeThread(std::io::Error),
     Runtime(std::io::Error),
+    StorageLease(std::io::Error),
     ConnectionFile {
         path: PathBuf,
         source: subc_transport::ConnectionFileError,
@@ -919,7 +1503,9 @@ pub enum SubcError {
 impl fmt::Display for SubcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::RuntimeThread(e) => write!(f, "failed to start subc runtime thread: {e}"),
             Self::Runtime(e) => write!(f, "failed to build subc tokio runtime: {e}"),
+            Self::StorageLease(e) => write!(f, "failed to acquire subc storage lease: {e}"),
             Self::ConnectionFile { path, source } => {
                 write!(f, "failed to read subc connection file {path:?}: {source}")
             }
@@ -998,7 +1584,7 @@ impl SubcError {
 impl std::error::Error for SubcError {}
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::subc::route_key;
     use serde_json::json;
@@ -1100,7 +1686,10 @@ mod tests {
         );
     }
 
-    fn legacy_tool_response_body(result: &ToolCallResult, include_structured: bool) -> Vec<u8> {
+    pub(in crate::subc) fn legacy_tool_response_body(
+        result: &ToolCallResult,
+        include_structured: bool,
+    ) -> Vec<u8> {
         serde_json::to_vec(&ToolResponseEnvelope {
             result,
             include_structured,

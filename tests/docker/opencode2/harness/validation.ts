@@ -106,6 +106,7 @@ export interface ListSurface {
   unit: string;
   narrow: string[];
   reasons: string[];
+  requires?: string | null;
 }
 
 export interface ParityAllowlistEntry {
@@ -643,6 +644,26 @@ function ownerForCommand(command: string): string {
   return canonicalToolName(command === "semantic_search" ? "search" : command);
 }
 
+async function surfaceRequirement(repoRoot: string, body: string): Promise<string | null> {
+  const requirement = body.match(/requires:\s*(None|Some\(([^)]+)\))/);
+  if (!requirement) fail("matrix_invalid", "LIST_SURFACES requirement is missing");
+  if (requirement[1] === "None") return null;
+  const expression = requirement[2].trim();
+  if (/^"[^"\\]*"$/.test(expression)) return JSON.parse(expression) as string;
+  if (!/^crate(?:::[A-Za-z_][A-Za-z0-9_]*)+$/.test(expression)) {
+    fail("matrix_invalid", `unsupported list surface requirement: ${expression}`);
+  }
+  const parts = expression.split("::").slice(1);
+  const name = parts.pop();
+  const module = join(repoRoot, "crates", "aft", "src", ...parts);
+  const path = await firstExisting([`${module}.rs`, join(module, "mod.rs")]);
+  if (!path) fail("matrix_invalid", `list surface requirement module is missing: ${expression}`);
+  const source = await readFile(path, "utf8");
+  const value = source.match(new RegExp(`\\bconst\\s+${name}:\\s*&str\\s*=\\s*("[^"\\\\]*")\\s*;`))?.[1];
+  if (!value) fail("matrix_invalid", `list surface requirement is not a string constant: ${expression}`);
+  return JSON.parse(value) as string;
+}
+
 export async function deriveListSurfaces(repoRoot: string): Promise<ListSurface[]> {
   const path = join(repoRoot, "crates", "aft", "src", "list_surfaces.rs");
   const source = await readFile(path, "utf8");
@@ -652,7 +673,7 @@ export async function deriveListSurfaces(repoRoot: string): Promise<ListSurface[
   const entries = [
     ...registry.matchAll(/SurfaceEntry\s*\{(?<body>[\s\S]*?)(?=\n\s*SurfaceEntry\s*\{|$)/g),
   ];
-  return entries.map((entry) => {
+  return Promise.all(entries.map(async (entry) => {
     const body = entry.groups?.body ?? "";
     const command = body.match(/command:\s*"([^"]+)"/)?.[1];
     const mode = body.match(/mode:\s*"([^"]*)"/)?.[1];
@@ -683,8 +704,9 @@ export async function deriveListSurfaces(repoRoot: string): Promise<ListSurface[
       unit,
       narrow,
       reasons,
+      requires: await surfaceRequirement(repoRoot, body),
     };
-  });
+  }));
 }
 
 export async function validateParityAllowlist(
@@ -808,9 +830,14 @@ export function validateT6(
   matrix: ApplicabilityMatrix,
   scenarios: readonly ScenarioDefinition[],
   surfaces: readonly ListSurface[],
+  routeCapabilities: readonly string[] = [],
 ): void {
+  // Standalone hosts negotiate no capabilities; route-only surfaces do not exist there.
+  const available = surfaces.filter(
+    (surface) => surface.requires == null || routeCapabilities.includes(surface.requires),
+  );
   const byOwner = new Map<string, ListSurface[]>();
-  for (const surface of surfaces)
+  for (const surface of available)
     byOwner.set(surface.owner, [...(byOwner.get(surface.owner) ?? []), surface]);
   for (const row of matrix.rows) {
     if (row.tool === "powershell" && matrix.platform === "linux") continue;
@@ -826,7 +853,7 @@ export function validateT6(
   const t6Metadata = scenarios
     .filter((scenario) => scenario.trajectory === "T6")
     .map((scenario) => ({ scenario, t6: asRecord(scenario.metadata?.t6) }));
-  for (const surface of surfaces) {
+  for (const surface of available) {
     const fixtures = t6Metadata.filter(({ t6 }) => t6?.surface_id === surface.id);
     for (const fixture of fixtures) {
       if (
@@ -893,7 +920,7 @@ export function validateT6(
   for (const { t6 } of t6Metadata) {
     if (
       typeof t6?.surface_id === "string" &&
-      !surfaces.some((surface) => surface.id === t6.surface_id)
+      !available.some((surface) => surface.id === t6.surface_id)
     ) {
       fail("matrix_invalid", `unknown T6 surface: ${t6.surface_id}`);
     }

@@ -299,7 +299,8 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
             "results": [],
             "more_available": false,
             "engine_capped": false,
-            "fully_degraded": true,
+            // No search ran yet, so no answer was read from files directly.
+            "fully_degraded": false,
         });
         attach_gaps(&mut body, gaps.into_values());
         return Response::success(&req.id, body);
@@ -517,7 +518,9 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
         "results": page,
         "more_available": more_available,
         "engine_capped": engine_capped,
-        "fully_degraded": fully_degraded,
+        // Every child that answered read its files directly; with no child
+        // answer at all, nothing was read.
+        "fully_degraded": fully_degraded && searched,
         "lexical_only_fallback": lexical_only_fallback,
         "semantic_status": semantic_status,
     });
@@ -550,6 +553,10 @@ pub(super) mod tests {
                 callgraph: false,
             },
             semantic_config: Default::default(),
+            trigram_policy: crate::blob_store::v2::TrigramPolicy {
+                max_file_size: crate::config::Config::default().search_index_max_file_size,
+            },
+            view_routes: Default::default(),
             discovery: RwLock::new(None),
             children: RwLock::new(Vec::new()),
             semantic: RwLock::new(Plane::Loading),
@@ -594,7 +601,9 @@ pub(super) mod tests {
         ));
         let registry =
             crate::views::registry::FamilyRegistry::open(storage.path(), "family").unwrap();
-        let owner = registry.register_view("child", root.path()).unwrap();
+        let owner = registry
+            .register_view_with_storage(registry.storage(), "child", root.path())
+            .unwrap();
         let access = ViewAccess::Owner(owner.clone());
         let mut manifest = ManifestV2::new(ManifestHeader {
             producers: Producers {

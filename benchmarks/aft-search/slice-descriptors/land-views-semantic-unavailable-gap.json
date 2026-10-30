@@ -1,0 +1,11 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/tests/integration/per_checkout_semantic_runtime.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs"
+  ],
+  "note": "Views-on roots: when the checkout view cannot build its index for the installed snapshot, or the started lane is still loading or failed to load while the shared status reads ready, or the lane was released by idle eviction and the search restarts it, the reply reports the lane's actual state (unavailable with the reason, or building) through the existing status words and disclosures instead of answering lexical-only under semantic: ready. The legacy semantic index is never read for a started views-on lane. Views-off roots take the unchanged sampling path; scoring, fusion, routing for ready lanes and paging are untouched, so ranked rows stay byte-identical."
+}

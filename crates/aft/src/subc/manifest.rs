@@ -7,6 +7,8 @@ use super::{
     MODULE_CONTROL_OP_HEALTH_CHECK, PROTOCOL_VERSION,
 };
 
+pub(super) const FLOW_OPERATIONS: &[&str] = &[super::diagnostics_findings::OPERATION];
+
 pub(super) fn is_bash_family_tool(name: &str) -> bool {
     name == "bash" || name == "powershell" || name.starts_with("bash_")
 }
@@ -453,6 +455,12 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
     // `call-modes/v1` requests the bind mode and run deadline. AFT checks
     // each tool's modes and confirms a run scope has ended before killing
     // its processes.
+    //
+    // `worker-runs/v1` admits worker runs: codemode runs that carry
+    // `on_behalf_of_agent` and no `agent_id`. Declaring it promises that AFT
+    // runs such a call with only its worker's own access (see `codemode`) and
+    // treats `on_behalf_of_agent` as attribution: it never acts as, asks for,
+    // or hands out the tasks or handles of the attributed agent.
     // Nothing goes in `requires`.
     //
     // The builder leaves `self_signals` and `provenance` unset; `provenance`
@@ -469,7 +477,7 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
     //
     // A subc daemon older than 0.17.20 refuses this manifest, so that version
     // is the minimum supported daemon version.
-    ModuleManifest::builder("aft", env!("CARGO_PKG_VERSION"))
+    let mut manifest = ModuleManifest::builder("aft", env!("CARGO_PKG_VERSION"))
         .protocol_ver(PROTOCOL_VERSION)
         .trust_tier(Some(TrustTier::FirstParty))
         .ready(false)
@@ -477,6 +485,10 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
             provides: vec![
                 cortexkit_role_tool_provider::PROVIDES.to_string(),
                 cortexkit_role_tool_provider::CALL_MODES_CAPABILITY.to_string(),
+                subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
+                subc_protocol::scope::WORKER_RUNS_CAPABILITY.to_string(),
+                subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY.to_string(),
+                crate::page_collect::CAPABILITY.to_string(),
             ],
             requires: Vec::new(),
             must_never_reach: Vec::new(),
@@ -544,6 +556,14 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                         description: None,
                     },
                     ManagementOperation {
+                        name: super::diagnostics_findings::OPERATION.to_string(),
+                        kind: ManagementOperationKind::Query,
+                        description: Some(
+                            "Read AFT's recorded health findings without scheduling work."
+                                .to_owned(),
+                        ),
+                    },
+                    ManagementOperation {
                         name: crate::commands::memory_census::MEMORY_CENSUS_OPERATION.to_string(),
                         kind: ManagementOperationKind::Query,
                         description: None,
@@ -584,6 +604,25 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                         kind: ManagementOperationKind::Mutate,
                         description: None,
                     },
+                    // Core's page-bundle operations (`page-collect/v1`): read an
+                    // HTML page and the files it names under one agent
+                    // session's read policy into a private snapshot, read the
+                    // snapshot back, and release it.
+                    ManagementOperation {
+                        name: crate::page_collect::COLLECT_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Mutate,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: crate::page_collect::READ_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: crate::page_collect::RELEASE_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Mutate,
+                        description: None,
+                    },
                 ],
                 config_schema: json!({
                     "type": "object",
@@ -598,6 +637,9 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                 concurrency: Concurrency::ModuleManaged,
             },
         ])
+        .flow_operations(Some(
+            FLOW_OPERATIONS.iter().map(|op| (*op).to_owned()).collect(),
+        ))
         .bindings(Some(Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,
@@ -618,7 +660,19 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                 of: vec!["synapse".to_string()],
             },
         ])
-        .build()
+        .build();
+    if crate::agent_data::CATALOG_ENABLED {
+        if let Some(capabilities) = &mut manifest.capabilities {
+            capabilities
+                .provides
+                .push(cortexkit_role_agent_data::PROVIDES.to_string());
+        }
+        manifest.provides.push(serde_json::from_value(json!({
+            "role":"internal_service", "service_id":cortexkit_role_agent_data::SERVICE_ID,
+            "transport":"bulk", "agent_facing":false, "operations":cortexkit_role_agent_data::REQUIRED_OPS,
+        })).expect("the published agent-data internal-service declaration is valid"));
+    }
+    manifest
 }
 
 pub(super) fn control_ops() -> Option<Vec<String>> {
@@ -808,13 +862,27 @@ mod tests {
         let capabilities = manifest.capabilities.as_ref().expect("capabilities");
         assert_eq!(
             capabilities.provides,
-            vec!["tool-provider/v1".to_string(), "call-modes/v1".to_string()]
+            vec![
+                "tool-provider/v1".to_string(),
+                "call-modes/v1".to_string(),
+                "flow-scopes/v1".to_string(),
+                "worker-runs/v1".to_string(),
+                "scope-workdir/v1".to_string(),
+                "page-collect/v1".to_string(),
+            ]
         );
         assert!(capabilities.requires.is_empty());
         let wire = serde_json::to_value(&manifest).unwrap();
         assert_eq!(
             wire.pointer("/capabilities/provides"),
-            Some(&serde_json::json!(["tool-provider/v1", "call-modes/v1"]))
+            Some(&serde_json::json!([
+                "tool-provider/v1",
+                "call-modes/v1",
+                "flow-scopes/v1",
+                "worker-runs/v1",
+                "scope-workdir/v1",
+                "page-collect/v1"
+            ]))
         );
     }
 
@@ -853,6 +921,10 @@ mod tests {
                     &ManagementOperationKind::Query,
                 ),
                 (
+                    super::super::diagnostics_findings::OPERATION,
+                    &ManagementOperationKind::Query,
+                ),
+                (
                     crate::commands::memory_census::MEMORY_CENSUS_OPERATION,
                     &ManagementOperationKind::Query,
                 ),
@@ -878,6 +950,18 @@ mod tests {
                 ),
                 (
                     crate::backup::purge::BACKUPS_PURGE_OPERATION,
+                    &ManagementOperationKind::Mutate,
+                ),
+                (
+                    crate::page_collect::COLLECT_OPERATION,
+                    &ManagementOperationKind::Mutate,
+                ),
+                (
+                    crate::page_collect::READ_OPERATION,
+                    &ManagementOperationKind::Query,
+                ),
+                (
+                    crate::page_collect::RELEASE_OPERATION,
                     &ManagementOperationKind::Mutate,
                 ),
             ]
@@ -1093,7 +1177,7 @@ mod tests {
         assert_eq!(
             top.insert(
                 "capabilities".to_string(),
-                json!({"provides": ["tool-provider/v1", "call-modes/v1"], "requires": [], "must_never_reach": []}),
+                json!({"provides": ["tool-provider/v1", "call-modes/v1", "flow-scopes/v1", "worker-runs/v1", "scope-workdir/v1", "page-collect/v1"], "requires": [], "must_never_reach": []}),
             ),
             None
         );
@@ -1107,8 +1191,9 @@ mod tests {
             management.insert("concurrency".to_string(), json!("module_managed")),
             None
         );
-        // The snapshot predates the gh shim relay operations and the backup
-        // purge, so they are appended to its management operation list here.
+        // The snapshot predates the gh shim relay operations, the backup purge
+        // and the page-bundle operations, so they are appended to its
+        // management operation list here.
         // It also predates `bash.kill_scope`, which the manifest lists first.
         let operations = management
             .get_mut("operations")
@@ -1118,17 +1203,34 @@ mod tests {
             0,
             json!({"name": crate::commands::bash_kill_scope::BASH_KILL_SCOPE_OPERATION, "kind": "mutate"}),
         );
+        operations.insert(
+            2,
+            json!({
+                "name": "diagnostics.findings", "kind": "query",
+                "description": "Read AFT's recorded health findings without scheduling work.",
+            }),
+        );
         operations.extend([
             json!({"name": crate::gh_shim_relay::BOT_REQUEST_OPERATION, "kind": "mutate"}),
             json!({"name": crate::gh_shim_relay::BINDINGS_READ_OPERATION, "kind": "query"}),
             json!({"name": crate::gh_shim_relay::SESSION_CONTEXT_OPERATION, "kind": "query"}),
             json!({"name": crate::gh_shim_relay::READ_REQUEST_OPERATION, "kind": "query"}),
             json!({"name": crate::backup::purge::BACKUPS_PURGE_OPERATION, "kind": "mutate"}),
+            json!({"name": crate::page_collect::COLLECT_OPERATION, "kind": "mutate"}),
+            json!({"name": crate::page_collect::READ_OPERATION, "kind": "query"}),
+            json!({"name": crate::page_collect::RELEASE_OPERATION, "kind": "mutate"}),
         ]);
         // AFT registers not-ready and flips itself ready after warm-up (see
         // `subc::readiness`); this is the only field readiness adds.
         let top = expected.as_object_mut().expect("manifest object");
         assert_eq!(top.insert("ready".to_string(), json!(false)), None);
+        assert_eq!(
+            top.insert(
+                "flow_operations".to_owned(),
+                json!(["diagnostics.findings"])
+            ),
+            None
+        );
         // The snapshot predates the bash companion tools, which the catalog
         // appends after `safety`.
         expected["provides"][0]["tools"]

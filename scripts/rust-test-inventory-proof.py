@@ -225,17 +225,47 @@ def parse_nextest_list(
     return entries
 
 
+# Integration shards run through .github/actions/integration-shard, which pins
+# three hash partitions on every platform.
+INTEGRATION_PARTITION_COUNT = 3
+
+
+def unit_partition_count() -> int:
+    """Return how many hash partitions the calling platform's lib/bin shards use.
+
+    Each platform runs a different number of libtest shard jobs, so the workflow
+    step that runs this proof passes that number in AFT_UNIT_PARTITION_COUNT.
+    The proof must partition the same way the shard jobs do, or it would prove
+    coverage for a split that never runs.
+    """
+    raw = os.environ.get("AFT_UNIT_PARTITION_COUNT", "3")
+    try:
+        count = int(raw)
+    except ValueError:
+        count = 0
+    if count < 1:
+        print(
+            f"AFT_UNIT_PARTITION_COUNT must be a positive integer, got {raw!r}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return count
+
+
 def partition_nextest_entries(
-    command: list[str], allowed_suite_kinds: set[str] | None = None
+    command: list[str],
+    allowed_suite_kinds: set[str] | None = None,
+    partition_count: int = INTEGRATION_PARTITION_COUNT,
 ) -> list[list[NextestEntry]]:
     entries = []
-    for shard in range(1, 4):
+    for shard in range(1, partition_count + 1):
+        partition = f"hash:{shard}/{partition_count}"
         command_args = [*command]
         if "--" in command_args:
             separator = command_args.index("--")
-            command_args[separator:separator] = ["--partition", f"hash:{shard}/3"]
+            command_args[separator:separator] = ["--partition", partition]
         else:
-            command_args.extend(["--partition", f"hash:{shard}/3"])
+            command_args.extend(["--partition", partition])
         entries.append(
             parse_nextest_list(
                 run_command(command_args, merge_stderr=False),
@@ -369,10 +399,16 @@ def verify_split_archives(
     bin_shardable_entries = parse_nextest_list(
         bin_source_output, {"bin"}, matching_tests_only=True
     )
-    lib_partitions = partition_nextest_entries(lib_command, {"lib"})
-    bin_partitions = partition_nextest_entries(bin_command, {"bin"})
+    unit_partitions_total = unit_partition_count()
+    lib_partitions = partition_nextest_entries(
+        lib_command, {"lib"}, unit_partitions_total
+    )
+    bin_partitions = partition_nextest_entries(
+        bin_command, {"bin"}, unit_partitions_total
+    )
     unit_partitions = [
-        [*lib_partitions[index], *bin_partitions[index]] for index in range(3)
+        [*lib_partitions[index], *bin_partitions[index]]
+        for index in range(unit_partitions_total)
     ]
     unit_shardable_entries = [*lib_shardable_entries, *bin_shardable_entries]
     integration_shardable_entries = parse_nextest_list(
@@ -443,7 +479,8 @@ def verify_split_archives(
     )
     print(f"Doctest cases in split inventory: {len(doc_entries)}")
     print(
-        "Hash partition counts: "
+        f"Hash partition counts (lib/bin hash:K/{unit_partitions_total}, "
+        f"integration hash:K/{INTEGRATION_PARTITION_COUNT}): "
         f"nextest-lib={','.join(str(len(partition)) for partition in lib_partitions)}; "
         f"nextest-bin={','.join(str(len(partition)) for partition in bin_partitions)}; "
         f"nextest-integration={','.join(str(len(partition)) for partition in integration_partitions)}"
@@ -615,8 +652,9 @@ unit_bin_partition_output = run_command(unit_bin_partition_command, merge_stderr
 unit_bin_shardable_entries = parse_nextest_list(
     unit_bin_partition_output, {"lib", "bin"}, matching_tests_only=True
 )
+unit_bin_partitions_total = unit_partition_count()
 unit_bin_partitions = partition_nextest_entries(
-    unit_bin_partition_command, {"lib", "bin"}
+    unit_bin_partition_command, {"lib", "bin"}, unit_bin_partitions_total
 )
 serial_tls_candidates = [
     entry
@@ -752,7 +790,8 @@ print(
 print(f"Watcher tests in nextest inventory: {len(watcher_in_nextest)}")
 print(f"Doctest cases in baseline inventory: {len(doc_baseline_entries)}")
 print(
-    "Hash partition counts: "
+    f"Hash partition counts (lib/bin hash:K/{unit_bin_partitions_total}, "
+    f"integration hash:K/{INTEGRATION_PARTITION_COUNT}): "
     f"nextest-lib-bin={','.join(str(len(partition)) for partition in unit_bin_partitions)}; "
     f"nextest-integration={','.join(str(len(partition)) for partition in nextest_partitions)}"
 )

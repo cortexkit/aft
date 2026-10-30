@@ -33,6 +33,8 @@ use aft::migration::prune_legacy::{
     prune_legacy, CensusFinding, ProcessCensus, PruneExit, PruneObserver, PruneOptions,
     OPERATOR_CONTRACT, PRUNE_DIR_PREFIX,
 };
+use aft::migration::v3_import::LegacyArtifact;
+use aft::migration::v3_ledger::{run_v3_import, ArtifactOutcome, V3ImportRequest, V3Ledger};
 use aft::search_index::SearchIndex;
 use aft::semantic_index::{EmbedTextCaps, SemanticIndex, SemanticIndexFingerprint};
 use aft::views::first_load::{ConfiguredMembershipWalker, MembershipWalker};
@@ -142,6 +144,7 @@ fn write_legacy_set(storage: &Path, root: &Path, key: &str, max_file_size: u64) 
 fn full_request(storage: &Path, root: &Path) -> ImportRequest {
     let producer = producer();
     ImportRequest {
+        durable_storage: storage.to_path_buf(),
         storage: storage.to_path_buf(),
         family: KEY.to_owned(),
         legacy_key: KEY.to_owned(),
@@ -161,6 +164,7 @@ fn full_request(storage: &Path, root: &Path) -> ImportRequest {
 fn lane_request(storage: &Path, root: &Path, key: &str) -> ImportRequest {
     let producer = producer();
     ImportRequest {
+        durable_storage: storage.to_path_buf(),
         storage: storage.to_path_buf(),
         family: key.to_owned(),
         legacy_key: key.to_owned(),
@@ -230,7 +234,11 @@ fn assert_same(
 fn current_generation(storage: &Path, root: &Path) -> Option<String> {
     FamilyRegistry::open(storage, KEY)
         .unwrap()
-        .register_view(SCOPE, root)
+        .register_view_with_storage(
+            FamilyRegistry::open(storage, KEY).unwrap().storage(),
+            SCOPE,
+            root,
+        )
         .unwrap()
         .view_store()
         .unwrap()
@@ -461,6 +469,8 @@ fn a_repeated_import_is_a_no_op() {
     write_legacy_set(&storage, &root, KEY, POLICY.max_file_size);
     let first = run_import(&full_request(&storage, &root), None).unwrap();
     assert_eq!(first.outcome, ImportOutcome::Completed);
+    // The no-op audit starts after the first import's background maintenance.
+    aft::views::wait_for_generation_maintenance_for_test(&storage.join("views/v2").join(SCOPE));
     let before = tree(&storage);
     let again = run_import(&full_request(&storage, &root), None).unwrap();
     assert_eq!(again.outcome, ImportOutcome::AlreadyComplete);
@@ -602,7 +612,11 @@ fn an_incompatible_cache_is_rebuilt_not_relabelled() {
     assert!(trigram.is_none_or(|store| store.usage().unwrap().rows == 0));
     let registration = FamilyRegistry::open(&storage, KEY)
         .unwrap()
-        .register_view(SCOPE, &root)
+        .register_view_with_storage(
+            FamilyRegistry::open(&storage, KEY).unwrap().storage(),
+            SCOPE,
+            &root,
+        )
         .unwrap();
     let store = registration.view_store().unwrap();
     let manifest = store
@@ -660,7 +674,15 @@ fn result_rows(root: &Path, results: &[aft::semantic_index::SemanticResult]) -> 
 /// Loads and fills the production semantic lane runtime for `root`, and
 /// returns how many texts it embedded and its answer to `query`.
 fn lane_fill(storage: &Path, root: &Path, key: &str, query: &str) -> (usize, Vec<Row>) {
-    let lane = CheckoutSemantic::new(storage, key, SCOPE, root, producer(), Weak::new()).unwrap();
+    let lane = CheckoutSemantic::new(
+        &aft::root_cache::StoragePaths::same(storage),
+        key,
+        SCOPE,
+        root,
+        producer(),
+        Weak::new(),
+    )
+    .unwrap();
     lane.load().unwrap();
     let mut embedded = 0;
     let mut counting = |texts: Vec<String>| {
@@ -690,8 +712,27 @@ fn migrated_planes_equal_a_cold_rebuild() {
 
     let storage = base.path().join("storage");
     write_legacy_set(&storage, &root, KEY, POLICY.max_file_size);
-    let report = run_import(&lane_request(&storage, &root, KEY), None).unwrap();
-    assert_eq!(report.semantic_files, FILES.len(), "{report:?}");
+    // The views-on lane is a v3 member, so its legacy set is imported into
+    // the family's v3 planes, as views-on configure does.
+    let report = run_v3_import(
+        &V3ImportRequest::full_plane(
+            storage.clone(),
+            KEY.to_owned(),
+            KEY.to_owned(),
+            root.clone(),
+            POLICY,
+            Some(producer()),
+        ),
+        None,
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            report.outcomes.get(&LegacyArtifact::Semantic),
+            Some(ArtifactOutcome::Done { skipped: 0, .. })
+        ),
+        "{report:?}"
+    );
     let (embedded, rows) = lane_fill(&storage, &root, KEY, query);
     assert_eq!(
         embedded, 0,
@@ -786,6 +827,8 @@ fn prune_fixture(base: &Path) -> PathBuf {
     write_legacy_set(&storage, &root, "familyb", POLICY.max_file_size);
     let report = run_import(&lane_request(&storage, &root, KEY), None).unwrap();
     assert_eq!(report.outcome, ImportOutcome::Completed);
+    // Pruning is audited independently of the publication that built the fixture.
+    aft::views::wait_for_generation_maintenance_for_test(&storage.join("views/v2").join(SCOPE));
     for (path, bytes) in [
         ("semantic/models/model.onnx", &b"model"[..]),
         ("backups/session/one.bak", &b"backup"[..]),
@@ -1543,9 +1586,15 @@ mod production {
             "{during:#}"
         );
         assert_ne!(during["complete"], true, "{during:#}");
-        let ledger = ImportLedger::open_existing(&storage, &key).unwrap();
+        // The views-on lane imports into the family's v3 planes through the
+        // v3 ledger (the family is the legacy key).
+        let ledger = V3Ledger::new(&storage, &key).unwrap();
         assert!(
-            ledger.is_none_or(|ledger| !ledger.status().unwrap().complete),
+            ledger
+                .rows()
+                .unwrap()
+                .iter()
+                .all(|row| row.state != ImportState::Done),
             "the import ran before it was admitted"
         );
 
@@ -1562,14 +1611,17 @@ mod production {
             legacy_texts,
             "the views-on lane re-embedded content the legacy index already held"
         );
-        let status = ImportLedger::read_status(&storage, &key).unwrap().unwrap();
-        assert!(status.complete, "{status:?}");
-        let semantic = status
-            .rows
+        let rows = ledger.rows().unwrap();
+        let semantic = rows
             .iter()
-            .find(|row| row.artifact == Artifact::Semantic)
+            .find(|row| row.key.artifact == LegacyArtifact::Semantic)
             .unwrap();
         assert_eq!(semantic.state, ImportState::Done, "{semantic:?}");
+        // Writer stop: the views-on lane no longer imports through the v2
+        // import ledger into the v2 family stores.
+        assert!(ImportLedger::open_existing(&storage, &key)
+            .unwrap()
+            .is_none());
         let after = search(&ctx, "evict the oldest cache entry");
         assert!(
             after["results"]

@@ -344,13 +344,19 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // --- Write, format, validate ---
     let _mutation = crate::runtime_drain::record_file_mutation(ctx, [path.as_path()]);
-    let mut write_result =
-        match edit::write_format_validate(&path, &new_source, &ctx.config(), &req.params) {
-            Ok(r) => r,
-            Err(e) => {
-                return Response::error(&req.id, e.code(), e.to_string());
-            }
-        };
+    let tool_policy = &crate::sandbox_spawn::ToolLaunchPolicy::for_request(ctx);
+    let mut write_result = match edit::write_format_validate(
+        tool_policy,
+        &path,
+        &new_source,
+        &ctx.config(),
+        &req.params,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
+    };
 
     // Honesty: write_format_validate reverts the file when the extraction
     // produced invalid syntax (e.g. extracting a class method emits a bare
@@ -764,7 +770,14 @@ mod audit11_regressions {
             format_on_edit: false,
             ..Default::default()
         };
-        edit::write_format_validate(&path, &content, &config, &serde_json::json!({})).unwrap();
+        edit::write_format_validate(
+            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &path,
+            &content,
+            &config,
+            &serde_json::json!({}),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(path).unwrap(), "\u{feff}function helper() {\r\n  run();\r\n}\r\n\r\nfunction outer() {\r\n  helper();\r\n}\r\n".as_bytes());
     }
 }

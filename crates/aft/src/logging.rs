@@ -6,6 +6,7 @@
 use crate::bash_background::process::is_process_alive;
 use crate::executor::Executor;
 use crate::run_tool_call::{ToolCallPhaseDurations, WaitingOn};
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 #[cfg(unix)]
@@ -13,11 +14,18 @@ use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
+
+mod stderr_mirror;
+
+static SUBC_LOGGING: AtomicBool = AtomicBool::new(false);
+static STDERR_MIRROR: OnceLock<stderr_mirror::Mirror> = OnceLock::new();
+static STDERR_MIRROR_HEALTH: LazyLock<Arc<stderr_mirror::MirrorHealth>> =
+    LazyLock::new(|| Arc::new(stderr_mirror::MirrorHealth::default()));
 
 /// Maximum size of an active Rust or plugin log before its single backup rotates in.
 const LOG_FILE_BYTES: u64 = 32 * 1024 * 1024;
@@ -251,25 +259,37 @@ static INDEX_EVENT_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 thread_local! {
-    static LOG_LINE_CAPTURE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    static LOG_LINE_CAPTURE: RefCell<Option<Arc<Mutex<Vec<String>>>>> = const { RefCell::new(None) };
 }
 
 #[cfg(test)]
 pub(crate) fn capture_log_lines<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    let result = capture_log_lines_into(capture.clone(), f);
+    let lines = capture.lock().unwrap().clone();
+    (result, lines)
+}
+
+/// Share a worker thread's captured records with the test while it is running.
+#[cfg(test)]
+pub(crate) fn capture_log_lines_into<R>(
+    capture: Arc<Mutex<Vec<String>>>,
+    f: impl FnOnce() -> R,
+) -> R {
     // Keep the test representative of a libtest process where another test
     // may already have installed the global logger.
     let _ = env_logger::builder().is_test(true).try_init();
-    LOG_LINE_CAPTURE.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    let previous = LOG_LINE_CAPTURE.with(|slot| slot.replace(Some(capture)));
     let result = f();
-    let lines = LOG_LINE_CAPTURE.with(|slot| slot.borrow_mut().take().unwrap_or_default());
-    (result, lines)
+    LOG_LINE_CAPTURE.with(|slot| slot.replace(previous));
+    result
 }
 
 #[cfg(test)]
 fn capture_log_line(level: log::Level, line: &str) {
     LOG_LINE_CAPTURE.with(|slot| {
-        if let Some(lines) = slot.borrow_mut().as_mut() {
-            lines.push(format!("{level} {line}"));
+        if let Some(lines) = slot.borrow().as_ref() {
+            lines.lock().unwrap().push(format!("{level} {line}"));
         }
     });
 }
@@ -427,28 +447,37 @@ fn sanitize_index_value(value: &str) -> String {
     out
 }
 
-fn push_index_field(line: &mut String, key: &str, value: &str) {
+fn push_index_field(line: &mut String, key: &str, value: &str, max_bytes: usize) {
     let sanitized = sanitize_index_value(value);
     let addition = format!(" {key}={sanitized}");
-    if line.len() + addition.len() > INDEX_EVENT_MAX_BYTES {
+    if line.len() + addition.len() > max_bytes {
         return;
     }
     line.push_str(&addition);
 }
 
-/// Keep the distinctive suffix of a long root so the five required fields still fit.
+/// Keep the last two components when possible, with a stable hash to distinguish worktrees.
 fn left_truncate_root(root: &str, max_bytes: usize) -> String {
-    const MARKER: &str = "...";
     if root.len() <= max_bytes {
         return root.to_string();
     }
-    let max_bytes = max_bytes.max(MARKER.len());
-    let keep = max_bytes.saturating_sub(MARKER.len());
-    let mut start = root.len().saturating_sub(keep);
+    let hash = format!("{:x}", Sha256::digest(root.as_bytes()));
+    let marker = format!(".../{}", &hash[..8]);
+    if max_bytes <= marker.len() {
+        return marker[..max_bytes].to_string();
+    }
+    let root = root.trim_end_matches('/');
+    let suffix_start = root.rmatch_indices('/').nth(1).map_or(0, |(i, _)| i + 1);
+    let keep = max_bytes.saturating_sub(marker.len() + 1);
+    let mut start = suffix_start.max(root.len().saturating_sub(keep));
     while start < root.len() && !root.is_char_boundary(start) {
         start += 1;
     }
-    format!("{MARKER}{}", &root[start..])
+    if start == root.len() {
+        marker
+    } else {
+        format!("{marker}/{}", &root[start..])
+    }
 }
 
 fn format_index_event_line(event: &IndexEvent) -> String {
@@ -459,17 +488,28 @@ fn format_index_event_line(event: &IndexEvent) -> String {
     let mut root = sanitize_index_value(&normalize_index_root(&event.root));
     let prefix = format!("index_event kind={kind} plane={plane} build_id={build_id} root=");
     let key_field = format!(" key={key}");
+    // Reserve measurements before descriptive fields, and give the root only the
+    // remaining bytes. Keep root/key in their current positions so existing readers
+    // can parse the record.
+    let extra_budget = INDEX_EVENT_MAX_BYTES
+        .saturating_sub(prefix.len() + key_field.len())
+        .saturating_sub(root.len().min(".../00000000".len()));
+    let mut extra_fields = String::new();
+    for numeric in [true, false] {
+        for (key, value) in &event.extra {
+            if value.parse::<u64>().is_ok() == numeric {
+                push_index_field(&mut extra_fields, key, value, extra_budget);
+            }
+        }
+    }
     let root_budget = INDEX_EVENT_MAX_BYTES
         .saturating_sub(prefix.len())
-        .saturating_sub(key_field.len());
+        .saturating_sub(key_field.len())
+        .saturating_sub(extra_fields.len());
     if root.len() > root_budget {
         root = left_truncate_root(&root, root_budget);
     }
-    let mut line = format!("{prefix}{root}{key_field}");
-    for (key, value) in &event.extra {
-        push_index_field(&mut line, key, value);
-    }
-    line
+    format!("{prefix}{root}{key_field}{extra_fields}")
 }
 
 fn root_plane_key(root: &Path, plane: IndexPlane) -> (String, IndexPlane) {
@@ -880,6 +920,28 @@ pub(crate) fn capture_index_events<R>(f: impl FnOnce() -> R) -> (R, Vec<String>)
 
 /// Initialize the `RUST_LOG`-filtered stderr logger and its additive file sink.
 pub fn init() {
+    init_with_stderr_mode(false);
+}
+
+/// Initialize logging before the supervised module starts its frame runtime.
+/// Stderr is a bounded best-effort mirror; the independent file sink is unchanged.
+pub fn init_subc() {
+    init_with_stderr_mode(true);
+}
+
+fn init_with_stderr_mode(subc: bool) {
+    SUBC_LOGGING.store(subc, Ordering::Relaxed);
+    if subc {
+        STDERR_MIRROR.get_or_init(|| {
+            stderr_mirror::Mirror::spawn(
+                io::stderr(),
+                stderr_mirror::QUEUE_CAPACITY,
+                Arc::clone(&STDERR_MIRROR_HEALTH),
+            )
+            .map(|(mirror, _worker)| mirror)
+            .unwrap_or_else(|_| stderr_mirror::Mirror::disabled(Arc::clone(&STDERR_MIRROR_HEALTH)))
+        });
+    }
     let storage_root = crate::bash_background::storage_dir(None);
     let logs_dir = storage_root.join("logs");
     let file_name = format!("aft-{}.log", std::process::id());
@@ -915,7 +977,7 @@ pub fn init() {
         });
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .target(env_logger::Target::Pipe(Box::new(TeeWriter { file_tx })))
+        .target(env_logger::Target::Pipe(Box::new(TeeWriter::new(file_tx))))
         .format(|buf, record| {
             // Wall-clock stamp so post-hoc log forensics can correlate
             // lines with external events (health probes, module bounces).
@@ -936,6 +998,11 @@ pub fn init() {
     if let Some(summary) = startup_sweep {
         log_sweep_summary(summary);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn subc_stderr_tee_for_test() -> impl Write + Send {
+    TeeWriter::new(None)
 }
 
 /// Log before delegating to the previous hook. Do not change RUST_BACKTRACE:
@@ -987,6 +1054,29 @@ pub(crate) fn daemon_log_path() -> PathBuf {
         .unwrap_or_else(|| crate::bash_background::storage_dir(None));
     root.join("logs")
         .join(format!("aft-{}.log", std::process::id()))
+}
+
+/// The standalone gh shim runs before logger initialization. Preserve its rare
+/// authority diagnostics in the process log without adding agent-visible stderr.
+pub(crate) fn write_preinit_warning(message: &str) -> io::Result<()> {
+    write_preinit_warning_to(&daemon_log_path(), message)
+}
+
+fn write_preinit_warning_to(path: &Path, message: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        create_private_log_dir(parent)?;
+    }
+    let mut line = Vec::new();
+    write_log_line(
+        &mut line,
+        &format_utc_timestamp(),
+        log::Level::Warn,
+        "aft::gh_shim_speech",
+        &format_args!("{message}"),
+    )?;
+    let mut file = open_private_log_file(path, false)?;
+    file.write_all(&crate::log_redact::aft_redact_bytes(&line))?;
+    file.sync_all()
 }
 
 fn bounded_panic_text(args: std::fmt::Arguments<'_>, max_bytes: usize) -> String {
@@ -1161,7 +1251,11 @@ static LOG_WRITE_HEALTH: LazyLock<Arc<LogWriteHealth>> =
 /// recovery markers count the latter over each write outage. Partial writes
 /// cannot confirm a record, so an errored batch is counted in full.
 pub fn durable_log_health() -> serde_json::Value {
-    LOG_WRITE_HEALTH.snapshot()
+    let mut health = LOG_WRITE_HEALTH.snapshot();
+    let mut mirror = STDERR_MIRROR_HEALTH.snapshot();
+    mirror["best_effort"] = SUBC_LOGGING.load(Ordering::Relaxed).into();
+    health["stderr_mirror"] = mirror;
+    health
 }
 
 impl LogWriteHealth {
@@ -1326,13 +1420,62 @@ static FILE_CONTROL: LazyLock<Mutex<FileControl>> =
 
 struct TeeWriter {
     file_tx: Option<SyncSender<LogMessage>>,
+    stderr: StderrOutput,
+}
+
+impl TeeWriter {
+    fn new(file_tx: Option<SyncSender<LogMessage>>) -> Self {
+        Self {
+            file_tx,
+            stderr: StderrOutput::for_process(),
+        }
+    }
+}
+
+enum StderrOutput {
+    Standalone,
+    Subc(stderr_mirror::Mirror),
+}
+
+impl StderrOutput {
+    fn for_process() -> Self {
+        if SUBC_LOGGING.load(Ordering::Relaxed) {
+            Self::Subc(STDERR_MIRROR.get().cloned().unwrap_or_else(|| {
+                stderr_mirror::Mirror::disabled(Arc::clone(&STDERR_MIRROR_HEALTH))
+            }))
+        } else {
+            Self::Standalone
+        }
+    }
+}
+
+impl Write for StderrOutput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Standalone => {
+                let _ = io::stderr().write_all(bytes);
+            }
+            Self::Subc(mirror) => mirror.record(bytes),
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Standalone => {
+                let _ = io::stderr().flush();
+            }
+            Self::Subc(mirror) => mirror.flush(),
+        }
+        Ok(())
+    }
 }
 
 impl Write for TeeWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // Mask credentials once, before either copy is written. The stderr copy
-        // is durable too: in standalone mode the plugin relays it into its own
-        // log file.
+        // Mask credentials before either copy. Standalone writes stderr
+        // synchronously so the plugin can save it in its log; subc uses the
+        // best-effort mirror.
         let line = crate::log_redact::aft_redact_bytes(buf);
         // The durable file copy goes first and does not depend on stderr: in
         // subc mode stderr is a pipe the daemon reads, and once the daemon is
@@ -1340,12 +1483,12 @@ impl Write for TeeWriter {
         // return early here and drop the file copy too, which is how a module
         // exit could leave no line explaining it.
         enqueue_file_line(&mut self.file_tx, &line, &LOG_WRITE_HEALTH);
-        let _ = io::stderr().write_all(&line);
+        let _ = self.stderr.write_all(&line);
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        let _ = io::stderr().flush();
+        let _ = self.stderr.flush();
         Ok(())
     }
 }
@@ -1464,7 +1607,14 @@ fn run_file_writer<S: FileLogSink>(
 }
 
 fn write_stderr_once(message: &str) {
-    let _ = io::stderr().write_all(message.as_bytes());
+    write_stderr_diagnostic(message);
+}
+
+/// Emit a process diagnostic without making subc callers wait on its stderr pipe.
+/// Standalone retains its synchronous stderr behavior.
+pub fn write_stderr_diagnostic(message: &str) {
+    let line = crate::log_redact::aft_redact_bytes(message.as_bytes());
+    let _ = StderrOutput::for_process().write_all(&line);
 }
 
 /// Wait, at most `timeout`, until the durable log writer has written every line
@@ -1493,6 +1643,24 @@ pub fn flush_durable_log(timeout: std::time::Duration) -> bool {
     done_rx.recv_timeout(timeout).unwrap_or(false)
 }
 
+/// Wait only during process exit for the queued stderr flush fence.
+/// File-log durability is a separate fence; ordinary log flushes never wait here.
+pub fn flush_stderr_on_exit(timeout: std::time::Duration) -> bool {
+    STDERR_MIRROR
+        .get()
+        .is_none_or(|mirror| mirror.drain_on_exit(timeout))
+}
+
+/// Test-only (debug builds): stop the stderr mirror from writing until
+/// [`flush_stderr_on_exit`] starts, so the lines logged in between are still
+/// queued when the exit fence runs. Without the fence they would be lost.
+#[cfg(debug_assertions)]
+pub fn hold_stderr_mirror_until_exit_fence() {
+    if let Some(mirror) = STDERR_MIRROR.get() {
+        mirror.hold_until_exit_fence();
+    }
+}
+
 /// Persist the last process-exit line without depending on the async writer.
 /// Taking its active sink prevents later rotation or reconfiguration from
 /// moving the marker. Queued diagnostics may be abandoned once their bounded
@@ -1513,7 +1681,7 @@ pub fn write_terminal_log_sync(message: &str) -> io::Result<()> {
     if let Some(mut writer) = sink.writer.take() {
         writer.flush()?;
     }
-    write_terminal_line(&sink, &mut io::stderr(), message)
+    write_terminal_line(&sink, &mut StderrOutput::for_process(), message)
 }
 
 fn write_terminal_line(
@@ -2253,13 +2421,14 @@ pub fn note_tool_call_trace(
 
     let waiting_on_build_id = phases.waiting_on_build_id.as_deref().unwrap_or("-");
     crate::slog_debug!(
-        "tool_call phase name={} session={} channel={} corr={} total_ms={:.3} queue_ms={:.3} translate_ms={:.3} exec_ms={:.3} format_ms={:.3} finalize_ms={:.3} egress_ms={:.3} egress_enqueue_ms={:.3} egress_queue_ms={:.3} egress_prepare_ms={:.3} egress_write_ms={:.3} frame_bytes={} writer_queue_depth={} writer_active={} writer_queue_full={} reserve_timeouts={} waiting_on={} waiting_on_build_id={} wait_ms={} root={}",
+        "tool_call phase name={} session={} channel={} corr={} total_ms={:.3} queue_ms={:.3} setup_ms={:.3} translate_ms={:.3} exec_ms={:.3} format_ms={:.3} finalize_ms={:.3} egress_ms={:.3} egress_enqueue_ms={:.3} egress_queue_ms={:.3} egress_prepare_ms={:.3} egress_write_ms={:.3} frame_bytes={} writer_queue_depth={} writer_active={} writer_queue_full={} reserve_timeouts={} waiting_on={} waiting_on_build_id={} wait_ms={} root={}",
         name,
         session,
         channel,
         corr,
         duration_millis_f64(phases.total),
         duration_millis_f64(phases.queue),
+        duration_millis_f64(phases.setup),
         duration_millis_f64(phases.translate),
         duration_millis_f64(phases.execute),
         duration_millis_f64(phases.format),
@@ -2280,7 +2449,15 @@ pub fn note_tool_call_trace(
         root.display(),
     );
 
-    if phases.total > SLOW_TOOL_CALL_THRESHOLD {
+    // Waiting tools do not separate their requested wait from execution work.
+    // Exclude that whole phase rather than warning about an intentional wait;
+    // queueing, translation, formatting and transport delays still warrant a warning.
+    let diagnostic_elapsed = if phases.intentional_wait {
+        phases.total.saturating_sub(phases.execute)
+    } else {
+        phases.total
+    };
+    if diagnostic_elapsed > SLOW_TOOL_CALL_THRESHOLD {
         let level = slow_tool_call_level(caller);
         // The argument shape and edit phase times go before `root=`, which
         // stays last because a root path may contain spaces.
@@ -2294,22 +2471,23 @@ pub fn note_tool_call_trace(
             detail.push_str(edit_phases);
         }
         let message = format!(
-            "slow tool_call name={} session={} channel={} corr={} total={}ms queue={} translate={} exec={} format={} finalize={} egress={} egress_enqueue={} egress_queue={} egress_prepare={} egress_write={} frame_bytes={} writer_queue_depth={} writer_active={} writer_queue_full={} reserve_timeouts={} waiting_on={} waiting_on_build_id={} wait_ms={}{} root={}",
+            "slow tool_call name={} session={} channel={} corr={} total={}ms queue={} setup={} translate={} exec={} format={} finalize={} egress={} egress_enqueue={} egress_queue={} egress_prepare={} egress_write={} frame_bytes={} writer_queue_depth={} writer_active={} writer_queue_full={} reserve_timeouts={} waiting_on={} waiting_on_build_id={} wait_ms={}{} root={}",
             name,
             session,
             channel,
             corr,
             duration_millis_u64(phases.total),
-            duration_millis_u64(phases.queue),
-            duration_millis_u64(phases.translate),
-            duration_millis_u64(phases.execute),
-            duration_millis_u64(phases.format),
-            duration_millis_u64(phases.finalize),
-            duration_millis_u64(phases.egress),
-            duration_millis_u64(phases.egress_enqueue),
-            duration_millis_u64(phases.egress_queue),
-            duration_millis_u64(phases.egress_prepare),
-            duration_millis_u64(phases.egress_write),
+            slow_phase_time(phases.queue, None),
+            slow_phase_time(phases.setup, phases.cpu.setup),
+            slow_phase_time(phases.translate, phases.cpu.translate),
+            slow_phase_time(phases.execute, phases.cpu.execute),
+            slow_phase_time(phases.format, phases.cpu.format),
+            slow_phase_time(phases.finalize, phases.cpu.finalize),
+            slow_phase_time(phases.egress, None),
+            slow_phase_time(phases.egress_enqueue, None),
+            slow_phase_time(phases.egress_queue, None),
+            slow_phase_time(phases.egress_prepare, phases.cpu.egress_prepare),
+            slow_phase_time(phases.egress_write, None),
             phases.frame_bytes,
             phases.writer_queue_depth,
             phases.writer_active_at_enqueue,
@@ -2325,6 +2503,19 @@ pub fn note_tool_call_trace(
         SLOW_TOOL_CALL_CAPTURE
             .with(|captured| captured.borrow_mut().push((level, message.clone())));
         log::log!(level, "{}{}", crate::log_ctx::session_prefix(), message);
+    }
+}
+
+fn slow_phase_time(wall: Duration, cpu: Option<Duration>) -> String {
+    // Fractional milliseconds keep microsecond translation work visible beside
+    // scheduling delay. Unknown CPU is explicit, not a misleading zero.
+    match cpu {
+        Some(cpu) => format!(
+            "{:.3}ms/cpu={:.3}ms",
+            duration_millis_f64(wall),
+            duration_millis_f64(cpu)
+        ),
+        None => format!("{:.3}ms/cpu=?", duration_millis_f64(wall)),
     }
 }
 
@@ -2351,9 +2542,17 @@ pub fn perf_tick(executor: Option<&Executor>) {
     });
 
     let completion_counts = executor.map_or((0, 0), Executor::completion_counts);
-    let tool_call_count = PERF.tool_call_count.load(Ordering::Relaxed);
+    report_perf_tick(&PERF, sample, completion_counts);
+}
+
+fn report_perf_tick(
+    perf: &PerfMetrics,
+    sample: Option<ExecutorSample>,
+    completion_counts: (u64, u64),
+) {
+    let tool_call_count = perf.tool_call_count.load(Ordering::Relaxed);
     let (completed_interactive, completed_maintenance, new_tool_calls) = {
-        let Ok(mut reporter) = PERF.reporter.lock() else {
+        let Ok(mut reporter) = perf.reporter.lock() else {
             return;
         };
         if reporter.last_report.elapsed() < perf_tick_interval() {
@@ -2375,22 +2574,22 @@ pub fn perf_tick(executor: Option<&Executor>) {
         completed
     };
 
-    let watcher_ingested = PERF.watcher_ingested.swap(0, Ordering::Relaxed);
-    let watcher_paths = PERF.watcher_paths.swap(0, Ordering::Relaxed);
-    let watcher_dropped = PERF.watcher_dropped.swap(0, Ordering::Relaxed);
-    let drain_slices = PERF.drain_slices.swap(0, Ordering::Relaxed);
-    let semantic_collects = PERF.semantic_collects.swap(0, Ordering::Relaxed);
-    let semantic_files = PERF.semantic_files.swap(0, Ordering::Relaxed);
-    let semantic_chunks = PERF.semantic_chunks.swap(0, Ordering::Relaxed);
-    let semantic_ms = PERF.semantic_ms.swap(0, Ordering::Relaxed);
-    let callgraph_invalidations = PERF.callgraph_invalidations.swap(0, Ordering::Relaxed);
-    let file_lines_dropped = PERF.file_lines_dropped.swap(0, Ordering::Relaxed);
-    let tier2 = PERF
+    let watcher_ingested = perf.watcher_ingested.swap(0, Ordering::Relaxed);
+    let watcher_paths = perf.watcher_paths.swap(0, Ordering::Relaxed);
+    let watcher_dropped = perf.watcher_dropped.swap(0, Ordering::Relaxed);
+    let drain_slices = perf.drain_slices.swap(0, Ordering::Relaxed);
+    let semantic_collects = perf.semantic_collects.swap(0, Ordering::Relaxed);
+    let semantic_files = perf.semantic_files.swap(0, Ordering::Relaxed);
+    let semantic_chunks = perf.semantic_chunks.swap(0, Ordering::Relaxed);
+    let semantic_ms = perf.semantic_ms.swap(0, Ordering::Relaxed);
+    let callgraph_invalidations = perf.callgraph_invalidations.swap(0, Ordering::Relaxed);
+    let file_lines_dropped = perf.file_lines_dropped.swap(0, Ordering::Relaxed);
+    let tier2 = perf
         .tier2
         .lock()
         .map(|mut tier2| std::mem::take(&mut *tier2))
         .unwrap_or_default();
-    let tool_calls = PERF
+    let tool_calls = perf
         .tool_calls
         .lock()
         .map(|samples| summarize_tool_calls(&samples))
@@ -2405,7 +2604,6 @@ pub fn perf_tick(executor: Option<&Executor>) {
     let active = watcher_ingested > 0
         || watcher_paths > 0
         || watcher_dropped > 0
-        || drain_slices > 0
         || semantic_collects > 0
         || callgraph_invalidations > 0
         || completed_interactive > 0
@@ -2534,6 +2732,19 @@ fn perf_tick_interval() -> Duration {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn gh_shim_preinit_warning_is_durable_and_file_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs").join("aft-shim.log");
+        super::write_preinit_warning_to(&path, "gh speech snapshot invalid: first").unwrap();
+        super::write_preinit_warning_to(&path, "gh speech snapshot invalid: second").unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].ends_with(" [aft] WARN gh speech snapshot invalid: first"));
+        assert!(lines[1].ends_with(" [aft] WARN gh speech snapshot invalid: second"));
+    }
+
+    #[test]
     fn terminal_sync_redacts_both_sinks() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("terminal.log");
@@ -2558,6 +2769,255 @@ mod tests {
     use super::*;
     use filetime::{set_file_mtime, FileTime};
     use tempfile::TempDir;
+
+    fn isolated_subc_stderr(test_name: &str, body: impl FnOnce()) {
+        // libtest's exact names omit the crate prefix from module_path!().
+        let test_name = test_name.split_once("::").unwrap().1;
+        const PROBE: &str = "AFT_TEST_LOGGING_STDERR_CHILD";
+        if std::env::var(PROBE).ok().as_deref() == Some(test_name) {
+            super::init_subc();
+            body();
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture", "--color=never"])
+            .env(PROBE, test_name)
+            .env("RUST_LOG", "off")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+            "stderr child failed: stdout={:?} stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn hold_stderr() -> (mpsc::Sender<()>, thread::JoinHandle<()>) {
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder = thread::spawn(move || {
+            let stderr = io::stderr();
+            let _held = stderr.lock();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        });
+        held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        (release_tx, holder)
+    }
+
+    #[test]
+    fn subc_file_writer_warning_does_not_wait_for_stderr() {
+        isolated_subc_stderr(
+            concat!(
+                module_path!(),
+                "::subc_file_writer_warning_does_not_wait_for_stderr"
+            ),
+            || {
+                struct ReconfigureFault(Arc<Mutex<Vec<u8>>>);
+                impl FileLogSink for ReconfigureFault {
+                    fn write_batch(&mut self, lines: &[Vec<u8>]) -> io::Result<()> {
+                        for line in lines {
+                            self.0.lock().unwrap().extend_from_slice(line);
+                        }
+                        Ok(())
+                    }
+                    fn reopen(&mut self) -> io::Result<()> {
+                        Ok(())
+                    }
+                    fn discard_buffer(&mut self) {}
+                    fn reconfigure(&mut self, _: &Path) -> io::Result<SweepSummary> {
+                        Err(io::Error::other("injected reconfigure failure"))
+                    }
+                }
+                let output = Arc::new(Mutex::new(Vec::new()));
+                let sink = Arc::new(Mutex::new(Some(ReconfigureFault(Arc::clone(&output)))));
+                let (tx, rx) = mpsc::sync_channel(4);
+                let (release, holder) = hold_stderr();
+                let worker = thread::spawn(move || {
+                    run_file_writer(
+                        sink,
+                        rx,
+                        Arc::new(LogWriteHealth::default()),
+                        Duration::ZERO,
+                    )
+                });
+                tx.send(LogMessage::Reconfigure(PathBuf::from("injected-log-root")))
+                    .unwrap();
+                tx.send(LogMessage::Write(b"after warning\n".to_vec()))
+                    .unwrap();
+                let (done, completed) = mpsc::sync_channel(1);
+                tx.send(LogMessage::Flush(done)).unwrap();
+                let progressed = completed.recv_timeout(Duration::from_secs(1));
+                let _ = release.send(());
+                holder.join().unwrap();
+                drop(tx);
+                worker.join().unwrap();
+                assert_eq!(
+                    progressed.ok(),
+                    Some(true),
+                    "file writer warning waited on stderr"
+                );
+                assert_eq!(&*output.lock().unwrap(), b"after warning\n");
+            },
+        );
+    }
+
+    #[test]
+    fn subc_terminal_mirror_does_not_wait_for_stderr() {
+        isolated_subc_stderr(
+            concat!(
+                module_path!(),
+                "::subc_terminal_mirror_does_not_wait_for_stderr"
+            ),
+            || {
+                let directory = tempfile::tempdir().unwrap();
+                let tx = FILE_CONTROL.lock().unwrap().tx.clone().unwrap();
+                tx.send(LogMessage::Reconfigure(directory.path().to_path_buf()))
+                    .unwrap();
+                assert!(writer_barrier(&tx));
+                let (release, holder) = hold_stderr();
+                let (done, completed) = mpsc::channel();
+                let caller = thread::spawn(move || {
+                    let _ = done.send(write_terminal_log_sync("held-terminal-stderr-probe"));
+                });
+                let result = completed.recv_timeout(Duration::from_secs(1));
+                let _ = release.send(());
+                holder.join().unwrap();
+                caller.join().unwrap();
+                assert!(
+                    matches!(result, Ok(Ok(()))),
+                    "terminal stderr blocked persistence: {result:?}"
+                );
+                let file = directory
+                    .path()
+                    .join("logs")
+                    .join(format!("aft-{}.log", std::process::id()));
+                assert!(fs::read_to_string(file)
+                    .unwrap()
+                    .contains("held-terminal-stderr-probe"));
+            },
+        );
+    }
+
+    #[test]
+    fn tee_and_process_diagnostics_cannot_bypass_transport_stderr_policy() {
+        let source = include_str!("logging.rs");
+        let tee = source
+            .split_once("impl Write for TeeWriter {")
+            .unwrap()
+            .1
+            .split_once("fn enqueue_file_line(")
+            .unwrap()
+            .0;
+        assert!(tee.contains("self.stderr.write_all"));
+        assert!(tee.contains("self.stderr.flush"));
+        assert!(!tee.contains("io::stderr"));
+        let diagnostics = source
+            .split_once("fn write_stderr_once(")
+            .unwrap()
+            .1
+            .split_once("pub fn flush_durable_log(")
+            .unwrap()
+            .0;
+        assert!(diagnostics.contains("StderrOutput::for_process()"));
+        assert!(!diagnostics.contains("io::stderr"));
+        let terminal = source
+            .split_once("pub fn write_terminal_log_sync(")
+            .unwrap()
+            .1
+            .split_once("fn write_terminal_line(")
+            .unwrap()
+            .0;
+        assert!(terminal.contains("StderrOutput::for_process()"));
+        assert!(!terminal.contains("io::stderr"));
+    }
+
+    #[test]
+    fn blocked_stderr_does_not_stop_redacted_file_logging_or_health() {
+        struct Gate {
+            entered: Option<mpsc::Sender<()>>,
+            release: mpsc::Receiver<()>,
+            bytes: Arc<Mutex<Vec<u8>>>,
+        }
+        impl Write for Gate {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if let Some(entered) = self.entered.take() {
+                    entered.send(()).unwrap();
+                    let _ = self.release.recv_timeout(Duration::from_secs(5));
+                }
+                self.bytes.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mirror-independent.log");
+        let sink = RotatingFile::open(path.clone(), 1024 * 1024, 1, 1).unwrap();
+        let (file_tx, file_rx) = mpsc::sync_channel(8);
+        let file_worker = thread::spawn(move || {
+            run_file_writer(
+                Arc::new(Mutex::new(Some(sink))),
+                file_rx,
+                Arc::new(LogWriteHealth::default()),
+                Duration::ZERO,
+            )
+        });
+        let health = Arc::new(stderr_mirror::MirrorHealth::default());
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (mirror, stderr_worker) = stderr_mirror::Mirror::spawn(
+            Gate {
+                entered: Some(entered_tx),
+                release: release_rx,
+                bytes: Arc::clone(&bytes),
+            },
+            1,
+            Arc::clone(&health),
+        )
+        .unwrap();
+        let mut tee = TeeWriter {
+            file_tx: Some(file_tx.clone()),
+            stderr: StderrOutput::Subc(mirror),
+        };
+        tee.write_all(b"Authorization: Bearer mirror-secret-value\n")
+            .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let start = Instant::now();
+        tee.write_all(b"Authorization: Bearer second-secret-value\n")
+            .unwrap();
+        tee.write_all(b"third\n").unwrap();
+        tee.flush().unwrap();
+        let snapshot = health.snapshot();
+        let elapsed = start.elapsed();
+        let file_progressed = writer_barrier(&file_tx);
+        let file = fs::read(&path).unwrap();
+        let _ = release_tx.send(());
+        drop(tee);
+        drop(file_tx);
+        stderr_worker.join().unwrap();
+        file_worker.join().unwrap();
+        assert!(elapsed < Duration::from_secs(1));
+        assert!(file_progressed, "file writer waited on stderr");
+        assert_eq!(snapshot["dropped_lines_total"], 1);
+        assert_eq!(snapshot["dropped_flushes_total"], 1);
+        let file = String::from_utf8(file).unwrap();
+        let mirrored = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        for output in [&file, &mirrored] {
+            assert!(!output.contains("mirror-secret-value"), "{output}");
+            assert!(!output.contains("second-secret-value"), "{output}");
+            assert!(
+                output.contains(crate::log_redact::SECRET_PLACEHOLDER),
+                "{output}"
+            );
+        }
+        assert!(file.ends_with("third\n"));
+        assert!(!mirrored.contains("third"));
+    }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum SinkFault {
@@ -3028,7 +3488,9 @@ mod tests {
 
     fn slow_phases() -> ToolCallPhaseDurations {
         ToolCallPhaseDurations {
+            cpu: crate::run_tool_call::ToolCallPhaseCpu::default(),
             queue: Duration::ZERO,
+            setup: Duration::ZERO,
             translate: Duration::ZERO,
             execute: Duration::from_millis(120),
             format: Duration::ZERO,
@@ -3047,6 +3509,7 @@ mod tests {
             waiting_on: WaitingOn::None,
             waiting_on_build_id: None,
             wait_ms: 0,
+            intentional_wait: false,
             arg_shape: None,
             edit_phases: None,
         }
@@ -3076,6 +3539,21 @@ mod tests {
     }
 
     #[test]
+    fn slow_phase_time_renders_wall_and_cpu_in_one_field() {
+        assert_eq!(
+            slow_phase_time(
+                Duration::from_micros(39_123),
+                Some(Duration::from_micros(4))
+            ),
+            "39.123ms/cpu=0.004ms"
+        );
+        assert_eq!(
+            slow_phase_time(Duration::from_millis(50), None),
+            "50.000ms/cpu=?"
+        );
+    }
+
+    #[test]
     fn slow_plumbing_call_logs_at_debug_while_slow_agent_call_warns() {
         assert_eq!(
             slow_call_levels("bash_drain_completions", ToolCallCaller::Plumbing),
@@ -3093,6 +3571,56 @@ mod tests {
             slow_call_levels("read", ToolCallCaller::Agent),
             vec![log::Level::Warn]
         );
+    }
+
+    #[test]
+    fn slow_intentional_wait_excludes_execution_but_warns_for_overhead() {
+        let mut phases = slow_phases();
+        phases.intentional_wait = true;
+        phases.execute = Duration::from_secs(120);
+        phases.total = phases.execute + SLOW_TOOL_CALL_THRESHOLD;
+        let _ = take_slow_tool_call_logs_for_test();
+        note_tool_call_trace(
+            "bash_watch",
+            "waiting-session",
+            Path::new("/repo"),
+            7,
+            1,
+            phases.clone(),
+            ToolCallCaller::Agent,
+        );
+        assert!(take_slow_tool_call_logs_for_test().is_empty());
+
+        phases.queue = SLOW_TOOL_CALL_THRESHOLD + Duration::from_millis(1);
+        phases.total = phases.execute + phases.queue;
+        note_tool_call_trace(
+            "bash_watch",
+            "waiting-session",
+            Path::new("/repo"),
+            7,
+            2,
+            phases.clone(),
+            ToolCallCaller::Agent,
+        );
+        let lines = SLOW_TOOL_CALL_CAPTURE.with(|captured| captured.take());
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, log::Level::Warn);
+
+        phases.intentional_wait = false;
+        phases.queue = Duration::ZERO;
+        phases.total = phases.execute;
+        note_tool_call_trace(
+            "bash",
+            "waiting-session",
+            Path::new("/repo"),
+            7,
+            3,
+            phases,
+            ToolCallCaller::Agent,
+        );
+        let lines = SLOW_TOOL_CALL_CAPTURE.with(|captured| captured.take());
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, log::Level::Warn);
     }
 
     #[test]
@@ -3155,7 +3683,7 @@ mod tests {
                 LOG_WRITE_RETRY_MIN,
             )
         });
-        let mut tee = TeeWriter { file_tx: Some(tx) };
+        let mut tee = TeeWriter::new(Some(tx));
         let token = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
         tee.write_all(
             format!("[aft] fetch https://bob:pw123@host.example/x?access_token=zz9 {token}\n")
@@ -3484,6 +4012,39 @@ mod tests {
     }
 
     #[test]
+    fn perf_tick_skips_empty_drains_but_keeps_real_work_and_drain_counts() {
+        for activity in ["drain", "watcher", "semantic"] {
+            let perf = PerfMetrics::default();
+            perf.reporter.lock().unwrap().last_report = Instant::now() - perf_tick_interval();
+            perf.drain_slices.store(1, Ordering::Relaxed);
+            if activity == "watcher" {
+                perf.watcher_ingested.store(2, Ordering::Relaxed);
+                perf.watcher_paths.store(1, Ordering::Relaxed);
+            } else if activity == "semantic" {
+                perf.semantic_collects.store(1, Ordering::Relaxed);
+                perf.semantic_files.store(2, Ordering::Relaxed);
+                perf.semantic_chunks.store(3, Ordering::Relaxed);
+                perf.semantic_ms.store(4, Ordering::Relaxed);
+            }
+            let (_, lines) = capture_log_lines(|| report_perf_tick(&perf, None, (0, 0)));
+            if activity == "drain" {
+                assert!(lines.is_empty(), "{lines:?}");
+            } else {
+                assert_eq!(lines.len(), 1, "{lines:?}");
+                assert!(lines[0].starts_with("INFO perf tick:"), "{lines:?}");
+                assert!(lines[0].contains(" drains=1 "), "{lines:?}");
+                let expected = if activity == "watcher" {
+                    "watcher={ingested:2,paths:1,dropped:0}"
+                } else {
+                    "semantic={collects:1,files:2,chunks:3,ms:4}"
+                };
+                assert!(lines[0].contains(expected), "{lines:?}");
+            }
+            assert_eq!(perf.drain_slices.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
     fn tool_call_tick_labels_interval_count_and_rolling_window() {
         let samples = VecDeque::from([ToolCallPerfSample {
             total_ms: 3_000,
@@ -3693,6 +4254,77 @@ mod tests {
         assert_eq!(fields.get("key").map(String::as_str), Some("keepkey"));
         assert!(fields.get("root").is_some(), "{lines:?}");
         assert_index_event_grammar(&lines);
+    }
+
+    #[test]
+    fn index_event_long_root_keeps_measurements_within_cap() {
+        let suffix = "/typescript-eslint/worker";
+        let root = format!("/{}{suffix}", "a".repeat(300 - 1 - suffix.len()));
+        assert_eq!(root.len(), 300);
+        let event = IndexEvent::new(
+            IndexEventKind::FirstQuery,
+            IndexPlane::Semantic,
+            "b-12345-123",
+            &root,
+            "workspace",
+        )
+        .field("tool", "semantic_search")
+        .field("queue_ms", 12)
+        .field("service_ms", 34)
+        .field("status", "ok")
+        .field("elapsed_ms", 5678)
+        .field("ready_to_first_query_ms", 9012)
+        .field("completed", 345)
+        .field("total", 678);
+        let line = format_index_event_line(&event);
+        assert!(line.len() <= INDEX_EVENT_MAX_BYTES, "{line}");
+        assert!(index_event_matches_grammar(&line), "{line}");
+        let fields = index_event_fields(&line);
+        for (key, value) in [
+            ("elapsed_ms", "5678"),
+            ("ready_to_first_query_ms", "9012"),
+            ("completed", "345"),
+            ("total", "678"),
+            ("queue_ms", "12"),
+            ("service_ms", "34"),
+        ] {
+            assert_eq!(fields.get(key).map(String::as_str), Some(value), "{line}");
+        }
+        assert!(fields["root"].ends_with(suffix), "{line}");
+        assert_eq!(
+            line,
+            include_str!("../../../scripts/telemetry/fixtures/index-event-long-root.txt").trim()
+        );
+    }
+
+    #[test]
+    fn index_event_measurements_take_priority_over_long_descriptions() {
+        let event = IndexEvent::new(
+            IndexEventKind::FirstQuery,
+            IndexPlane::Search,
+            "b-1-1",
+            "/work/repo",
+            "0123456789abcdef",
+        )
+        .field("tool", "x".repeat(190))
+        .field("status", "x".repeat(300))
+        .field("ready_to_first_query_ms", 42);
+        let line = format_index_event_line(&event);
+        assert!(line.len() <= INDEX_EVENT_MAX_BYTES, "{line}");
+        assert_eq!(index_event_fields(&line)["ready_to_first_query_ms"], "42");
+    }
+
+    #[test]
+    fn shortened_index_roots_are_distinct_and_bounded() {
+        let root = format!("/{}/typescript-eslint/worker", "a".repeat(300));
+        let other = root.replacen('a', "b", 1);
+        let shortened = left_truncate_root(&root, 50);
+        assert!(shortened.starts_with(".../"));
+        assert!(shortened.ends_with("/typescript-eslint/worker"));
+        assert_ne!(shortened, left_truncate_root(&other, 50));
+        for budget in 0..50 {
+            assert!(left_truncate_root(&root, budget).len() <= budget);
+        }
     }
 
     #[test]

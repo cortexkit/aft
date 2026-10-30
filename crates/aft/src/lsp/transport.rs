@@ -1,8 +1,35 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 
 use crate::lsp::jsonrpc::{Notification, Request, ServerMessage};
 
 const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
+const MAX_HEADER_LINE: usize = 1024;
+const MAX_HEADER_BYTES: usize = 8192;
+
+#[derive(Debug)]
+struct MessageParseError(String);
+
+impl std::fmt::Display for MessageParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for MessageParseError {}
+
+/// Only body decoding errors leave the stream at the next frame boundary.
+pub(crate) fn is_message_parse_error(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|error| error.is::<MessageParseError>())
+}
+
+fn message_parse_error(error: impl std::fmt::Display) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        MessageParseError(error.to_string()),
+    )
+}
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
@@ -14,10 +41,17 @@ pub fn read_message(reader: &mut impl BufRead) -> io::Result<Option<ServerMessag
     let mut content_length = None;
     let mut content_type = None;
     let mut saw_header = false;
+    let mut header_bytes = 0;
 
     loop {
         let mut line = String::new();
-        let bytes_read = reader.read_line(&mut line)?;
+        // Bound the read itself, including a header with no terminating newline.
+        let limit = MAX_HEADER_LINE.min(MAX_HEADER_BYTES - header_bytes);
+        let bytes_read = reader.take((limit + 1) as u64).read_line(&mut line)?;
+        if bytes_read > limit {
+            return Err(invalid_data("LSP headers exceed maximum size"));
+        }
+        header_bytes += bytes_read;
 
         if bytes_read == 0 {
             return if saw_header {
@@ -82,12 +116,11 @@ pub fn read_message(reader: &mut impl BufRead) -> io::Result<Option<ServerMessag
         }
     })?;
 
-    let json =
-        String::from_utf8(body).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    let json = String::from_utf8(body).map_err(message_parse_error)?;
 
     ServerMessage::from_json(&json)
         .map(Some)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+        .map_err(message_parse_error)
 }
 
 fn validate_content_type(value: &str) -> io::Result<()> {
@@ -152,6 +185,24 @@ pub fn write_response(
 // `aft_fake_lsp_helper` so these tests run only once, in this crate.
 #[cfg(all(test, not(aft_fake_lsp_helper)))]
 mod audit_regressions {
+    use std::io::Cursor;
+
+    #[test]
+    fn oversized_header_line_is_rejected_before_consuming_it() {
+        let mut input = Cursor::new(vec![b'x'; 20_000]);
+        let error = super::read_message(&mut input).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(input.position() <= 1025, "read an unbounded header");
+    }
+
+    #[test]
+    fn oversized_header_block_is_rejected_before_consuming_it() {
+        let mut input = Cursor::new("X-Extension: value\r\n".repeat(2000));
+        let error = super::read_message(&mut input).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(input.position() <= 8193, "read an unbounded header block");
+    }
+
     #[test]
     fn content_type_accepts_utf8_alias() {
         for charset in ["utf8", "UTF8", "utf-8", "UTF-8", "\"utf8\""] {

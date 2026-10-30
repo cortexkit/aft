@@ -1,0 +1,12 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/commands/semantic_search/rerank/synapse.rs"
+  ],
+  "note": "non-ranking: test budgets for flaky CI tests Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}

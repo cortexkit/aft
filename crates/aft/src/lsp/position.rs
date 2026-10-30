@@ -5,7 +5,8 @@ use url::Url;
 
 use super::LspError;
 
-/// Convert AFT 1-based (or compatibility 0-based) line/column values to an LSP 0-based position.
+/// Convert AFT 1-based line/column values to an LSP 0-based position.
+/// Zero is clamped to the first line/column, not interpreted as an alternate coordinate mode.
 pub fn to_lsp_position(line: u32, column: u32) -> Position {
     Position::new(line.saturating_sub(1), column.saturating_sub(1))
 }

@@ -1,11 +1,16 @@
 import {
   BASH_HOST_FALLBACK_REFUSAL,
+  BASH_RETURN_PATHS_DESCRIPTION,
   BASH_RUNON_DESCRIPTION,
   BASH_RUNON_GUIDANCE,
+  type BashPermissionAsk,
   type BridgeRequestOptions,
   bashHostFallbackAskPattern,
   classifyBashHostFallbackError,
   coerceBoolean,
+  escalationAskText,
+  formatBashOutputPages,
+  groupBashPermissionAsks,
   isLiveBackgroundTaskReply,
   LONGEST_TIMER_DELAY_MS,
   maybeAppendGrepSearchHint,
@@ -15,6 +20,7 @@ import {
   sleep,
   type WatchCallerRole,
   WORKER_WAIT_LIMIT_PHRASE,
+  withBashPermissionLoop,
   workerBackgroundTaskNote,
 } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
@@ -28,11 +34,14 @@ import { resolveIsSubagent, resolveSubagentStatus } from "../shared/subagent-det
 import type { PluginContext } from "../types.js";
 import { trackV2BackgroundTask, v2StopEpoch } from "../v2-session-lifecycle.js";
 import { callBashBridge, coerceOptionalInt, optionalInt, projectRootFor } from "./_shared.js";
+import { metadataUpdater } from "./metadata.js";
 import { withHostPermissionGrants } from "./outside-permissions.js";
 import { runAsk } from "./permissions.js";
 
 const z = tool.schema;
 const METADATA_PREVIEW_LIMIT = 30 * 1024;
+export const BASH_SECRET_HOST_FALLBACK_REFUSAL =
+  "Secret placeholder commands need AFT's shell; OpenCode's built-in shell cannot run them.";
 // Default hard timeout of 30 minutes when the caller omits a timeout. This
 // sizes the bridge transport timeout for bash calls where the server blocks
 // until the command completes or is killed.
@@ -311,55 +320,7 @@ export function bashToolDescription(
 DO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — ${searchSteer}. When a list is cut, the reply ends with \`shown N of M <unit> (<reason>) · narrow: <knobs>\`; absence of that line means the list is complete.`;
 }
 
-interface PermissionAsk {
-  kind: "external_directory" | "bash" | "escalation";
-  patterns?: string[];
-  always?: string[];
-  command?: string;
-  cwd?: string;
-  grant_id?: string;
-}
-
 type BridgeCaller = typeof callBashBridge;
-
-function pushUnique(target: string[], values: string[]): void {
-  for (const value of values) {
-    if (!target.includes(value)) target.push(value);
-  }
-}
-
-function groupBashPermissionAsks(asks: PermissionAsk[]): PermissionAsk[] {
-  const grouped: PermissionAsk[] = [];
-  let bashAsk: PermissionAsk | undefined;
-
-  for (const ask of asks) {
-    if (ask.kind === "bash") {
-      if (!bashAsk) {
-        bashAsk = { kind: "bash", patterns: [], always: [] };
-        grouped.push(bashAsk);
-      }
-      pushUnique(bashAsk.patterns ?? [], ask.patterns ?? []);
-      pushUnique(bashAsk.always ?? [], ask.always ?? []);
-      continue;
-    }
-
-    grouped.push(ask);
-  }
-
-  return grouped;
-}
-
-function permissionsGrantedForRetry(asks: PermissionAsk[]): string[] {
-  return asks.flatMap((ask) => {
-    if (ask.kind === "escalation") return ask.grant_id ? [ask.grant_id] : [];
-    const always = ask.always ?? [];
-    return always.length > 0 ? always : (ask.patterns ?? []);
-  });
-}
-
-function escalationAskText(ask: PermissionAsk): string {
-  return `This command will run UNSANDBOXED on the host.\n\nExact command:\n${ask.command ?? ""}\n\nWorking directory:\n${ask.cwd ?? ""}`;
-}
 
 async function withPermissionLoop(
   ctx: PluginContext,
@@ -368,53 +329,33 @@ async function withPermissionLoop(
   bridgeCall: BridgeCaller,
   options?: BridgeRequestOptions,
 ): ReturnType<BridgeCaller> {
-  const granted: string[] = [];
-  let response = await bridgeCall(
-    ctx,
-    runtime,
-    "bash",
-    withHostPermissionGrants(params, granted),
-    options,
-  );
-
-  for (let round = 0; round < 8; round++) {
-    if (response.success !== false || response.code !== "permission_required") return response;
-    const asks = Array.isArray(response.asks) ? (response.asks as PermissionAsk[]) : [];
-    if (asks.length === 0) throw new Error("bash permission retry failed: no asks returned");
-
-    for (const ask of groupBashPermissionAsks(asks)) {
-      const permission = ask.kind === "external_directory" ? "external_directory" : "bash";
-      const escalation = ask.kind === "escalation";
-      await runAsk(
-        runtime.ask({
-          permission,
-          patterns: escalation ? [escalationAskText(ask)] : (ask.patterns ?? []),
-          always: escalation ? [] : (ask.always ?? []),
-          metadata: escalation
-            ? {
-                command: ask.command ?? "",
-                cwd: ask.cwd ?? "",
-                grant_id: ask.grant_id ?? "",
-                unsandboxed: true,
-              }
-            : {},
-        }),
-      );
-    }
-
-    for (const grant of permissionsGrantedForRetry(asks)) {
-      if (!granted.includes(grant)) granted.push(grant);
-    }
-    response = await bridgeCall(
-      ctx,
-      runtime,
-      "bash",
-      withHostPermissionGrants(params, granted),
-      options,
-    );
-  }
-
-  throw new Error("bash permission retry failed: too many rounds");
+  return withBashPermissionLoop({
+    request: (granted) =>
+      bridgeCall(ctx, runtime, "bash", withHostPermissionGrants(params, granted), options),
+    approve: async (asks: readonly BashPermissionAsk[]) => {
+      for (const ask of groupBashPermissionAsks(asks)) {
+        const permission = ask.kind === "external_directory" ? "external_directory" : "bash";
+        const escalation = ask.kind === "escalation";
+        await runAsk(
+          runtime.ask({
+            permission,
+            patterns: escalation ? [escalationAskText(ask)] : (ask.patterns ?? []),
+            always: escalation ? [] : (ask.always ?? []),
+            metadata: escalation
+              ? {
+                  command: ask.command ?? "",
+                  cwd: ask.cwd ?? "",
+                  grant_id: ask.grant_id ?? "",
+                  unsandboxed: true,
+                }
+              : ask.reason
+                ? { reason: ask.reason }
+                : {},
+          }),
+        );
+      }
+    },
+  });
 }
 
 /** The PTY argument's sentence on driving a session, naming only registered companions. */
@@ -536,7 +477,10 @@ export function createBashTool(
   // config (and not turned off by the project), decided once here; runner
   // health never adds or removes it.
   const remoteRuns = () => remoteRunsOffered(ctx.config);
-  const runonArg = { runon: z.string().optional().describe(BASH_RUNON_DESCRIPTION) };
+  const runonArg = {
+    runon: z.string().optional().describe(BASH_RUNON_DESCRIPTION),
+    return_paths: z.array(z.string()).max(64).optional().describe(BASH_RETURN_PATHS_DESCRIPTION),
+  };
   const args = {
     command: z
       .string()
@@ -609,7 +553,7 @@ export function createBashTool(
       const aftSearchRegistered = aftSearchRegisteredOverride ?? ctxAftSearchRegistered;
       let accumulatedOutput = "";
       const description = args.description as string | undefined;
-      const metadata = (context as { metadata?: (data: Record<string, unknown>) => void }).metadata;
+      const metadata = metadataUpdater(context);
       const rawCommand = args.command as string;
       const command = rawCommand;
       const cwd = (args.workdir as string | undefined) ?? context.directory;
@@ -683,6 +627,9 @@ export function createBashTool(
       // the engine refuses a remote run it cannot make by name, and a stale
       // `runon` must never quietly become a local run.
       const runon = args.runon;
+      // Forwarded like `runon`: the engine refuses it without `runon`, and
+      // a host fallback must not run the command and drop the request.
+      const returnPaths = args.return_paths;
       if (runon !== undefined && !remoteRunsOffered(ctx.config)) {
         throw new Error(
           "runon refused: remote execution or bash.runon_enabled is unavailable in this session",
@@ -733,6 +680,7 @@ export function createBashTool(
             wait: requestedWait,
             sandbox: args.sandbox,
             ...(runon !== undefined ? { runon } : {}),
+            ...(returnPaths !== undefined ? { return_paths: returnPaths } : {}),
           },
           callBashBridge,
           {
@@ -746,13 +694,16 @@ export function createBashTool(
             ),
             onProgress: ({ text }) => {
               accumulatedOutput = preview(accumulatedOutput + text);
-              metadata?.({ output: accumulatedOutput, description });
+              void metadata({ output: accumulatedOutput, description });
             },
           },
         );
       } catch (error) {
         const fallbackCause = classifyBashHostFallbackError(error);
         if (fallbackCause === undefined) throw error;
+        if (command.includes("{{ck-secret:")) {
+          throw new Error(BASH_SECRET_HOST_FALLBACK_REFUSAL);
+        }
         if (!backgroundDisabled && rawRequestedBackground) {
           throw refuseAftModuleOptionWithoutFallback(
             error,
@@ -766,7 +717,21 @@ export function createBashTool(
         if (runon !== undefined) {
           throw refuseAftModuleOptionWithoutFallback(error, "runon", BASH_HOST_FALLBACK_REFUSAL);
         }
+        if (returnPaths !== undefined) {
+          throw refuseAftModuleOptionWithoutFallback(
+            error,
+            "return_paths",
+            BASH_HOST_FALLBACK_REFUSAL,
+          );
+        }
         if (!bashCfg.host_fallback) throw error;
+        if (bashCfg.memory_limit_mib !== undefined) {
+          throw refuseAftModuleOptionWithoutFallback(
+            error,
+            "bash.memory_limit_mib",
+            BASH_HOST_FALLBACK_REFUSAL,
+          );
+        }
 
         const projectRoot = projectRootFor(context);
         const pattern = bashHostFallbackAskPattern(command, projectRoot, fallbackCause);
@@ -811,7 +776,7 @@ export function createBashTool(
           rendered += workerBackgroundTaskNote(taskId);
         }
         const metadataPayload = { description, output: rendered, status: "running", taskId };
-        metadata?.(metadataPayload);
+        await metadata(metadataPayload);
         return { output: rendered, title: uiTitle, metadata: metadataPayload };
       }
 
@@ -820,7 +785,7 @@ export function createBashTool(
         ? output
         : maybeAppendGrepSearchHint(output, command, aftSearchRegistered, projectRootFor(context));
       const metadataPayload = foregroundMetadata(description, data, rendered);
-      metadata?.(metadataPayload);
+      await metadata(metadataPayload);
       return {
         output: rendered,
         title: uiTitle,
@@ -843,6 +808,12 @@ export function createBashStatusTool(ctx: PluginContext): ToolDefinition {
         .describe(
           "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
         ),
+      outputOffset: optionalInt(0, Number.MAX_SAFE_INTEGER).describe(
+        "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+      ),
+      stderrOffset: optionalInt(0, Number.MAX_SAFE_INTEGER).describe(
+        "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+      ),
       outputMode: z
         .enum(["screen", "raw", "both"])
         .optional()
@@ -856,7 +827,27 @@ export function createBashStatusTool(ctx: PluginContext): ToolDefinition {
       // bash_status is snapshot-only as of bash_watch landing. waitFor/exit/
       // timeoutMs moved to bash_watch — if the agent passes them here, they're
       // silently ignored at the Zod schema layer (extra keys stripped).
-      const data = await bashStatusSnapshot(ctx, context, taskId, outputMode);
+      const paging = args.outputOffset !== undefined || args.stderrOffset !== undefined;
+      const data = paging
+        ? await callBashBridge(ctx, context, "bash_status", {
+            task_id: taskId,
+            output_mode: outputMode,
+            output_offset: coerceOptionalInt(
+              args.outputOffset,
+              "outputOffset",
+              0,
+              Number.MAX_SAFE_INTEGER,
+            ),
+            stderr_offset: coerceOptionalInt(
+              args.stderrOffset,
+              "stderrOffset",
+              0,
+              Number.MAX_SAFE_INTEGER,
+            ),
+          })
+        : await bashStatusSnapshot(ctx, context, taskId, outputMode);
+      if (data.success === false) throw new Error(String(data.message ?? "bash_status failed"));
+      if (paging) return formatBashOutputPages(data, true);
       const isSubagent = await resolveIsSubagent(ctx.client, context.sessionID, context.directory);
       return await formatBashStatusText(
         context,
@@ -887,10 +878,17 @@ export function createBashKillTool(ctx: PluginContext): ToolDefinition {
       if (data.success === false) {
         throw new Error((data.message as string | undefined) ?? "bash_kill failed");
       }
+      const warning =
+        typeof data.bot_write_revocation_warning === "string"
+          ? `\n${data.bot_write_revocation_warning}`
+          : "";
       if (data.kill_signaled === true) {
-        return `Task ${args.taskId}: kill_signaled · reached ${String(data.kill_reached ?? 0)} live descendants`;
+        return `Task ${args.taskId}: kill_signaled · reached ${String(data.kill_reached ?? 0)} live descendants${warning}`;
       }
-      return `Task ${args.taskId}: ${String(data.status ?? "killed")}`;
+      if (typeof data.remote_cancel === "string") {
+        return `Task ${args.taskId}: ${String(data.status ?? "fate_unknown")} · ${data.remote_cancel}${warning}`;
+      }
+      return `Task ${args.taskId}: ${String(data.status ?? "killed")}${warning}`;
     },
   };
 }
@@ -1005,6 +1003,7 @@ function foregroundMetadata(
     exit: data.exit_code as number | undefined,
     truncated,
     ...(outputPath ? { outputPath } : {}),
+    ...(data._bash_changed_files ? { _bash_changed_files: data._bash_changed_files } : {}),
   };
 }
 

@@ -37,6 +37,10 @@ struct FakeState {
     asks: HashMap<String, String>,
     /// Settled replies per elicitation id.
     answers: HashMap<String, Value>,
+    /// Asks withdrawn through `consent.withdraw`: a later `consent.await`
+    /// for the same id reports `access_withdrawn`, like Cingulate, so a
+    /// sibling covered by a folder grant resumes without a second answer.
+    withdrawn: std::collections::HashSet<String>,
     macos: bool,
     cards: HashMap<(String, String), String>,
     next_id: usize,
@@ -254,11 +258,26 @@ impl FakeCingulate {
                     ));
                 }
                 assert!(params["timeout_ms"].as_u64().unwrap() <= 120_000);
-                Ok(state.answers.get(id).cloned())
+                if let Some(answer) = state.answers.get(id) {
+                    return Ok(Some(answer.clone()));
+                }
+                if state.withdrawn.contains(id) {
+                    return Ok(Some(
+                        json!({"state":"refused:access_withdrawn","outcome":"access_withdrawn","code":"access_withdrawn"}),
+                    ));
+                }
+                Ok(None)
             }
             "consent.withdraw" => {
                 if let Some(id) = params["elicitation_id"].as_str() {
                     state.cards.retain(|_, card| card != id);
+                    // Withdrawing an already-settled ask returns its recorded
+                    // outcome (the race guard); only a still-open ask settles
+                    // as withdrawn, matching Cingulate's settled-withdraw reply.
+                    if let Some(answer) = state.answers.get(id).cloned() {
+                        return Ok(Some(answer));
+                    }
+                    state.withdrawn.insert(id.to_string());
                 }
                 Ok(Some(
                     json!({"state":"refused:access_withdrawn","outcome":"access_withdrawn","code":"access_withdrawn"}),
@@ -272,6 +291,9 @@ impl FakeCingulate {
 }
 
 struct SharedFake(Arc<FakeCingulate>);
+
+// Delay only terminal answers, after receipt by the fake and before application.
+const ANSWER_APPLICATION_DELAY: Duration = Duration::ZERO;
 
 impl ConsentTransport for SharedFake {
     fn call(&self, call: ConsentCall) -> ConsentFuture {
@@ -293,6 +315,11 @@ impl ConsentTransport for SharedFake {
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             };
+            if call.method == "consent.await"
+                && matches!(decode_record(&result), Ok(settled) if settled != Settlement::Pending)
+            {
+                tokio::time::sleep(ANSWER_APPLICATION_DELAY).await;
+            }
             decode_result(&serde_json::to_vec(&json!({ "result": result })).unwrap())
         })
     }
@@ -335,6 +362,7 @@ fn identity(root: &Path, scope: Option<subc_protocol::scope::ScopeStamp>) -> Rou
             principal_id: Some("reserved:broca".into()),
         },
         consumer_elicitation_capable: false,
+        tool_result_body: false,
         disabled_tools: Arc::new(vec![]),
         scope,
         call_mode: subc_protocol::call_mode::CallMode::Classic,
@@ -416,6 +444,7 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         install_test_transport(None);
         set_hold_budget_for_test(None);
+        SETTLED_WAIT_OVERRIDE_MS.store(0, Ordering::SeqCst);
     }
 }
 
@@ -429,6 +458,8 @@ fn scope_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
         "read" => read_dispatch(request, ctx),
         "grep" => crate::commands::grep::handle_grep(&request, ctx),
         "glob" => crate::commands::glob::handle_glob(&request, ctx),
+        "outline" => crate::commands::outline::handle_outline(&request, ctx),
+        "zoom" => crate::commands::zoom::handle_zoom(&request, ctx),
         "write" => crate::commands::write::handle_write(&request, ctx),
         other => panic!("unexpected scope test command: {other}"),
     }
@@ -592,6 +623,7 @@ impl Fixture {
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
+            codemode_policies: None,
             frame,
             phase_trace: PhaseTrace::new(Instant::now()),
         };
@@ -681,8 +713,44 @@ impl Fixture {
             request["call_key"].as_str().unwrap(),
             json!({"state":"settled", "outcome":"allow_scope", "answered_by":"user"}),
         );
-        let allowed = self.read(&self.worker, &target, 202).await;
+        let allowed = self.settled_read(&self.worker, &target, 202).await;
         assert!(text(&allowed).contains("head-owned contents"), "{allowed}");
+    }
+
+    #[cfg(unix)]
+    async fn settled_read(&self, identity: &RouteIdentity, path: &Path, corr: u64) -> Value {
+        self.settled_reply(self.send_read(identity, path, corr))
+            .await
+    }
+
+    #[cfg(unix)]
+    async fn settled_reply(
+        &self,
+        send: impl Future<Output = mpsc::Receiver<WriterFrame>>,
+    ) -> Value {
+        // The short budget parks unanswered calls, not local answer application.
+        set_hold_budget_for_test(None);
+        let received = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        install_test_transport(Some(Arc::new(ReceiptGate {
+            fake: Arc::clone(&self.fake),
+            received: Arc::clone(&received),
+            release: Arc::clone(&release),
+        })));
+        let mut replies = send.await;
+        // The receipt callback applies grants or discards declined asks before
+        // this signal. Merely storing an answer in the fake is not sufficient.
+        let applied = tokio::time::timeout(Duration::from_secs(10), received.notified()).await;
+        release.notify_one();
+        applied.expect("the settled answer is applied before continuing");
+        let allowed = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+            .await
+            .expect("the approved read ends with one terminal frame")
+            .expect("writer stays open");
+        let allowed = serde_json::from_slice(&allowed.body).unwrap();
+        install_test_transport(Some(Arc::new(SharedFake(Arc::clone(&self.fake)))));
+        set_hold_budget_for_test(Some(Duration::from_millis(100)));
+        allowed
     }
 }
 
@@ -692,6 +760,246 @@ mod rust_sources;
 
 fn code(reply: &Value) -> &str {
     reply["structuredContent"]["code"].as_str().unwrap_or("")
+}
+
+#[tokio::test]
+async fn occipital_outside_read_refuses_without_any_permission_ask() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let carrier = |role| {
+        let mut carrier = identity(&f.worker.project_root, f.worker.scope.clone());
+        let data = Arc::get_mut(&mut carrier.0).unwrap();
+        data.role = role;
+        if let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut data.spawn_principal {
+            *principal_id = Some("reserved:occipital".into());
+        }
+        data.consumer_elicitation_capable = true;
+        carrier
+    };
+    let target = f.head_root.join("shared.txt");
+    let v1 = carrier(tool_provider::RouteRole::ToolProviderV1);
+    let missing_operation = f.read(&v1, &target, 800).await;
+    assert_eq!(
+        missing_operation,
+        json!({
+            "content":[{"type":"text", "text":"rich_ui_op_malformed"}], "isError":true,
+            "structuredContent":{"success":false,"code":"rich_ui_op_malformed", "message":"A versioned rich UI operation is required."}
+        })
+    );
+
+    // V1 requests missing an operation marker never reach filesystem policy.
+    // Use the older request format to exercise the read's outside-root refusal
+    // and in-root success independently of operation admission.
+    let carrier = carrier(tool_provider::RouteRole::Legacy);
+    assert!(matches!(
+        crate::subc::access_grants::ask_route(&carrier),
+        crate::access_policy::AskRoute::Deny
+    ));
+    let denied = f.read(&carrier, &target, 801).await;
+    assert_eq!(denied["isError"], true, "{denied}");
+    assert!(!text(&denied).contains("head-owned contents"), "{denied}");
+    assert_eq!(code(&denied), "path_outside_root", "{denied}");
+    assert!(f.fake.calls("consent.request").is_empty());
+    assert!(f.asks().is_empty());
+    assert!(f.worker_grants().is_empty());
+    assert!(!text(&denied).contains("permission_required"), "{denied}");
+
+    std::fs::write(carrier.project_root.join("local.txt"), "local-read-marker").unwrap();
+    let local = f
+        .read(&carrier, &carrier.project_root.join("local.txt"), 802)
+        .await;
+    assert_eq!(local["isError"], false, "{local}");
+    assert!(text(&local).contains("local-read-marker"), "{local}");
+}
+
+#[tokio::test]
+async fn consent_nonhost_carrier_cannot_save_agent_scope_grants() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let grant = AccessGrant {
+        path: f.head_root.join("shared.txt"),
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    };
+    let db = f.ctx.db().unwrap();
+    crate::db::access_grants::insert(
+        &db.lock().unwrap(),
+        &access_grants::scope_key(&f.worker),
+        &grant,
+    )
+    .unwrap();
+    let arguments = json!({"path": grant.path});
+    for principal in [
+        "reserved:unrecognized-carrier",
+        "reserved:occipital",
+        "reserved:basal",
+    ] {
+        let mut carrier = identity(&f.worker.project_root, f.worker.scope.clone());
+        let data = Arc::get_mut(&mut carrier.0).unwrap();
+        if let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut data.spawn_principal {
+            *principal_id = Some(principal.into());
+        }
+        if principal == "reserved:basal" {
+            let scope = data.scope.as_mut().unwrap();
+            scope.kind = subc_protocol::scope::ScopeKind::Ephemeral;
+            scope.attributes.flow_id = Some("flow-target-lease".into());
+        }
+        let call = HeldCall {
+            reply_deadline: Instant::now() + Duration::from_secs(5),
+            identity: carrier.clone(),
+            tool: "read".into(),
+            arguments: arguments.clone(),
+            request_id: "nonhost-consent".into(),
+            executor: f.executor.clone(),
+            route: RouteChannel {
+                channel: 41,
+                epoch: 1,
+            },
+            corr: 803,
+            active: f.active.clone(),
+            connection_cancel: f.connection_cancel.clone(),
+            drain: drain::ModuleDrainWindow::default(),
+        };
+        let mut first = Response::error(
+            "nonhost-consent",
+            crate::access_policy::ACCESS_ASK_REQUIRED,
+            "approval required",
+        );
+        first.data["ask"] = serde_json::to_value(&grant).unwrap();
+        let (refusal, _) = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_with_consent(call, (first, String::new()), |_| async {
+                panic!("carrier must not rerun")
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!refusal.success);
+        assert_eq!(refusal.data["code"], "path_outside_root");
+        assert!(prepare(&db, &f.ctx, &carrier, "read", &arguments, &grant, &grant, None).is_err());
+        assert!(f.asks().is_empty());
+        assert!(f.fake.calls("consent.request").is_empty());
+        let Prep::Ask(prep) = prepare(
+            &db, &f.ctx, &f.worker, "read", &arguments, &grant, &grant, None,
+        )
+        .unwrap() else {
+            panic!("host must be able to prepare a consent card");
+        };
+        assert!(apply_allow(
+            &db,
+            &f.ctx,
+            &carrier,
+            &prep.key,
+            &prep.call_key,
+            "carrier",
+            &grant,
+            true,
+            true,
+        )
+        .is_err());
+        asks::discard(&db.lock().unwrap(), &prep.key).unwrap();
+    }
+    assert_eq!(f.worker_grants().len(), 1);
+}
+
+#[tokio::test]
+async fn consent_qualifying_hosts_and_codemode_runs_can_save_scope_grants() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let mut direct = identity(&f.head.project_root, f.head.scope.clone());
+    if let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
+        &mut Arc::get_mut(&mut direct.0).unwrap().spawn_principal
+    {
+        *principal_id = Some("direct".into());
+    }
+    let mut routes = vec![direct, f.worker.clone()];
+    for (parent, worker) in [(&f.head, false), (&f.worker, true)] {
+        let run_id = if worker { "save-worker" } else { "save-head" };
+        let mut run = identity(
+            &parent.project_root,
+            Some(stamp(
+                &format!("codemode/{run_id}"),
+                "ephemeral",
+                Some(&parent.scope.as_ref().unwrap().scope_ref),
+            )),
+        );
+        let data = Arc::get_mut(&mut run.0).unwrap();
+        let scope = data.scope.as_mut().unwrap();
+        scope.attributes.run_id = Some(run_id.into());
+        scope.attributes.agent_id = (!worker).then(|| "head".into());
+        scope.attributes.on_behalf_of_agent = worker.then(|| "head".into());
+        let mut run_principal = parent.spawn_principal.clone();
+        if let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut run_principal {
+            *principal_id = Some("reserved:basal".into());
+        }
+        data.run_owner = Some(Arc::new(codemode::RunOwner {
+            kind: if worker {
+                codemode::RunKind::Worker {
+                    on_behalf_of_agent: "head".into(),
+                }
+            } else {
+                codemode::RunKind::Agent {
+                    agent_id: "head".into(),
+                }
+            },
+            run_id: run_id.into(),
+            owner_route: parent.clone(),
+            owner_route_channel: RouteChannel {
+                channel: 41,
+                epoch: 1,
+            },
+            run_route: RouteChannel {
+                channel: 42,
+                epoch: 1,
+            },
+            run_principal,
+        }));
+        access_grants::register(&run, &f.ctx).unwrap();
+        routes.push(run);
+    }
+    let db = f.ctx.db().unwrap();
+    for (index, route) in routes.iter().enumerate() {
+        let outside = f.dir.path().join(format!("consent-outside-{index}.txt"));
+        std::fs::write(&outside, "consent scope grant").unwrap();
+        let grant = AccessGrant {
+            path: crate::access_policy::policy_path(&outside),
+            kind: GrantKind::File,
+            operation: AccessOperation::Read,
+        };
+        let Prep::Ask(prep) = prepare(
+            &db,
+            &f.ctx,
+            route,
+            "read",
+            &json!({"path": grant.path}),
+            &grant,
+            &grant,
+            None,
+        )
+        .unwrap() else {
+            panic!("qualifying route must prepare a card");
+        };
+        let applied = apply_allow(
+            &db,
+            &f.ctx,
+            route,
+            &prep.key,
+            &prep.call_key,
+            &asks::new_holder(),
+            &grant,
+            true,
+            true,
+        )
+        .unwrap();
+        assert!(matches!(applied, Applied::Run(_)));
+        assert!(crate::db::access_grants::list(
+            &db.lock().unwrap(),
+            &access_grants::policy_scope_key(route)
+        )
+        .unwrap()
+        .contains(&grant));
+    }
 }
 
 fn text(reply: &Value) -> String {
@@ -754,6 +1062,7 @@ async fn consent_parked_ask_only_scope_goodbye_ended_withdraws_and_refuses_retry
         parsed_body: Default::default(),
         confinement: None,
         launch_restore: None,
+        codemode_policies: None,
     };
     let reply = |corr, status| {
         let live = status == subc_protocol::scope::ScopeStatus::Live;
@@ -855,7 +1164,7 @@ async fn consent_held_call_becomes_pending_and_retry_runs_after_allow_once() {
     );
     // The retry arrives under a new transport call; it re-sends the original
     // consent call key, gets the same ask, and runs once.
-    let allowed = f.read(&f.worker, &target, 8).await;
+    let allowed = f.settled_read(&f.worker, &target, 8).await;
     assert_ne!(code(&allowed), "access_pending", "{allowed}");
     assert!(text(&allowed).contains("head-owned contents"), "{allowed}");
     let requests = f.fake.calls("consent.request");
@@ -902,6 +1211,1081 @@ async fn consent_answer_within_the_budget_runs_the_held_call() {
     // allow_scope with no answered_by is the head's answer; the head holds the
     // path, so the scope grant is installed on the worker's scope.
     assert_eq!(f.worker_grants().len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn consent_covering_withdraw_log_names_grant_without_raw_path() {
+    let grant = AccessGrant {
+        path: crate::access_policy::policy_path(Path::new("/tmp/scope")),
+        kind: GrantKind::Subtree,
+        operation: AccessOperation::Read,
+    };
+    let ((), lines) = crate::logging::capture_log_lines(|| {
+        crate::log_ctx::with_session(Some("worker".to_string()), || {
+            log_covered_withdrawn("worker", "acc_718", "acc_717", &grant);
+        });
+    });
+    let covered: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("consent covering grant withdrew covered ask"))
+        .collect();
+    assert_eq!(covered.len(), 1, "{lines:?}");
+    let line = covered[0];
+    assert!(line.starts_with("INFO "), "{line}");
+    assert!(line.contains("ask=acc_718"), "{line}");
+    assert!(line.contains("covered_by=acc_717"), "{line}");
+    assert!(line.contains("kind=subtree"), "{line}");
+    let hash = line.split_once("path_hash=").unwrap().1;
+    assert_eq!(hash.len(), 12, "{line}");
+    assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()), "{line}");
+    assert!(!line.contains("/tmp/scope"), "{line}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_folder_grant_settles_and_withdraws_covered_sibling() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let _probe = DirectoryScopeProbeBudgetOverride::generous();
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_secs(5)));
+    let sub = f.head_root.join("sharedir");
+    std::fs::create_dir_all(&sub).unwrap();
+    let a = sub.join("a.txt");
+    let b = sub.join("b.txt");
+    std::fs::write(&a, "a contents\n").unwrap();
+    std::fs::write(&b, "b contents\n").unwrap();
+    let mut rx1 = f.send_read(&f.worker, &a, 901).await;
+    let mut rx2 = f.send_read(&f.worker, &b, 902).await;
+    wait_for(|| f.fake.calls("consent.request").len() >= 2).await;
+    let requests = f.fake.calls("consent.request");
+    assert_eq!(requests.len(), 2);
+    let key1 = requests[0]["call_key"].as_str().unwrap().to_string();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let records = f.asks();
+        if records
+            .iter()
+            .filter(|record| record.elicitation_id.is_some())
+            .count()
+            == 2
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "both elicitation ids were not recorded within 30s; ask records: {records:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let before: std::collections::HashSet<String> = f
+        .asks()
+        .into_iter()
+        .filter_map(|record| record.elicitation_id)
+        .collect();
+    assert_eq!(before.len(), 2);
+    f.fake.answer(
+        &key1,
+        json!({"state": "settled", "outcome": "allow_scope", "answered_by": "user"}),
+    );
+    let r1 = tokio::time::timeout(Duration::from_secs(10), rx1.recv())
+        .await
+        .expect("covering call resumes")
+        .expect("writer stays open");
+    let r2 = tokio::time::timeout(Duration::from_secs(10), rx2.recv())
+        .await
+        .expect("covered sibling resumes without a second answer")
+        .expect("writer stays open");
+    let v1: Value = serde_json::from_slice(&r1.body).unwrap();
+    let v2: Value = serde_json::from_slice(&r2.body).unwrap();
+    assert!(text(&v1).contains("a contents"), "{v1}");
+    assert!(text(&v2).contains("b contents"), "{v2}");
+    assert_eq!(f.worker_grants().len(), 1);
+    let grant = &f.worker_grants()[0];
+    assert_eq!(grant.kind, GrantKind::Subtree);
+    let withdraws = f.fake.calls("consent.withdraw");
+    assert_eq!(
+        withdraws.len(),
+        1,
+        "one covered card is withdrawn {withdraws:?}"
+    );
+    let withdrawn = withdraws[0]["elicitation_id"].as_str().unwrap();
+    assert!(
+        before.contains(withdrawn),
+        "withdrawn ask was pending {withdrawn:?}"
+    );
+}
+
+/// Holds the reply for b.txt after Cingulate creates its card, before AFT can
+/// record the id. Other requests and answers continue through the normal fake.
+#[cfg(unix)]
+struct DelayedSiblingRequest {
+    fake: Arc<FakeCingulate>,
+    received: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[cfg(unix)]
+impl ConsentTransport for DelayedSiblingRequest {
+    fn call(&self, call: ConsentCall) -> ConsentFuture {
+        let delayed = call.method == "consent.request"
+            && call.params["paths"][0]
+                .as_str()
+                .is_some_and(|path| path.ends_with("b.txt"));
+        let reply = SharedFake(Arc::clone(&self.fake)).call(call);
+        let received = Arc::clone(&self.received);
+        let release = Arc::clone(&self.release);
+        Box::pin(async move {
+            let reply = reply.await?;
+            if delayed {
+                received.notify_one();
+                release.notified().await;
+            }
+            Ok(reply)
+        })
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_folder_grant_withdraws_sibling_after_delayed_request_reply() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let _probe = DirectoryScopeProbeBudgetOverride::generous();
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_secs(30)));
+    let received = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    install_test_transport(Some(Arc::new(DelayedSiblingRequest {
+        fake: Arc::clone(&f.fake),
+        received: Arc::clone(&received),
+        release: Arc::clone(&release),
+    })));
+    let sub = f.head_root.join("lateid");
+    std::fs::create_dir_all(&sub).unwrap();
+    let a = sub.join("a.txt");
+    let b = sub.join("b.txt");
+    std::fs::write(&a, "a contents\n").unwrap();
+    std::fs::write(&b, "b contents\n").unwrap();
+    let mut rx1 = f.send_read(&f.worker, &a, 903).await;
+    let mut rx2 = f.send_read(&f.worker, &b, 904).await;
+    tokio::time::timeout(Duration::from_secs(30), received.notified())
+        .await
+        .expect("sibling card exists while its request reply is held");
+    // The two reads file their requests in either order, so b.txt's held
+    // reply can arrive before a.txt's request has been sent.
+    let requests_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let requests = loop {
+        let requests = f.fake.calls("consent.request");
+        if requests.len() >= 2 || tokio::time::Instant::now() >= requests_deadline {
+            break requests;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(requests.len(), 2);
+    let key1 = call_key_for_file(&requests, "a.txt");
+    let key2 = call_key_for_file(&requests, "b.txt");
+    let records = f.asks();
+    let sibling = records
+        .iter()
+        .find(|record| record.call_key.as_deref() == Some(&key2))
+        .expect("sibling ask is persisted before its request");
+    assert_eq!(sibling.elicitation_id, None, "{records:?}");
+    f.fake.answer(
+        &key1,
+        json!({"state": "settled", "outcome": "allow_scope", "answered_by": "user"}),
+    );
+    let r1 = tokio::time::timeout(Duration::from_secs(10), rx1.recv())
+        .await
+        .expect("covering call completes before releasing the sibling id")
+        .expect("writer stays open");
+    let v1: Value = serde_json::from_slice(&r1.body).unwrap();
+    assert!(text(&v1).contains("a contents"), "{v1}");
+    assert_eq!(f.worker_grants().len(), 1);
+    assert_eq!(f.worker_grants()[0].kind, GrantKind::Subtree);
+    assert!(f.fake.calls("consent.withdraw").is_empty());
+    release.notify_one();
+    let r2 = tokio::time::timeout(Duration::from_secs(10), rx2.recv())
+        .await
+        .expect("late sibling resumes without a second answer")
+        .expect("writer stays open");
+    let v2: Value = serde_json::from_slice(&r2.body).unwrap();
+    assert!(text(&v2).contains("b contents"), "{v2}");
+    let withdraws = f.fake.calls("consent.withdraw");
+    assert_eq!(withdraws.len(), 1, "{withdraws:?}");
+    let state = f.fake.state.lock().unwrap();
+    let sibling_id = &state.asks[&key2];
+    assert_eq!(withdraws[0]["elicitation_id"], json!(sibling_id));
+    assert!(state.withdrawn.contains(sibling_id));
+    assert!(!state.answers.contains_key(sibling_id));
+}
+
+/// The call key of the consent request for `file_name`. Parallel calls file
+/// their requests in either order, so a test must not take the first one.
+#[cfg(unix)]
+fn call_key_for_file(requests: &[Value], file_name: &str) -> String {
+    requests
+        .iter()
+        .find(|request| {
+            request["paths"][0]
+                .as_str()
+                .is_some_and(|path| path.ends_with(file_name))
+        })
+        .unwrap_or_else(|| panic!("no consent request for {file_name}: {requests:?}"))["call_key"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_folder_grant_leaves_uncovered_asks_pending() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    // Sibling folder: a grant for one directory never covers another.
+    {
+        let _probe = DirectoryScopeProbeBudgetOverride::generous();
+        let f = fixture(FakeCingulate::up());
+        set_hold_budget_for_test(Some(Duration::from_millis(600)));
+        let sub_a = f.head_root.join("sub_a");
+        let sub_b = f.head_root.join("sub_b");
+        std::fs::create_dir_all(&sub_a).unwrap();
+        std::fs::create_dir_all(&sub_b).unwrap();
+        let a = sub_a.join("a.txt");
+        let b = sub_b.join("b.txt");
+        std::fs::write(&a, "a contents\n").unwrap();
+        std::fs::write(&b, "b contents\n").unwrap();
+        let mut rx1 = f.send_read(&f.worker, &a, 911).await;
+        let mut rx2 = f.send_read(&f.worker, &b, 912).await;
+        wait_for(|| f.fake.calls("consent.request").len() >= 2).await;
+        let key1 = call_key_for_file(&f.fake.calls("consent.request"), "a.txt");
+        f.fake.answer(
+            &key1,
+            json!({"state": "settled", "outcome": "allow_scope", "answered_by": "user"}),
+        );
+        let r1 = tokio::time::timeout(Duration::from_secs(10), rx1.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let v1: Value = serde_json::from_slice(&r1.body).unwrap();
+        assert!(text(&v1).contains("a contents"), "{v1}");
+        let r2 = tokio::time::timeout(Duration::from_secs(10), rx2.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let v2: Value = serde_json::from_slice(&r2.body).unwrap();
+        assert_eq!(code(&v2), "access_pending", "sibling stays pending {v2}");
+        assert!(
+            f.fake.calls("consent.withdraw").is_empty(),
+            "no withdraw for sibling"
+        );
+    }
+    // Different operation: a read folder grant never covers a write ask.
+    {
+        let _probe = DirectoryScopeProbeBudgetOverride::generous();
+        let f = fixture(FakeCingulate::up());
+        set_hold_budget_for_test(Some(Duration::from_millis(600)));
+        let sub = f.head_root.join("opdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        let a = sub.join("a.txt");
+        let b = sub.join("b.txt");
+        std::fs::write(&a, "a contents\n").unwrap();
+        std::fs::write(&b, "old\n").unwrap();
+        let mut rx1 = f.send_read(&f.worker, &a, 913).await;
+        let mut rx2 = f
+            .send_tool(
+                &f.worker,
+                "write",
+                json!({"path": b, "content": "new\n"}),
+                914,
+                scope_dispatch,
+            )
+            .await;
+        wait_for(|| f.fake.calls("consent.request").len() >= 2).await;
+        let requests = f.fake.calls("consent.request");
+        let read_key = requests
+            .iter()
+            .find(|request| request["operation"] == json!("read"))
+            .unwrap()["call_key"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        f.fake.answer(
+            &read_key,
+            json!({"state": "settled", "outcome": "allow_scope", "answered_by": "user"}),
+        );
+        let r1 = tokio::time::timeout(Duration::from_secs(10), rx1.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let v1: Value = serde_json::from_slice(&r1.body).unwrap();
+        assert!(text(&v1).contains("a contents"), "{v1}");
+        let r2 = tokio::time::timeout(Duration::from_secs(10), rx2.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let v2: Value = serde_json::from_slice(&r2.body).unwrap();
+        assert_eq!(code(&v2), "access_pending", "write stays pending {v2}");
+        assert!(
+            f.fake.calls("consent.withdraw").is_empty(),
+            "no withdraw for write"
+        );
+    }
+    // Another session: same scope and path, different harness session.
+    {
+        let _probe = DirectoryScopeProbeBudgetOverride::generous();
+        let f = fixture(FakeCingulate::up());
+        set_hold_budget_for_test(Some(Duration::from_millis(600)));
+        let sub = f.head_root.join("sessdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        let a = sub.join("a.txt");
+        let b = sub.join("b.txt");
+        std::fs::write(&a, "a contents\n").unwrap();
+        std::fs::write(&b, "b contents\n").unwrap();
+        let mut other = identity(&f.worker.project_root, f.worker.scope.clone());
+        let inner = Arc::get_mut(&mut other.0).unwrap();
+        inner.session = "other-session".into();
+        if let AuthenticatedPrincipal::RouteBind { session_id, .. } = &mut inner.spawn_principal {
+            *session_id = "other-session".into();
+        }
+        let mut rx1 = f.send_read(&f.worker, &a, 915).await;
+        let mut rx2 = f.send_read(&other, &b, 916).await;
+        wait_for(|| f.fake.calls("consent.request").len() >= 2).await;
+        let key1 = call_key_for_file(&f.fake.calls("consent.request"), "a.txt");
+        f.fake.answer(
+            &key1,
+            json!({"state": "settled", "outcome": "allow_scope", "answered_by": "user"}),
+        );
+        let r1 = tokio::time::timeout(Duration::from_secs(10), rx1.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let v1: Value = serde_json::from_slice(&r1.body).unwrap();
+        assert!(text(&v1).contains("a contents"), "{v1}");
+        let r2 = tokio::time::timeout(Duration::from_secs(10), rx2.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let v2: Value = serde_json::from_slice(&r2.body).unwrap();
+        assert_eq!(
+            code(&v2),
+            "access_pending",
+            "other session stays pending {v2}"
+        );
+        assert!(
+            f.fake.calls("consent.withdraw").is_empty(),
+            "no withdraw across sessions"
+        );
+    }
+    // Another epoch: same session and path shape, different scope epoch.
+    {
+        let _probe = DirectoryScopeProbeBudgetOverride::generous();
+        let f = fixture(FakeCingulate::up());
+        set_hold_budget_for_test(Some(Duration::from_millis(600)));
+        let sub = f.head_root.join("epochdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        let a = sub.join("a.txt");
+        let b = sub.join("b.txt");
+        std::fs::write(&a, "a contents\n").unwrap();
+        std::fs::write(&b, "b contents\n").unwrap();
+        let epoch8: subc_protocol::scope::ScopeStamp = serde_json::from_value(json!({
+            "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+            "ref": "worker",
+            "scope_epoch": 8,
+            "kind": "worker",
+            "parent": {"owner": {"kind": "reserved", "module_id": "prefrontal-core"}, "ref": "head", "scope_epoch": 7},
+            "owner_authorized": true,
+        }))
+        .unwrap();
+        let other = identity(&f.worker.project_root, Some(epoch8));
+        let mut rx1 = f.send_read(&f.worker, &a, 917).await;
+        let mut rx2 = f.send_read(&other, &b, 918).await;
+        wait_for(|| f.fake.calls("consent.request").len() >= 2).await;
+        let key1 = call_key_for_file(&f.fake.calls("consent.request"), "a.txt");
+        f.fake.answer(
+            &key1,
+            json!({"state": "settled", "outcome": "allow_scope", "answered_by": "user"}),
+        );
+        let r1 = tokio::time::timeout(Duration::from_secs(10), rx1.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let v1: Value = serde_json::from_slice(&r1.body).unwrap();
+        assert!(text(&v1).contains("a contents"), "{v1}");
+        let r2 = tokio::time::timeout(Duration::from_secs(10), rx2.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let v2: Value = serde_json::from_slice(&r2.body).unwrap();
+        assert_eq!(
+            code(&v2),
+            "access_pending",
+            "other epoch stays pending {v2}"
+        );
+        assert!(
+            f.fake.calls("consent.withdraw").is_empty(),
+            "no withdraw across epochs"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_folder_grant_withdraw_race_uses_recorded_outcome() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let _probe = DirectoryScopeProbeBudgetOverride::generous();
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_secs(5)));
+    let sub = f.head_root.join("racedir");
+    std::fs::create_dir_all(&sub).unwrap();
+    let a = sub.join("a.txt");
+    let b = sub.join("b.txt");
+    std::fs::write(&a, "a contents\n").unwrap();
+    std::fs::write(&b, "b contents\n").unwrap();
+    let mut rx1 = f.send_read(&f.worker, &a, 921).await;
+    let mut rx2 = f.send_read(&f.worker, &b, 922).await;
+    wait_for(|| f.fake.calls("consent.request").len() >= 2).await;
+    let requests = f.fake.calls("consent.request");
+    let key1 = call_key_for_file(&requests, "a.txt");
+    let key2 = call_key_for_file(&requests, "b.txt");
+    // Hold the sibling's denial inside its finish so the covering grant's
+    // withdraw finds it still live: the withdraw then returns the settled
+    // record (like settled-withdraw-reply) and must not override it.
+    let gate = FinishGateOverride::install("subc-41-922", false);
+    f.fake
+        .answer(&key2, json!({"state": "settled", "outcome": "deny"}));
+    f.fake.answer(
+        &key1,
+        json!({"state": "settled", "outcome": "allow_scope", "answered_by": "user"}),
+    );
+    wait_for(|| gate.0.entered.load(Ordering::SeqCst)).await;
+    // The covering grant is stored while the sibling is still live, so a
+    // withdraw is attempted for it even though it already settled.
+    wait_for(|| !f.fake.calls("consent.withdraw").is_empty()).await;
+    gate.release();
+    let r1 = tokio::time::timeout(Duration::from_secs(10), rx1.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let r2 = tokio::time::timeout(Duration::from_secs(10), rx2.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let v1: Value = serde_json::from_slice(&r1.body).unwrap();
+    let v2: Value = serde_json::from_slice(&r2.body).unwrap();
+    assert!(text(&v1).contains("a contents"), "covering still runs {v1}");
+    assert_eq!(
+        code(&v2),
+        "access_declined",
+        "recorded denial wins over covering grant {v2}"
+    );
+}
+
+struct FinishGate {
+    request: String,
+    after_claim: bool,
+    entered: AtomicBool,
+    completed: AtomicBool,
+    released: StdMutex<bool>,
+    wake: std::sync::Condvar,
+}
+
+static FINISH_GATE: StdMutex<Option<Arc<FinishGate>>> = StdMutex::new(None);
+
+#[cfg(unix)]
+struct FinishGateOverride(Arc<FinishGate>);
+
+#[cfg(unix)]
+impl FinishGateOverride {
+    fn install(request: &str, after_claim: bool) -> Self {
+        let gate = Arc::new(FinishGate {
+            request: request.into(),
+            after_claim,
+            entered: AtomicBool::new(false),
+            completed: AtomicBool::new(false),
+            released: StdMutex::new(false),
+            wake: std::sync::Condvar::new(),
+        });
+        assert!(FINISH_GATE
+            .lock()
+            .unwrap()
+            .replace(Arc::clone(&gate))
+            .is_none());
+        Self(gate)
+    }
+
+    fn release(&self) {
+        *self.0.released.lock().unwrap() = true;
+        self.0.wake.notify_all();
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FinishGateOverride {
+    fn drop(&mut self) {
+        self.release();
+        FINISH_GATE.lock().unwrap().take();
+    }
+}
+
+pub(super) fn wait_at_finish(request: &str, after_claim: bool) {
+    let gate = FINISH_GATE.lock().unwrap().clone();
+    if let Some(gate) = gate.filter(|gate| gate.request == request) {
+        if gate.after_claim == after_claim {
+            gate.entered.store(true, Ordering::SeqCst);
+            let released = gate.released.lock().unwrap();
+            let (_released, timeout) = gate
+                .wake
+                .wait_timeout_while(released, Duration::from_secs(10), |released| !*released)
+                .unwrap();
+            assert!(!timeout.timed_out(), "finish gate must be released");
+        }
+        if after_claim {
+            gate.completed.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_deadline_during_settled_application_waits_for_the_real_answer() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    for after_claim in [false, true] {
+        let f = fixture(FakeCingulate::up());
+        set_hold_budget_for_test(Some(Duration::from_secs(1)));
+        let gate = FinishGateOverride::install("subc-41-781", after_claim);
+        let target = f.head_root.join("shared.txt");
+        let mut first = f.send_read(&f.worker, &target, 781).await;
+        wait_for(|| !f.fake.calls("consent.request").is_empty()).await;
+        let request = &f.fake.calls("consent.request")[0];
+        let original = request["call_key"].as_str().unwrap().to_owned();
+        f.fake.answer(
+            &original,
+            json!({"state":"settled", "outcome":"allow_once", "answered_by":"user"}),
+        );
+        wait_for(|| gate.0.entered.load(Ordering::SeqCst)).await;
+
+        SETTLED_DEADLINE_WAITING.store(false, Ordering::SeqCst);
+        wait_for(|| SETTLED_DEADLINE_WAITING.load(Ordering::SeqCst) || !first.is_empty()).await;
+        assert!(
+            first.try_recv().is_err(),
+            "a received answer must not promise another resume"
+        );
+        gate.release();
+        let frame = tokio::time::timeout(Duration::from_secs(5), first.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let allowed: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert!(
+            text(&allowed).contains("head-owned contents"),
+            "the received answer must finish the original call: {allowed}"
+        );
+        assert_eq!(
+            f.fake.state.lock().unwrap().asks.len(),
+            1,
+            "retry must reuse the original ask"
+        );
+        assert!(f
+            .fake
+            .calls("consent.request")
+            .iter()
+            .all(|request| request["call_key"] == original));
+        assert!(f.asks().is_empty());
+        assert!(f.worker_grants().is_empty());
+
+        let mut second = f.send_read(&f.worker, &target, 783).await;
+        wait_for(|| f.fake.state.lock().unwrap().asks.len() == 2).await;
+        assert!(
+            second.try_recv().is_err(),
+            "allow_once cannot run another retry"
+        );
+        let requests = f.fake.calls("consent.request");
+        let new_key = requests.last().unwrap()["call_key"].as_str().unwrap();
+        assert_ne!(new_key, original);
+        f.fake
+            .answer(new_key, json!({"state":"settled", "outcome":"deny"}));
+        // Bounds only the reply after a deny; a loaded runner once took over
+        // 3 s, and a call that never replies still fails here.
+        let frame = tokio::time::timeout(Duration::from_secs(30), second.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let refused: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(code(&refused), "access_declined", "{refused}");
+    }
+}
+
+static SETTLED_DEADLINE_WAITING: AtomicBool = AtomicBool::new(false);
+static SETTLED_WAITER_JOINED: AtomicBool = AtomicBool::new(false);
+// Regression checks can disable either synchronization path without rebuilding
+// the non-test library.
+pub(super) static SETTLED_DEADLINE_ENABLED: AtomicBool = AtomicBool::new(true);
+pub(super) static SETTLED_JOIN_ENABLED: AtomicBool = AtomicBool::new(true);
+pub(super) static SETTLED_GROUP_RETENTION_ENABLED: AtomicBool = AtomicBool::new(true);
+pub(super) static SETTLED_WAIT_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn settled_deadline_waiting() {
+    SETTLED_DEADLINE_WAITING.store(true, Ordering::SeqCst);
+}
+
+pub(super) fn settled_waiter_joined() {
+    SETTLED_WAITER_JOINED.store(true, Ordering::SeqCst);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_retry_during_settled_claim_reuses_the_terminal_result() {
+    static APPROVED_RUNS: AtomicU64 = AtomicU64::new(0);
+    fn counted_read(request: RawRequest, ctx: &AppContext) -> Response {
+        let response = read_dispatch(request, ctx);
+        if response.success {
+            APPROVED_RUNS.fetch_add(1, Ordering::SeqCst);
+        }
+        response
+    }
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_secs(1)));
+    let gate = FinishGateOverride::install("subc-41-791", true);
+    let target = f.head_root.join("shared.txt");
+    APPROVED_RUNS.store(0, Ordering::SeqCst);
+    let mut first = f.send_with(&f.worker, &target, 791, counted_read).await;
+    wait_for(|| !f.fake.calls("consent.request").is_empty()).await;
+    let request = &f.fake.calls("consent.request")[0];
+    f.fake.answer(
+        request["call_key"].as_str().unwrap(),
+        json!({"state":"settled", "outcome":"allow_once", "answered_by":"user"}),
+    );
+    wait_for(|| gate.0.entered.load(Ordering::SeqCst)).await;
+    assert!(f.asks()[0].holder_is_live());
+    SETTLED_WAITER_JOINED.store(false, Ordering::SeqCst);
+    let mut retry = f.send_with(&f.worker, &target, 792, counted_read).await;
+    wait_for(|| SETTLED_WAITER_JOINED.load(Ordering::SeqCst) || !retry.is_empty()).await;
+    assert!(
+        retry.try_recv().is_err(),
+        "a settled holder must not return access_pending"
+    );
+    gate.release();
+    let first = tokio::time::timeout(Duration::from_secs(5), first.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let retry = tokio::time::timeout(Duration::from_secs(5), retry.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let first: Value = serde_json::from_slice(&first.body).unwrap();
+    let retry: Value = serde_json::from_slice(&retry.body).unwrap();
+    assert!(text(&first).contains("head-owned contents"), "{first}");
+    assert_eq!(text(&retry), text(&first));
+    assert_eq!(f.fake.calls("consent.request").len(), 1);
+    assert!(f.asks().is_empty());
+    assert!(f.worker_grants().is_empty());
+    assert_eq!(
+        APPROVED_RUNS.load(Ordering::SeqCst),
+        1,
+        "share the result, not the one-time authority"
+    );
+    assert_eq!(
+        code(&f.read(&f.worker, &target, 793).await),
+        "access_pending"
+    );
+}
+
+#[cfg(unix)]
+struct DelayedSecondConsentReceipt {
+    fake: Arc<FakeCingulate>,
+    awaits: AtomicU64,
+    second_waiting: Arc<Notify>,
+    second_received: Arc<Notify>,
+    release_second: Arc<Notify>,
+}
+
+#[cfg(unix)]
+impl ConsentTransport for DelayedSecondConsentReceipt {
+    fn call(&self, call: ConsentCall) -> ConsentFuture {
+        SharedFake(Arc::clone(&self.fake)).call(call)
+    }
+
+    fn call_with_receipt(&self, call: ConsentCall, receipt: ConsentReceipt) -> ConsentFuture {
+        let second =
+            call.method == "consent.await" && self.awaits.fetch_add(1, Ordering::SeqCst) == 1;
+        let reply = self.call(call);
+        let waiting = Arc::clone(&self.second_waiting);
+        let received = Arc::clone(&self.second_received);
+        let release = Arc::clone(&self.release_second);
+        Box::pin(async move {
+            if second {
+                waiting.notify_one();
+            }
+            let record = reply.await?;
+            if second {
+                received.notify_one();
+                release.notified().await;
+            }
+            receipt(record).await
+        })
+    }
+}
+
+#[cfg(unix)]
+async fn complete_overlap_with_delayed_receipt() -> (Fixture, PathBuf) {
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(None);
+    let waiting = Arc::new(Notify::new());
+    let received = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let transport = Arc::new(DelayedSecondConsentReceipt {
+        fake: Arc::clone(&f.fake),
+        awaits: AtomicU64::new(0),
+        second_waiting: Arc::clone(&waiting),
+        second_received: Arc::clone(&received),
+        release_second: Arc::clone(&release),
+    });
+    install_test_transport(Some(transport.clone()));
+    let target = f.head_root.join("shared.txt");
+    let mut first = f.send_read(&f.worker, &target, 821).await;
+    wait_for(|| transport.awaits.load(Ordering::SeqCst) >= 1).await;
+    let mut second = f.send_read(&f.worker, &target, 822).await;
+    tokio::time::timeout(Duration::from_secs(10), waiting.notified())
+        .await
+        .unwrap();
+    let request = &f.fake.calls("consent.request")[0];
+    f.fake.answer(
+        request["call_key"].as_str().unwrap(),
+        json!({"state":"settled", "outcome":"allow_once", "answered_by":"user"}),
+    );
+    tokio::time::timeout(Duration::from_secs(10), received.notified())
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(10), first.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let first: Value = serde_json::from_slice(&first.body).unwrap();
+    assert!(text(&first).contains("head-owned contents"), "{first}");
+    // Sending the terminal frame happens after run_with_consent returns and its
+    // SettlementOwner drops. The second call's receipt callback is still paused.
+    std::fs::write(&target, "contents changed after the approved read\n").unwrap();
+    release.notify_one();
+    let second = tokio::time::timeout(Duration::from_secs(10), second.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let second: Value = serde_json::from_slice(&second.body).unwrap();
+    assert_eq!(
+        text(&second),
+        text(&first),
+        "the delayed overlapping call must retain the original result: {second}"
+    );
+    assert_eq!(
+        f.fake.state.lock().unwrap().asks.len(),
+        1,
+        "both calls must use one permission ask"
+    );
+    assert_eq!(
+        f.fake.calls("consent.request").len(),
+        2,
+        "only the two original overlapping calls requested consent"
+    );
+    assert!(f.asks().is_empty());
+    assert!(
+        f.worker_grants().is_empty(),
+        "sharing a result must not install a standing grant"
+    );
+    (f, target)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_overlapping_retry_keeps_result_after_settlement_owner_drops() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let _completed = complete_overlap_with_delayed_receipt().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_completed_overlap_group_is_not_a_result_cache() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let (f, target) = complete_overlap_with_delayed_receipt().await;
+    set_hold_budget_for_test(Some(Duration::from_millis(100)));
+    let later = f.read(&f.worker, &target, 823).await;
+    assert_eq!(
+        code(&later),
+        "access_pending",
+        "a later call needs a new approval: {later}"
+    );
+    assert_eq!(f.fake.state.lock().unwrap().asks.len(), 2);
+    let requests = f.fake.calls("consent.request");
+    assert_ne!(
+        requests[0]["call_key"],
+        requests.last().unwrap()["call_key"]
+    );
+}
+
+#[test]
+fn consent_settled_wait_retry_message_is_exact() {
+    assert_eq!(ACCESS_RETRY_MESSAGE, "The permission answer has been received but is still being applied. Retry this same call now; do not wait for another resume.");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_settled_application_bound_says_retry_now_and_preserves_once() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_secs(1)));
+    SETTLED_WAIT_OVERRIDE_MS.store(50, Ordering::SeqCst);
+    let gate = FinishGateOverride::install("subc-41-801", true);
+    let target = f.head_root.join("shared.txt");
+    let mut first = f.send_read(&f.worker, &target, 801).await;
+    wait_for(|| !f.fake.calls("consent.request").is_empty()).await;
+    let request = &f.fake.calls("consent.request")[0];
+    f.fake.answer(
+        request["call_key"].as_str().unwrap(),
+        json!({"state":"settled", "outcome":"allow_once", "answered_by":"user"}),
+    );
+    wait_for(|| gate.0.entered.load(Ordering::SeqCst)).await;
+    let retry = f.read(&f.worker, &target, 802).await;
+    assert_eq!(code(&retry), "access_retry", "{retry}");
+    assert!(text(&retry).contains(ACCESS_RETRY_MESSAGE), "{retry}");
+    let frame = tokio::time::timeout(Duration::from_secs(5), first.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let expired: Value = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(code(&expired), "access_retry", "{expired}");
+    assert!(text(&expired).contains(ACCESS_RETRY_MESSAGE), "{expired}");
+    let cleanup_pending = f.read(&f.worker, &target, 804).await;
+    assert_eq!(code(&cleanup_pending), "access_retry", "{cleanup_pending}");
+    assert!(text(&cleanup_pending).contains(ACCESS_RETRY_MESSAGE));
+    gate.release();
+    wait_for(|| gate.0.completed.load(Ordering::SeqCst)).await;
+    wait_for(|| f.asks().iter().all(|ask| !ask.holder_is_live())).await;
+    let allowed = f.settled_read(&f.worker, &target, 803).await;
+    assert!(text(&allowed).contains("head-owned contents"), "{allowed}");
+    assert_eq!(f.fake.state.lock().unwrap().asks.len(), 1);
+    assert!(f.asks().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_deadline_during_settled_denial_returns_the_refusal() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_secs(1)));
+    let gate = FinishGateOverride::install("subc-41-811", false);
+    let target = f.head_root.join("shared.txt");
+    let mut first = f.send_read(&f.worker, &target, 811).await;
+    wait_for(|| !f.fake.calls("consent.request").is_empty()).await;
+    let request = &f.fake.calls("consent.request")[0];
+    SETTLED_DEADLINE_WAITING.store(false, Ordering::SeqCst);
+    f.fake.answer(
+        request["call_key"].as_str().unwrap(),
+        json!({"state":"settled", "outcome":"deny"}),
+    );
+    wait_for(|| gate.0.entered.load(Ordering::SeqCst)).await;
+    wait_for(|| SETTLED_DEADLINE_WAITING.load(Ordering::SeqCst) || !first.is_empty()).await;
+    assert!(
+        first.try_recv().is_err(),
+        "a received denial must not promise another resume"
+    );
+    gate.release();
+    let frame = tokio::time::timeout(Duration::from_secs(5), first.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let refused: Value = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(code(&refused), "access_declined", "{refused}");
+    assert!(f.asks().is_empty());
+    assert!(f.worker_grants().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_cancelled_finish_releases_claim_for_identical_retry() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    for after_claim in [false, true] {
+        cancel_finish_at(after_claim).await;
+    }
+}
+
+#[cfg(unix)]
+async fn cancel_finish_at(after_claim: bool) {
+    let mut f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_secs(8)));
+    let gate = FinishGateOverride::install("subc-41-761", after_claim);
+    let target = f.head_root.join("shared.txt");
+    let _first = f.send_read(&f.worker, &target, 761).await;
+    wait_for(|| !f.fake.calls("consent.request").is_empty()).await;
+    let request = &f.fake.calls("consent.request")[0];
+    f.fake.answer(
+        request["call_key"].as_str().unwrap(),
+        json!({"state":"settled", "outcome":"allow_once", "answered_by":"user"}),
+    );
+    wait_for(|| gate.0.entered.load(Ordering::SeqCst)).await;
+    assert_eq!(f.asks()[0].holder_is_live(), after_claim);
+
+    // Losing the caller drops the receipt future while its blocking database
+    // work is still completing. No tool rerun can take ownership of this claim.
+    f.connection_cancel.cancel();
+    wait_for(|| HELD.lock().unwrap().get(&route_key(41, 1)).is_none()).await;
+    gate.release();
+    assert_claim_cleared_then_retry(&mut f, &target, 762).await;
+}
+
+#[cfg(unix)]
+async fn assert_claim_cleared_then_retry(f: &mut Fixture, target: &Path, corr: u64) {
+    let cleared = tokio::time::timeout(Duration::from_secs(3), async {
+        while !f.asks().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        cleared.is_ok(),
+        "cancelled finish left a live holder: {:?}",
+        f.asks()
+    );
+
+    f.connection_cancel = PersistentCancelSignal::new();
+    install_test_transport(Some(Arc::new(SharedFake(Arc::clone(&f.fake)))));
+    let mut retry = f.send_read(&f.worker, target, corr).await;
+    wait_for(|| f.fake.calls("consent.request").len() == 2).await;
+    let request = &f.fake.calls("consent.request")[1];
+    f.fake.answer(
+        request["call_key"].as_str().unwrap(),
+        json!({"state":"settled", "outcome":"allow_once", "answered_by":"user"}),
+    );
+    let frame = tokio::time::timeout(Duration::from_secs(5), retry.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let reply: Value = serde_json::from_slice(&frame.body).unwrap();
+    assert!(text(&reply).contains("head-owned contents"), "{reply}");
+    assert!(f.asks().is_empty());
+    assert!(f.worker_grants().is_empty());
+}
+
+/// Models route cleanup after a consent reply has arrived but before the
+/// transport returns it to the held tool call.
+#[cfg(unix)]
+struct ReceiptGate {
+    fake: Arc<FakeCingulate>,
+    received: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[cfg(unix)]
+impl ConsentTransport for ReceiptGate {
+    fn call(&self, call: ConsentCall) -> ConsentFuture {
+        self.call_with_receipt(call, Box::new(|record| Box::pin(async { Ok(record) })))
+    }
+
+    fn call_with_receipt(&self, call: ConsentCall, receipt: ConsentReceipt) -> ConsentFuture {
+        let reply = SharedFake(Arc::clone(&self.fake)).call(call.clone());
+        let received = Arc::clone(&self.received);
+        let release = Arc::clone(&self.release);
+        Box::pin(async move {
+            let result = receipt(reply.await?).await?;
+            if call.method == "consent.await"
+                && matches!(decode_record(&result), Ok(settled) if settled != Settlement::Pending)
+            {
+                received.notify_one();
+                release.notified().await;
+            }
+            Ok(result)
+        })
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_cancelled_receipt_releases_claim_before_handoff() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let mut f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_secs(8)));
+    let received = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    install_test_transport(Some(Arc::new(ReceiptGate {
+        fake: Arc::clone(&f.fake),
+        received: Arc::clone(&received),
+        release: Arc::clone(&release),
+    })));
+    let target = f.head_root.join("shared.txt");
+    let _first = f.send_read(&f.worker, &target, 771).await;
+    wait_for(|| !f.fake.calls("consent.request").is_empty()).await;
+    let request = &f.fake.calls("consent.request")[0];
+    f.fake.answer(
+        request["call_key"].as_str().unwrap(),
+        json!({"state":"settled", "outcome":"allow_once", "answered_by":"user"}),
+    );
+    tokio::time::timeout(Duration::from_secs(5), received.notified())
+        .await
+        .unwrap();
+    assert!(f.asks()[0].holder_is_live());
+    f.connection_cancel.cancel();
+    wait_for(|| HELD.lock().unwrap().get(&route_key(41, 1)).is_none()).await;
+    release.notify_one();
+    assert_claim_cleared_then_retry(&mut f, &target, 772).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_scope_outline_settlement_precedes_cleanup_and_zoom_via_symlink() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let _probe_budget = DirectoryScopeProbeBudgetOverride::generous();
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(None);
+    let target = f.head_root.join("live.rs");
+    std::fs::write(&target, "pub fn retained() -> bool { true }\n").unwrap();
+    let alias = f.dir.path().join("target");
+    std::os::unix::fs::symlink(&f.head_root, &alias).unwrap();
+    let received = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    install_test_transport(Some(Arc::new(ReceiptGate {
+        fake: Arc::clone(&f.fake),
+        received: Arc::clone(&received),
+        release: Arc::clone(&release),
+    })));
+    let mut outline = f
+        .send_tool(
+            &f.worker,
+            "outline",
+            json!({"target": alias.join("live.rs")}),
+            701,
+            scope_dispatch,
+        )
+        .await;
+    wait_for(|| !f.fake.calls("consent.request").is_empty()).await;
+    let request = &f.fake.calls("consent.request")[0];
+    assert_eq!(request["paths"][0], json!(target));
+    f.fake.answer(
+        request["call_key"].as_str().unwrap(),
+        json!({"state":"settled", "outcome":"allow_scope"}),
+    );
+    tokio::time::timeout(Duration::from_secs(5), received.notified())
+        .await
+        .unwrap();
+    let zoom = f
+        .tool(
+            "zoom",
+            json!({"batch":[{"target": target, "symbols":"retained"}]}),
+            702,
+        )
+        .await;
+    release.notify_one();
+    assert!(text(&zoom).contains("retained"), "{zoom}");
+    assert_eq!(
+        f.fake.calls("consent.request").len(),
+        1,
+        "zoom must not file another ask"
+    );
+    assert_eq!(f.worker_grants().len(), 1);
+    let reply = tokio::time::timeout(Duration::from_secs(5), outline.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert!(text(&reply).contains("retained"), "{reply}");
 }
 
 #[cfg(unix)]
@@ -982,7 +2366,9 @@ async fn consent_scope_write_folder_admits_subfolders_and_refuses_sibling_and_sy
         request["call_key"].as_str().unwrap(),
         json!({"state":"settled", "outcome":"allow_scope", "answered_by":"user"}),
     );
-    let allowed = f.tool("write", args, 302).await;
+    let allowed = f
+        .settled_reply(f.send_tool(&f.worker, "write", args, 302, scope_dispatch))
+        .await;
     assert_ne!(code(&allowed), "access_pending", "{allowed}");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "first write\n");
     assert_eq!(
@@ -1137,7 +2523,7 @@ async fn consent_scope_old_pending_file_is_not_widened() {
         record.call_key.as_deref().unwrap(),
         json!({"state":"settled", "outcome":"allow_scope", "answered_by":"user"}),
     );
-    let allowed = f.read(&f.worker, &target, 202).await;
+    let allowed = f.settled_read(&f.worker, &target, 202).await;
     assert!(text(&allowed).contains("head-owned contents"), "{allowed}");
     assert_eq!(f.worker_grants(), vec![old_grant]);
     assert_eq!(f.fake.calls("consent.request")[1]["pattern"], json!(target));
@@ -1186,7 +2572,7 @@ async fn consent_scope_persisted_non_parent_pattern_is_refused() {
             record.call_key.as_deref().unwrap(),
             json!({"state":"settled", "outcome":"allow_scope", "answered_by":"head"}),
         );
-        let declined = f.read(&f.worker, &target, 202).await;
+        let declined = f.settled_read(&f.worker, &target, 202).await;
         assert_eq!(code(&declined), "access_declined", "{declined}");
         assert!(!text(&declined).contains("head-owned contents"));
         assert!(f.worker_grants().is_empty());
@@ -1230,7 +2616,7 @@ async fn consent_scope_head_file_grant_allows_once_without_delegating_directory(
             "state":"settled", "outcome":"allow_once", "answered_by":"head",
         }),
     );
-    let allowed = f.read(&f.worker, &target, 202).await;
+    let allowed = f.settled_read(&f.worker, &target, 202).await;
     assert!(text(&allowed).contains("unheld contents"), "{allowed}");
     assert!(f.worker_grants().is_empty());
 }
@@ -1271,7 +2657,7 @@ async fn consent_scope_head_file_only_scope_answer_stores_only_the_file() {
             "state":"settled", "outcome":"allow_scope", "answered_by":"head",
         }),
     );
-    let allowed = f.read(&f.worker, &target, 202).await;
+    let allowed = f.settled_read(&f.worker, &target, 202).await;
     assert!(text(&allowed).contains("unheld contents"), "{allowed}");
     assert_eq!(f.worker_grants(), vec![grant]);
     let sibling = f.dir.path().join("sibling.txt");
@@ -1302,7 +2688,7 @@ async fn consent_scope_head_directory_still_delegates_directory() {
             "state":"settled", "outcome":"allow_scope", "answered_by":"head",
         }),
     );
-    let allowed = f.read(&f.worker, &target, 202).await;
+    let allowed = f.settled_read(&f.worker, &target, 202).await;
     assert!(text(&allowed).contains("head-owned contents"), "{allowed}");
     assert_eq!(
         f.worker_grants(),
@@ -1380,12 +2766,14 @@ async fn consent_scope_stalled_prepare_probe_is_bounded_and_releases_database() 
     let started = Instant::now();
     let task = tokio::spawn(async move {
         let route = RouteHold::new(running_call.route);
+        let owner = SettlementOwner::new(&running_call);
         hold(
             &running_call,
             grant,
             Instant::now() + Duration::from_millis(100),
             &route,
             None,
+            &owner.0,
         )
         .await
     });
@@ -1439,10 +2827,13 @@ async fn consent_stalled_home_scope_probe_is_single_flight_and_file_only() {
         let call = scope_probe_call(&f, &target);
         tasks.spawn(async move {
             let route = RouteHold::new(call.route);
-            let result =
-                tokio::time::timeout(HANG_GUARD, hold(&call, grant, Instant::now(), &route, None))
-                    .await
-                    .expect("concurrent stalled probes must finish before the hang guard");
+            let owner = SettlementOwner::new(&call);
+            let result = tokio::time::timeout(
+                HANG_GUARD,
+                hold(&call, grant, Instant::now(), &route, None, &owner.0),
+            )
+            .await
+            .expect("concurrent stalled probes must finish before the hang guard");
             assert!(matches!(result, Hold::Answer(_)));
         });
     }
@@ -1521,7 +2912,7 @@ async fn consent_scope_held_probe_at_settlement_keeps_advertised_tree_and_siblin
         request["call_key"].as_str().unwrap(),
         json!({"state":"settled", "outcome":"allow_scope", "answered_by":"head"}),
     );
-    let allowed = f.read(&f.worker, &target, 202).await;
+    let allowed = f.settled_read(&f.worker, &target, 202).await;
     assert!(text(&allowed).contains("head-owned contents"), "{allowed}");
     assert_eq!(
         f.worker_grants(),
@@ -1719,6 +3110,98 @@ fn consent_scope_rejects_home_ancestors() {
     for directory in ["/srv/users", "/srv/users/alice"] {
         assert!(
             !directory_scope_is_narrow(Path::new(directory), home, Path::new("/")),
+            "{directory}"
+        );
+    }
+}
+
+#[test]
+fn consent_scope_preserves_ordinary_system_name_prefixes() {
+    #[cfg(unix)]
+    let (home, root, ordinary, system) = (
+        Path::new("/srv/users/alice"),
+        Path::new("/"),
+        vec!["/library/x", "/library/projects", "/libfoo/x"],
+        vec!["/lib64/x", "/libx32/x"],
+    );
+    #[cfg(windows)]
+    let (home, root, ordinary, system) = (
+        Path::new(r"C:\Users\alice"),
+        Path::new(r"C:\"),
+        vec![r"C:\Program Files-backup\x", r"C:\PROGRAM FILES ARM\Vendor"],
+        vec![r"C:\Program Files (x86)\x", r"C:\pRoGrAm FiLeS\x"],
+    );
+    for directory in ordinary {
+        assert!(
+            directory_scope_is_narrow(Path::new(directory), home, root),
+            "ordinary folder must remain eligible: {directory}"
+        );
+    }
+    for directory in system {
+        assert!(
+            !directory_scope_is_narrow(Path::new(directory), home, root),
+            "system tree must stay file-only: {directory}"
+        );
+    }
+}
+
+#[test]
+fn consent_scope_rejects_system_trees() {
+    #[cfg(unix)]
+    let (home, root, directories) = (
+        Path::new("/srv/users/alice"),
+        Path::new("/"),
+        vec![
+            "/usr/local",
+            "/usr/local/share",
+            "/etc/ssl",
+            "/bin/tools",
+            "/sbin/tools",
+            "/lib/modules",
+            "/lib32/modules",
+            "/lib64/modules",
+            "/libx32/modules",
+            "/libexec/tools",
+            "/opt/vendor",
+            "/var/log",
+            "/var/folders-other/user",
+            "/System/Library",
+            "/Library/Application Support",
+            "/private/etc/ssl",
+            "/private/var/db",
+        ],
+    );
+    #[cfg(windows)]
+    let (home, root, directories) = (
+        Path::new(r"C:\Users\alice"),
+        Path::new(r"C:\"),
+        vec![
+            r"C:\Windows\System32",
+            r"C:\wInDoWs\Temp",
+            r"C:\Program Files\Vendor",
+            r"C:\Program Files (x86)\Vendor",
+            r"C:\PROGRAM FILES (X86)\Vendor",
+        ],
+    );
+    for directory in directories {
+        assert!(
+            !directory_scope_is_narrow(Path::new(directory), home, root),
+            "system tree must stay file-only: {directory}"
+        );
+    }
+    #[cfg(unix)]
+    let ordinary = [
+        "/srv/projects/src",
+        "/usr-local/project",
+        "/opt-project/src",
+        "/var/folders/ab/user/T",
+        "/private/var/folders/ab/user/T",
+    ];
+    #[cfg(windows)]
+    let ordinary = [r"C:\Users\alice\Work\src", r"C:\Windows-project\src"];
+    for directory in ordinary {
+        assert!(
+            directory_scope_is_narrow(Path::new(directory), home, root),
             "{directory}"
         );
     }
@@ -3064,7 +4547,7 @@ async fn consent_head_answer_is_rechecked_against_the_current_head_policy() {
         request["call_key"].as_str().unwrap(),
         json!({"state": "settled", "outcome": "allow_scope", "answered_by": "head"}),
     );
-    let declined = f.read(&f.worker, &target, 8).await;
+    let declined = f.settled_read(&f.worker, &target, 8).await;
     assert_eq!(code(&declined), "access_declined", "{declined}");
     assert!(!text(&declined).contains("unheld contents"));
     assert!(f.worker_grants().is_empty(), "no worker grant is recorded");
@@ -3086,7 +4569,7 @@ async fn consent_user_answer_is_not_rechecked_against_the_head() {
         request["call_key"].as_str().unwrap(),
         json!({"state": "settled", "outcome": "allow_once", "answered_by": "user"}),
     );
-    let allowed = f.read(&f.worker, &target, 8).await;
+    let allowed = f.settled_read(&f.worker, &target, 8).await;
     assert!(text(&allowed).contains("unheld contents"), "{allowed}");
 }
 
@@ -3106,7 +4589,7 @@ async fn consent_stamped_head_with_explicit_ask_requests_user_and_full_access_op
         requests[0]["call_key"].as_str().unwrap(),
         json!({"state":"settled","outcome":"allow_once","answered_by":"user"}),
     );
-    let reply = f.read(&f.head, &target, 7).await;
+    let reply = f.settled_read(&f.head, &target, 7).await;
     assert!(text(&reply).contains("unheld contents"), "{reply}");
     let count = f.fake.calls("consent.request").len();
     remote_policy::catalog(
@@ -3302,7 +4785,7 @@ async fn access_pending_renderer_wire_matches_golden_vector_without_consent() {
         BindTrust::FirstParty,
     )
     .unwrap();
-    let wire = String::from_utf8(frame.body).unwrap();
+    let wire = String::from_utf8(frame.frame.body).unwrap();
     let body: Value = serde_json::from_str(&wire).unwrap();
     assert_eq!(body["content"][0]["type"], "text");
     assert_eq!(body["isError"], true);
@@ -3496,6 +4979,54 @@ fn consent_vectors_settled_allow_without_answered_by_is_the_head() {
     assert!(decode_record(&json!({"outcome": "allow_once"})).is_err());
     assert!(decode_elicitation_id(&json!({"id": "acc_1"})).is_err());
     assert!(decode_result(br#"{"elicitation_id":"acc_1"}"#).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn consent_vectors_folder_grant_withdraw() {
+    // Owner withdraws settle as `access_withdrawn` on AFT's normal route;
+    // withdrawing an already-settled ask returns its own settled record for
+    // the race guard; a non-owner gets `elicitation_not_owner`.
+    for (name, id) in [
+        ("scope-owner-withdraw-request.json", "acc_5"),
+        ("non-owner-withdraw-request.json", "acc_5"),
+        ("settled-withdraw-request.json", "acc_4"),
+    ] {
+        assert_eq!(
+            encode("consent.withdraw", &json!({"elicitation_id": id})).unwrap(),
+            vector(name),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        decode_record(&decode_result(&vector("scope-owner-withdraw-reply.json")).unwrap()).unwrap(),
+        Settlement::Refused("access_withdrawn".into())
+    );
+    assert_eq!(
+        decode_record(&decode_result(&vector("settled-withdraw-reply.json")).unwrap()).unwrap(),
+        Settlement::Allow {
+            scope: false,
+            by_user: true
+        }
+    );
+    let refusal: Value =
+        serde_json::from_slice(&vector("non-owner-withdraw-refusal.json")).unwrap();
+    assert_eq!(refusal["code"], json!("elicitation_not_owner"));
+    let notice = vector_json("notice-owner-withdrawn.json");
+    assert_eq!(notice["purpose"], json!("withdrawn"));
+    assert_eq!(notice["elicitation_id"], json!("acc_5"));
+    assert_eq!(notice["asker"]["scope_ref"], json!("worker"));
+    assert_eq!(notice["asker"]["scope_epoch"], json!(3));
+    let stamps = vector_json("withdraw-bind-stamps.json");
+    assert_eq!(
+        stamps["scope-owner-withdraw"],
+        json!("reserved:prefrontal-core")
+    );
+    assert_eq!(stamps["non-owner-withdraw"], json!("reserved:basal"));
+    assert_eq!(
+        stamps["settled-withdraw"],
+        json!("reserved:prefrontal-core")
+    );
 }
 
 #[cfg(unix)]
@@ -4238,22 +5769,53 @@ async fn consent_head_policy_resolves_with_database_unlocked() {
     let asked = probes.borrow().len();
     assert!(asked > 0, "preparing the ask resolved the head's policy");
 
-    let applied = apply_allow(
-        &db,
-        &f.ctx,
-        &f.worker,
+    asks::set_elicitation(
+        &db.lock().unwrap(),
         &prep.key,
         &prep.call_key,
-        &asks::new_holder(),
-        &prep.grant,
-        false,
-        false,
+        "acc_log_granted",
     )
     .unwrap();
+    let (applied, lines) = crate::logging::capture_log_lines(|| {
+        apply_allow(
+            &db,
+            &f.ctx,
+            &f.worker,
+            &prep.key,
+            &prep.call_key,
+            &asks::new_holder(),
+            &prep.grant,
+            true,
+            false,
+        )
+    });
+    let applied = applied.unwrap();
     assert!(
         matches!(applied, Applied::Run(_)),
         "the head's answer applies"
     );
+    let inserted: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("consent grant inserted"))
+        .collect();
+    assert_eq!(inserted.len(), 1, "{lines:?}");
+    let line = inserted[0];
+    assert!(
+        line.starts_with("INFO ") && line.contains("[ses_worker]"),
+        "{line}"
+    );
+    assert!(
+        line.contains("ask=acc_log_granted kind=file scope_epoch=7"),
+        "{line}"
+    );
+    let hash = line.split_once("path_hash=").unwrap().1;
+    assert_eq!(hash.len(), 12, "{line}");
+    assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()), "{line}");
+    assert!(
+        !line.contains(target.to_str().unwrap()) && !line.contains("shared.txt"),
+        "{line}"
+    );
+    assert_eq!(f.worker_grants(), vec![grant]);
     drop(hook);
     let probes = probes.borrow();
     assert!(
@@ -4482,6 +6044,49 @@ async fn authenticated_consent_transport(
     transport
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn consent_real_transport_applies_receipt_before_releasing_lease() {
+    let daemon = crate::synapse_embed::route_tests::Daemon::start(1, false);
+    let transport = authenticated_consent_transport(&daemon).await;
+    let call = transport_consent_call("receipt-worker", "consent.await");
+    let bind = subc_protocol::BindIdentity::new(
+        call.project_root.clone(),
+        "aft-consent",
+        call.session.clone(),
+    );
+    let route = transport.route_identity(ConsentRouteKey::new(&bind, &call.scope));
+    let state = Arc::clone(&route.state);
+    let observed = Arc::new(AtomicBool::new(false));
+    let received = Arc::clone(&observed);
+    let reply = transport
+        .clone()
+        .send_with_receipt(
+            call,
+            Some(Box::new(move |record| {
+                Box::pin(async move {
+                    // Inspect the production lease, not a stand-in's cleanup ordering.
+                    // release_route removes it before closing the scoped daemon handle.
+                    assert_eq!(
+                        state.leases.lock().unwrap().len(),
+                        1,
+                        "receipt must precede route release"
+                    );
+                    received.store(true, Ordering::SeqCst);
+                    Ok(record)
+                })
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply, json!({"ok":true}));
+    assert!(observed.load(Ordering::SeqCst));
+    assert!(route.state.leases.lock().unwrap().is_empty());
+    drop(route);
+    daemon.wait_closed();
+    assert!(transport.routes.lock().unwrap().is_empty());
+    daemon.finish();
+}
+
 async fn wait_consent_counts(
     daemon: &crate::synapse_embed::route_tests::Daemon,
     ready: impl Fn(&crate::synapse_embed::route_tests::Counts) -> bool,
@@ -4568,7 +6173,7 @@ async fn consent_answered_call_returns_while_another_scope_open_is_held() {
 #[cfg(unix)]
 #[tokio::test]
 async fn scratch_read_worker_route_skips_cingulate_only_for_own_task() {
-    use crate::bash_background::persistence::{task_paths, write_task, PersistedTask};
+    use crate::bash_background::persistence::{create_task_layout, write_task_at, PersistedTask};
     use crate::bash_background::BgTaskStatus;
 
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -4580,7 +6185,13 @@ async fn scratch_read_worker_route_skips_cingulate_only_for_own_task() {
         ("worker", "bash-0123456789abcdef"),
         ("other-session", "bash-fedcba9876543210"),
     ] {
-        let paths = task_paths(&storage, session, id).unwrap();
+        // Allocate the bundle through the locked production path so the
+        // session directory is non-empty before the detached persisted-task
+        // GC from the first replay can see it. A bare task_paths + write_task
+        // leaves an empty session directory that the sweep can rmdir between
+        // creation and the first file write.
+        let task = create_task_layout(&storage, session, id).unwrap();
+        let paths = &task.paths;
         let mut metadata = PersistedTask::starting(
             id.into(),
             session.into(),
@@ -4592,7 +6203,7 @@ async fn scratch_read_worker_route_skips_cingulate_only_for_own_task() {
             false,
         );
         metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
-        write_task(&paths.json, &metadata).unwrap();
+        write_task_at(&task, &metadata).unwrap();
         std::fs::write(&paths.stdout, "task output\n").unwrap();
         std::fs::write(&paths.stderr, "").unwrap();
         std::fs::write(&paths.exit, "0\n").unwrap();

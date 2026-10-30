@@ -26,13 +26,25 @@ def git(*args: str, input: str | None = None) -> str:
     return subprocess.check_output(["git", *args], input=input, text=True).strip()
 
 
-def check_commits(base: str, head: str, branch: str) -> int:
-    for sha in (base, head):
+def commits_between(base: str, head: str, *also_known: str) -> list[str]:
+    """Commits reachable from head but not from base (or `also_known`), newest first.
+
+    Compares full ancestry sets instead of asking `git rev-list base..head`.
+    Merge-queue commits carry committer dates out of order, and git's
+    date-based range walk then lists commits that base already contains (a
+    queue group once reported main's own merge commit as a PR commit).
+    """
+    known = set(git("rev-list", base, *also_known).splitlines())
+    return [sha for sha in git("rev-list", head).splitlines() if sha not in known]
+
+
+def check_commits(base: str, head: str, branch: str, also_known: tuple[str, ...] = ()) -> int:
+    for sha in (base, head, *also_known):
         if re.fullmatch(r"[0-9a-f]{40}", sha) is None:
             raise ValueError("identity policy requires full base/head SHAs")
         git("cat-file", "-e", f"{sha}^{{commit}}")
     count = 0
-    for sha in git("rev-list", f"{base}..{head}").splitlines():
+    for sha in commits_between(base, head, *also_known):
         name, author, committer, message = git(
             "show", "-s", "--format=%an%x00%ae%x00%ce%x00%B", sha
         ).split("\0", 3)
@@ -56,6 +68,14 @@ def check_commits(base: str, head: str, branch: str) -> int:
     return count
 
 
+def fetched_main() -> tuple[str, ...]:
+    """The fetched `origin/main` commit, or nothing when it isn't fetched."""
+    try:
+        return (git("rev-parse", "--verify", "--quiet", "origin/main^{commit}"),)
+    except subprocess.CalledProcessError:
+        return ()
+
+
 def check_event(event: str, payload: dict) -> int:
     queue = import_module("merge-queue-search")
     if event == "pull_request":
@@ -63,7 +83,11 @@ def check_event(event: str, payload: dict) -> int:
         head = pr["head"]["sha"]
         if git("rev-parse", "HEAD") != head:
             raise ValueError("PR identity checkout does not match the original head")
-        return check_commits(pr["base"]["sha"], head, pr["head"]["ref"])
+        # The event's base SHA can predate the main a PR branch later merged
+        # in, which would count main's own landed commits as the PR's. Commits
+        # already on main passed this policy when they landed, so exclude
+        # them. Without a fetched main, keep the stricter event base alone.
+        return check_commits(pr["base"]["sha"], head, pr["head"]["ref"], fetched_main())
     if event == "merge_group":
         group = payload["merge_group"]
         members = queue.queue_members(group["base_sha"], group["head_sha"],
@@ -80,7 +104,7 @@ def check_event(event: str, payload: dict) -> int:
             base = git("merge-base", "origin/main", head)
             return check_commits(base, head, payload["ref"].removeprefix("refs/heads/"))
         base = payload["before"]
-        commits = git("rev-list", "--first-parent", f"{base}..{head}").splitlines()
+        commits = queue.first_parent_between(base, head)
         if commits and all(len(git("show", "-s", "--format=%P", sha).split()) == 2 for sha in commits):
             members = queue.queue_members(base, head, None, payload["repository"]["full_name"])
             return sum(check_commits(base, member["head"], member["branch"]) for member in members)

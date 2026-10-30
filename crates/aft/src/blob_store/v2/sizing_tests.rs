@@ -586,7 +586,9 @@ fn io_amplification_real_payload_touch_probe() {
     use crate::views::RelPath;
     let checkout = dir.path().join("checkout");
     std::fs::create_dir_all(&checkout).unwrap();
-    let view = registry.register_view("probe-live", &checkout).unwrap();
+    let view = registry
+        .register_view_with_storage(dir.path(), "probe-live", &checkout)
+        .unwrap();
     crate::views::eviction::wait_for_background_enforcement(&registry);
     let mut manifest = ManifestV2::new(ManifestHeader {
         producers: Producers {

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use super::blocks::{BlockEntry, BlockReply, CanonicalList};
-use super::evidence_descriptor::{EvidenceDescriptor, EvidenceKind, EvidenceTier};
+use super::evidence_descriptor::{EvidenceDescriptor, EvidenceTier};
 
 pub const CONFIDENCE_THRESHOLD_RELATIVE_PATH: &str =
     "benchmarks/aft-search/engine-fixtures/confidence-threshold.json";
@@ -458,27 +458,28 @@ fn compare_exact_fields_1_to_4(
     first: &EvidenceDescriptor,
     second: &EvidenceDescriptor,
 ) -> Ordering {
-    let kind_rank = |kind| match kind {
-        EvidenceKind::Definition => 0,
-        EvidenceKind::E1 => 1,
-        EvidenceKind::Anchored => 2,
-        EvidenceKind::E2 => 3,
-        EvidenceKind::None => usize::MAX,
-    };
+    super::comparator::compare_exact_strength(first, second)
+}
 
-    match kind_rank(first.kind).cmp(&kind_rank(second.kind)) {
-        Ordering::Equal => {}
-        ordering => return ordering,
-    }
-
-    match first.kind {
-        EvidenceKind::Definition => Ordering::Equal,
-        EvidenceKind::E1 => second.occurrences.cmp(&first.occurrences),
-        EvidenceKind::Anchored => second
-            .matched_span
-            .cmp(&first.matched_span)
-            .then_with(|| first.gap_chars.cmp(&second.gap_chars)),
-        EvidenceKind::E2 => first.window_lines.cmp(&second.window_lines),
-        EvidenceKind::None => Ordering::Equal,
-    }
+#[cfg(test)]
+#[test]
+fn audit01_confidence_uses_source_receiver_and_gap_strength() {
+    let source = EvidenceDescriptor::for_e1(1, true, false);
+    let mut data = EvidenceDescriptor::for_e1(10, true, false);
+    data.data_file = true;
+    assert_eq!(compare_exact_fields_1_to_4(&source, &data), Ordering::Less);
+    let ordinary = EvidenceDescriptor::for_definition(true, false);
+    let mut receiver = ordinary.clone();
+    receiver.receiver_in_path = true;
+    assert_eq!(
+        compare_exact_fields_1_to_4(&receiver, &ordinary),
+        Ordering::Less
+    );
+    assert_eq!(
+        compare_exact_fields_1_to_4(
+            &EvidenceDescriptor::for_anchored(20, 1, true, false),
+            &EvidenceDescriptor::for_anchored(20, 2, true, false)
+        ),
+        Ordering::Less
+    );
 }

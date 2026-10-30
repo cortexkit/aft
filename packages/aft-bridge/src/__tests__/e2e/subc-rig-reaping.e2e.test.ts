@@ -216,8 +216,11 @@ async function plantProcess(
   const pid = await firstPidLine(shell);
   const ready = await waitUntil(() => {
     const parent = parentOf(pid);
+    // The shell can print $! and exit before its child execs. Reparenting alone
+    // is not readiness: the sweep ignores commands outside the daemon cache.
     return (
       isAlive(pid) &&
+      commandOf(pid).startsWith(`${exe} `) &&
       parent !== null &&
       (options.keepParentAlive
         ? parent === shell.pid && parent !== 1
@@ -226,12 +229,8 @@ async function plantProcess(
   }, 2_000);
   if (!ready) {
     const parent = parentOf(pid);
-    const command =
-      parent === null
-        ? "<missing>"
-        : new TextDecoder()
-            .decode(Bun.spawnSync(["ps", "-p", String(parent), "-o", "command="]).stdout)
-            .trim();
+    const parentCommand = parent === null ? "<missing>" : commandOf(parent);
+    const childCommand = commandOf(pid);
     try {
       process.kill(pid, "SIGKILL");
     } catch {
@@ -239,7 +238,7 @@ async function plantProcess(
     }
     shell.kill("SIGKILL");
     throw new Error(
-      `Planting pid ${pid} failed: expected ${options.keepParentAlive ? "live shell parent" : "reparented child"}; actual parent pid=${parent}, command=${command}`,
+      `Planting pid ${pid} failed: expected ${exe} with ${options.keepParentAlive ? "live shell parent" : "reparented child"}; actual command=${childCommand}, parent pid=${parent}, command=${parentCommand}`,
     );
   }
   return {
@@ -291,6 +290,11 @@ function parentOf(pid: number): number | null {
   const text = new TextDecoder().decode(result.stdout).trim();
   const ppid = Number(text);
   return Number.isFinite(ppid) && text.length > 0 ? ppid : null;
+}
+
+function commandOf(pid: number): string {
+  const result = Bun.spawnSync(["ps", "-p", String(pid), "-o", "command="]);
+  return new TextDecoder().decode(result.stdout).trim();
 }
 
 function isAlive(pid: number): boolean {

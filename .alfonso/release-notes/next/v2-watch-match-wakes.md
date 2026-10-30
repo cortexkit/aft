@@ -1,1 +1,0 @@
-- OpenCode 2: a background `bash_watch` now wakes the agent when its pattern matches, including a match found after a missed notification.

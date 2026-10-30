@@ -15,6 +15,10 @@ inputs:
   path:
     description: Destination directory
     required: true
+  verify-zstd:
+    description: Optional zstd archive filename under path; validate each download before accepting it (requires zstd)
+    required: false
+    default: ""
 runs:
   using: composite
   steps:
@@ -30,31 +34,59 @@ runs:
         name: ${{ inputs.name }}
         path: ${{ inputs.path }}
 
+    # A successful artifact transfer can still leave a truncated zstd frame.
+    # Validation belongs to the attempt so corruption triggers another download.
+    - name: Verify zstd archive (attempt 1 of 3)
+      id: verify-1
+      if: ${{ !cancelled() && steps.attempt-1.outcome == 'success' && inputs.verify-zstd != '' }}
+      continue-on-error: true
+      shell: bash
+      env:
+        ARCHIVE_PATH: ${{ inputs.path }}/${{ inputs.verify-zstd }}
+      run: zstd --test -- "$ARCHIVE_PATH"
+
     - name: Wait 60 s before retrying the download
-      if: ${{ !cancelled() && steps.attempt-1.outcome == 'failure' }}
+      if: ${{ !cancelled() && (steps.attempt-1.outcome == 'failure' || steps.verify-1.outcome == 'failure') }}
       shell: bash
       run: sleep 60
 
     # A partial earlier extraction is overwritten file by file.
     - name: Download artifact (attempt 2 of 3)
       id: attempt-2
-      if: ${{ !cancelled() && steps.attempt-1.outcome == 'failure' }}
+      if: ${{ !cancelled() && (steps.attempt-1.outcome == 'failure' || steps.verify-1.outcome == 'failure') }}
       continue-on-error: true
       uses: actions/download-artifact@v4
       with:
         name: ${{ inputs.name }}
         path: ${{ inputs.path }}
 
+    - name: Verify zstd archive (attempt 2 of 3)
+      id: verify-2
+      if: ${{ !cancelled() && steps.attempt-2.outcome == 'success' && inputs.verify-zstd != '' }}
+      continue-on-error: true
+      shell: bash
+      env:
+        ARCHIVE_PATH: ${{ inputs.path }}/${{ inputs.verify-zstd }}
+      run: zstd --test -- "$ARCHIVE_PATH"
+
     - name: Wait 120 s before the last download attempt
-      if: ${{ !cancelled() && steps.attempt-2.outcome == 'failure' }}
+      if: ${{ !cancelled() && (steps.attempt-2.outcome == 'failure' || steps.verify-2.outcome == 'failure') }}
       shell: bash
       run: sleep 120
 
     # No continue-on-error here: if the last attempt fails, the job fails.
     - name: Download artifact (attempt 3 of 3)
       id: attempt-3
-      if: ${{ !cancelled() && steps.attempt-2.outcome == 'failure' }}
+      if: ${{ !cancelled() && (steps.attempt-2.outcome == 'failure' || steps.verify-2.outcome == 'failure') }}
       uses: actions/download-artifact@v4
       with:
         name: ${{ inputs.name }}
         path: ${{ inputs.path }}
+
+    - name: Verify zstd archive (attempt 3 of 3)
+      id: verify-3
+      if: ${{ !cancelled() && steps.attempt-3.outcome == 'success' && inputs.verify-zstd != '' }}
+      shell: bash
+      env:
+        ARCHIVE_PATH: ${{ inputs.path }}/${{ inputs.verify-zstd }}
+      run: zstd --test -- "$ARCHIVE_PATH"

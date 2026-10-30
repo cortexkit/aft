@@ -1,0 +1,9 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "note": "Derived against RANKING_FENCE_PREFIXES in benchmarks/aft-search/search_quality_lib.py, both before and after this change: every changed path is under benchmarks/aft-search/ outside engine-fixtures/, so none is fenced. No engine code changes and no row moves. The change widens the fence itself: crates/aft/src/parser.rs joins it because its extractors decide the symbol ranges the semantic index chunks on, so later parser-only diffs derive ranking."
+}

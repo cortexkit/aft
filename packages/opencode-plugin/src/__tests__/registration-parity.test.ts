@@ -182,6 +182,8 @@ function aliasForTool(toolName: string, key: string): string {
   if (key === "toFile") return "toPath";
   if (toolName === "bash_status" && key === "task_id") return "taskId";
   if (toolName === "bash_status" && key === "output_mode") return "outputMode";
+  if (toolName === "bash_status" && key === "output_offset") return "outputOffset";
+  if (toolName === "bash_status" && key === "stderr_offset") return "stderrOffset";
   if (toolName === "bash_write" && key === "task_id") return "taskId";
   if (toolName === "bash_watch" && key === "task_id") return "taskId";
   if (toolName === "bash_watch" && key === "timeout_ms") return "timeoutMs";

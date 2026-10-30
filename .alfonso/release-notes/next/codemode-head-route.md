@@ -1,1 +1,0 @@
-- Codemode calls in the agent's checkout no longer fail after work in other checkouts. Permission conflicts still refuse, naming conflicting settings and route channels.

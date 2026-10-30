@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "landing-policy-exact-ranges"
+  ],
+  "note": "CI landing scripts only (scripts/lib/landing_policy.py, scripts/merge-queue-search.py and their test): PR and queue commit ranges follow ancestry instead of committer dates. No aft_search ranking, fusion, lane admission or truncation change."
+}

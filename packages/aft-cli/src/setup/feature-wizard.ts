@@ -141,7 +141,7 @@ const clackIO: WizardIO = {
       initial,
       () => {
         log.warn("Cancelled.");
-        process.exit(0);
+        process.exit(130);
       },
       {},
       rules,

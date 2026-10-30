@@ -133,7 +133,18 @@ pub(crate) mod work_probe {
 }
 
 pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
-    crate::bounded_io::command(req, ctx, handle_grep_inner)
+    let config = ctx.config();
+    let _pin = config.views.enabled.then(|| ctx.pin_config_to(config));
+    ctx.with_read_policy_snapshot(&req.id, || {
+        crate::context::confinement::with_floor_disclosure(|| {
+            crate::bounded_io::command(req, ctx, handle_grep_inner)
+        })
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_SEARCH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -235,6 +246,7 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(response) => return response,
     };
     let project_root = grep_executor::project_root(ctx);
+    crate::context::confinement::set_floor_filter(&project_root, &filters);
     // Search roots that are files: naming a file as `path` prints its lines
     // whatever kind of file it is.
     let file_roots: Vec<PathBuf> = scope
@@ -276,17 +288,33 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             (result, phases, Vec::new())
         }
     };
+    if result.index_sources_unavailable {
+        return Response::error(&req.id, "internal_error", result.index_read_gaps.join("; "));
+    }
     let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
+    #[cfg(test)]
+    AFTER_SEARCH.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
     let scope_probe_started = std::time::Instant::now();
     let scope_presence = phases
         .indexed_scope_has_files
         .or_else(|| {
             phases.walk_counts.and_then(|counts| {
-                (!result.walk_truncated && result.skipped_foreign_mounts == 0)
+                (counts.eligible > 0
+                    || (!result.walk_truncated && result.skipped_foreign_mounts == 0))
                     .then_some(counts.eligible > 0)
             })
         })
-        .or_else(|| grep_executor::scope_has_files(&scope, &filters));
+        .or_else(|| {
+            // A stopped walk cannot prove absence. Probing again can consume
+            // the reply budget and replace the results it already found.
+            (!result.walk_truncated)
+                .then(|| grep_executor::scope_has_files(&scope, &filters))
+                .flatten()
+        });
     let scope_has_files = scope_presence != Some(false);
     let empty_counts = if !scope_has_files {
         grep_executor::scope_file_counts(&scope, &filters)
@@ -327,7 +355,8 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             && (scope_has_files || empty_counts.is_some())
             && !result.scan_deadline_reached
             && result.skipped_foreign_mounts == 0
-            && result.missing_on_disk == 0,
+            && result.missing_on_disk == 0
+            && result.index_read_gaps.is_empty(),
         "no_files_matched_scope": !scope_has_files,
         "skipped_foreign_mounts": result.skipped_foreign_mounts,
         "matches": output.page.iter().map(|m| match_to_json(m)).collect::<Vec<_>>(),
@@ -351,6 +380,17 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         "truncated": result.truncated,
         "search_ms": (search_ms * 1000.0).round() / 1000.0,
     });
+    if let Some(counts) = phases.walk_counts {
+        body["entries_examined"] = serde_json::json!(counts.entries_visited);
+        body["files_examined"] = serde_json::json!(counts.examined);
+    }
+    if !result.index_read_gaps.is_empty() {
+        body["index_read_gap"] = serde_json::json!(result.index_read_gaps);
+        if let Some(text) = body["text"].as_str() {
+            body["text"] =
+                serde_json::json!(format!("{text}\n\n{}", result.index_read_gaps.join("\n")));
+        }
+    }
     if let Some(bound) = result.walk_bound {
         body["walk_stopped_by"] = serde_json::Value::String(
             match bound {
@@ -560,19 +600,22 @@ fn grep_footer(result: &GrepResult) -> String {
     // When the search stopped at the result cap, the count is a floor, not the
     // true total — say so in the agent-facing text (the JSON already carries
     // `truncated`). Otherwise the agent reads "Found N match" as exhaustive.
+    format!(
+        "Found {} match across {} file{}",
+        result.total_matches,
+        result.files_with_matches,
+        grep_footer_tags(result)
+    )
+}
+
+/// The tags `format_grep_text`'s footer puts after its counts: ` (capped)`
+/// when the count is a floor, then ` [index: <status>]` unless the index was
+/// ready. aft_search's ranked regex page ends its own count line with them.
+pub(crate) fn grep_footer_tags(result: &GrepResult) -> String {
     let cap_note = if result.truncated { " (capped)" } else { "" };
     match result.index_status {
-        IndexStatus::Ready => format!(
-            "Found {} match across {} file{}",
-            result.total_matches, result.files_with_matches, cap_note
-        ),
-        other => format!(
-            "Found {} match across {} file{} [index: {}]",
-            result.total_matches,
-            result.files_with_matches,
-            cap_note,
-            index_status_label(other)
-        ),
+        IndexStatus::Ready => cap_note.to_string(),
+        other => format!("{cap_note} [index: {}]", index_status_label(other)),
     }
 }
 
@@ -1696,6 +1739,44 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn second_scope_probe_keeps_partial_grep_reply_after_expiry() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.rs", "b.rs"] {
+            std::fs::write(dir.path().join(name), "needle\n").unwrap();
+        }
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            },
+        );
+        let req = serde_json::from_value(serde_json::json!({
+            "id": "walk-partial", "command": "grep", "path": dir.path(), "pattern": "needle",
+        }))
+        .unwrap();
+        let budget = crate::bounded_io::Budget::after(Duration::from_secs(2));
+        let deadline = budget.deadline;
+        AFTER_SEARCH.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            }))
+        });
+        let response = crate::bounded_io::with_budget(Some(budget), || {
+            grep_executor::with_walk_limit(1, || handle_grep(&req, &ctx))
+        });
+        assert!(
+            response.success,
+            "partial reply replaced: {:?}",
+            response.data
+        );
+        assert_eq!(response.data["complete"], false);
+        assert_eq!(response.data["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(response.data["walk_stopped_by"], "file_limit");
+    }
+
     fn grep_match(file: &str, line: u32, line_text: &str) -> GrepMatch {
         GrepMatch {
             file: PathBuf::from(file),
@@ -1715,6 +1796,8 @@ mod tests {
         truncated: bool,
     ) -> GrepResult {
         GrepResult {
+            index_sources_unavailable: false,
+            index_read_gaps: Vec::new(),
             matches,
             total_matches,
             files_searched,
@@ -1897,20 +1980,23 @@ mod tests {
         for (threads, reversed) in [(1, false), (8, false), (1, true), (8, true)] {
             crate::grep_executor::scan_order_for_test::set(&root, reversed);
             let pool = rayon::ThreadPoolBuilder::new()
+                .thread_name(|index| format!("aft-rayon-grep-test-{index}"))
                 .num_threads(threads)
                 .build()
                 .unwrap();
-            let (result, _) = pool.install(|| {
-                snapshot.search_grep_profiled_with_filters_and_query_in_order(
-                    &pattern,
-                    &query,
-                    &filters,
-                    &root,
-                    1000,
-                    None,
-                    GrepScanOrder::Path,
-                )
-            });
+            let (result, _) = pool
+                .install(|| {
+                    snapshot.search_grep_profiled_with_filters_and_query_in_order(
+                        &pattern,
+                        &query,
+                        &filters,
+                        &root,
+                        1000,
+                        None,
+                        GrepScanOrder::Path,
+                    )
+                })
+                .expect("grep over a test index");
             assert!(result.truncated, "{threads} threads, reversed {reversed}");
             let mut kept: Vec<(PathBuf, u32)> = result
                 .matches
@@ -1940,15 +2026,17 @@ mod tests {
         let filters = build_path_filters(&[], &[]).unwrap();
         let max_results = 100_100;
         crate::search_index::path_order_held_rows_for_test::take(&root);
-        let (result, _) = snapshot.search_grep_profiled_with_filters_and_query_in_order(
-            &pattern,
-            &query,
-            &filters,
-            &root,
-            max_results,
-            None,
-            GrepScanOrder::Path,
-        );
+        let (result, _) = snapshot
+            .search_grep_profiled_with_filters_and_query_in_order(
+                &pattern,
+                &query,
+                &filters,
+                &root,
+                max_results,
+                None,
+                GrepScanOrder::Path,
+            )
+            .expect("grep over a test index");
         let peak = crate::search_index::path_order_held_rows_for_test::take(&root);
         assert!(
             peak <= max_results + crate::search_index::PATH_ORDER_BATCH_ROW_BUDGET,
@@ -2427,8 +2515,9 @@ mod tests {
         let pattern = compiled_literal("needle");
 
         for (include, exclude, max_results) in cases {
-            let legacy =
-                snapshot.search_grep(&pattern, &include, &exclude, project.path(), max_results);
+            let legacy = snapshot
+                .search_grep(&pattern, &include, &exclude, project.path(), max_results)
+                .unwrap();
             let filters = build_path_filters(&include, &exclude).expect("valid filters");
             let optimized = snapshot
                 .search_grep_profiled_with_filters(
@@ -2438,6 +2527,7 @@ mod tests {
                     max_results,
                     None,
                 )
+                .unwrap()
                 .0;
             assert_eq!(
                 grep_result_bytes(&optimized, project.path()),
@@ -2475,13 +2565,16 @@ mod tests {
         let legacy_once = || {
             let validated = build_path_filters(&include, &exclude).expect("valid filters");
             std::hint::black_box(&validated);
-            let result = snapshot.search_grep(&pattern, &include, &exclude, &project_root, 100);
+            let result = snapshot
+                .search_grep(&pattern, &include, &exclude, &project_root, 100)
+                .unwrap();
             std::hint::black_box(result.total_matches);
         };
         let optimized_once = || {
             let filters = build_path_filters(&include, &exclude).expect("valid filters");
             let result = snapshot
                 .search_grep_profiled_with_filters(&pattern, &filters, &project_root, 100, None)
+                .unwrap()
                 .0;
             std::hint::black_box(result.total_matches);
         };

@@ -1,0 +1,68 @@
+{
+  "read": {
+    "text": "read normalized text",
+    "complete": true,
+    "private_canary": "not forwarded",
+    "content": "1: normalized text",
+    "byte_size": 15
+  },
+  "outline": {
+    "text": "outline normalized text",
+    "complete": true,
+    "private_canary": "not forwarded"
+  },
+  "zoom": {
+    "text": "zoom normalized text",
+    "complete": true,
+    "private_canary": "not forwarded",
+    "targets": [
+      {
+        "targetLabel": "src/example.rs",
+        "name": "run",
+        "response": {
+          "success": true,
+          "content": "fn run() {}"
+        }
+      }
+    ]
+  },
+  "search": {
+    "text": "search normalized text",
+    "complete": true,
+    "private_canary": "not forwarded"
+  },
+  "grep": {
+    "text": "grep normalized text",
+    "complete": true,
+    "private_canary": "not forwarded"
+  },
+  "glob": {
+    "text": "glob normalized text",
+    "complete": true,
+    "private_canary": "not forwarded"
+  },
+  "callgraph": {
+    "text": "callgraph normalized text",
+    "complete": true,
+    "private_canary": "not forwarded"
+  },
+  "bash_status": {
+    "status": "completed",
+    "exit_code": 0,
+    "output_preview": "not forwarded",
+    "hard_kill": {
+      "limit_ms": 999999
+    }
+  },
+  "bash_watch": {
+    "status": "running",
+    "exit_code": null,
+    "output": "not forwarded",
+    "waited": {
+      "reason": "matched",
+      "limit_ms": 20000,
+      "elapsed_ms": 1,
+      "match": "private canary"
+    }
+  }
+}

@@ -50,6 +50,16 @@ class SlowToolLineTest(unittest.TestCase):
             f"slow tool_call name=tool.catalog session= channel=7 corr=1 total=12345ms queue=300 {TAIL}"
         )
 
+    def test_line_with_wall_and_cpu_phase_times(self) -> None:
+        for cpu in ["?", "0.004ms"]:
+            with self.subTest(cpu=cpu):
+                self.assert_parses(
+                    "slow tool_call name=tool.catalog session=ses_abc channel=7 corr=1 "
+                    f"total=12345ms queue=300.123ms/cpu={cpu} "
+                    "translate=39.123ms/cpu=0.004ms exec=12000.000ms/cpu=? "
+                    "waiting_on=limiter root=/repo"
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

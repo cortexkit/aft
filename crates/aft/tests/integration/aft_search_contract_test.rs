@@ -460,11 +460,42 @@ fn start_mock_embedding_error_server() -> (String, thread::JoinHandle<()>) {
     (base_url, handle)
 }
 
-/// How long the recovering server holds its first response. It is well past
-/// the 1s bound `slow_query_embedding_degrades_within_budget_and_next_query_retries_fresh`
+/// How long the recovering server holds its first response. It is far past
+/// every bound `slow_query_embedding_degrades_within_budget_and_next_query_retries_fresh`
 /// asserts, so a search that waits for this response instead of honouring
-/// its 500ms query budget fails that bound instead of slipping under it.
-const SLOW_FIRST_EMBEDDING_RESPONSE: Duration = Duration::from_millis(2_000);
+/// its 500ms query budget fails those bounds instead of slipping under them,
+/// while a loaded runner that is merely slow at the lexical fallback after
+/// the budget fires still passes.
+const SLOW_FIRST_EMBEDDING_RESPONSE: Duration = Duration::from_millis(10_000);
+
+/// Holds a request's connection open without answering until `hold` has
+/// passed or the client closes the connection, whichever comes first. A
+/// client that gave up after its timeout no longer needs a reply, so ending
+/// the hold there keeps the test from idling out the full hold at teardown.
+fn hold_unless_client_disconnects(stream: &mut std::net::TcpStream, hold: Duration) {
+    let deadline = Instant::now() + hold;
+    let mut scratch = [0u8; 4096];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || stream.set_read_timeout(Some(remaining)).is_err() {
+            return;
+        }
+        match stream.read(&mut scratch) {
+            // The client closed its side: nobody is waiting for the reply.
+            Ok(0) => return,
+            // Late request bytes (for example a body sent after the headers).
+            Ok(_) => {}
+            // The read timed out; the loop re-checks the deadline.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            // Reset or aborted connection: the client is gone.
+            Err(_) => return,
+        }
+    }
+}
 
 fn start_recovering_slow_embedding_server() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow embedding server");
@@ -480,7 +511,7 @@ fn start_recovering_slow_embedding_server() -> (String, Arc<AtomicUsize>, thread
                 let mut request = [0u8; 4096];
                 let _ = stream.read(&mut request);
                 if ordinal == 0 {
-                    thread::sleep(SLOW_FIRST_EMBEDDING_RESPONSE);
+                    hold_unless_client_disconnects(&mut stream, SLOW_FIRST_EMBEDDING_RESPONSE);
                 }
                 let body = r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0}]}"#;
                 let response = format!(
@@ -1738,6 +1769,77 @@ fn warm_up_embedding_fallback_route(query: &str) {
     handle.join().expect("warm-up embedding server thread");
 }
 
+fn capture_query_embedding_phases<T>(
+    started: Instant,
+    action: impl FnOnce() -> T,
+) -> (T, Vec<(&'static str, Instant)>) {
+    let phases = std::rc::Rc::new(std::cell::RefCell::new(vec![("search_start", started)]));
+    #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+    let value = {
+        let observed = std::rc::Rc::clone(&phases);
+        aft::semantic_index::with_query_embedding_phase_observer_for_test(
+            move |phase| observed.borrow_mut().push((phase, Instant::now())),
+            action,
+        )
+    };
+    #[cfg(not(any(debug_assertions, feature = "test-timing-hooks")))]
+    let value = action();
+    phases.borrow_mut().push(("reply", Instant::now()));
+    (value, std::rc::Rc::try_unwrap(phases).unwrap().into_inner())
+}
+
+fn format_query_embedding_phases(phases: &[(&str, Instant)], started: Instant) -> String {
+    [
+        "search_start",
+        "embed_query_entry",
+        "model_mutex_first_acquired",
+        "model_construction_start",
+        "model_construction_end",
+        "model_mutex_second_acquired",
+        "model_mutex_reacquired",
+        "request_send",
+        "deadline_fire_observed",
+        "fallback_start",
+        "reply",
+    ]
+    .iter()
+    .map(|phase| {
+        let offsets = phases
+            .iter()
+            .filter(|(name, _)| name == phase)
+            .map(|(_, at)| {
+                format!(
+                    "{:.3}ms",
+                    at.duration_since(started).as_secs_f64() * 1_000.0
+                )
+            })
+            .collect::<Vec<_>>();
+        let offset = if offsets.is_empty() {
+            "not reached".to_string()
+        } else {
+            offsets.join(" / ")
+        };
+        format!("{phase}={offset}")
+    })
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
+#[test]
+fn query_embedding_phase_report_includes_missing_and_repeated_phases() {
+    let started = Instant::now();
+    let report = format_query_embedding_phases(
+        &[
+            ("search_start", started),
+            ("request_send", started + Duration::from_millis(10)),
+            ("request_send", started + Duration::from_millis(20)),
+            ("reply", started + Duration::from_millis(750)),
+        ],
+        started,
+    );
+    assert_eq!(report, "search_start=0.000ms, embed_query_entry=not reached, model_mutex_first_acquired=not reached, model_construction_start=not reached, model_construction_end=not reached, model_mutex_second_acquired=not reached, model_mutex_reacquired=not reached, request_send=10.000ms / 20.000ms, deadline_fire_observed=not reached, fallback_start=not reached, reply=750.000ms");
+}
+
 #[test]
 fn slow_query_embedding_degrades_within_budget_and_next_query_retries_fresh() {
     let query = "where is the needle symbol implementation";
@@ -1752,15 +1854,64 @@ fn slow_query_embedding_degrades_within_budget_and_next_query_retries_fresh() {
 
     let semantic_request = request_with(query, Some("semantic"));
     let started = Instant::now();
-    let degraded = response_value(handle_semantic_search(&semantic_request, &ctx));
+    let (degraded, phases) = capture_query_embedding_phases(started, || {
+        response_value(handle_semantic_search(&semantic_request, &ctx))
+    });
     let elapsed = started.elapsed();
 
     // Checked first so a budget that is not enforced reports as a budget
     // failure: the search would then wait for the server's held response,
-    // which arrives well after this bound.
+    // which arrives only after this bound. The bound is deliberately loose
+    // (half the hold) because the lexical fallback that runs after the
+    // budget fires can take hundreds of milliseconds on a loaded runner;
+    // the phase checks below pin the budget itself.
     assert!(
-        elapsed < Duration::from_millis(1_000),
-        "500ms query budget took {elapsed:?}"
+        elapsed < SLOW_FIRST_EMBEDDING_RESPONSE / 2,
+        "500ms query budget took {elapsed:?}, as if it waited for the held \
+         embedding response; phases: {}",
+        format_query_embedding_phases(&phases, started)
+    );
+    #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+    {
+        let offset_of = |phase: &str| {
+            phases
+                .iter()
+                .find(|(name, _)| *name == phase)
+                .map(|(_, at)| at.duration_since(started))
+        };
+        // The budget is what ended the embedding request: its timeout became
+        // observable no earlier than the 500ms budget (less a margin for
+        // timer granularity) and long before the server would have replied.
+        let deadline_fired = offset_of("deadline_fire_observed").unwrap_or_else(|| {
+            panic!(
+                "500ms query budget never fired; phases: {}",
+                format_query_embedding_phases(&phases, started)
+            )
+        });
+        assert!(
+            deadline_fired >= Duration::from_millis(400)
+                && deadline_fired < SLOW_FIRST_EMBEDDING_RESPONSE / 4,
+            "500ms query budget fired at {deadline_fired:?}, not near the budget; phases: {}",
+            format_query_embedding_phases(&phases, started)
+        );
+    }
+    #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+    assert_eq!(
+        phases.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+        [
+            "search_start",
+            "embed_query_entry",
+            "model_mutex_first_acquired",
+            "model_construction_start",
+            "model_construction_end",
+            "model_mutex_second_acquired",
+            "request_send",
+            "deadline_fire_observed",
+            "fallback_start",
+            "reply",
+        ],
+        "phase capture must explain pre-request work as well as timeout and fallback: {}",
+        format_query_embedding_phases(&phases, started)
     );
     assert_lexical_fallback(&degraded, "unavailable");
     assert!(
@@ -3155,5 +3306,271 @@ fn external_prose_query_finds_a_file_added_after_the_saved_index() {
         text.contains("Checked the saved AFT index of")
             && text.contains("since it was saved 1 file was added"),
         "the reply says the index was checked and what changed: {text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #826: aft_search replies an agent misread. Each test below states the
+// honest reply that replaced a misleading one.
+// ---------------------------------------------------------------------------
+
+/// Files that talk about `bash_watch`, waiting and detaching, but never
+/// contain the literal `bash_wait_detach(`.
+fn issue_826_bash_files() -> [(&'static str, &'static str); 3] {
+    [
+        (
+            "src/bash_watch.rs",
+            "/// bash_watch waits for a background bash task.\npub fn bash_watch(task_id: &str) -> bool {\n    wait_for(task_id)\n}\n\nfn wait_for(task_id: &str) -> bool {\n    !task_id.is_empty()\n}\n",
+        ),
+        (
+            "src/detach.rs",
+            "/// Detach a running bash command into the background.\npub fn detach_running(command: &str) {\n    drop(command);\n}\n",
+        ),
+        (
+            "docs/tools.md",
+            "# Tools\n\nUse bash_watch to wait for a background task.\nbash_watch(taskId) returns when the task exits.\n",
+        ),
+    ]
+}
+
+fn render_search(response: Response) -> (String, Value) {
+    let rendered = aft::subc_format::format_response("search", &response, false);
+    (rendered, response_value(response))
+}
+
+/// The bare identifier already answers "not found"; the same name followed by
+/// `(` must not come back as files labelled `[lexical match]` that do not
+/// contain it. The reply says no file contains the literal and labels the
+/// files that only share its words as similar.
+#[test]
+fn issue_826_missing_punctuated_literal_is_not_labelled_a_lexical_match() {
+    let files = issue_826_bash_files();
+    let (project, entries) = project_with_files(&files);
+    let ctx = test_context(project.path());
+    install_lexical_index_entries(&ctx, &entries);
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+
+    let (bare, _) = render_search(handle_semantic_search(
+        &request_with_top_k("bash_wait_detach", None, 10),
+        &ctx,
+    ));
+    assert!(
+        bare.starts_with(
+            "`bash_wait_detach` not found in this project, and no similar names were found."
+        ),
+        "the bare identifier keeps its not-found answer: {bare}"
+    );
+
+    let (rendered, response) = render_search(handle_semantic_search(
+        &request_with_top_k("bash_wait_detach(", None, 10),
+        &ctx,
+    ));
+    assert_eq!(response["success"], true, "{response}");
+    assert!(
+        !rendered.contains("[lexical match]"),
+        "no file contains `bash_wait_detach(`, so no hit may be labelled a match:\n{rendered}"
+    );
+    assert!(
+        rendered.starts_with(
+            "No file contains `bash_wait_detach(`. The files below only share words with it; none of them is a match.\n\n"
+        ),
+        "{rendered}"
+    );
+    // The header uses the platform's path separator.
+    let detach = format!(
+        "{}:1 [similar]",
+        Path::new("src").join("detach.rs").display()
+    );
+    assert!(rendered.contains(&detach), "{rendered}");
+    assert!(
+        rendered.contains("\nFound 1 similar result(s)."),
+        "{rendered}"
+    );
+
+    // A literal that does occur keeps its ordinary labels.
+    let (present, _) = render_search(handle_semantic_search(
+        &request_with_top_k("bash_watch(", None, 10),
+        &ctx,
+    ));
+    assert!(!present.contains("No file contains"), "{present}");
+    assert!(!present.contains("[similar]"), "{present}");
+}
+
+/// A literal that ends in punctuation is present only where its whole text
+/// is, punctuation included. Lines that hold the bare name
+/// (`bash_wait_detach = true`) do not contain `bash_wait_detach(`, so they
+/// must not suppress the missing-literal notice; a real call does.
+#[test]
+fn punctuated_literal_counts_only_lines_that_contain_its_whole_text() {
+    let mut files = vec![
+        (
+            "src/config.rs",
+            "pub fn defaults(flags: &mut Flags) {\n    let bash_wait_detach = true;\n    flags.bash_wait_detach = bash_wait_detach;\n}\n",
+        ),
+        ("config/settings.toml", "bash_wait_detach = true\n"),
+    ];
+    let notice =
+        "No file contains `bash_wait_detach(`. The files below only share words with it; none of them is a match.";
+
+    let (_project, response) = lexical_search(&files, "bash_wait_detach(");
+    let rendered = response["text"].as_str().unwrap();
+    assert!(
+        rendered.starts_with(notice),
+        "no file contains `bash_wait_detach(`: {rendered}"
+    );
+    assert!(!rendered.contains("[exact]"), "{rendered}");
+    assert!(!rendered.contains("[lexical match]"), "{rendered}");
+
+    files.push((
+        "src/run.rs",
+        "fn run(task: Task) {\n    bash_wait_detach(task);\n}\n",
+    ));
+    let (_project, response) = lexical_search(&files, "bash_wait_detach(");
+    let rendered = response["text"].as_str().unwrap();
+    assert!(
+        !rendered.contains("No file contains"),
+        "src/run.rs contains `bash_wait_detach(`: {rendered}"
+    );
+    assert!(!rendered.contains("[similar]"), "{rendered}");
+}
+
+/// A regex-only request ranks every matching file before it cuts the page,
+/// so the list trailer knows the exact number of file results, and the count
+/// line counts files first. The reply used to say `shown 3 of ≥4 results`
+/// beside `Found 36 match across 12 file`.
+#[test]
+fn issue_826_regex_only_trailer_reports_the_ranked_file_total() {
+    let owned: Vec<(String, String)> = (0..12)
+        .map(|i| {
+            (
+                format!("src/m{i}.rs"),
+                format!("pub fn handler_{i}() {{}}\n// handler_{i} helper\nlet handler_x = {i};\n"),
+            )
+        })
+        .collect();
+    let files: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .collect();
+    let (project, entries) = project_with_files(&files);
+    let ctx = test_context(project.path());
+    install_lexical_index_entries(&ctx, &entries);
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+    let request: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "issue-826-regex-only",
+        "command": "semantic_search",
+        "query": "",
+        "pattern": "handler_[0-9x]",
+        "top_k": 3,
+    }))
+    .expect("build pattern request");
+
+    let (rendered, response) = render_search(handle_semantic_search(&request, &ctx));
+    assert_eq!(response["success"], true, "{response}");
+    assert_eq!(response["result_count"], 3, "{response}");
+    assert!(
+        rendered.contains("shown 3 of 12 results"),
+        "all 12 matching files were ranked before the page cut:\n{rendered}"
+    );
+    assert!(
+        rendered.contains(
+            "\n12 files match (36 matching lines); one result per file, definitions first.\n"
+        ),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("Found 36 match"), "{rendered}");
+}
+
+/// When the query embedding fails, the answer comes from a filesystem scan
+/// and the reply says so; the lane footer must not then print
+/// `semantic: ready`. Both lines come from the record of what served this
+/// request.
+#[test]
+fn issue_826_lane_footer_agrees_with_a_degraded_answer() {
+    let (project, _source_file, _source) = project_with_needle();
+    let (base_url, handle) = start_mock_embedding_error_server();
+    let ctx = openai_context(project.path(), base_url);
+    install_ready_semantic_lane(&ctx, project.path());
+
+    let (rendered, response) =
+        render_search(handle_semantic_search(&request("needle_symbol"), &ctx));
+    handle.join().expect("embedding server thread");
+
+    assert_eq!(response["success"], true, "{response}");
+    assert_eq!(response["fully_degraded"], true, "{response}");
+    assert_eq!(response["semantic_unavailable"], true, "{response}");
+    assert!(
+        rendered.contains("Search status: answered by a filesystem scan"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.lines().any(|line| line == "semantic: ready"),
+        "the semantic lane did not serve this answer, so the footer may not call it ready:\n{rendered}"
+    );
+    assert!(
+        rendered.lines().any(|line| line
+            == "semantic: unavailable for this query (query embedding failed: HTTP 400)"),
+        "{rendered}"
+    );
+}
+
+/// The trigram lane is not resident but its saved cache is valid. Planning
+/// treats that lane as still loading and answers from a filesystem scan; the
+/// footer used to call it ready beside `Search status: fully degraded`.
+///
+/// The search request would otherwise start reloading the saved cache itself.
+/// That reload usually finishes inside the request, but on a loaded machine it
+/// can still be running when the footer is written, which then truthfully
+/// says `trigram: building`. The test holds the reload back so the footer
+/// always describes a valid cache that is not resident.
+#[test]
+fn issue_826_trigram_footer_agrees_with_a_scan_answer() {
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    let (project, _source_file, _source) = git_project_with_needle();
+    let storage = tempfile::tempdir().expect("storage");
+    persist_search_index(project.path(), storage.path());
+    let (base_url, handle) = start_mock_embedding_error_server();
+    let ctx = openai_context_with_storage(project.path(), storage.path(), base_url);
+    let canonical = std::fs::canonicalize(project.path()).expect("canonical root");
+    ctx.set_canonical_cache_root(canonical.clone());
+    ctx.memoized_artifact_cache_key(&canonical);
+    ctx.defer_query_search_index_reloads_for_test();
+    install_ready_semantic_lane(&ctx, project.path());
+
+    let (rendered, response) =
+        render_search(handle_semantic_search(&request("needle_symbol"), &ctx));
+    handle.join().expect("embedding server thread");
+
+    assert!(
+        ctx.search_index_rx()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+            && ctx
+                .search_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+        "the request must not have started loading the saved trigram cache"
+    );
+    assert_eq!(response["success"], true, "{response}");
+    assert_eq!(response["fully_degraded"], true, "{response}");
+    assert!(
+        rendered.contains("Search status: answered by a filesystem scan"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.lines().any(|line| line == "trigram: ready"),
+        "the trigram index did not serve this answer, so the footer may not call it ready:\n{rendered}"
+    );
+    assert!(
+        rendered
+            .lines()
+            .any(|line| line == "trigram: loading (this answer read files directly, no index)"),
+        "{rendered}"
     );
 }

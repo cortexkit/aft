@@ -20,7 +20,9 @@ use crate::protocol::{RawRequest, Response};
 ///   - `globs` (string[], optional) — include/exclude glob filters; prefix `!` to exclude
 ///   - `context` (integer, optional) — lines of context around each match (default: 0)
 ///
-/// Returns: `{ matches: [{ file, line, column, text, meta_variables, context? }], total_matches, files_with_matches, files_searched, complete, skipped_files }`
+/// Returns: `{ matches: [{ file, line, column, text, meta_variables, meta_variable_text?, context? }], total_matches, files_with_matches, files_searched, complete, skipped_files }`
+///
+/// `meta_variable_text` maps each non-empty `$$$` capture to its source text.
 pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
     let pattern = match req.params.get("pattern").and_then(|v| v.as_str()) {
         Some(p) => p.to_string(),
@@ -129,36 +131,61 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     use rayon::prelude::*;
-    let per_file: Vec<(usize, Vec<serde_json::Value>, Option<serde_json::Value>)> = scope
-        .files
-        .par_iter()
-        .map(|file_path| {
-            let source = match crate::bounded_io::read_to_string(file_path) {
-                Ok(s) => s,
-                Err(err) => {
-                    return (
-                        0usize,
-                        Vec::new(),
-                        Some(serde_json::json!({
-                            "file": file_path.display().to_string(),
-                            "reason": format!("read_error: {err}"),
-                        })),
-                    );
-                }
-            };
-            let matches =
-                search_file_compiled(&source, file_path, &compiled_pattern, &lang, context_lines);
-            (1usize, matches, None)
-        })
-        .collect();
+    let bounded = crate::subc::result_body::active();
+    let mut budget = MatchBudget {
+        remaining: bounded.then_some(256 * 1024),
+        cut: false,
+    };
+    let search = |file_path: &std::path::PathBuf, budget: &mut MatchBudget| {
+        let source = match crate::bounded_io::read_to_string(file_path) {
+            Ok(s) => s,
+            Err(err) => {
+                return (
+                    0usize,
+                    0usize,
+                    Vec::new(),
+                    Some(serde_json::json!({
+                        "file": file_path.display().to_string(),
+                        "reason": format!("read_error: {err}"),
+                    })),
+                );
+            }
+        };
+        let (total, matches) = search_file_compiled(
+            &source,
+            file_path,
+            &compiled_pattern,
+            &lang,
+            context_lines,
+            budget,
+        );
+        (1usize, total, matches, None)
+    };
+    // A single producer owns the opted-in byte budget, retaining a deterministic
+    // prefix while still counting every match. Legacy searches keep their parallel path.
+    let per_file: Vec<_> = if bounded {
+        scope
+            .files
+            .iter()
+            .map(|path| search(path, &mut budget))
+            .collect()
+    } else {
+        scope
+            .files
+            .par_iter()
+            .map(|path| search(path, &mut MatchBudget::default()))
+            .collect()
+    };
 
     let mut all_matches: Vec<serde_json::Value> = Vec::new();
     let mut skipped_files: Vec<serde_json::Value> = Vec::new();
     let mut files_searched: usize = 0;
     let mut files_with_matches: usize = 0;
-    for (counted, matches, skipped) in per_file {
+    let mut total_matches = 0;
+    for (counted, total, matches, skipped) in per_file {
         files_searched += counted;
-        if !matches.is_empty() {
+        total_matches += total;
+        if total > 0 {
             files_with_matches += 1;
         }
         all_matches.extend(matches);
@@ -172,8 +199,8 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
         a_file.cmp(b_file)
     });
 
-    let total_matches = all_matches.len();
-    let complete = skipped_files.is_empty();
+    let shown = all_matches.len();
+    let complete = skipped_files.is_empty() && !budget.cut;
 
     let mut payload = serde_json::json!({
         "matches": all_matches,
@@ -185,6 +212,19 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
         "complete": complete,
         "skipped_files": skipped_files,
     });
+
+    if budget.cut {
+        payload["truncated"] = serde_json::json!(true);
+        payload["matches_list_envelope"] =
+            serde_json::to_value(crate::list_surfaces::ast_search_envelope(
+                shown,
+                total_matches,
+                !payload["skipped_files"]
+                    .as_array()
+                    .is_some_and(|files| files.is_empty()),
+            ))
+            .expect("list envelope is JSON");
+    }
 
     // When the search succeeded but matched zero AST nodes, attach a hint if
     // the pattern looks like a common mistake (regex syntax, language-specific
@@ -199,24 +239,35 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
     Response::success(&req.id, payload)
 }
 
+#[derive(Default)]
+struct MatchBudget {
+    remaining: Option<usize>,
+    cut: bool,
+}
+
 fn search_file_compiled(
     source: &str,
     file_path: &Path,
     pattern: &ast_grep_core::matcher::Pattern,
     lang: &AstGrepLang,
     context_lines: usize,
-) -> Vec<serde_json::Value> {
+    budget: &mut MatchBudget,
+) -> (usize, Vec<serde_json::Value>) {
     let ast_grep = lang.ast_grep(source);
     let root = ast_grep.root();
 
     let source_lines: Vec<&str> = source.lines().collect();
     let file_str = file_path.display().to_string();
 
-    let matches_iter: Vec<_> = root.find_all(pattern).collect();
-
-    matches_iter
-        .into_iter()
-        .map(|node_match| {
+    let mut total = 0;
+    let matches = root
+        .find_all(pattern)
+        .filter_map(|node_match| {
+            total += 1;
+            if budget.remaining == Some(0) {
+                budget.cut = true;
+                return None;
+            }
             let start_pos = node_match.start_pos();
             let line_1based = start_pos.line() + 1;
             let column = start_pos.byte_point().1;
@@ -224,6 +275,11 @@ fn search_file_compiled(
 
             let env = node_match.get_env();
             let mut meta_vars: HashMap<String, serde_json::Value> = HashMap::new();
+            // Source text of each `$$$` capture, from its first node to its
+            // last, separators and line breaks included. The array in
+            // `meta_variables` lists every matched node, punctuation included,
+            // so joining it does not reproduce the source.
+            let mut multi_capture_text: HashMap<String, serde_json::Value> = HashMap::new();
             for meta_var in env.get_matched_variables() {
                 use ast_grep_core::meta_var::MetaVariable;
                 match &meta_var {
@@ -237,6 +293,14 @@ fn search_file_compiled(
                     }
                     MetaVariable::MultiCapture(name) => {
                         let nodes = env.get_multiple_matches(name);
+                        if let (Some(first), Some(last)) = (nodes.first(), nodes.last()) {
+                            if let Some(text) = source.get(first.range().start..last.range().end) {
+                                multi_capture_text.insert(
+                                    format!("${}", name),
+                                    serde_json::Value::String(text.to_string()),
+                                );
+                            }
+                        }
                         let texts: Vec<serde_json::Value> = nodes
                             .iter()
                             .map(|n| serde_json::Value::String(n.text().to_string()))
@@ -254,6 +318,9 @@ fn search_file_compiled(
                 "text": text,
                 "meta_variables": meta_vars,
             });
+            if !multi_capture_text.is_empty() {
+                result["meta_variable_text"] = serde_json::json!(multi_capture_text);
+            }
 
             if context_lines > 0 {
                 let match_line_0 = start_pos.line();
@@ -272,9 +339,19 @@ fn search_file_compiled(
                 result["context"] = serde_json::Value::Array(context);
             }
 
-            result
+            if let Some(remaining) = &mut budget.remaining {
+                let bytes = serde_json::to_vec(&result).expect("match is JSON").len();
+                if bytes > *remaining {
+                    *remaining = 0;
+                    budget.cut = true;
+                    return None;
+                }
+                *remaining -= bytes;
+            }
+            Some(result)
         })
-        .collect()
+        .collect();
+    (total, matches)
 }
 
 #[cfg(test)]

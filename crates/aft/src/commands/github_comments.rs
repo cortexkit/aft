@@ -323,8 +323,8 @@ fn apply_comment_match(
             &req.id,
             "match_not_found",
             format!(
-                "edit_match: '{}' not found in {}{}",
-                match_text,
+                "edit_match: {} not found in {}{}",
+                crate::fuzzy_match::describe_searched_text(match_text),
                 resource,
                 crate::fuzzy_match::render_nearest_miss_detail(source, match_text)
             ),
@@ -369,14 +369,24 @@ fn apply_comment_match(
         let updated = super::edit_match::apply_sorted_non_overlapping_fuzzy_matches(
             source,
             &matches,
+            match_text,
             replacement,
+            None,
         )
         .map_err(|error| Response::error(&req.id, error.code(), error.to_string()))?;
         Ok((updated, matches.len()))
     } else {
         let matched = &matches[occurrence.unwrap_or(0)];
         let mut effective = String::with_capacity(replacement.len().saturating_add(1));
-        super::edit_match::push_fuzzy_replacement(&mut effective, source, matched, replacement);
+        let plan = crate::fuzzy_match::ReindentPlan::new(
+            source,
+            match_text,
+            replacement,
+            None,
+            std::slice::from_ref(matched),
+        );
+        super::edit_match::push_fuzzy_replacement(&mut effective, &plan, 0)
+            .map_err(|error| Response::error(&req.id, error.code(), error.to_string()))?;
         let updated = crate::edit::replace_byte_range(
             source,
             matched.byte_start,
@@ -466,6 +476,7 @@ pub(crate) fn run_governed_gh(
         ticket.value(),
     )
     .map_err(|error| format!("could not prepare the governed gh shim: {error}"))?;
+    crate::gh_shim_speech::start_view::inject(ticket.value(), &mut environment, &ctx.storage_dir());
     if worker {
         environment.insert(
             crate::gh_shim_ticket::GH_SHIM_WORKER_ENV.to_string(),
@@ -623,6 +634,56 @@ mod tests {
     use crate::context::default_language_provider_factory;
     use crate::harness::Harness;
     use serde_json::json;
+
+    #[test]
+    fn comment_match_miss_bounds_a_large_needle() {
+        let req: RawRequest = serde_json::from_value(json!({
+            "id": "comment-miss", "command": "edit_match", "params": {}
+        }))
+        .unwrap();
+        let needle = (0..400)
+            .map(|index| format!("    let absent_{index} = {index};\n"))
+            .collect::<String>();
+        let response = apply_comment_match(
+            &req,
+            "issue://759/comments/2",
+            "unrelated comment body\n",
+            &needle,
+            "replacement",
+        )
+        .unwrap_err();
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "match_not_found");
+        let message = response.data["message"].as_str().unwrap();
+        assert!(message.starts_with(
+            "edit_match: '    let absent_0 = 0;…' (400 lines, 10180 bytes) not found in issue://759/comments/2"
+        ), "{message}");
+        assert!(message.len() < 4096);
+        assert!(!message.contains(&needle));
+    }
+
+    #[test]
+    fn comment_match_miss_keeps_short_needle_text() {
+        let req: RawRequest = serde_json::from_value(json!({
+            "id": "comment-miss", "command": "edit_match", "params": {}
+        }))
+        .unwrap();
+        let response = apply_comment_match(
+            &req,
+            "issue://759/comments/2",
+            "",
+            "ABSENT_TOKEN",
+            "replacement",
+        )
+        .unwrap_err();
+        assert_eq!(response.data["code"], "match_not_found");
+        assert_eq!(
+            response.data["message"].as_str(),
+            Some(
+                "edit_match: 'ABSENT_TOKEN' not found in issue://759/comments/2 (file has 0 lines)"
+            )
+        );
+    }
 
     #[cfg(unix)]
     #[test]

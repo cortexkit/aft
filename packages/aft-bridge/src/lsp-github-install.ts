@@ -57,7 +57,9 @@ import { cachedFileSha256Sync, writeStampedFileDigest } from "./binary-identity.
 import { getAftLspBinariesDir } from "./cache-paths.js";
 import { execFile, spawn } from "./child-process.js";
 import {
+  assertAllowedDownloadUrl,
   assertSafeVersion,
+  fetchGithubApiFollowingRedirects,
   isSafeVersion,
   probeGithubReleases,
   stripTagV,
@@ -339,7 +341,16 @@ export function createGithubInstaller(services: GithubInstallerHost) {
         ...(layout ? { layout } : {}),
         ...(smoke ? { smoke } : {}),
       };
-      writeFileSync(join(installDir, INSTALLED_META_FILE), JSON.stringify(meta), "utf8");
+      // Rename a complete private sibling into place so a host reading the
+      // shared cache sees the old record or the new one, never a truncation.
+      const path = join(installDir, INSTALLED_META_FILE);
+      const tempPath = `${path}.tmp-${process.pid}-${randomBytes(6).toString("hex")}`;
+      try {
+        writeFileSync(tempPath, JSON.stringify(meta), { encoding: "utf8", flag: "wx" });
+        renameSync(tempPath, path);
+      } finally {
+        rmSync(tempPath, { force: true });
+      }
     } catch (err) {
       warn(`[lsp] failed to write github installed metadata in ${installDir}: ${err}`);
     }
@@ -502,7 +513,7 @@ export function createGithubInstaller(services: GithubInstallerHost) {
       const url = `https://api.github.com/repos/${githubRepo}/releases/tags/${encodeURIComponent(candidate)}`;
       const timeout = controlledTimeoutSignal(15_000, signal);
       try {
-        const res = await fetchJsonFollowingRedirects(url, headers, fetchImpl, timeout.signal);
+        const res = await fetchGithubApiFollowingRedirects(url, headers, fetchImpl, timeout.signal);
         if (res.status === 404) continue; // try next candidate
         if (!res.ok) {
           warn(`[lsp] github release-by-tag ${githubRepo}@${candidate}: HTTP ${res.status}`);
@@ -536,28 +547,6 @@ export function createGithubInstaller(services: GithubInstallerHost) {
       }
     }
     return null;
-  }
-
-  async function fetchJsonFollowingRedirects(
-    url: string,
-    headers: Record<string, string>,
-    fetchImpl: typeof fetch,
-    signal?: AbortSignal,
-  ): Promise<Response> {
-    const maxRedirects = 5;
-    let currentUrl = url;
-    for (let i = 0; i <= maxRedirects; i += 1) {
-      assertAllowedDownloadUrl(currentUrl);
-      const res = await fetchImpl(currentUrl, { headers, redirect: "manual", signal });
-      if (res.status >= 300 && res.status < 400) {
-        const location = res.headers.get("location");
-        if (!location) throw new Error(`redirect status ${res.status} without Location`);
-        currentUrl = new URL(location, currentUrl).toString();
-        continue;
-      }
-      return res;
-    }
-    throw new Error(`too many redirects (>${maxRedirects})`);
   }
 
   /* ─────────────────────────── orchestrator ─────────────────────────── */
@@ -623,7 +612,12 @@ export function createGithubInstaller(services: GithubInstallerHost) {
     const cachedSafe = isSafeVersion(cachedTag);
     if (cached && !shouldRecheckVersion(cached, weeklyMs) && cachedSafe) {
       // Installations still need the selected tag's asset URLs.
-      const release = await fetchReleaseByTag(spec.githubRepo, cachedTag as string, fetchImpl);
+      const release = await fetchReleaseByTag(
+        spec.githubRepo,
+        cachedTag as string,
+        fetchImpl,
+        signal,
+      );
       if (release) {
         return {
           tag: release.tag,
@@ -635,7 +629,13 @@ export function createGithubInstaller(services: GithubInstallerHost) {
     }
 
     // 3. Live probe.
-    const probe = await probeGithubReleases(spec.githubRepo, config.graceDays, fetchImpl, warn);
+    const probe = await probeGithubReleases(
+      spec.githubRepo,
+      config.graceDays,
+      fetchImpl,
+      warn,
+      signal,
+    );
     if (!probe) {
       // Probe failed. Return tag:null instead of
       // `cached.latest_eligible` with empty assets. Returning a non-null
@@ -648,6 +648,11 @@ export function createGithubInstaller(services: GithubInstallerHost) {
         blockedByGrace: false,
         reason: "github releases probe failed",
       };
+    }
+    // The chosen tag becomes a URL path, a cache directory name and a
+    // persisted version record; refuse one that could escape those.
+    if (probe.tag !== null && !isSafeVersion(probe.tag)) {
+      return { tag: null, assets: [], blockedByGrace: false, reason: "invalid GitHub release tag" };
     }
     writeVersionCheck(spec.githubRepo, probe.tag);
     return { tag: probe.tag, assets: probe.assets, blockedByGrace: probe.blockedByGrace };
@@ -691,49 +696,6 @@ export function createGithubInstaller(services: GithubInstallerHost) {
    * `assetSize` is the size hint from GitHub's release JSON. When provided
    * we sanity-check it against the cap before even starting the download.
    */
-  /**
-   * Hosts we will download GitHub release artifacts from. The GitHub API
-   * returns `browser_download_url` values that almost always live on
-   * `github.com` (the canonical URL), but the actual blob is served from
-   * `objects.githubusercontent.com` after redirect. We allow both.
-   *
-   * Without this allowlist, a compromised or malicious
-   * GitHub API response could swap `browser_download_url` to an attacker-
-   * controlled host (e.g. `evil.example/payload.zip`) and we would happily
-   * follow the redirect chain. The download size cap and SHA-256 TOFU help
-   * but cannot stop the very first install on a tag we have never seen.
-   *
-   * We handle redirects manually so every hop is checked before any bytes are
-   * accepted. A compromised release URL may start on github.com and redirect to
-   * an attacker-controlled host; `redirect: "follow"` would hide that hop.
-   */
-  const ALLOWED_DOWNLOAD_HOSTS = new Set([
-    "github.com",
-    "api.github.com",
-    "objects.githubusercontent.com",
-    "release-assets.githubusercontent.com",
-    "raw.githubusercontent.com",
-    "codeload.github.com",
-  ]);
-
-  function assertAllowedDownloadUrl(rawUrl: string): URL {
-    let parsed: URL;
-    try {
-      parsed = new URL(rawUrl);
-    } catch {
-      throw new Error(`download url is not a valid URL: ${rawUrl}`);
-    }
-    if (parsed.protocol !== "https:") {
-      throw new Error(`download url must be https (got ${parsed.protocol}): ${rawUrl}`);
-    }
-    if (!ALLOWED_DOWNLOAD_HOSTS.has(parsed.hostname.toLowerCase())) {
-      throw new Error(
-        `download url host ${parsed.hostname} is not in the GitHub allowlist: ${rawUrl}`,
-      );
-    }
-    return parsed;
-  }
-
   async function downloadFile(
     url: string,
     destPath: string,
@@ -999,13 +961,17 @@ export function createGithubInstaller(services: GithubInstallerHost) {
       if (line.startsWith("h")) {
         throw new Error(`archive contains hardlink entry: ${line.trim()}`);
       }
+      if (!line.trim()) continue;
+      // Read the size column by position: the largest number on a line can be
+      // a numeric file name or a year rather than the entry's size.
+      // GNU tar: mode owner/group size date time name.
+      // bsdtar: mode links owner group size month day time/year name.
       const parts = line.trim().split(/\s+/);
-      if (parts.length >= 6) {
-        const numeric = parts
-          .map((part) => Number.parseInt(part, 10))
-          .filter((value) => Number.isFinite(value) && value >= 0);
-        if (numeric.length > 0) totalBytes += Math.max(...numeric);
+      const size = parts[1]?.includes("/") ? parts[2] : parts[4];
+      if (!size || !/^\d+$/.test(size) || !Number.isSafeInteger(Number(size))) {
+        throw new Error(`unrecognized tar size listing: ${line.trim()}`);
       }
+      totalBytes += Number(size);
     }
 
     const names = await runArchiveTool(command, ["-tf", archivePath], ARCHIVE_LIST_TIMEOUT_MS);
@@ -1844,10 +1810,19 @@ export function createGithubInstaller(services: GithubInstallerHost) {
     abortInFlightGithubInstalls,
     runGithubAutoInstall,
     discoverRelevantGithubServers,
-    _assertAllowedDownloadUrlForTesting: assertAllowedDownloadUrl,
+    // A local wrapper keeps the plugins' inferred export types free of a
+    // reference to the bridge's internal probe module.
+    _assertAllowedDownloadUrlForTesting: (rawUrl: string): URL => assertAllowedDownloadUrl(rawUrl),
     _downloadFileForTesting: downloadFile,
     _extractArchiveSafelyForTesting: extractArchiveSafely,
     _precheckArchiveSizeForTesting: precheckArchiveContents,
     _runArchiveToolForTesting: runArchiveTool,
+    _fetchReleaseByTagForTesting: fetchReleaseByTag,
+    _resolveTargetTagForTesting: resolveTargetTag,
+    // A narrower wrapper keeps the private smoke-verdict type out of the
+    // installer's exported declaration.
+    _writeGithubInstalledMetaForTesting: (installDir: string, version: string, sha256: string) =>
+      writeGithubInstalledMetaIn(installDir, version, sha256),
+    _precheckTarForTesting: precheckWithTar,
   };
 }

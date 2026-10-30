@@ -200,15 +200,160 @@ fn inline_symbol_python() {
     );
     assert_eq!(resp["symbol"], "add");
 
-    // Verify call was replaced
+    // Verify call was replaced, at the call site's indentation: the body's
+    // second line must not keep the function body's own indentation on top
+    // of the call site's (`        result = total` is an IndentationError).
+    // A Windows checkout gives the fixture CRLF endings, so the text is
+    // compared with endings normalized and the endings are checked apart.
     let content = std::fs::read_to_string(&file).expect("read file");
     assert!(
         !content.contains("add(x, y)"),
         "call should be replaced:\n{}",
         content
     );
+    assert!(
+        content.replace("\r\n", "\n").contains(
+            "def main():\n    x = 10\n    y = 20\n    total = x + y\n    result = total\n    print(result)\n"
+        ),
+        "inlined body should sit at the call site's indentation:\n{}",
+        content
+    );
+    assert_consistent_line_endings(&content);
 
     aft.shutdown();
+}
+
+/// Every line ends the same way: all CRLF when the file has any CRLF, all
+/// LF otherwise. An inline that wrote LF lines into a CRLF file would mix
+/// them.
+fn assert_consistent_line_endings(content: &str) {
+    let crlf = content.matches("\r\n").count();
+    let lf = content.matches('\n').count();
+    assert!(
+        crlf == 0 || crlf == lf,
+        "line endings are mixed ({crlf} CRLF of {lf} lines): {content:?}"
+    );
+}
+
+/// The same inline into a file with CRLF endings, written explicitly so the
+/// case is covered on every platform: the inlined lines keep CRLF.
+#[test]
+fn inline_symbol_python_keeps_crlf_line_endings() {
+    let source = "def add(a, b):\r\n    total = a + b\r\n    return total\r\n\r\ndef main():\r\n    x = 10\r\n    y = 20\r\n    result = add(x, y)\r\n    print(result)\r\n";
+    let (resp, content) = inline_in_fresh_file("crlf.py", source, "add", 8);
+    assert_eq!(
+        resp["success"], true,
+        "CRLF python inline should succeed: {resp:?}"
+    );
+    assert!(
+        content.contains("    total = x + y\r\n    result = total\r\n    print(result)\r\n"),
+        "inlined lines should keep CRLF: {content:?}"
+    );
+    assert_consistent_line_endings(&content);
+}
+
+/// A Python body with a nested block keeps its relative nesting when it is
+/// inlined into a call site that is itself nested.
+#[test]
+fn inline_symbol_python_nested_body_keeps_relative_indentation() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let file = tmp.path().join("nested.py");
+    std::fs::write(
+        &file,
+        "def pick(a):\n    if a > 1:\n        print(a)\n    return a\n\ndef main():\n    v = 5\n    if v:\n        r = pick(v)\n        print(r)\n",
+    )
+    .expect("write test file");
+    let root = tmp.path().display().to_string();
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"inline_symbol","file":{},"symbol":"pick","call_site_line":9}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+    assert_eq!(
+        resp["success"], true,
+        "nested python inline should succeed: {resp:?}"
+    );
+    let content = std::fs::read_to_string(&file).expect("read file");
+    assert!(
+        content.contains(
+            "    if v:\n        if v > 1:\n            print(v)\n        r = v\n        print(r)\n"
+        ),
+        "inlined body should keep its nesting at the call site's depth:\n{content}"
+    );
+
+    aft.shutdown();
+}
+
+/// Inline `symbol` at 1-based `line` of a fresh file holding `source`, and
+/// return the response and the file afterwards.
+fn inline_in_fresh_file(
+    name: &str,
+    source: &str,
+    symbol: &str,
+    line: u32,
+) -> (serde_json::Value, String) {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let file = tmp.path().join(name);
+    std::fs::write(&file, source).expect("write test file");
+    let root = tmp.path().display().to_string();
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, &root);
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"inline_symbol","file":{},"symbol":"{}","call_site_line":{}}}"#,
+        crate::helpers::json_string(&file.display()),
+        symbol,
+        line
+    ));
+    let content = std::fs::read_to_string(&file).expect("read file");
+    aft.shutdown();
+    (resp, content)
+}
+
+/// Removing the body's indentation must not remove indentation inside a
+/// multi-line string: those spaces are part of the string's value, and the
+/// result would still parse, so no syntax check would catch the change.
+#[test]
+fn inline_symbol_keeps_multiline_string_values() {
+    let cases = [
+        (
+            "python triple-quoted string",
+            "f.py",
+            "def f():\n    return '''hello\n    world'''\n\nresult = f()\n",
+            5,
+            "result = '''hello\n    world'''\n",
+        ),
+        (
+            "typescript template literal",
+            "f.ts",
+            "function f(): string {\n  return `a\n  b`;\n}\n\nconst r = f();\n",
+            6,
+            "const r = `a\n  b`;\n",
+        ),
+        (
+            "python docstring in a nested body",
+            "g.py",
+            "def g():\n    \"\"\"Doc\n    more\n    \"\"\"\n    print(1)\n\ndef main():\n    if True:\n        g()\n",
+            9,
+            "    if True:\n        \"\"\"Doc\n    more\n    \"\"\"\n        print(1)\n",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (label, name, source, line, expected) in cases {
+        let (resp, content) = inline_in_fresh_file(
+            name,
+            source,
+            if name.starts_with('g') { "g" } else { "f" },
+            line,
+        );
+        if resp["success"] != true || !content.contains(expected) {
+            failures.push(format!(
+                "{label}: expected the file to contain {expected:?}; response {resp:?}; file {content:?}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n\n"));
 }
 
 // ---------------------------------------------------------------------------

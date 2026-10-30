@@ -19,7 +19,7 @@ fn zero_posting_trigrams_do_not_collapse_candidate_union() {
     index.index_file(&path, b"alpha_token");
 
     let query = SearchIndex::query_trigrams_from_tokens(&["zzzzzz", "alpha_token"]);
-    let ranked = index.lexical_rank(&query, None, 10);
+    let ranked = index.lexical_rank(&query, None, 10).unwrap();
 
     assert_eq!(ranked.len(), 1);
     assert_eq!(ranked[0].0, path);
@@ -35,7 +35,7 @@ fn three_or_more_trigrams_use_rarest_three_and_cap_at_200() {
     }
 
     let query = SearchIndex::query_trigrams_from_tokens(&["abcdefghij"]);
-    let ranked = index.lexical_rank(&query, None, 1_000);
+    let ranked = index.lexical_rank(&query, None, 1_000).unwrap();
 
     assert_eq!(ranked.len(), 200);
 }
@@ -50,7 +50,7 @@ fn one_or_two_trigrams_use_all_remaining_and_cap_at_500() {
     }
 
     let query = SearchIndex::query_trigrams_from_tokens(&["abc"]);
-    let ranked = index.lexical_rank(&query, None, 1_000);
+    let ranked = index.lexical_rank(&query, None, 1_000).unwrap();
 
     assert_eq!(ranked.len(), 500);
 }
@@ -65,7 +65,9 @@ fn candidate_filter_excludes_non_semantic_file_extensions() {
     index.index_file(&readme_path, b"uniqueIdentifier");
 
     let query = SearchIndex::query_trigrams_from_tokens(&["uniqueIdentifier"]);
-    let ranked = index.lexical_rank(&query, Some(&is_semantic_indexed_extension), 10);
+    let ranked = index
+        .lexical_rank(&query, Some(&is_semantic_indexed_extension), 10)
+        .unwrap();
 
     assert!(ranked.iter().any(|(path, _)| path == &rust_path));
     assert!(!ranked.iter().any(|(path, _)| path == &readme_path));

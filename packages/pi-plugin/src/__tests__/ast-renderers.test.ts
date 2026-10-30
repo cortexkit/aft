@@ -96,6 +96,37 @@ describe("AST renderers", () => {
     expect(replace).toContain("logger.info(alpha)");
   });
 
+  test("renderAstResult shows a variadic capture as its source text", () => {
+    const match = {
+      file: "/repo/src/a.ts",
+      line: 1,
+      column: 0,
+      text: "foo(1, 2)",
+      meta_variables: { $A: ["1", ",", "2"] },
+    };
+    const render = (payloadMatch: Record<string, unknown>) =>
+      renderToString(
+        renderAstResult(
+          "ast_grep_search",
+          makeResult("", {
+            matches: [payloadMatch],
+            total_matches: 1,
+            files_with_matches: 1,
+            files_searched: 1,
+          }),
+          mockTheme,
+          makeContext({ pattern: "foo($$$A)", lang: "typescript" }),
+        ),
+      );
+
+    const withText = render({ ...match, meta_variable_text: { $A: "1, 2" } });
+    expect(withText).toContain("$A = 1, 2");
+    expect(withText).not.toContain("1, ,, 2");
+
+    // An older engine without the source text still renders the node list.
+    expect(render(match)).toContain("$A = 1, ,, 2");
+  });
+
   test("renderAstResult honors collapsed and expanded result views", () => {
     const payload = {
       matches: Array.from({ length: 6 }, (_, index) => ({

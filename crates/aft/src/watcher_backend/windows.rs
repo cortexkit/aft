@@ -435,6 +435,14 @@ fn run_completion_loop(
             return Ok(());
         }
     }
+    let git_directory = root.join(".git");
+    counters.bash_flush.set_marker_directory(
+        if std::fs::symlink_metadata(&git_directory).is_ok_and(|metadata| metadata.is_dir()) {
+            git_directory
+        } else {
+            root.clone()
+        },
+    );
     if start_tx.send(Ok(())).is_err() {
         cancel_and_drain(completion_port, &mut watches);
         return Ok(());

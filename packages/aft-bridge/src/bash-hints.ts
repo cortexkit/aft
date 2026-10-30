@@ -206,7 +206,7 @@ export function taskKillDeadlineText(
   // stop it). Mirrors `kill_deadline_text` in crates/aft/src/commands/bash_watch.rs.
   if (typeof data.remote_phase_note === "string" && data.remote_phase_note !== "") {
     const note = data.remote_phase_note;
-    return `${note.charAt(0).toUpperCase()}${note.slice(1)}.`;
+    return `${note.charAt(0).toUpperCase()}${note.slice(1)}${note.endsWith(".") ? "" : "."}`;
   }
   const hardKill = data.hard_kill as { limit_ms?: unknown; source?: unknown } | undefined;
   if (!hardKill || typeof hardKill.limit_ms !== "number") {

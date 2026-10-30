@@ -125,14 +125,32 @@ fn warm_scope_lsp(ctx: &AppContext, file: &Path, content: &str) {
 
 fn open_with_lsp(ctx: &AppContext, file: &Path, content: &str) {
     let config = ctx.config().clone();
-    ctx.lsp()
-        .notify_file_changed(file, content, &config)
-        .expect("notify file changed");
-    let diagnostics = ctx
-        .lsp()
-        .wait_for_diagnostics(file, &config, Duration::from_secs(2));
+    let (pre_snapshot, expected_versions) = {
+        let mut lsp = ctx.lsp();
+        lsp.drain_events();
+        let pre_snapshot = lsp.snapshot_pre_edit_state(file);
+        let expected_versions = lsp
+            .notify_file_changed_versioned(file, content, &config)
+            .expect("notify file changed");
+        (pre_snapshot, expected_versions)
+    };
     assert!(
-        !diagnostics.is_empty(),
+        !expected_versions.is_empty(),
+        "fake LSP should match {file:?}"
+    );
+    let result = aft::lsp::fresh_wait::wait_for_post_edit_diagnostics_unlocked(
+        || ctx.lsp(),
+        file,
+        &expected_versions,
+        &pre_snapshot,
+        std::time::Instant::now() + Duration::from_secs(2),
+    );
+    assert!(
+        result.complete(),
+        "fake LSP must report the notified versions for {file:?}: {result:?}"
+    );
+    assert!(
+        !result.diagnostics.is_empty(),
         "fake LSP should publish diagnostics for {file:?}"
     );
 }

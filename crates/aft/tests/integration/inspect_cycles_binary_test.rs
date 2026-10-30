@@ -33,16 +33,27 @@ fn inspect_cycles(files: &[(&str, &str)]) -> Value {
         "configure failed: {configured:#}"
     );
 
-    let response = aft.send(
-        &json!({
-            "id": "inspect-cycles",
-            "command": "inspect",
-            "sections": ["cycles"],
-            "topK": 20,
-        })
-        .to_string(),
-    );
-    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let response = loop {
+        let response = aft.send(
+            &json!({
+                "id": "inspect-cycles",
+                "command": "inspect",
+                "sections": ["cycles"],
+                "topK": 20,
+            })
+            .to_string(),
+        );
+        assert_eq!(response["success"], true, "inspect failed: {response:#}");
+        if response["inspect_terminal"] == "fresh" {
+            break response;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cycle inspection did not become fresh: {response:#}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
     assert_cycle_scan_complete(&response);
     assert!(aft.shutdown().success());
     response

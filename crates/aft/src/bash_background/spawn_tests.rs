@@ -36,6 +36,7 @@ fn spawn(registry: &BgTaskRegistry, root: &Path, command: &str, background: bool
             root.to_owned(),
             HashMap::new(),
             super::super::HardKill::After(Duration::from_secs(60)),
+            None,
             root.to_owned(),
             if background {
                 super::super::TaskSlot::Background { max: 100 }
@@ -59,6 +60,150 @@ fn wait_done(registry: &BgTaskRegistry, id: &str) {
             "child did not finish"
         );
         std::thread::yield_now();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_scope_preserves_shell_dollar_expressions() {
+    const FIXTURE: &str = "AFT_TEST_SYSTEMD_SCOPE_FIXTURE";
+    if let Some(root) = std::env::var_os(FIXTURE) {
+        let root = PathBuf::from(root);
+        let registry = BgTaskRegistry::default();
+        let command = r#"X=inner; printf '%s' "$BASHPID" > shell-pid; printf 'braced=%s plain=%s pid=%s\n' "${X}" "$X" "$$"; cd child-dir ; echo "${PWD}""#;
+        let id = registry
+            .spawn_with_shell(
+                SpawnPlan::Unsandboxed,
+                command,
+                super::super::BashShell::Bash,
+                PathBuf::from("/bin/bash"),
+                "scope-contract".into(),
+                root.clone(),
+                HashMap::from([
+                    (LINUX_SCOPE_ENV.into(), "1".into()),
+                    ("X".into(), "outer".into()),
+                ]),
+                super::super::HardKill::After(Duration::from_secs(15)),
+                None,
+                root.clone(),
+                4,
+                false,
+                false,
+                Some(root.clone()),
+            )
+            .unwrap();
+        wait_done(&registry, &id);
+        let task = registry.task(&id).unwrap();
+        let stderr = std::fs::read_to_string(&task.paths.stderr).unwrap();
+        assert_eq!(
+            registry
+                .status(&id, "scope-contract", None, None, 1024)
+                .unwrap()
+                .exit_code,
+            Some(0),
+            "{stderr}"
+        );
+        // BASHPID is independent of the $$ expression that systemd can corrupt.
+        let pid: u32 = std::fs::read_to_string(root.join("shell-pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(pid > 0);
+        assert_eq!(
+            std::fs::read_to_string(&task.paths.stdout).unwrap(),
+            format!(
+                "braced=inner plain=inner pid={pid}\n{}\n",
+                root.join("child-dir").display()
+            )
+        );
+        assert_eq!(stderr, "");
+        return;
+    }
+
+    // Isolate PATH changes from every other test, including launcher discovery.
+    for mode in ["modern", "legacy"] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("child-dir")).unwrap();
+        let script = r#"#!/bin/bash
+mode=@MODE@
+expand=yes
+while [[ $1 == --* ]]; do
+    case $1 in
+        --expand-environment=no)
+            if [[ $mode == legacy ]]; then
+                echo probe:unsupported >> "${0%/*}/calls"
+                exit 1
+            fi
+            expand=no ;;
+        --user|--scope|--collect|--quiet) ;;
+        *) exit 2 ;;
+    esac
+    shift
+done
+kind=launch
+[[ $1 == /bin/true ]] && kind=probe
+echo "$kind:$expand" >> "${0%/*}/calls"
+if [[ $mode == modern && $expand == yes ]]; then
+    # Model systemd's embedded ${...}/$$ expansion, never shell-eval the input.
+    args=()
+    for rest in "$@"; do
+        out=
+        while [[ -n $rest ]]; do
+            if [[ $rest == '$$'* ]]; then
+                out+='$'
+                rest=${rest:2}
+            elif [[ $rest =~ ^\$\{([^}]*)\} ]]; then
+                match=${BASH_REMATCH[0]}
+                name=${BASH_REMATCH[1]}
+                if [[ $name =~ ^[a-zA-Z_][a-zA-Z_0-9]*$ ]]; then out+=${!name-}; fi
+                rest=${rest:${#match}}
+            else
+                out+=${rest:0:1}
+                rest=${rest:1}
+            fi
+        done
+        args+=("$out")
+    done
+    set -- "${args[@]}"
+fi
+exec "$@"
+"#
+        .replace("@MODE@", mode);
+        crate::executable_cache::write_executable(
+            &dir.path().join("systemd-run"),
+            script.as_bytes(),
+        )
+        .unwrap();
+        let path = std::env::join_paths(std::iter::once(dir.path().to_owned()).chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+        ))
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "bash_background::registry::spawn_tests::linux_scope_preserves_shell_dollar_expressions",
+                "--nocapture",
+            ])
+            .env(FIXTURE, dir.path())
+            .env("PATH", path)
+            .env("X", "outer")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{mode}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("calls")).unwrap(),
+            if mode == "modern" {
+                "probe:no\nlaunch:no\n"
+            } else {
+                "probe:unsupported\nprobe:yes\nlaunch:yes\n"
+            },
+            "{mode} must exercise the availability probe and the real scope launch"
+        );
     }
 }
 

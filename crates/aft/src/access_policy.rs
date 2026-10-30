@@ -8,6 +8,31 @@ use crate::sandbox_profile::{SandboxDataPolicy, SandboxProfile, SandboxProfileEr
 
 thread_local! {
     static REQUEST_SCOPE: std::cell::RefCell<Option<crate::db::access_grants::ScopeKey>> = const { std::cell::RefCell::new(None) };
+    static SCOPE_GRANTS_DENIAL: std::cell::Cell<Option<ScopeGrantsDenial>> = const { std::cell::Cell::new(None) };
+}
+
+/// Bind saved-grant eligibility to the authenticated caller. Nested work cannot
+/// restore authority withheld by an outer caller, including during traversal.
+pub(crate) fn scope_grants_guard(denial: Option<ScopeGrantsDenial>) -> ScopeGrantsGuard {
+    ScopeGrantsGuard(
+        SCOPE_GRANTS_DENIAL.with(|slot| slot.replace(slot.get().or(denial))),
+        std::marker::PhantomData,
+    )
+}
+
+pub(crate) struct ScopeGrantsGuard(
+    Option<ScopeGrantsDenial>,
+    std::marker::PhantomData<*const ()>,
+);
+
+impl Drop for ScopeGrantsGuard {
+    fn drop(&mut self) {
+        SCOPE_GRANTS_DENIAL.with(|slot| slot.set(self.0));
+    }
+}
+
+pub(crate) fn scope_grants_denial() -> Option<ScopeGrantsDenial> {
+    SCOPE_GRANTS_DENIAL.with(std::cell::Cell::get)
 }
 
 pub(crate) fn with_scope<R>(
@@ -40,6 +65,10 @@ pub(crate) fn scope_guard(scope: Option<crate::db::access_grants::ScopeKey>) -> 
 
 pub(crate) fn current_scope() -> Option<crate::db::access_grants::ScopeKey> {
     REQUEST_SCOPE.with(|slot| slot.borrow().clone())
+}
+
+pub(crate) fn scope_matches(scope: &Option<crate::db::access_grants::ScopeKey>) -> bool {
+    REQUEST_SCOPE.with(|slot| *slot.borrow() == *scope)
 }
 
 /// Published crate sources (registry and git dependencies) and toolchains:
@@ -355,12 +384,14 @@ pub(crate) fn is_access_request(response: &crate::protocol::Response) -> bool {
 
 thread_local! {
     static ASK_ROUTE: std::cell::RefCell<Option<AskRoute>> = const { std::cell::RefCell::new(None) };
+    static ASK_ROUTE_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 pub(crate) struct AskRouteGuard(Option<AskRoute>, std::marker::PhantomData<*const ()>);
 
 impl Drop for AskRouteGuard {
     fn drop(&mut self) {
+        ASK_ROUTE_GENERATION.with(|generation| generation.set(generation.get().wrapping_add(1)));
         ASK_ROUTE.with(|slot| {
             slot.replace(self.0.take());
         });
@@ -368,10 +399,15 @@ impl Drop for AskRouteGuard {
 }
 
 pub(crate) fn ask_route_guard(route: Option<AskRoute>) -> AskRouteGuard {
+    ASK_ROUTE_GENERATION.with(|generation| generation.set(generation.get().wrapping_add(1)));
     AskRouteGuard(
         ASK_ROUTE.with(|slot| slot.replace(route)),
         std::marker::PhantomData,
     )
+}
+
+pub(crate) fn ask_route_generation() -> u64 {
+    ASK_ROUTE_GENERATION.with(|generation| generation.get())
 }
 
 pub(crate) fn current_ask_route() -> AskRoute {
@@ -420,6 +456,15 @@ pub enum AccessDenial {
     OutsideRoots,
     ReadOnly,
     UnsafeTemp,
+    ScopeGrants(ScopeGrantsDenial),
+}
+
+/// Why an authenticated connection cannot use the agent's saved scope grants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeGrantsDenial {
+    Flow,
+    UnknownScopeKind,
+    NotSessionHost,
 }
 
 /// What a route does with a path outside every one of its roots.
@@ -577,6 +622,9 @@ pub struct AccessPolicy {
     pub shell_write_floor: Vec<PathBuf>,
     pub private_stores: SandboxDataPolicy,
     pub grants: Vec<AccessGrant>,
+    /// Built-in worker library reads are ordinary policy, not saved approvals.
+    worker_read_grants: Vec<AccessGrant>,
+    pub scope_grants_denial: Option<ScopeGrantsDenial>,
     /// Shell-only configured write exceptions; they do not grant access to private stores.
     pub shell_write_allow: Vec<PathBuf>,
     /// Checkouts that live inside a private store but hold project code, not
@@ -674,6 +722,14 @@ impl AccessPolicy {
             path
         })
         .collect();
+        if config.cache_dir.is_some() {
+            let path = policy_path(&crate::root_cache::cache_root(config));
+            floor_rules.push(PolicyFloor {
+                path: path.clone(),
+                rule: FloorRule::AftStorage,
+            });
+            deny.push(path);
+        }
         if let Some(path) = &config.semantic.subc_connection_file {
             let path = expand_home(path, home);
             let path = policy_path(&if path.is_absolute() {
@@ -702,7 +758,7 @@ impl AccessPolicy {
         let mut read_allow = roots.clone();
         let mut managed_paths = Vec::new();
         if config.github.shim {
-            managed_paths.push(storage.join(crate::agent_child_env::SHIMS_DIR_NAME));
+            managed_paths.push(crate::pinned_executable::shims_dir(&storage));
             if let Ok(binary) = crate::agent_child_env::shim_binary(config) {
                 managed_paths.push(binary);
             }
@@ -741,6 +797,8 @@ impl AccessPolicy {
             floor_rules,
             shell_write_floor,
             grants: Vec::new(),
+            worker_read_grants: Vec::new(),
+            scope_grants_denial: scope_grants_denial(),
             shell_write_allow: config
                 .sandbox
                 .write_allow
@@ -754,9 +812,9 @@ impl AccessPolicy {
         }
     }
 
-    /// Installs the grants a scope's policy holds: the ones stored for the scope,
-    /// plus the built-in Rust library read grants when the scope is a live
-    /// worker. Every policy built for a scope comes through here, so the
+    /// Installs saved scope grants and, separately, the built-in Rust library
+    /// read policy when the scope is a live worker. Every scoped policy comes
+    /// through here, so the
     /// in-process tool checks and the subc consent and launch checks cannot
     /// disagree about what a worker may read.
     pub(crate) fn install_scope_grants(&mut self, stored: Vec<AccessGrant>, worker: bool) {
@@ -769,10 +827,19 @@ impl AccessPolicy {
         worker: bool,
         rust_sources: &WorkerRustSources,
     ) {
-        self.grants = stored;
-        if worker {
-            self.grants.extend(rust_sources.grants());
+        // Policies captured by a handler's off-thread work must also carry no
+        // agent grants; a thread-local decision check alone would not do that.
+        self.worker_read_grants = if worker {
+            rust_sources.grants()
+        } else {
+            Vec::new()
+        };
+        self.scope_grants_denial = self.scope_grants_denial.or(scope_grants_denial());
+        if self.scope_grants_denial.is_some() {
+            self.grants.clear();
+            return;
         }
+        self.grants = stored;
     }
 
     pub fn decide(
@@ -781,10 +848,31 @@ impl AccessPolicy {
         path: &Path,
         owned_artifact: bool,
     ) -> AccessDecision {
-        if self
-            .floor_for_path(operation, path, owned_artifact)
-            .is_some()
-        {
+        self.decide_inner(operation, path, owned_artifact, false)
+    }
+
+    pub(crate) fn decide_resolved(
+        &self,
+        operation: AccessOperation,
+        path: &Path,
+        owned_artifact: bool,
+    ) -> AccessDecision {
+        self.decide_inner(operation, path, owned_artifact, true)
+    }
+
+    fn decide_inner(
+        &self,
+        operation: AccessOperation,
+        path: &Path,
+        owned_artifact: bool,
+        resolved: bool,
+    ) -> AccessDecision {
+        let floor = if resolved {
+            self.floor_for_path_using(operation, path, owned_artifact, floor_contains_resolved)
+        } else {
+            self.floor_for_path(operation, path, owned_artifact)
+        };
+        if floor.is_some() {
             return AccessDecision::Deny(AccessDenial::Floor);
         }
         let exceptions = match operation {
@@ -833,14 +921,24 @@ impl AccessPolicy {
             || exceptions.iter().any(|root| path.starts_with(root))
             || (operation == AccessOperation::Read && owned_artifact)
             || self
-                .grants
+                .worker_read_grants
                 .iter()
                 .any(|grant| grant.covers(operation, path))
+            || (self.scope_grants_denial.or(scope_grants_denial()).is_none()
+                && self
+                    .grants
+                    .iter()
+                    .any(|grant| grant.covers(operation, path)))
         {
             AccessDecision::Allow
         } else {
             match (self.mode, self.outside) {
                 (ApprovalMode::FullAccess, AccessDecision::Ask) => AccessDecision::Allow,
+                (_, AccessDecision::Deny(AccessDenial::OutsideRoots)) => self
+                    .scope_grants_denial
+                    .or(scope_grants_denial())
+                    .map(|reason| AccessDecision::Deny(AccessDenial::ScopeGrants(reason)))
+                    .unwrap_or(self.outside),
                 _ => self.outside,
             }
         }
@@ -873,6 +971,16 @@ impl AccessPolicy {
         path: &Path,
         owned_artifact: bool,
     ) -> Option<PolicyFloor> {
+        self.floor_for_path_using(operation, path, owned_artifact, floor_contains)
+    }
+
+    fn floor_for_path_using(
+        &self,
+        operation: AccessOperation,
+        path: &Path,
+        owned_artifact: bool,
+        contains: fn(&Path, &Path) -> bool,
+    ) -> Option<PolicyFloor> {
         if crate::bash_background::registry::is_task_environment(path) {
             return Some(PolicyFloor {
                 path: path.to_path_buf(),
@@ -882,9 +990,25 @@ impl AccessPolicy {
         if let Some(floor) = self
             .absolute_floor
             .iter()
-            .find(|floor| floor_contains(path, floor))
+            .find(|floor| contains(path, floor))
         {
             return Some(self.describe_floor(floor));
+        }
+        // Project roots and capability grants cannot admit AFT's SQLite files:
+        // closing a second descriptor releases the process's SQLite locks.
+        // Ownership-checked task output keeps its separate, non-SQLite read path.
+        if !(operation == AccessOperation::Read && owned_artifact) {
+            if let Some(floor) = self.floor_rules.iter().find(|floor| {
+                matches!(floor.rule, FloorRule::AftStorage) && contains(path, &floor.path)
+            }) {
+                return Some(floor.clone());
+            }
+        }
+        if crate::db::file_identity::is_live_sqlite_file(path) {
+            return Some(PolicyFloor {
+                path: path.to_path_buf(),
+                rule: FloorRule::AftStorage,
+            });
         }
         let exceptions = match operation {
             AccessOperation::Read => &self.private_stores.read_allow,
@@ -901,7 +1025,7 @@ impl AccessPolicy {
                 .private_stores
                 .deny
                 .iter()
-                .find(|floor| floor_contains(path, floor))
+                .find(|floor| contains(path, floor))
                 .map(|floor| self.describe_floor(floor));
         }
         None
@@ -1003,6 +1127,7 @@ impl AccessPolicy {
     pub(crate) fn shell_grants(&self, operation: AccessOperation) -> Vec<PathBuf> {
         self.grants
             .iter()
+            .chain(&self.worker_read_grants)
             .filter(|grant| {
                 grant.covers(operation, &grant.path)
                     && match operation {
@@ -1130,14 +1255,38 @@ fn environment_private_store_denies(
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-fn floor_contains(path: &Path, prefix: &Path) -> bool {
+pub(crate) fn floor_contains(path: &Path, prefix: &Path) -> bool {
     path.starts_with(prefix)
 }
 
 #[cfg(windows)]
-fn floor_contains(path: &Path, prefix: &Path) -> bool {
-    use std::os::windows::ffi::OsStrExt;
+pub(crate) fn floor_contains(path: &Path, prefix: &Path) -> bool {
+    // Resolve short-name aliases and missing descendants through their nearest
+    // existing ancestor. Preserve a final symlink's location for unlink checks.
+    let path = if path
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => policy_path(parent).join(name),
+            _ => policy_path(path),
+        }
+    } else {
+        policy_path(path)
+    };
+    let prefix = policy_path(prefix);
+    floor_contains_resolved(&path, &prefix)
+}
 
+/// Compare identities that were already resolved for this request's snapshot.
+#[cfg(not(windows))]
+pub(crate) fn floor_contains_resolved(path: &Path, prefix: &Path) -> bool {
+    floor_contains(path, prefix)
+}
+
+#[cfg(windows)]
+pub(crate) fn floor_contains_resolved(path: &Path, prefix: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
     #[link(name = "kernel32")]
     unsafe extern "system" {
         #[link_name = "CompareStringOrdinal"]
@@ -1149,10 +1298,6 @@ fn floor_contains(path: &Path, prefix: &Path) -> bool {
             ignore_case: i32,
         ) -> i32;
     }
-
-    // Windows accepts case aliases even for missing final components. Compare
-    // whole components with the OS's ordinal case rules, without following a
-    // final symlink or losing non-UTF-8 names through string conversion.
     let path = crate::inspect::job::normalize_path(path);
     let prefix = crate::inspect::job::normalize_path(prefix);
     let mut components = path.components();
@@ -1179,7 +1324,7 @@ fn floor_contains(path: &Path, prefix: &Path) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn floor_contains(path: &Path, prefix: &Path) -> bool {
+pub(crate) fn floor_contains(path: &Path, prefix: &Path) -> bool {
     use std::ffi::c_void;
     use std::os::unix::ffi::OsStrExt;
 
@@ -1325,6 +1470,83 @@ fn resolve_policy_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn carrier_scope_grants_guard_is_nested_thread_local_and_unwind_safe() {
+        use super::{scope_grants_denial, scope_grants_guard, ScopeGrantsDenial};
+        assert_eq!(scope_grants_denial(), None);
+        {
+            let _outer = scope_grants_guard(Some(ScopeGrantsDenial::NotSessionHost));
+            {
+                let _inner = scope_grants_guard(None);
+                assert_eq!(
+                    scope_grants_denial(),
+                    Some(ScopeGrantsDenial::NotSessionHost)
+                );
+            }
+            assert_eq!(
+                scope_grants_denial(),
+                Some(ScopeGrantsDenial::NotSessionHost)
+            );
+            assert_eq!(
+                std::thread::spawn(scope_grants_denial).join().unwrap(),
+                None
+            );
+        }
+        assert_eq!(scope_grants_denial(), None);
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = scope_grants_guard(Some(ScopeGrantsDenial::NotSessionHost));
+            panic!("exercise scope-grant guard unwinding");
+        });
+        assert_eq!(scope_grants_denial(), None);
+    }
+
+    #[test]
+    fn carrier_scope_grants_guard_masks_existing_and_captured_policies_only_while_installed() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        // Callers resolve targets before deciding access; temp roots can be
+        // aliases (/var on macOS, short or verbatim paths on Windows).
+        let outside_path = policy_path(outside.path());
+        let grant = AccessGrant {
+            path: outside_path.clone(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        };
+        let mut existing = policy(root.path(), &root.path().join("store"));
+        existing.outside = AccessDecision::Deny(AccessDenial::OutsideRoots);
+        existing.install_scope_grants(vec![grant.clone()], false);
+        assert_eq!(
+            existing.decide(AccessOperation::Read, &outside_path, false),
+            AccessDecision::Allow
+        );
+        let captured;
+        {
+            let _guard = scope_grants_guard(Some(ScopeGrantsDenial::NotSessionHost));
+            assert_eq!(
+                existing.decide(AccessOperation::Read, &outside_path, false),
+                AccessDecision::Deny(AccessDenial::ScopeGrants(ScopeGrantsDenial::NotSessionHost))
+            );
+            let mut policy = existing.clone();
+            policy.install_scope_grants(vec![grant], false);
+            captured = policy;
+        }
+        assert_eq!(
+            existing.decide(AccessOperation::Read, &outside_path, false),
+            AccessDecision::Allow
+        );
+        assert_eq!(
+            std::thread::spawn(move || captured.decide(
+                AccessOperation::Read,
+                &outside_path,
+                false
+            ))
+            .join()
+            .unwrap(),
+            AccessDecision::Deny(AccessDenial::ScopeGrants(ScopeGrantsDenial::NotSessionHost))
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn environment_store_denies_resolve_dotdot_and_symlink_targets() {
@@ -1561,7 +1783,7 @@ mod tests {
     }
 
     #[test]
-    fn private_store_grants_cannot_add_carve_outs() {
+    fn storage_floor_grants_and_project_roots_cannot_add_carve_outs() {
         let root = tempfile::tempdir().unwrap();
         let outside_dir = tempfile::tempdir().unwrap();
         // Production callers pass canonical policy identities. On macOS the temp
@@ -1591,7 +1813,7 @@ mod tests {
         policy.private_stores.read_allow.push(outside.clone());
         assert_eq!(
             policy.decide(AccessOperation::Read, &outside, false),
-            AccessDecision::Allow
+            AccessDecision::Deny(AccessDenial::Floor)
         );
         assert_eq!(
             policy.decide(AccessOperation::Write, &outside, false),

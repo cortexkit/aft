@@ -6,13 +6,36 @@ use serde_json::{json, Value};
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
+mod cpu_time;
+pub(crate) use cpu_time::ThreadCpuSample;
+
 pub type DispatchFn<'a> = dyn Fn(RawRequest, &AppContext) -> Response + 'a;
 /// Finalizes a formatted tool result. It receives the agent-visible text so the finalizer can
 /// append trailing lines (the AFT status bar) that every transport then delivers unchanged.
 pub type FinalizeFn<'a> = dyn Fn(&mut Response, &mut String) + 'a;
 
-/// Monotonic timestamps for one subc tool call. The recorder stays on the
-/// request path and only takes an `Instant::now()` at each phase boundary.
+#[cfg(test)]
+thread_local! {
+    /// Every string a prepare asked the edit translator to classify as a glob
+    /// or a file, recorded for the tests that pin how much filesystem
+    /// validation a prepare does.
+    static EDIT_TARGET_PROBES: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn record_edit_target_probe(resolved: &str) {
+    EDIT_TARGET_PROBES.with(|probes| probes.borrow_mut().push(resolved.to_string()));
+}
+
+#[cfg(test)]
+pub(crate) fn take_edit_target_probes_for_test() -> Vec<String> {
+    EDIT_TARGET_PROBES.with(|probes| std::mem::take(&mut *probes.borrow_mut()))
+}
+
+/// Wall and optional thread-CPU timestamps for one subc tool call. Synchronous
+/// boundaries read thread CPU on Linux/macOS; Windows lacks a sufficiently fine
+/// clock and reports unknown CPU. Sampling does not perform file I/O.
 ///
 /// Causal wait state is harvested on the executor worker at `mark_execute_done`
 /// because `PhaseTrace::new` and `finish` run on different threads than execute.
@@ -22,13 +45,16 @@ pub struct PhaseTrace {
     launch_restore_wait: std::time::Duration,
     executor_submitted: Option<Instant>,
     job_admitted: Option<Instant>,
+    setup_done: Option<Instant>,
     translate_done: Option<Instant>,
     execute_done: Option<Instant>,
     format_done: Option<Instant>,
     finalize_done: Option<Instant>,
+    cpu: PhaseCpuTrace,
     waiting_on: WaitingOn,
     waiting_on_build_id: Option<String>,
     wait_ms: u64,
+    intentional_wait: bool,
     arg_shape: Option<String>,
     edit_phases: Option<String>,
 }
@@ -44,6 +70,31 @@ pub struct ToolCallEgressTiming {
     pub writer_active_at_enqueue: bool,
     pub writer_queue_was_full: bool,
     pub reserve_timeouts: u32,
+    pub prepare_cpu: Option<Duration>,
+}
+
+#[derive(Debug, Default)]
+struct PhaseCpuTrace {
+    job_admitted: Option<ThreadCpuSample>,
+    setup_done: Option<ThreadCpuSample>,
+    translate_done: Option<ThreadCpuSample>,
+    execute_done: Option<ThreadCpuSample>,
+    format_done: Option<ThreadCpuSample>,
+    finalize_done: Option<ThreadCpuSample>,
+    execute_suspended: bool,
+}
+
+/// Only uninterrupted, same-thread intervals have an attributable CPU delta.
+/// Queueing, async writes, and aggregate egress span awaits or worker handoffs.
+/// Platforms without a sufficiently fine thread clock always report unknown.
+#[derive(Debug, Clone, Default)]
+pub struct ToolCallPhaseCpu {
+    pub setup: Option<Duration>,
+    pub translate: Option<Duration>,
+    pub execute: Option<Duration>,
+    pub format: Option<Duration>,
+    pub finalize: Option<Duration>,
+    pub egress_prepare: Option<Duration>,
 }
 
 /// Causal wait recorded on a tool call so slow-call logs can name the blocker.
@@ -71,7 +122,17 @@ impl WaitingOn {
 
 #[derive(Debug, Clone)]
 pub struct ToolCallPhaseDurations {
+    pub cpu: ToolCallPhaseCpu,
     pub queue: Duration,
+    /// From executor admission to the start of argument translation: the
+    /// route's call policy (confinement admission, access-policy scope, the
+    /// formatter launch-policy handle) and repeat-breaker capture. Kept apart
+    /// from `translate` so per-call policy work is not mistaken for argument
+    /// translation.
+    pub setup: Duration,
+    /// From the start of argument translation to a dispatchable request:
+    /// disabled-tool and database gates, hashline registration, and the
+    /// translation itself.
     pub translate: Duration,
     pub execute: Duration,
     pub format: Duration,
@@ -90,6 +151,8 @@ pub struct ToolCallPhaseDurations {
     pub waiting_on: WaitingOn,
     pub waiting_on_build_id: Option<String>,
     pub wait_ms: u64,
+    /// Execution includes a requested wait, not just AFT's own work.
+    pub intentional_wait: bool,
     /// What the call was asked to do, without any content: the target kind
     /// and, for edits, the match and replacement sizes and the outcome code.
     /// See [`tool_call_arg_shape`].
@@ -117,13 +180,16 @@ impl PhaseTrace {
             launch_restore_wait: std::time::Duration::ZERO,
             executor_submitted: None,
             job_admitted: None,
+            setup_done: None,
             translate_done: None,
             execute_done: None,
             format_done: None,
             finalize_done: None,
+            cpu: PhaseCpuTrace::default(),
             waiting_on: WaitingOn::None,
             waiting_on_build_id: None,
             wait_ms: 0,
+            intentional_wait: false,
             arg_shape: None,
             edit_phases: None,
         }
@@ -137,6 +203,7 @@ impl PhaseTrace {
         crate::logging::reset_tool_call_wait();
         crate::logging::reset_edit_phase_times();
         let now = Instant::now();
+        self.cpu.job_admitted = ThreadCpuSample::now();
         self.job_admitted = Some(now);
         if let Some(submitted) = self.executor_submitted {
             crate::logging::note_tool_call_queue_ms(
@@ -147,17 +214,33 @@ impl PhaseTrace {
         }
     }
 
+    /// The call reached argument translation; everything since admission was
+    /// call-policy setup.
+    fn mark_setup_done(&mut self) {
+        self.setup_done = Some(Instant::now());
+        self.cpu.setup_done = ThreadCpuSample::now();
+    }
+
     fn mark_translate_done(&mut self) {
         self.translate_done = Some(Instant::now());
+        self.cpu.translate_done = ThreadCpuSample::now();
     }
 
     pub(crate) fn mark_execute_done(&mut self) {
         self.execute_done = Some(Instant::now());
+        self.cpu.execute_done = ThreadCpuSample::now();
         let (waiting_on, waiting_on_build_id, wait_ms) = crate::logging::take_tool_call_wait();
         self.waiting_on = waiting_on;
         self.waiting_on_build_id = waiting_on_build_id;
         self.wait_ms = wait_ms;
         self.edit_phases = crate::logging::take_edit_phase_times();
+    }
+
+    pub(crate) fn mark_execute_done_after_await(&mut self) {
+        // Matching endpoint thread IDs cannot detect a hop away and back, nor
+        // CPU consumed by unrelated tasks while a deferred response was pending.
+        self.cpu.execute_suspended = true;
+        self.mark_execute_done();
     }
 
     /// Record the argument shape the slow-call line reports for this call.
@@ -168,18 +251,25 @@ impl PhaseTrace {
     pub(crate) fn mark_provider_read_done(&mut self) {
         // Provider reads have no tool translation, formatting, or finalization
         // phases; keep their executor wait and operation time in the shared trace.
+        self.setup_done = self.job_admitted;
+        self.cpu.setup_done = self.cpu.job_admitted;
         self.translate_done = self.job_admitted;
+        self.cpu.translate_done = self.cpu.job_admitted;
         self.mark_execute_done();
         self.format_done = self.execute_done;
         self.finalize_done = self.execute_done;
+        self.cpu.format_done = self.cpu.execute_done;
+        self.cpu.finalize_done = self.cpu.execute_done;
     }
 
     fn mark_format_done(&mut self) {
         self.format_done = Some(Instant::now());
+        self.cpu.format_done = ThreadCpuSample::now();
     }
 
     fn mark_finalize_done(&mut self) {
         self.finalize_done = Some(Instant::now());
+        self.cpu.finalize_done = ThreadCpuSample::now();
     }
 
     pub fn finish(self, egress: ToolCallEgressTiming) -> Option<ToolCallPhaseDurations> {
@@ -189,9 +279,28 @@ impl PhaseTrace {
         let execute_done = self.execute_done?;
         let format_done = self.format_done?;
         let finalize_done = self.finalize_done?;
+        // A call refused before argument translation started has no setup
+        // mark; all of its pre-dispatch time then counts as translate.
+        let (setup_done, cpu_setup_done) = match self.setup_done {
+            Some(setup_done) => (setup_done, self.cpu.setup_done),
+            None => (job_admitted, self.cpu.job_admitted),
+        };
         Some(ToolCallPhaseDurations {
+            cpu: ToolCallPhaseCpu {
+                setup: ThreadCpuSample::elapsed(self.cpu.job_admitted, cpu_setup_done),
+                translate: ThreadCpuSample::elapsed(cpu_setup_done, self.cpu.translate_done),
+                execute: if self.cpu.execute_suspended {
+                    None
+                } else {
+                    ThreadCpuSample::elapsed(self.cpu.translate_done, self.cpu.execute_done)
+                },
+                format: ThreadCpuSample::elapsed(self.cpu.execute_done, self.cpu.format_done),
+                finalize: ThreadCpuSample::elapsed(self.cpu.format_done, self.cpu.finalize_done),
+                egress_prepare: egress.prepare_cpu,
+            },
             queue: job_admitted.duration_since(executor_submitted),
-            translate: translate_done.duration_since(job_admitted),
+            setup: setup_done.duration_since(job_admitted),
+            translate: translate_done.saturating_duration_since(setup_done),
             execute: execute_done.duration_since(translate_done),
             format: format_done.duration_since(execute_done),
             finalize: finalize_done.duration_since(format_done),
@@ -209,6 +318,7 @@ impl PhaseTrace {
             waiting_on: self.waiting_on,
             waiting_on_build_id: self.waiting_on_build_id,
             wait_ms: self.wait_ms,
+            intentional_wait: self.intentional_wait,
             arg_shape: self.arg_shape,
             edit_phases: self.edit_phases,
         })
@@ -339,6 +449,9 @@ pub(crate) fn prepare_tool_call(
     app_ctx: &AppContext,
     mut phase_trace: Option<&mut PhaseTrace>,
 ) -> Result<PreparedToolCall, ToolCallResult> {
+    if let Some(trace) = phase_trace.as_mut() {
+        trace.mark_setup_done();
+    }
     // A tool the user disabled is refused before anything else happens: no
     // hashline registration, translation, permission preflight or backup.
     let refusal = match ctx.disabled_tools.as_deref() {
@@ -382,7 +495,7 @@ pub(crate) fn prepare_tool_call(
         ));
     }
     if ctx.worker_session {
-        app_ctx.lsp().disable_rust_cargo_for_worker();
+        app_ctx.disable_rust_cargo_for_worker();
     }
     let sanitized_args = strip_agent_preview_arg_owned(args);
     let binding_root = app_ctx
@@ -421,6 +534,8 @@ pub(crate) fn prepare_tool_call(
         // as before instead of dispatching it for a permission request.
         let request_id = ctx.request_id.as_str();
         let edit_target_is_glob = |resolved: &str| {
+            #[cfg(test)]
+            record_edit_target_probe(resolved);
             crate::commands::edit_match::classify_edit_target(resolved, app_ctx, request_id)
                 != crate::commands::edit_match::EditTargetKind::Literal
         };
@@ -469,6 +584,7 @@ pub(crate) fn prepare_tool_call(
         }
     };
     if let Some(trace) = phase_trace.as_mut() {
+        trace.intentional_wait = tool_call_intentionally_waits(&request);
         trace.mark_translate_done();
     }
 
@@ -636,6 +752,7 @@ pub fn run_tool_call(
                 .is_some()
                 .then(|| tool_call_arg_shape(&prepared.request));
             let reports_outcome = is_edit_command(&prepared.request.command);
+            let reports_search_plan = prepared.request.command == "semantic_search";
             let skipped_before = app_ctx.backup().lock().latest_skipped_order(
                 ctx.session_id
                     .as_deref()
@@ -676,6 +793,10 @@ pub fn run_tool_call(
             if let Some(trace) = phase_trace.as_mut() {
                 trace.mark_execute_done();
                 if let Some(mut shape) = arg_shape {
+                    if reports_search_plan {
+                        shape.push(' ');
+                        shape.push_str(&search_plan_summary(&response));
+                    }
                     if reports_outcome {
                         shape.push_str(" outcome=");
                         shape.push_str(&response_outcome(&response));
@@ -712,12 +833,44 @@ pub fn run_tool_call(
     ToolCallOutcome::Unary(result)
 }
 
+fn tool_call_intentionally_waits(request: &RawRequest) -> bool {
+    match request.command.as_str() {
+        "bash_watch" => true,
+        "bash" | "powershell" => ["wait", "block_to_completion"]
+            .iter()
+            .any(|key| request.params.get(*key).and_then(Value::as_bool) == Some(true)),
+        _ => false,
+    }
+}
+
 /// Commands that change files, whose slow-call line also reports the outcome.
 fn is_edit_command(command: &str) -> bool {
     matches!(
         command,
         "edit_match" | "batch" | "edit_symbol" | "write" | "apply_patch" | "append"
     )
+}
+
+fn search_plan_summary(response: &Response) -> String {
+    use crate::commands::semantic_search::plan_table::{SearchLaneKind, SearchShape};
+    // Log only parsed shape and selected_lanes labels from the search plan,
+    // never its input or other fields that may contain query text.
+    let labels = (|| {
+        let plan = response.data.get("structuredContent")?.get("plan")?;
+        let shape = SearchShape::from_str(plan.get("shape")?.as_str()?)?;
+        let lanes = plan
+            .get("selected_lanes")?
+            .as_array()?
+            .iter()
+            .map(|lane| SearchLaneKind::from_str(lane.as_str()?).map(|lane| lane.as_str()))
+            .collect::<Option<Vec<_>>>()?;
+        Some(format!(
+            "shape={} lanes={}",
+            shape.as_str(),
+            lanes.join(",")
+        ))
+    })();
+    labels.unwrap_or_else(|| "shape=unavailable lanes=unavailable".to_string())
 }
 
 /// `ok`, or the response's error code reduced to a plain token.
@@ -914,10 +1067,184 @@ fn refusal_result(
 mod tests {
     use super::*;
 
+    fn finish_cpu_phase(mut trace: PhaseTrace) -> ToolCallPhaseDurations {
+        trace.mark_execute_done();
+        trace.mark_format_done();
+        trace.mark_finalize_done();
+        let now = Instant::now();
+        trace
+            .finish(ToolCallEgressTiming {
+                enqueued: now,
+                dequeued: now,
+                write_started: now,
+                write_finished: now,
+                frame_bytes: 0,
+                queue_depth: 0,
+                writer_active_at_enqueue: false,
+                writer_queue_was_full: false,
+                reserve_timeouts: 0,
+                prepare_cpu: None,
+            })
+            .unwrap()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn cpu_phase_busy_loop_is_close_to_wall_time() {
+        const TARGET_CPU: Duration = Duration::from_millis(10);
+        const MAX_ITERATIONS: u32 = 1_000_000;
+        let mut trace = PhaseTrace::new(Instant::now());
+        trace.mark_executor_submitted();
+        trace.mark_job_admitted();
+        let start = ThreadCpuSample::now().expect("thread CPU clock is available");
+        let mut value = 1u64;
+        let mut elapsed = Duration::ZERO;
+        // Stop on CPU progress, not wall time, so descheduling cannot reduce
+        // the measured work. The iteration cap also bounds a stalled clock.
+        for _ in 0..MAX_ITERATIONS {
+            value = std::hint::black_box(value.wrapping_mul(3).wrapping_add(1));
+            elapsed = ThreadCpuSample::elapsed(Some(start), ThreadCpuSample::now())
+                .expect("thread CPU clock became unavailable or moved backwards");
+            if elapsed >= TARGET_CPU {
+                break;
+            }
+        }
+        assert!(
+            elapsed >= TARGET_CPU,
+            "thread CPU clock failed to advance by {TARGET_CPU:?} within {MAX_ITERATIONS} iterations: elapsed={elapsed:?}"
+        );
+        trace.mark_translate_done();
+        let phases = finish_cpu_phase(trace);
+        let cpu = phases.cpu.translate.expect("thread CPU clock is available");
+        assert!(
+            cpu >= TARGET_CPU,
+            "recorded translate CPU {cpu:?} is below {TARGET_CPU:?}"
+        );
+        assert!(
+            cpu <= phases.translate + Duration::from_millis(2),
+            "CPU {cpu:?} exceeds wall {:?}",
+            phases.translate
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn cpu_phase_sleep_excludes_wait_time() {
+        let mut trace = PhaseTrace::new(Instant::now());
+        trace.mark_executor_submitted();
+        trace.mark_job_admitted();
+        std::thread::sleep(Duration::from_millis(80));
+        trace.mark_translate_done();
+        let phases = finish_cpu_phase(trace);
+        let cpu = phases.cpu.translate.expect("thread CPU clock is available");
+        assert!(
+            cpu < phases.translate / 4,
+            "sleep charged as CPU: wall={:?} cpu={cpu:?}",
+            phases.translate
+        );
+    }
+
+    #[test]
+    fn cpu_phase_thread_handoff_is_unknown() {
+        let mut trace = PhaseTrace::new(Instant::now());
+        trace.mark_executor_submitted();
+        trace.mark_job_admitted();
+        let phases = std::thread::spawn(move || {
+            trace.mark_translate_done();
+            finish_cpu_phase(trace)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(phases.cpu.translate, None);
+        assert_eq!(
+            phases.cpu.execute.is_some(),
+            cfg!(any(target_os = "linux", target_os = "macos"))
+        );
+    }
+
+    #[test]
+    fn cpu_phase_await_is_unknown_even_on_same_thread() {
+        let mut trace = PhaseTrace::new(Instant::now());
+        trace.mark_executor_submitted();
+        trace.mark_job_admitted();
+        trace.mark_translate_done();
+        trace.mark_execute_done_after_await();
+        let phases = finish_cpu_phase(trace);
+        assert_eq!(phases.cpu.execute, None);
+        assert_eq!(
+            phases.cpu.format.is_some(),
+            cfg!(any(target_os = "linux", target_os = "macos"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cpu_phase_windows_slow_line_reports_unknown() {
+        let mut trace = PhaseTrace::new(Instant::now());
+        trace.mark_executor_submitted();
+        trace.mark_job_admitted();
+        trace.mark_translate_done();
+        let mut phases = finish_cpu_phase(trace);
+        phases.total = crate::logging::SLOW_TOOL_CALL_THRESHOLD + Duration::from_millis(1);
+        let _ = crate::logging::take_slow_tool_call_logs_for_test();
+        crate::logging::note_tool_call_trace(
+            "read",
+            "windows-cpu",
+            std::path::Path::new("/repo"),
+            1,
+            1,
+            phases,
+            crate::logging::ToolCallCaller::Agent,
+        );
+        let lines = crate::logging::take_slow_tool_call_logs_for_test();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        for phase in [
+            "queue",
+            "translate",
+            "exec",
+            "format",
+            "finalize",
+            "egress",
+            "egress_enqueue",
+            "egress_queue",
+            "egress_prepare",
+            "egress_write",
+        ] {
+            let field = lines[0]
+                .split_whitespace()
+                .find(|field| field.starts_with(&format!("{phase}=")))
+                .unwrap();
+            assert!(
+                field.ends_with("ms/cpu=?"),
+                "Windows CPU must be unknown: {field}"
+            );
+        }
+    }
+
     /// Run one agent `edit` call through `run_tool_call` with a phase trace,
     /// as the subc transport does, and return the slow-call line it would log.
     fn slow_edit_line(ctx: &AppContext, root: &std::path::Path, args: Value) -> String {
-        let format = crate::subc_format::FormatContext::from_tool_call("edit", &args, root);
+        slow_tool_line(
+            ctx,
+            root,
+            "edit",
+            args,
+            &|request, ctx| match request.command.as_str() {
+                "edit_match" => crate::commands::edit_match::handle_edit_match(&request, ctx),
+                "batch" => crate::commands::batch::handle_batch(&request, ctx),
+                other => panic!("unexpected dispatch of {other}"),
+            },
+        )
+    }
+
+    fn slow_tool_line(
+        ctx: &AppContext,
+        root: &std::path::Path,
+        name: &str,
+        args: Value,
+        dispatch: &DispatchFn<'_>,
+    ) -> String {
+        let format = crate::subc_format::FormatContext::from_tool_call(name, &args, root);
         let tool_ctx = ToolCallContext {
             project_root: root.to_path_buf(),
             session_id: Some("slow-shape".into()),
@@ -935,16 +1262,12 @@ mod tests {
         trace.mark_executor_submitted();
         trace.mark_job_admitted();
         let ToolCallOutcome::Unary(_) = run_tool_call(
-            "edit",
+            name,
             args,
             &format,
             &tool_ctx,
             ctx,
-            &|request, ctx| match request.command.as_str() {
-                "edit_match" => crate::commands::edit_match::handle_edit_match(&request, ctx),
-                "batch" => crate::commands::batch::handle_batch(&request, ctx),
-                other => panic!("unexpected dispatch of {other}"),
-            },
+            dispatch,
             Some(&|_response: &mut Response, _text: &mut String| {}),
             Some(&mut trace),
         );
@@ -960,12 +1283,13 @@ mod tests {
                 writer_active_at_enqueue: false,
                 writer_queue_was_full: false,
                 reserve_timeouts: 0,
+                prepare_cpu: None,
             })
             .expect("every phase was marked");
         phases.total = crate::logging::SLOW_TOOL_CALL_THRESHOLD + Duration::from_millis(1);
         let _ = crate::logging::take_slow_tool_call_logs_for_test();
         crate::logging::note_tool_call_trace(
-            "edit",
+            name,
             "slow-shape",
             std::path::Path::new("/repo"),
             1,
@@ -976,6 +1300,126 @@ mod tests {
         let mut lines = crate::logging::take_slow_tool_call_logs_for_test();
         assert_eq!(lines.len(), 1, "{lines:?}");
         lines.remove(0)
+    }
+
+    #[test]
+    fn slow_search_summary_rejects_content_bearing_plan_labels() {
+        for plan in [
+            serde_json::json!({"shape": "identifier SECRET_QUERY", "selected_lanes": ["exact"]}),
+            serde_json::json!({"shape": "identifier", "selected_lanes": ["exact", "SECRET_QUERY"]}),
+            serde_json::json!({"shape": "identifier", "selected_lanes": [7]}),
+        ] {
+            let response = Response::success(
+                "private",
+                serde_json::json!({
+                    "structuredContent": {"plan": plan},
+                }),
+            );
+            assert_eq!(
+                search_plan_summary(&response),
+                "shape=unavailable lanes=unavailable"
+            );
+        }
+        let response = Response::success(
+            "private",
+            serde_json::json!({
+                "structuredContent": {"plan": {
+                    "shape": "identifier", "selected_lanes": ["exact", "lexical", "semantic"],
+                    "lanes_run": ["lexical"], "exact_input": "SECRET_QUERY", "variants": ["SECRET_VARIANT"],
+                }},
+            }),
+        );
+        assert_eq!(
+            search_plan_summary(&response),
+            "shape=identifier lanes=exact,lexical,semantic"
+        );
+    }
+
+    #[test]
+    fn slow_search_line_carries_planner_shape_and_lanes_without_query_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        std::fs::write(root.join("private.rs"), "pub fn secret_needle() {}\n").unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                ..Default::default()
+            },
+        );
+        *ctx.search_index().write().unwrap() = Some(crate::search_index::SearchIndex::build(&root));
+        *ctx.semantic_index_status().write().unwrap() =
+            crate::context::SemanticIndexStatus::Disabled;
+        for (query, expected) in [
+            (
+                "secret_needle",
+                "shape=identifier lanes=exact,lexical,variants",
+            ),
+            ("private.rs", "shape=path lanes=path_lookup,exact,lexical"),
+        ] {
+            let line = slow_tool_line(
+                &ctx,
+                &root,
+                "search",
+                serde_json::json!({"query": query}),
+                &|request, ctx| {
+                    crate::commands::semantic_search::handle_semantic_search(&request, ctx)
+                },
+            );
+            assert!(line.contains(expected), "expected {expected:?}: {line}");
+            for private in ["secret_needle", "private.rs", "pub fn"] {
+                assert!(!line.contains(private), "{private:?} leaked into {line}");
+            }
+        }
+    }
+
+    /// A plain edit target is a file from its spelling, so a prepare never
+    /// spends a filesystem validation (canonicalising every ancestor, asking
+    /// the storage floor) on it; that validation belongs to the handler. The
+    /// call runs through `run_tool_call`, so this sees the probe the translator
+    /// is really handed, and a plain target records none.
+    #[test]
+    fn plain_edit_target_never_reaches_path_validation_during_prepare() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let file = root.join("plain-target.ts");
+        assert!(
+            !crate::commands::edit_match::is_glob_pattern(&file.display().to_string()),
+            "test path {file:?} has glob characters"
+        );
+        // Line-range items make this a multi-item batch, the one edit shape
+        // that consults the probe; their content defines the new file, so the
+        // prepare succeeds without the handler being able to find old text.
+        let items: Vec<Value> = (0..10)
+            .map(|index| {
+                json!({
+                    "startLine": index * 3 + 1,
+                    "endLine": index * 3 + 1,
+                    "content": format!("const value_{index} = 2;\n"),
+                })
+            })
+            .collect();
+        let _ = take_edit_target_probes_for_test();
+
+        let _ = slow_edit_line(
+            &AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                crate::config::Config {
+                    project_root: Some(root.clone()),
+                    ..Default::default()
+                },
+            ),
+            &root,
+            json!({ "path": file, "edits": items }),
+        );
+
+        let probes = take_edit_target_probes_for_test();
+        for probe in &probes {
+            assert!(
+                crate::commands::edit_match::is_glob_pattern(probe),
+                "a target without glob characters reached path validation: {probe}"
+            );
+        }
     }
 
     /// The slow-call line names what an edit was asked to do (target kind,
@@ -1040,6 +1484,24 @@ mod tests {
             assert!(applied.contains(phase), "missing {phase} in {applied}");
         }
         for line in [&failed, &applied] {
+            for phase in [
+                "queue",
+                "translate",
+                "exec",
+                "format",
+                "finalize",
+                "egress",
+                "egress_enqueue",
+                "egress_queue",
+                "egress_prepare",
+                "egress_write",
+            ] {
+                let field = line
+                    .split_whitespace()
+                    .find(|field| field.starts_with(&format!("{phase}=")))
+                    .unwrap();
+                assert!(field.contains("ms/cpu="), "missing wall/CPU pair: {field}");
+            }
             for secret in [missing, replacement, "SECRET", "private-name", "value = 1"] {
                 assert!(!line.contains(secret), "{secret:?} leaked into {line}");
             }
@@ -1130,13 +1592,16 @@ mod tests {
             launch_restore_wait: Duration::ZERO,
             executor_submitted: Some(t0 + Duration::from_millis(1)),
             job_admitted: Some(t0 + Duration::from_millis(3)),
+            setup_done: None,
             translate_done: Some(t0 + Duration::from_millis(6)),
             execute_done: Some(t0 + Duration::from_millis(10)),
             format_done: Some(t0 + Duration::from_millis(15)),
             finalize_done: Some(t0 + Duration::from_millis(21)),
+            cpu: PhaseCpuTrace::default(),
             waiting_on: WaitingOn::None,
             waiting_on_build_id: None,
             wait_ms: 0,
+            intentional_wait: false,
             arg_shape: None,
             edit_phases: None,
         };
@@ -1152,10 +1617,12 @@ mod tests {
                 writer_active_at_enqueue: true,
                 writer_queue_was_full: true,
                 reserve_timeouts: 2,
+                prepare_cpu: Some(Duration::from_micros(10)),
             })
             .unwrap();
 
         assert_eq!(phases.queue, Duration::from_millis(2));
+        assert_eq!(phases.setup, Duration::ZERO);
         assert_eq!(phases.translate, Duration::from_millis(3));
         assert_eq!(phases.execute, Duration::from_millis(4));
         assert_eq!(phases.format, Duration::from_millis(5));
@@ -1163,6 +1630,7 @@ mod tests {
         assert_eq!(phases.egress_enqueue, Duration::from_millis(7));
         assert_eq!(phases.egress_queue, Duration::from_millis(7));
         assert_eq!(phases.egress_prepare, Duration::from_millis(2));
+        assert_eq!(phases.cpu.egress_prepare, Some(Duration::from_micros(10)));
         assert_eq!(phases.egress_write, Duration::from_millis(11));
         assert_eq!(phases.egress, Duration::from_millis(27));
         assert_eq!(phases.frame_bytes, 262_144);
@@ -1171,6 +1639,28 @@ mod tests {
         assert!(phases.writer_queue_was_full);
         assert_eq!(phases.writer_reserve_timeouts, 2);
         assert_eq!(phases.total, Duration::from_millis(48));
+    }
+
+    /// Call-policy work between executor admission and argument translation
+    /// is its own `setup` phase. It used to be reported as `translate`, which
+    /// sent a slow worker policy build looking like slow argument translation.
+    #[test]
+    fn phase_trace_reports_call_policy_setup_apart_from_translation() {
+        let mut trace = PhaseTrace::new(Instant::now());
+        trace.mark_executor_submitted();
+        trace.mark_job_admitted();
+        std::thread::sleep(Duration::from_millis(30));
+        trace.mark_setup_done();
+        trace.mark_translate_done();
+        let phases = finish_cpu_phase(trace);
+        assert!(phases.setup >= Duration::from_millis(30), "{phases:?}");
+        assert!(phases.translate < Duration::from_millis(30), "{phases:?}");
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(
+            phases.cpu.setup.is_some() && phases.cpu.translate.is_some(),
+            "{:?}",
+            phases.cpu
+        );
     }
 
     #[test]
@@ -1199,6 +1689,7 @@ mod tests {
                 writer_active_at_enqueue: false,
                 writer_queue_was_full: false,
                 reserve_timeouts: 0,
+                prepare_cpu: None,
             })
         })
         .join()
@@ -1207,6 +1698,14 @@ mod tests {
         assert_eq!(phases.waiting_on, WaitingOn::Limiter);
         assert_eq!(phases.waiting_on_build_id.as_deref(), Some("b-1-1"));
         assert_eq!(phases.wait_ms, 42);
+        assert_eq!(
+            phases.cpu.translate.is_some(),
+            cfg!(any(target_os = "linux", target_os = "macos"))
+        );
+        assert_eq!(
+            phases.cpu.execute.is_some(),
+            cfg!(any(target_os = "linux", target_os = "macos"))
+        );
     }
 
     mod raw_request_construction {
@@ -1228,6 +1727,68 @@ mod tests {
                 disabled_tools: None,
                 worker_session: false,
                 host_tool_names: None,
+            }
+        }
+
+        #[test]
+        fn intentional_wait_is_classified_before_deferred_execution() {
+            let app = AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                crate::config::Config::default(),
+            );
+            let mut ctx = context(false);
+            ctx.standard_edit_grammar = true;
+            for (name, args, expected) in [
+                ("bash_watch", json!({"taskId": "task-test"}), true),
+                ("bash", json!({"command": "echo ready", "wait": true}), true),
+                (
+                    "bash",
+                    json!({"command": "echo ready", "wait": "true"}),
+                    true,
+                ),
+                (
+                    "bash",
+                    json!({"command": "echo ready", "block_to_completion": true}),
+                    true,
+                ),
+                (
+                    "powershell",
+                    json!({"command": "echo ready", "wait": true}),
+                    true,
+                ),
+                (
+                    "bash",
+                    json!({"command": "echo ready", "wait": false}),
+                    false,
+                ),
+                ("bash", json!({"command": "echo ready"}), false),
+                (
+                    "bash",
+                    json!({"command": "echo ready", "background": true}),
+                    false,
+                ),
+                ("bash_status", json!({"taskId": "task-test"}), false),
+                ("read", json!({"path": "example.rs", "wait": true}), false),
+            ] {
+                let mut trace = PhaseTrace::new(Instant::now());
+                trace.mark_executor_submitted();
+                trace.mark_job_admitted();
+                let prepared = prepare_tool_call(
+                    name,
+                    args,
+                    &crate::subc_format::FormatContext::default(),
+                    &ctx,
+                    &app,
+                    Some(&mut trace),
+                )
+                .unwrap_or_else(|result| panic!("{name}: {:?}", result.response));
+                assert_eq!(
+                    trace.intentional_wait, expected,
+                    "{name}: {:?}",
+                    prepared.request
+                );
+                let phases = finish_cpu_phase(trace);
+                assert_eq!(phases.intentional_wait, expected, "{name}");
             }
         }
 
@@ -1291,6 +1852,7 @@ mod tests {
                         writer_active_at_enqueue: false,
                         writer_queue_was_full: false,
                         reserve_timeouts: 0,
+                        prepare_cpu: None,
                     })
                     .is_some(),
                 "database refusal must retain timing telemetry"

@@ -378,6 +378,9 @@ fn configure(root: &Path, storage: &Path, doc: Value) -> Arc<AppContext> {
 }
 
 fn drain(ctx: &AppContext) {
+    // Match the runtime maintenance tick: a busy bind can defer identity
+    // resolution or view publication beyond configure's first drain.
+    aft::runtime_drain::drain_deferred_configure_maintenance(ctx);
     aft::runtime_drain::drain_watcher_events(ctx);
     aft::runtime_drain::drain_search_index_events(ctx);
     aft::runtime_drain::drain_semantic_index_events(ctx);
@@ -390,14 +393,12 @@ fn trigram_artifact(root: &Path, storage: &Path) -> PathBuf {
 }
 
 /// Waits until the child session's trigram index is ready and persisted.
-/// Each round also runs the configure-tail drain both runtimes run on their
-/// maintenance tick: a child whose bind met a busy aft.db settles its identity
-/// there once the database is free, and only then starts its index.
+/// The runtime drain also settles a bind whose identity was deferred by busy
+/// storage, so its index can start once the database is free.
 fn wait_trigram(ctx: &AppContext, root: &Path, storage: &Path) {
     let deadline = Instant::now() + DEADLINE;
     loop {
         drain(ctx);
-        aft::runtime_drain::drain_deferred_configure_maintenance(ctx);
         let ready = ctx
             .search_index()
             .read()
@@ -409,43 +410,114 @@ fn wait_trigram(ctx: &AppContext, root: &Path, storage: &Path) {
         }
         assert!(
             Instant::now() < deadline,
-            "child trigram index never persisted: {}; enabled={}; key={:?}; degraded={:?}",
+            "child trigram index never persisted: {}; enabled={}; key={:?}; degraded={:?}; cache_unavailable={:?}",
             root.display(),
             ctx.config().indexes.trigram,
             ctx.cached_artifact_cache_key(root),
             ctx.degraded_reasons(),
+            ctx.cache_unavailable_reason(),
         );
         thread::sleep(Duration::from_millis(20));
     }
 }
 
-fn callgraph_view(root: &Path, storage: &Path) -> aft::views::ViewStore {
-    aft::views::ViewStore::open(storage, &aft::path_identity::project_scope_key(root)).unwrap()
+#[test]
+fn runtime_drains_retry_child_trigram_after_busy_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(temp.path()).unwrap();
+    let root = base.join("alpha");
+    let storage = base.join("storage");
+    init_repo(
+        &root,
+        &[("src/lib.rs", "pub fn retry_marker() {}\n".into())],
+    );
+    std::fs::create_dir_all(&storage).unwrap();
+    let lock = rusqlite::Connection::open(storage.join("aft.db")).unwrap();
+    // Rollback-journal mode blocks identity readers as well as writers.
+    lock.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+        .unwrap();
+    let ctx = configure(&root, &storage, child_trigram_doc());
+    assert!(ctx
+        .degraded_reasons()
+        .iter()
+        .any(|reason| reason.contains("aft.db was busy at bind")));
+    assert!(ctx.cached_artifact_cache_key(&root).is_none());
+    assert!(!ctx.config().indexes.trigram);
+    lock.execute_batch("ROLLBACK").unwrap();
+    drop(lock);
+
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        drain(&ctx);
+        if ctx
+            .search_index()
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|index| index.ready)
+            && trigram_artifact(&root, &storage).is_file()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "runtime drains never retried the child's busy identity: {:?}",
+            ctx.degraded_reasons()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!ctx
+        .degraded_reasons()
+        .iter()
+        .any(|reason| reason.contains("aft.db was busy at bind")));
+    assert!(ctx.config().indexes.trigram);
+    assert!(ctx.cached_artifact_cache_key(&root).is_some());
 }
 
-/// Waits until the child's content-addressed view publishes a generation
-/// other than `previous`.
-fn wait_callgraph_view(
-    ctx: &AppContext,
-    root: &Path,
-    storage: &Path,
-    previous: Option<&str>,
-) -> String {
+/// Asks the child session for its call graph until it answers. The first
+/// answer binds the child's v3 call-graph view and publishes it; a later one
+/// publishes the edits made since.
+fn child_callgraph_answer(ctx: &AppContext, root: &Path) -> Value {
     let deadline = Instant::now() + DEADLINE;
     loop {
         drain(ctx);
-        aft::runtime_drain::drain_deferred_configure_maintenance(ctx);
-        if let Some(generation) = callgraph_view(root, storage).current_generation().unwrap() {
+        let answer = aft::commands::callers::handle_callers(
+            &request(json!({
+                "id": "child-callers",
+                "command": "callers",
+                "file": root.join("src/lib.rs"),
+                "symbol": "target",
+            })),
+            ctx,
+        );
+        if answer.success {
+            return data(answer);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child call graph view never answered: {}: {:?}",
+            root.display(),
+            answer.data
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Waits until the parent serves a call-graph generation of `child` other
+/// than `previous`, and returns it.
+fn wait_parent_callgraph(child: &aft::views::parent::Child, previous: Option<&str>) -> String {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        if let Some(generation) = child.callgraph_generation() {
             if Some(generation.as_str()) != previous {
                 return generation;
             }
         }
         assert!(
             Instant::now() < deadline,
-            "child call graph view never published: {}",
-            root.display()
+            "the parent never served the child's call graph view"
         );
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -818,6 +890,77 @@ fn parent_backstop_applies_child_edits_and_never_writes_child_artifacts() {
     assert_eq!(session.children()[0].applied_paths(), 0);
 }
 
+/// A child whose sessions run with views on publishes its lexical index only
+/// as its v3 lexical view. The parent reads that publication: grep and glob
+/// answer from it, and an edit the child has not published is not claimed by
+/// the parent, which applies no file changes of its own on top.
+#[test]
+fn parent_grep_and_glob_read_views_on_children_from_their_v3_lexical_view() {
+    fast_refresh();
+    let folder = folder(2);
+    std::fs::remove_file(folder.root.join("README.md")).unwrap();
+    let mut expected_grep = BTreeSet::new();
+    let mut children = Vec::new();
+    for (index, child) in folder.children.iter().enumerate() {
+        // The child's bind publishes its v3 lexical view.
+        let ctx = configure(child, &folder.storage, config_doc(true, TRIGRAM_ONLY, None));
+        assert!(!trigram_artifact(child, &folder.storage).exists());
+        let prefix = format!("repo-{index:02}");
+        expected_grep.insert((format!("{prefix}/src/lib.rs"), 5));
+        expected_grep.insert((format!("{prefix}/src/util.rs"), 2));
+        children.push(ctx);
+    }
+
+    let parent = configure(
+        &folder.root,
+        &folder.storage,
+        config_doc(true, TRIGRAM_ONLY, None),
+    );
+    let session = parent_session(&parent);
+    assert!(session.children().iter().all(|child| child.trigram_ready()));
+    let answer = grep(&parent, COMMON);
+    assert_eq!(
+        grep_rows(&answer, &folder.root, Path::new("")),
+        expected_grep,
+        "{answer:#}"
+    );
+    assert_eq!(answer["complete"], true, "{answer:#}");
+    assert!(session.view_route_counts()[1] >= 1);
+    let globbed = glob(&parent, "**/*.rs");
+    assert_eq!(
+        globbed["files"].as_array().map(Vec::len),
+        Some(4),
+        "{globbed:#}"
+    );
+    let routed = session.view_route_counts()[1];
+    assert!(routed >= 2, "{routed}");
+
+    // An edit no child session has published: the parent answers as of the
+    // child's publication rather than reading the file itself.
+    write(
+        &folder.children[1],
+        "src/fresh.rs",
+        "pub fn fresh() {}\n// UNPUBLISHED_PARENT_EDIT_NEEDLE\n",
+    );
+    let rounds = session.rounds();
+    assert!(session.wait_rounds(rounds + 2, DEADLINE));
+    let unpublished = grep(&parent, "UNPUBLISHED_PARENT_EDIT_NEEDLE");
+    assert_eq!(
+        grep_rows(&unpublished, &folder.root, Path::new("")),
+        BTreeSet::new(),
+        "{unpublished:#}"
+    );
+    for child in session.children() {
+        assert_eq!(child.loads(), 1, "an unchanged publication is not reloaded");
+        assert_eq!(
+            child.applied_paths(),
+            0,
+            "the parent applied an edit itself"
+        );
+    }
+    drop(children);
+}
+
 /// The parent's own file watcher carries a child's edit to the parent within
 /// seconds, while the backstop stays at its multi-minute default: changes are
 /// event-driven, routed to the child that owns the path.
@@ -900,12 +1043,12 @@ fn parent_watcher_routes_child_edits_to_the_owning_child() {
     assert!(aft.shutdown().success());
 }
 
-/// The call graph is served from a child's view while the child's SQLite
-/// journal files exist, paths carry the child prefix, a child without a view
-/// and a file outside every child are named gaps, and the generation the
-/// parent serves survives the child's generation sweep.
+/// The call graph is served from a child's published v3 view: answers carry
+/// the child prefix and say which publication they are as of, a child without
+/// a view and a file outside every child are named gaps, and the generation
+/// the parent serves stays readable after the child publishes a newer one.
 #[test]
-fn parent_callgraph_reads_child_views_and_protects_served_generation() {
+fn parent_callgraph_reads_child_v3_views_and_answers_as_of_their_publication() {
     fast_refresh();
     let temp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(temp.path()).unwrap();
@@ -928,41 +1071,9 @@ fn parent_callgraph_reads_child_views_and_protects_served_generation() {
         callgraph: true,
         semantic: false,
     };
-    // The child session stays alive, so its view databases keep their
-    // `-wal`/`-shm` journal files while the parent reads them.
-    let child = configure(&graph, &storage, config_doc(true, with_graph, None));
-    let first = wait_callgraph_view(&child, &graph, &storage, None);
     // `plain` is never bound to a session, so it has no view at all.
-    let view_dir = callgraph_view(&graph, &storage).view_dir().to_path_buf();
-    // Hold the derived database open in WAL mode, as a live child process
-    // does: SQLite then keeps its `-wal` and `-shm` journal files beside it.
-    let derived = std::fs::read_dir(&view_dir)
-        .unwrap()
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("derived") && name.ends_with(".sqlite"))
-        })
-        .expect("published view has a derived database");
-    let holder = rusqlite::Connection::open(&derived).unwrap();
-    let mode: String = holder
-        .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(mode, "wal");
-    let _: i64 = holder
-        .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
-        .unwrap();
-    let journals = std::fs::read_dir(&view_dir)
-        .unwrap()
-        .flatten()
-        .filter(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            name.ends_with("-wal") || name.ends_with("-shm")
-        })
-        .count();
-    assert!(journals > 0, "fixture must leave SQLite journal files");
+    let child = configure(&graph, &storage, config_doc(true, with_graph, None));
+    child_callgraph_answer(&child, &graph);
 
     let parent = configure(&root, &storage, config_doc(true, with_graph, None));
     let session = parent_session(&parent);
@@ -972,14 +1083,8 @@ fn parent_callgraph_reads_child_views_and_protects_served_generation() {
         .find(|child| child.root == graph)
         .unwrap()
         .clone();
-    assert!(
-        graph_child.callgraph_ready(),
-        "journal files must not lock the parent out"
-    );
-    assert_eq!(
-        graph_child.callgraph_generation().as_deref(),
-        Some(first.as_str())
-    );
+    let first = wait_parent_callgraph(&graph_child, None);
+    assert_eq!(session.view_route_counts()[0], 0);
 
     let callers = data(
         aft::views::parent::route(
@@ -996,6 +1101,16 @@ fn parent_callgraph_reads_child_views_and_protects_served_generation() {
     let text = callers.to_string();
     assert!(text.contains("graph/src/lib.rs"), "{callers:#}");
     assert!(text.contains("caller"), "{callers:#}");
+    // A foreign reader names the publication it answers as of; it never
+    // claims the child's graph is current.
+    assert_eq!(callers["as_of"]["child"], "graph", "{callers:#}");
+    assert_eq!(
+        callers["as_of"]["generation"],
+        first.as_str(),
+        "{callers:#}"
+    );
+    assert!(callers["as_of"]["published_at_ms"].is_u64(), "{callers:#}");
+    assert_eq!(session.view_route_counts()[0], 1);
 
     let missing = aft::views::parent::route(
         &request(json!({
@@ -1086,45 +1201,59 @@ fn parent_callgraph_reads_child_views_and_protects_served_generation() {
     assert_eq!(off.data["summary"]["todos"]["off"], true);
     assert_eq!(parent.inspect_manager().reuse_start_count_for_test(), 0);
 
-    // Hold the served generation, let the child publish a new one, and sweep
-    // the child's view: the parent's read marker keeps the old generation.
+    // Hold the served generation while the child publishes an edit: the
+    // parent keeps answering from the generation it holds a marker on, as
+    // of that publication, and follows the child once released.
     session.pause_refresh(true);
-    drop(holder);
-    drop(child);
-    write(
-        &graph,
-        "src/lib.rs",
-        "pub fn target() -> u32 {\n    2\n}\n\npub fn caller() -> u32 {\n    target()\n}\n",
+    // An AFT write through the child's session, which its view records.
+    let written = aft::commands::write::handle_write(
+        &request(json!({
+            "id": "child-write",
+            "command": "write",
+            "file": graph.join("src/lib.rs"),
+            "content": "pub fn target() -> u32 {\n    2\n}\n\npub fn caller() -> u32 {\n    target()\n}\n\npub fn second() -> u32 {\n    target()\n}\n",
+        })),
+        &child,
     );
-    commit_all(&graph, "second");
-    let child = configure(&graph, &storage, config_doc(true, with_graph, None));
-    let second = wait_callgraph_view(&child, &graph, &storage, Some(&first));
-    let manifest = view_dir.join(format!("manifest-{first}.json"));
-    // The child's own maintenance sweeps its view after publishing; the
-    // generation the parent serves must survive that sweep and an explicit one.
-    assert!(
-        manifest.is_file(),
-        "the child's post-publication sweep removed a generation the parent serves"
+    assert!(written.success, "{:?}", written.data);
+    let edited = child_callgraph_answer(&child, &graph);
+    assert!(edited.to_string().contains("second"), "{edited:#}");
+    let held = data(
+        aft::views::parent::route(
+            &request(json!({
+                "id": "parent-callers-held",
+                "command": "callers",
+                "file": "graph/src/lib.rs",
+                "symbol": "target",
+            })),
+            &parent,
+        )
+        .unwrap(),
     );
-    callgraph_view(&graph, &storage)
-        .sweep_generations()
-        .unwrap();
-    assert!(
-        manifest.is_file(),
-        "a generation the parent serves must survive the child's sweep"
-    );
-    // Control: once the parent follows the child, the old generation is no
-    // longer protected and the same sweep collects it.
+    assert_eq!(held["as_of"]["generation"], first.as_str(), "{held:#}");
+    assert!(!held.to_string().contains("second"), "{held:#}");
     session.pause_refresh(false);
-    let deadline = Instant::now() + DEADLINE;
-    while graph_child.callgraph_generation().as_deref() != Some(second.as_str()) {
-        assert!(Instant::now() < deadline, "parent never followed the child");
-        thread::sleep(Duration::from_millis(20));
-    }
-    callgraph_view(&graph, &storage)
-        .sweep_generations()
-        .unwrap();
-    assert!(!manifest.exists(), "an unprotected old generation is swept");
+    let second = wait_parent_callgraph(&graph_child, Some(&first));
+    let followed = data(
+        aft::views::parent::route(
+            &request(json!({
+                "id": "parent-callers-followed",
+                "command": "callers",
+                "file": "graph/src/lib.rs",
+                "symbol": "target",
+            })),
+            &parent,
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        followed["as_of"]["generation"],
+        second.as_str(),
+        "{followed:#}"
+    );
+    assert!(followed.to_string().contains("second"), "{followed:#}");
+    // The parent built and wrote no call graph of its own.
+    assert!(parent.callgraph_store().read().unwrap().is_none());
     drop(child);
 }
 
@@ -1558,73 +1687,6 @@ fn slow_discovery_never_delays_the_bind() {
     );
 }
 
-/// The standalone (stdin/stdout) runtime keeps answering requests while the
-/// first views-on publication of a checkout runs: the publication detaches
-/// from the request thread, as it does under the daemon, and still commits
-/// while requests keep arriving. Before, a large checkout's first publication
-/// ran inline on the request thread and every request waited minutes.
-#[test]
-fn standalone_view_publication_never_blocks_requests() {
-    let temp = tempfile::tempdir().unwrap();
-    let base = std::fs::canonicalize(temp.path()).unwrap();
-    let root = base.join("repo");
-    let storage = base.join("storage");
-    init_repo(&root, &child_files(0));
-    let delay = Duration::from_secs(20);
-    let delay_ms = delay.as_millis().to_string();
-    let mut aft = crate::helpers::AftProcess::spawn_with_env(&[(
-        "AFT_TEST_VIEW_PUBLICATION_DELAY_MS",
-        std::ffi::OsStr::new(&delay_ms),
-    )]);
-    let configured = aft.send(
-        &json!({
-            "id": "cfg",
-            "command": "configure",
-            "harness": "opencode",
-            "project_root": root,
-            "storage_dir": storage,
-            "config": crate::helpers::user_config(config_doc(true, TRIGRAM_ONLY, None)),
-        })
-        .to_string(),
-    );
-    assert_eq!(configured["success"], true, "{configured:#}");
-    let started = Instant::now();
-    let grep_request = json!({"id": "grep", "command": "grep", "pattern": COMMON}).to_string();
-    let mut slowest = Duration::ZERO;
-    // Requests during the publication: each must be answered promptly.
-    while started.elapsed() < Duration::from_secs(6) {
-        let sent = Instant::now();
-        let answer = aft.send_with_timeout(&grep_request, delay / 2);
-        slowest = slowest.max(sent.elapsed());
-        assert_eq!(answer["success"], true, "{answer:#}");
-        thread::sleep(Duration::from_millis(100));
-    }
-    eprintln!(
-        "standalone requests during a {} s view publication: slowest {} ms",
-        delay.as_secs(),
-        slowest.as_millis()
-    );
-    assert!(
-        slowest < Duration::from_secs(5),
-        "a request waited {} ms for the view publication",
-        slowest.as_millis()
-    );
-    // The detached publication still commits while requests keep arriving.
-    let view = aft::views::ViewStore::open(&storage, &aft::path_identity::project_scope_key(&root))
-        .unwrap();
-    let deadline = Instant::now() + delay + DEADLINE;
-    while view.current_generation().unwrap().is_none() {
-        assert!(
-            Instant::now() < deadline,
-            "the view publication never committed"
-        );
-        let answer = aft.send(&grep_request);
-        assert_eq!(answer["success"], true, "{answer:#}");
-        thread::sleep(Duration::from_millis(200));
-    }
-    assert!(aft.shutdown().success());
-}
-
 /// Pi uses this stdin/stdout loop, not a daemon actor. Opening the view's
 /// stores and reading its manifest is startup work too, even when publication
 /// and the semantic worker are already detached.
@@ -1805,243 +1867,6 @@ fn standalone_semantic_grace_and_load_never_block_requests() {
     assert!(aft.shutdown().success());
 }
 
-/// A view generation published with the call graph off holds no call graph.
-/// Every reader of a view's call graph reports it unavailable, by name, never
-/// as zero callers: here the call graph tools (and zoom's call graph field)
-/// in a standalone process whose current generation was published with the
-/// call graph off, while the republish that builds the graph is still
-/// running. Once that republish lands, the same query answers.
-#[test]
-fn callgraph_ops_report_a_keyless_view_generation_as_disabled() {
-    let temp = tempfile::tempdir().unwrap();
-    let base = std::fs::canonicalize(temp.path()).unwrap();
-    let root = base.join("repo");
-    let storage = base.join("storage");
-    init_repo(
-        &root,
-        &[(
-            "src/lib.rs",
-            "pub fn target() -> u32 {\n    1\n}\n\npub fn caller() -> u32 {\n    target()\n}\n"
-                .to_string(),
-        )],
-    );
-    publish_without_callgraph(&root, &storage);
-    // The republish with the call graph waits until this file exists, so the
-    // generation without call graph data stays current for as long as the
-    // checks below take, however slow the machine.
-    let publication_gate = base.join("publication.release");
-    let mut aft = crate::helpers::AftProcess::spawn_with_env(&[(
-        "AFT_TEST_VIEW_PUBLICATION_GATE_FILE",
-        publication_gate.as_os_str(),
-    )]);
-    let with_graph = Planes {
-        trigram: true,
-        callgraph: true,
-        semantic: false,
-    };
-    let configured = aft.send(
-        &json!({
-            "id": "cfg",
-            "command": "configure",
-            "harness": "opencode",
-            "project_root": root,
-            "storage_dir": storage,
-            "config": crate::helpers::user_config(config_doc(true, with_graph, None)),
-        })
-        .to_string(),
-    );
-    assert_eq!(configured["success"], true, "{configured:#}");
-    let callers = json!({
-        "id": "callers",
-        "command": "callers",
-        "file": root.join("src/lib.rs"),
-        "symbol": "target",
-    })
-    .to_string();
-    // Configure finishes its view setup in background steps, one after each
-    // request. Until it has loaded the current generation (the one without
-    // call graph data), callers answers `callgraph_building`; keep sending
-    // requests until it answers anything else. The held publication means
-    // that answer comes from the generation without call graph data.
-    let deadline = Instant::now() + DEADLINE;
-    let answer = loop {
-        aft.send(&json!({"id": "ping", "command": "ping"}).to_string());
-        let answer = aft.send(&callers);
-        if answer["code"] != "callgraph_building" {
-            break answer;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "configure never loaded the generation without call graph data; last answer: {answer:#}"
-        );
-        thread::sleep(Duration::from_millis(20));
-    };
-    assert!(
-        !current_generation_has_callgraph(&root, &storage),
-        "the generation without call graph data is no longer current"
-    );
-    assert_eq!(answer["success"], false, "{answer:#}");
-    assert_eq!(answer["code"], "callgraph_unavailable", "{answer:#}");
-    assert!(
-        answer["message"]
-            .as_str()
-            .unwrap()
-            .contains("call graph is disabled (indexes.callgraph=false)"),
-        "{answer:#}"
-    );
-    let zoom = aft.send(
-        &json!({
-            "id": "zoom",
-            "command": "zoom",
-            "file": root.join("src/lib.rs"),
-            "symbol": "target",
-            "callgraph": true,
-        })
-        .to_string(),
-    );
-    // Zoom's own call lists come from the file's syntax tree; its call graph
-    // field must say the index is not serving, not present an empty graph.
-    assert_eq!(zoom["callgraph"]["status"], "unavailable", "{zoom:#}");
-    assert!(
-        zoom["callgraph"]["index"]["reason"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("call graph is disabled (indexes.callgraph=false)"),
-        "{zoom:#}"
-    );
-    // Let the republish with call graph data run.
-    std::fs::write(&publication_gate, b"release").unwrap();
-    // Once the republish with call graph data lands, callers answers. Right
-    // after that publication its derived database is checkpointed, and a
-    // reader that meets the checkpoint gets a retryable `callgraph_building`.
-    // That answer is acceptable only once the published generation carries a
-    // call graph: the pointer is read before each request, so "building"
-    // while the generation without call graph data is still current fails.
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        let keyed_generation_published = current_generation_has_callgraph(&root, &storage);
-        let answer = aft.send(&callers);
-        if answer["success"] == true {
-            assert!(answer.to_string().contains("caller"), "{answer:#}");
-            break;
-        }
-        if !(keyed_generation_published && answer["code"] == "callgraph_building") {
-            assert_eq!(answer["code"], "callgraph_unavailable", "{answer:#}");
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the call graph was never published"
-        );
-        thread::sleep(Duration::from_millis(250));
-    }
-    // Zoom reads the store the same way `callers` does and can meet the same
-    // post-publication checkpoint, which it reports as a retryable
-    // `callgraph_building`. Retry only on that answer; any other verdict, and
-    // above all `callgraph_unavailable`, for the published graph fails.
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        let zoom = aft.send(
-            &json!({
-                "id": "zoom-ready",
-                "command": "zoom",
-                "file": root.join("src/lib.rs"),
-                "symbol": "target",
-                "callgraph": true,
-            })
-            .to_string(),
-        );
-        assert_eq!(zoom["success"], true, "{zoom:#}");
-        if zoom["callgraph"].is_null() {
-            break;
-        }
-        assert_eq!(zoom["callgraph"]["code"], "callgraph_building", "{zoom:#}");
-        assert!(
-            Instant::now() < deadline,
-            "zoom never read the published call graph: {zoom:#}"
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
-    assert!(aft.shutdown().success());
-}
-
-/// Whether `root`'s current published view generation carries call graph
-/// data. False while no generation is published or its manifest cannot be
-/// read (a superseded generation may be collected between the two reads).
-fn current_generation_has_callgraph(root: &Path, storage: &Path) -> bool {
-    let view =
-        aft::views::ViewStore::open(storage, &aft::path_identity::project_scope_key(root)).unwrap();
-    let Some(generation) = view.current_generation_read_only().unwrap() else {
-        return false;
-    };
-    view.load_manifest(&generation)
-        .is_ok_and(|manifest| !aft::views::assembly::manifest_lacks_callgraph(&manifest))
-}
-
-/// Publishes `root`'s current view generation with the call graph off, as a
-/// views-on session with `callgraph_store: false` does.
-fn publish_without_callgraph(root: &Path, storage: &Path) {
-    let head = aft::alias::head_tree_entries(root).unwrap();
-    let report = aft::views::assembly::publish_checkout(&aft::views::assembly::AssemblyRequest {
-        storage: storage.to_path_buf(),
-        project_root: root.to_path_buf(),
-        family: aft::search_index::artifact_cache_key(root),
-        scope: aft::path_identity::project_scope_key(root),
-        desired_head: aft::views::assembly::head_tree_fingerprint(&head),
-        changed_paths: Default::default(),
-        semantic_keys: Default::default(),
-        require_semantic: false,
-        allow_blob_put: true,
-        callgraph: false,
-    })
-    .unwrap();
-    assert!(report.published);
-    assert!(aft::views::assembly::manifest_lacks_callgraph(
-        report.manifest.as_ref().unwrap()
-    ));
-}
-
-/// A parent folder names a child whose view was published with the call
-/// graph off as unavailable for the call graph, never as having no callers.
-#[test]
-fn parent_names_a_child_view_without_callgraph_as_disabled() {
-    fast_refresh();
-    let temp = tempfile::tempdir().unwrap();
-    let base = std::fs::canonicalize(temp.path()).unwrap();
-    let root = base.join("projects");
-    let storage = base.join("storage");
-    let child = root.join("child");
-    init_repo(&child, &[("src/lib.rs", "pub fn alone() {}\n".to_string())]);
-    publish_without_callgraph(&child, &storage);
-    let with_graph = Planes {
-        trigram: true,
-        callgraph: true,
-        semantic: false,
-    };
-    let parent = configure(&root, &storage, config_doc(true, with_graph, None));
-    parent_session(&parent);
-    let answer = aft::views::parent::route(
-        &request(json!({
-            "id": "parent-callers",
-            "command": "callers",
-            "file": "child/src/lib.rs",
-            "symbol": "alone",
-        })),
-        &parent,
-    )
-    .unwrap();
-    assert!(!answer.success, "{:#}", answer.data);
-    assert_eq!(answer.data["complete"], false);
-    assert_eq!(answer.data["gaps"][0]["path"], "child");
-    assert!(
-        answer.data["gaps"][0]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("call graph is disabled (indexes.callgraph=false)"),
-        "{:#}",
-        answer.data
-    );
-}
-
 /// Views stay off by default; with views off a parent folder keeps today's
 /// behaviour and no parent session starts.
 #[test]
@@ -2062,9 +1887,9 @@ fn views_off_folder_is_not_a_parent_session() {
 }
 
 /// A real process restart: a new `aft` process bound to the parent folder
-/// serves the child from the index the child's own session persisted,
-/// without the child ever being bound in the new process, and without
-/// writing the child's artifact.
+/// serves the child from the v3 lexical view the child's own session
+/// published, without the child ever being bound in the new process. Neither
+/// process writes a legacy trigram artifact for the child.
 #[test]
 fn parent_folder_survives_a_real_process_restart() {
     let temp = tempfile::tempdir().unwrap();
@@ -2119,12 +1944,10 @@ fn parent_folder_survives_a_real_process_restart() {
     let configured = first.send(&configure_request(&child));
     assert_eq!(configured["success"], true, "{configured:#}");
     let artifact = trigram_artifact(&child, &storage);
-    let deadline = Instant::now() + DEADLINE;
-    while !artifact.is_file() {
-        assert!(Instant::now() < deadline, "child index never persisted");
-        first.send(&grep_request);
-        thread::sleep(Duration::from_millis(100));
-    }
+    // The child's own grep answers from its lexical view, which the child's
+    // bind published.
+    let child_answer = wait_for_match(&mut first);
+    assert_eq!(child_answer["complete"], true, "{child_answer:#}");
     let configured = first.send(&configure_request(&root));
     assert_eq!(configured["success"], true, "{configured:#}");
     let answer = wait_for_match(&mut first);
@@ -2135,7 +1958,6 @@ fn parent_folder_survives_a_real_process_restart() {
         .replace('\\', "/");
     assert!(file.ends_with("src/lib.rs"), "{answer:#}");
     assert!(first.shutdown().success());
-    let before = std::fs::read(&artifact).unwrap();
 
     let mut second = crate::helpers::AftProcess::spawn();
     let configured = second.send(&configure_request(&root));
@@ -2143,5 +1965,5 @@ fn parent_folder_survives_a_real_process_restart() {
     let answer = wait_for_match(&mut second);
     assert_eq!(answer["complete"], true, "{answer:#}");
     assert!(second.shutdown().success());
-    assert_eq!(std::fs::read(&artifact).unwrap(), before);
+    assert!(!artifact.exists());
 }

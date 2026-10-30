@@ -13,6 +13,25 @@ pub mod search;
 pub mod trace_data;
 pub mod trace_to;
 
+pub fn ast_search_envelope(
+    shown: usize,
+    total: usize,
+    skipped: bool,
+) -> crate::list_envelope::ListEnvelope {
+    use crate::list_envelope::{ListEnvelope, Total};
+    ListEnvelope::new(
+        shown,
+        if skipped {
+            Total::AtLeast(total)
+        } else {
+            Total::Exact(total)
+        },
+        Unit::Results,
+        vec![Reason::Budget],
+        &["paths", "globs", "pattern"],
+    )
+}
+
 /// Classification of a reason: whether the traversal stopped (`Bounding`)
 /// or a selector chose which of an enumerated set to retain (`Selecting`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -35,6 +54,8 @@ pub struct SurfaceEntry {
     pub command: &'static str,
     pub mode: &'static str,
     pub list_id: &'static str,
+    /// A negotiated route capability required for this surface to exist.
+    pub requires: Option<&'static str>,
     pub unit: Unit,
     pub narrow: &'static [&'static str],
     pub reasons: &'static [ReasonEntry],
@@ -43,6 +64,7 @@ pub struct SurfaceEntry {
 /// Authoritative registry of every list-shaped surface in AFT.
 pub static LIST_SURFACES: &[SurfaceEntry] = &[
     SurfaceEntry {
+        requires: None,
         command: "callgraph",
         mode: "impact",
         list_id: "payload.sites",
@@ -62,6 +84,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         ],
     },
     SurfaceEntry {
+        requires: None,
         command: "callgraph",
         mode: "callers",
         list_id: "payload.callers",
@@ -81,6 +104,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         ],
     },
     SurfaceEntry {
+        requires: None,
         command: "callgraph",
         mode: "call_tree",
         list_id: "payload.tree",
@@ -104,6 +128,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
     // (`path: Option<Vec<...>>`), rather than a `paths` list. Truncation envelopes apply
     // only to multi-path lists (`trace_to`).
     SurfaceEntry {
+        requires: None,
         command: "callgraph",
         mode: "trace_to",
         list_id: "payload.paths",
@@ -128,6 +153,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         ],
     },
     SurfaceEntry {
+        requires: None,
         command: "callgraph",
         mode: "trace_data",
         list_id: "payload.hops",
@@ -140,6 +166,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         }],
     },
     SurfaceEntry {
+        requires: None,
         command: "search",
         mode: "",
         list_id: "payload.results",
@@ -169,11 +196,12 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Cap,
                 kind: ReasonKind::Selecting,
-                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S1MoreAtDepth, StopState::S2Exhausted, more_available, handle_external_semantic_or_hybrid_search, handle_external_grep_search, handle_semantic_or_hybrid_search, handle_grep_search, from_matches, run_engine_ranking, blast_radius_annotation_for_result, enrich_snippets_from_source_reference, enrich_snippets_from_source_with_context, truncate_chars, split_semantic_results, handle_split_search, rank_hits",
+                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S1MoreAtDepth, StopState::S2Exhausted, more_available, handle_external_semantic_or_hybrid_search, handle_external_grep_search, handle_semantic_or_hybrid_search, handle_grep_search, from_matches, run_engine_ranking, blast_radius_annotation_for_result, enrich_snippets_from_source_reference, enrich_snippets_from_source_with_context, read_bounded_snippet_line, truncate_chars, split_semantic_results, handle_split_search, reply",
             },
         ],
     },
     SurfaceEntry {
+        requires: None,
         command: "grep",
         mode: "",
         list_id: "payload.matches",
@@ -203,6 +231,20 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         ],
     },
     SurfaceEntry {
+        requires: Some(crate::subc::result_body::RESULT_FORMAT),
+        command: "ast_search",
+        mode: "matches",
+        list_id: "payload.matches",
+        unit: Unit::Results,
+        narrow: &["paths", "globs", "pattern"],
+        reasons: &[ReasonEntry {
+            reason: Reason::Budget,
+            kind: ReasonKind::Selecting,
+            predicate_name: "MatchBudget",
+        }],
+    },
+    SurfaceEntry {
+        requires: None,
         command: "glob",
         mode: "",
         list_id: "payload.files",
@@ -227,6 +269,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         ],
     },
     SurfaceEntry {
+        requires: None,
         command: "outline",
         mode: "files",
         list_id: "payload.files",
@@ -251,6 +294,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         ],
     },
     SurfaceEntry {
+        requires: None,
         command: "read",
         mode: "directory",
         list_id: "payload.entries",
@@ -270,6 +314,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         ],
     },
     SurfaceEntry {
+        requires: None,
         command: "inspect",
         mode: "",
         list_id: "payload.details",
@@ -282,6 +327,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         }],
     },
     SurfaceEntry {
+        requires: None,
         command: "bash",
         mode: "",
         list_id: "bash.output",
@@ -293,6 +339,8 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             predicate_name: "cap_lines, compress_json, finish, middle_truncate, append_hunk, cap_git_lines, compress_add, compress_blame, compress_diff, flush_status_entries, looks_like_golangci_json, finish_folded, first_error_lines, truncate_line, parse_tree, compress_tsc, frozen_compress_tsc, compressor_line_dropping, render_cut, cap_lines_head_tail, cap_text_head_tail, apply_plain_cap_streaming, test_verdict, cap_test_verdict",
         }],
     },
+    SurfaceEntry { requires: None, command: "bash", mode: "changed_files", list_id: "bash.changed_files", unit: Unit::Files, narrow: &[], reasons: &[ReasonEntry { reason: Reason::Cap, kind: ReasonKind::Selecting, predicate_name: "render" }, ReasonEntry { reason: Reason::TimeLimit, kind: ReasonKind::Bounding, predicate_name: "render" }] },
+    SurfaceEntry { requires: None, command: "bash", mode: "diff_lines", list_id: "bash.diff_lines", unit: Unit::Lines, narrow: &[], reasons: &[ReasonEntry { reason: Reason::Cap, kind: ReasonKind::Selecting, predicate_name: "diff_file" }] },
 ];
 
 /// An entry in the discovery exclusions table with written justification.
@@ -308,15 +356,45 @@ pub struct ExclusionEntry {
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
         file: "semantic_index.rs",
-        enclosing_item: "refused_rows_summary",
+        enclosing_item: "format_skipped_chunks_summary",
         location_or_primitive: ".take(5)",
-        reason: "Diagnostic preview of refused-input paths; skipped rows and omitted file counts are disclosed alongside the first five paths.",
+        reason: "Diagnostic preview of refused-input paths; skipped chunks and omitted file counts are disclosed alongside the first five paths.",
+    },
+    ExclusionEntry {
+        file: "bash_background/remote.rs",
+        enclosing_item: "admission_progress_detail",
+        location_or_primitive: "MAX_DETAIL_CHARS character preview",
+        reason: "pre-acceptance progress detail is one display string, not a result list; its redacted text is ellipsized at a Unicode character boundary without omitting any task or output records",
+    },
+    ExclusionEntry {
+        file: "subc/rich_ui/bash_output.rs",
+        enclosing_item: "page, stream_items",
+        location_or_primitive: "limit, PAGE_BYTES, ITEM_BYTES",
+        reason: "Resumable cursor pages split output losslessly by byte limits instead of dropping result items.",
+    },
+    ExclusionEntry {
+        file: "bash_background/viewed_task.rs",
+        enclosing_item: "resolve",
+        location_or_primitive: "SQL LIMIT 2",
+        reason: "The LIMIT 2 uniqueness probe detects ambiguous task keys and never returns a list.",
+    },
+    ExclusionEntry {
+        file: "commands/read.rs",
+        enclosing_item: "fit_github_images, process_image_fitting",
+        location_or_primitive: "remaining image byte budget, MAX_IMAGE_FIT_STEPS",
+        reason: "binary image sidecars are a bounded multimodal supplement, not pageable result records; omitted attachments are disclosed in read text with an exact count and source links, while local images shrink to a fixed floor or refuse explicitly",
     },
     ExclusionEntry {
         file: "bash_permissions/scan.rs",
         enclosing_item: "top_level_directory_targets, MAX_CWD_PATHS, insert",
         location_or_primitive: "MAX_CWD_PATHS",
         reason: "internal cwd analysis retains at most eight folder/mode states per exit-status branch; exceeding that bound makes the folder unknown rather than removing alternatives, and no response list is shortened",
+    },
+    ExclusionEntry {
+        file: "bash_background/watch_lines.rs",
+        enclosing_item: "LineDelivery",
+        location_or_primitive: "MAX_LINES_PER_NOTIFICATION, MAX_NOTIFICATIONS_PER_MINUTE, MAX_LINE_BYTES",
+        reason: "Async push notifications are not command-response lists. LineBatch reports exact cap drops and the source stream/byte offset; oversized lines explicitly mark scanning incomplete.",
     },
     ExclusionEntry {
         file: "standalone_input.rs",
@@ -373,6 +451,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "bounded internal mutation-index discovery, not a response list; ignored directories are pruned, examined counts are logged, and unfinished work schedules a background corpus replacement with the index marked not ready",
     },
     ExclusionEntry {
+        file: "backup.rs",
+        enclosing_item: "read_session_disk_index_with_budget, merge_disk_stack_heads",
+        location_or_primitive: "MAX_SESSION_DISCOVERY_ENTRIES, examined >= entry_limit, BackupIoBudget::check, ROLLBACK_CLEANUP_ALLOWANCE",
+        reason: "internal durable undo-stack discovery stops at its entry or deadline budget and returns an error, never a partial path list or false no-history result; rollback uses one independent bounded cleanup allowance after cancellation, and per-file undo avoids the session scan",
+    },
+    ExclusionEntry {
         file: "runtime_drain.rs",
         enclosing_item: "drop",
         location_or_primitive: "budget.exhausted()",
@@ -401,6 +485,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "should_emit",
         location_or_primitive: "256-entry status-bar session history / pop_front",
         reason: "bounded deduplication bookkeeping, not a result list; evicting an idle session only repeats its next bar and never suppresses a changed value",
+    },
+    ExclusionEntry {
+        file: "lsp/manager.rs",
+        enclosing_item: "remember",
+        location_or_primitive: "WATCHED_LIFECYCLE_CAP / oldest pop_first",
+        reason: "per-server watched-file echo bookkeeping, not a result list; eviction can only forward a duplicate lifecycle event, never hide a file change",
     },
     ExclusionEntry {
         file: "edit.rs",
@@ -445,10 +535,34 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "a background-launch error previews at most eight of the caller's slot holders, counts omitted own holders and other sessions' holders, and shortens command labels with an ellipsis; this is actionable refusal context, not a paginated task-result list",
     },
     ExclusionEntry {
+        file: "bash_background/registry.rs",
+        enclosing_item: "kill_survivors_line",
+        location_or_primitive: "KILL_SURVIVORS_NAMED .take()",
+        reason: "the one-line kill-survivor notice names the first three surviving processes and counts the rest with +N more; every listed survivor stays in the structured live_descendants field",
+    },
+    ExclusionEntry {
+        file: "bash_background/process.rs",
+        enclosing_item: "bounded_members, safe_name, macos_argv, capped_identities",
+        location_or_primitive: "LIVE_DESCENDANT_CAP .take(), LIVE_DESCENDANT_NAME_CAP .take(), MAX_ARGS, GROUP_IDENTITY_CAP .take()",
+        reason: "a process-group check keeps at most 16 members and reports the exact omitted count in live_descendants_omitted; each member's name is shortened with an ellipsis and its arguments are never kept; the record keeps at most 1,024 member identities for recognising the group later and flags when more were found; this is task status detail, not a paginated result list",
+    },
+    ExclusionEntry {
         file: "subc/health.rs",
-        enclosing_item: "budget_health_metrics",
-        location_or_primitive: "storage_retention map removal under HEALTH_METRICS_BUDGET_BYTES",
-        reason: "management health detail, not an agent result list; omitted retention reports are counted exactly and aggregate retention counters remain present",
+        enclosing_item: "budget_health_metrics, abbreviate_health_root, abbreviated_health_path, abbreviated_health_refusal",
+        location_or_primitive: "root row removal, optional root subfield removal, path/refusal character caps, storage_retention map removal and v2_family_sweeps pop under HEALTH_METRICS_BUDGET_BYTES",
+        reason: "management health detail, not an agent result list; ancillary telemetry yields before root diagnostics and ordinary ready roots yield before standing, refused or unhealthy roots; the last actionable row is abbreviated with a full identity digest, status and refusal code instead of omitted; omitted root, sweep, cache and retention rows are counted exactly and aggregate counters remain present",
+    },
+    ExclusionEntry {
+        file: "subc/route_census.rs",
+        enclosing_item: "snapshot, ScopeDescriptions::record",
+        location_or_primitive: "ROOT_LIMIT, ROUTE_LIMIT, PRINCIPAL_LIMIT, DESCRIPTION_LIMIT",
+        reason: "management-only ownership diagnostics, not an agent result list; root and per-root route details and principal groups have exact omitted counts while summary counts include omitted rows; the latest-result scope cache is bounded and reports evictions, with absent observations remaining unknown",
+    },
+    ExclusionEntry {
+        file: "gc/family.rs",
+        enclosing_item: "SweepStatsStore::update",
+        location_or_primitive: "SWEEP_STATS_FAMILY_LIMIT / pop_front",
+        reason: "observational health telemetry retains the latest 64 family details, not a paginated result list; cap evictions and retired-family removals are disclosed separately",
     },
     ExclusionEntry {
         file: "status_push.rs",
@@ -487,10 +601,22 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal persisted-task and quarantine retention scans resume the same iterator next pass; the cap bounds inspection work, not returned records",
     },
     ExclusionEntry {
+        file: "bash_background/gc_memo.rs",
+        enclosing_item: "due_batches",
+        location_or_primitive: "GC_ENTRY_BUDGET ordered deadline iterator advancement",
+        reason: "internal retention candidates beyond the budget remain indexed for the next maintenance request; no agent-visible records are truncated",
+    },
+    ExclusionEntry {
         file: "bash_background/remote.rs",
         enclosing_item: "append_executor_environment_disclosure",
         location_or_primitive: "executor environment name preview min(10)",
         reason: "supplemental execution note names at most ten filtered environment variables and explicitly counts the rest with +N more; the complete executor report remains in persisted task metadata, not a paginated tool-result list",
+    },
+    ExclusionEntry {
+        file: "subc/bind_log.rs",
+        location_or_primitive: "consumer_capabilities preview (eight-entry slice cap)",
+        reason: "Bounds RouteBind INFO logging only; does not cut a product result list.",
+        enclosing_item: "consumer_capabilities",
     },
     ExclusionEntry {
         file: "url_fetch.rs",
@@ -517,6 +643,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "flow-only telemetry stops at byte or line caps and reports truncated plus scanned counts; top tool and WARN previews disclose tools_total and warn_shapes_total, not a paginated agent list",
     },
     ExclusionEntry {
+        file: "subc/diagnostics_findings.rs",
+        enclosing_item: "bounded_body",
+        location_or_primitive: "truncate(5) samples and size >= BODY_LIMIT response trimming",
+        reason: "diagnostics.findings v1 is a bounded diagnosis snapshot, not a paginated ledger; samples are removed first, then tail findings, and retained counts are unchanged as required by the vendored contract",
+    },
+    ExclusionEntry {
         file: "subc/perf_sweep.rs",
         enclosing_item: "summarize_profile, child_output, ChildCapture::drain",
         location_or_primitive: "top eight threads, first stack, leaf frame and child-output ceilings",
@@ -524,7 +656,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "url_fetch.rs",
-        enclosing_item: "read_response_body, download_to_cache",
+        enclosing_item: "read_response_body, read_response_body_with, download_to_cache, fetch_with_secrets",
         location_or_primitive: "URL download byte ceiling and UTF-8 prefix repair",
         reason: "the producer stops after a bounded prefix and one lookahead byte; cached metadata discloses the cut with the known size or an explicit lower bound, separately from the rendered output ceiling",
     },
@@ -571,10 +703,28 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal corpus census, not a paginated findings list; an incomplete walk reports a named gap, marks scope_files_complete false, and renders the count as a lower bound",
     },
     ExclusionEntry {
+        file: "root_cache.rs",
+        enclosing_item: "sweep_all_read_markers_pinned, sweep_marker_generation, read_marker_protection, marker_file_is_protected",
+        location_or_primitive: "shared repair traversal budget and read-marker byte limit",
+        reason: "internal marker liveness and cleanup, not result lists; incomplete or oversized marker reads protect the cache rather than authorize deletion",
+    },
+    ExclusionEntry {
+        file: "bash_background/persistence.rs",
+        enclosing_item: "RepairBudget, DirectoryEntries, unix_entries, unix_names, repair_names, directory_identities, collect_directory_identities, repair_measure, repair_remove_contents, windows_repair_names, repair_descendant, repair_validate_descendants",
+        location_or_primitive: "repair traversal depth, entry and deadline bounds",
+        reason: "internal cache repair and retention walks, not result lists; an incomplete identity census or inventory refuses deletion and interrupted removal reports partial progress",
+    },
+    ExclusionEntry {
+        file: "cache_location.rs",
+        enclosing_item: "candidates_and_durable, candidates_and_durable_with_budget, deletion_protections, deletion_protections_with_budget, retention_protections_with_budget, ensure_cache_idle",
+        location_or_primitive: "RepairBudget",
+        reason: "internal cleanup preflight, not result lists; exhausting the traversal budget refuses all deletion rather than accepting incomplete protection or lock inventories",
+    },
+    ExclusionEntry {
         file: "storage_retention.rs",
-        enclosing_item: "bounded_dirs, traversal_batch_filtered, next_batch, validate_tree, due_first, orphan_first, run_pass_with_budget, prune_bindings",
-        location_or_primitive: "DUE_FIRST_ENTRIES, PASS_ENTRIES, TREE_ENTRIES, HISTORY_ENTRIES, take",
-        reason: "internal disk-maintenance walks, not tool-result lists; bounded lexical batches persist only processed names, incomplete protection snapshots refuse deletion, and health reports examined, removed, remaining vanished views and stopped-early counts",
+        enclosing_item: "bounded_dirs, traversal_batch_filtered, next_batch, sweep_view_generations, generation_registries, report_generation_registry_error, validate_tree, validate_tree_with_admission, report_candidate_error, reap_trash, reap_trash_with_snapshot_budget, reap_trash_with_cursor, trash_scans, reap_retired_with_budget, due_first, orphan_first, run_pass_with_budget, prune_bindings, retirement_members, retirement_members_with_budget, write_retirement_witness, verify_retirement_witness, collect_v3_idle, report_v3_idle_unknown",
+        location_or_primitive: "DUE_FIRST_ENTRIES, PASS_ENTRIES, TREE_ENTRIES, HISTORY_ENTRIES, TRASH_SCAN_HANDLES, reaper deadline and 10ms mount-snapshot admission budget, 64-view generation batch, 16 diagnostic errors, take, v3 idle SQL LIMIT 1 and member/deadline window",
+        reason: "internal disk-maintenance walks, not tool-result lists; bounded lexical batches persist only processed names, incomplete protection snapshots refuse deletion, and health reports remaining views, trash estimates, kept reasons and incomplete censuses",
     },
     ExclusionEntry {
         file: "views/registry.rs",
@@ -589,10 +739,22 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "optional sibling donor discovery bounds Git topology bytes, records and worktrees at their iterators; an incomplete or malformed enumeration disables reuse rather than claiming a freshest donor",
     },
     ExclusionEntry {
+        file: "views/derived_index.rs",
+        enclosing_item: "candidates, record",
+        location_or_primitive: "SQL LIMIT CANDIDATES_PER_KIND, LIMIT RETAINED_ROWS",
+        reason: "internal donor hints for derived-database seeding, not an agent-visible list; a candidate outside the bound or a trimmed row only means a seedless publication falls back to the worktree census or a cold build",
+    },
+    ExclusionEntry {
         file: "views/generation.rs",
-        enclosing_item: "generation_directory_entries, blob_references_by_generation, sweep_generations_bounded, remove_generation_files",
-        location_or_primitive: "take(limit.saturating_add(1)), take(GENERATION_DIRECTORY_LIMIT)",
-        reason: "internal generation/protection enumeration; ownership or blob-mark overflow aborts before deletion, while an incomplete temporary-file deletion pass only leaves garbage for a later pass",
+        enclosing_item: "generation_directory_entries, bounded_directory_entries, blob_references_by_generation, generation_sweep_registry, has_superseded_artifacts, sweep_generations_bounded, claim_generation, reap_generation_trash, remove_generation_files",
+        location_or_primitive: "take(limit.saturating_add(1)), truncate(limit), take(GENERATION_DIRECTORY_LIMIT), MAX_CLAIM_FILES atomic retirement batch",
+        reason: "internal generation/protection enumeration; ownership or blob-mark overflow aborts before deletion, an oversized directory is cleaned one bounded window per pass that keeps any generation whose derived-owner reference it cannot see, and an incomplete temporary-file deletion pass only leaves garbage for a later pass",
+    },
+    ExclusionEntry {
+        file: "views/reference_sidecar.rs",
+        enclosing_item: "free_slots",
+        location_or_primitive: "take(limit.saturating_add(1))",
+        reason: "internal count of view-directory entries, taken once per blob scan or publication, that bounds how many reference sidecars may be added; counting stops just past the limit because only the free slots below it matter, and a skipped sidecar only means blob GC decodes that manifest",
     },
     ExclusionEntry {
         file: "gc/mod.rs",
@@ -659,6 +821,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "unanalyzed_macro_note",
         location_or_primitive: "macro note site truncate",
         reason: "summary line under the callers list that carries its own count and 'shown N of M' wording; the callers list itself keeps its envelope",
+    },
+    ExclusionEntry {
+        file: "callgraph_store/mod.rs",
+        enclosing_item: "unresolved_call_site_count",
+        location_or_primitive: "UNRESOLVED_CALL_SITE_COUNT_LIMIT, SQL LIMIT",
+        reason: "bounded count for the empty-callers and impact incompleteness note, not a list cut; the note says 'at least N' at the limit and the result lists keep their own envelopes",
     },
     // The borrowed-graph coverage note on callgraph answers is one summary
     // line: it names the first few files the borrowed graph does not reflect
@@ -798,6 +966,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "caps bytes inspected for a file's line-count statistic; the file remains in the outline with an unknown line count, so no agent-visible list items are removed",
     },
     ExclusionEntry {
+        file: "commands/outline.rs",
+        enclosing_item: "files_walk_stall_keeps_examined_paths_and_named_gap",
+        location_or_primitive: "collection_truncated regression assertion",
+        reason: "a test observes incomplete discovery; the assertion does not cut an agent-visible list",
+    },
+    ExclusionEntry {
         file: "commands/read.rs",
         enclosing_item: "handle_streaming_range_read",
         location_or_primitive: "bounded streamed line window",
@@ -930,7 +1104,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     // results page is the search surface's, registered under its cap reason.
     ExclusionEntry {
         file: "commands/semantic_search/external_exact.rs",
-        enclosing_item: "files_with_hits",
+        enclosing_item: "sweep",
         location_or_primitive: "commands::semantic_search::external_exact::sweep skipped_foreign_mounts",
         reason: "counts mount points of other filesystems that the walk does not enter; no list is cut here, and a walk the deadline stops is reported through the sweep's enumeration_stopped and the reply's coverage line",
     },
@@ -948,9 +1122,9 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "commands/semantic_search/external_pattern.rs",
-        enclosing_item: "semantic_results, semantic_index",
+        enclosing_item: "semantic_results",
         location_or_primitive: "commands::semantic_search::external_pattern::Corpus semantic enumeration",
-        reason: "enumerates at most SEMANTIC_ENUMERATION_LIMIT prose candidates before ranking, like the external query-only route; more_available reports the remaining candidates and the engine envelopes the results page. Discovery currently attributes the restricted-visibility method to its preceding semantic_index helper",
+        reason: "enumerates at most SEMANTIC_ENUMERATION_LIMIT prose candidates before ranking, like the external query-only route; more_available reports the remaining candidates and the engine envelopes the results page",
     },
     ExclusionEntry {
         file: "commands/inspect.rs",

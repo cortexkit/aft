@@ -180,6 +180,8 @@ pub enum WatcherDispatchEvent {
     Paths(Vec<PathBuf>),
     /// Every path had only explicit data modifications, never topology events.
     ContentOnlyPaths(Vec<PathBuf>),
+    /// Ordered control; preceding changes must enter the driver before its ack.
+    CookieObserved(PathBuf),
     RescanRequired(RescanReason),
     IgnoreRulesChanged {
         paths: Vec<PathBuf>,
@@ -285,7 +287,9 @@ pub fn watcher_event_invalidates(kind: &notify::EventKind) -> bool {
 pub fn watcher_path_is_infra_skip(path: &Path) -> bool {
     // Operating-system metadata files (a Finder `.DS_Store` rewrite, say) are
     // never indexed by the project walks, so their events carry no change.
-    if crate::project_content::is_excluded_event(path) {
+    if crate::watcher_backend::cookie::is_cookie_path(path)
+        || crate::project_content::is_excluded_event(path)
+    {
         return true;
     }
     watcher_path_has_infra_component(path)
@@ -308,6 +312,12 @@ pub(crate) fn watcher_path_is_infra_skip_under(root: &Path, path: &Path) -> bool
         || absolute
             .strip_prefix(root)
             .is_ok_and(watcher_path_has_infra_component)
+        // Events under a nested linked worktree of this repository belong to
+        // that checkout's own session, like other excluded paths. The boundary
+        // resolves the common dir lazily and only reads a `.git` file for
+        // directories that hold one.
+        || crate::project_content::NestedWorktreeBoundary::for_root(root)
+            .is_under_nested_worktree(&absolute)
 }
 
 /// High-churn ignored directories that can be dropped from the raw event stream
@@ -417,7 +427,7 @@ pub(crate) fn watcher_directory_is_ignored_by_matcher(
     watcher_path_is_ignored_by_matcher_with_kind(matcher, path, root, true)
 }
 
-fn watcher_path_is_ignored_by_matcher_with_kind(
+pub(crate) fn watcher_path_is_ignored_by_matcher_with_kind(
     matcher: &SharedGitignore,
     path: &Path,
     root: &Path,
@@ -689,29 +699,42 @@ impl WatcherExclusionPaths {
         self.lasting.len() != previous_len
     }
 
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn refresh_event(&mut self, event: &notify::Event) -> Vec<PathBuf> {
+        self.refresh_events(std::iter::once(event))
+    }
+
+    pub(crate) fn refresh_events<'a>(
+        &mut self,
+        events: impl IntoIterator<Item = &'a notify::Event>,
+    ) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        let mut rescan = false;
         // Content, metadata and access events cannot replace a directory.
         // Keep their high-volume path free of filesystem probes.
-        if !event.need_rescan()
-            && !matches!(
+        for event in events {
+            if event.need_rescan() {
+                rescan = true;
+            } else if !matches!(
                 event.kind,
                 notify::EventKind::Create(_)
                     | notify::EventKind::Remove(_)
                     | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
-            )
-        {
+            ) {
+                continue;
+            }
+            paths.extend(event.paths.iter().cloned());
+        }
+        if paths.is_empty() && !rescan {
             return Vec::new();
         }
         let previous = self.external.clone();
-        if event.need_rescan() {
+        if rescan {
             // Overflow events may have no paths. Recheck every known external
             // boundary, including replacements whose topology event was lost.
-            let mut paths = event.paths.clone();
             paths.extend(self.external.iter().cloned());
-            self.refresh_touched(&paths);
-        } else {
-            self.refresh_touched(&event.paths);
         }
+        self.refresh_touched(&paths);
         self.external
             .symmetric_difference(&previous)
             .cloned()
@@ -726,14 +749,36 @@ impl WatcherExclusionPaths {
             return false;
         };
         let previous = self.external.clone();
+        // Component results are keyed by lexical path and shared only within
+        // this batch. Discarding the cache at the next batch invalidates both a
+        // touched path and descendants of a renamed/replaced parent, including
+        // external ancestors reported only through a child event. Walks retain
+        // their independent uncached boundary checks.
+        let mut cache = BTreeMap::new();
         self.external.retain(|excluded| {
             !paths
                 .iter()
                 .any(|path| path.starts_with(excluded) || excluded.starts_with(path))
-                || boundary.kind(excluded) == ExclusionPathKind::External
+                || boundary.classify_cached(excluded, &mut cache).0 == ExclusionPathKind::External
         });
+        let mut seen = BTreeSet::new();
         for path in paths {
-            if let (_, Some(external)) = boundary.classify(path) {
+            // Discovery need not spend more exclusion slots below an installed
+            // lasting exclusion. Probe through that boundary in case it became
+            // a link, not through every build artifact. This only shortens the
+            // probe: exact-path native exclusions may still deliver descendants,
+            // and their events must still reach the ordinary corpus filter.
+            let probe = self
+                .lasting
+                .iter()
+                .map(|entry| entry.path())
+                .filter(|excluded| path.starts_with(excluded))
+                .min_by_key(|excluded| excluded.components().count())
+                .unwrap_or(path);
+            if !seen.insert(probe) {
+                continue;
+            }
+            if let (_, Some(external)) = boundary.classify_cached(probe, &mut cache) {
                 // Keep the shared budget within FSEvents' eight-exclusion limit.
                 // Full slots do not permit traversal: every directory scan
                 // independently checks symlinks and device boundaries.
@@ -934,6 +979,51 @@ impl WatcherWalkBoundary {
     }
 
     fn classify(&self, path: &Path) -> (ExclusionPathKind, Option<PathBuf>) {
+        self.classify_with(path, |path| self.component_kind(path))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", test))]
+    fn classify_cached(
+        &self,
+        path: &Path,
+        cache: &mut BTreeMap<PathBuf, ExclusionPathKind>,
+    ) -> (ExclusionPathKind, Option<PathBuf>) {
+        self.classify_with(path, |path| {
+            *cache
+                .entry(path.to_path_buf())
+                .or_insert_with(|| self.component_kind(path))
+        })
+    }
+
+    fn component_kind(&self, path: &Path) -> ExclusionPathKind {
+        let metadata = match watcher_boundary_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return ExclusionPathKind::Absent;
+            }
+            Err(_) => return ExclusionPathKind::Other,
+        };
+        if metadata.file_type().is_symlink() {
+            return ExclusionPathKind::External;
+        }
+        if !metadata.is_dir() {
+            return ExclusionPathKind::Other;
+        }
+        if self
+            .device
+            .zip(exclusion_device(path, &metadata))
+            .is_some_and(|(root, child)| !crate::walk_boundary::same_filesystem_device(root, child))
+        {
+            return ExclusionPathKind::External;
+        }
+        ExclusionPathKind::LocalDirectory
+    }
+
+    fn classify_with(
+        &self,
+        path: &Path,
+        mut component_kind: impl FnMut(&Path) -> ExclusionPathKind,
+    ) -> (ExclusionPathKind, Option<PathBuf>) {
         #[cfg(test)]
         EXCLUSION_TEST_CLASSIFICATIONS.with(|calls| calls.set(calls.get() + 1));
         let Ok(relative) = path.strip_prefix(&self.root) else {
@@ -945,27 +1035,10 @@ impl WatcherWalkBoundary {
                 return (ExclusionPathKind::Other, None);
             }
             current.push(component);
-            let metadata = match watcher_boundary_metadata(&current) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return (ExclusionPathKind::Absent, None)
-                }
-                Err(_) => return (ExclusionPathKind::Other, None),
-            };
-            if metadata.file_type().is_symlink() {
-                return (ExclusionPathKind::External, Some(current));
-            }
-            if !metadata.is_dir() {
-                return (ExclusionPathKind::Other, None);
-            }
-            if self
-                .device
-                .zip(exclusion_device(&current, &metadata))
-                .is_some_and(|(root, child)| {
-                    !crate::walk_boundary::same_filesystem_device(root, child)
-                })
-            {
-                return (ExclusionPathKind::External, Some(current));
+            match component_kind(&current) {
+                ExclusionPathKind::LocalDirectory => {}
+                ExclusionPathKind::External => return (ExclusionPathKind::External, Some(current)),
+                kind => return (kind, None),
             }
         }
         (ExclusionPathKind::LocalDirectory, None)
@@ -978,7 +1051,10 @@ impl WatcherWalkBoundary {
 
 fn watcher_boundary_metadata(path: &Path) -> std::io::Result<fs::Metadata> {
     #[cfg(test)]
-    EXCLUSION_TEST_LSTATS.with(|calls| calls.set(calls.get() + 1));
+    {
+        EXCLUSION_TEST_LSTATS.with(|calls| calls.set(calls.get() + 1));
+        EXCLUSION_TEST_STAT_PATHS.with(|paths| paths.borrow_mut().push(path.to_path_buf()));
+    }
     fs::symlink_metadata(path)
 }
 
@@ -1220,6 +1296,8 @@ pub(crate) fn exclusion_read_dir(path: &Path) -> std::io::Result<fs::ReadDir> {
 thread_local! {
     pub(crate) static EXCLUSION_TEST_OPENS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
     pub(crate) static EXCLUSION_TEST_LSTATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static EXCLUSION_TEST_STAT_PATHS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+    static WATCHER_TEST_ROOT_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static EXCLUSION_TEST_CLASSIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static EXCLUSION_TEST_DEVICE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
@@ -2221,6 +2299,10 @@ pub fn run_watcher_thread<W, E, F>(
                 return;
             }
             crate::slog_info!("watcher started: {}", root_path.display());
+            let _subscription = crate::watcher_backend::subscription::start(
+                &root_path,
+                crate::watcher_backend::initial_coverage_of(&_watcher),
+            );
             let mut filter = WatcherFilterThread::new(
                 config,
                 matcher,
@@ -2254,6 +2336,7 @@ struct WatcherFilterThread {
     content_only_paths: BTreeSet<PathBuf>,
     recent_paths: VecDeque<(PathBuf, Instant)>,
     flush_deadline: Option<Instant>,
+    next_root_check: Instant,
     /// Events the dispatch channel had no room for, oldest first. Changed
     /// paths are merged into one event while they wait; see `hold_event`.
     backlog: VecDeque<WatcherDispatchEvent>,
@@ -2292,6 +2375,7 @@ impl WatcherFilterThread {
             content_only_paths: BTreeSet::new(),
             recent_paths: VecDeque::with_capacity(WATCHER_ATTRIBUTION_RING_CAPACITY),
             flush_deadline: None,
+            next_root_check: Instant::now(),
             backlog: VecDeque::new(),
             overflow_burst: None,
             #[cfg(test)]
@@ -2319,7 +2403,7 @@ impl WatcherFilterThread {
             if !self.retry_backlog() {
                 return;
             }
-            if self.project_root_was_deleted() {
+            if self.project_root_was_deleted(Instant::now()) {
                 self.raw_paths.clear();
                 self.content_only_paths.clear();
                 let _ = self.send_dispatch_final(WatcherDispatchEvent::RootDeleted);
@@ -2333,10 +2417,19 @@ impl WatcherFilterThread {
             }
 
             match raw_rx.recv_timeout(self.next_recv_timeout()) {
-                Ok(Ok(event)) => {
+                Ok(Ok(mut event)) => {
                     #[cfg(feature = "test-timing-hooks")]
                     hold_watcher_intake_for_test(&self.shutdown);
                     self.config.counters.note_raw_event();
+                    let cookies = self.take_cookie_paths(&mut event);
+                    if self.config.counters.bash_changes.get().is_some()
+                        && self.config.counters.bash_flush.observe(&event)
+                    {
+                        continue;
+                    }
+                    if let Some(journal) = self.config.counters.bash_changes.get() {
+                        journal.event_for_root(&event, &self.config.project_root, &self.matcher);
+                    }
                     if event.need_rescan() {
                         // Delay only this test's overflow notification so its
                         // timeout is exercised against worker scheduling.
@@ -2382,8 +2475,19 @@ impl WatcherFilterThread {
                             return;
                         }
                     }
+                    for cookie in cookies {
+                        if !self.flush_pending()
+                            || self.send_dispatch(WatcherDispatchEvent::CookieObserved(cookie))
+                                == Dispatch::Closed
+                        {
+                            return;
+                        }
+                    }
                 }
                 Ok(Err(error)) => {
+                    if let Some(journal) = self.config.counters.bash_changes.get() {
+                        journal.gap();
+                    }
                     let _ =
                         self.send_dispatch_final(WatcherDispatchEvent::Error(error.to_string()));
                     return;
@@ -2405,7 +2509,42 @@ impl WatcherFilterThread {
         }
     }
 
-    fn project_root_was_deleted(&self) -> bool {
+    fn take_cookie_paths(&self, event: &mut notify::Event) -> Vec<PathBuf> {
+        let acknowledge =
+            !event.need_rescan() && matches!(event.kind, notify::EventKind::Create(_));
+        let mut cookies = Vec::new();
+        event.paths.retain(|path| {
+            if !crate::watcher_backend::cookie::is_cookie_path(path) {
+                return true;
+            }
+            // Only root cookies are controls. Do not unlink a similarly named
+            // file in an auxiliary watch or a nested directory.
+            if path.parent() == Some(self.config.project_root.as_path()) {
+                let removed = std::fs::remove_file(path).or_else(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    }
+                });
+                if acknowledge && removed.is_ok() {
+                    cookies.push(path.clone());
+                }
+            }
+            false
+        });
+        cookies
+    }
+
+    fn project_root_was_deleted(&mut self, now: Instant) -> bool {
+        // Check on a wall-clock cadence, not once per raw event. Ignored build
+        // bursts can otherwise turn the root-deletion fallback into a stat loop.
+        if now < self.next_root_check {
+            return false;
+        }
+        self.next_root_check = now + ROOT_DELETED_CHECK_INTERVAL;
+        #[cfg(test)]
+        WATCHER_TEST_ROOT_PROBES.with(|calls| calls.set(calls.get() + 1));
         !self.config.project_root.exists()
     }
 
@@ -2616,6 +2755,7 @@ impl WatcherFilterThread {
                 .strip_prefix(&self.config.project_root)
                 .is_ok_and(watcher_path_is_high_churn_infra)
                 || crate::os_metadata::is_os_metadata_path(&path)
+                || crate::watcher_backend::cookie::is_cookie_path(&path)
             {
                 continue;
             }
@@ -2653,15 +2793,15 @@ impl WatcherFilterThread {
     fn next_recv_timeout(&self) -> Duration {
         // Wake in time to flush a pending overflow summary, and sooner while
         // dispatch-backlogged events are waiting for room.
-        let mut timeout =
-            self.overflow_burst
-                .as_ref()
-                .map_or(ROOT_DELETED_CHECK_INTERVAL, |burst| {
-                    (burst.3 + WATCHER_OVERFLOW_QUIET_INTERVAL)
-                        .min(burst.2 + WATCHER_OVERFLOW_MAX_INTERVAL)
-                        .saturating_duration_since(Instant::now())
-                        .min(ROOT_DELETED_CHECK_INTERVAL)
-                });
+        let root_timeout = self
+            .next_root_check
+            .saturating_duration_since(Instant::now());
+        let mut timeout = self.overflow_burst.as_ref().map_or(root_timeout, |burst| {
+            (burst.3 + WATCHER_OVERFLOW_QUIET_INTERVAL)
+                .min(burst.2 + WATCHER_OVERFLOW_MAX_INTERVAL)
+                .saturating_duration_since(Instant::now())
+                .min(root_timeout)
+        });
         if !self.backlog.is_empty() {
             timeout = timeout.min(DISPATCH_BACKLOG_RETRY_INTERVAL);
         }
@@ -2778,7 +2918,7 @@ impl WatcherFilterThread {
         while !self.shutdown.load(Ordering::SeqCst)
             && self.matcher_generation.load(Ordering::SeqCst) == observed_generation
         {
-            if self.project_root_was_deleted() {
+            if self.project_root_was_deleted(Instant::now()) {
                 let _ = self.send_dispatch_final(WatcherDispatchEvent::RootDeleted);
                 return false;
             }
@@ -2892,10 +3032,19 @@ impl WatcherFilterThread {
             WatcherDispatchEvent::Paths(paths) => self.hold_paths(paths, false),
             WatcherDispatchEvent::ContentOnlyPaths(paths) => self.hold_paths(paths, true),
             WatcherDispatchEvent::RescanRequired(reason) => {
-                self.backlog.retain(|held| !is_path_batch(held));
+                // Losing the paths before a held cookie also loses its proof.
+                self.backlog.retain(|held| {
+                    !is_path_batch(held) && !matches!(held, WatcherDispatchEvent::CookieObserved(_))
+                });
                 if !rescan_held {
                     self.backlog
                         .push_back(WatcherDispatchEvent::RescanRequired(reason));
+                }
+            }
+            WatcherDispatchEvent::CookieObserved(path) => {
+                if !rescan_held {
+                    self.backlog
+                        .push_back(WatcherDispatchEvent::CookieObserved(path));
                 }
             }
             WatcherDispatchEvent::IgnoreRulesChanged { paths } => match self.backlog.back_mut() {
@@ -2947,7 +3096,9 @@ impl WatcherFilterThread {
             // logged and counted like an operating-system event overflow. A
             // rescan already running is told to run again instead.
             let during_rescan = self.log_overflow(RescanReason::BufferOverflow);
-            self.backlog.retain(|held| !is_path_batch(held));
+            self.backlog.retain(|held| {
+                !is_path_batch(held) && !matches!(held, WatcherDispatchEvent::CookieObserved(_))
+            });
             if !during_rescan {
                 self.backlog.push_back(WatcherDispatchEvent::RescanRequired(
                     RescanReason::BufferOverflow,
@@ -3060,6 +3211,116 @@ pub(crate) fn take_watcher_overflow_logs_for_test() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn watcher_cookie_bypasses_ignore_and_flushes_mixed_paths_before_ack() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("source.rs");
+        let cookie = root.join(".aft-cookie-123-nonce");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&cookie, b"").unwrap();
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(&root);
+        builder.add_line(None, ".aft-cookie-*").unwrap();
+        let matcher = Arc::new(RwLock::new(Some(Arc::new(builder.build().unwrap()))));
+        let (tx, rx) = watcher_dispatch_channel();
+        let (raw_tx, raw_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut filter = WatcherFilterThread::new(
+            WatcherFilterConfig::new(root.clone(), None),
+            matcher,
+            Arc::new(AtomicU64::new(0)),
+            tx,
+            Arc::clone(&shutdown),
+        );
+        let worker = thread::spawn(move || filter.run(raw_rx));
+        raw_tx
+            .send(Ok(notify::Event::new(notify::EventKind::Create(
+                notify::event::CreateKind::File,
+            ))
+            .add_path(source.clone())
+            .add_path(cookie.clone())))
+            .unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            WatcherDispatchEvent::Paths(vec![source])
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            WatcherDispatchEvent::CookieObserved(cookie.clone())
+        );
+        assert!(!cookie.exists());
+        shutdown.store(true, Ordering::SeqCst);
+        drop(raw_tx);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn watcher_cookie_unlinks_on_overflow_but_only_create_can_ack() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (filter, _rx, _) = filter_with_full_dispatch_channel(&root);
+        let cookie = root.join(".aft-cookie-123-nonce");
+        for kind in [
+            notify::EventKind::Remove(notify::event::RemoveKind::File),
+            notify::EventKind::Any,
+        ] {
+            std::fs::write(&cookie, b"").unwrap();
+            let mut event = notify::Event::new(kind).add_path(cookie.clone());
+            assert!(filter.take_cookie_paths(&mut event).is_empty());
+            assert!(event.paths.is_empty());
+            assert!(!cookie.exists());
+        }
+        std::fs::write(&cookie, b"").unwrap();
+        let mut event =
+            notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+                .add_path(cookie.clone())
+                .set_flag(notify::event::Flag::Rescan);
+        assert!(filter.take_cookie_paths(&mut event).is_empty());
+        assert!(event.need_rescan());
+        assert!(!cookie.exists());
+        let nested = root.join("nested/.aft-cookie-123-nonce");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        std::fs::write(&nested, b"not a root control").unwrap();
+        let mut event =
+            notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+                .add_path(nested.clone());
+        assert!(filter.take_cookie_paths(&mut event).is_empty());
+        assert!(nested.exists());
+    }
+
+    #[test]
+    fn watcher_cookie_backlog_preserves_barriers_and_drops_them_with_lost_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (mut filter, _rx, _) = filter_with_full_dispatch_channel(&root);
+        filter.send_dispatch(WatcherDispatchEvent::Paths(vec![root.join("a.rs")]));
+        filter.send_dispatch(WatcherDispatchEvent::CookieObserved(
+            root.join(".aft-cookie-1-nonce"),
+        ));
+        filter.send_dispatch(WatcherDispatchEvent::Paths(vec![root.join("b.rs")]));
+        assert_eq!(
+            filter.backlog.len(),
+            3,
+            "paths must not merge across the cookie"
+        );
+        filter.send_dispatch(WatcherDispatchEvent::RescanRequired(
+            RescanReason::BufferOverflow,
+        ));
+        assert_eq!(filter.backlog.len(), 1);
+        assert!(matches!(
+            filter.backlog.front(),
+            Some(WatcherDispatchEvent::RescanRequired(_))
+        ));
+        filter.send_dispatch(WatcherDispatchEvent::CookieObserved(
+            root.join(".aft-cookie-1-next"),
+        ));
+        assert_eq!(
+            filter.backlog.len(),
+            1,
+            "a held rescan cannot certify a cookie"
+        );
+    }
+
     #[test]
     fn issue645_nested_git_and_local_manifests_get_kernel_exclusions() {
         use super::*;
@@ -3672,6 +3933,147 @@ mod tests {
     #[cfg(unix)]
     fn exclusion_tempdir() -> TempDir {
         tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn excluded_topology_burst_stats_follow_distinct_directories() {
+        const EVENTS: usize = 512;
+        for _ in 0..2 {
+            let root = TempDir::new().unwrap();
+            let excluded = root.path().join("packages/pkg/target");
+            fs::create_dir_all(&excluded).unwrap();
+            let paths: Vec<_> = (0..EVENTS)
+                .map(|index| excluded.join(format!("object-{index}.o")))
+                .collect();
+            let mut state = WatcherExclusionPaths::new(
+                root.path(),
+                &[WatcherExclusion {
+                    path: excluded.clone(),
+                    source: WatcherExclusionSource::Ecosystem,
+                }],
+            );
+            EXCLUSION_TEST_STAT_PATHS.with(|paths| paths.borrow_mut().clear());
+            let events: Vec<_> = paths
+                .into_iter()
+                .map(|path| notify::Event::new(EventKind::Create(CreateKind::File)).add_path(path))
+                .collect();
+            assert!(state.refresh_events(&events).is_empty());
+            let stats = EXCLUSION_TEST_STAT_PATHS.with(|paths| paths.borrow().clone());
+            eprintln!(
+                "root={} events={EVENTS} lstat={}",
+                root.path().display(),
+                stats.len()
+            );
+            assert_eq!(
+                stats.len(),
+                3,
+                "only the distinct covering directories need lstat"
+            );
+            assert_eq!(
+                stats,
+                vec![
+                    root.path().join("packages"),
+                    root.path().join("packages/pkg"),
+                    excluded.clone()
+                ]
+            );
+            assert_eq!(state.paths(), vec![excluded]);
+        }
+    }
+
+    #[test]
+    fn topology_batch_reuses_component_probes_without_an_exclusion() {
+        let root = TempDir::new().unwrap();
+        let directory = root.path().join("src/nested");
+        fs::create_dir_all(&directory).unwrap();
+        let mut state = WatcherExclusionPaths::new(root.path(), &[]);
+        let events: Vec<_> = (0..128)
+            .map(|index| {
+                notify::Event::new(EventKind::Create(CreateKind::File))
+                    .add_path(directory.join(format!("source-{index}.rs")))
+            })
+            .collect();
+        for _ in 0..2 {
+            EXCLUSION_TEST_STAT_PATHS.with(|paths| paths.borrow_mut().clear());
+            assert!(state.refresh_events(&events).is_empty());
+            let stats = EXCLUSION_TEST_STAT_PATHS.with(|paths| paths.borrow().clone());
+            assert_eq!(
+                stats.len(),
+                130,
+                "two directories plus each unknown leaf, not three probes per event"
+            );
+            assert_eq!(stats.iter().filter(|path| **path == directory).count(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn topology_batch_cache_expires_for_child_parent_and_pathless_events() {
+        let root = exclusion_tempdir();
+        let outside = TempDir::new().unwrap();
+        let parent = root.path().join("parent");
+        let excluded = parent.join("target");
+        fs::create_dir_all(&excluded).unwrap();
+        let mut state = WatcherExclusionPaths::new(
+            root.path(),
+            &[WatcherExclusion {
+                path: excluded.clone(),
+                source: WatcherExclusionSource::Ecosystem,
+            }],
+        );
+        let child_event = notify::Event::new(EventKind::Create(CreateKind::File))
+            .add_path(excluded.join("object.o"));
+        assert!(state.refresh_event(&child_event).is_empty());
+        fs::remove_dir(&excluded).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &excluded).unwrap();
+        assert_eq!(state.refresh_event(&child_event), vec![excluded.clone()]);
+        fs::remove_file(&excluded).unwrap();
+        assert_eq!(
+            state.refresh_event(
+                &notify::Event::new(EventKind::Remove(notify::event::RemoveKind::Folder))
+                    .add_path(parent.clone())
+            ),
+            vec![excluded.clone()]
+        );
+        fs::create_dir(&excluded).unwrap();
+        assert!(state.refresh_event(&child_event).is_empty());
+        fs::remove_dir(&excluded).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &excluded).unwrap();
+        assert_eq!(state.refresh_event(&child_event), vec![excluded.clone()]);
+        fs::remove_file(&excluded).unwrap();
+        fs::create_dir(&excluded).unwrap();
+        assert_eq!(
+            state.refresh_event(&notify::Event::new(EventKind::Other).set_flag(Flag::Rescan)),
+            vec![excluded.clone()]
+        );
+        assert_eq!(state.paths(), vec![excluded]);
+    }
+
+    #[test]
+    fn root_existence_probes_follow_poll_deadlines_not_event_count() {
+        let root = TempDir::new().unwrap();
+        let (dispatch_tx, _dispatch_rx) = watcher_dispatch_channel();
+        let mut filter = WatcherFilterThread::new(
+            WatcherFilterConfig::new(root.path().to_path_buf(), None),
+            Arc::new(RwLock::new(None)),
+            Arc::new(AtomicU64::new(0)),
+            dispatch_tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let now = Instant::now();
+        WATCHER_TEST_ROOT_PROBES.with(|calls| calls.set(0));
+        for _ in 0..10_000 {
+            assert!(!filter.project_root_was_deleted(now));
+        }
+        WATCHER_TEST_ROOT_PROBES.with(|calls| assert_eq!(calls.get(), 1));
+        fs::remove_dir(root.path()).unwrap();
+        assert!(filter.project_root_was_deleted(now + ROOT_DELETED_CHECK_INTERVAL));
+        WATCHER_TEST_ROOT_PROBES.with(|calls| assert_eq!(calls.get(), 2));
+        filter.next_root_check = Instant::now();
+        assert!(
+            filter.next_recv_timeout().is_zero(),
+            "continuous intake cannot postpone the next root check"
+        );
     }
 
     #[test]
@@ -5524,6 +5926,8 @@ mod tests {
     /// Feed `burst` through a filter thread followed by an overflow, so the
     /// thread records observed volume the way a live overflow does.
     fn record_overflow_burst(root: &Path, matcher: &SharedGitignore, burst: Vec<PathBuf>) {
+        let burst_len = burst.len();
+        assert!(burst_len > 0 && burst_len <= WATCHER_ATTRIBUTION_RING_CAPACITY);
         let shutdown = Arc::new(AtomicBool::new(false));
         let (dispatch_tx, dispatch_rx) = crossbeam_channel::bounded(1);
         let (raw_tx, raw_rx) = mpsc::channel();
@@ -5534,7 +5938,8 @@ mod tests {
             dispatch_tx,
             Arc::clone(&shutdown),
         );
-        let handle = thread::spawn(move || filter.run(raw_rx));
+        let counters = Arc::clone(&filter.config.counters);
+        // Queue the complete burst and overflow before intake can start.
         for path in burst {
             raw_tx
                 .send(Ok(
@@ -5547,13 +5952,31 @@ mod tests {
                 notify::Event::new(EventKind::Other).set_flag(Flag::Rescan)
             ))
             .unwrap();
-        assert_eq!(
-            dispatch_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            WatcherDispatchEvent::RescanRequired(RescanReason::Unknown)
-        );
+        let timeout = Duration::from_secs(30);
+        let deadline = Instant::now() + timeout;
+        // This fixture tests overflow attribution, not debounce timing. Keep
+        // automatic flushing beyond the receive timeout even if canonicalizing
+        // the queued paths takes longer than the normal 250 ms flush window.
+        filter.flush_deadline = Some(deadline + timeout);
+        let handle = thread::spawn(move || filter.run(raw_rx));
+        let dispatched =
+            dispatch_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
         shutdown.store(true, Ordering::SeqCst);
         drop(raw_tx);
         handle.join().unwrap();
+        assert_eq!(
+            dispatched.unwrap(),
+            WatcherDispatchEvent::RescanRequired(RescanReason::Unknown)
+        );
+        // Diagnostic overflow prefixes count nonignored paths too, so their
+        // total verifies the burst was observed even when the exclusion list
+        // is empty.
+        let prefixes = counters.snapshot().last_overflow_prefixes;
+        assert_eq!(
+            prefixes.iter().map(|prefix| prefix.count).sum::<u64>(),
+            burst_len as u64,
+            "overflow must record the entire burst: {prefixes:?}"
+        );
     }
 
     const AGENT_SCRATCH_SIBLINGS: [&str; 7] = [

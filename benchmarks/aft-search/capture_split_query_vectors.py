@@ -3,21 +3,46 @@
 
 The gate pack (split-query-vectors.bin) holds the prose and joined texts of
 the gate's query/pattern rows, and the query text of every gate row the main
-pack has no vector for. The tuning pack (split-tuning-vectors.bin,
+pack has no vector for. It also holds the corpus vectors of the chunk texts
+listed in candidate-chunk-texts.json: texts a pending engine change embeds on
+the pinned tree that the unchanged engine never produces, so both engines are
+measured on the same vectors instead of the candidate faulting with
+vector_missing. The tuning pack (split-tuning-vectors.bin,
 --tuning-only) holds the tuning rows' texts. Each run rebinds only its own
 manifest, and vectors already in the pack keep their exact bytes.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
-from embedding_fixture_server import query_key
+from embedding_fixture_server import corpus_key, query_key
 from minilm_embedder import MiniLmEmbedder
 from run_real_query import ROOT, HERE
-from search_quality_lib import canonical_json, sha256_file
+from search_quality_lib import EVIDENCE_SHA, InputFault, canonical_json, sha256_file
 from vector_pack import read_pack, write_pack
+
+CANDIDATE_CHUNK_TEXTS = HERE / "candidate-chunk-texts.json"
+
+
+def candidate_chunk_texts(path: Path = CANDIDATE_CHUNK_TEXTS) -> list[str]:
+    """The exact chunk texts listed in `path`, each checked against its digest.
+
+    A text whose bytes do not hash to the recorded digest was copied wrongly,
+    and embedding it would store a vector under a key no engine ever asks for.
+    """
+    document = json.loads(path.read_text())
+    if document.get("schema") != "aft-search-candidate-chunk-texts-v1" or document.get("evidence_sha") != EVIDENCE_SHA:
+        raise InputFault(f"malformed_schema:{path.name}")
+    texts: list[str] = []
+    for entry in document.get("texts", []):
+        text = entry.get("embed_text")
+        if not isinstance(text, str) or hashlib.sha256(text.encode()).hexdigest() != entry.get("sha256"):
+            raise InputFault(f"candidate_chunk_text_digest_mismatch:{entry.get('sha256')}")
+        texts.append(text)
+    return texts
 
 
 def without_surrounding_quotes(query: str) -> str:
@@ -74,6 +99,11 @@ def main() -> None:
     previous = read_pack(output) if output.is_file() else None
     vectors = {key: previous["vectors"][key] for key in previous["vectors"]} if previous else {}
     missing = {query_key(text, template): text for text in sorted(texts)}
+    if not args.tuning_only:
+        for text in candidate_chunk_texts():
+            key = corpus_key(text, template)
+            if key not in pack["vectors"]:
+                missing[key] = text
     missing = {key: text for key, text in missing.items() if key not in vectors}
     embedder = MiniLmEmbedder() if missing else None
     for key, text in missing.items():

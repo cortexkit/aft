@@ -187,8 +187,14 @@ pub(super) fn decode_reply(request: &WireRequest, value: &Value) -> Result<ReadR
         }
         WireRequest::JobLog { args, .. } => {
             let reply: LogReply = serde_json::from_value(result.clone()).map_err(decode_error)?;
-            if reply.length != reply.body.len() as u64
-                || reply.length > args.length.unwrap_or(read_contract::MAX_REPLY_BYTES)
+            // `offset`, `length` and `total_bytes` count raw log bytes in
+            // storage, while `body` is display text: Plexus strips ANSI escape
+            // codes, redacts the storage URL and credential, and decodes UTF-8
+            // lossily (a multibyte character split by the range edge becomes
+            // U+FFFD). So `body.len()` may be smaller or larger than `length`
+            // and is never compared with it; only the raw byte range is checked
+            // here. The body itself stays bounded by the REPLY_BYTES check below.
+            if reply.length > args.length.unwrap_or(read_contract::MAX_REPLY_BYTES)
                 || args.offset.is_some_and(|offset| offset != reply.offset)
                 || reply
                     .offset
@@ -197,16 +203,17 @@ pub(super) fn decode_reply(request: &WireRequest, value: &Value) -> Result<ReadR
             {
                 return Err(malformed(
                     "success",
-                    "job log byte range does not match its request or body",
+                    "job log byte range does not match its request",
                 ));
             }
             ReadReply::JobLog(reply)
         }
     };
-    if reply.bytes().map_err(decode_error)?.len() > REPLY_BYTES {
-        return Err(ReadError::Refused(
-            "governed read response exceeds 1 MiB; narrow the request".into(),
-        ));
+    let size = reply.bytes().map_err(decode_error)?.len();
+    if size > REPLY_BYTES {
+        return Err(ReadError::Refused(format!(
+            "governed read response is {size} bytes; cap is {REPLY_BYTES} bytes (1 MiB); narrow the request"
+        )));
     }
     Ok(reply)
 }

@@ -103,7 +103,14 @@ jobs:
         run: bun run --cwd packages/aft-bridge build
       - name: Governed-docs aggregate input validator
         run: |
-          git fetch --no-tags origin refs/tags/v0.48.1:refs/tags/v0.48.1
+          set -euo pipefail
+          # A runner that briefly cannot reach github.com must not fail the
+          # check: retry the tag fetch before giving up.
+          for attempt in 1 2 3; do
+            git fetch --no-tags origin refs/tags/v0.48.1:refs/tags/v0.48.1 && break
+            if [ "$attempt" = 3 ]; then exit 1; fi
+            sleep 20
+          done
           node scripts/release-gate-v049.mjs --check-inputs
 
   pr-checks:
@@ -124,6 +131,12 @@ jobs:
           node-version: "24"
       - name: Rust formatting
         run: cargo fmt --all -- --check
+      - name: Test-only secret vault stays out of release builds
+        # V5: fails when a dependency edge, a default feature or another crate
+        # would compile the fake vault into a shipped build.
+        run: |
+          bash scripts/check-secret-test-fake.test.sh
+          bash scripts/check-secret-test-fake.sh
       - name: Install workspace deps
         run: bun install --frozen-lockfile
       - name: Bun lint
@@ -136,12 +149,13 @@ jobs:
         run: |
           python3 --version
           python3 scripts/test-ci-rust-quality.py
+          bash scripts/test-ci-sccache-start.sh
           python3 -m unittest discover -s scripts/lib -p test_workflow_gates.py -v
           python3 -m unittest discover -s scripts/lib -p test_ci_rustc_cache.py -v
           python3 -m unittest discover -s scripts/lib -p test_rust_gate_collection.py -v
           python3 -m unittest discover -s scripts/lib -p test_ci_macos_integration_archive.py -v
           python3 -m unittest discover -s scripts/lib -p test_ci_windows_probes.py -v
-          python3 -m unittest discover -s scripts/lib -p test_ci_storm_controls.py -v
+          python3 -m unittest discover -s scripts/lib -p test_ci_storm_inventory.py -v
           python3 -m unittest discover -s scripts/lib -p test_cache_write_policy.py -v
           python3 -m unittest discover -s scripts/lib -p test_native_release_artifact.py -v
           python3 -m unittest discover -s scripts/lib -p test_native_release_workflow.py -v
@@ -207,38 +221,56 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         id: rust
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        continue-on-error: true
+      - name: Start compiler cache (fall back to uncached)
+        shell: bash
+        run: bash scripts/ci-sccache-start.sh
       # Executables include the commit's build provenance. Never restore a
       # fallback binary from another SHA or compiler, even with identical source.
       - uses: actions/cache/restore@v4
         id: release-binary
         with:
-          path: target/release/aft
-          key: search-quality-release-bin-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.cachekey }}-${{ github.sha }}
+          path: target/ci-storm/aft
+          key: search-quality-ci-storm-bin-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.cachekey }}-${{ github.sha }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: steps.release-binary.outputs.cache-hit != 'true'
         with:
-          shared-key: search-quality-release
+          shared-key: search-quality-ci-storm
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Build shared release AFT
+      # The scored benchmark uses the ci-storm profile (opt-level 3 like the
+      # shipped profile, but no LTO and 16 codegen units), not the shipped
+      # --release profile. Fat LTO with one codegen unit made this the longest
+      # merge-queue job: cold 8-vCPU builds took 16m29s and 20m04s with
+      # --release against 3m11s and 8m59s with ci-storm. The scores do not
+      # depend on the profile: Rust never enables fast-math, so LTO and
+      # codegen splitting cannot change floating-point results, and the
+      # benchmark scores rank order, never latency. Measured, not assumed:
+      # the gate's evaluate run (exact recall, concept recall, real query),
+      # repeated against both binaries from the same provisioned inputs,
+      # gave score.json files whose only difference was binary_sha256; all
+      # 103 real-query rows, ranked_paths included, were byte-identical.
+      # Shipped binaries are built by release.yml and stay fat LTO.
+      - name: Build shared search-quality AFT
         if: steps.release-binary.outputs.cache-hit != 'true'
-        run: cargo build --release --locked -p agent-file-tools --bin aft
+        run: cargo build --profile ci-storm --locked -p agent-file-tools --bin aft
         env:
-          RUSTC_WRAPPER: ${{ github.workspace }}/scripts/ci-rustc-cache.py
-      - name: Verify release executable can self-report
-        run: target/release/aft --version
+          # The measurement wrapper invokes sccache too; do not re-enable it after fallback.
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER != '' && format('{0}/scripts/ci-rustc-cache.py', github.workspace) || '' }}
+      - name: Verify search-quality executable can self-report
+        run: target/ci-storm/aft --version
       - uses: ./.github/actions/upload-artifact-retry
         with:
           name: search-quality-aft-${{ github.sha }}
-          path: target/release/aft
+          path: target/ci-storm/aft
           if-no-files-found: error
           retention-days: 1
 
-      - name: Save exact release executable on main
+      - name: Save exact search-quality executable on main
         if: ${{ github.ref == 'refs/heads/main' && steps.release-binary.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
-          path: target/release/aft
+          path: target/ci-storm/aft
           key: ${{ steps.release-binary.outputs.cache-primary-key }}
 
   search-quality-gate:
@@ -270,32 +302,34 @@ jobs:
           python3 benchmarks/aft-search/search_quality.py --mode check-descriptor \
             --base-ref "$PR_BASE_SHA" --head "$PR_HEAD_SHA" --branch "$QUALITY_BRANCH"
       # Deliberately a single attempt, not the retrying download action: when
-      # this download leaves target/release/aft absent, the next steps build
+      # this download leaves target/ci-storm/aft absent, the next steps build
       # the binary instead, so an artifact-service outage cannot fail the
       # check, and retrying would only delay that fallback by minutes when the
       # producing job did not upload.
-      - name: Download the shared release AFT
+      - name: Download the shared search-quality AFT
         if: ${{ github.event_name != 'pull_request' }}
         id: download-release-aft
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: search-quality-aft-${{ github.sha }}
-          path: target/release
-      - name: Check the shared release AFT
+          path: target/ci-storm
+      - name: Check the shared search-quality AFT
         if: ${{ github.event_name != 'pull_request' }}
         id: release-aft
         shell: bash
         run: |
-          if [[ -f target/release/aft ]]; then
-            chmod +x target/release/aft
+          if [[ -f target/ci-storm/aft ]]; then
+            chmod +x target/ci-storm/aft
             echo "available=true" >> "$GITHUB_OUTPUT"
           else
             echo "available=false" >> "$GITHUB_OUTPUT"
           fi
+      # Same ci-storm profile as the search-quality-binary job; see the
+      # comment on its build step for why the scores do not depend on it.
       - name: Build the product binary when the artifact is absent
         if: ${{ github.event_name != 'pull_request' && steps.release-aft.outputs.available != 'true' }}
-        run: cargo build --release --locked -p agent-file-tools --bin aft
+        run: cargo build --profile ci-storm --locked -p agent-file-tools --bin aft
       - name: Provision search-quality corpora at their pinned commits
         if: ${{ github.event_name != 'pull_request' }}
         # The only network-enabled step: evaluation itself runs offline against
@@ -314,7 +348,7 @@ jobs:
           QUALITY_BRANCH: ${{ github.event.pull_request.head.ref || github.ref_name }}
           AFT_SEARCH_NETWORK_POLICY: loopback-only
           AFT_SEARCH_CACHE_DIR: ${{ runner.temp }}/empty-aft-search-cache
-          AFT_BINARY_PATH: ${{ github.workspace }}/target/release/aft
+          AFT_BINARY_PATH: ${{ github.workspace }}/target/ci-storm/aft
         run: |
           # Capture this step from its FIRST line. Two earlier attempts put the
           # capture partway down and the step died above it, leaving an empty

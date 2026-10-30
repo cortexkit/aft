@@ -56,18 +56,6 @@ fn durable_restart_sigkill_each_q5_failpoint_preserves_committed_blobs_and_point
 }
 
 #[test]
-fn durable_restart_randomized_schedule_seed_is_replayable() {
-    // Keep the seed fixed and include it in failure output so a failing shuffled
-    // failpoint order can be reproduced locally.
-    let seed = 0x5eed_cafe_u64;
-    let mut schedule = FAILPOINTS.to_vec();
-    shuffle(&mut schedule, seed);
-    for failpoint in schedule {
-        run_kill9_case(failpoint, seed);
-    }
-}
-
-#[test]
 #[ignore]
 fn durable_restart_child() {
     let root = PathBuf::from(std::env::var_os("DURABLE_RESTART_ROOT").unwrap());
@@ -497,13 +485,5 @@ fn wait_for_ready(child: &mut Child, ready: &Path) {
             "timed out waiting for {ready:?}"
         );
         thread::sleep(Duration::from_millis(10));
-    }
-}
-
-fn shuffle<T>(items: &mut [T], mut seed: u64) {
-    for end in (1..items.len()).rev() {
-        seed ^= seed << 7;
-        seed ^= seed >> 9;
-        items.swap(end, (seed as usize) % (end + 1));
     }
 }

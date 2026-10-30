@@ -81,6 +81,9 @@ export function createRpcClient(child: ChildProcess): RpcClient {
     }
 
     if (message.type === "extension_ui_request") {
+      // Pi can flush UI frames after close() ends stdin. A closing client must
+      // not dispatch callbacks that could try to answer through that pipe.
+      if (closed) return;
       for (const handler of uiHandlers) handler(message);
       return;
     }

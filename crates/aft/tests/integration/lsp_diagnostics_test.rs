@@ -29,6 +29,7 @@ use tempfile::tempdir;
 #[cfg(unix)]
 use super::helpers::warm_executable;
 use super::helpers::{link_cached_executable, link_cached_path, AftProcess};
+use crate::test_helpers::real_rust_analyzer_available;
 
 fn fake_server_path() -> PathBuf {
     crate::test_helpers::fake_lsp::fake_server_binary()
@@ -131,12 +132,19 @@ fn collect_watched_file_events(manager: &mut LspManager) -> serde_json::Value {
 }
 
 fn collect_watched_file_events_from_ctx(ctx: &AppContext) -> serde_json::Value {
-    let event = collect_event(&mut ctx.lsp(), |event| {
-        matches!(
-            event,
-            LspEvent::Notification { method, .. } if method == "custom/watchedFilesChanged"
-        )
-    })
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let event = loop {
+        // An asynchronous post-write hook may need this manager to send its
+        // queued changes. Do not retain the guard while waiting for its notification.
+        let drained = ctx.lsp().drain_events();
+        if let Some(event) = drained.into_iter().find(|event| matches!(
+            event, LspEvent::Notification { method, .. } if method == "custom/watchedFilesChanged"
+        )) { break Some(event); }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
     .unwrap_or_else(|| {
         #[cfg(windows)]
         panic!(
@@ -259,9 +267,9 @@ fn pyright_diagnostics_for(
     // Start the server first so its startup does not use up the edit's
     // diagnostics budget, which production caps at 10 seconds.
     assert!(
-        !ctx.lsp()
-            .ensure_server_for_file(file, &ctx.config())
-            .is_empty(),
+        !crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| startup_manager
+            .ensure_server_for_file(file, &ctx.config()))
+        .is_empty(),
         "pyright should start for the fixture before diagnostics can be checked"
     );
 
@@ -483,9 +491,9 @@ fn pyright_edit_error_reaches_status_bar_alert_source_and_inline_diagnostics() {
         "configure failed: {configured:#}"
     );
     assert!(
-        !ctx.lsp()
-            .ensure_server_for_file(&file, &ctx.config())
-            .is_empty(),
+        !crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| startup_manager
+            .ensure_server_for_file(&file, &ctx.config()))
+        .is_empty(),
         "pyright should start for the fixture"
     );
 
@@ -901,23 +909,66 @@ fn move_file_reports_deleted_source_and_created_destination_for_config_file() {
     let json = serde_json::to_value(&response).expect("response serializes");
     assert_eq!(json["success"], true, "move failed: {json}");
 
-    let mut events = drain_watched_file_events_from_ctx(&ctx);
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while events.len() < 2 && Instant::now() < deadline {
+    // Both watched events arrive asynchronously from the move; a loaded runner
+    // can deliver them well after 2 s, so wait generously for them. The two
+    // events may arrive as two notifications (one per watched-file call) or
+    // together in a single notification carrying two FileEvents: when the
+    // second event is queued while the first is still waiting for delivery,
+    // both are sent together. Count FileEvents across notifications,
+    // not notifications.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut all_changes: Vec<serde_json::Value> = Vec::new();
+    loop {
+        for params in drain_watched_file_events_from_ctx(&ctx) {
+            if let Some(changes) = params["changes"].as_array() {
+                all_changes.extend(changes.iter().cloned());
+            }
+        }
+        let has_deleted_src = all_changes.iter().any(|change| {
+            change["uri"]
+                .as_str()
+                .is_some_and(|uri| uri.ends_with("/package.json") && !uri.contains("/moved/"))
+                && change["type"] == 3
+        });
+        let has_created_dst = all_changes.iter().any(|change| {
+            change["uri"]
+                .as_str()
+                .is_some_and(|uri| uri.ends_with("/moved/package.json"))
+                && change["type"] == 1
+        });
+        if has_deleted_src && has_created_dst {
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
         thread::sleep(Duration::from_millis(25));
-        events.extend(drain_watched_file_events_from_ctx(&ctx));
     }
     assert_eq!(
-        events.len(),
+        all_changes.len(),
         2,
-        "expected source and destination watched events"
+        "expected source and destination watched events, got: {all_changes:?}"
     );
-    let mut event_types = vec![
-        config_change_type(&events[0], "/package.json"),
-        config_change_type(&events[1], "/package.json"),
-    ];
-    event_types.sort_unstable();
-    assert_eq!(event_types, vec![1, 3]);
+    let has_deleted_src = all_changes.iter().any(|change| {
+        change["uri"]
+            .as_str()
+            .is_some_and(|uri| uri.ends_with("/package.json") && !uri.contains("/moved/"))
+            && change["type"] == 3
+    });
+    let has_created_dst = all_changes.iter().any(|change| {
+        change["uri"]
+            .as_str()
+            .is_some_and(|uri| uri.ends_with("/moved/package.json"))
+            && change["type"] == 1
+    });
+    assert!(
+        has_deleted_src,
+        "missing deleted event for the move source, got: {all_changes:?}"
+    );
+    assert!(
+        has_created_dst,
+        "missing created event for the move destination, got: {all_changes:?}"
+    );
 }
 
 #[test]
@@ -2078,7 +2129,10 @@ fn test_ensure_file_open_detects_disk_drift() {
 
     let mut manager = manager_with_fake_server();
     // Open the file the first time.
-    manager.ensure_file_open(file, &config).expect("first open");
+    crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_file_open(file, &config)
+    })
+    .expect("first open");
 
     let original_mtime = fs::metadata(file).unwrap().modified().unwrap();
 
@@ -2095,9 +2149,10 @@ fn test_ensure_file_open_detects_disk_drift() {
     // Drain anything queued and then re-open. Should re-sync (didChange).
     let _ = manager.drain_events();
 
-    manager
-        .ensure_file_open(file, &config)
-        .expect("re-open after drift");
+    crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+        startup_manager.ensure_file_open(file, &config)
+    })
+    .expect("re-open after drift");
 
     // The fake server emits "custom/documentChanged" on didChange. If
     // ensure_file_open detected drift, that notification arrives.
@@ -2934,13 +2989,6 @@ fn server_without_server_status_keeps_authoritative_behavior() {
     );
 }
 
-fn real_rust_analyzer_available() -> bool {
-    Command::new("rust-analyzer")
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
-}
-
 fn configured_rust_context(root: &std::path::Path) -> AppContext {
     configured_rust_context_with_lsp(root, serde_json::json!({}))
 }
@@ -3044,8 +3092,9 @@ fn poll_lsp_diagnostics(
 /// report the type error that only the full load can see.
 #[test]
 fn lsp_diagnostics_recovers_after_external_cargo_update_with_real_rust_analyzer() {
-    if !real_rust_analyzer_available() {
-        eprintln!("SKIP lsp_diagnostics_recovers_after_external_cargo_update_with_real_rust_analyzer: rust-analyzer is not installed");
+    if !real_rust_analyzer_available(
+        "lsp_diagnostics_recovers_after_external_cargo_update_with_real_rust_analyzer",
+    ) {
         return;
     }
     let temp_dir = tempdir().expect("tempdir");
@@ -3362,6 +3411,289 @@ fn forwarded_changes(root: &std::path::Path, params: &serde_json::Value) -> Vec<
     changes
 }
 
+mod mutation_events {
+    use super::*;
+
+    fn check(command: &str, operation: &str, expected: &[(&str, i64)]) {
+        check_subscribed(command, operation, expected, None);
+    }
+
+    fn check_subscribed(
+        command: &str,
+        operation: &str,
+        expected: &[(&str, i64)],
+        watchers: Option<serde_json::Value>,
+    ) {
+        let (_temp, root, files) = typescript_workspace_with_files(&["importer.ts", "before.ts"]);
+        let importer = &files[0];
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config {
+                project_root: Some(root.clone()),
+                format_on_edit: false,
+                ..Config::default()
+            }),
+        )
+        .with_test_checkpoint_store();
+        ctx.lsp()
+            .override_binary(ServerKind::TypeScript, fake_server_path());
+        if let Some(watchers) = watchers {
+            ctx.lsp()
+                .set_extra_env("AFT_FAKE_LSP_WATCHED_GLOBS", &watchers.to_string());
+        }
+        if operation == "ignored write" {
+            fs::write(root.join(".gitignore"), "src/after.ts\n").unwrap();
+            ctx.rebuild_gitignore();
+        }
+        let outcome = ctx.lsp_notify_and_collect_diagnostics(
+            importer,
+            "export const importer = 1;\n",
+            Duration::from_secs(15),
+        );
+        assert!(outcome.complete(), "fake server startup: {outcome:?}");
+        ctx.lsp().drain_events();
+
+        let (_other_temp, other_root, other_files) = typescript_workspace_with_files(&["other.ts"]);
+        let outcome = ctx.lsp_notify_and_collect_diagnostics(
+            &other_files[0],
+            "export const other = 1;\n",
+            Duration::from_secs(15),
+        );
+        assert!(
+            outcome.complete(),
+            "sibling fake server startup: {outcome:?}"
+        );
+        assert_eq!(
+            ctx.lsp().active_server_keys().len(),
+            2,
+            "two independent server roots"
+        );
+        ctx.lsp().drain_events();
+
+        let before = root.join("src/before.ts");
+        let after = root.join("src/after.ts");
+        let params = match operation {
+            "write" | "queued write" | "ignored write" | "recreate" => {
+                serde_json::json!({"file": after, "content": "export const added = 1;\n"})
+            }
+            "edit" => serde_json::json!({"file": before, "content": "export const value = 2;\n"}),
+            "delete" => serde_json::json!({"file": before}),
+            "move" => serde_json::json!({"file": before, "destination": after}),
+            "add hunk" => serde_json::json!({"patch_text": format!(
+                "*** Begin Patch\n*** Add File: {}\n+export const added = 1;\n*** End Patch", after.display())}),
+            "delete hunk" => serde_json::json!({"patch_text": format!(
+                "*** Begin Patch\n*** Delete File: {}\n*** End Patch", before.display())}),
+            "move hunk" => serde_json::json!({"patch_text": format!(
+                "*** Begin Patch\n*** Update File: {}\n*** Move to: {}\n@@\n-export const value = 1;\n+export const value = 2;\n*** End Patch", before.display(), after.display())}),
+            _ => panic!("unknown operation"),
+        };
+        let req = RawRequest {
+            id: operation.into(),
+            command: command.into(),
+            params,
+            lsp_hints: None,
+            session_id: None,
+        };
+        let held = (operation == "queued write").then(|| ctx.lsp());
+        let response = match command {
+            "write" => handle_write(&req, &ctx),
+            "delete_file" => handle_delete_file(&req, &ctx),
+            "move_file" => handle_move_file(&req, &ctx),
+            "apply_patch" => aft::commands::apply_patch::handle_apply_patch(&req, &ctx),
+            _ => panic!("unknown command"),
+        };
+        drop(held);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while ctx.lsp_pending_changes_for_test() {
+            assert!(
+                Instant::now() < deadline,
+                "mutation events did not drain after contention"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let response = serde_json::to_value(response).unwrap();
+        assert_eq!(response["success"], true, "{operation}: {response:#}");
+
+        if operation == "recreate" {
+            let req: RawRequest = serde_json::from_value(
+                serde_json::json!({"id": "delete-again", "command": "delete_file", "file": after}),
+            )
+            .unwrap();
+            assert!(handle_delete_file(&req, &ctx).success);
+            let req: RawRequest = serde_json::from_value(serde_json::json!({"id": "create-again", "command": "write", "file": after, "content": "export const added = 1;\n"})).unwrap();
+            assert!(handle_write(&req, &ctx).success);
+        }
+
+        // A single watcher echo is coalesced, then its bookkeeping is released.
+        // Exercise path-only OS events and a typed create delayed past an edit.
+        let final_events = expected
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let echoes = final_events
+            .iter()
+            .map(|(path, kind)| {
+                (
+                    root.join(path),
+                    if *kind == 1 {
+                        FileChangeType::CREATED
+                    } else {
+                        FileChangeType::DELETED
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        if operation == "write" {
+            let req: RawRequest = serde_json::from_value(serde_json::json!({"id": "edit-created", "command": "write", "file": after, "content": "export const added = 123456;\n"})).unwrap();
+            assert!(handle_write(&req, &ctx).success);
+            // An old create event can arrive after a later content edit. It
+            // still describes the same creation, not another new module.
+            ctx.lsp().forward_watcher_file_events(&echoes, &[]);
+        } else {
+            ctx.lsp_forward_watcher_file_events(
+                &echoes
+                    .iter()
+                    .map(|(path, _)| path.clone())
+                    .collect::<Vec<_>>(),
+            );
+        }
+
+        // The importer is untouched by the mutation. Its acknowledgement is a
+        // protocol barrier: every earlier watched-file event has been echoed.
+        // AFT sends the resolved path (macOS temp dirs resolve /var to
+        // /private/var), so the barrier must compare against that spelling.
+        let importer_uri =
+            aft::lsp::position::uri_for_path(&crate::helpers::canonicalize_like_product(importer))
+                .unwrap();
+        ctx.lsp()
+            .notify_file_changed(importer, "export const importer = 2;\n", &ctx.config())
+            .unwrap();
+        let mut actual = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        'wait: loop {
+            assert!(Instant::now() < deadline, "missing importer barrier");
+            for event in ctx.lsp().drain_events() {
+                if let LspEvent::Notification {
+                    method,
+                    params: Some(params),
+                    ..
+                } = event
+                {
+                    if method == "custom/watchedFilesChanged" {
+                        actual.extend(forwarded_changes(&root, &params));
+                    } else if method == "custom/documentChanged"
+                        && params["uri"] == importer_uri.as_str()
+                    {
+                        break 'wait;
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        actual.sort();
+        let (other_events, _) =
+            server_reports_before_barrier(&ctx, &other_files[0], "export const other = 2;\n");
+        assert!(
+            other_events.is_empty(),
+            "server rooted at {} received another root's mutation: {other_events:?}",
+            other_root.display()
+        );
+        let mut expected = expected
+            .iter()
+            .map(|(path, kind)| (path.to_string(), *kind))
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(
+            actual, expected,
+            "{operation} must report exact lifecycle events"
+        );
+    }
+
+    #[test]
+    fn lsp_mutation_write_created() {
+        check("write", "write", &[("src/after.ts", 1)]);
+    }
+    #[test]
+    fn lsp_mutation_delete_deleted() {
+        check("delete_file", "delete", &[("src/before.ts", 3)]);
+    }
+    #[test]
+    fn lsp_mutation_move_deleted_created() {
+        check(
+            "move_file",
+            "move",
+            &[("src/after.ts", 1), ("src/before.ts", 3)],
+        );
+    }
+    #[test]
+    fn lsp_mutation_patch_add_created() {
+        check("apply_patch", "add hunk", &[("src/after.ts", 1)]);
+    }
+    #[test]
+    fn lsp_mutation_patch_delete_deleted() {
+        check("apply_patch", "delete hunk", &[("src/before.ts", 3)]);
+    }
+    #[test]
+    fn lsp_mutation_patch_move_deleted_created() {
+        check(
+            "apply_patch",
+            "move hunk",
+            &[("src/after.ts", 1), ("src/before.ts", 3)],
+        );
+    }
+    #[test]
+    fn lsp_mutation_existing_content_keeps_document_notifications_only() {
+        check("write", "edit", &[]);
+    }
+    #[test]
+    fn lsp_mutation_create_survives_busy_manager() {
+        check("write", "queued write", &[("src/after.ts", 1)]);
+    }
+    #[test]
+    fn lsp_mutation_create_ignored_source_still_notifies_server() {
+        check("write", "ignored write", &[("src/after.ts", 1)]);
+    }
+    #[test]
+    fn lsp_mutation_create_respects_registered_glob() {
+        check_subscribed(
+            "write",
+            "write",
+            &[],
+            Some(serde_json::json!([{"globPattern": "**/*.js"}])),
+        );
+    }
+    #[test]
+    fn lsp_mutation_create_respects_registered_kind() {
+        check_subscribed(
+            "write",
+            "write",
+            &[],
+            Some(serde_json::json!([{"globPattern": "**/*.ts", "kind": 4}])),
+        );
+    }
+    #[test]
+    fn lsp_mutation_delete_then_recreate_reports_each_transition() {
+        check(
+            "write",
+            "recreate",
+            &[
+                ("src/after.ts", 1),
+                ("src/after.ts", 3),
+                ("src/after.ts", 1),
+            ],
+        );
+    }
+    #[test]
+    fn lsp_mutation_recreate_with_creation_only_subscription() {
+        check_subscribed(
+            "write",
+            "recreate",
+            &[("src/after.ts", 1), ("src/after.ts", 1)],
+            Some(serde_json::json!([{"globPattern": "**/*.ts", "kind": 1}])),
+        );
+    }
+}
+
 #[test]
 fn watcher_drain_forwards_only_changes_matching_registered_watchers() {
     let (_temp_dir, root, file, ctx, watcher_tx) = fake_rust_server_with_watcher(|root| {
@@ -3428,7 +3760,7 @@ fn watcher_drain_forwards_nothing_to_a_server_without_watched_file_support() {
 }
 
 #[test]
-fn watcher_drain_forwards_config_files_to_a_server_without_registered_globs() {
+fn watcher_drain_ignores_echoed_client_capabilities_without_registration() {
     let (_temp_dir, root, file, ctx, watcher_tx) =
         fake_rust_server_with_watcher(|_| env_pair("AFT_FAKE_LSP_STATIC_WATCHED_FILES_ONLY", "1"));
     fs::write(root.join("Cargo.lock"), "version = 4\n").expect("write lockfile");
@@ -3443,11 +3775,9 @@ fn watcher_drain_forwards_config_files_to_a_server_without_registered_globs() {
     drain_watcher_events(&ctx);
 
     let (watched, _) = server_reports_before_barrier(&ctx, &file, "fn main() { 1; }\n");
-    assert_eq!(watched.len(), 1, "{watched:?}");
-    assert_eq!(
-        forwarded_changes(&root, &watched[0]),
-        vec![("Cargo.lock".to_string(), 2), ("Cargo.toml".to_string(), 2)],
-        "without globs, only project configuration files are forwarded"
+    assert!(
+        watched.is_empty(),
+        "an echoed client capability is not a subscription: {watched:?}"
     );
 }
 
@@ -3484,6 +3814,240 @@ fn watcher_overflow_sends_no_per_file_flood() {
     assert!(
         watched.is_empty(),
         "a rescan sends no per-file notifications: {watched:?}"
+    );
+}
+
+#[test]
+fn workspace_unchanged_reply_does_not_relabel_an_interleaved_report() {
+    for replacement_id in [None, Some(None), Some(Some("B"))] {
+        let (_temp, root, files) = rust_workspace_with_files(&["main.rs"]);
+        let config = Config {
+            project_root: Some(root),
+            ..Config::default()
+        };
+        let mut manager = LspManager::new();
+        manager.override_binary(ServerKind::Rust, fake_server_path());
+        for name in [
+            "AFT_FAKE_LSP_PULL",
+            "AFT_FAKE_LSP_WORKSPACE",
+            "AFT_FAKE_LSP_WS_UNCHANGED",
+        ] {
+            manager.set_extra_env(name, "1");
+        }
+        let keys = crate::test_helpers::settled_lsp(&mut manager, |startup_manager| {
+            startup_manager.ensure_server_for_file(&files[0], &config)
+        });
+        assert_eq!(keys.len(), 1, "workspace producer must start");
+        let key = &keys[0];
+        let file = key.root.join("src/main.rs");
+        let diagnostics = |message| {
+            aft::lsp::diagnostics::from_lsp_diagnostics(
+                file.clone(),
+                vec![serde_json::from_value(serde_json::json!({
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                "message": message, "severity": 1
+            })).unwrap()],
+                &key.kind,
+            )
+        };
+        manager
+            .diagnostics_store_mut_for_test()
+            .publish_full_with_provisional(
+                key.clone(),
+                file.clone(),
+                diagnostics("A"),
+                Some("A".into()),
+                Some(1),
+                false,
+            );
+        let manager = parking_lot::Mutex::new(manager);
+        let locks = std::cell::Cell::new(0);
+        let result = aft::lsp::manager::pull_workspace_diagnostics_unlocked(
+            || {
+                let mut manager = manager.lock();
+                locks.set(locks.get() + 1);
+                if locks.get() == 2 {
+                    // The second lock is the completion hook, after the request
+                    // has been sent and awaited without owning the manager.
+                    if let Some(result_id) = replacement_id {
+                        manager
+                            .diagnostics_store_mut_for_test()
+                            .publish_full_with_provisional(
+                                key.clone(),
+                                file.clone(),
+                                diagnostics("B"),
+                                result_id.map(str::to_owned),
+                                Some(2),
+                                false,
+                            );
+                    }
+                }
+                manager
+            },
+            key,
+            Some(Duration::from_secs(5)),
+        )
+        .unwrap();
+        assert_eq!(
+            locks.get(),
+            2,
+            "the interleaving hook must run after request submission"
+        );
+        let current = manager
+            .lock()
+            .diagnostics_store_for_test()
+            .entries_for_file(&file)
+            .into_iter()
+            .find(|(server, _)| **server == *key)
+            .map(|(_, entry)| entry.clone())
+            .expect("the cached report must remain present");
+        if let Some(result_id) = replacement_id {
+            assert_eq!(current.diagnostics[0].message, "B");
+            assert_eq!(
+                current.result_id.as_deref(),
+                result_id,
+                "an unchanged verdict for A must not relabel the replacement report B"
+            );
+            assert_eq!(
+                current.version,
+                Some(2),
+                "the replacement's version must remain intact"
+            );
+            assert!(
+                !result.complete,
+                "a rejected unchanged item is not a complete workspace report"
+            );
+            assert!(!result.files_reported.contains(&file));
+        } else {
+            assert_eq!(current.diagnostics[0].message, "A");
+            assert_eq!(current.result_id.as_deref(), Some("next-A"));
+            assert_eq!(current.version, Some(99));
+            assert!(
+                result.complete,
+                "a matching unchanged reply must remain usable"
+            );
+            assert_eq!(result.files_reported, vec![file]);
+        }
+    }
+}
+
+#[test]
+fn overflowing_document_backlog_leaves_disjoint_unchanged_documents_unsent() {
+    let (_temp, root, files) = rust_workspace_with_files(&["main.rs", "probe.rs"]);
+    fs::write(root.join("pyproject.toml"), "[project]\nname = \"demo\"\n").unwrap();
+    let python = root.join("main.py");
+    fs::write(&python, "pass\n").unwrap();
+    let log = root.join("did-change.jsonl");
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        crate::context_storage::isolate(Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        }),
+    )
+    .with_test_checkpoint_store();
+    {
+        let mut manager = ctx.lsp();
+        manager.override_binary(ServerKind::Rust, fake_server_path());
+        manager.override_binary(ServerKind::Python, fake_server_path());
+        manager.set_extra_env("AFT_FAKE_LSP_DID_CHANGE_LOG", log.to_str().unwrap());
+    }
+    let documents = [
+        (files[0].clone(), "fn main() {}\n", ServerKind::Rust),
+        (python, "pass\n", ServerKind::Python),
+    ];
+    let config = ctx.config();
+    let mut before = Vec::new();
+    for (file, content, kind) in &documents {
+        let versions = ctx
+            .lsp()
+            .notify_file_changed_versioned(file, content, &config)
+            .unwrap();
+        assert_eq!(versions.len(), 1, "one producer must own {file:?}");
+        assert_eq!(&versions[0].0.kind, kind);
+        wait_for_publish(&mut ctx.lsp());
+        let snapshot = ctx.lsp().snapshot_pre_edit_state(file);
+        assert_eq!(
+            snapshot.len(),
+            1,
+            "each file must be open in only one store"
+        );
+        assert_eq!(
+            snapshot
+                .get(&versions[0].0)
+                .expect("owning store must be captured")
+                .document_version_at_capture,
+            Some(0)
+        );
+        before.push(snapshot);
+    }
+    assert_ne!(before[0].keys().next(), before[1].keys().next());
+    let probe = &files[1];
+    ctx.lsp()
+        .notify_file_changed_versioned(probe, "fn main() {}\n", &config)
+        .unwrap();
+    wait_for_publish(&mut ctx.lsp());
+    fs::write(probe, "fn main() { 1; }\n").unwrap();
+    {
+        let _held = ctx.lsp();
+        // The helper may take one full batch before blocking on this lock.
+        // A second full batch plus one path guarantees that a batch overflows.
+        for index in 0..=2 * aft::lsp::pending_changes::PENDING_LSP_DOCUMENTS_CAP {
+            ctx.lsp_notify_file_changed(&root.join(format!("noise-{index}.rs")), "ignored");
+        }
+        assert!(
+            ctx.lsp_pending_changes_for_test(),
+            "the held manager must retain the overflowing backlog"
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while ctx.lsp_pending_changes_for_test() {
+        assert!(Instant::now() < deadline, "overflow backlog did not drain");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let probe_state = ctx.lsp().snapshot_pre_edit_state(probe);
+    assert_eq!(
+        probe_state
+            .values()
+            .next()
+            .expect("probe must remain open")
+            .document_version_at_capture,
+        Some(1),
+        "the unqueued disk change must prove an overflow resync ran"
+    );
+    for ((file, _, _), previous) in documents.iter().zip(&before) {
+        let current = ctx.lsp().snapshot_pre_edit_state(file);
+        assert_eq!(
+            current.len(),
+            1,
+            "only the owning store must contain {file:?}"
+        );
+        for (key, snapshot) in previous {
+            assert_eq!(
+                current
+                    .get(key)
+                    .expect("owning producer must remain open")
+                    .document_version_at_capture,
+                snapshot.document_version_at_capture,
+                "overflow must not send didChange for unchanged {file:?} absent from another store"
+            );
+        }
+    }
+    let probe_ack = collect_event(&mut ctx.lsp(), |event| {
+        matches!(event,
+        LspEvent::Notification { method, .. } if method == "custom/documentChanged")
+    });
+    assert!(probe_ack.is_some(), "overflow probe must reach its server");
+    // The probe acknowledgement is consumed. FIFO acknowledgements for these
+    // barriers account for exactly two additional changes in the log.
+    for (file, content, _) in &documents {
+        server_reports_before_barrier(&ctx, file, content);
+    }
+    let changes = fs::read_to_string(&log).expect("barrier changes must be logged");
+    assert_eq!(
+        changes.lines().count(),
+        3,
+        "only the drifted probe and two barriers may send didChange: {changes}"
     );
 }
 
@@ -3715,7 +4279,10 @@ fn main() {
     println!("cargo:rerun-if-changed=src/lib.rs");
     if std::path::Path::new("armed").exists() {
         let out = std::env::var("OUT_DIR").unwrap();
-        std::fs::write("check-started", &out).unwrap();
+        // Rename into place so the test never reads the file between its
+        // creation and the write (it once read an empty path that way).
+        std::fs::write("check-started.tmp", &out).unwrap();
+        std::fs::rename("check-started.tmp", "check-started").unwrap();
         std::thread::sleep(std::time::Duration::from_secs(8));
     }
 }

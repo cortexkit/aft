@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "views-policy-walk"
+  ],
+  "note": "Views checkout verification: policy discovery skips ignored directories and treats non-file policy names as absent; I/O errors name their operation and path. No changed path matches RANKING_FENCE_PREFIXES."
+}

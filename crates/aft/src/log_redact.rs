@@ -21,6 +21,11 @@
 //! Deliberately NOT masked: bare `key=value` fields outside a URL query. AFT's
 //! own structured lines use `key=` for index keys, and masking them would
 //! destroy the forensic value of the log.
+//!
+//! Shell commands quoted in a log line additionally go through
+//! [`redact_command`], which masks credentials typed inline in a command
+//! (`GITHUB_TOKEN=...`, `--password ...`). Those shapes are command-only for
+//! the reason above.
 
 use std::borrow::Cow;
 use std::sync::LazyLock;
@@ -94,6 +99,698 @@ static KEY_QUERY: LazyLock<Regex> = LazyLock::new(|| compile(r#"(?i)([?&]key=)([
 /// contains nothing to mask, so the common case allocates nothing.
 pub fn aft_redactor(text: &str) -> Cow<'_, str> {
     redact_with_range(text, None)
+}
+
+// Shell-command credential shapes. These are applied only to command text
+// (see [`redact_command`]), not to every log line: AFT's own structured log
+// fields are lowercase `key=value` pairs and must stay readable.
+//
+// The leading `(^|[^...])` group stands in for a look-behind, which the regex
+// crate lacks; replacements re-emit it.
+
+/// One whole shell word, as the shell would read it: single-quoted runs,
+/// double-quoted runs with backslash escapes, backslash-escaped characters
+/// and plain characters, concatenated (`'a'"b"c`, `my\ pass`), up to the
+/// next unquoted whitespace or shell operator. A quote left open runs to the
+/// end of the text. `<` ends a word, so an already-masked value is never
+/// matched again.
+macro_rules! shell_word {
+    () => {
+        r#"(?:'[^']*'?|"(?:\\[\s\S]|[^"\\])*"?|\\[\s\S]?|[^\s;&|<>()'"\\])+"#
+    };
+}
+
+/// `NAME=value` where NAME is UPPER_SNAKE and contains a credential word,
+/// at its start or after other letters, followed by `=` or `_` (`TOKEN=`,
+/// `GITHUB_TOKEN=`, `export DB_PASSWORD=`, `AWS_SECRET_ACCESS_KEY_ID=`).
+/// Plain substrings do not count: `MAX_TOKENS`, `TOKENIZERS_PARALLELISM`,
+/// `GIT_AUTHOR_NAME` and `GH_SHIM_BYPASS` stay.
+static COMMAND_SECRET_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
+    compile(concat!(
+        r#"(^|[^A-Za-z0-9_])((?:[A-Z][A-Z0-9_]*?)?(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIALS?|APIKEY|API_KEY|ACCESS_KEY|PRIVATE_KEY|AUTH_KEY|_KEY|_PAT|_AUTH)(?:_[A-Z0-9]+)*=)("#,
+        shell_word!(),
+        ")"
+    ))
+});
+/// Assignment names ending in one of these name where a credential lives or
+/// who owns it, not the credential (`SSH_KEY_PATH=`, `AWS_ACCESS_KEY_ID=`).
+const COMMAND_NON_SECRET_NAME_SUFFIXES: [&str; 16] = [
+    "_PATH=",
+    "_FILE=",
+    "_DIR=",
+    "_NAME=",
+    "_URL=",
+    "_ID=",
+    "_HOST=",
+    "_PORT=",
+    "_USER=",
+    "_USERNAME=",
+    "_ENV=",
+    "_COUNT=",
+    "_LEN=",
+    "_LENGTH=",
+    "_TTL=",
+    "_MODE=",
+];
+/// Long options whose value is a credential, as `--flag=value` or
+/// `--flag value`. `--secret` is deliberately absent: gcloud and others use it
+/// for a secret's name.
+static COMMAND_SECRET_FLAG: LazyLock<Regex> = LazyLock::new(|| {
+    compile(concat!(
+        r#"(^|[^A-Za-z0-9_-])(--(?:password|passwd|pass|token|api-key|apikey|client-secret|auth-token|access-token|bearer)(?:=|[ \t]+))("#,
+        shell_word!(),
+        ")"
+    ))
+});
+/// How deep [`mask_tool_passwords`] looks into quoted strings and
+/// substitutions that hold a command of their own (`bash -c "curl ..."`,
+/// `$(curl ...)`). A quoted substitution (`"$(...)"`) takes two levels.
+const QUOTED_COMMAND_DEPTH: usize = 8;
+
+/// The longest command prefix [`mask_tool_passwords`] scans. Anything past
+/// it is masked whole rather than logged unscanned, which keeps the work on
+/// a huge command bounded without letting its tail through.
+const MAX_SCANNED_COMMAND_BYTES: usize = 1 << 20;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShellTokenKind {
+    Word,
+    /// A redirection with its target (`<f`, `> f`, `2>&1`, `<<<word`). It is
+    /// neither an argument nor the value of the option before it.
+    Redirect,
+}
+
+#[derive(Clone)]
+struct ShellToken {
+    kind: ShellTokenKind,
+    range: std::ops::Range<usize>,
+}
+
+/// Bytes that separate words without ending the command: every ASCII
+/// whitespace byte except the newline (space, tab, carriage return, vertical
+/// tab, form feed; `u8::is_ascii_whitespace` leaves out the vertical tab).
+/// The command loop skips exactly these and the word scan stops at exactly
+/// these, so every byte a word stops at is one the loop around it consumes.
+fn is_shell_blank(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\r' | b'\x0b' | b'\x0c')
+}
+
+/// Bytes that end a word: blanks, plus the bytes that start an operator or
+/// end a command. The command loop has an arm for each of them.
+fn ends_shell_word(byte: u8) -> bool {
+    is_shell_blank(byte) || matches!(byte, b'\n' | b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')')
+}
+
+/// Whether a process substitution (`<(` or `>(`) starts at `at`.
+fn starts_process_substitution(bytes: &[u8], at: usize) -> bool {
+    matches!(bytes.get(at), Some(b'<' | b'>')) && bytes.get(at + 1) == Some(&b'(')
+}
+
+/// The index of the `)` that closes a substitution whose body starts at
+/// `from`, or the end of `text` when it never closes. Quotes, backticks and
+/// escapes inside are skipped; nested parentheses are counted.
+fn substitution_end(text: &str, from: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut depth = 1;
+    let mut at = from;
+    while at < bytes.len() {
+        note_shell_scan_steps(1);
+        match bytes[at] {
+            b'\\' => at += 2,
+            b'\'' => at = skip_single_quoted(text, at),
+            b'"' => at = skip_double_quoted(bytes, at),
+            b'`' => at = backtick_end(bytes, at + 1) + 1,
+            b'(' => {
+                depth += 1;
+                at += 1;
+            }
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return at;
+                }
+                at += 1;
+            }
+            _ => at += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// The index just past the single-quoted run opening at `at`.
+fn skip_single_quoted(text: &str, at: usize) -> usize {
+    text[at + 1..]
+        .find('\'')
+        .map_or(text.len(), |offset| at + 1 + offset + 1)
+}
+
+/// The index just past the double-quoted run opening at `at`.
+fn skip_double_quoted(bytes: &[u8], at: usize) -> usize {
+    let mut close = at + 1;
+    while close < bytes.len() && bytes[close] != b'"' {
+        close += if bytes[close] == b'\\' { 2 } else { 1 };
+    }
+    (close + 1).min(bytes.len())
+}
+
+/// The index of the backtick that closes a substitution whose body starts
+/// at `from`, or the end of the text.
+fn backtick_end(bytes: &[u8], from: usize) -> usize {
+    let mut at = from;
+    while at < bytes.len() && bytes[at] != b'`' {
+        at += if bytes[at] == b'\\' { 2 } else { 1 };
+    }
+    at.min(bytes.len())
+}
+
+/// Split `text` into simple commands of words and redirections, reading it
+/// as the shell would: quotes and backslashes keep operators inside a word;
+/// a command substitution (`$( ... )`, backticks) or process substitution
+/// (`<( ... )`, `>( ... )`) is part of the word it appears in, so the
+/// command around it carries on after it closes; an unquoted `;`, `&`, `|`,
+/// newline, `(` or `)` ends a command (a subshell is a command of its own);
+/// a backslash-newline continues the line; redirections may be attached to
+/// a word or spaced from it. Also returns the inside of every quoted run and
+/// substitution, which [`collect_tool_password_masks`] scans as a command of
+/// its own one level down.
+fn split_shell_commands(text: &str) -> (Vec<Vec<ShellToken>>, Vec<std::ops::Range<usize>>) {
+    let bytes = text.as_bytes();
+    let mut commands = vec![Vec::new()];
+    let mut quoted = Vec::new();
+    let end_command = |commands: &mut Vec<Vec<ShellToken>>| {
+        if !commands.last().is_some_and(Vec::is_empty) {
+            commands.push(Vec::new());
+        }
+    };
+    let mut at = 0;
+    while at < bytes.len() {
+        note_shell_scan_steps(1);
+        let before = at;
+        match bytes[at] {
+            byte if is_shell_blank(byte) => at += 1,
+            b'\\' if bytes.get(at + 1) == Some(&b'\n') => at += 2,
+            b'\n' | b';' | b'(' | b')' => {
+                end_command(&mut commands);
+                at += 1;
+            }
+            b'|' => {
+                end_command(&mut commands);
+                at += 1 + usize::from(matches!(bytes.get(at + 1), Some(b'|' | b'&')));
+            }
+            b'&' if bytes.get(at + 1) != Some(&b'>') => {
+                end_command(&mut commands);
+                at += 1 + usize::from(bytes.get(at + 1) == Some(&b'&'));
+            }
+            b'&' | b'<' | b'>' if !starts_process_substitution(bytes, at) => {
+                let (token, next) = scan_redirect(text, at, &mut quoted);
+                commands.last_mut().unwrap().push(token);
+                at = next;
+            }
+            _ => {
+                let next = scan_shell_word(text, at, &mut quoted);
+                // A file-descriptor number attached to a redirection (`2>`).
+                if text[at..next].bytes().all(|byte| byte.is_ascii_digit())
+                    && matches!(bytes.get(next), Some(b'<' | b'>'))
+                {
+                    let (mut token, after) = scan_redirect(text, next, &mut quoted);
+                    token.range.start = at;
+                    commands.last_mut().unwrap().push(token);
+                    at = after;
+                } else {
+                    commands.last_mut().unwrap().push(ShellToken {
+                        kind: ShellTokenKind::Word,
+                        range: at..next,
+                    });
+                    at = next;
+                }
+            }
+        }
+        // Every arm above consumes at least one byte: the word arm is only
+        // reached on a byte that does not end a word, or on the `<(` / `>(`
+        // that opens a process substitution, which the word scan consumes
+        // whole. Should a future change
+        // break that, step over one character rather than loop forever on
+        // a spawn path.
+        if at <= before {
+            debug_assert!(false, "shell scan stalled at byte {before} of {text:?}");
+            at = before + text[before..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    (commands, quoted)
+}
+
+/// The end of the shell word starting at `start`, recording the inside of
+/// each quoted run. An unclosed quote runs to the end of `text`.
+fn scan_shell_word(text: &str, start: usize, quoted: &mut Vec<std::ops::Range<usize>>) -> usize {
+    let bytes = text.as_bytes();
+    let mut at = start;
+    while at < bytes.len() {
+        note_shell_scan_steps(1);
+        match bytes[at] {
+            b'\'' => {
+                let close = text[at + 1..]
+                    .find('\'')
+                    .map_or(bytes.len(), |off| at + 1 + off);
+                quoted.push(at + 1..close);
+                at = (close + 1).min(bytes.len());
+            }
+            b'"' => {
+                let mut close = at + 1;
+                while close < bytes.len() && bytes[close] != b'"' {
+                    close += if bytes[close] == b'\\' { 2 } else { 1 };
+                }
+                let close = close.min(bytes.len());
+                quoted.push(at + 1..close);
+                at = (close + 1).min(bytes.len());
+            }
+            b'\\' => at = (at + 2).min(bytes.len()),
+            // A substitution belongs to the word around it; its body is
+            // scanned as a command one level down.
+            b'$' if bytes.get(at + 1) == Some(&b'(') => {
+                let close = substitution_end(text, at + 2);
+                quoted.push(at + 2..close);
+                at = (close + 1).min(bytes.len());
+            }
+            b'<' | b'>' if starts_process_substitution(bytes, at) => {
+                let close = substitution_end(text, at + 2);
+                quoted.push(at + 2..close);
+                at = (close + 1).min(bytes.len());
+            }
+            b'`' => {
+                let close = backtick_end(bytes, at + 1);
+                quoted.push(at + 1..close);
+                at = (close + 1).min(bytes.len());
+            }
+            byte if ends_shell_word(byte) => break,
+            _ => at += 1,
+        }
+    }
+    // Stay on a character boundary after a backslash before a multibyte char.
+    while !text.is_char_boundary(at) {
+        at += 1;
+    }
+    at
+}
+
+/// A redirection operator at `start` (`<`, `>>`, `<<<`, `>&`, `&>`, `>|`,
+/// `<<-`) and its target word, attached or after spaces, if one follows.
+fn scan_redirect(
+    text: &str,
+    start: usize,
+    quoted: &mut Vec<std::ops::Range<usize>>,
+) -> (ShellToken, usize) {
+    let bytes = text.as_bytes();
+    let mut at = start + usize::from(bytes[start] == b'&');
+    let mut arrows = 0;
+    while arrows < 3 && matches!(bytes.get(at), Some(b'<' | b'>')) {
+        at += 1;
+        arrows += 1;
+    }
+    if matches!(bytes.get(at), Some(b'&' | b'|' | b'-')) {
+        at += 1;
+    }
+    let mut target = at;
+    while bytes.get(target).is_some_and(|byte| is_shell_blank(*byte)) {
+        target += 1;
+    }
+    let starts_word = bytes
+        .get(target)
+        .is_some_and(|byte| !ends_shell_word(*byte));
+    if starts_word {
+        at = scan_shell_word(text, target, quoted);
+    }
+    (
+        ShellToken {
+            kind: ShellTokenKind::Redirect,
+            range: start..at,
+        },
+        at,
+    )
+}
+
+/// A shell word as the program sees it: quotes removed, escapes resolved.
+fn unquote_shell_word(word: &str) -> String {
+    let mut out = String::with_capacity(word.len());
+    let mut chars = word.chars();
+    let mut quote = None;
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (None, '\'' | '"') => quote = Some(ch),
+            (Some(open), _) if ch == open => quote = None,
+            (Some('\''), _) => out.push(ch),
+            (_, '\\') => {
+                if let Some(next) = chars.next() {
+                    if next != '\n' {
+                        out.push(next);
+                    }
+                }
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Mask the passwords that curl (`-u`/`--user`), the MySQL family (`-p<pw>`)
+/// and sshpass (`-p pw`) take on the command line, wherever those programs
+/// run in `command`: after assignments or wrappers (`env`, `sudo`,
+/// `command`), inside subshells and substitutions, across continuation
+/// lines, and inside a quoted string handed to another shell.
+fn mask_tool_passwords(command: &str) -> Cow<'_, str> {
+    if !["curl", "mysql", "mariadb", "sshpass"]
+        .iter()
+        .any(|program| command.contains(program))
+    {
+        return Cow::Borrowed(command);
+    }
+    let mut masks = Vec::new();
+    let scanned = crate::compress::generic::floor_char_boundary(
+        command,
+        command.len().min(MAX_SCANNED_COMMAND_BYTES),
+    );
+    collect_tool_password_masks(&command[..scanned], 0, 0, &mut masks);
+    if scanned < command.len() {
+        masks.push((scanned..command.len(), SECRET_PLACEHOLDER.to_string()));
+    }
+    if masks.is_empty() {
+        return Cow::Borrowed(command);
+    }
+    masks.sort_by_key(|(range, _): &(std::ops::Range<usize>, String)| range.start);
+    let mut out = String::with_capacity(command.len());
+    let mut copied = 0;
+    for (range, replacement) in masks {
+        if range.start < copied {
+            // Overlaps a span already replaced: drop the rest of this span
+            // too, so no byte of either one is written out.
+            copied = copied.max(range.end);
+            continue;
+        }
+        out.push_str(&command[copied..range.start]);
+        out.push_str(&replacement);
+        copied = range.end;
+    }
+    out.push_str(&command[copied..]);
+    if out == command {
+        Cow::Borrowed(command)
+    } else {
+        Cow::Owned(out)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Bytes tokenized plus tokens visited by the tool-password scan, so a
+    /// test can check the work stays linear in the command's length.
+    static SHELL_SCAN_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// A test's step budget: exceeding it panics at once, so a superlinear
+    /// scan fails quickly instead of running for hours on a large command.
+    static SHELL_SCAN_BUDGET: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
+#[cfg(test)]
+fn note_shell_scan_steps(steps: usize) {
+    let total = SHELL_SCAN_STEPS.with(|count| {
+        count.set(count.get().saturating_add(steps));
+        count.get()
+    });
+    let budget = SHELL_SCAN_BUDGET.with(std::cell::Cell::get);
+    assert!(
+        total <= budget,
+        "shell scan took {total} steps, over its budget of {budget}"
+    );
+}
+
+#[cfg(not(test))]
+fn note_shell_scan_steps(_steps: usize) {}
+
+/// Where sshpass's own options stand in one command.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SshpassOptions {
+    NotSeen,
+    Reading,
+    /// The next word is the value of `-f`, `-d` or `-P`.
+    SkipValue,
+    /// The next word is the password given to `-p`.
+    PasswordNext,
+    /// The wrapped command has started; its `-p` is not sshpass's.
+    Done,
+}
+
+/// Find the tool passwords in `text` (one level of quoting) in a single pass
+/// over each command's tokens, then in the quoted runs, at most
+/// [`QUOTED_COMMAND_DEPTH`] levels down. Quoted runs at one level do not
+/// overlap, so each byte is tokenized at most once per level.
+fn collect_tool_password_masks(
+    text: &str,
+    base: usize,
+    depth: usize,
+    masks: &mut Vec<(std::ops::Range<usize>, String)>,
+) {
+    let (commands, quoted) = split_shell_commands(text);
+    note_shell_scan_steps(1);
+    let mut local = Vec::new();
+    for tokens in &commands {
+        note_shell_scan_steps(tokens.len());
+        // A program's arguments run to the end of its command, as the
+        // shell passes them; each program seen so far keeps reading them.
+        let (mut curl, mut mysql) = (false, false);
+        let mut curl_user_next = false;
+        let mut sshpass = SshpassOptions::NotSeen;
+        for token in tokens {
+            if token.kind == ShellTokenKind::Redirect {
+                // An option followed by a redirection has no value here.
+                curl_user_next = false;
+                if sshpass == SshpassOptions::PasswordNext || sshpass == SshpassOptions::SkipValue {
+                    sshpass = SshpassOptions::Done;
+                }
+                continue;
+            }
+            let raw = &text[token.range.clone()];
+            if curl_user_next {
+                curl_user_next = false;
+                if let Some(masked) = mask_curl_password(raw) {
+                    local.push((token.range.clone(), masked));
+                }
+                continue;
+            }
+            match sshpass {
+                SshpassOptions::PasswordNext => {
+                    if !command_value_is_reference(raw) {
+                        local.push((token.range.clone(), SECRET_PLACEHOLDER.to_string()));
+                    }
+                    sshpass = SshpassOptions::Done;
+                    continue;
+                }
+                SshpassOptions::SkipValue => {
+                    sshpass = SshpassOptions::Reading;
+                    continue;
+                }
+                _ => {}
+            }
+            let plain = unquote_shell_word(raw);
+            let program = plain.rsplit('/').next().unwrap_or_default();
+            let program = program.strip_suffix(".exe").unwrap_or(program);
+            let is_curl = program == "curl";
+            let is_mysql = matches!(program, "mysql" | "mariadb" | "mysqladmin" | "mysqldump");
+            if (is_curl || is_mysql) && sshpass == SshpassOptions::Reading {
+                // The command sshpass wraps has started.
+                sshpass = SshpassOptions::Done;
+            }
+            match program {
+                _ if is_curl => {
+                    curl = true;
+                    continue;
+                }
+                _ if is_mysql => {
+                    mysql = true;
+                    continue;
+                }
+                "sshpass" => {
+                    sshpass = SshpassOptions::Reading;
+                    continue;
+                }
+                _ => {}
+            }
+            if curl {
+                if plain == "-u" || plain == "--user" {
+                    curl_user_next = true;
+                    continue;
+                }
+                if plain.starts_with("--user=") {
+                    curl_attached_mask(text, token, "--user=", &mut local);
+                } else if plain.starts_with("-u") && !plain.starts_with("--") {
+                    curl_attached_mask(text, token, "-u", &mut local);
+                }
+            }
+            if mysql && plain.starts_with("-p") {
+                mask_attached_password(text, token, "-p", &mut local);
+            }
+            if sshpass == SshpassOptions::Reading {
+                sshpass = match plain.as_str() {
+                    "-p" => SshpassOptions::PasswordNext,
+                    "-f" | "-d" | "-P" => SshpassOptions::SkipValue,
+                    _ if plain.starts_with("-p") => {
+                        mask_attached_password(text, token, "-p", &mut local);
+                        SshpassOptions::Done
+                    }
+                    _ if plain.starts_with('-') => SshpassOptions::Reading,
+                    _ => SshpassOptions::Done,
+                };
+            }
+        }
+    }
+    masks.extend(
+        local
+            .into_iter()
+            .map(|(range, replacement)| (range.start + base..range.end + base, replacement)),
+    );
+    for inner in quoted {
+        if depth < QUOTED_COMMAND_DEPTH {
+            collect_tool_password_masks(&text[inner.clone()], base + inner.start, depth + 1, masks);
+        } else if !inner.is_empty() {
+            // Too deep to scan: mask the whole body instead of logging it
+            // unscanned, so a credential nested past the limit never leaks.
+            masks.push((
+                base + inner.start..base + inner.end,
+                SECRET_PLACEHOLDER.to_string(),
+            ));
+        }
+    }
+}
+
+/// The value attached to an option word (`-uadmin:pw`, `--user=admin:pw`,
+/// `-ppw`) after `prefix`, as a range of `text`, when the word starts with
+/// the option as typed. A word whose option part is itself quoted
+/// (`"-ppw"`) yields `None` and is masked whole by the caller.
+fn attached_option_value(
+    text: &str,
+    token: &ShellToken,
+    prefix: &str,
+) -> Option<std::ops::Range<usize>> {
+    let raw = &text[token.range.clone()];
+    (raw.len() > prefix.len() && raw.starts_with(prefix))
+        .then(|| token.range.start + prefix.len()..token.range.end)
+}
+
+/// Mask the password half of an attached curl user value. When the option
+/// itself is quoted, the whole word becomes the placeholder: every byte that
+/// stays in the log is then one the command really had.
+fn curl_attached_mask(
+    text: &str,
+    token: &ShellToken,
+    prefix: &str,
+    masks: &mut Vec<(std::ops::Range<usize>, String)>,
+) {
+    match attached_option_value(text, token, prefix) {
+        Some(range) => {
+            if let Some(masked) = mask_curl_password(&text[range.clone()]) {
+                masks.push((range, masked));
+            }
+        }
+        None => {
+            let plain = unquote_shell_word(&text[token.range.clone()]);
+            let value = plain.strip_prefix(prefix).unwrap_or_default();
+            if mask_curl_password(value).is_some() {
+                masks.push((token.range.clone(), SECRET_PLACEHOLDER.to_string()));
+            }
+        }
+    }
+}
+
+/// Push a placeholder over an attached option value unless it is a
+/// reference; a quoted option word is masked whole.
+fn mask_attached_password(
+    text: &str,
+    token: &ShellToken,
+    prefix: &str,
+    masks: &mut Vec<(std::ops::Range<usize>, String)>,
+) {
+    match attached_option_value(text, token, prefix) {
+        Some(range) => {
+            if !command_value_is_reference(&text[range.clone()]) {
+                masks.push((range, SECRET_PLACEHOLDER.to_string()));
+            }
+        }
+        None => {
+            let plain = unquote_shell_word(&text[token.range.clone()]);
+            let value = plain.strip_prefix(prefix).unwrap_or_default();
+            if !command_value_is_reference(value) {
+                masks.push((token.range.clone(), SECRET_PLACEHOLDER.to_string()));
+            }
+        }
+    }
+}
+
+/// Mask what follows the first `:` of a `user:password` word, keeping the
+/// user and a quote pair that wraps the whole word (`"admin:<masked>"`).
+/// A word without a password, or whose password is a reference, is kept.
+fn mask_curl_password(word: &str) -> Option<String> {
+    let quote = word
+        .chars()
+        .next()
+        .filter(|first| matches!(first, '"' | '\'') && word.len() > 1 && word.ends_with(*first));
+    let body = match quote {
+        Some(_) => &word[1..word.len() - 1],
+        None => word,
+    };
+    let (user, password) = body.split_once(':')?;
+    if command_value_is_reference(password) {
+        return None;
+    }
+    let quote = quote.map(String::from).unwrap_or_default();
+    Some(format!("{quote}{user}:{SECRET_PLACEHOLDER}{quote}"))
+}
+
+/// A value that names another value instead of holding one: a variable or
+/// command substitution (`$GH_TOKEN`, `"$(gcloud secrets ...)"`), an empty
+/// string, a placeholder this module already wrote, or the next option.
+fn command_value_is_reference(value: &str) -> bool {
+    let unquoted = value.trim_matches(|ch| ch == '"' || ch == '\'');
+    unquoted.is_empty() || unquoted.starts_with(['$', '<', '-'])
+}
+
+/// Mask credentials typed inline in a shell command, for logs that quote the
+/// command. Applies [`aft_redactor`] plus command-only shapes: secret-named
+/// `NAME=value` assignments (including after `export` or `env`), credential
+/// long options, MySQL's `-p<value>`, `sshpass -p` and `curl -u user:pass`.
+/// Mask the whole command before shortening it for a log line: a token cut
+/// short no longer matches its pattern.
+pub fn redact_command(command: &str) -> Cow<'_, str> {
+    // Runs first, on the command as typed: the shapes below write
+    // placeholders that read as redirections to the shell-word scan.
+    let mut out = mask_tool_passwords(command);
+    if command.contains('=') {
+        out = replace_in(
+            out,
+            None,
+            &COMMAND_SECRET_ASSIGNMENT,
+            |caps: &Captures<'_>| {
+                let name = &caps[2];
+                if command_value_is_reference(&caps[3])
+                    || COMMAND_NON_SECRET_NAME_SUFFIXES
+                        .iter()
+                        .any(|suffix| name.ends_with(suffix))
+                {
+                    caps[0].to_string()
+                } else {
+                    format!("{}{name}{SECRET_PLACEHOLDER}", &caps[1])
+                }
+            },
+        );
+    }
+    if command.contains("--") {
+        out = replace_in(out, None, &COMMAND_SECRET_FLAG, |caps: &Captures<'_>| {
+            if command_value_is_reference(&caps[3]) {
+                caps[0].to_string()
+            } else {
+                format!("{}{}{SECRET_PLACEHOLDER}", &caps[1], &caps[2])
+            }
+        });
+    }
+    match aft_redactor(&out) {
+        Cow::Borrowed(_) => out,
+        Cow::Owned(masked) => Cow::Owned(masked),
+    }
 }
 
 // Separate limits bound byte scanning and expensive candidate hashes. Long
@@ -332,17 +1029,31 @@ pub fn is_secret_environment_key(key: &str) -> bool {
     {
         return false;
     }
-    [
-        "TOKEN",
-        "SECRET",
-        "KEY",
-        "PASSWORD",
-        "PASSWD",
-        "CREDENTIAL",
-        "AUTH",
-    ]
-    .iter()
-    .any(|part| contains_ignore_ascii_case(key, part))
+    ["TOKEN", "SECRET", "KEY", "PASSWORD", "PASSWD", "CREDENTIAL"]
+        .iter()
+        .any(|part| contains_ignore_ascii_case(key, part))
+        || names_auth(key)
+}
+
+/// Whether `key` contains "AUTH" other than as the word AUTHOR, which names a
+/// person rather than a credential: GIT_AUTHOR_NAME, GIT_AUTHOR_EMAIL, and
+/// AFT_GIT_CO_AUTHOR, the co-author trailer AFT itself gives every governed
+/// child. Counting those made every such child look like it carried a secret,
+/// so its output previews were withheld after a daemon restart. AUTHOR counts
+/// as a word only at the end of the name or before an underscore; AUTHORITY,
+/// AUTHORIZATION, AUTH_TOKEN and NPM_AUTH still count.
+fn names_auth(key: &str) -> bool {
+    let key = key.as_bytes();
+    (0..key.len()).any(|at| {
+        let rest = &key[at..];
+        if rest.len() < 4 || !rest[..4].eq_ignore_ascii_case(b"AUTH") {
+            return false;
+        }
+        let author_word = rest.len() >= 6
+            && rest[4..6].eq_ignore_ascii_case(b"OR")
+            && matches!(rest.get(6), None | Some(b'_'));
+        !author_word
+    })
 }
 
 impl SecretValues {
@@ -858,6 +1569,447 @@ mod tests {
         expected: String,
     }
 
+    #[derive(serde::Deserialize)]
+    struct CommandFixture {
+        masked: Vec<MaskedCase>,
+        untouched: Vec<String>,
+    }
+
+    /// Credentials typed inline in shell commands are masked, and none of the
+    /// ordinary commands beside them change: the untouched list holds every
+    /// command line from this repository's scripts, workflows and package.json
+    /// scripts plus common cargo, git, npm, ssh and docker invocations.
+    #[test]
+    fn command_credentials_are_masked_without_touching_ordinary_commands() {
+        let fixture: CommandFixture = serde_json::from_str(include_str!(
+            "../tests/fixtures/command_redaction_cases.json"
+        ))
+        .expect("command redaction fixture parses");
+        assert_eq!(fixture.masked.len(), 119);
+        assert!(fixture.untouched.len() > 800);
+        for case in &fixture.masked {
+            let masked = redact_command(&case.input);
+            assert_eq!(masked, case.expected, "input: {}", case.input);
+            assert_eq!(redact_command(&masked), masked, "not idempotent");
+        }
+        // A few corpus lines hold URL userinfo (`ssh://git@host`), which the
+        // shared log patterns already mask in every log line. The command
+        // shapes themselves must change nothing.
+        let mangled: Vec<_> = fixture
+            .untouched
+            .iter()
+            .filter(|command| redact_command(command) != aft_redactor(command))
+            .map(|command| format!("{command} -> {}", redact_command(command)))
+            .collect();
+        assert!(mangled.is_empty(), "{}", mangled.join("\n"));
+    }
+
+    /// The curl, MySQL and sshpass rules as they were before commands were
+    /// read as shell words: the span ran to the first `;`, `&`, `|` or
+    /// newline, quoted or not.
+    fn line_pattern_tool_passwords(command: &str) -> String {
+        static PATTERNS: LazyLock<[Regex; 4]> = LazyLock::new(|| {
+            [
+                compile(r"\bcurl\b[^;&|\n]*"),
+                compile(concat!(
+                    r"(^|\s)(-u[ \t]*|--user(?:=|[ \t]+))(",
+                    shell_word!(),
+                    ")"
+                )),
+                compile(concat!(
+                    r"\b((?:mysql|mariadb|mysqladmin|mysqldump)\b[^;&|\n]*?\s-p)(",
+                    shell_word!(),
+                    ")"
+                )),
+                compile(concat!(r"\b(sshpass[ \t]+-p[ \t]*)(", shell_word!(), ")")),
+            ]
+        });
+        let [segment, user_option, mysql, sshpass] = &*PATTERNS;
+        let out = segment.replace_all(command, |segment: &Captures<'_>| {
+            user_option
+                .replace_all(
+                    &segment[0],
+                    |caps: &Captures<'_>| match mask_curl_password(&caps[3]) {
+                        Some(masked) => format!("{}{}{masked}", &caps[1], &caps[2]),
+                        None => caps[0].to_string(),
+                    },
+                )
+                .into_owned()
+        });
+        let mut out = out.into_owned();
+        for pattern in [mysql, sshpass] {
+            out = pattern
+                .replace_all(&out, |caps: &Captures<'_>| {
+                    if command_value_is_reference(&caps[2]) {
+                        caps[0].to_string()
+                    } else {
+                        format!("{}{SECRET_PLACEHOLDER}", &caps[1])
+                    }
+                })
+                .into_owned();
+        }
+        out
+    }
+
+    /// Reading commands as shell words must not lose a password the earlier
+    /// line patterns caught: on every fixture command, each placeholder the
+    /// line patterns wrote is also written by the shell-word scan, at the
+    /// same place.
+    #[test]
+    fn shell_word_scan_masks_everything_the_line_patterns_did() {
+        let fixture: CommandFixture = serde_json::from_str(include_str!(
+            "../tests/fixtures/command_redaction_cases.json"
+        ))
+        .expect("command redaction fixture parses");
+        let mut compared = 0;
+        let mut lost = Vec::new();
+        for command in fixture
+            .masked
+            .iter()
+            .map(|case| &case.input)
+            .chain(&fixture.untouched)
+        {
+            let legacy = line_pattern_tool_passwords(command);
+            if legacy == *command {
+                continue;
+            }
+            compared += 1;
+            let scanned = mask_tool_passwords(command);
+            // Every byte the line patterns masked must be masked by the scan
+            // too: each of their masked spans lies inside one of the scan's.
+            let legacy_spans = masked_ranges(command, &legacy).expect("line patterns only mask");
+            let scanned_spans = masked_ranges(command, &scanned).expect("scan only masks");
+            for span in legacy_spans {
+                if !scanned_spans
+                    .iter()
+                    .any(|scanned| scanned.start <= span.start && span.end <= scanned.end)
+                {
+                    lost.push(format!(
+                        "{command:?}\n  line patterns: {legacy}\n  shell words:   {scanned}"
+                    ));
+                }
+            }
+        }
+        assert!(lost.is_empty(), "{}", lost.join("\n"));
+        eprintln!("{compared} fixture commands masked by the line patterns; none lost");
+        assert!(compared > 40, "{compared}");
+    }
+
+    /// Whether `output` is `input` with some spans replaced by placeholders
+    /// and every other byte unchanged and in order.
+    fn only_placeholders_changed(input: &str, output: &str) -> bool {
+        masked_ranges(input, output).is_some()
+    }
+
+    /// The spans of `input` that `output` replaced with placeholders, if
+    /// `output` is `input` with only such replacements (each other piece
+    /// matched at its earliest place).
+    fn masked_ranges(input: &str, output: &str) -> Option<Vec<std::ops::Range<usize>>> {
+        // Split `output` at its placeholders. Each placeholder's next
+        // occurrence is searched for only after the previous one is passed,
+        // so splitting a megabyte output stays linear.
+        let placeholders = [SECRET_PLACEHOLDER, URL_CREDENTIAL_PLACEHOLDER];
+        let find_from =
+            |from: usize, placeholder: &str| output[from..].find(placeholder).map(|at| from + at);
+        let mut next: Vec<Option<usize>> = placeholders
+            .iter()
+            .map(|placeholder| find_from(0, placeholder))
+            .collect();
+        let mut pieces = Vec::new();
+        let mut copied = 0;
+        loop {
+            let nearest = next
+                .iter()
+                .enumerate()
+                .filter_map(|(index, at)| at.map(|at| (at, index)))
+                .min();
+            let Some((at, index)) = nearest else {
+                pieces.push(&output[copied..]);
+                break;
+            };
+            pieces.push(&output[copied..at]);
+            copied = at + placeholders[index].len();
+            for (slot, placeholder) in next.iter_mut().zip(placeholders) {
+                if slot.is_some_and(|found| found < copied) {
+                    *slot = find_from(copied, placeholder);
+                }
+            }
+        }
+        if pieces.len() == 1 {
+            return (input == output).then(Vec::new);
+        }
+        let (first, last) = (pieces[0], pieces[pieces.len() - 1]);
+        if first.len() + last.len() > input.len()
+            || !input.starts_with(first)
+            || !input.ends_with(last)
+        {
+            return None;
+        }
+        let limit = input.len() - last.len();
+        let mut cursor = first.len();
+        let mut ranges = Vec::new();
+        for piece in &pieces[1..pieces.len() - 1] {
+            if cursor > limit {
+                return None;
+            }
+            let at = input[cursor..limit].find(piece)?;
+            ranges.push(cursor..cursor + at);
+            cursor += at + piece.len();
+        }
+        (cursor <= limit).then(|| {
+            ranges.push(cursor..limit);
+            ranges
+        })
+    }
+
+    /// The command redactor runs on every spawned command, so it must never
+    /// panic, whatever the command holds. Twenty thousand seeded random
+    /// commands mix quotes, backslashes, substitutions, operators, every
+    /// ASCII whitespace byte, Unicode spaces and multibyte text (combining
+    /// marks, emoji), with unterminated quotes and trailing backslashes. Each
+    /// command runs under a linear step budget, so a stalled scan fails.
+    /// Each output must be `input` with only placeholder replacements.
+    #[test]
+    fn command_redaction_never_panics_and_changes_only_masked_bytes() {
+        const PIECES: [&str; 54] = [
+            "'",
+            "\"",
+            "\\",
+            "$(",
+            ")",
+            "(",
+            "`",
+            "<",
+            ">",
+            "&",
+            "|",
+            ";",
+            "\n",
+            " ",
+            "\t",
+            "é",
+            "中",
+            "🙂",
+            "e\u{301}",
+            "\u{301}",
+            "\u{200d}",
+            "curl",
+            "mysql",
+            "sshpass",
+            "-u",
+            "-p",
+            "--user=",
+            "--password",
+            "-ppw",
+            "admin:pw",
+            ":",
+            "a",
+            "1",
+            "=",
+            "TOKEN=",
+            "$X",
+            "2>&1",
+            "<<<",
+            "\\\n",
+            "-f",
+            "env",
+            "sudo",
+            "\"-u",
+            "x'y",
+            "\x0c",
+            "\x0b",
+            "\r",
+            "\u{a0}",
+            "\u{85}",
+            "\u{2028}",
+            "\u{2029}",
+            "\u{3000}",
+            "\u{feff}",
+            "\u{1680}",
+        ];
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let redactors: [(&str, fn(&str) -> Cow<'_, str>); 2] = [
+            ("mask_tool_passwords", mask_tool_passwords),
+            ("redact_command", redact_command),
+        ];
+        let mut failures = Vec::new();
+        let mut masked = 0;
+        for case in 0..20_000 {
+            let mut input = String::new();
+            for _ in 0..next() % 40 {
+                input.push_str(PIECES[(next() % PIECES.len() as u64) as usize]);
+            }
+            if case % 7 == 0 {
+                input.push('\\');
+            }
+            for (name, redact) in redactors {
+                // Under the same linear step budget as the 1 MB test, so a
+                // scan that stops advancing fails here instead of hanging.
+                SHELL_SCAN_STEPS.with(|steps| steps.set(0));
+                SHELL_SCAN_BUDGET
+                    .with(|budget| budget.set(3 * (QUOTED_COMMAND_DEPTH + 1) * input.len() + 16));
+                let result = std::panic::catch_unwind(|| redact(&input).into_owned());
+                SHELL_SCAN_BUDGET.with(|budget| budget.set(usize::MAX));
+                match result {
+                    Err(_) => failures.push(format!("{name} panicked on {input:?}")),
+                    Ok(output) => {
+                        assert!(std::str::from_utf8(output.as_bytes()).is_ok());
+                        masked += usize::from(output != input);
+                        if !only_placeholders_changed(&input, &output) {
+                            failures.push(format!(
+                                "{name} changed other bytes: {input:?} -> {output:?}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} failures, first: {}",
+            failures.len(),
+            failures
+                .iter()
+                .take(10)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        // The generator must reach the masking paths, not only ordinary text.
+        assert!(masked > 1_000, "{masked} outputs masked");
+    }
+
+    /// One command of a megabyte or more, in shapes that would make a
+    /// rescanning or per-program-word design quadratic, is scanned in steps
+    /// linear in its length: each nesting level tokenizes each byte once and
+    /// visits each token once, and quoted commands nest at most
+    /// QUOTED_COMMAND_DEPTH levels below the top.
+    #[test]
+    fn tool_password_scan_work_is_linear_on_a_megabyte_command() {
+        const MEGABYTE: usize = 1 << 20;
+        let repeat = |unit: &str| unit.repeat(MEGABYTE / unit.len() + 1);
+        let inputs = [
+            repeat("curl "),
+            repeat("curl -u a:b --next -u "),
+            repeat("mysql -ppw sshpass -p x "),
+            format!("bash -c \"{}", repeat("sh -c 'curl \\\"x ")),
+            format!("curl {}", repeat("\"'")),
+            format!("curl '{}", repeat("é中🙂 \"' ")),
+            format!("curl {}", repeat("\\")),
+            format!("curl {}", repeat("<<<")),
+            format!("curl \"{}\"", repeat("'\\\"`$( curl -u a:b ) ")),
+            format!("\"'\"'\"'{}", repeat("curl -u a:b ")),
+            // Substitutions that never close, each nested in the last.
+            format!("curl {}", repeat("$(echo -u a:b ")),
+            format!("curl {}", repeat("\"$(curl `mysql -ppw ")),
+            repeat("curl $(printf x) -u a:b "),
+        ];
+        for input in &inputs {
+            let bound = 3 * (QUOTED_COMMAND_DEPTH + 1) * input.len();
+            SHELL_SCAN_STEPS.with(|steps| steps.set(0));
+            SHELL_SCAN_BUDGET.with(|budget| budget.set(bound));
+            let started = std::time::Instant::now();
+            let masked = mask_tool_passwords(input);
+            SHELL_SCAN_BUDGET.with(|budget| budget.set(usize::MAX));
+            let steps = SHELL_SCAN_STEPS.with(std::cell::Cell::get);
+            let elapsed = started.elapsed();
+            assert!(
+                steps <= bound,
+                "{steps} steps for {} bytes (bound {bound}) starting {:?}",
+                input.len(),
+                input.chars().take(40).collect::<String>()
+            );
+            assert!(only_placeholders_changed(input, &masked));
+            let started = std::time::Instant::now();
+            let _ = redact_command(input);
+            eprintln!(
+                "{} bytes starting {:?}: {steps} scan steps, scan {elapsed:?}, full redaction {:?}",
+                input.len(),
+                input.chars().take(12).collect::<String>(),
+                started.elapsed()
+            );
+        }
+    }
+
+    /// Run `mask_tool_passwords` under a step budget linear in the
+    /// command's length, so a scan that stops advancing panics at once.
+    fn mask_within_budget(command: &str) -> String {
+        let bound = 3 * (QUOTED_COMMAND_DEPTH + 1) * command.len() + 16;
+        SHELL_SCAN_STEPS.with(|steps| steps.set(0));
+        SHELL_SCAN_BUDGET.with(|budget| budget.set(bound));
+        let masked = std::panic::catch_unwind(|| mask_tool_passwords(command).into_owned());
+        SHELL_SCAN_BUDGET.with(|budget| budget.set(usize::MAX));
+        masked.unwrap_or_else(|_| panic!("scan stalled or panicked on {command:?}"))
+    }
+
+    /// A command longer than the scanned prefix has its tail masked whole: a
+    /// credential after the cut-off, or one the cut-off splits, never
+    /// reaches the log unscanned.
+    #[test]
+    fn command_tail_past_the_scan_limit_is_masked_not_logged() {
+        let padding = "x".repeat(MAX_SCANNED_COMMAND_BYTES - 10);
+        let after = format!("echo {padding} && curl -u admin:hunter2 h");
+        let split = format!(
+            "curl {} -u admin:hunter2 h",
+            "y".repeat(MAX_SCANNED_COMMAND_BYTES - 18)
+        );
+        for command in [&after, &split] {
+            assert!(command.len() > MAX_SCANNED_COMMAND_BYTES);
+            for masked in [
+                mask_within_budget(command),
+                redact_command(command).into_owned(),
+            ] {
+                assert!(
+                    !masked.contains("hunter2"),
+                    "credential after the cut-off logged"
+                );
+                assert!(!masked.contains("hun"), "part of a split credential logged");
+                assert!(masked.ends_with(SECRET_PLACEHOLDER));
+                assert!(only_placeholders_changed(command, &masked));
+            }
+        }
+    }
+
+    /// A byte that ends a word must be consumed by the loop around the word,
+    /// or the scan stops advancing. A form feed did exactly that: words
+    /// ended at any ASCII whitespace, while the command loop skipped only
+    /// space, tab and carriage return. Every ASCII whitespace byte and a few
+    /// Unicode spaces, inside a quoted argument (scanned again as a command)
+    /// and between words, must keep the scan moving.
+    #[test]
+    fn every_ascii_and_unicode_space_keeps_the_scan_advancing() {
+        let ascii = ["\x0c", "\x0b", "\r", "\t", " "];
+        let unicode = [
+            "\u{a0}", "\u{85}", "\u{2028}", "\u{2029}", "\u{3000}", "\u{feff}",
+        ];
+        for space in ascii.iter().chain(&unicode) {
+            let quoted = format!("curl \"a{space}b\" -u admin:hunter2 h");
+            assert_eq!(
+                mask_within_budget(&quoted),
+                format!("curl \"a{space}b\" -u admin:{SECRET_PLACEHOLDER} h"),
+                "{space:?}"
+            );
+            for command in [
+                format!("curl{space}-u admin:hunter2 h"),
+                format!("curl -u admin:hunter2{space}h"),
+                format!("mysql{space}-phunter2 db"),
+                format!("sshpass -p hunter2{space}ssh h"),
+                format!("{space}{space}curl{space}{space}"),
+            ] {
+                let masked = mask_within_budget(&command);
+                if ascii.contains(space) {
+                    assert!(!masked.contains("hunter2"), "{command:?} -> {masked:?}");
+                }
+            }
+        }
+    }
+
     fn fixture() -> Fixture {
         serde_json::from_str(include_str!("../tests/fixtures/log_redaction_cases.json"))
             .expect("shared redaction fixture parses")
@@ -1054,6 +2206,30 @@ mod tests {
             "NPM_AUTH",
             "AWS_SECRET_ACCESS_KEY",
             "API_KEY",
+        ] {
+            assert!(is_secret_environment_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn author_names_are_not_secret_names() {
+        for key in [
+            "AFT_GIT_CO_AUTHOR",
+            "GIT_AUTHOR_NAME",
+            "git_author_email",
+            "AUTHOR",
+        ] {
+            assert!(!is_secret_environment_key(key), "{key}");
+        }
+        for key in [
+            "AUTH",
+            "NPM_AUTH",
+            "AUTH_HEADER",
+            "HTTP_AUTHORIZATION",
+            "XAUTHORITY",
+            "AUTHORS_FILE",
+            "GIT_AUTHOR_TOKEN",
+            "AUTHOR_AUTH",
         ] {
             assert!(is_secret_environment_key(key), "{key}");
         }

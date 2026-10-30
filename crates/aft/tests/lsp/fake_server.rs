@@ -234,7 +234,9 @@ fn write_flycheck_progress(writer: &mut impl Write, kind: &str) -> io::Result<()
     if kind == "begin" {
         value["title"] = json!("cargo check");
     } else if kind == "end" {
-        if let Ok(message) = std::env::var("AFT_FAKE_LSP_CHECK_END_MESSAGE") { value["message"] = json!(message); }
+        if let Ok(message) = std::env::var("AFT_FAKE_LSP_CHECK_END_MESSAGE") {
+            value["message"] = json!(message);
+        }
     }
     write_notification(
         writer,
@@ -481,7 +483,8 @@ pub(crate) fn main() -> io::Result<()> {
         // directly so persistence tests fingerprint the real analyzer version.
         if std::env::args_os().any(|arg| arg == "--version") {
             let status = std::process::Command::new(program)
-                .args(std::env::args_os().skip(1)).status()?;
+                .args(std::env::args_os().skip(1))
+                .status()?;
             std::process::exit(status.code().unwrap_or(1));
         }
         return run_proxy(program);
@@ -540,7 +543,8 @@ pub(crate) fn main() -> io::Result<()> {
         let freeze_release = std::env::var_os("AFT_FAKE_LSP_FREEZE_AFTER_OPEN");
         loop {
             let message = read_message(&mut reader);
-            let freeze = freeze_release.is_some() && matches!(&message,
+            let freeze = freeze_release.is_some()
+                && matches!(&message,
                 Ok(Some(ServerMessage::Notification { method, .. })) if method == "textDocument/didOpen");
             let last = !matches!(message, Ok(Some(_)));
             if message_tx.send(message).is_err() || last {
@@ -605,6 +609,11 @@ pub(crate) fn main() -> io::Result<()> {
     let mut client_disables_pull = false;
     let mut diagnostic_registered = false;
     let mut open_documents: std::collections::BTreeMap<String, (Value, Value)> =
+        std::collections::BTreeMap::new();
+    // The text the client last synced for each open document, so
+    // AFT_FAKE_LSP_PULL_FROM_CONTENT=1 can answer a pull from what the server
+    // was actually told, as a real language server does.
+    let mut document_texts: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     // Files the last emulated check found a compiler error in. Like
     // rust-analyzer, every later report for such a file still carries the
@@ -844,9 +853,8 @@ pub(crate) fn main() -> io::Result<()> {
                     }
 
                     if !no_watched_files {
-                        // Default: advertise didChangeWatchedFiles so the capability gate
-                        // in notify_files_watched_changed (#32) allows notifications
-                        // to reach the fake server during integration tests.
+                        // Echo the client capability to exercise defensive
+                        // parsing; the registration below is the subscription.
                         capabilities["workspace"] = json!({
                             "didChangeWatchedFiles": {
                                 "dynamicRegistration": true
@@ -855,8 +863,8 @@ pub(crate) fn main() -> io::Result<()> {
                         // AFT_FAKE_LSP_STATIC_WATCHED_FILES_ONLY=1 still
                         // advertises `workspace.didChangeWatchedFiles` in the
                         // initialize result but never sends
-                        // client/registerCapability, so the client may send
-                        // watched-file events yet knows no globs for them.
+                        // client/registerCapability. The echoed field alone
+                        // must not enable watched-file notifications.
                         should_register_watched_files =
                             std::env::var("AFT_FAKE_LSP_STATIC_WATCHED_FILES_ONLY")
                                 .ok()
@@ -878,7 +886,11 @@ pub(crate) fn main() -> io::Result<()> {
                         json!({
                             "capabilities": capabilities,
                             "serverInfo": {
-                                "name": "fake-lsp-server",
+                                // AFT_FAKE_LSP_SERVER_NAME=<name>: report another
+                                // server name, such as the native TypeScript
+                                // server's `typescript-go`.
+                                "name": std::env::var("AFT_FAKE_LSP_SERVER_NAME")
+                                    .unwrap_or_else(|_| "fake-lsp-server".into()),
                                 "version": "0.1.0",
                             }
                         }),
@@ -906,6 +918,9 @@ pub(crate) fn main() -> io::Result<()> {
                     )?;
                 }
                 "shutdown" => {
+                    if std::env::var("AFT_FAKE_LSP_REPORT_SHUTDOWN").as_deref() == Ok("1") {
+                        write_custom_notification(&mut writer, "aft-test/shutdownReceived", Value::Null, Value::Null)?;
+                    }
                     if !ignore_shutdown {
                         write_response(&mut writer, id, Value::Null)?;
                     }
@@ -1208,14 +1223,21 @@ pub(crate) fn main() -> io::Result<()> {
                                 }
                             }),
                         )?;
-                    } else if std::env::var("AFT_FAKE_LSP_PULL_WAIT_FOR_CHECK").ok().as_deref() == Some("1")
+                    } else if std::env::var("AFT_FAKE_LSP_PULL_WAIT_FOR_CHECK")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
                         && !check_completed
                     {
                         // A successful native pull can describe the old
                         // workspace before a watched-file change is applied.
-                        write_response(&mut writer, id, json!({
-                            "kind": "full", "resultId": "old-native", "items": []
-                        }))?;
+                        write_response(
+                            &mut writer,
+                            id,
+                            json!({
+                                "kind": "full", "resultId": "old-native", "items": []
+                            }),
+                        )?;
                     } else if force_unchanged {
                         write_response(
                             &mut writer,
@@ -1224,6 +1246,40 @@ pub(crate) fn main() -> io::Result<()> {
                                 "kind": "unchanged",
                                 "resultId": "fake-result-1"
                             }),
+                        )?;
+                    } else if std::env::var("AFT_FAKE_LSP_PULL_FROM_CONTENT").ok().as_deref()
+                        == Some("1")
+                    {
+                        // AFT_FAKE_LSP_PULL_FROM_CONTENT=1: report one error
+                        // for every line of the synced text that contains
+                        // `BROKEN`, so a test can tell an analysis of the
+                        // current text from one of an older text.
+                        let text = document_uri(&params)
+                            .as_str()
+                            .and_then(|uri| document_texts.get(uri))
+                            .cloned()
+                            .unwrap_or_default();
+                        let items = text
+                            .lines()
+                            .enumerate()
+                            .filter(|(_, line)| line.contains("BROKEN"))
+                            .map(|(line, _)| {
+                                json!({
+                                    "range": {
+                                        "start": { "line": line, "character": 0 },
+                                        "end": { "line": line, "character": 6 }
+                                    },
+                                    "severity": 1,
+                                    "code": "E0TEXT",
+                                    "source": "fake-lsp",
+                                    "message": "BROKEN marker in synced text"
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        write_response(
+                            &mut writer,
+                            id,
+                            json!({ "kind": "full", "items": items }),
                         )?;
                     } else {
                         write_response(
@@ -1253,10 +1309,13 @@ pub(crate) fn main() -> io::Result<()> {
                     // a synthetic URI. Test variants:
                     //   AFT_FAKE_LSP_WS_TIMEOUT=1 → never reply (server hangs)
                     //   AFT_FAKE_LSP_WS_PARTIAL=1 → reply with empty items
+                    //   AFT_FAKE_LSP_WS_UNCHANGED=1 → unchanged reports with fresh result IDs
                     let force_timeout =
                         std::env::var("AFT_FAKE_LSP_WS_TIMEOUT").ok().as_deref() == Some("1");
                     let force_partial =
                         std::env::var("AFT_FAKE_LSP_WS_PARTIAL").ok().as_deref() == Some("1");
+                    let force_unchanged =
+                        std::env::var("AFT_FAKE_LSP_WS_UNCHANGED").ok().as_deref() == Some("1");
 
                     if force_timeout {
                         // Never respond — emulates a server still analyzing.
@@ -1266,6 +1325,17 @@ pub(crate) fn main() -> io::Result<()> {
 
                     let items = if force_partial {
                         json!([])
+                    } else if force_unchanged {
+                        let previous = params
+                            .as_ref()
+                            .and_then(|value| value.get("previousResultIds"))
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        Value::Array(previous.into_iter().map(|previous| json!({
+                            "kind": "unchanged", "uri": previous["uri"],
+                            "resultId": format!("next-{}", previous["value"].as_str().unwrap_or_default()), "version": 99
+                        })).collect())
                     } else {
                         json!([{
                             "kind": "full",
@@ -1452,6 +1522,15 @@ pub(crate) fn main() -> io::Result<()> {
                 "textDocument/didOpen" => {
                     let uri = document_uri(&params);
                     let version = document_version(&params);
+                    if let (Some(uri), Some(text)) = (
+                        uri.as_str(),
+                        params
+                            .as_ref()
+                            .and_then(|p| p.pointer("/textDocument/text"))
+                            .and_then(Value::as_str),
+                    ) {
+                        document_texts.insert(uri.to_string(), text.to_string());
+                    }
                     if dynamic_pull {
                         if let Some(uri) = uri.as_str() { open_documents.insert(uri.to_string(), (opened_diagnostics(), version.clone())); }
                         record_pull_event(&format!("open {uri}"))?;
@@ -1551,7 +1630,11 @@ pub(crate) fn main() -> io::Result<()> {
                             diagnostics,
                             version.clone(),
                         )?;
-                    } else {
+                    } else if std::env::var("AFT_FAKE_LSP_PULL_FROM_CONTENT").ok().as_deref()
+                        != Some("1")
+                    {
+                        // A pull-only server (`tsc --lsp`) publishes nothing
+                        // for an opened source file; the content mode models it.
                         write_publish_diagnostics(&mut writer, uri.clone(), json!([]))?;
                     }
                     if matches!(
@@ -1603,10 +1686,7 @@ pub(crate) fn main() -> io::Result<()> {
                     // The release file lets a test resume the same process without
                     // relying on platform-specific signals or leaving a stopped child.
                     if let Some(release) = std::env::var_os("AFT_FAKE_LSP_FREEZE_AFTER_OPEN") {
-                        write_notification(
-                            &mut writer,
-                            &Notification::new("custom/frozen", None),
-                        )?;
+                        write_notification(&mut writer, &Notification::new("custom/frozen", None))?;
                         while !std::path::Path::new(&release).exists() {
                             std::thread::sleep(std::time::Duration::from_millis(10));
                         }
@@ -1617,6 +1697,18 @@ pub(crate) fn main() -> io::Result<()> {
                     }
                 }
                 "textDocument/didChange" => {
+                    if let (Some(uri), Some(text)) = (
+                        document_uri(&params).as_str(),
+                        params
+                            .as_ref()
+                            .and_then(|p| p.get("contentChanges"))
+                            .and_then(Value::as_array)
+                            .and_then(|changes| changes.last())
+                            .and_then(|change| change.get("text"))
+                            .and_then(Value::as_str),
+                    ) {
+                        document_texts.insert(uri.to_string(), text.to_string());
+                    }
                     if dynamic_pull && client_dynamic_pull {
                         let uri = document_uri(&params);
                         if let Some(uri) = uri.as_str() { open_documents.insert(uri.into(), (changed_diagnostics(), document_version(&params))); }
@@ -1689,6 +1781,7 @@ pub(crate) fn main() -> io::Result<()> {
                     let uri = document_uri(&params);
                     if let Some(uri) = uri.as_str() {
                         open_documents.remove(uri);
+                        document_texts.remove(uri);
                     }
                     write_custom_notification(
                         &mut writer,
@@ -1705,6 +1798,19 @@ pub(crate) fn main() -> io::Result<()> {
                     }
                     // AFT_FAKE_LSP_CLOSE_PUBLISHES=1: answer the close with real
                     // diagnostics instead of the usual clearing empty list.
+                    // A pull-only server (AFT_FAKE_LSP_PULL_FROM_CONTENT=1, as
+                    // `tsc --lsp`) publishes nothing for a closed source file,
+                    // unless AFT_FAKE_LSP_PULL_CONTENT_CLEARS_ON_CLOSE=1 makes
+                    // it send the usual clearing empty list.
+                    if std::env::var("AFT_FAKE_LSP_PULL_FROM_CONTENT").ok().as_deref()
+                        == Some("1")
+                        && std::env::var("AFT_FAKE_LSP_PULL_CONTENT_CLEARS_ON_CLOSE")
+                            .ok()
+                            .as_deref()
+                            != Some("1")
+                    {
+                        continue;
+                    }
                     let close_diagnostics = if std::env::var("AFT_FAKE_LSP_CLOSE_PUBLISHES")
                         .ok()
                         .as_deref()

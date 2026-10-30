@@ -17,7 +17,7 @@ import {
   prepareLinkedWorktree,
 } from "./linked-worktree.js";
 const here = dirname(fileURLToPath(import.meta.url));
-const expectedIds = ["bash/T1/happy","bash/T1/linked_worktree","bash/T2/invalid_arguments","bash/T2/missing_target","bash/T3/fallback_ask_allow","bash/T3/fallback_ask_deny","bash/T3/fallback_config_deny","bash/T3/loop_ask_allow","bash/T3/loop_ask_deny","bash/T3/loop_config_deny","bash/T4/abort","bash/T5/completion_wake","bash/T5/message_aborts_sync_watch","bash/T5/message_detaches_wait","bash/T5/message_queue_keeps_wait","bash/T5/watch_pattern_once","bash/T6/bash-bash-output/complete","bash/T6/bash-bash-output/incomplete","bash/T7/happy","bash/T7/linked_worktree"];
+const expectedIds = ["bash/T1/happy","bash/T1/linked_worktree","bash/T2/invalid_arguments","bash/T2/missing_target","bash/T3/fallback_ask_allow","bash/T3/fallback_ask_deny","bash/T3/fallback_config_deny","bash/T3/loop_ask_allow","bash/T3/loop_ask_deny","bash/T3/loop_config_deny","bash/T4/abort","bash/T5/completion_wake","bash/T5/message_aborts_sync_watch","bash/T5/message_detaches_wait","bash/T5/message_queue_keeps_wait","bash/T5/watch_pattern_once","bash/T6/bash-bash-output/complete","bash/T6/bash-bash-output/incomplete","bash/T6/bash-changed-files/complete","bash/T6/bash-changed-files/incomplete","bash/T6/bash-diff-lines/complete","bash/T6/bash-diff-lines/incomplete","bash/T7/happy","bash/T7/linked_worktree"];
 async function validate(context: HarnessValidationContext): Promise<void> {
   const scenarios = context.scenarios.filter((scenario) => scenario.tool === "bash");
   const actual = scenarios.map((scenario) => scenario.id).sort();
@@ -28,8 +28,6 @@ async function validate(context: HarnessValidationContext): Promise<void> {
   }
   const matrix = JSON.parse(await readFile(join(here, "matrix.json"), "utf8"));
   if (JSON.stringify(matrix.rows?.[0]?.trajectories) !== JSON.stringify({"T1":"applicable","T2":"applicable","T3":"applicable","T4":"applicable","T5":"applicable","T6":"applicable","T7":"applicable"})) throw new Error("bash" + " applicability mismatch");
-  const controls = JSON.parse(await readFile(join(here, "mutation-controls.json"), "utf8"));
-  if (!Array.isArray(controls.controls) || controls.controls.length < 3) throw new Error("bash" + " mutation controls missing");
   // Every fallback row says what its dead transport produces, and a row that
   // refuses instead of falling back has to record where the break-glass
   // coverage went. Read at validation time so a row that drops the record

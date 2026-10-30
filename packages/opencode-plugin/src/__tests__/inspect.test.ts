@@ -381,3 +381,26 @@ describe("aft_inspect tool", () => {
     expect(runs).toEqual(["sid-1"]);
   });
 });
+test("inspect idle timer is passive and still cleared on disposal", () => {
+  let unrefs = 0;
+  let clears = 0;
+  const timer = {
+    unref: () => {
+      unrefs++;
+    },
+  } as unknown as ReturnType<typeof setTimeout>;
+  const scheduler = createInspectTier2IdleScheduler({
+    isEnabled: () => true,
+    idleMinutes: () => undefined,
+    run: async () => {},
+    setTimer: () => timer,
+    clearTimer: (value) => {
+      expect(value).toBe(timer);
+      clears++;
+    },
+  });
+  scheduler.schedule("session");
+  expect(unrefs).toBe(1);
+  scheduler.clearAll();
+  expect(clears).toBe(1);
+});

@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "gh-shim-typed-field-files"
+  ],
+  "note": "gh shim: typed -F field=@file on governed api writes reads the file (or refuses); legacy comment PATCH decoder removed. No changed path matches RANKING_FENCE_PREFIXES."
+}

@@ -978,6 +978,8 @@ export class ConfigRejectedError extends Error {
 }
 
 /** Sections whose schema failure must not replace explicit security settings with defaults. */
+// `storage` is deliberately not listed: a malformed `storage.cache_dir` weakens
+// no protection; it turns caches off (cache_dir_config_unknown) and warns.
 const SECURITY_CONFIG_SECTIONS = new Set([
   "restrict_to_project_root",
   "url_fetch_allow_private",

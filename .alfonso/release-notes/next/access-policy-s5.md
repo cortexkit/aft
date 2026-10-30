@@ -1,1 +1,0 @@
-- Permission checks for files outside the project now run inside AFT for OpenCode and Pi sessions without the daemon, with one-time approvals tied to the session; deletes and undo ask for exactly what they touch and refuse if a file was swapped after approval.

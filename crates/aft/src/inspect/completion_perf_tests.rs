@@ -147,7 +147,7 @@ fn tier2_changed_rollup_loads_contributions_once() {
 
 #[test]
 fn duplicate_cache_upgrade_rebuilds_legacy_fragment_rows() {
-    for legacy_version in [34, 35, 36, 37, 38, 39] {
+    for legacy_version in [34, 35, 36, 37, 38, 39, 40, 41] {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         write_projection_cache_file(

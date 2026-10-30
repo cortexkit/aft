@@ -1,1 +1,0 @@
-- Worker checkouts connect faster during cache cleanup, while newly connected checkouts still keep their cached data safe.

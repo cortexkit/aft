@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "bash-background-project-replay-tests"
+  ],
+  "note": "Test-only: project replay tests in crates/aft/src/bash_background/registry.rs that expect a single replay pass to reach every task now set the per-pass scan time budget to 60 s instead of the 25 ms production limit. No aft_search ranking, fusion, lane admission or truncation change."
+}

@@ -1,9 +1,12 @@
+import { isAbsolute, relative, resolve, win32 } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { PluginInput } from "@opencode-ai/plugin";
 import { sessionWarn } from "./logger.js";
 
 /** Wire format for a single LSP symbol hint sent to the binary. */
 interface LspSymbolHint {
   name: string;
+  /** Absolute file URI, preserving percent escapes until filesystem decoding. */
   file: string;
   line: number;
   kind?: string;
@@ -27,6 +30,44 @@ export const LSP_SYMBOL_KIND_MAP: Record<number, string> = {
   12: "function",
   23: "struct",
 };
+
+function symbolFileUri(file: string, directory?: string): string | undefined {
+  try {
+    const windowsPath = (path: string) => /^[A-Za-z]:[\\/]/.test(path) || path.startsWith("\\\\");
+    const uri = /^file:/i.test(file) ? new URL(file) : undefined;
+    const windows =
+      windowsPath(file) ||
+      (uri !== undefined &&
+        ((uri.hostname !== "" && uri.hostname !== "localhost") ||
+          /^\/[A-Za-z]:\//.test(uri.pathname))) ||
+      (directory !== undefined && windowsPath(directory));
+    const paths = windows ? win32 : { isAbsolute, relative, resolve };
+    if (/^file:/i.test(file)) {
+      file = fileURLToPath(file, { windows });
+    } else if (!windowsPath(file) && /^[A-Za-z][A-Za-z0-9+.-]*:/.test(file)) {
+      return undefined;
+    }
+    if (!paths.isAbsolute(file)) {
+      // Relative SDK paths belong to the explicit query root, never the plugin cwd.
+      if (!directory || !paths.isAbsolute(directory)) return undefined;
+      file = paths.resolve(directory, file);
+    }
+    if (directory) {
+      if (!paths.isAbsolute(directory)) return undefined;
+      const within = paths.relative(directory, file);
+      if (
+        within === ".." ||
+        within.startsWith(`..${windows ? "\\" : "/"}`) ||
+        paths.isAbsolute(within)
+      ) {
+        return undefined;
+      }
+    }
+    return pathToFileURL(file, { windows }).href;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Query the OpenCode LSP for workspace symbols matching `symbolName`.
@@ -67,19 +108,8 @@ export async function queryLspHints(
     // Map to wire format
     const hints: LspSymbolHint[] = [];
     for (const sym of symbols) {
-      // Convert file URI to path (handles Windows file:///C:/path correctly)
-      let file = sym.location.uri;
-      if (file.startsWith("file://")) {
-        try {
-          file = new URL(file).pathname;
-          // On Windows, URL.pathname gives /C:/path — strip leading slash
-          if (process.platform === "win32" && /^\/[A-Za-z]:/.test(file)) {
-            file = file.slice(1);
-          }
-        } catch {
-          file = file.slice(7);
-        }
-      }
+      const file = symbolFileUri(sym.location.uri, directory);
+      if (!file) continue;
 
       const hint: LspSymbolHint = {
         name: sym.name,
@@ -95,7 +125,7 @@ export async function queryLspHints(
       hints.push(hint);
     }
 
-    return { symbols: hints };
+    return hints.length > 0 ? { symbols: hints } : undefined;
   } catch (err) {
     sessionWarn(sessionId, `LSP query failed for "${symbolName}": ${(err as Error).message}`);
     return undefined;

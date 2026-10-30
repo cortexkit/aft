@@ -73,6 +73,7 @@ fn format_ndjson(base_text: &str, data: &Value, list_id: &str) -> String {
 fn make_impact_result(count: usize, depth_limited: bool, truncated: usize) -> StoreImpactResult {
     let callers = (1..=count)
         .map(|i| StoreImpactCaller {
+            relation: None,
             caller_symbol: format!("caller{i}"),
             caller_file: "src/app.ts".to_string(),
             line: i as u32,
@@ -110,6 +111,9 @@ fn make_impact_result(count: usize, depth_limited: bool, truncated: usize) -> St
     let sites_list_envelope = build_callgraph_envelope(Unit::Sites, shown, count, truncated);
 
     StoreImpactResult {
+        callback_dependencies: 0,
+        callback_reference_label: None,
+        test_filter_note: None,
         symbol: "target".to_string(),
         file: "src/app.ts".to_string(),
         signature: None,
@@ -129,6 +133,8 @@ fn make_impact_result(count: usize, depth_limited: bool, truncated: usize) -> St
 fn make_callers_result(count: usize, depth_limited: bool, truncated: usize) -> StoreCallersResult {
     let entries = (1..=count)
         .map(|i| StoreCallerEntry {
+            relation: None,
+            test_status_unknown: false,
             symbol: format!("caller{:02}", i),
             line: i as u32,
             approximate: None,
@@ -162,6 +168,9 @@ fn make_callers_result(count: usize, depth_limited: bool, truncated: usize) -> S
     let callers_list_envelope = build_callgraph_envelope(Unit::Items, shown, count, truncated);
 
     StoreCallersResult {
+        callback_dependencies: 0,
+        callback_reference_label: None,
+        test_filter_note: None,
         symbol: "target".to_string(),
         file: "src/app.ts".to_string(),
         callers: vec![StoreCallerGroup {

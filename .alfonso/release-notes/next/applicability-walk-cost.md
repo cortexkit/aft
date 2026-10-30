@@ -1,1 +1,0 @@
-- Reduced CPU and allocation overhead when discovering applicable language servers in new checkouts, without changing server selection or workspace roots.

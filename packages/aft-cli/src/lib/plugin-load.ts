@@ -1,4 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, join, normalize } from "node:path";
 import {
   type ConfigErrorCode,
   formatConfigErrorMessage,
@@ -43,6 +45,8 @@ export interface PluginLoadBlocker {
 }
 
 export interface PluginLoadEvaluation {
+  /** Configured artifact location, before native startup tests writability. */
+  cacheDir?: string;
   blockers: PluginLoadBlocker[];
   /** Whether the semantic index resolves on. */
   semanticIndex: boolean;
@@ -85,7 +89,7 @@ function failsEveryToolCall(toolCallError: string, scope = ""): string {
 /** A block's own values, then its `harnesses.<harness>` override on top. */
 function withHarness(block: Json, harness: string): Json {
   const override = isRecord(block.harnesses) ? block.harnesses[harness] : undefined;
-  return isRecord(override) ? { ...block, ...override } : block;
+  return isRecord(override) ? { ...block, ...override, storage: block.storage } : block;
 }
 
 function indexesOf(block: Json | null): RawIndexesConfig | undefined {
@@ -165,7 +169,17 @@ export function evaluatePluginLoad(input: PluginLoadInput): PluginLoadEvaluation
     typeof userSemantic?.backend === "string" && userSemantic.backend.length > 0
       ? userSemantic.backend
       : "fastembed";
+  const storage = loaded.user && isRecord(loaded.user.storage) ? loaded.user.storage : null;
+  const requested = typeof storage?.cache_dir === "string" ? storage.cache_dir : "";
+  const home = input.home ?? homedir();
+  const expanded =
+    requested === "~"
+      ? home
+      : requested.startsWith("~/") || requested.startsWith("~\\")
+        ? join(home, requested.slice(2))
+        : requested;
   return {
+    ...(isAbsolute(expanded) ? { cacheDir: normalize(expanded) } : {}),
     blockers,
     semanticIndex,
     semanticBackend,

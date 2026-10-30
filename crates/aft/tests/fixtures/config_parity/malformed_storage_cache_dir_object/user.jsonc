@@ -1,0 +1,8 @@
+{
+  "storage": {
+    "cache_dir": {
+      "path": "/aft-cache"
+    }
+  },
+  "format_on_edit": true
+}

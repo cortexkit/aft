@@ -113,24 +113,68 @@ pub(super) fn assert_promoted(text: &str) {
 }
 
 pub(super) fn assert_transport_repeat_sequence(texts: &[String]) {
-    assert_eq!(texts.len(), 3);
+    assert_transport_repeat_sequence_with_diagnostics(texts, String::new);
+}
+
+/// Collect extra state only after an assertion fails, so diagnostics cannot
+/// introduce a new prerequisite for a successful transport fixture.
+pub(super) fn assert_transport_repeat_sequence_with_diagnostics(
+    texts: &[String],
+    extra_diagnostics: impl Fn() -> String,
+) {
+    let diagnostics = || format!("all tool replies: {texts:#?}\n{}", extra_diagnostics());
+    assert_eq!(texts.len(), 3, "{}", diagnostics());
     assert!(
         !texts[0].contains("identical call"),
-        "first call: {:?}",
-        texts[0]
+        "first call: {}",
+        diagnostics()
     );
     assert!(
         !texts[1].contains("identical call"),
-        "second call: {:?}",
-        texts[1]
+        "second call: {}",
+        diagnostics()
     );
     assert!(
         texts[2].contains("This is the 3rd identical call"),
-        "third call: {:?}",
-        texts[2]
+        "third call: {}",
+        diagnostics()
     );
-    assert!(texts[2].contains("use a background task with a watch"));
-    assert!(texts[2].contains("end the turn"));
+    assert!(
+        texts[2].contains("use a background task with a watch"),
+        "third call watch advice: {}",
+        diagnostics()
+    );
+    assert!(
+        texts[2].contains("end the turn"),
+        "third call end-turn advice: {}",
+        diagnostics()
+    );
+}
+
+#[test]
+fn repeat_breaker_transport_diagnostics_only_run_on_failure() {
+    let mut texts = vec![
+        "first reply".to_string(),
+        "second reply".to_string(),
+        "This is the 3rd identical call; use a background task with a watch; end the turn"
+            .to_string(),
+    ];
+    assert_transport_repeat_sequence_with_diagnostics(&texts, || {
+        panic!("a passing fixture must not collect diagnostics")
+    });
+
+    texts[2] = "This is the 3rd call with the same arguments; output is drifting".to_string();
+    let failure = std::panic::catch_unwind(|| {
+        assert_transport_repeat_sequence_with_diagnostics(&texts, || {
+            "recorded output hashes: [11, 22, 22]".to_string()
+        });
+    })
+    .expect_err("a drifting reply must still fail the identical-output assertion");
+    let message = failure.downcast_ref::<String>().expect("assertion message");
+    for text in &texts {
+        assert!(message.contains(text), "missing reply in {message:?}");
+    }
+    assert!(message.contains("recorded output hashes: [11, 22, 22]"));
 }
 
 fn observe_tool(

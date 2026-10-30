@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "note": "No search ranking, routing or index source is touched. Bash changed-files diffs that run out of their time budget now say so instead of claiming no git before-image exists, and the changed-files tests give rendering an ample budget. Search output, scores, ordering and page cuts are unchanged; benchmark rows must remain byte-identical.",
+  "slices": [
+    "changed-files-diff-budget-reason"
+  ]
+}

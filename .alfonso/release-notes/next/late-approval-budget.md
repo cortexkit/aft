@@ -1,1 +1,0 @@
-- An approved outside-folder read or write no longer fails with a filesystem deadline when AFT was busy at the moment you approved it.

@@ -1,1 +1,0 @@
-Reduce disk I/O in the legacy call-graph store (standalone with views off): cold builds commit source-byte batches with a build-only page cache, and one-file refreshes reuse connections and avoid whole-store status/root scans. Existing generations rebuild once for the new indexed schema. Thanks to @moynzzz for the measurements and report in #746.

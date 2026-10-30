@@ -1,0 +1,10 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs"
+  ],
+  "note": "The ranking-fenced semantic_search mod.rs change is test-only: the split-request ranking test runs its borrowed-load, disk-check and first-search waits generous so a loaded runner cannot truncate the file list, and a missing host now prints the response. Enumeration, lane selection, scores, fusion, ordering and page cuts are unchanged; benchmark rows must remain byte-identical."
+}

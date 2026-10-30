@@ -1,0 +1,7 @@
+{
+  "bash": {
+    "env": {
+      "PARITY_PROJECT_ENV": "project-value"
+    }
+  }
+}

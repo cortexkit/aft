@@ -1,1 +1,0 @@
-- Reclaim empty bash-task session folders during bounded cleanup, remove incomplete empty task layouts, and isolate unreadable retention bindings so one damaged record cannot stall other cleanup; routine no-op retention and detach traces now use debug logging. Thanks @null-axiom for reporting these storage and log hygiene issues.

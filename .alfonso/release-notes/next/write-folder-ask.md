@@ -1,1 +1,0 @@
-When an agent asks to write a file outside its own checkout, the permission ask now also offers write access to that file's whole folder, under the same rules that already limit which folders a read ask may offer (never the home folder, a home ancestor, a root-level folder or a system folder).

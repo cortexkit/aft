@@ -578,6 +578,10 @@ fn dropped_failure_or_error_blocks(result: &CompressionResult) -> bool {
         .any(|class| result.dropped_by_class.get(&class).copied().unwrap_or(0) > 0)
 }
 
+/// The line that introduces failure lines AFT kept from output it otherwise
+/// shortened, so the agent can tell them from the command's own lines.
+pub(crate) const PRESERVED_FAILURES_LABEL: &str = "[raw failure lines preserved by AFT]";
+
 fn append_missing_failure_lines(
     mut result: CompressionResult,
     raw_output: &str,
@@ -602,7 +606,8 @@ fn append_missing_failure_lines(
     if !text.is_empty() {
         text.push('\n');
     }
-    text.push_str("[raw failure lines preserved by AFT]\n");
+    text.push_str(PRESERVED_FAILURES_LABEL);
+    text.push('\n');
     text.push_str(&missing_failure_lines.join("\n"));
     if let Some(final_line) = final_line {
         text.push('\n');
@@ -671,7 +676,7 @@ pub(crate) fn text_has_failure_signal(text: &str) -> bool {
         .any(|(line, lower)| line_has_failure_signal_lower(line.trim(), lower.trim()))
 }
 
-fn line_has_failure_signal_lower(line: &str, lower: &str) -> bool {
+pub(crate) fn line_has_failure_signal_lower(line: &str, lower: &str) -> bool {
     line.contains("error[")
         || lower.contains("error:")
         || line.contains("Error")
@@ -1699,6 +1704,21 @@ mod tests {
     }
 }
 
+/// Cargo output of 1 KiB or less is passed through raw. A dispatch test that
+/// must see the cargo summary at work pads its fixture with per-test progress
+/// lines, which the summary drops.
+#[cfg(test)]
+fn cargo_test_progress_padding() -> String {
+    "test padding_case ... ok\n".repeat(50)
+}
+
+/// Cargo build counterpart of [`cargo_test_progress_padding`]: status lines the
+/// build summary drops.
+#[cfg(test)]
+fn cargo_build_progress_padding() -> String {
+    "   Compiling padding v0.1.0\n".repeat(40)
+}
+
 #[cfg(test)]
 mod output_probe_tests {
     use super::generic::strip_ansi;
@@ -2064,11 +2084,66 @@ mod dispatch_specificity_tests {
         );
     }
 
+    /// A gate script's verdicts followed by four cargo test binaries, as one
+    /// finished command printed them (417 bytes).
+    const SHORT_GATE_OUTPUT: &str = "fmt-ok\nwin-check rc=0\ntest result: ok. 803 passed; 0 failed; 19 ignored; 0 measured; 8977 filtered out; finished in 23.38s\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2592 filtered out; finished in 0.12s\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2592 filtered out; finished in 0.16s\ntest result: ok. 114 passed; 0 failed; 3 ignored; 0 measured; 2476 filtered out; finished in 11.74s\n";
+
+    #[test]
+    fn short_cargo_test_output_passes_through_raw_without_a_cap_trailer() {
+        for output in [
+            SHORT_GATE_OUTPUT.to_string(),
+            SHORT_GATE_OUTPUT.replace("win-check rc=0", "win-check rc=101"),
+        ] {
+            for command in ["./scripts/gate.sh", "cargo test"] {
+                let compressed =
+                    compress_with_registry_exit_code(command, &output, Some(0), &empty_registry());
+
+                assert_eq!(compressed.text, output, "{command}");
+                assert!(
+                    crate::list_surfaces::bash::build_envelope_from_output(
+                        &compressed.text,
+                        compressed.input_line_count()
+                    )
+                    .is_none(),
+                    "{command}: nothing was cut, so no `shown N of M` trailer"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn long_sniffed_cargo_test_output_keeps_gate_verdicts() {
+        let mut output = String::from("fmt-ok\nwin-check rc=101\nrunning 40 tests\n");
+        for index in 0..40 {
+            output.push_str(&format!("test tests::case_{index} ... ok\n"));
+        }
+        output.push_str("\ntest result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n");
+        assert!(
+            output.len() > 1024,
+            "fixture must be past the raw passthrough size"
+        );
+
+        let compressed = compress_with_registry_exit_code(
+            "./scripts/gate.sh",
+            &output,
+            Some(0),
+            &empty_registry(),
+        );
+
+        assert_eq!(
+            compressed.text,
+            "fmt-ok\nwin-check rc=101\nrunning 40 tests\ntest result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
+        );
+    }
+
     #[test]
     fn non_piped_cargo_test_still_uses_cargo_compressor() {
-        let output = "running 1 test\ntest ok_test ... ok\n\ntest result: ok. 1 passed; 0 failed\n";
+        let output = format!(
+            "running 1 test\ntest ok_test ... ok\n{}\ntest result: ok. 1 passed; 0 failed\n",
+            cargo_test_progress_padding()
+        );
 
-        let compressed = compress_with_registry("cargo test", output, &empty_registry());
+        let compressed = compress_with_registry("cargo test", &output, &empty_registry());
 
         assert!(compressed.text.contains("running 1 test"));
         assert!(compressed.text.contains("test result: ok"));
@@ -2729,9 +2804,9 @@ mod normalize_command_tests {
 
     #[test]
     fn bare_assignment_prefix_cargo_test_routes_to_cargo() {
-        let output = "running 1 test\ntest foo ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
+        let output = format!("running 1 test\ntest foo ... ok\n{}\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n", cargo_test_progress_padding());
         let compressed =
-            compress_with_registry("FOO=1 BAR=2 cargo test", output, &empty_registry());
+            compress_with_registry("FOO=1 BAR=2 cargo test", &output, &empty_registry());
         assert!(compressed.contains("running 1 test"));
         assert!(compressed.contains("test result: ok"));
         assert!(!compressed.contains("test foo ... ok"));
@@ -2739,10 +2814,10 @@ mod normalize_command_tests {
 
     #[test]
     fn quoted_assignment_prefix_cargo_build_routes_to_cargo() {
-        let output = "   Compiling foo v0.1.0\nwarning: unused variable: `x`\n --> src/lib.rs:1:9\n  |\n1 |     let x = 1;\n  |         ^ help: if this is intentional, prefix it with an underscore: `_x`\n\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.12s\n";
+        let output = format!("{}   Compiling foo v0.1.0\nwarning: unused variable: `x`\n --> src/lib.rs:1:9\n  |\n1 |     let x = 1;\n  |         ^ help: if this is intentional, prefix it with an underscore: `_x`\n\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.12s\n", cargo_build_progress_padding());
         let compressed = compress_with_registry(
             "RUSTFLAGS='-C debug' cargo build",
-            output,
+            &output,
             &empty_registry(),
         );
         assert!(!compressed.contains("Compiling foo"));
@@ -3026,8 +3101,11 @@ mod normalize_command_tests {
         // `cd /x && cargo test` — the `cd /x &&` prefix is peeled, leaving a
         // clean `cargo test` with NO residual separator. Specialized cargo
         // compression must still engage (not force-generic).
-        let output = "running 1 test\ntest ok_test ... ok\n\ntest result: ok. 1 passed; 0 failed\n";
-        let compressed = compress_with_registry("cd /x && cargo test", output, &empty_registry());
+        let output = format!(
+            "running 1 test\ntest ok_test ... ok\n{}\ntest result: ok. 1 passed; 0 failed\n",
+            cargo_test_progress_padding()
+        );
+        let compressed = compress_with_registry("cd /x && cargo test", &output, &empty_registry());
         // Cargo compressor drops individual "test ... ok" lines in its summary.
         assert!(
             !compressed.text.contains("test ok_test ... ok"),
@@ -3042,8 +3120,11 @@ mod normalize_command_tests {
         // Control: a clean single `cargo test` (no separator, no pipe) must
         // continue dispatching to the specialized cargo compressor and produce
         // the same output as the original specialized-compression behavior.
-        let output = "running 1 test\ntest ok_test ... ok\n\ntest result: ok. 1 passed; 0 failed\n";
-        let compressed = compress_with_registry("cargo test", output, &empty_registry());
+        let output = format!(
+            "running 1 test\ntest ok_test ... ok\n{}\ntest result: ok. 1 passed; 0 failed\n",
+            cargo_test_progress_padding()
+        );
+        let compressed = compress_with_registry("cargo test", &output, &empty_registry());
         assert!(compressed.text.contains("running 1 test"));
         assert!(compressed.text.contains("test result: ok"));
         assert!(

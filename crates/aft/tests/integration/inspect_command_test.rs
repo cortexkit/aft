@@ -1884,141 +1884,32 @@ fn scoped_inspect_views_worktree_reports_checkout_only_dead_function() {
     assert!(!fs::read_to_string(owner.join("target.ts"))
         .unwrap()
         .contains("checkoutOnlyDead"));
-    // A view that predates another edit must not be passed off as this checkout.
+    // An edit after the view was bound is reflected at once: the checkout
+    // view is verified against the tree for every request, so an older view
+    // is never passed off as this checkout.
     write_file(
         &linked,
         "target.ts",
         "export function used() {}\nexport function nextDead() {}\n",
     );
-    let pending = inspect_tool_call(
+    let current = inspect_tool_call(
         &ctx,
         json!({
-            "id": "worktree-view-stale", "command": "inspect", "scope": "target.ts", "sections": "dead_code"
+            "id": "worktree-view-current", "command": "inspect", "scope": "target.ts", "sections": "dead_code"
         }),
     );
-    assert_eq!(
-        pending["summary"]["dead_code"]["unavailable"], true,
-        "{pending:#}"
+    assert!(
+        current["summary"]["dead_code"].get("unavailable").is_none(),
+        "{current:#}"
     );
-    assert!(pending["details"]["dead_code"].is_null(), "{pending:#}");
-}
-
-#[test]
-fn inspect_views_owner_persists_and_reuses_tier2_contributions() {
-    let _env_lock = env_serial_lock();
-    crate::helpers::disable_in_process_file_watcher();
-    let (temp, root) = fixture_project();
-    write_file(
-        &root,
-        "main.ts",
-        "import { used } from './target';\nused();\n",
-    );
-    write_file(
-        &root,
-        "target.ts",
-        "export function used() {}\nexport function dead() {}\n",
-    );
-    for args in [
-        vec!["init", "--quiet"],
-        vec!["add", "."],
-        vec![
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.com",
-            "commit",
-            "--quiet",
-            "-m",
-            "fixture",
-        ],
-    ] {
-        assert!(std::process::Command::new("git")
-            .current_dir(&root)
-            .args(args)
-            .status()
-            .unwrap()
-            .success());
-    }
-    let storage = temp.path().join("storage");
-    let ctx = AppContext::new(
-        Box::new(TreeSitterProvider::new()),
-        Config {
-            storage_dir: Some(storage.clone()),
-            ..Config::default()
-        },
-    )
-    .with_test_checkpoint_store();
-    ctx.isolate_cold_build_limiter_for_test(2);
-    let configured = handle_configure(
-        &request(json!({
-            "id": "configure-owner", "command": "configure", "harness": "opencode", "project_root": root, "storage_dir": storage,
-            "config": crate::helpers::user_config(json!({ "indexes": { "trigram": false, "semantic": false, "callgraph": true }, "views": {"enabled": true} }))
-        })),
-        &ctx,
-    );
-    assert!(configured.success, "{configured:?}");
-    assert!(ctx.inspect_writer());
-    ctx.inspect_manager()
-        .set_automatic_tier2_refresh_allowed(false);
-    let publish = aft::views::assembly::AssemblyRequest {
-        storage,
-        project_root: root.clone(),
-        family: aft::search_index::artifact_cache_key(&root),
-        scope: aft::path_identity::project_scope_key(&root),
-        desired_head: aft::views::assembly::head_tree_fingerprint(
-            &aft::alias::head_tree_entries(&root).unwrap(),
-        ),
-        changed_paths: Default::default(),
-        semantic_keys: Default::default(),
-        require_semantic: false,
-        allow_blob_put: true,
-        callgraph: true,
-    };
-    aft::views::assembly::publish_checkout(&publish).unwrap();
-    configure_fake_scope_lsp(&ctx);
-    let first = inspect_tool_call(
-        &ctx,
-        json!({"id": "owner-first", "command": "inspect", "sections": ["dead_code"]}),
-    );
-    assert_eq!(first["success"], true, "{first:#}");
-    let cache = InspectCache::open_readonly(ctx.inspect_dir(), root.clone())
-        .unwrap()
-        .expect("writer-backed owner cache");
-    let contributions = cache
-        .load_tier2_contributions(InspectCategory::DeadCode)
-        .unwrap();
-    assert_eq!(
-        contributions.len(),
-        2,
-        "owner inspect must persist source contributions"
-    );
-    assert!(cache
-        .last_full_run(InspectCategory::DeadCode)
-        .unwrap()
-        .is_some());
-    let scanned_before = ctx.inspect_manager().source_scan_files_for_test();
-    assert!(scanned_before > 0, "first request must reach the scanner");
-    let second = inspect_tool_call(
-        &ctx,
-        json!({"id": "owner-second", "command": "inspect", "sections": ["dead_code"]}),
-    );
-    assert_eq!(second["success"], true, "{second:#}");
-    assert_eq!(dead_code_items(&first), dead_code_items(&second));
-    assert_eq!(
-        ctx.inspect_manager().source_scan_files_for_test(),
-        scanned_before,
-        "unchanged owner inspect must quick-reuse contributions without scanning source files"
-    );
-    assert_eq!(
-        cache
-            .load_tier2_contributions(InspectCategory::DeadCode)
-            .unwrap()
-            .len(),
-        2
+    let items = dead_code_items(&current);
+    assert!(
+        items.iter().any(|(_, symbol)| symbol == "nextDead"),
+        "{current:#}"
     );
     assert!(
-        ctx.inspect_manager().reuse_start_count_for_test() >= 10,
-        "both requests must use the contribution reuse pipeline"
+        !items.iter().any(|(_, symbol)| symbol == "checkoutOnlyDead"),
+        "{current:#}"
     );
 }
 
@@ -3670,14 +3561,32 @@ fn configure_fake_rust_lsp(ctx: &AppContext) {
 
 fn open_with_lsp(ctx: &AppContext, file: &Path, content: &str) {
     let config = ctx.config().clone();
-    ctx.lsp()
-        .notify_file_changed(file, content, &config)
-        .expect("notify file changed");
-    let diagnostics = ctx
-        .lsp()
-        .wait_for_diagnostics(file, &config, Duration::from_secs(30));
+    let (pre_snapshot, expected_versions) = {
+        let mut lsp = ctx.lsp();
+        lsp.drain_events();
+        let pre_snapshot = lsp.snapshot_pre_edit_state(file);
+        let expected_versions = lsp
+            .notify_file_changed_versioned(file, content, &config)
+            .expect("notify file changed");
+        (pre_snapshot, expected_versions)
+    };
     assert!(
-        !diagnostics.is_empty(),
+        !expected_versions.is_empty(),
+        "fake LSP should match {file:?}"
+    );
+    let result = aft::lsp::fresh_wait::wait_for_post_edit_diagnostics_unlocked(
+        || ctx.lsp(),
+        file,
+        &expected_versions,
+        &pre_snapshot,
+        std::time::Instant::now() + Duration::from_secs(30),
+    );
+    assert!(
+        result.complete(),
+        "fake LSP must report the notified versions for {file:?}: {result:?}"
+    );
+    assert!(
+        !result.diagnostics.is_empty(),
         "fake LSP should publish diagnostics for {file:?}"
     );
 }
@@ -4462,9 +4371,9 @@ fn rust_worker_inspect_capacity_refusal_is_partial_and_names_cap() {
         manager.override_binary(ServerKind::Rust, fake_server_path());
         manager.disable_rust_cargo_for_worker();
         assert_eq!(
-            manager
-                .ensure_server_for_file(file, &Config::default())
-                .len(),
+            crate::test_helpers::settled_lsp(&mut manager, |startup_manager| startup_manager
+                .ensure_server_for_file(file, &Config::default()))
+            .len(),
             1
         );
         occupied.push(manager);
@@ -4929,14 +4838,14 @@ fn review_python_background_pull_preserves_queued_rust_alert_once() {
     std::fs::write(&rust, "pub fn broken() {}\n").unwrap();
     configure_fake_rust_lsp(&ctx);
     let config = ctx.config();
-    let rust_key = ctx
-        .lsp()
-        .ensure_file_open(&rust, &config)
-        .unwrap()
-        .server_keys
-        .into_iter()
-        .find(|key| key.kind == ServerKind::Rust)
-        .unwrap();
+    let rust_key = crate::test_helpers::settled_lsp(&mut ctx.lsp(), |manager| {
+        manager.ensure_file_open(&rust, &config)
+    })
+    .unwrap()
+    .server_keys
+    .into_iter()
+    .find(|key| key.kind == ServerKind::Rust)
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         ctx.lsp().drain_events();
@@ -4951,7 +4860,10 @@ fn review_python_background_pull_preserves_queued_rust_alert_once() {
         .set_extra_env("AFT_FAKE_LSP_PULL_DELAY_SIGNAL", signal.to_str().unwrap());
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL_DELAY_MS", "500");
     let python = root.join("broken.py");
-    ctx.lsp().ensure_file_open(&python, &config).unwrap();
+    crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+        startup_manager.ensure_file_open(&python, &config)
+    })
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     while !signal.exists() {
         ctx.lsp().drain_events();
@@ -5028,7 +4940,10 @@ fn python_dynamic_pull_populates_status_and_alert_source_without_inspect() {
     let (dir, ctx, log) = dynamic_python_pull_fixture();
     let file = std::fs::canonicalize(dir.path()).unwrap().join("broken.py");
     let config = ctx.config();
-    ctx.lsp().ensure_file_open(&file, &config).unwrap();
+    crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+        startup_manager.ensure_file_open(&file, &config)
+    })
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut snapshots = Vec::new();
     loop {
@@ -5095,7 +5010,10 @@ fn open_dynamic_python(
     expected: usize,
 ) -> Vec<aft::alert_state::AcceptedDiagnosticSnapshot> {
     let config = ctx.config();
-    ctx.lsp().ensure_file_open(file, &config).unwrap();
+    crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+        startup_manager.ensure_file_open(file, &config)
+    })
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut accepted = Vec::new();
     loop {
@@ -5403,7 +5321,10 @@ fn scoped_python_progress_second_file_after_idle_without_new_run_settles() {
     std::fs::write(dir.path().join("second.py"), "value: int = 'wrong'\n").unwrap();
     let first = std::fs::canonicalize(dir.path()).unwrap().join("broken.py");
     let config = ctx.config();
-    ctx.lsp().ensure_file_open(&first, &config).unwrap();
+    crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+        startup_manager.ensure_file_open(&first, &config)
+    })
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut ended = false;
     loop {
@@ -5598,7 +5519,10 @@ fn scoped_python_progress_reanalysis_keeps_warm_counts_and_alert_episode() {
         .diagnostics_store_mut_for_test()
         .mark_stale_for_file(&file);
     let config = ctx.config();
-    ctx.lsp().ensure_file_open(&file, &config).unwrap();
+    crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+        startup_manager.ensure_file_open(&file, &config)
+    })
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let drained = ctx.lsp().drain_events();
@@ -6945,6 +6869,328 @@ fn scoped_typescript_sync_excluded_external_file_is_not_requested() {
         .all(|request| request["arguments"][1]["file"] == file_uri(&included)));
 }
 
+/// Serve TypeScript under `package_root` the way TypeScript 7 is served: a
+/// `node_modules/typescript` at version 7 selects the native compiler's own
+/// server (`tsc --lsp`), here the fake. That server only answers pull
+/// requests (it publishes nothing for an opened source file) and reports one
+/// error for each line of the text it was last sent that contains `BROKEN`.
+/// These tests disable the in-process file watcher, so no watcher event marks
+/// a stored report stale (outside the project none would arrive anyway).
+/// Call before `configured_context`, so the installation is seen.
+fn install_content_pull_native_typescript(package_root: &Path) -> ServerKind {
+    let package_dir = package_root.join("node_modules").join("typescript");
+    write_file(
+        &package_dir,
+        "package.json",
+        "{\"name\":\"typescript\",\"version\":\"7.0.0\"}\n",
+    );
+    ServerKind::TypeScriptNative(Arc::from(
+        crate::helpers::canonicalize_like_product(&package_dir).as_path(),
+    ))
+}
+
+fn configure_content_pull_typescript_lsp(ctx: &AppContext, native: ServerKind) {
+    ctx.lsp().override_binary(native, fake_server_path());
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_DISABLE_PUSH", "1");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PULL_FROM_CONTENT", "1");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_SERVER_NAME", "typescript-go");
+}
+
+const CONTENT_PULL_ERROR: &str = "BROKEN marker in synced text";
+
+/// `edit_match` dispatched as an OpenCode host's request is, so a file
+/// outside the project can be edited.
+fn edit_match_as_opencode(ctx: &AppContext, id: &str, file: &Path, from: &str, to: &str) {
+    let response = aft::access_policy::with_native_route(
+        request(json!({
+            "id": id, "command": "edit_match",
+            "file": file.display().to_string(), "match": from, "replacement": to,
+        })),
+        ctx,
+        |req, ctx| aft::commands::edit_match::handle_edit_match(&req, ctx),
+    );
+    assert!(response.success, "{response:?}");
+}
+
+/// Fail when `response` certifies diagnostics for `file` that do not describe
+/// its current text. A stale result marked incomplete is acceptable; one
+/// counted as authoritative is not.
+fn assert_not_certified_stale(response: &Value, file: &Path, expected_errors: u64) {
+    let messages = diagnostic_messages_for(response, &diagnostic_path(file));
+    let reported = messages
+        .iter()
+        .filter(|message| message.as_str() == CONTENT_PULL_ERROR)
+        .count() as u64;
+    if response["complete"] == false {
+        assert!(
+            uncovered_files(response)
+                .iter()
+                .any(|(gap, _)| gap == &diagnostic_path(file)),
+            "an incomplete result must name the file it could not certify: {response:#}"
+        );
+        return;
+    }
+    assert_eq!(
+        reported, expected_errors,
+        "diagnostics certified as authoritative must describe the file's current text: {response:#}"
+    );
+}
+
+/// A scoped inspect of a file outside the project pulled its
+/// diagnostics (and closed the document again); an AFT edit then fixed the
+/// error and reopened the document in the server. The pulled report stays in
+/// the store as current, and the next inspect reads an already-open document's
+/// stored report instead of asking again, so it certifies the fixed error as
+/// authoritative.
+#[test]
+fn scoped_inspect_outside_project_drops_an_error_fixed_by_an_aft_edit() {
+    let (_temp, root) = fixture_project();
+    let (_external, external_root, file) = external_typescript_fixture();
+    fs::write(&file, "export const n: number = BROKEN;\n").unwrap();
+    let native = install_content_pull_native_typescript(&external_root);
+    let ctx = configured_context(&root);
+    configure_content_pull_typescript_lsp(&ctx, native.clone());
+
+    let before =
+        scoped_diagnostics_inspect_outside(&ctx, "fixed-outside-before", file.to_str().unwrap());
+    assert_eq!(before["complete"], true, "{before:#}");
+    assert_eq!(
+        diagnostic_messages_for(&before, &diagnostic_path(&file)),
+        vec![CONTENT_PULL_ERROR.to_string()],
+        "control: the first inspect reports the error: {before:#}"
+    );
+    assert!(
+        ctx.lsp()
+            .active_server_keys()
+            .iter()
+            .any(|key| key.kind == native),
+        "control: the native TypeScript server analyzed the file"
+    );
+
+    edit_match_as_opencode(&ctx, "fixed-outside-edit", &file, "BROKEN", "5");
+    let after =
+        scoped_diagnostics_inspect_outside(&ctx, "fixed-outside-after", file.to_str().unwrap());
+    assert_not_certified_stale(&after, &file, 0);
+}
+
+/// After the AFT edit left the document open, the file is changed again by a
+/// plain disk write (as a shell append would), which nothing reports to the
+/// server, so its analysis still describes the earlier text.
+#[test]
+fn scoped_inspect_outside_project_sees_a_disk_write_after_an_aft_edit() {
+    let (_temp, root) = fixture_project();
+    let (_external, external_root, file) = external_typescript_fixture();
+    fs::write(&file, "export const n: number = 5;\n").unwrap();
+    let native = install_content_pull_native_typescript(&external_root);
+    let ctx = configured_context(&root);
+    configure_content_pull_typescript_lsp(&ctx, native.clone());
+
+    let before =
+        scoped_diagnostics_inspect_outside(&ctx, "append-outside-before", file.to_str().unwrap());
+    assert_eq!(before["complete"], true, "{before:#}");
+    assert!(
+        diagnostic_messages_for(&before, &diagnostic_path(&file)).is_empty(),
+        "control: the clean file is reported clean: {before:#}"
+    );
+    assert!(
+        ctx.lsp()
+            .active_server_keys()
+            .iter()
+            .any(|key| key.kind == native),
+        "control: the native TypeScript server analyzed the file"
+    );
+    edit_match_as_opencode(&ctx, "append-outside-edit", &file, "= 5", "= 6");
+    let edited =
+        scoped_diagnostics_inspect_outside(&ctx, "append-outside-edited", file.to_str().unwrap());
+    assert_not_certified_stale(&edited, &file, 0);
+
+    let mut appended = fs::read_to_string(&file).unwrap();
+    appended.push_str("export const m: number = BROKEN;\n");
+    fs::write(&file, appended).unwrap();
+    let after =
+        scoped_diagnostics_inspect_outside(&ctx, "append-outside-after", file.to_str().unwrap());
+    assert_not_certified_stale(&after, &file, 1);
+}
+
+/// The same sequence as the out-of-project edit, inside the project. In a
+/// running session the project watcher sees AFT's own write and marks the old
+/// analysis stale, which hides the defect; without that event (these tests run
+/// no watcher) the old analysis is certified exactly as outside the project.
+#[test]
+fn scoped_inspect_inside_project_drops_an_error_fixed_by_an_aft_edit_without_a_watcher_event() {
+    let (_temp, root, _broken) = external_typescript_fixture();
+    let file = crate::helpers::canonicalize_like_product(&write_file(
+        &root,
+        "a.ts",
+        "export const n: number = BROKEN;\n",
+    ));
+    let native = install_content_pull_native_typescript(&root);
+    let ctx = configured_context(&root);
+    configure_content_pull_typescript_lsp(&ctx, native.clone());
+
+    let before = scoped_diagnostics_inspect(&ctx, "fixed-inside-before", "a.ts");
+    assert_eq!(before["complete"], true, "{before:#}");
+    assert_eq!(
+        diagnostic_messages_for(&before, "a.ts"),
+        vec![CONTENT_PULL_ERROR.to_string()],
+        "control: the first inspect reports the error: {before:#}"
+    );
+    assert!(
+        ctx.lsp()
+            .active_server_keys()
+            .iter()
+            .any(|key| key.kind == native),
+        "control: the native TypeScript server analyzed the file"
+    );
+
+    let fix = aft::commands::edit_match::handle_edit_match(
+        &request(json!({
+            "id": "fixed-inside-edit", "command": "edit_match",
+            "file": file.display().to_string(), "match": "BROKEN", "replacement": "5",
+        })),
+        &ctx,
+    );
+    assert!(fix.success, "{fix:?}");
+    let after = scoped_diagnostics_inspect(&ctx, "fixed-inside-after", "a.ts");
+    if after["complete"] == true {
+        assert!(
+            diagnostic_messages_for(&after, "a.ts").is_empty(),
+            "diagnostics certified as authoritative must describe the file's current text: {after:#}"
+        );
+    }
+}
+
+/// After an AFT edit left the document open, the file changed on disk to
+/// bytes that are not UTF-8 text, so AFT cannot send the server the current
+/// text. The server's analysis describes the older text, so the file must be
+/// reported unknown, with the reason, never certified.
+#[test]
+fn scoped_inspect_reports_a_file_unknown_when_its_changed_text_cannot_be_sent() {
+    let (_temp, root) = fixture_project();
+    let (_external, external_root, file) = external_typescript_fixture();
+    fs::write(&file, "export const n: number = BROKEN;\n").unwrap();
+    let native = install_content_pull_native_typescript(&external_root);
+    let ctx = configured_context(&root);
+    configure_content_pull_typescript_lsp(&ctx, native.clone());
+
+    let before =
+        scoped_diagnostics_inspect_outside(&ctx, "unsendable-before", file.to_str().unwrap());
+    assert_eq!(
+        diagnostic_messages_for(&before, &diagnostic_path(&file)),
+        vec![CONTENT_PULL_ERROR.to_string()],
+        "control: the first inspect reports the error: {before:#}"
+    );
+    assert!(
+        ctx.lsp()
+            .active_server_keys()
+            .iter()
+            .any(|key| key.kind == native),
+        "control: the native TypeScript server analyzed the file"
+    );
+    edit_match_as_opencode(&ctx, "unsendable-edit", &file, "BROKEN", "5");
+    let edited =
+        scoped_diagnostics_inspect_outside(&ctx, "unsendable-edited", file.to_str().unwrap());
+    assert_eq!(edited["complete"], true, "control: {edited:#}");
+    assert!(
+        diagnostic_messages_for(&edited, &diagnostic_path(&file)).is_empty(),
+        "control: the fixed file is reported clean: {edited:#}"
+    );
+
+    fs::write(&file, b"export const n: number = BROKEN;\n// \xff\xfe\n").unwrap();
+    let after =
+        scoped_diagnostics_inspect_outside(&ctx, "unsendable-after", file.to_str().unwrap());
+    assert_eq!(after["complete"], false, "{after:#}");
+    let gaps = uncovered_files(&after);
+    // The full agent-visible reason, pinned word for word: the wording was
+    // approved as written, so any change to it must show up here.
+    assert!(
+        gaps.iter().any(|(gap, reason)| gap == &diagnostic_path(&file)
+            && reason
+                == "changed on disk since the server last analyzed it, and AFT could not send it the current text; retry aft_inspect"),
+        "the file must be named unknown with the reason: {after:#}"
+    );
+    assert!(
+        diagnostic_messages_for(&after, &diagnostic_path(&file)).is_empty(),
+        "no analysis of the older text may be reported: {after:#}"
+    );
+}
+
+/// A server that answers pulls and clears a closed document's diagnostics
+/// with an empty, unversioned `publishDiagnostics` sent the clear late: after
+/// an AFT edit had already reopened the document. That push says nothing
+/// about the open text (which still has the error), so a scoped inspect must
+/// ask the server again rather than certify the file clean from it.
+#[test]
+fn scoped_inspect_asks_a_pull_server_again_after_a_late_clearing_push() {
+    let (_temp, root) = fixture_project();
+    let (_external, external_root, file) = external_typescript_fixture();
+    fs::write(
+        &file,
+        "export const n: number = BROKEN;\nexport const other = 1;\n",
+    )
+    .unwrap();
+    let native = install_content_pull_native_typescript(&external_root);
+    let ctx = configured_context(&root);
+    configure_content_pull_typescript_lsp(&ctx, native.clone());
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PULL_CONTENT_CLEARS_ON_CLOSE", "1");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_CLOSE_DELAY_MS", "500");
+
+    let before =
+        scoped_diagnostics_inspect_outside(&ctx, "late-clear-before", file.to_str().unwrap());
+    assert_eq!(
+        diagnostic_messages_for(&before, &diagnostic_path(&file)),
+        vec![CONTENT_PULL_ERROR.to_string()],
+        "control: the first inspect reports the error: {before:#}"
+    );
+    assert!(
+        ctx.lsp()
+            .active_server_keys()
+            .iter()
+            .any(|key| key.kind == native),
+        "control: the native TypeScript server analyzed the file"
+    );
+    // An edit that keeps the error reopens the document before the server's
+    // delayed reply to the inspect's close arrives.
+    edit_match_as_opencode(&ctx, "late-clear-edit", &file, "other = 1", "other = 2");
+
+    // Control: the late clearing push reached the store as a current,
+    // pushed (not pulled), empty report for the file.
+    let canonical = crate::helpers::canonicalize_like_product(&file);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut lsp = ctx.lsp();
+        lsp.drain_events();
+        let landed = lsp
+            .diagnostics_store_for_test()
+            .entries_for_file(&canonical)
+            .into_iter()
+            .any(|(key, entry)| {
+                key.kind == native
+                    && !entry.stale
+                    && !entry.from_document_pull
+                    && entry.diagnostics.is_empty()
+            });
+        drop(lsp);
+        if landed {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "control: the late clearing push never reached the store"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let after =
+        scoped_diagnostics_inspect_outside(&ctx, "late-clear-after", file.to_str().unwrap());
+    assert_not_certified_stale(&after, &file, 1);
+}
+
 /// The reporter's scenario: the server reported on file Y only, so a scoped
 /// call for file X must return `complete: false` naming X — never an
 /// empty-clean result. The second half is the mutation control: forcing the
@@ -7393,10 +7639,10 @@ fn scoped_diagnostics_open_no_documents_and_close_none() {
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
 
     let config = ctx.config().clone();
-    let open_result = ctx
-        .lsp()
-        .ensure_file_open(&pre_opened, &config)
-        .expect("pre-open document");
+    let open_result = crate::test_helpers::settled_lsp(&mut ctx.lsp(), |manager| {
+        manager.ensure_file_open(&pre_opened, &config)
+    })
+    .expect("pre-open document");
     assert_eq!(open_result.newly_opened.len(), 1);
     let pre_open_events = collect_lsp_notifications(&ctx, "custom/documentOpened", 1);
     assert_eq!(pre_open_events[0]["uri"], file_uri(&pre_opened));
@@ -7456,9 +7702,10 @@ fn scoped_inspect_without_diagnostics_does_no_producer_work() {
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
-    ctx.lsp()
-        .ensure_file_open(&pre_opened, &ctx.config())
-        .unwrap();
+    crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+        startup_manager.ensure_file_open(&pre_opened, &ctx.config())
+    })
+    .unwrap();
     collect_lsp_notifications(&ctx, "custom/documentOpened", 1);
     ctx.update_status_bar_tier2(Some(11), Some(12), Some(13), Some(14), false);
 
@@ -7766,7 +8013,49 @@ fn scoped_diagnostics_discovery_preserves_project_bar_counts() {
         "AFT_FAKE_LSP_QUIESCENCE_RELEASE_FILE",
         ready_release.to_str().unwrap(),
     );
-    open_with_lsp(&ctx, &pre_opened, "pub fn old() {}\n");
+    // This fixture intentionally holds the initial report provisional. Wait for
+    // its publication here; authoritative version proof must wait until the
+    // readiness gate below is released.
+    let config = ctx.config().clone();
+    let (pre, expected) = {
+        let mut lsp = ctx.lsp();
+        lsp.drain_events();
+        let pre = lsp.snapshot_pre_edit_state(&pre_opened);
+        let expected = lsp
+            .notify_file_changed_versioned(&pre_opened, "pub fn old() {}\n", &config)
+            .expect("notify file changed");
+        (pre, expected)
+    };
+    assert!(
+        !expected.is_empty(),
+        "the fake must receive a versioned edit"
+    );
+    wait_for_lsp_report_state(&ctx, &pre_opened, true);
+    let wait_for_notified_versions = |timeout| {
+        let deadline = Instant::now() + timeout;
+        loop {
+            // A zero-duration check drains current events without holding the
+            // manager mutex across the wait for the server's readiness signal.
+            let outcome = ctx.lsp().wait_for_post_edit_diagnostics(
+                &pre_opened,
+                &config,
+                &expected,
+                &pre,
+                Duration::ZERO,
+            );
+            if outcome.complete() || Instant::now() >= deadline {
+                break outcome;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let warming = wait_for_notified_versions(Duration::ZERO);
+    assert!(
+        !warming.complete(),
+        "warming reports cannot prove freshness"
+    );
+    assert!(warming.accepted_snapshots.is_empty());
+    assert_eq!(warming.pending_servers.len(), expected.len());
     ctx.update_status_bar_tier2(Some(11), Some(12), Some(13), Some(14), false);
     assert!(ctx.lsp().has_diagnostic_report_for_file(&pre_opened));
     assert!(
@@ -7774,12 +8063,17 @@ fn scoped_diagnostics_discovery_preserves_project_bar_counts() {
         "the fake must hold the initial report provisional until the readiness wait"
     );
     let wait_for_before = || {
-        // `open_with_lsp` waits for a stored diagnostic publication, which can
-        // still be provisional while the server is warming. Allow the fake to
-        // announce readiness, then wait for a non-provisional report and keep
-        // the first bar snapshot with a known error count. A later fresh read
-        // could hit the manager-contention fallback again.
+        // Require the same notified versions after readiness, without sending
+        // another edit. Keep the first bar snapshot with a known error count;
+        // a later read could hit the manager-contention fallback again.
         std::fs::write(&ready_release, "ready\n").unwrap();
+        let ready = wait_for_notified_versions(Duration::from_secs(30));
+        assert!(
+            ready.complete(),
+            "the notified versions must become fresh: {ready:?}"
+        );
+        assert_eq!(ready.accepted_snapshots.len(), expected.len());
+        assert!(!ready.diagnostics.is_empty());
         wait_for_lsp_report_state(&ctx, &pre_opened, false);
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -8918,6 +9212,134 @@ fn scoped_rust_inspect_reports_a_removed_field_after_an_outside_edit_with_real_r
     assert_removed_field_reported(&after);
 }
 
+/// When a watcher drain forwards an outside edit while another thread holds
+/// the LSP manager, the change waits in a queue for a helper thread, and
+/// until that helper runs rust-analyzer has not heard of the edit, so no
+/// `cargo check` is expected for it. The helper is held here, the way a
+/// loaded machine can delay it, so the inspect runs while the change is still
+/// queued. It must deliver the change itself and then report the compiler
+/// error of the check the change starts, or name that check as still
+/// running; the stale answer it used to give is a complete result without
+/// that error.
+#[test]
+fn scoped_rust_inspect_forwards_a_queued_outside_edit_before_certifying() {
+    let (_temp_dir, root, lib) = single_crate_fixture("queued-outside-edit");
+    let ctx = configured_context_with_diagnostics_timeout(&root, 40_000);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "0");
+    let warm = scoped_diagnostics_inspect(&ctx, "queued-outside-edit-warm", "src/lib.rs");
+    assert!(!reported_check_still_running(&warm), "{warm:#}");
+    // The fake's own analysis always reports a test error and warning; only
+    // a check of a file containing `fake_compile_error` adds this one.
+    assert!(
+        !diagnostic_messages_for(&warm, "src/lib.rs")
+            .iter()
+            .any(|message| message == "fake compile error"),
+        "control: the file compiles before the outside edit: {warm:#}"
+    );
+
+    // Another program adds a compiler error.
+    fs::write(&lib, "// fake_compile_error\npub fn f() {}\n").unwrap();
+    let paused = queue_watcher_change_for_held_helper(&ctx, &lib);
+
+    let after = scoped_diagnostics_inspect(&ctx, "queued-outside-edit-after", "src/lib.rs");
+    drop(paused);
+    if reported_check_still_running(&after) {
+        return;
+    }
+    let text = after["text"].as_str().expect("rendered text");
+    assert!(
+        diagnostic_messages_for(&after, "src/lib.rs")
+            .iter()
+            .any(|message| message == "fake compile error"),
+        "the compiler error of the outside edit is missing: {text}\n{after:#}"
+    );
+}
+
+/// Forward the watcher's change to `path` while another thread holds the LSP
+/// manager, so it is queued for the helper thread, and keep that helper from
+/// delivering it until the returned guard is dropped.
+fn queue_watcher_change_for_held_helper<'a>(
+    ctx: &'a AppContext,
+    path: &Path,
+) -> parking_lot::MutexGuard<'a, ()> {
+    let paused = ctx.pause_lsp_watcher_forwarding_for_test();
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    thread::scope(|scope| {
+        scope.spawn(move || {
+            let _busy = ctx.lsp();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        held_rx.recv().unwrap();
+        ctx.lsp_forward_watcher_file_events(&[path.to_path_buf()]);
+        release_tx.send(()).unwrap();
+    });
+    assert!(
+        ctx.lsp_watcher_forward_pending_for_test(),
+        "control: the change must still be queued"
+    );
+    paused
+}
+
+/// `lsp_diagnostics` reads the same check state as inspect, so a change
+/// still queued for the held helper thread must not be answered from
+/// rust-analyzer's results for the file before it: the answer reports the
+/// compiler error of the check the change starts, or is incomplete with the
+/// note that the check is still running.
+#[test]
+fn rust_lsp_diagnostics_forwards_a_queued_outside_edit_before_answering() {
+    let (_temp_dir, root, lib) = single_crate_fixture("queued-outside-edit-lsp");
+    let ctx = configured_context_with_diagnostics_timeout(&root, 40_000);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "0");
+    let lsp_diagnostics = |id: &str| -> Value {
+        serde_json::to_value(aft::commands::lsp_diagnostics::handle_lsp_diagnostics(
+            &request(json!({
+                "id": id,
+                "command": "lsp_diagnostics",
+                "file": lib.display().to_string(),
+                "wait_ms": 10_000,
+            })),
+            &ctx,
+        ))
+        .expect("response serializes")
+    };
+    let compiler_error_reported = |response: &Value| {
+        response["diagnostics"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|diagnostic| diagnostic["message"] == "fake compile error")
+    };
+    let warm = lsp_diagnostics("queued-outside-edit-lsp-warm");
+    assert_eq!(warm["success"], true, "{warm:#}");
+    assert!(
+        !compiler_error_reported(&warm),
+        "control: the file compiles before the outside edit: {warm:#}"
+    );
+
+    // Another program adds a compiler error.
+    fs::write(&lib, "// fake_compile_error\npub fn f() {}\n").unwrap();
+    let paused = queue_watcher_change_for_held_helper(&ctx, &lib);
+
+    let after = lsp_diagnostics("queued-outside-edit-lsp-after");
+    drop(paused);
+    assert_eq!(after["success"], true, "{after:#}");
+    if after["complete"] == false && after["note"].as_str().is_some() {
+        assert_eq!(
+            after["note"], "rust-analyzer: cargo check still running; retry",
+            "{after:#}"
+        );
+        return;
+    }
+    assert!(
+        compiler_error_reported(&after),
+        "the compiler error of the outside edit is missing: {after:#}"
+    );
+}
+
 /// The opposite direction: a compiler error present when rust-analyzer
 /// starts (its first `cargo check` reports it) is then fixed with an AFT
 /// edit. `use of moved value` comes only from the compiler, never from
@@ -9282,7 +9704,9 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
     let ctx = new_context();
     let config = ctx.config();
     let file = root.join("src/lib.rs");
-    ctx.lsp().ensure_server_for_file(&file, &config);
+    crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+        startup_manager.ensure_server_for_file(&file, &config)
+    });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
     loop {
         ctx.lsp().drain_events();
@@ -9584,7 +10008,9 @@ fn scoped_rust_inspect_does_not_take_a_check_announced_before_a_save_for_the_sav
     // a request round trip prove it ran and the reader queued its events,
     // without draining those events through the manager before the save.
     let config = ctx.config().clone();
-    let started = ctx.lsp().ensure_server_for_file(&lib, &config);
+    let started = crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| {
+        startup_manager.ensure_server_for_file(&lib, &config)
+    });
     assert!(!started.is_empty(), "the fake rust server must start");
     wait_for_path_event(&completed, "initial check completed");
     ctx.lsp()

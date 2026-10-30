@@ -1,0 +1,40 @@
+{
+  "github_reads": [
+    {
+      "request_body": null,
+      "request_line": "GET /repos/org/repo/pulls/7 HTTP/1.1",
+      "response": {
+        "message": "Not Found"
+      },
+      "status": 404
+    }
+  ],
+  "name": "pr-edit-pull-request-not-found",
+  "reply": {
+    "repo_binding_generation": 1,
+    "result": {
+      "refusal_code": "vendor_rejected{status: 404}",
+      "retry_same_nonce": false,
+      "status": "refused"
+    }
+  },
+  "request": {
+    "action": "pr edit",
+    "author_scope": "own",
+    "body": {
+      "title": "T"
+    },
+    "gh_route_schema": 1,
+    "manifest_version": 22,
+    "metadata": {
+      "agent_id": "alfonso-aft",
+      "pid": 4242
+    },
+    "operation": "gh.route",
+    "repository": "org/repo",
+    "rung_as_of_unix_secs": 1793066213,
+    "target": {
+      "number": "7"
+    }
+  }
+}

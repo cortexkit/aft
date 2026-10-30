@@ -1,1 +1,0 @@
-- On Windows machines started less than a day ago, finished background command results are kept for their full retention period again, instead of being deleted at the next cleanup about a minute later.

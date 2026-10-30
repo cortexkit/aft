@@ -1,1 +1,0 @@
-- Outline and zoom on a slow or unresponsive URL, or on `issue://`/`pr://` while `gh` hangs, now answer within the call budget, and a repeated failure answers at once.

@@ -41,6 +41,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub(crate) const NO_PUBLISH_REASON: &str =
     "opened for analysis, but the server published no diagnostics within the inspect budget; retry aft_inspect";
 
+/// Why a scoped file is unknown when its document is open in a server, the
+/// file changed on disk since AFT last sent the server its text, and sending
+/// the current text failed (the file is not valid UTF-8 text, or the server
+/// rejected the change). The server's analysis describes the older text.
+pub(crate) const DRIFT_RESYNC_FAILED_REASON: &str =
+    "changed on disk since the server last analyzed it, and AFT could not send it the current text; retry aft_inspect";
+
 /// Why Rust files are incomplete while rust-analyzer's check of the current
 /// files is running, or was expected and never began.
 pub(crate) const STILL_CHECKING_REASON: &str =
@@ -215,6 +222,10 @@ pub(crate) fn sweep_scoped_files(
             return sweep;
         }
     }
+    // Watcher changes still queued for the manager lock (an edit made by
+    // another program, say) have not reached the servers, which would
+    // otherwise be read as if they had analyzed the files as they are now.
+    ctx.lsp_forward_queued_watcher_changes();
     // A check an earlier request expected and that never began is asked for
     // again now, so it can run while the files are opened.
     {
@@ -247,6 +258,20 @@ pub(crate) fn sweep_scoped_files(
             continue;
         }
         let mut lsp = ctx.lsp();
+        // A document left open (by an AFT edit, say) still holds the text
+        // the server was last sent. When the file changed on disk since, send
+        // the current text first, so the decisions below are about the
+        // file as it is. If that fails the server analyzes old text, so the
+        // file is reported unknown rather than certified from it.
+        if lsp.resync_drifted_document(file, keys).is_err() {
+            for key in keys {
+                sweep.unanswered.insert(
+                    file.clone(),
+                    (key.clone(), DRIFT_RESYNC_FAILED_REASON.to_string()),
+                );
+            }
+            continue;
+        }
         let before = keys
             .iter()
             .map(|key| {
@@ -281,13 +306,18 @@ pub(crate) fn sweep_scoped_files(
             }
             // A document that was already open is analyzed continuously
             // (an edit opened it, for example); its current report is
-            // live and is read as it stands. rust-analyzer answering
-            // pulls is the exception: it analyzes a document only when
-            // asked, so its stored report can predate an edit to another
-            // file (removing a struct field the document still sets, for
-            // example) and is asked for again. A document opened now needs
-            // a report newer than whatever was stored before (a `cargo
-            // check` result, or an older analysis).
+            // live and is read as it stands. For a server that answers
+            // pulls that holds only for a report that describes the open
+            // text: a pulled one (AFT's own edits mark it stale) or a push
+            // carrying the open document's version. An unversioned push (a
+            // late clearing reply to an earlier close, for example) proves
+            // neither, so the server is asked again.
+            // rust-analyzer answering pulls is asked again even then: it
+            // analyzes a document only when asked, so its stored report can
+            // predate an edit to another file (removing a struct field the
+            // document still sets, for example). A document opened now
+            // needs a report newer than whatever was stored before (a
+            // `cargo check` result, or an older analysis).
             let pulls = lsp.server_supports_pull_for_file(&key, file);
             if key.kind == ServerKind::TypeScript && !pulls {
                 to_pull.push((file.clone(), key, epoch_before));
@@ -296,7 +326,12 @@ pub(crate) fn sweep_scoped_files(
             let repull_open = pulls
                 && (matches!(key.kind, ServerKind::Rust | ServerKind::Python)
                     || matches!(&key.kind, ServerKind::Custom(id) if id.as_ref() == "basedpyright"));
-            if was_open && !repull_open && lsp.has_diagnostic_report_for_server_file(&key, file) {
+            let live_report = if pulls {
+                lsp.has_report_for_open_document(&key, file)
+            } else {
+                lsp.has_diagnostic_report_for_server_file(&key, file)
+            };
+            if was_open && !repull_open && live_report {
                 continue;
             }
             if !pulls {

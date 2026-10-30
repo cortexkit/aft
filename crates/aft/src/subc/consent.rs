@@ -11,6 +11,9 @@
 //! (never more than 100 s); an ask still open then ends the call with
 //! `access_pending`, and the persisted ask (see [`crate::db::access_asks`]) lets
 //! the retried call pick up the same Cingulate ask by its original call key.
+//! Once an answer arrives, local application gets a separate bounded wait;
+//! exhausting that wait asks for an immediate retry, not another notification
+//! from Cingulate.
 //!
 //! Wire contract (Cingulate's requester contract, `tool_permission` asks): a
 //! management-surface route to the `cingulate` module, opened by AFT's own
@@ -53,6 +56,20 @@ const MAX_HOLD: Duration = Duration::from_secs(100);
 const SIGNAL_POLL: Duration = Duration::from_millis(100);
 /// Bound on one `consent.request` or `consent.withdraw` round trip.
 const UNARY_TIMEOUT: Duration = Duration::from_secs(10);
+/// A received answer must not depend on a second notification from Cingulate.
+const SETTLED_WAIT: Duration = Duration::from_secs(5);
+const ACCESS_RETRY_MESSAGE: &str = "The permission answer has been received but is still being applied. Retry this same call now; do not wait for another resume.";
+
+fn settled_wait_budget() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = tests::SETTLED_WAIT_OVERRIDE_MS.load(Ordering::SeqCst);
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    SETTLED_WAIT
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ConsentError {
@@ -63,6 +80,7 @@ pub(super) enum ConsentError {
 }
 
 pub(super) type ConsentFuture = Pin<Box<dyn Future<Output = Result<Value, ConsentError>> + Send>>;
+pub(super) type ConsentReceipt = Box<dyn FnOnce(Value) -> ConsentFuture + Send>;
 
 /// One consent method sent under the asking route's scope.
 #[derive(Clone, Debug)]
@@ -79,6 +97,13 @@ pub(super) struct ConsentCall {
 /// daemon; tests install a fake.
 pub(super) trait ConsentTransport: Send + Sync {
     fn call(&self, call: ConsentCall) -> ConsentFuture;
+
+    /// Apply a reply before asynchronous transport cleanup can release or
+    /// delay the held call. Simple transports have no separate cleanup phase.
+    fn call_with_receipt(&self, call: ConsentCall, receipt: ConsentReceipt) -> ConsentFuture {
+        let reply = self.call(call);
+        Box::pin(async move { receipt(reply.await?).await })
+    }
 }
 
 static TRANSPORT: LazyLock<StdMutex<Option<Arc<dyn ConsentTransport>>>> =
@@ -90,11 +115,13 @@ static TEST_TRANSPORT: LazyLock<StdMutex<Option<Arc<dyn ConsentTransport>>>> =
 
 /// Install the production transport for this process's daemon connection.
 pub(super) fn install_subc_transport(connection_file: &Path) {
+    let transport: Arc<dyn ConsentTransport> = Arc::new(SharedSubcConsent(Arc::new(
+        SubcConsentTransport::new(connection_file.to_path_buf()),
+    )));
     *TRANSPORT
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(SharedSubcConsent(
-        Arc::new(SubcConsentTransport::new(connection_file.to_path_buf())),
-    )));
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&transport));
+    super::secret_consent::install_subc_transport(transport);
 }
 
 /// Replace the transport for consent tests; the module loop's production
@@ -346,6 +373,14 @@ impl SubcConsentTransport {
     }
 
     async fn send(self: Arc<Self>, call: ConsentCall) -> Result<Value, ConsentError> {
+        self.send_with_receipt(call, None).await
+    }
+
+    async fn send_with_receipt(
+        self: Arc<Self>,
+        call: ConsentCall,
+        receipt: Option<ConsentReceipt>,
+    ) -> Result<Value, ConsentError> {
         use subc_client_rs::{CallError, CallOptions};
         let body = encode(call.method, &call.params)?;
         let consumer = self.consumer().await?;
@@ -410,8 +445,7 @@ impl SubcConsentTransport {
             ..CallOptions::default()
         };
         let reply = consumer.request(&route, body, options).await;
-        lease.close().await;
-        match reply {
+        let result = match reply {
             Ok(bytes) => decode_result(&bytes),
             Err(CallError::Module(body)) => Err(ConsentError::Refused {
                 code: body.code,
@@ -421,7 +455,15 @@ impl SubcConsentTransport {
                 self.forget(&consumer).await;
                 Err(ConsentError::Unavailable(error.to_string()))
             }
-        }
+        };
+        // A settled scope answer must be durable before closing the route:
+        // close_handle can wait while another tool is already checking access.
+        let result = match (result, receipt) {
+            (Ok(record), Some(receipt)) => receipt(record).await,
+            (result, _) => result,
+        };
+        lease.close().await;
+        result
     }
 }
 
@@ -481,6 +523,10 @@ struct SharedSubcConsent(Arc<SubcConsentTransport>);
 impl ConsentTransport for SharedSubcConsent {
     fn call(&self, call: ConsentCall) -> ConsentFuture {
         Box::pin(Arc::clone(&self.0).send(call))
+    }
+
+    fn call_with_receipt(&self, call: ConsentCall, receipt: ConsentReceipt) -> ConsentFuture {
+        Box::pin(Arc::clone(&self.0).send_with_receipt(call, Some(receipt)))
     }
 }
 
@@ -550,7 +596,281 @@ pub(super) fn note_route_closed(route: RouteChannel) {
     }
 }
 
+/// A consent ask that is still waiting for Cingulate, registered before sending
+/// `consent.request` and removed when its last overlapping hold ends.
+/// A folder (`allow_scope`) grant that truly covers one of these asks withdraws
+/// its card so the phone no longer shows it, and the waiting call runs without
+/// needing a second answer. Both sides already carry canonical policy
+/// identities (`policy_path` on insert and on the ask), so the coverage check
+/// below compares them the same way the grant check does.
+#[derive(Clone)]
+struct LiveCoverable {
+    key: AskKey,
+    session: String,
+    scope: crate::db::access_grants::ScopeKey,
+    operation: AccessOperation,
+    path: PathBuf,
+    elicitation: Option<String>,
+    covering: Option<CoveringGrant>,
+    holds: usize,
+    selector: ScopeSelector,
+    project_root: PathBuf,
+}
+
+#[derive(Clone)]
+struct CoveringGrant {
+    grant: AccessGrant,
+    elicitation: String,
+}
+
+// A persisted call key can be reused by another session. Share overlapping
+// holds only within one session, which is also the principal for withdrawal.
+type LiveCoverKey = (String, String);
+
+static LIVE_COVERABLE: LazyLock<StdMutex<HashMap<LiveCoverKey, LiveCoverable>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// Removes the live entry when its last overlapping hold ends, on every return path.
+struct LiveCoverGuard {
+    key: LiveCoverKey,
+}
+
+impl LiveCoverGuard {
+    fn record_elicitation(&self, elicitation: &str) -> Option<(LiveCoverable, CoveringGrant)> {
+        let mut live = LIVE_COVERABLE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let covered = live.get_mut(&self.key)?;
+        covered.elicitation = Some(elicitation.to_owned());
+        // The folder grant may have scanned this request while its reply was
+        // still in flight. Publishing the id and taking that deferred withdraw
+        // share the scan's lock, so neither ordering can miss the card.
+        let covering = covered.covering.take()?;
+        Some((covered.clone(), covering))
+    }
+}
+
+impl Drop for LiveCoverGuard {
+    fn drop(&mut self) {
+        let mut live = LIVE_COVERABLE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(covered) = live.get_mut(&self.key) {
+            covered.holds -= 1;
+            if covered.holds == 0 {
+                live.remove(&self.key);
+            }
+        }
+    }
+}
+
+fn track_live_coverable(call: &HeldCall, prep: &Prepared) -> LiveCoverGuard {
+    let key = (prep.call_key.clone(), call.identity.session.clone());
+    let mut live = LIVE_COVERABLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    live.entry(key.clone())
+        .and_modify(|covered| covered.holds += 1)
+        .or_insert_with(|| LiveCoverable {
+            key: prep.key.clone(),
+            session: call.identity.session.clone(),
+            scope: prep.key.scope.clone(),
+            operation: prep.grant.operation,
+            path: prep.grant.path.clone(),
+            elicitation: None,
+            covering: None,
+            holds: 1,
+            selector: prep.selector.clone(),
+            project_root: call.identity.project_root.clone(),
+        });
+    LiveCoverGuard { key }
+}
+
+/// One info line per withdrawn ask, naming the grant that covered it. The
+/// covering grant's path is logged as a hash, like every other consent grant
+/// line, so no raw path leaves the daemon in logs.
+fn log_covered_withdrawn(session: &str, withdrawn: &str, covering_ask: &str, grant: &AccessGrant) {
+    if !crate::logging::slog_info_enabled(module_path!()) {
+        return;
+    }
+    let path_hash = cortexkit_role_tool_provider::catalog::composition_digest(&json!(grant.path))
+        .expect("canonical consent path is JSON");
+    let kind = match grant.kind {
+        GrantKind::File => "file",
+        GrantKind::Subtree => "subtree",
+    };
+    crate::log_ctx::with_session(Some(session.to_owned()), || {
+        crate::slog_info!("consent covering grant withdrew covered ask ask={withdrawn} covered_by={covering_ask} kind={kind} path_hash={path_hash:.12}");
+    });
+}
+
+/// After an `allow_scope` folder grant is stored, withdraw every other live ask
+/// it truly covers: same scope (owner, ref and epoch), same session, same
+/// operation kind, and a path inside the granted subtree. Each withdraw runs on
+/// AFT's normal route under the covered ask's own scope stamp and session, the
+/// same route its `consent.request` used, so Cingulate sees the same principal
+/// that requested the ask withdrawing its own ask.
+///
+/// When the withdraw reports the ask was already settled (the user answered it
+/// at the same moment), the recorded outcome is left for its own waiting call
+/// to apply; nothing is assumed and nothing is logged as withdrawn. An
+/// `elicitation_not_found` or `elicitation_not_owner` refusal likewise leaves
+/// the ask untouched so it stays pending.
+async fn settle_covered_asks(
+    call: &HeldCall,
+    covering: &AccessGrant,
+    covering_key: &AskKey,
+    covering_elicitation: &str,
+) {
+    if covering.kind != GrantKind::Subtree {
+        return;
+    }
+    let covering = CoveringGrant {
+        grant: covering.clone(),
+        elicitation: covering_elicitation.to_owned(),
+    };
+    let ready = {
+        let mut live = LIVE_COVERABLE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut ready = Vec::new();
+        for covered in live.values_mut() {
+            if covered.elicitation.as_deref() == Some(covering_elicitation)
+                || covered.key == *covering_key
+                || covered.scope != covering_key.scope
+                || covered.session != call.identity.session
+                || covered.operation != covering.grant.operation
+            {
+                continue;
+            }
+            // Both paths are canonical policy identities, so `covers` compares
+            // them exactly as the grant check does.
+            if !covering.grant.covers(covered.operation, &covered.path) {
+                continue;
+            }
+            if covered.elicitation.is_some() {
+                ready.push(covered.clone());
+            } else {
+                // The card can already be visible on the phone even though
+                // its request reply has not delivered the id to AFT yet.
+                covered.covering = Some(covering.clone());
+            }
+        }
+        ready
+    };
+    for covered in ready {
+        withdraw_covered_ask(&covered, &covering).await;
+    }
+}
+
+async fn withdraw_covered_ask(covered: &LiveCoverable, covering: &CoveringGrant) {
+    let Some(elicitation) = covered.elicitation.as_deref() else {
+        return;
+    };
+    let Some(transport) = transport() else {
+        return;
+    };
+    let withdraw = ConsentCall {
+        scope: covered.selector.clone(),
+        project_root: covered.project_root.clone(),
+        session: covered.session.clone(),
+        method: "consent.withdraw",
+        params: json!({"elicitation_id": elicitation}),
+        timeout: UNARY_TIMEOUT,
+    };
+    match transport.call(withdraw).await {
+        Ok(record) => match decode_record(&record) {
+            Ok(Settlement::Refused(code)) if code == "access_withdrawn" => {
+                log_covered_withdrawn(
+                    &covered.session,
+                    elicitation,
+                    &covering.elicitation,
+                    &covering.grant,
+                );
+            }
+            // Already settled: its own waiting call applies that real
+            // answer through its own `consent.await`. Anything else
+            // (including a pending record, which a withdraw never
+            // returns) leaves the ask alone.
+            _ => {}
+        },
+        // Any withdrawal error leaves the local ask pending and untouched.
+        Err(_) => {}
+    }
+}
+
+/// A waiting call whose card was withdrawn because a folder grant now covers
+/// it runs with that covering authority instead of answering `access_withdrawn`.
+/// Claims the call's own pending file (already inside the stored subtree) so
+/// the rerun owns exactly one approval, like any other allowed call.
+async fn try_apply_covering_grant(
+    call: &HeldCall,
+    prep: &Prepared,
+    retry_after_deadline: Arc<AtomicBool>,
+    elicitation: &str,
+) -> Option<Hold> {
+    let Some(ctx) = call.executor.actor_context(&call.identity.root) else {
+        return None;
+    };
+    let Some(db) = ctx.db() else {
+        return None;
+    };
+    let identity = call.identity.clone();
+    let key = prep.key.clone();
+    let call_key = prep.call_key.clone();
+    let pending = prep.grant.clone();
+    let covered: bool = tokio::task::spawn_blocking(move || {
+        let conn = db.lock().ok()?;
+        let scope = access_grants::policy_scope_key(&identity);
+        let grants = crate::db::access_grants::list(&conn, &scope).ok()?;
+        Some(grants.into_iter().any(|grant| {
+            grant.operation == pending.operation && grant.covers(pending.operation, &pending.path)
+        }))
+    })
+    .await
+    .ok()??;
+    if !covered {
+        return None;
+    }
+    let Some(ctx) = call.executor.actor_context(&call.identity.root) else {
+        return None;
+    };
+    let Some(db) = ctx.db() else {
+        return None;
+    };
+    let holder = asks::new_holder();
+    let key_clone = key.clone();
+    let call_key_clone = call_key.clone();
+    let holder_clone = holder.clone();
+    let db_for_claim = Arc::clone(&db);
+    let joined: Option<Option<Vec<AccessGrant>>> = tokio::task::spawn_blocking(move || {
+        let conn = db_for_claim.lock().ok()?;
+        let claimed = asks::claim(&conn, &key_clone, &call_key_clone, &holder_clone).ok()?;
+        Some(claimed)
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(claimed) = joined else {
+        return None;
+    };
+    let Some(once) = claimed else {
+        return Some(Hold::Answer(retry_answer(call, &prep.grant)));
+    };
+    let claim = Arc::new(ClaimedAsk {
+        db: Arc::clone(&db),
+        key,
+        holder,
+        armed: AtomicBool::new(true),
+        retry_after_deadline,
+        original: None,
+        elicitation: elicitation.to_owned(),
+    });
+    Some(Hold::Run { once, claim })
+}
+
 /// The parts of a held call the consent flow reads.
+#[derive(Clone)]
 pub(super) struct HeldCall {
     pub(super) reply_deadline: Instant,
     pub(super) identity: RouteIdentity,
@@ -567,18 +887,278 @@ pub(super) struct HeldCall {
 
 /// What a held call does after its ask was handled.
 enum Hold {
-    /// Run the call again with these capabilities approved once. `holder`
+    /// Run the call again with these capabilities approved once. `claim`
     /// owns them until the call finishes.
     Run {
         once: Vec<AccessGrant>,
-        ask: AskKey,
-        holder: String,
+        claim: Arc<ClaimedAsk>,
     },
     /// End the call with this response.
     Answer(Response),
+    /// An overlapping call owns the one-time approval; reuse its result only.
+    Shared((Response, Option<String>)),
     /// Nobody waits for this call any more (cancelled, route closed, transport
     /// gone); the caller sends nothing.
     Abandoned,
+}
+
+#[derive(Clone)]
+struct SharedReply {
+    success: bool,
+    data: Value,
+    text: Option<String>,
+}
+
+/// Tracks only overlapping dispatches, not a cache of reusable approvals.
+struct SettlementFlight {
+    root: PathBuf,
+    session: String,
+    binding: Value,
+    key: AskKey,
+    member: Arc<()>,
+    group: Arc<SettlementGroup>,
+}
+
+/// Members retain the result while they overlap, even after its publisher exits.
+/// The owner token identifies the only publisher without retaining its flight.
+struct SettlementGroup {
+    owner: StdMutex<Option<Arc<()>>>,
+    settled: AtomicBool,
+    done: tokio::sync::watch::Sender<Option<Option<SharedReply>>>,
+}
+
+static SETTLEMENT_FLIGHTS: LazyLock<StdMutex<Vec<std::sync::Weak<SettlementFlight>>>> =
+    LazyLock::new(|| StdMutex::new(Vec::new()));
+
+struct SettlementOwner(Arc<SettlementFlight>);
+
+impl SettlementOwner {
+    fn new(call: &HeldCall) -> Self {
+        let mut flight = SettlementFlight {
+            root: call.identity.root.clone().into(),
+            session: call.identity.session.clone(),
+            binding: serde_json::to_value(&call.identity.scope).expect("scope stamp is JSON"),
+            key: AskKey {
+                scope: access_grants::scope_key(&call.identity),
+                args_hash: args_hash(&call.identity, &call.tool, &call.arguments),
+            },
+            member: Arc::new(()),
+            group: Arc::new(SettlementGroup {
+                owner: StdMutex::new(None),
+                settled: AtomicBool::new(false),
+                done: tokio::sync::watch::channel(None).0,
+            }),
+        };
+        let mut flights = SETTLEMENT_FLIGHTS.lock().unwrap();
+        let retain_overlap = true;
+        #[cfg(test)]
+        let retain_overlap =
+            retain_overlap && tests::SETTLED_GROUP_RETENTION_ENABLED.load(Ordering::SeqCst);
+        if retain_overlap {
+            if let Some(other) = flights
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .find(|other| {
+                    other.root == flight.root
+                        && other.session == flight.session
+                        && other.binding == flight.binding
+                        && other.key == flight.key
+                    // A published group belongs to calls that overlapped it; a call that
+                    // arrives after publication needs its own approval.
+                    && other.group.done.borrow().is_none()
+                })
+            {
+                // Join before either receipt arrives. Looking up only settled
+                // flights can miss a publisher that already returned and dropped.
+                flight.group = Arc::clone(&other.group);
+            }
+        }
+        let flight = Arc::new(flight);
+        flights.push(Arc::downgrade(&flight));
+        Self(flight)
+    }
+
+    fn complete(&self, result: &Option<(Response, Option<String>)>) {
+        if !self.0.owns_group() {
+            return;
+        }
+        self.0
+            .group
+            .done
+            .send_replace(Some(result.as_ref().map(|(response, text)| SharedReply {
+                success: response.success,
+                data: response.data.clone(),
+                text: text.clone(),
+            })));
+    }
+}
+
+impl Drop for SettlementOwner {
+    fn drop(&mut self) {
+        if self.0.owns_group() && self.0.group.done.borrow().is_none() {
+            self.0.group.done.send_replace(Some(None));
+        }
+        SETTLEMENT_FLIGHTS.lock().unwrap().retain(|flight| {
+            flight
+                .upgrade()
+                .is_some_and(|flight| !Arc::ptr_eq(&flight, &self.0))
+        });
+    }
+}
+
+impl SettlementFlight {
+    fn owns_group(&self) -> bool {
+        self.group
+            .owner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|owner| Arc::ptr_eq(owner, &self.member))
+    }
+
+    /// Elect one application owner even if two open awaits receive the answer.
+    fn other_settled(self: &Arc<Self>, receiving: bool) -> Option<Arc<SettlementGroup>> {
+        #[cfg(test)]
+        if !tests::SETTLED_JOIN_ENABLED.load(Ordering::SeqCst) {
+            return None;
+        }
+        let mut owner = self.group.owner.lock().unwrap();
+        if let Some(publisher) = owner.as_ref() {
+            if !Arc::ptr_eq(publisher, &self.member) {
+                return (receiving
+                    || self.group.settled.load(Ordering::SeqCst)
+                    || self.group.done.borrow().is_some())
+                .then(|| Arc::clone(&self.group));
+            }
+        } else if receiving {
+            *owner = Some(Arc::clone(&self.member));
+        }
+        if receiving {
+            self.group.settled.store(true, Ordering::SeqCst);
+        }
+        None
+    }
+}
+
+impl SettlementGroup {
+    async fn result(
+        &self,
+        call: &HeldCall,
+        grant: &AccessGrant,
+        route_hold: &RouteHold,
+    ) -> Option<(Response, Option<String>)> {
+        let mut done = self.done.subscribe();
+        #[cfg(test)]
+        tests::settled_waiter_joined();
+        let wait = settled_wait_budget().min(
+            call.reply_deadline
+                .saturating_duration_since(Instant::now()),
+        );
+        let waiting = tokio::time::timeout(wait, async {
+            loop {
+                if let Some(result) = done.borrow_and_update().clone() {
+                    break result;
+                }
+                if done.changed().await.is_err() {
+                    break None;
+                }
+            }
+        });
+        tokio::pin!(waiting);
+        let result = loop {
+            tokio::select! {
+                result = &mut waiting => break result,
+                _ = tokio::time::sleep(SIGNAL_POLL) => match stop_signal(call, route_hold) {
+                    Some(Stop::Detach | Stop::Withdraw) => return None,
+                    Some(Stop::RunEnded) => return Some((refused_answer(call, grant, "access_withdrawn", None), None)),
+                    None => {}
+                }
+            }
+        };
+        match result {
+            Ok(Some(reply)) => Some((
+                Response {
+                    id: call.request_id.clone(),
+                    success: reply.success,
+                    data: reply.data,
+                },
+                reply.text,
+            )),
+            _ => {
+                crate::log_ctx::with_session(Some(call.identity.session.clone()), || {
+                    crate::slog_warn!("consent settled result wait ended without completion");
+                });
+                Some((retry_answer(call, grant), None))
+            }
+        }
+    }
+}
+
+/// Keep ownership of an approval from the blocking claim through its rerun.
+/// Cancellation consumes an unused claim; hold expiry can return a one-time
+/// answer to its original ask so an identical retry does not need approval again.
+struct ClaimedAsk {
+    db: Arc<StdMutex<crate::db::TrackedConnection>>,
+    key: AskKey,
+    holder: String,
+    armed: AtomicBool,
+    retry_after_deadline: Arc<AtomicBool>,
+    original: Option<Prepared>,
+    elicitation: String,
+}
+
+impl ClaimedAsk {
+    fn cleanup(&self) -> impl FnOnce() + Send + 'static {
+        let db = Arc::clone(&self.db);
+        let key = self.key.clone();
+        let holder = self.holder.clone();
+        let original = self.original.clone();
+        let elicitation = self.elicitation.clone();
+        let retry = self.retry_after_deadline.load(Ordering::SeqCst);
+        move || match db.lock() {
+            Ok(conn) => {
+                let cleaned = match original.filter(|_| retry) {
+                    Some(original) => asks::release_claim(
+                        &conn,
+                        &key,
+                        &holder,
+                        &original.call_key,
+                        Some(&elicitation),
+                        &original.request,
+                        &original.grant,
+                    ),
+                    None => asks::consume(&conn, &key, &holder),
+                };
+                if let Err(error) = cleaned {
+                    crate::slog_warn!("consent approval cleanup failed: {error}");
+                }
+            }
+            Err(_) => crate::slog_warn!("consent approval cleanup failed: database mutex poisoned"),
+        }
+    }
+
+    async fn clear(self: Arc<Self>) {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.retry_after_deadline.store(false, Ordering::SeqCst);
+            // The cleanup task outlives this await if its caller is cancelled.
+            if let Err(error) = tokio::task::spawn_blocking(self.cleanup()).await {
+                crate::slog_warn!("consent approval cleanup task failed: {error}");
+            }
+        }
+    }
+}
+
+impl Drop for ClaimedAsk {
+    fn drop(&mut self) {
+        if self.armed.load(Ordering::SeqCst) {
+            let cleanup = self.cleanup();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                let _ = runtime.spawn_blocking(cleanup);
+            } else {
+                cleanup();
+            }
+        }
+    }
 }
 
 /// Run a stamped worker's call, holding it on Cingulate whenever the access
@@ -588,7 +1168,7 @@ enum Hold {
 pub(super) async fn run_with_consent<F, Fut>(
     call: HeldCall,
     first: (Response, String),
-    mut rerun: F,
+    rerun: F,
 ) -> Option<(Response, Option<String>)>
 where
     F: FnMut(AskRoute) -> Fut,
@@ -607,25 +1187,51 @@ where
             None,
         ));
     }
-    let Some(mut grant) = requested_ask(&first.0) else {
+    let Some(grant) = requested_ask(&first.0) else {
         return Some((first.0, Some(first.1)));
     };
+    if access_grants::scope_grants_denial(&call.identity).is_some() {
+        return Some((
+            Response::error(
+                &call.request_id,
+                "path_outside_root",
+                "outside-path access needs a permission-capable route",
+            ),
+            None,
+        ));
+    }
+    let owner = SettlementOwner::new(&call);
+    let result = run_held(&call, grant, rerun, &owner.0).await;
+    owner.complete(&result);
+    result
+}
+
+async fn run_held<F, Fut>(
+    call: &HeldCall,
+    mut grant: AccessGrant,
+    mut rerun: F,
+    flight: &Arc<SettlementFlight>,
+) -> Option<(Response, Option<String>)>
+where
+    F: FnMut(AskRoute) -> Fut,
+    Fut: Future<Output = (Response, String)>,
+{
     let route_hold = RouteHold::new(call.route);
+    if let Some(other) = flight.other_settled(false) {
+        return other.result(call, &grant, &route_hold).await;
+    }
     let deadline = (Instant::now() + hold_budget(None)).min(
         call.reply_deadline
             .checked_sub(RERUN_MARGIN)
             .unwrap_or_else(Instant::now),
     );
-    let mut holder: Option<(AskKey, String)> = None;
+    let mut holder: Option<Arc<ClaimedAsk>> = None;
     loop {
-        let own = holder.as_ref().map(|(_, holder)| holder.clone());
-        match hold(&call, grant, deadline, &route_hold, own).await {
-            Hold::Run {
-                once,
-                ask,
-                holder: claimed,
-            } => {
-                holder = Some((ask, claimed));
+        let own = holder.as_ref().map(|claim| claim.holder.clone());
+        match hold(call, grant, deadline, &route_hold, own, flight).await {
+            Hold::Run { once, claim } => {
+                claim.retry_after_deadline.store(false, Ordering::SeqCst);
+                holder = Some(claim);
                 let running = rerun(AskRoute::Consent {
                     once,
                     launch: super::access_grants::launch_key(&call.identity, "worker"),
@@ -646,11 +1252,8 @@ where
                                     call.corr,
                                     "route closed during an approved rerun",
                                 );
-                                if let Some((ask, _)) = holder.take() {
-                                    let _ = with_db(&call, move |conn, _| {
-                                        asks::discard(conn, &ask).map(|_| ())
-                                    })
-                                    .await;
+                                if let Some(claim) = holder.take() {
+                                    claim.clear().await;
                                 }
                                 return None;
                             }
@@ -658,20 +1261,22 @@ where
                     }
                 };
                 match requested_ask(&response) {
-                    Some(next) => grant = next,
+                    Some(next) => {
+                        // A new outside path has its own unanswered question.
+                        flight.group.settled.store(false, Ordering::SeqCst);
+                        grant = next;
+                    }
                     None => {
-                        if let Some((ask, claimed)) = holder.take() {
+                        if let Some(claim) = holder.take() {
                             // The approvals are used up by this run, whatever it returned.
-                            let _ = with_db(&call, move |conn, _| {
-                                asks::consume(conn, &ask, &claimed).map(|_| ())
-                            })
-                            .await;
+                            claim.clear().await;
                         }
                         return Some((response, Some(text)));
                     }
                 }
             }
             Hold::Answer(response) => return Some((response, None)),
+            Hold::Shared(result) => return Some(result),
             Hold::Abandoned => return None,
         }
     }
@@ -736,11 +1341,11 @@ enum Prep {
 }
 
 fn selector(stamp: &subc_protocol::scope::ScopeStamp) -> ScopeSelector {
-    ScopeSelector {
-        owner: stamp.owner.clone(),
-        scope_ref: stamp.scope_ref.clone(),
-        scope_epoch: Some(stamp.scope_epoch),
-    }
+    ScopeSelector::new(
+        stamp.owner.clone(),
+        stamp.scope_ref.clone(),
+        Some(stamp.scope_epoch),
+    )
 }
 
 fn operation_name(operation: AccessOperation) -> &'static str {
@@ -817,6 +1422,9 @@ fn prepare(
     directory_scope: &AccessGrant,
     own_holder: Option<&str>,
 ) -> Result<Prep, String> {
+    if let Some(reason) = access_grants::scope_grants_denial(identity) {
+        return Err(format!("saved scope grants unavailable: {reason:?}"));
+    }
     let worker = identity
         .scope
         .as_ref()
@@ -948,8 +1556,9 @@ fn scope_reason(grant: &AccessGrant) -> &'static str {
 /// Offer a file ask's immediate directory, for reads and writes alike, only
 /// when that directory passes `probe_directory_scope_with`: it is not the home
 /// folder, a home ancestor, a root-level or volume-level folder, or a protected
-/// system folder. Unknown home/volume identity stays file-only.
-fn directory_scope(grant: &AccessGrant) -> AccessGrant {
+/// system tree (including nested system folders). macOS per-user temporary
+/// trees remain eligible. Unknown home/volume identity stays file-only.
+pub(crate) fn directory_scope(grant: &AccessGrant) -> AccessGrant {
     directory_scope_with(grant, directory_is_root_alias)
 }
 
@@ -1319,6 +1928,46 @@ fn pattern(grant: &AccessGrant) -> String {
     }
 }
 
+enum ConsentEvent<'a> {
+    Filed { tool: &'a str, epoch: u64 },
+    Settled(&'a Settlement),
+    Granted { epoch: u64 },
+}
+
+fn log_consent(session: &str, event: ConsentEvent<'_>, ask: &str, grant: &AccessGrant) {
+    if !crate::logging::slog_info_enabled(module_path!()) {
+        return;
+    }
+    let path_hash = cortexkit_role_tool_provider::catalog::composition_digest(&json!(grant.path))
+        .expect("canonical consent path is JSON");
+    let kind = match grant.kind {
+        GrantKind::File => "file",
+        GrantKind::Subtree => "subtree",
+    };
+    // Attribute only this emission; consent work may run on async or blocking
+    // workers whose thread-local logging context belongs to an earlier call.
+    crate::log_ctx::with_session(Some(session.to_owned()), || match event {
+        ConsentEvent::Filed { tool, epoch } => {
+            crate::slog_info!("consent ask filed ask={ask} tool={tool} kind={kind} scope_epoch={epoch} path_hash={path_hash:.12}");
+        }
+        ConsentEvent::Settled(settled) => {
+            let outcome = match settled {
+                Settlement::Allow { scope: true, .. } => "allow_scope",
+                Settlement::Allow { scope: false, .. } => "allow_once",
+                Settlement::Deny { .. } => "deny",
+                Settlement::Refused(_) => "refused",
+                Settlement::Pending => "pending",
+            };
+            crate::slog_info!(
+                "consent answer settled ask={ask} outcome={outcome} path_hash={path_hash:.12}"
+            );
+        }
+        ConsentEvent::Granted { epoch } => {
+            crate::slog_info!("consent grant inserted ask={ask} kind={kind} scope_epoch={epoch} path_hash={path_hash:.12}");
+        }
+    });
+}
+
 fn head_policy_name(policy: HeadPolicy) -> &'static str {
     match policy {
         HeadPolicy::Allow => "allow",
@@ -1454,6 +2103,10 @@ fn pending_answer(call: &HeldCall, grant: &AccessGrant) -> Response {
     )
 }
 
+fn retry_answer(call: &HeldCall, grant: &AccessGrant) -> Response {
+    answer(call, "access_retry", ACCESS_RETRY_MESSAGE.to_owned(), grant)
+}
+
 fn unavailable_answer(call: &HeldCall, grant: &AccessGrant, detail: &str) -> Response {
     answer(
         call,
@@ -1584,6 +2237,7 @@ async fn hold(
     deadline: Instant,
     route_hold: &RouteHold,
     own_holder: Option<String>,
+    flight: &Arc<SettlementFlight>,
 ) -> Hold {
     if !consent_path_representable(&grant.path) {
         let mut response = refused_answer(call, &grant, "access_not_placed", None);
@@ -1610,7 +2264,17 @@ async fn hold(
     .await;
     let prep = match prepared {
         Ok(Prep::Ask(prep)) => prep,
-        Ok(Prep::Busy) => return Hold::Answer(pending_answer(call, &grant)),
+        Ok(Prep::Busy) => {
+            return match flight.other_settled(false) {
+                Some(other) => match other.result(call, &grant, route_hold).await {
+                    Some(result) => Hold::Shared(result),
+                    None => Hold::Abandoned,
+                },
+                // A claimed row has already received an answer. Its owner may
+                // have been cancelled while asynchronous cleanup is still running.
+                None => Hold::Answer(retry_answer(call, &grant)),
+            };
+        }
         Err(error) => return Hold::Answer(unavailable_answer(call, &grant, &error)),
     };
     let Some(transport) = transport() else {
@@ -1620,6 +2284,9 @@ async fn hold(
             "no consent transport is connected",
         ));
     };
+    // Register before sending: a sibling's folder answer can arrive while
+    // Cingulate is still returning this request's elicitation id.
+    let live = track_live_coverable(call, &prep);
     let reply = transport
         .call(consent_call(
             call,
@@ -1633,6 +2300,15 @@ async fn hold(
         Ok(elicitation) => elicitation,
         Err(error) => return failed(call, &prep, error).await,
     };
+    log_consent(
+        &call.identity.session,
+        ConsentEvent::Filed {
+            tool: &call.tool,
+            epoch: prep.key.scope.epoch,
+        },
+        &elicitation,
+        &prep.grant,
+    );
     {
         let key = prep.key.clone();
         let call_key = prep.call_key.clone();
@@ -1641,6 +2317,9 @@ async fn hold(
             asks::set_elicitation(conn, &key, &call_key, &id)
         })
         .await;
+    }
+    if let Some((covered, covering)) = live.record_elicitation(&elicitation) {
+        withdraw_covered_ask(&covered, &covering).await;
     }
     // Await at least once, even with no budget left, so an ask that already
     // settled (a retry after the answer) is applied rather than parked.
@@ -1653,14 +2332,65 @@ async fn hold(
         }
         first = false;
         let wait = deadline.saturating_duration_since(now).min(MAX_AWAIT);
-        let awaited = transport.call(consent_call(
-            call,
-            &prep,
-            "consent.await",
-            json!({"elicitation_id": elicitation, "timeout_ms": wait.as_millis() as u64}),
-            wait + UNARY_TIMEOUT,
-        ));
+        let applied = Arc::new(StdMutex::new(None));
+        let settled_received = Arc::new(AtomicBool::new(false));
+        let receipt_settled = Arc::clone(&settled_received);
+        let receipt_flight = Arc::clone(flight);
+        let retry_after_deadline = Arc::new(AtomicBool::new(false));
+        let receipt_retry = Arc::clone(&retry_after_deadline);
+        let received = Arc::clone(&applied);
+        let receipt_call = call.clone();
+        let receipt_prep = prep.clone();
+        let ask_id = elicitation.clone();
+        let awaited = transport.call_with_receipt(
+            consent_call(
+                call,
+                &prep,
+                "consent.await",
+                json!({"elicitation_id": elicitation, "timeout_ms": wait.as_millis() as u64}),
+                wait + UNARY_TIMEOUT,
+            ),
+            Box::new(move |record| {
+                Box::pin(async move {
+                    if let Ok(settled) = decode_record(&record) {
+                        if settled != Settlement::Pending {
+                            receipt_settled.store(true, Ordering::SeqCst);
+                            if let Some(other) = receipt_flight.other_settled(true) {
+                                let route_hold = RouteHold::new(receipt_call.route);
+                                let result = other
+                                    .result(&receipt_call, &receipt_prep.grant, &route_hold)
+                                    .await;
+                                *received.lock().unwrap() = Some(match result {
+                                    Some(result) => Hold::Shared(result),
+                                    None => Hold::Abandoned,
+                                });
+                                return Ok(record);
+                            }
+                            log_consent(
+                                &receipt_call.identity.session,
+                                ConsentEvent::Settled(&settled),
+                                &ask_id,
+                                &receipt_prep.grant,
+                            );
+                            let result = finish(
+                                &receipt_call,
+                                &receipt_prep,
+                                settled,
+                                receipt_retry,
+                                &ask_id,
+                            )
+                            .await;
+                            *received
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+                        }
+                    }
+                    Ok(record)
+                })
+            }),
+        );
         tokio::pin!(awaited);
+        let mut local_deadline = None;
         let reply = loop {
             tokio::select! {
                 reply = &mut awaited => break Some(reply),
@@ -1675,15 +2405,48 @@ async fn hold(
                             withdraw(call, &prep, &elicitation).await;
                             return Hold::Answer(refused_answer(call, &prep.grant, "access_withdrawn", None));
                         }
-                        None if Instant::now() >= deadline => break None,
+                        None if Instant::now() >= deadline => {
+                            let received_settlement = settled_received.load(Ordering::SeqCst);
+                            #[cfg(test)]
+                            let received_settlement = received_settlement && tests::SETTLED_DEADLINE_ENABLED.load(Ordering::SeqCst);
+                            if received_settlement {
+                                if let Some(result) = applied.lock().unwrap().take() {
+                                    return result;
+                                }
+                                let bound = local_deadline.get_or_insert_with(|| (Instant::now() + settled_wait_budget()).min(call.reply_deadline));
+                                #[cfg(test)]
+                                tests::settled_deadline_waiting();
+                                if Instant::now() < *bound {
+                                    continue;
+                                }
+                                retry_after_deadline.store(true, Ordering::SeqCst);
+                                crate::log_ctx::with_session(Some(call.identity.session.clone()), || {
+                                    crate::slog_warn!("consent settled application exceeded local wait bound ask={elicitation}");
+                                });
+                                return Hold::Answer(retry_answer(call, &prep.grant));
+                            }
+                            // Mark expiry before dropping the receipt: its blocking
+                            // claim can still complete after we promise a retry.
+                            retry_after_deadline.store(true, Ordering::SeqCst);
+                            break None;
+                        }
                         None => {}
                     }
                 }
             }
         };
+        if let Some(result) = applied
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            return result;
+        }
         match reply.map(|reply| reply.and_then(|record| decode_record(&record))) {
             None | Some(Ok(Settlement::Pending)) => {}
-            Some(Ok(settled)) => return finish(call, &prep, settled).await,
+            Some(Ok(settled)) => {
+                return finish(call, &prep, settled, retry_after_deadline, &elicitation).await
+            }
             Some(Err(error)) => return failed(call, &prep, error).await,
         }
     }
@@ -1717,7 +2480,20 @@ enum Applied {
     NotClaimed,
 }
 
-async fn finish(call: &HeldCall, prep: &Prepared, settled: Settlement) -> Hold {
+async fn finish(
+    call: &HeldCall,
+    prep: &Prepared,
+    settled: Settlement,
+    retry_after_deadline: Arc<AtomicBool>,
+    elicitation: &str,
+) -> Hold {
+    #[cfg(test)]
+    if matches!(settled, Settlement::Deny { .. } | Settlement::Refused(_)) {
+        let request = call.request_id.clone();
+        tokio::task::spawn_blocking(move || tests::wait_at_finish(&request, false))
+            .await
+            .expect("refusal application gate completes");
+    }
     match settled {
         Settlement::Pending => unreachable!("finish runs on settled answers"),
         Settlement::Deny { note } => {
@@ -1730,6 +2506,16 @@ async fn finish(call: &HeldCall, prep: &Prepared, settled: Settlement) -> Hold {
             ))
         }
         Settlement::Refused(code) => {
+            // A card withdrawn because a folder grant now covers its path runs
+            // under that covering authority instead of ending withdrawn. Any
+            // other withdrawn card keeps its recorded refusal.
+            if code == "access_withdrawn" {
+                if let Some(run) =
+                    try_apply_covering_grant(call, prep, retry_after_deadline, elicitation).await
+                {
+                    return run;
+                }
+            }
             discard(call, prep).await;
             Hold::Answer(refused_answer(call, &prep.grant, &code, None))
         }
@@ -1752,26 +2538,73 @@ async fn finish(call: &HeldCall, prep: &Prepared, settled: Settlement) -> Hold {
             } else {
                 prep.grant.clone()
             };
+            let Some(ctx) = call.executor.actor_context(&call.identity.root) else {
+                return Hold::Answer(unavailable_answer(
+                    call,
+                    &prep.grant,
+                    "executor actor is not registered",
+                ));
+            };
+            let Some(db) = ctx.db() else {
+                return Hold::Answer(unavailable_answer(
+                    call,
+                    &prep.grant,
+                    "aft.db is unavailable",
+                ));
+            };
+            // Application and cleanup must use the same pinned database even
+            // if the actor's context or database slot is replaced meanwhile.
+            let claim = Arc::new(ClaimedAsk {
+                db: Arc::clone(&db),
+                key: key.clone(),
+                holder: holder.clone(),
+                armed: AtomicBool::new(true),
+                retry_after_deadline,
+                // Claim clears the persisted request fields. Keep the original
+                // card rather than rereading a row another dispatch may own.
+                original: (!scope).then(|| prep.clone()),
+                elicitation: elicitation.to_owned(),
+            });
+            let ownership = Arc::clone(&claim);
             let claimant = holder.clone();
-            let applied = with_db_handle(call, move |db, ctx| {
-                apply_allow(
-                    db, ctx, &identity, &key, &call_key, &claimant, &grant, scope, by_user,
-                )
+            let covering_key = key.clone();
+            let covering_grant = grant.clone();
+            #[cfg(test)]
+            let request_id = call.request_id.clone();
+            let applied = tokio::task::spawn_blocking(move || {
+                // Blocking work survives cancellation of the waiting future.
+                // Retain the owner until after the claim has finished committing.
+                let _ownership = ownership;
+                #[cfg(test)]
+                tests::wait_at_finish(&request_id, false);
+                let applied = apply_allow(
+                    &db, &ctx, &identity, &key, &call_key, &claimant, &grant, scope, by_user,
+                );
+                #[cfg(test)]
+                tests::wait_at_finish(&request_id, true);
+                applied
             })
-            .await;
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|applied| applied);
             match applied {
-                Ok(Applied::Run(once)) => Hold::Run {
-                    once,
-                    ask: prep.key.clone(),
-                    holder,
-                },
+                Ok(Applied::Run(once)) => {
+                    // Beside the grant insert: withdraw every other live ask this
+                    // folder grant truly covers so its card disappears from the
+                    // phone and its waiting call resumes without a second answer.
+                    if scope {
+                        settle_covered_asks(call, &covering_grant, &covering_key, elicitation)
+                            .await;
+                    }
+                    Hold::Run { once, claim }
+                }
                 Ok(Applied::HeadNotHeld) => Hold::Answer(refused_answer(
                     call,
                     &prep.grant,
                     "access_declined",
                     Some("the head no longer holds this permission itself"),
                 )),
-                Ok(Applied::NotClaimed) => Hold::Answer(pending_answer(call, &prep.grant)),
+                Ok(Applied::NotClaimed) => Hold::Answer(retry_answer(call, &prep.grant)),
                 Err(error) => Hold::Answer(unavailable_answer(call, &prep.grant, &error)),
             }
         }
@@ -1793,6 +2626,11 @@ fn apply_allow(
     scope: bool,
     by_user: bool,
 ) -> Result<Applied, String> {
+    if scope {
+        if let Some(reason) = access_grants::scope_grants_denial(identity) {
+            return Err(format!("saved scope grants unavailable: {reason:?}"));
+        }
+    }
     with_head_policy(db, ctx, identity, !by_user, |conn, head| {
         // A head may pass on only what it holds now: its authority is
         // checked again against the head's current policy and grants.
@@ -1800,6 +2638,7 @@ fn apply_allow(
             asks::discard(conn, key)?;
             return Ok(Applied::HeadNotHeld);
         }
+        let audit = if scope { asks::get(conn, key)? } else { None };
         let Some(approved) = asks::claim(conn, key, call_key, claimant)? else {
             return Ok(Applied::NotClaimed);
         };
@@ -1809,6 +2648,16 @@ fn apply_allow(
                 &access_grants::policy_scope_key(identity),
                 grant,
             )?;
+            if let Some(record) = audit {
+                log_consent(
+                    &identity.session,
+                    ConsentEvent::Granted {
+                        epoch: key.scope.epoch,
+                    },
+                    record.elicitation_id.as_deref().unwrap_or(call_key),
+                    grant,
+                );
+            }
         }
         Ok(Applied::Run(approved))
     })

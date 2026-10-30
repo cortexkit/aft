@@ -1031,8 +1031,8 @@ fn workspace_exports_change_refreshes_package_importers() {
     );
 }
 
-/// After lost watcher events, the reconcile compares every stored file's size
-/// and content hash with the disk. Three edits (a changed call target, a
+/// After lost watcher events, the reconcile compares stored stat hints first
+/// and hashes changed stamps. Three edits (a changed call target, a
 /// same-size rewrite and a deletion) plus a new file must come back as exactly
 /// those paths, and refreshing only them must give the cold-build graph.
 #[test]
@@ -1069,14 +1069,14 @@ fn disk_reconcile_finds_exactly_the_changed_files() {
     let unchanged = store.reconcile_with_disk(1_000).unwrap();
     assert_eq!(unchanged.changed_count(), 0, "{unchanged:#?}");
     assert_eq!(unchanged.examined_files, before.len());
-    assert_eq!(unchanged.hashed_files, before.len());
+    assert_eq!(unchanged.hashed_files, 0);
 
     let modified_call = write_file(
         &root,
         "a.ts",
         "import { extra } from \"./extra\";\nexport function a() { return extra(); }\n",
     );
-    // Same size as before: only the content hash can tell it changed.
+    // Same size as before: the distinct mtime selects it for a content hash.
     let same_size = write_file(&root, "c.ts", "export function c() { return 4; }\n");
     let deleted = root.join("gone.ts");
     fs::remove_file(&deleted).unwrap();

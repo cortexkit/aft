@@ -123,25 +123,46 @@ pub fn note_closed(session: &str, root: &Path) {
 /// index. `standing_roots` is the user-tier `index.roots` list from the
 /// resolved configuration.
 pub fn admission(root: &Path, standing_roots: &[IndexRootConfig]) -> SemanticAdmission {
-    let root = canonical(root);
-    {
-        let registry = REGISTRY.lock();
+    admission_with_repository_identity(
+        &REGISTRY,
+        &canonical(root),
+        standing_roots,
+        repository_identity,
+    )
+}
+
+fn admission_with_repository_identity(
+    roots: &Mutex<Registry>,
+    root: &Path,
+    standing_roots: &[IndexRootConfig],
+    resolve_repository: impl FnOnce(&Path) -> Option<PathBuf>,
+) -> SemanticAdmission {
+    let needs_repository = {
+        let registry = roots.lock();
         if registry.opened.values().any(|opened| opened.root == root) {
             return SemanticAdmission::InteractiveSession;
         }
-        if !registry.opened.is_empty() {
-            if let Some(repository) = repository_identity(&root) {
-                if registry
-                    .opened
-                    .values()
-                    .any(|opened| opened.repository.as_ref() == Some(&repository))
-                {
-                    return SemanticAdmission::OpenedRepository;
-                }
+        !registry.opened.is_empty()
+    };
+    // Git identity discovery can read and canonicalize several filesystem
+    // paths. Other sessions must be able to bind or close roots while it runs.
+    let repository = needs_repository.then(|| resolve_repository(root)).flatten();
+    {
+        let registry = roots.lock();
+        if registry.opened.values().any(|opened| opened.root == root) {
+            return SemanticAdmission::InteractiveSession;
+        }
+        if let Some(repository) = repository {
+            if registry
+                .opened
+                .values()
+                .any(|opened| opened.repository.as_ref() == Some(&repository))
+            {
+                return SemanticAdmission::OpenedRepository;
             }
         }
     }
-    if standing_root_covers(&root, standing_roots) {
+    if standing_root_covers(root, standing_roots) {
         return SemanticAdmission::StandingRoot;
     }
     SemanticAdmission::NotOpened
@@ -264,6 +285,30 @@ pub fn take_notice(session: &str, root: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit10_repository_resolution_does_not_hold_registry() {
+        let opened = tempfile::tempdir().unwrap();
+        let subject = tempfile::tempdir().unwrap();
+        let roots = Mutex::new(Registry::default());
+        let root = canonical(opened.path());
+        roots.lock().opened.insert(
+            ("test".to_string(), root.clone()),
+            OpenedRoot {
+                root,
+                repository: None,
+            },
+        );
+        let result =
+            admission_with_repository_identity(&roots, &canonical(subject.path()), &[], |_| {
+                assert!(
+                    roots.try_lock().is_some(),
+                    "repository I/O held the registry lock"
+                );
+                None
+            });
+        assert_eq!(result, SemanticAdmission::NotOpened);
+    }
 
     fn git_repo(path: &Path) {
         std::fs::create_dir_all(path.join(".git")).unwrap();

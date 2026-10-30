@@ -583,7 +583,8 @@ function withoutStructuredText(envelopeResponse: Record<string, unknown>): Recor
 
 describe("SubcTransport.toolCall", () => {
   test("decodes routed progress chunks in order for only the requesting callback", async () => {
-    const client = new FakeClient(async (channel, _body, options) => {
+    const client = new FakeClient(async (channel, body, options) => {
+      expect(body).toHaveProperty("handles_progress", true);
       for (const [kind, chunk] of [
         ["stdout", `route-${channel}:🦀`],
         ["stderr", "\nend"],
@@ -616,6 +617,19 @@ describe("SubcTransport.toolCall", () => {
         { kind: "stdout", text: "route-2:🦀" },
         { kind: "stderr", text: "\nend" },
       ]);
+      const native: Array<{ kind: "stdout" | "stderr"; text: string }> = [];
+      await bridge.send(
+        "bash",
+        { command: "echo native" },
+        { onProgress: (chunk) => native.push(chunk) },
+      );
+      expect(native.length).toBe(2);
+      for (const request of client.requests) {
+        expect(request.body).toHaveProperty("handles_progress", true);
+        expect((request.body as { arguments: unknown }).arguments).not.toHaveProperty(
+          "handles_progress",
+        );
+      }
     } finally {
       await pool.shutdown();
     }

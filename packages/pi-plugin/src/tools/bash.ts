@@ -1,13 +1,17 @@
 import {
   type AftProjectTransport,
   BASH_HOST_FALLBACK_REFUSAL,
+  BASH_RETURN_PATHS_DESCRIPTION,
   BASH_RUNON_DESCRIPTION,
   BASH_RUNON_GUIDANCE,
   BashOutputPageDecoder,
+  BashPermissionLoopError,
   type BridgeRequestOptions,
   bashHostFallbackAskPattern,
   classifyBashHostFallbackError,
   coerceBoolean,
+  escalationAskText,
+  formatBashOutputPages,
   formatWatchWaited,
   interruptedWatchTail,
   isBridgeTransportTimeout,
@@ -25,6 +29,7 @@ import {
   TERMINAL_SCAN_INCOMPLETE_TEXT,
   taskKillDeadlineText,
   taskKillDeadlineWithinHandoffMargin,
+  WATCH_EACH_LINE_NEEDS_BACKGROUND,
   WATCH_SYNC_DEFAULTS_DESCRIPTION,
   WATCH_TIMEOUT_PARAM_DESCRIPTION,
   WATCH_UNAVAILABLE_GIVE_UP_MS,
@@ -33,6 +38,7 @@ import {
   watchPollDelayMs,
   watchTimeoutSteer,
   watchUnavailableSteer,
+  withBashPermissionLoop,
   workerBackgroundTaskNote,
   workerWatchStillRunning,
 } from "@cortexkit/aft-bridge";
@@ -133,6 +139,8 @@ function resolveForegroundWaitMs(configured: number): number {
 // orchestrated bash tool overrides this per request because Rust may hold the
 // final response until the foreground wait window or hard-kill cap elapses.
 const BASH_TRANSPORT_TIMEOUT_MS = 30_000;
+const BASH_SECRET_HOST_FALLBACK_REFUSAL =
+  "Secret placeholder commands need AFT's shell; Pi's built-in shell cannot run them.";
 const DEFAULT_HARD_TIMEOUT_MS = 30 * 60 * 1000;
 // The margin gives Rust time to promote or finalize the task and deliver the
 // final response after the server's foreground wait window or hard kill timeout.
@@ -267,6 +275,9 @@ const BashPtyParams = {
 
 const BashRunonParam = {
   runon: Type.Optional(Type.String({ description: BASH_RUNON_DESCRIPTION })),
+  return_paths: Type.Optional(
+    Type.Array(Type.String(), { maxItems: 64, description: BASH_RETURN_PATHS_DESCRIPTION }),
+  ),
 };
 
 /** The full argument set, used for the parameter types `execute` receives. */
@@ -405,6 +416,22 @@ const BashTaskParams = Type.Object({
 });
 
 const BashStatusParams = Type.Object({
+  output_offset: Type.Optional(
+    Type.Integer({
+      minimum: 0,
+      maximum: Number.MAX_SAFE_INTEGER,
+      description:
+        "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset.",
+    }),
+  ),
+  stderr_offset: Type.Optional(
+    Type.Integer({
+      minimum: 0,
+      maximum: Number.MAX_SAFE_INTEGER,
+      description:
+        "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset.",
+    }),
+  ),
   task_id: Type.String({
     description: "Background bash task id returned by bash({ background: true }).",
   }),
@@ -423,6 +450,12 @@ const BashWatchParams = Type.Object({
   pattern: Type.Optional(Type.Union([Type.String(), Type.Object({ regex: Type.String() })])),
   background: Type.Optional(Type.Boolean()),
   timeout_ms: optionalInt(1, 1800000, WATCH_TIMEOUT_PARAM_DESCRIPTION),
+  deliver: Type.Optional(
+    Type.Literal("each_line", {
+      description:
+        "Async-only: batch every matching complete line, fold consecutive duplicates, and report cap drops with byte offsets.",
+    }),
+  ),
   once: Type.Optional(Type.Boolean()),
 });
 
@@ -460,6 +493,7 @@ const BashWriteParams = Type.Object({
 });
 
 interface BashDetails {
+  _bash_changed_files?: import("@cortexkit/aft-bridge").BashChangedFiles;
   exit_code?: number;
   duration_ms?: number;
   truncated?: boolean;
@@ -506,8 +540,9 @@ interface BashStatusDetails {
   pty_cols?: number;
   pty_screen?: string;
   pty_raw?: string;
-  live_descendants?: Array<{ pid: number; comm: string; argv0: string }> | null;
+  live_descendants?: import("@cortexkit/aft-bridge").LiveDescendant[] | null;
   live_descendants_omitted?: number;
+  live_descendants_unavailable?: import("@cortexkit/aft-bridge").LiveDescendantsUnavailable;
   live_descendants_summary?: string;
   /** Text note saying which phase a still-running remote task has reached on the build server. */
   remote_phase_note?: string;
@@ -526,6 +561,7 @@ interface BashKillDetails {
   status: string;
   kill_signaled?: boolean;
   kill_reached?: number;
+  remote_cancel?: string;
 }
 
 interface BashWatchDetails extends Record<string, unknown> {}
@@ -550,19 +586,6 @@ async function callBashBridge(
   });
 }
 
-interface BashPermissionAsk {
-  kind?: string;
-  command?: string;
-  cwd?: string;
-  grant_id?: string;
-  patterns?: string[];
-  always?: string[];
-}
-
-function piEscalationAskText(ask: BashPermissionAsk): string {
-  return `This command will run UNSANDBOXED on the host.\n\nExact command:\n${ask.command ?? ""}\n\nWorking directory:\n${ask.cwd ?? ""}`;
-}
-
 function piPowerShellAskText(command: string): string {
   return `PowerShell commands are conservatively approved one at a time because AFT's POSIX shell scanner cannot safely interpret PowerShell syntax.\n\nExact command:\n${command}`;
 }
@@ -574,74 +597,76 @@ async function callBashWithPermissionLoop(
   options?: BridgeRequestOptions,
   bridgeCommand = "bash",
 ): Promise<Record<string, unknown>> {
-  const granted: string[] = [];
-
-  for (let round = 0; round < 8; round++) {
-    try {
-      return await callBashBridge(
-        bridge,
-        bridgeCommand,
-        withHostPermissionGrants(params, granted),
-        extCtx,
-        options,
-      );
-    } catch (error) {
-      if (!(error instanceof BridgeError)) {
-        if (error instanceof Error && error.message.includes("permission_required")) {
-          throw new Error("Permission ask reached Pi adapter — this is a bug.");
+  try {
+    return await withBashPermissionLoop({
+      operation: bridgeCommand,
+      request: async (granted) => {
+        try {
+          return await callBashBridge(
+            bridge,
+            bridgeCommand,
+            withHostPermissionGrants(params, granted),
+            extCtx,
+            options,
+          );
+        } catch (error) {
+          if (!(error instanceof BridgeError)) {
+            if (error instanceof Error && error.message.includes("permission_required")) {
+              throw new Error("Permission ask reached Pi adapter — this is a bug.");
+            }
+            throw error;
+          }
+          if (error.code !== "permission_required") throw error;
+          return error.response ?? { success: false, code: "permission_required" };
         }
-        throw error;
-      }
-      if (error.code !== "permission_required") throw error;
-      const asks = Array.isArray(error.response?.asks)
-        ? (error.response.asks as BashPermissionAsk[])
-        : [];
-      if (asks.length === 0 || !extCtx.hasUI || typeof extCtx.ui?.confirm !== "function") {
-        throw new BridgeError(
-          "Permission denied: command approval requires an interactive UI.",
-          "permission_denied",
-        );
-      }
-      for (const ask of asks) {
-        if (ask.kind === "escalation") {
+      },
+      approve: async (asks) => {
+        if (!extCtx.hasUI || typeof extCtx.ui?.confirm !== "function") {
+          throw new BridgeError(
+            "Permission denied: command approval requires an interactive UI.",
+            "permission_denied",
+          );
+        }
+        for (const ask of asks) {
+          if (ask.kind === "escalation") {
+            const approved = await extCtx.ui.confirm(
+              "Run command unsandboxed on host?",
+              escalationAskText(ask),
+              { signal: extCtx.signal },
+            );
+            if (!approved) {
+              throw new BridgeError(
+                "Permission denied: unsandboxed host execution was denied.",
+                "permission_denied",
+              );
+            }
+            continue;
+          }
+          if (bridgeCommand !== "powershell") {
+            throw new Error(
+              "Permission ask reached Pi adapter without a host escalation grant — this is a bug.",
+            );
+          }
           const approved = await extCtx.ui.confirm(
-            "Run command unsandboxed on host?",
-            piEscalationAskText(ask),
+            "Allow PowerShell command?",
+            piPowerShellAskText(String(params.command ?? "")),
             { signal: extCtx.signal },
           );
           if (!approved) {
             throw new BridgeError(
-              "Permission denied: unsandboxed host execution was denied.",
+              "Permission denied: PowerShell command was denied.",
               "permission_denied",
             );
           }
-          if (ask.grant_id && !granted.includes(ask.grant_id)) granted.push(ask.grant_id);
-          continue;
         }
-        if (bridgeCommand !== "powershell") {
-          throw new Error(
-            "Permission ask reached Pi adapter without a host escalation grant — this is a bug.",
-          );
-        }
-        const approved = await extCtx.ui.confirm(
-          "Allow PowerShell command?",
-          piPowerShellAskText(String(params.command ?? "")),
-          { signal: extCtx.signal },
-        );
-        if (!approved) {
-          throw new BridgeError(
-            "Permission denied: PowerShell command was denied.",
-            "permission_denied",
-          );
-        }
-        for (const grant of [...(ask.always ?? []), ...(ask.patterns ?? [])]) {
-          if (!granted.includes(grant)) granted.push(grant);
-        }
-      }
+      },
+    });
+  } catch (error) {
+    if (error instanceof BashPermissionLoopError && error.cause instanceof BridgeError) {
+      throw new BridgeError(error.message, error.cause.code, error.cause.response);
     }
+    throw error;
   }
-
-  throw new Error("bash permission retry failed: too many rounds");
 }
 
 /** Truncate output to last N visual lines for terminal width. */
@@ -906,6 +931,8 @@ export function registerBashTool(
                 sandbox: params.sandbox,
                 ...(isPowerShell ? { shell: "powershell" } : {}),
                 ...(params.runon !== undefined ? { runon: params.runon } : {}),
+                // Forwarded like `runon`: the engine refuses it without `runon`.
+                ...(params.return_paths !== undefined ? { return_paths: params.return_paths } : {}),
               },
               extCtx,
               {
@@ -934,6 +961,9 @@ export function registerBashTool(
       } catch (error) {
         const fallbackCause = classifyBashHostFallbackError(error);
         if (fallbackCause === undefined) throw error;
+        if (params.command.includes("{{ck-secret:") || bridgeCommand.includes("{{ck-secret:")) {
+          throw new Error(BASH_SECRET_HOST_FALLBACK_REFUSAL);
+        }
         if (isPowerShell) {
           throw refuseAftModuleOptionWithoutFallback(
             error,
@@ -954,7 +984,21 @@ export function registerBashTool(
         if (params.runon !== undefined) {
           throw refuseAftModuleOptionWithoutFallback(error, "runon", BASH_HOST_FALLBACK_REFUSAL);
         }
+        if (params.return_paths !== undefined) {
+          throw refuseAftModuleOptionWithoutFallback(
+            error,
+            "return_paths",
+            BASH_HOST_FALLBACK_REFUSAL,
+          );
+        }
         if (!bashCfg.host_fallback) throw error;
+        if (bashCfg.memory_limit_mib !== undefined) {
+          throw refuseAftModuleOptionWithoutFallback(
+            error,
+            "bash.memory_limit_mib",
+            BASH_HOST_FALLBACK_REFUSAL,
+          );
+        }
         if (!extCtx.hasUI || typeof extCtx.ui?.confirm !== "function") {
           throw new BridgeError(
             "Permission denied: host fallback execution requires an interactive UI.",
@@ -1011,6 +1055,7 @@ export function registerBashTool(
       }
 
       const details: BashDetails = {
+        _bash_changed_files: response._bash_changed_files as BashDetails["_bash_changed_files"],
         exit_code: response.exit_code as number | undefined,
         duration_ms: response.duration_ms as number | undefined,
         truncated: response.truncated as boolean | undefined,
@@ -1110,7 +1155,36 @@ export function createBashStatusTool(ctx: PluginContext) {
       // bash_status is snapshot-only. wait_for / exit / timeout_ms moved to
       // bash_watch; if the agent passes them here they're silently ignored
       // at the TypeBox schema layer.
-      const data = await bashStatusSnapshot(bridge, extCtx, params.task_id, params.output_mode);
+      const paging = params.output_offset !== undefined || params.stderr_offset !== undefined;
+      const data = paging
+        ? await callBashBridge(
+            bridge,
+            "bash_status",
+            {
+              task_id: params.task_id,
+              output_mode: params.output_mode,
+              output_offset: coerceOptionalInt(
+                params.output_offset,
+                "output_offset",
+                0,
+                Number.MAX_SAFE_INTEGER,
+              ),
+              stderr_offset: coerceOptionalInt(
+                params.stderr_offset,
+                "stderr_offset",
+                0,
+                Number.MAX_SAFE_INTEGER,
+              ),
+            },
+            extCtx,
+          )
+        : await bashStatusSnapshot(bridge, extCtx, params.task_id, params.output_mode);
+      if (data.success === false) throw new Error(String(data.message ?? "bash_status failed"));
+      if (paging)
+        return bashStatusResult(
+          formatBashOutputPages(data, false),
+          data as unknown as BashStatusDetails,
+        );
       const details = data as unknown as BashStatusDetails;
       return bashStatusResult(
         await formatBashStatus(extCtx, params.task_id, details, params.output_mode, {
@@ -1148,6 +1222,12 @@ export function createBashWatchTool(ctx: PluginContext) {
         coerceBoolean(params.background) &&
         !bashCfg.subagent_background &&
         isPiWorkerSession(extCtx);
+      if (params.deliver !== undefined && (!coerceBoolean(params.background) || workerForcedSync)) {
+        throw new Error(WATCH_EACH_LINE_NEEDS_BACKGROUND);
+      }
+      if (params.deliver !== undefined && params.deliver !== "each_line") {
+        throw new Error("invalid_request: bash_watch deliver must be each_line");
+      }
       // Coerce at the boundary: stringified background must enable async mode (coerceBoolean).
       if (coerceBoolean(params.background) && !workerForcedSync) {
         if (!waitFor) {
@@ -1159,6 +1239,7 @@ export function createBashWatchTool(ctx: PluginContext) {
           task_id: params.task_id,
           once: coerceBoolean(params.once, true),
         };
+        if (params.deliver !== undefined) notifyParams.deliver = params.deliver;
         if (waitFor.kind === "regex") notifyParams.regex = waitFor.source;
         else notifyParams.pattern = waitFor.value;
         const sessionId = resolveSessionId(extCtx);
@@ -1363,13 +1444,21 @@ export function createBashKillTool(ctx: PluginContext) {
         throw new Error((data.message as string | undefined) ?? "bash_kill failed");
       }
       const details = data as unknown as BashKillDetails;
+      const warning =
+        typeof data.bot_write_revocation_warning === "string"
+          ? `\n${data.bot_write_revocation_warning}`
+          : "";
       if (details.kill_signaled === true) {
         return bashKillResult(
-          `Task ${params.task_id}: kill_signaled · reached ${details.kill_reached ?? 0} live descendants`,
+          `Task ${params.task_id}: kill_signaled · reached ${details.kill_reached ?? 0} live descendants${warning}`,
           details,
         );
       }
-      return bashKillResult(`Task ${params.task_id}: ${details.status}`, details);
+      const cancel = details.remote_cancel ? ` · ${details.remote_cancel}` : "";
+      return bashKillResult(
+        `Task ${params.task_id}: ${details.status}${cancel}${warning}`,
+        details,
+      );
     },
   };
 }
@@ -1387,6 +1476,7 @@ function bashResult(
       output_path: details.output_path,
       task_id: details.task_id,
       bg_completions: details.bg_completions,
+      ...(details._bash_changed_files ? { _bash_changed_files: details._bash_changed_files } : {}),
     } as BashDetails,
   };
 }

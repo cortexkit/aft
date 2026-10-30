@@ -2,7 +2,7 @@
   "aft_search_registered": true,
   "bash": {
     "env": {
-      "AFT_PARITY_USER_ENV": "user-value",
+      "PARITY_USER_ENV": "user-value",
       "TZ": "UTC"
     }
   },

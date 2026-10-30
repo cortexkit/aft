@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "gh-worker-write-refusal"
+  ],
+  "note": "gh-shim refuses GitHub writes from worker shells with a report-to-parent instruction. No changed path matches RANKING_FENCE_PREFIXES."
+}

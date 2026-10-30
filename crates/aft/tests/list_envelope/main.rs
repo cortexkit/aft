@@ -1,6 +1,9 @@
 #[path = "../helpers/context_storage.rs"]
 mod context_storage;
 
+#[path = "../helpers/list_cut_item.rs"]
+mod list_cut_item;
+
 #[path = "../list_envelope_bash.rs"]
 mod list_envelope_bash;
 #[path = "../list_envelope_callgraph.rs"]

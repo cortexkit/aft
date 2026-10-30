@@ -1,1 +1,0 @@
-- Background bash keeps signal deaths as 128+signal exit codes and returns raw output in bounded 64 KiB pages. Watches in AFT, OpenCode and Pi scan every page of an exited command's output, keep characters whole across pages, and no longer treat a page edge as the end of the output; when they cannot rule out a match, they say the scan is incomplete instead of reporting no match.

@@ -79,7 +79,10 @@ const CLANGD: GithubServerSpec = {
   layout: "distribution",
   smokeArgs: ["--version"],
   requiredRuntimePaths: (version) => [{ path: `clangd_${version}/lib/clang`, kind: "directory" }],
-  resolveAsset: (platform, _arch, version) => {
+  resolveAsset: (platform, arch, version) => {
+    // clangd has no Linux ARM64 build; choosing the x86-64 Linux asset there
+    // would install an executable that cannot run, so offer no asset.
+    if (platform === "linux" && arch === "arm64") return null;
     const platformName = platform === "darwin" ? "mac" : platform === "linux" ? "linux" : "windows";
     return { name: `clangd-${platformName}-${version}.zip`, archive: "zip" };
   },

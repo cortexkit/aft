@@ -186,7 +186,9 @@ fn test_objc_outline_zoom_extensions_and_search_index() {
     );
 
     let index = SearchIndex::build(project.path());
-    let search = index.grep("objcxxSearchNeedle", true, &[], &[], project.path(), 10);
+    let search = index
+        .grep("objcxxSearchNeedle", true, &[], &[], project.path(), 10)
+        .unwrap();
     assert_eq!(
         search.total_matches, 1,
         ".mm file should be indexed: {search:?}"

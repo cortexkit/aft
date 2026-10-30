@@ -1,0 +1,10 @@
+{
+  "bash": {
+    "env": {
+      "PARITY_PROJECT_ENV": "v"
+    },
+    "runon_env": [
+      "PARITY_PROJECT_ENV"
+    ]
+  }
+}

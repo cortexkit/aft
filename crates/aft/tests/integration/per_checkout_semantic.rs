@@ -120,7 +120,9 @@ struct Checkout {
 impl Checkout {
     fn open(storage: &Path, scope: &str, root: &Path, plane: &Arc<SemanticPlane>) -> Self {
         let registry = FamilyRegistry::open(storage, "family").unwrap();
-        let owner = registry.register_view(scope, root).unwrap();
+        let owner = registry
+            .register_view_with_storage(registry.storage(), scope, root)
+            .unwrap();
         let composite: Arc<dyn CompositePlane> = plane.clone();
         let adapter: Arc<dyn PlaneAdapter> = plane.clone();
         let driver = Arc::new(
@@ -760,7 +762,9 @@ fn semantic_forced_kill_during_fill_keeps_pending_and_stored_work() {
     let checkout = Checkout::open(storage.path(), "pool", root.path(), &plane);
     let installed_before = {
         let registry = FamilyRegistry::open(storage.path(), "family").unwrap();
-        let view = registry.register_view("pool", root.path()).unwrap();
+        let view = registry
+            .register_view_with_storage(registry.storage(), "pool", root.path())
+            .unwrap();
         let store = view.view_store().unwrap();
         let current = store.current_generation().unwrap().unwrap();
         store.load_manifest_v2(&current).unwrap()

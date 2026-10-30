@@ -170,7 +170,11 @@ function renderTracePath(
   });
 }
 
-function renderCallersGroupLines(group: Record<string, unknown>, theme: CallgraphTheme): string[] {
+function renderCallersGroupLines(
+  group: Record<string, unknown>,
+  theme: CallgraphTheme,
+  callbackLabel: string,
+): string[] {
   const file = shortenPath(asString(group.file) ?? "(unknown file)");
   const lines = [theme.fg("accent", file)];
   const callers = asRecords(group.callers);
@@ -179,28 +183,35 @@ function renderCallersGroupLines(group: Record<string, unknown>, theme: Callgrap
   for (const caller of callers) {
     const symbol = asString(caller.symbol) ?? "(unknown)";
     const via = asString(caller.via) ?? "";
+    const relation = asString(caller.relation) ?? "";
     const provenanceKey =
       asString(caller.resolved_by) === "name_match"
-        ? `${symbol}\0${via}\0name_match`
-        : `${symbol}\0${via}\0exact`;
+        ? `${symbol}\0${via}\0${relation}\0name_match`
+        : `${symbol}\0${via}\0${relation}\0exact`;
     const line = asNumber(caller.line);
     const bucket = bySymbolProvenance.get(provenanceKey) ?? [];
     if (line !== undefined) bucket.push(line);
     bySymbolProvenance.set(provenanceKey, bucket);
   }
 
-  const keys = [...bySymbolProvenance.keys()].sort((a, b) => a.localeCompare(b));
+  const keys = [...bySymbolProvenance.keys()].sort();
   for (const key of keys) {
-    const [symbol = "(unknown)", via = ""] = key.split("\0");
+    const [symbol = "(unknown)", via = "", relation = ""] = key.split("\0");
     const isNameMatch = key.endsWith("\0name_match");
     const lineNums = (bySymbolProvenance.get(key) ?? []).sort((a, b) => a - b);
     const linePart = lineNums.length > 0 ? lineNums.map(String).join(", ") : "?";
     const marker = isNameMatch ? ` ${theme.fg("warning", "~")}` : "";
     const viaPart = via ? ` via ${via}` : "";
-    lines.push(`  ↳ ${symbol}:${linePart}${marker}${viaPart}`);
+    const reference = relation === "callback_reference" ? callbackLabel : "";
+    lines.push(`  ↳ ${symbol}:${linePart}${marker}${viaPart}${reference}`);
   }
 
   return lines;
+}
+
+function callbackReferenceCountSuffix(record: Record<string, unknown>): string {
+  const count = asNumber(record.callback_dependencies) ?? 0;
+  return count > 0 ? ` (${count} by callback reference)` : "";
 }
 
 export function formatCallgraphSections(
@@ -224,20 +235,32 @@ export function formatCallgraphSections(
     const groups = asRecords(record.callers);
     const warning = depthWarning(record, theme);
     const hubSummary = hubSummaryLine(record, theme);
-    const total = asNumber(record.total_callers) ?? 0;
+    const hiddenTests = asNumber(record.hidden_test_callers) ?? 0;
+    const total = (asNumber(record.total_callers) ?? 0) - hiddenTests;
+    const callbackNote = callbackReferenceCountSuffix(record);
     const sections = [
       joinNonEmpty([
-        theme.fg("success", `${total} caller${total === 1 ? "" : "s"}`),
+        theme.fg("success", `${total} caller${total === 1 ? "" : "s"}${callbackNote}`),
         theme.fg("muted", `${groups.length} file group${groups.length === 1 ? "" : "s"}`),
         warning,
       ]),
     ];
     const incompleteReason = asString(record.incomplete_reason);
     if (incompleteReason) sections.unshift(theme.fg("warning", incompleteReason));
+    const testFilterNote = asString(record.test_filter_note);
+    if (testFilterNote) sections.unshift(theme.fg("warning", testFilterNote));
     if (hubSummary) sections.push(hubSummary);
     groups.forEach((group) => {
-      sections.push(renderCallersGroupLines(group, theme).join("\n"));
+      sections.push(
+        renderCallersGroupLines(group, theme, asString(record.callback_reference_label) ?? "").join(
+          "\n",
+        ),
+      );
     });
+    if (hiddenTests > 0)
+      sections.push(
+        theme.fg("muted", `${hiddenTests} callers in tests hidden — includeTests: true shows them`),
+      );
     // Rust macro token trees that could not be parsed may hide more callers.
     const macroNote = asString(asRecord(record.macro_note)?.message);
     if (macroNote) sections.push(theme.fg("warning", macroNote));
@@ -300,17 +323,25 @@ export function formatCallgraphSections(
     const callers = asRecords(record.callers);
     const warning = depthWarning(record, theme);
     const hubSummary = hubSummaryLine(record, theme);
-    const totalAffected = asNumber(record.total_affected) ?? callers.length;
+    const hiddenTests = asNumber(record.hidden_test_callers) ?? 0;
+    const totalAffected = (asNumber(record.total_affected) ?? callers.length) - hiddenTests;
+    const callbackNote = callbackReferenceCountSuffix(record);
+    const siteKind = callbackNote ? "site" : "call site";
     const affectedFiles = asNumber(record.affected_files) ?? 0;
     const sections = [
       joinNonEmpty([
-        theme.fg("warning", `${totalAffected} affected call site${totalAffected === 1 ? "" : "s"}`),
+        theme.fg(
+          "warning",
+          `${totalAffected} affected ${siteKind}${totalAffected === 1 ? "" : "s"}${callbackNote}`,
+        ),
         theme.fg("muted", `${affectedFiles} file${affectedFiles === 1 ? "" : "s"}`),
         warning,
       ]),
     ];
     const incompleteReason = asString(record.incomplete_reason);
     if (incompleteReason) sections.unshift(theme.fg("warning", incompleteReason));
+    const testFilterNote = asString(record.test_filter_note);
+    if (testFilterNote) sections.unshift(theme.fg("warning", testFilterNote));
     if (hubSummary) sections.push(hubSummary);
     if (callers.length === 0) sections.push(theme.fg("muted", "No impacted callers found."));
     callers.forEach((caller) => {
@@ -319,6 +350,10 @@ export function formatCallgraphSections(
       const line = asNumber(caller.line) ?? 0;
       const entry = caller.is_entry_point === true ? ` ${theme.fg("warning", "[entry]")}` : "";
       const nameMatch = nameMatchEdgeMarker(caller, theme);
+      const reference =
+        caller.relation === "callback_reference"
+          ? (asString(record.callback_reference_label) ?? "")
+          : "";
       const expression = asString(caller.call_expression);
       const params = Array.isArray(caller.parameters)
         ? caller.parameters.map(String).join(", ")
@@ -326,7 +361,7 @@ export function formatCallgraphSections(
       sections.push(
         [
           `${theme.fg("accent", file)}:${line}`,
-          `  ↳ ${symbol}${entry}${nameMatch}`,
+          `  ↳ ${symbol}${entry}${nameMatch}${reference}`,
           expression ? `  ${theme.fg("muted", expression)}` : undefined,
           params ? `  ${theme.fg("muted", `params: ${params}`)}` : undefined,
         ]
@@ -334,6 +369,10 @@ export function formatCallgraphSections(
           .join("\n"),
       );
     });
+    if (hiddenTests > 0)
+      sections.push(
+        theme.fg("muted", `${hiddenTests} callers in tests hidden — includeTests: true shows them`),
+      );
     return sections;
   }
 

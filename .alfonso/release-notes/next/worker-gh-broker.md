@@ -1,1 +1,0 @@
-- Sandboxed worker commands reach AFT's GitHub read path through a private per-command broker, so they never see the daemon connection or its credentials. Worker GitHub reads stay off until a signed routing manifest turns them on.

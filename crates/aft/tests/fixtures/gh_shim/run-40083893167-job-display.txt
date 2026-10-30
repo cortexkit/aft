@@ -1,0 +1,18 @@
+2026-10-24T09:57:21.4042950Z ##[group]Checking out the ref
+2026-10-24T09:57:21.4043428Z [command]/usr/bin/git checkout --progress --force 4bfc477d907853824afb483e0f2e95f99d9b5cd8
+2026-10-24T09:57:22.0036415Z HEAD is now at 4bfc477d9 mason: defer glob edit write checks until content matches
+2026-10-24T09:57:22.0073427Z ##[endgroup]
+2026-10-24T09:57:22.0128480Z [command]/usr/bin/git log -1 --format=%H
+2026-10-24T09:57:22.0158498Z 4bfc477d907853824afb483e0f2e95f99d9b5cd8
+2026-10-24T09:57:22.0377683Z ##[group]Run python3 scripts/landing-policy.py --event "$GITHUB_EVENT_NAME" --event-path "$GITHUB_EVENT_PATH"
+2026-10-24T09:57:22.0378545Z python3 scripts/landing-policy.py --event "$GITHUB_EVENT_NAME" --event-path "$GITHUB_EVENT_PATH"
+2026-10-24T09:57:22.0617811Z shell: /usr/bin/bash -e {0}
+2026-10-24T09:57:22.0618129Z env:
+2026-10-24T09:57:22.0618375Z   SCCACHE_IDLE_TIMEOUT: 0
+2026-10-24T09:57:22.0618678Z   SCCACHE_GHA_RW_MODE: READ_ONLY
+2026-10-24T09:57:22.0621822Z   GH_TOKEN: ***
+2026-10-24T09:57:22.0622087Z ##[endgroup]
+2026-10-24T09:57:22.1681605Z Landing policy: REFUSED: 7e98a53e8e8d856b919fe52ad0ea8d6662fafc8f: land/storage-floor agent commit missing alfonso-aft co-author trailer
+2026-10-24T09:57:22.1783209Z ##[error]Process completed with exit code 1.
+2026-10-24T09:57:22.1960957Z Post job cleanup.
+2026-10-24T09:57:22.2803101Z [command]/usr/bin/git version

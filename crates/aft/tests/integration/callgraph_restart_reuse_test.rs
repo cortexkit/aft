@@ -139,6 +139,31 @@ fn callers(aft: &mut AftProcess, root: &Path) -> Value {
     }
 }
 
+fn callers_once(aft: &mut AftProcess, root: &Path) -> Value {
+    aft.send(
+        &json!({
+            "id": "immediate-callers", "command": "callers",
+            "file": root.join("target.ts"), "symbol": "target"
+        })
+        .to_string(),
+    )
+}
+
+fn callers_after_comparison(aft: &mut AftProcess, root: &Path) -> Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let response = callers(aft, root);
+        if response["complete"] != false {
+            return response;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "comparison never settled: {response:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -198,7 +223,31 @@ fn legacy_callgraph_restart_reuses_the_published_generation() {
 }
 
 #[test]
-#[ignore = "fails today (#746): a restart reuses the store but never compares it with edits made while no engine ran"]
+fn legacy_callgraph_restart_first_query_answers_without_waiting_for_comparison() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = project(fixture.path(), 3);
+    let storage = fixture.path().join("storage");
+    let mut first = AftProcess::spawn();
+    configure(&mut first, &root, &storage);
+    assert_eq!(callers(&mut first, &root)["total_callers"], 3);
+    let built = published_generation(&storage);
+    first.shutdown();
+
+    let mut restarted = AftProcess::spawn_with_real_watcher();
+    configure(&mut restarted, &root, &storage);
+    let response = callers_once(&mut restarted, &root);
+    assert_eq!(
+        response["success"], true,
+        "first query must answer, not Building: {response:?}"
+    );
+    assert_eq!(response["total_callers"], 3);
+    let settled = callers_after_comparison(&mut restarted, &root);
+    assert_ne!(settled["complete"], false, "{settled:?}");
+    assert_eq!(settled["total_callers"], 3);
+    assert_eq!(published_generation(&storage), built);
+}
+
+#[test]
 fn legacy_callgraph_restart_after_an_offline_edit_reuses_the_generation() {
     let fixture = tempfile::tempdir().unwrap();
     let root = project(fixture.path(), 3);
@@ -222,7 +271,9 @@ fn legacy_callgraph_restart_after_an_offline_edit_reuses_the_generation() {
     // The restarted engine installs a real file watcher, as in production.
     let mut restarted = AftProcess::spawn_with_real_watcher();
     configure(&mut restarted, &root, &storage);
-    let response = callers(&mut restarted, &root);
+    // The old snapshot is available during comparison, but only the settled
+    // answer claims to include edits made while no engine was running.
+    let response = callers_after_comparison(&mut restarted, &root);
     let served = published_generation(&storage);
     let (_, log) = restarted.stderr_output();
     assert_eq!(

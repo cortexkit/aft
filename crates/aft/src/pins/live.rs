@@ -51,6 +51,35 @@ impl LivePin {
         })
     }
 
+    /// Creates an empty live pin in the `pins/` of the v3 member `scope`,
+    /// inside the v3 registry barrier: the member must still be registered and
+    /// not `evicting`, so the retention collector's final protection check
+    /// either sees this pin or has already removed the member.
+    pub fn create_v3(storage: &Path, family: &str, scope: &str) -> Result<Self, PinError> {
+        crate::views::base_refs::with_base_barrier(storage, family, |tx| {
+            let state: Option<String> = rusqlite::OptionalExtension::optional(tx.query_row(
+                "SELECT state FROM members WHERE scope=?1",
+                [scope],
+                |r| r.get(0),
+            ))?;
+            if state.is_none() || state.as_deref() == Some(crate::views::registry::STATE_EVICTING) {
+                return Err(crate::views::base_refs::BaseRefError::Unavailable(format!(
+                    "v3 member {scope} is not registered"
+                )));
+            }
+            let view_dir = crate::blob_store::v3::view_dir(storage, family, scope)?;
+            Self::create_in(&view_dir, family.to_owned(), scope.to_owned()).map_err(|error| {
+                crate::views::base_refs::BaseRefError::Io(std::io::Error::other(error.to_string()))
+            })
+        })
+        .map_err(|error| match error {
+            crate::views::base_refs::BaseRefError::Unavailable(_) => {
+                PinError::NotRegistered(scope.to_owned())
+            }
+            other => PinError::Registry(other.to_string()),
+        })
+    }
+
     fn create_in(view_dir: &Path, family: String, view: String) -> Result<Self, PinError> {
         let pid = std::process::id();
         let now = now_ms();
@@ -65,7 +94,9 @@ impl LivePin {
             LIVE_SEQ.fetch_add(1, Ordering::Relaxed)
         );
         validate_generation(&label)?;
-        crate::private_storage::create_dir_all(view_dir.join("pins"))?;
+        let pins_dir = view_dir.join("pins");
+        crate::private_storage::create_dir_all(&pins_dir)
+            .map_err(|e| crate::views::io::at("creating live pin directory", &pins_dir, e))?;
         let (metadata_path, keys_path) = pin_paths(view_dir, &label);
         let metadata = PinMetadata {
             family,
@@ -129,6 +160,17 @@ impl LivePin {
         Ok(())
     }
 
+    /// A completed fill may leave its live pin only after durable publication
+    /// protects it. Unpublished override keys survive even if content equality
+    /// removed their corresponding live entry.
+    pub fn trim_published(
+        &mut self,
+        published: &BTreeSet<String>,
+        keep: impl Fn(&str) -> bool,
+    ) -> Result<(), PinError> {
+        self.trim(|key| keep(key) || !published.contains(key))
+    }
+
     pub fn len(&self) -> usize {
         self.keys.len()
     }
@@ -147,9 +189,17 @@ impl LivePin {
             let file = crate::private_storage::options()
                 .write(true)
                 .create_new(true)
-                .open(&temporary)?;
-            write_key_lines(file, self.keys.iter().map(String::as_str))?;
-            fs_lock::rename_over(&temporary, &self.keys_path)?;
+                .open(&temporary)
+                .map_err(|e| crate::views::io::at("creating live pin keys", &temporary, e))?;
+            write_key_lines(file, self.keys.iter().map(String::as_str))
+                .map_err(|e| crate::views::io::at("writing live pin keys", &temporary, e))?;
+            fs_lock::rename_over(&temporary, &self.keys_path).map_err(|e| {
+                crate::views::io::at(
+                    &format!("renaming live pin keys {} to", temporary.display()),
+                    &self.keys_path,
+                    e,
+                )
+            })?;
             Ok(())
         })();
         if result.is_err() {
@@ -212,6 +262,26 @@ mod tests {
                 .family_key()
             })
             .collect()
+    }
+
+    #[test]
+    fn override_fill_stays_live_until_durable_publication_protects_it() {
+        let view = tempfile::tempdir().unwrap();
+        let mut pin = LivePin::create_in(view.path(), "family".into(), "worker".into()).unwrap();
+        let key = keys(1)[0];
+        pin.protect(&[key]).unwrap();
+        pin.trim_published(&BTreeSet::new(), |_| false).unwrap();
+        assert_eq!(
+            pin.len(),
+            1,
+            "content equality cannot retire an unpublished override key"
+        );
+        assert!(fs::read_to_string(pin.keys_path())
+            .unwrap()
+            .contains(&key.to_hex()));
+        pin.trim_published(&BTreeSet::from([key.to_hex()]), |_| false)
+            .unwrap();
+        assert!(pin.is_empty());
     }
 
     #[test]

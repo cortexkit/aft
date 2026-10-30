@@ -9,7 +9,7 @@ use std::fs;
 use std::io::{BufRead, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use image::codecs::{gif::GifEncoder, jpeg::JpegEncoder, png::PngEncoder, webp::WebPEncoder};
@@ -37,6 +37,9 @@ const BINARY_SAMPLE_BYTES: usize = 4 * 1024;
 const MEDIA_MAGIC_BYTES: usize = 16;
 const MAX_INLINE_BASE64_BYTES: usize = 9 * 1024 * 1024 / 2; // 4.5 MiB encoded payload cap
 const MAX_INLINE_IMAGE_DIMENSION: u32 = 1024;
+const MIN_FITTED_IMAGE_DIMENSION: u32 = 256;
+const MAX_IMAGE_FIT_STEPS: usize = 6;
+const IMAGE_REPLY_MARGIN_BYTES: usize = 64 * 1024;
 const MAX_DECODE_IMAGE_DIMENSION: u32 = 16_384;
 const MAX_IMAGE_DECODE_ALLOC: u64 = 128 * 1024 * 1024;
 /// Debug builds get a wider budget: unoptimized image codecs on large test
@@ -275,7 +278,34 @@ fn handle_pdf_media(id: &str, raw_bytes: Vec<u8>) -> Response {
 }
 
 fn image_attachment_response(id: &str, image: ProcessedImage) -> Response {
+    image_attachment_response_with_budget(
+        id,
+        image,
+        crate::subc::result_body::active().then_some(image_base64_budget()),
+    )
+}
+
+fn image_base64_budget() -> usize {
+    (crate::subc::result_body::MAX_RESULT_BYTES - IMAGE_REPLY_MARGIN_BYTES - 1) / 2
+}
+
+fn image_attachment_response_with_budget(
+    id: &str,
+    image: ProcessedImage,
+    budget: Option<usize>,
+) -> Response {
     let byte_size = image.bytes.len();
+    if let Some(budget) = budget {
+        // Both content and structuredContent carry the fitted image. The encoder
+        // has already tried the floor before this final pre-base64 refusal.
+        let wire_size = base64_len(byte_size)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(2)
+            .saturating_add(IMAGE_REPLY_MARGIN_BYTES);
+        if base64_len(byte_size).is_none_or(|bytes| bytes > budget) {
+            return crate::subc::result_body::too_large(id, wire_size, "read a smaller image");
+        }
+    }
     let data = match encode_base64_checked(&image.bytes, |encoded_len| {
         format!(
             "image too large to inline after resize (base64 payload {} bytes > {} bytes)",
@@ -299,6 +329,9 @@ fn image_attachment_response(id: &str, image: ProcessedImage) -> Response {
         "animation": image.animation,
         "orientation_applied": image.orientation_applied,
     });
+    if budget.is_some() {
+        attachment["encoding"] = serde_json::json!(image.mime.trim_start_matches("image/"));
+    }
     if let Some(source_mime) = image.source_mime {
         attachment
             .as_object_mut()
@@ -345,6 +378,21 @@ fn process_image_with_timeout(
     raw_bytes: Vec<u8>,
     kind: ImageKind,
 ) -> Result<ProcessedImage, String> {
+    process_image_with_budget_timeout(
+        raw_bytes,
+        kind,
+        crate::subc::result_body::active().then_some(image_base64_budget()),
+        Instant::now() + IMAGE_PROCESS_TIMEOUT,
+    )
+}
+
+#[allow(deprecated)] // Keep decoder admission compatible with the minimum supported Rust version.
+fn process_image_with_budget_timeout(
+    raw_bytes: Vec<u8>,
+    kind: ImageKind,
+    budget: Option<usize>,
+    deadline: Instant,
+) -> Result<ProcessedImage, String> {
     #[cfg(test)]
     IMAGE_PROCESSING_DELAY.with(|delay| std::thread::sleep(delay.get()));
     ACTIVE_IMAGE_DECODERS.fetch_update(
@@ -361,13 +409,22 @@ fn process_image_with_timeout(
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
             let _permit = permit;
-            let _ = tx.send(process_image(raw_bytes, kind));
+            let result = match budget {
+                Some(budget) => process_image_fitting(raw_bytes, kind, budget, deadline),
+                None => process_image(raw_bytes, kind),
+            };
+            let _ = tx.send(result);
         });
     if let Err(error) = spawned {
         return Err(format!("failed to start image processing: {error}"));
     }
 
-    match rx.recv_timeout(IMAGE_PROCESS_TIMEOUT) {
+    let timeout = if budget.is_some() {
+        deadline.saturating_duration_since(Instant::now())
+    } else {
+        IMAGE_PROCESS_TIMEOUT
+    };
+    match rx.recv_timeout(timeout) {
         Ok(result) => result,
         Err(crossbeam_channel::RecvTimeoutError::Timeout) => Err(format!(
             "image processing timed out after {} seconds",
@@ -377,6 +434,166 @@ fn process_image_with_timeout(
             Err("image processing worker stopped before returning a result".to_string())
         }
     }
+}
+
+fn image_is_opaque(image: &DynamicImage) -> bool {
+    match image {
+        DynamicImage::ImageLumaA8(image) => image.pixels().all(|pixel| pixel.0[1] == u8::MAX),
+        DynamicImage::ImageRgba8(image) => image.pixels().all(|pixel| pixel.0[3] == u8::MAX),
+        DynamicImage::ImageLumaA16(image) => image.pixels().all(|pixel| pixel.0[1] == u16::MAX),
+        DynamicImage::ImageRgba16(image) => image.pixels().all(|pixel| pixel.0[3] == u16::MAX),
+        DynamicImage::ImageRgba32F(image) => image.pixels().all(|pixel| pixel.0[3] == 1.0),
+        _ => !image.color().has_alpha(),
+    }
+}
+
+fn encode_fitted_image(
+    image: &DynamicImage,
+    kind: ImageKind,
+    allow_lossy: bool,
+) -> Result<(Vec<u8>, &'static str), String> {
+    if kind == ImageKind::Jpeg && allow_lossy {
+        return encode_jpeg(image).map(|bytes| (bytes, ImageKind::Jpeg.mime()));
+    }
+    // PNG retains alpha (including 16-bit alpha); GIF palette conversion and
+    // JPEG's RGB conversion cannot be used for transparent fitted images.
+    let mut output = Cursor::new(Vec::new());
+    image
+        .write_to(&mut output, image::ImageFormat::Png)
+        .map_err(format_image_processing_error)?;
+    Ok((output.into_inner(), ImageKind::Png.mime()))
+}
+
+fn process_image_fitting(
+    raw_bytes: Vec<u8>,
+    kind: ImageKind,
+    budget: usize,
+    deadline: Instant,
+) -> Result<ProcessedImage, String> {
+    if Instant::now() >= deadline {
+        return Err("image processing timed out while fitting reply".into());
+    }
+    let mut reader =
+        image::ImageReader::with_format(Cursor::new(raw_bytes.as_slice()), kind.format());
+    reader.limits(image_decode_limits());
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(format_image_processing_error)?;
+    let orientation = decoder
+        .orientation()
+        .map_err(format_image_processing_error)?;
+    let mut decoded = DynamicImage::from_decoder(decoder).map_err(format_image_processing_error)?;
+    if Instant::now() >= deadline {
+        return Err("image processing timed out while fitting reply".into());
+    }
+    let (width, height) = decoded.dimensions();
+    let animated = is_animated_image(&raw_bytes, kind);
+    if width.max(height) <= MAX_INLINE_IMAGE_DIMENSION
+        && base64_len(raw_bytes.len()).is_some_and(|bytes| bytes <= budget)
+    {
+        return Ok(ProcessedImage {
+            bytes: raw_bytes,
+            mime: kind.mime(),
+            width,
+            height,
+            resized: false,
+            source_mime: None,
+            animation: if animated { "preserved" } else { "none" },
+            orientation_applied: false,
+        });
+    }
+    let allow_lossy = image_is_opaque(&decoded) && !animated;
+    let orientation_applied = orientation != Orientation::NoTransforms;
+    if orientation_applied {
+        decoded.apply_orientation(orientation);
+    }
+    let (width, height) = decoded.dimensions();
+    let (target_width, target_height) = resized_dimensions(width, height);
+    let mut current = if width.max(height) > MAX_INLINE_IMAGE_DIMENSION {
+        decoded.resize_exact(target_width, target_height, FilterType::Lanczos3)
+    } else {
+        decoded
+    };
+    let mut result = if width.max(height) > MAX_INLINE_IMAGE_DIMENSION {
+        let (bytes, mime) = encode_fitted_image(&current, kind, allow_lossy)?;
+        ProcessedImage {
+            bytes,
+            mime,
+            width: target_width,
+            height: target_height,
+            resized: true,
+            source_mime: Some(kind.mime()),
+            animation: if animated { "first_frame" } else { "none" },
+            orientation_applied,
+        }
+    } else {
+        ProcessedImage {
+            bytes: raw_bytes,
+            mime: kind.mime(),
+            width,
+            height,
+            resized: false,
+            source_mime: None,
+            animation: if animated { "preserved" } else { "none" },
+            orientation_applied: false,
+        }
+    };
+    for _ in 0..MAX_IMAGE_FIT_STEPS {
+        if Instant::now() >= deadline {
+            return Err("image processing timed out while fitting reply".into());
+        }
+        if base64_len(result.bytes.len()).is_some_and(|bytes| bytes <= budget) {
+            return Ok(result);
+        }
+        let long_side = current.width().max(current.height());
+        let at_floor = long_side <= MIN_FITTED_IMAGE_DIMENSION;
+        if at_floor && result.resized {
+            break;
+        }
+        let next = if at_floor {
+            long_side
+        } else {
+            (long_side * 3 / 4).max(MIN_FITTED_IMAGE_DIMENSION)
+        };
+        let width =
+            ((u64::from(current.width()) * u64::from(next)) / u64::from(long_side)).max(1) as u32;
+        let height =
+            ((u64::from(current.height()) * u64::from(next)) / u64::from(long_side)).max(1) as u32;
+        if !at_floor {
+            current = current.resize_exact(width, height, FilterType::Lanczos3);
+        }
+        if Instant::now() >= deadline {
+            return Err("image processing timed out while fitting reply".into());
+        }
+        let (mut bytes, mut mime) = encode_fitted_image(&current, kind, allow_lossy)?;
+        if mime != ImageKind::Jpeg.mime()
+            && base64_len(bytes.len()).is_none_or(|bytes| bytes > budget)
+            && allow_lossy
+        {
+            if Instant::now() >= deadline {
+                return Err("image processing timed out while fitting reply".into());
+            }
+            let jpeg = encode_jpeg(&current)?;
+            if jpeg.len() < bytes.len() {
+                bytes = jpeg;
+                mime = ImageKind::Jpeg.mime();
+            }
+        }
+        result = ProcessedImage {
+            bytes,
+            mime,
+            width,
+            height,
+            resized: true,
+            source_mime: Some(kind.mime()),
+            animation: if animated { "first_frame" } else { "none" },
+            orientation_applied,
+        };
+        if at_floor {
+            break;
+        }
+    }
+    Ok(result)
 }
 
 fn image_decode_limits() -> image::Limits {
@@ -935,7 +1152,7 @@ fn github_read_deadline() -> std::time::Instant {
 
 fn github_read_response(
     req: &RawRequest,
-    completion: GithubReadCompletion,
+    mut completion: GithubReadCompletion,
     start_line: usize,
 ) -> Response {
     let (start_line, lines_read, actual_end, truncated) = if let Some(page) = &completion.diff_page
@@ -956,23 +1173,30 @@ fn github_read_response(
             lines_read > 0 && (start_line > 1 || actual_end < completion.total_lines),
         )
     };
-    let attachments = completion
-        .attachments
-        .into_iter()
-        .map(|attachment| {
-            let bytes = attachment.bytes.len();
-            let data = BASE64.encode(&attachment.bytes);
-            let base64_bytes = data.len();
-            serde_json::json!({
-                "kind": "image",
-                "mime": attachment.mime,
-                "data": data,
-                "bytes": bytes,
-                "base64_bytes": base64_bytes,
-                "source_url": attachment.source_url,
+    let attachments = if crate::subc::result_body::active() {
+        match fit_github_images(req, &mut completion) {
+            Ok(attachments) => attachments,
+            Err(response) => return response,
+        }
+    } else {
+        completion
+            .attachments
+            .into_iter()
+            .map(|attachment| {
+                let bytes = attachment.bytes.len();
+                let data = BASE64.encode(&attachment.bytes);
+                let base64_bytes = data.len();
+                serde_json::json!({
+                    "kind": "image",
+                    "mime": attachment.mime,
+                    "data": data,
+                    "bytes": bytes,
+                    "base64_bytes": base64_bytes,
+                    "source_url": attachment.source_url,
+                })
             })
-        })
-        .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+    };
     let mut data = serde_json::json!({
         "content": completion.content,
         "attachments": attachments,
@@ -990,6 +1214,106 @@ fn github_read_response(
         );
     }
     Response::success(&req.id, data)
+}
+
+fn fit_github_images(
+    req: &RawRequest,
+    completion: &mut GithubReadCompletion,
+) -> Result<Vec<Value>, Response> {
+    let images = std::mem::take(&mut completion.attachments);
+    let links = images
+        .iter()
+        .map(|image| image.source_url.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Reserve the complete omission note before choosing any image. Replies with
+    // structuredContent serialize text three times and images twice; reserving
+    // that worst case also fits connections that receive content only.
+    let reserved_text = format!(
+        "{}\n\n{} more images not attached: {links}",
+        completion.content,
+        images.len()
+    );
+    let text_bytes = serde_json::to_vec(&reserved_text)
+        .expect("read text is JSON")
+        .len()
+        .saturating_mul(3);
+    if text_bytes.saturating_add(IMAGE_REPLY_MARGIN_BYTES)
+        >= crate::subc::result_body::MAX_RESULT_BYTES
+    {
+        return Err(crate::subc::result_body::too_large(
+            &req.id,
+            text_bytes.saturating_add(IMAGE_REPLY_MARGIN_BYTES),
+            "read a page with fewer or smaller images",
+        ));
+    }
+    let mut remaining = crate::subc::result_body::MAX_RESULT_BYTES
+        .saturating_sub(IMAGE_REPLY_MARGIN_BYTES)
+        .saturating_sub(text_bytes)
+        .saturating_sub(1)
+        / 2;
+    // All images share one processing window, without consuming the time already
+    // reserved to return a network-backed read to its caller.
+    let now = Instant::now();
+    let deadline = crate::bounded_io::current().map_or(now + IMAGE_PROCESS_TIMEOUT, |budget| {
+        budget
+            .deadline
+            .checked_sub(GITHUB_READ_RETURN_MARGIN)
+            .unwrap_or(now)
+            .max(now)
+            .min(now + IMAGE_PROCESS_TIMEOUT)
+    });
+    let mut attached = Vec::new();
+    let mut omitted = Vec::new();
+    let mut stopped = false;
+    for image in images {
+        if !stopped && remaining > 0 && Instant::now() < deadline {
+            if let Some(SniffedMedia::Image(kind)) = sniff_media(&image.bytes) {
+                if let Ok(processed) =
+                    process_image_with_budget_timeout(image.bytes, kind, Some(remaining), deadline)
+                {
+                    let encoded = base64_len(processed.bytes.len()).unwrap_or(usize::MAX);
+                    if encoded <= remaining {
+                        let mut response = image_attachment_response_with_budget(
+                            &req.id,
+                            processed,
+                            Some(remaining),
+                        );
+                        if let Some(mut attachment) = response
+                            .data
+                            .get_mut("attachments")
+                            .and_then(Value::as_array_mut)
+                            .and_then(Vec::pop)
+                        {
+                            attachment["source_url"] = serde_json::json!(image.source_url);
+                            attachment["alt"] = serde_json::json!(image.source_url);
+                            remaining -= encoded;
+                            attached.push(attachment);
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        // Attach a prefix only. A failure or exhausted budget never makes a later
+        // image jump ahead of an earlier one; every omitted source remains visible.
+        stopped = true;
+        omitted.push(image.source_url);
+    }
+    if !omitted.is_empty() {
+        let more = if attached.is_empty() { "" } else { "more " };
+        let noun = if omitted.len() == 1 {
+            "image"
+        } else {
+            "images"
+        };
+        completion.content.push_str(&format!(
+            "\n\n{} {more}{noun} not attached: {}",
+            omitted.len(),
+            omitted.join(", ")
+        ));
+    }
+    Ok(attached)
 }
 
 fn handle_github_read(req: &RawRequest, ctx: &AppContext, file: &str) -> Response {
@@ -1167,7 +1491,28 @@ pub fn build_read_outcome(req: RawRequest, ctx: &AppContext) -> DispatchOutcome 
 /// Returns for binary files:
 ///   `{ binary: true, byte_size }`
 pub fn handle_read(req: &RawRequest, ctx: &AppContext) -> Response {
-    crate::bounded_io::command(req, ctx, handle_read_inner)
+    let mut response = crate::bounded_io::command(req, ctx, handle_read_inner);
+    if crate::subc::result_body::active() {
+        if let Some(attachments) = response
+            .data
+            .get_mut("attachments")
+            .and_then(Value::as_array_mut)
+        {
+            for attachment in attachments
+                .iter_mut()
+                .filter(|part| part["kind"] == "image")
+            {
+                if !attachment["alt"].is_string() {
+                    attachment["alt"] = serde_json::json!(req
+                        .params
+                        .get("file")
+                        .and_then(Value::as_str)
+                        .unwrap_or("read image"));
+                }
+            }
+        }
+    }
+    response
 }
 
 fn handle_read_inner(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -2241,6 +2586,9 @@ fn handle_directory(req: &RawRequest, path: &Path) -> Response {
             Ok(e) => e,
             Err(_) => continue,
         };
+        if crate::watcher_backend::flush::is_marker_path(&entry.path()) {
+            continue;
+        }
 
         let name = entry.file_name().to_string_lossy().to_string();
         if !include_hidden && name.starts_with('.') {
@@ -2329,6 +2677,22 @@ fn handle_directory(req: &RawRequest, path: &Path) -> Response {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bash_flush_markers_are_not_directory_entries() {
+        let root = tempfile::tempdir().unwrap();
+        for name in [".aft-flush-123-1", ".aft-flush-not-private", "visible.rs"] {
+            std::fs::write(root.path().join(name), "").unwrap();
+        }
+        let request = serde_json::from_value(
+            serde_json::json!({"id":"flush-list", "command":"read", "params":{}}),
+        )
+        .unwrap();
+        let result = super::handle_directory(&request, root.path());
+        assert_eq!(
+            result.data["entries"],
+            serde_json::json!([".aft-flush-not-private", "visible.rs"])
+        );
+    }
     use super::*;
     use std::path::{Path, PathBuf};
 
@@ -2377,6 +2741,146 @@ mod tests {
         assert_eq!(
             decoded_attachment_bytes(attachment),
             vec![137, 80, 78, 71, 13, 10, 26, 10]
+        );
+    }
+
+    #[test]
+    fn github_image_result_budget_attaches_prefix_and_lists_omitted_links() {
+        let _decoder_guard = image_decoder_test_guard();
+        let request = RawRequest {
+            id: "github-budget".into(),
+            command: "read".into(),
+            lsp_hints: None,
+            session_id: None,
+            params: json!({"file":"issue://7"}),
+        };
+        let mut state = 0x12345678u32;
+        let image = image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_fn(256, 256, |_, _| {
+            let mut channel = || {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u16
+            };
+            image::Rgba([channel(), channel(), channel(), channel()])
+        });
+        let mut encoded = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba16(image)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let images: Vec<_> = (0..8)
+            .map(|index| crate::github_read::GithubImageAttachment {
+                source_url: format!("https://github.com/user-attachments/files/{index}/image.png"),
+                mime: "image/png".into(),
+                bytes: encoded.get_ref().clone(),
+            })
+            .collect();
+        let completion = || GithubReadCompletion {
+            content: "canonical text\n".into(),
+            total_lines: 1,
+            freshness: crate::github_read::GithubReadFreshness::Fetched,
+            attachments: images.clone(),
+            document: None,
+            diff_page: None,
+        };
+        let legacy = github_read_response(&request, completion(), 1);
+        assert!(legacy.success);
+        assert_eq!(legacy.data["attachments"].as_array().unwrap().len(), 8);
+        assert_eq!(legacy.data["content"], "canonical text\n");
+        let _budget = crate::subc::result_body::enter(true);
+        let bounded = github_read_response(&request, completion(), 1);
+        assert!(bounded.success, "{:?}", bounded.data);
+        let attached = bounded.data["attachments"].as_array().unwrap();
+        assert_eq!(attached.len(), 2);
+        for (index, attachment) in attached.iter().enumerate() {
+            assert_eq!(attachment["source_url"], images[index].source_url);
+            assert_eq!(attachment["width"], 256);
+            assert_eq!(attachment["height"], 256);
+            assert_eq!(attachment["encoding"], "png");
+            assert_eq!(
+                decoded_attachment_bytes(attachment.as_object().unwrap()),
+                images[index].bytes
+            );
+        }
+        let expected_links = images[2..]
+            .iter()
+            .map(|image| image.source_url.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(
+            bounded.data["content"],
+            format!("canonical text\n\n\n6 more images not attached: {expected_links}")
+        );
+        assert_eq!(
+            bounded.data["complete"], true,
+            "image omission does not truncate page text"
+        );
+        let image_bytes: usize = attached
+            .iter()
+            .map(|image| image["data"].as_str().unwrap().len())
+            .sum();
+        assert!(image_bytes * 2 + 64 * 1024 < crate::subc::result_body::MAX_RESULT_BYTES);
+    }
+
+    #[test]
+    fn github_image_budget_refuses_when_page_text_itself_cannot_fit() {
+        let request = RawRequest {
+            id: "github-text-budget".into(),
+            command: "read".into(),
+            lsp_hints: None,
+            session_id: None,
+            params: json!({"file":"issue://7"}),
+        };
+        let completion = || GithubReadCompletion {
+            content: "x".repeat(1024 * 1024),
+            total_lines: 1,
+            freshness: crate::github_read::GithubReadFreshness::Fetched,
+            attachments: Vec::new(),
+            document: None,
+            diff_page: None,
+        };
+        assert!(github_read_response(&request, completion(), 1).success);
+        let _budget = crate::subc::result_body::enter(true);
+        let response = github_read_response(&request, completion(), 1);
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "response_too_large");
+        assert!(response.data["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("; read a page with fewer or smaller images"));
+    }
+
+    #[test]
+    fn github_image_fitting_keeps_the_reserved_return_window() {
+        let request = RawRequest {
+            id: "github-return-window".into(),
+            command: "read".into(),
+            lsp_hints: None,
+            session_id: None,
+            params: json!({"file":"issue://7"}),
+        };
+        let completion = GithubReadCompletion {
+            content: "page".into(),
+            total_lines: 1,
+            freshness: crate::github_read::GithubReadFreshness::Fetched,
+            attachments: vec![crate::github_read::GithubImageAttachment {
+                source_url: "https://github.com/user-attachments/files/7/image.png".into(),
+                mime: "image/png".into(),
+                bytes: encode_png(&rgba_image(8, 8, false)).unwrap(),
+            }],
+            document: None,
+            diff_page: None,
+        };
+        let _budget = crate::subc::result_body::enter(true);
+        let _io = crate::bounded_io::enter(Some(crate::bounded_io::Budget::after(
+            Duration::from_millis(1),
+        )));
+        let response = github_read_response(&request, completion, 1);
+        assert!(response.success);
+        assert!(response.data["attachments"].as_array().unwrap().is_empty());
+        assert_eq!(
+            response.data["content"],
+            "page\n\n1 image not attached: https://github.com/user-attachments/files/7/image.png"
         );
     }
 
@@ -2440,6 +2944,115 @@ mod tests {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn noisy_fit_fixture(transparent: bool) -> Vec<u8> {
+        let mut state = 0x12345678u32;
+        let image = image::RgbaImage::from_fn(1024, 1024, |_, _| {
+            let mut channel = || {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            };
+            image::Rgba([
+                channel(),
+                channel(),
+                channel(),
+                if transparent { channel() % 255 } else { 255 },
+            ])
+        });
+        let mut bytes = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    }
+
+    #[test]
+    fn tool_result_noisy_image_already_at_1024_shrinks_to_fit() {
+        let _decoder_guard = image_decoder_test_guard();
+        let bytes = noisy_fit_fixture(false);
+        assert!(base64_len(bytes.len()).unwrap() > image_base64_budget());
+        let legacy = process_image_with_budget_timeout(
+            bytes.clone(),
+            ImageKind::Png,
+            None,
+            Instant::now() + IMAGE_PROCESS_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(legacy.bytes, bytes);
+        assert_eq!(legacy.width, 1024);
+        assert!(!legacy.resized);
+        let _budget = crate::subc::result_body::enter(true);
+        let image = process_image_with_timeout(bytes, ImageKind::Png).unwrap();
+        assert!(image.width < 1024 && image.width >= MIN_FITTED_IMAGE_DIMENSION);
+        assert_eq!(image.height, image.width);
+        assert!(image.resized);
+        assert_eq!(image.mime, "image/jpeg");
+        assert_eq!(
+            image::guess_format(&image.bytes).unwrap(),
+            image::ImageFormat::Jpeg
+        );
+        assert_eq!(
+            image::load_from_memory(&image.bytes).unwrap().dimensions(),
+            (image.width, image.height)
+        );
+        assert!(base64_len(image.bytes.len()).unwrap() <= image_base64_budget());
+        let response = image_attachment_response("fitted", image);
+        assert!(response.success);
+        assert_eq!(first_attachment(&response.data)["encoding"], "jpeg");
+    }
+
+    #[test]
+    fn tool_result_transparent_image_is_never_lossy_encoded() {
+        let _decoder_guard = image_decoder_test_guard();
+        let image = process_image_with_budget_timeout(
+            noisy_fit_fixture(true),
+            ImageKind::Png,
+            Some(512 * 1024),
+            Instant::now() + IMAGE_PROCESS_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(image.mime, "image/png");
+        assert!(image.resized);
+        assert!(image.width < 1024);
+        let decoded = image::load_from_memory(&image.bytes).unwrap();
+        assert_eq!(decoded.dimensions(), (image.width, image.height));
+        assert!(decoded.color().has_alpha());
+        assert!(decoded.to_rgba8().pixels().any(|pixel| pixel.0[3] < 255));
+        assert!(base64_len(image.bytes.len()).unwrap() <= 512 * 1024);
+        let almost_opaque = DynamicImage::ImageRgba16(image::ImageBuffer::from_pixel(
+            1,
+            1,
+            image::Rgba([0, 0, 0, 65534]),
+        ));
+        assert!(
+            !image_is_opaque(&almost_opaque),
+            "16-bit alpha must not be rounded to opaque"
+        );
+    }
+
+    #[test]
+    fn tool_result_image_floor_that_still_exceeds_budget_refuses() {
+        let _decoder_guard = image_decoder_test_guard();
+        // A private one-byte budget makes the otherwise unreachable floor refusal
+        // testable without changing the provider's real three-MiB contract.
+        let image = process_image_with_budget_timeout(
+            noisy_fit_fixture(true),
+            ImageKind::Png,
+            Some(1),
+            Instant::now() + IMAGE_PROCESS_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(image.width.max(image.height), 256);
+        assert_eq!(image.mime, "image/png");
+        let response = image_attachment_response_with_budget("floor", image, Some(1));
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "response_too_large");
+        let text = response.data["message"].as_str().unwrap();
+        assert!(text.starts_with("reply too large to send ("));
+        assert!(text.ends_with(" MiB, limit 3 MiB); read a smaller image"));
     }
 
     fn decoded_attachment_bytes(attachment: &serde_json::Map<String, Value>) -> Vec<u8> {

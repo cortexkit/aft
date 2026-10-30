@@ -1,0 +1,21 @@
+{
+  "name": "accepted-close-issue",
+  "request": {
+    "operation": "gh.route",
+    "gh_route_schema": 1,
+    "verb": "issue close",
+    "repository": "cortexkit/aft",
+    "number": "42",
+    "manifest_version": 22,
+    "rung_as_of_unix_secs": 1793066213,
+    "metadata": {
+      "agent_id": "alfonso-aft",
+      "pid": 4242
+    },
+    "reason": "not_planned",
+    "comment": "Closing as not planned."
+  },
+  "expect": {
+    "accepted": true
+  }
+}

@@ -1,1 +1,0 @@
-- Fixed AFT's internal file locks staying held while a command was starting, which could make undo-history migration and other maintenance give up and retry later.

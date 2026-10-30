@@ -332,7 +332,7 @@ fn read_draft_log_metadata_and_next_page_are_not_optional_or_inferred() {
     for result in [
         json!({"body":"x","offset":0,"length":1}),
         json!({"body":"x","offset":1,"length":1,"total_bytes":2}),
-        json!({"body":"x","offset":0,"length":2,"total_bytes":2}),
+        json!({"body":"x","offset":0,"length":3,"total_bytes":2}),
     ] {
         assert_eq!(
             executor::decode_reply(&request, &json!({"isError":false,"result":result}))
@@ -631,5 +631,135 @@ fn audit_native_permission_combines_canary_and_daemon_worker_evidence() {
             );
             assert_eq!(permission.is_ok(), !sandboxed && !worker);
         }
+    }
+}
+
+fn log_request(range: Option<(u64, u64)>) -> WireRequest {
+    wire(&ReadRequest::JobLog {
+        job_id: 42,
+        range: range.map(|(offset, length)| ByteRange { offset, length }),
+    })
+}
+
+fn decode_log(request: &WireRequest, result: Value) -> Result<ReadReply, ReadError> {
+    executor::decode_reply(request, &json!({"isError":false,"result":result}))
+}
+
+// Plexus counts offset/length/total_bytes in raw log bytes but returns display
+// text: ANSI codes stripped, so the body is shorter than the raw length.
+#[test]
+fn job_log_reply_with_ansi_stripped_body_shorter_than_raw_length_is_accepted() {
+    let raw = b"\x1b[31merror\x1b[0m\n";
+    let reply = decode_log(
+        &log_request(Some((0, 1_048_576))),
+        json!({"body":"error\n","offset":0,"length":raw.len(),"total_bytes":raw.len()}),
+    )
+    .unwrap();
+    assert_eq!(
+        reply,
+        ReadReply::JobLog(LogReply {
+            body: "error\n".into(),
+            offset: 0,
+            length: 15,
+            total_bytes: 15,
+        })
+    );
+}
+
+// A multibyte character split by the range edge decodes to U+FFFD, which can
+// make the display body longer than the raw length.
+#[test]
+fn job_log_reply_with_split_character_body_longer_than_raw_length_is_accepted() {
+    let ReadReply::JobLog(reply) = executor::decode_reply(
+        &log_request(Some((1, 3))),
+        &vectors()["log_split_character_growth"],
+    )
+    .unwrap() else {
+        panic!("job log request must decode to a job log reply");
+    };
+    assert_eq!(reply.body, "\u{FFFD}x\u{FFFD}");
+    assert!(reply.body.len() as u64 > reply.length);
+    assert_eq!((reply.offset, reply.length, reply.total_bytes), (1, 3, 5));
+}
+
+#[test]
+fn job_log_reply_with_ansi_and_split_characters_is_accepted() {
+    let ReadReply::JobLog(reply) = executor::decode_reply(
+        &log_request(Some((1, 1_048_576))),
+        &vectors()["log_ansi_and_split_character"],
+    )
+    .unwrap() else {
+        panic!("job log request must decode to a job log reply");
+    };
+    assert_eq!(reply.body, "\u{FFFD}ok\n\u{FFFD}");
+    assert!((reply.body.len() as u64) < reply.length);
+    assert_eq!((reply.offset, reply.length, reply.total_bytes), (1, 14, 16));
+}
+
+// Pinned to Plexus's own vector (copied byte for byte; see the fixture
+// directory's README for the source commit and path): 18 raw bytes starting
+// with a colour code and ending inside a three-byte character, whose display
+// body is 10 bytes.
+#[test]
+fn job_log_reply_matches_plexus_display_text_vector() {
+    let request: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/gh_shim/plexus-github-read-bot/job-log-range-display-text.request.json"
+    ))
+    .unwrap();
+    let reply: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/gh_shim/plexus-github-read-bot/job-log-range-display-text.reply.json"
+    ))
+    .unwrap();
+    let request: WireRequest =
+        serde_json::from_value(request["call"]["arguments"].clone()).unwrap();
+    let ReadReply::JobLog(decoded) = executor::decode_reply(&request, &reply).unwrap() else {
+        panic!("job log request must decode to a job log reply");
+    };
+    assert_eq!(decoded.body, "\u{2713} ok\n\u{FFFD}");
+    assert_eq!(decoded.body.len(), 10);
+    assert_eq!(
+        (decoded.offset, decoded.length, decoded.total_bytes),
+        (100, 18, 4000)
+    );
+}
+
+// Every remaining raw-range rule still rejects its own violation. The bodies
+// deliberately differ from `length`, so no case passes or fails on body size.
+#[test]
+fn job_log_reply_raw_range_violations_are_still_rejected() {
+    let cases = [
+        // Offset differs from the requested offset.
+        (
+            Some((0, 1_048_576)),
+            json!({"body":"ab","offset":1,"length":3,"total_bytes":10}),
+        ),
+        // Length exceeds the requested length.
+        (
+            Some((0, 4)),
+            json!({"body":"ab","offset":0,"length":5,"total_bytes":10}),
+        ),
+        // A tail request (no range) still caps length at 1 MiB.
+        (
+            None,
+            json!({"body":"ab","offset":0,"length":1_048_577,"total_bytes":2_000_000}),
+        ),
+        // The range ends past the total.
+        (
+            Some((0, 1_048_576)),
+            json!({"body":"ab","offset":0,"length":11,"total_bytes":10}),
+        ),
+        // offset + length overflows.
+        (
+            None,
+            json!({"body":"ab","offset":u64::MAX,"length":1,"total_bytes":u64::MAX}),
+        ),
+    ];
+    for (range, result) in cases {
+        let error = decode_log(&log_request(range), result.clone()).unwrap_err();
+        assert!(
+            matches!(&error, ReadError::Refused(message) if message.contains("job log byte range does not match its request")),
+            "{result}: {error:?}"
+        );
+        assert_eq!(error.status(), 86, "{result}");
     }
 }

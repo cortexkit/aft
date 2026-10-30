@@ -187,7 +187,7 @@ fn parse_stringified_collection(
     Ok(())
 }
 
-fn normalize_zoom_aliases(map: &mut Map<String, Value>) -> Result<(), TranslateError> {
+pub(crate) fn normalize_zoom_aliases(map: &mut Map<String, Value>) -> Result<(), TranslateError> {
     let mut batch = Vec::new();
     if let Some(mut value) = map.remove("batch") {
         parse_stringified_collection(&mut value, "batch", "an array of {target, symbols}", false)?;
@@ -247,7 +247,10 @@ fn normalize_zoom_aliases(map: &mut Map<String, Value>) -> Result<(), TranslateE
     Ok(())
 }
 
-fn normalize_path_arguments(bare_name: &str, args: Value) -> Result<Value, TranslateError> {
+pub(crate) fn normalize_path_arguments(
+    bare_name: &str,
+    args: Value,
+) -> Result<Value, TranslateError> {
     let mut map = match args {
         Value::Object(map) => map,
         _ => return Err(invalid_request("tool arguments must be an object")),
@@ -1324,10 +1327,14 @@ fn translate_bash_task_tool(bare_name: &str, args: Value) -> Translated {
     let mut map = agent_args_map(args);
     rename(&mut map, "taskId", "task_id");
     rename(&mut map, "outputMode", "output_mode");
+    rename(&mut map, "outputOffset", "output_offset");
+    rename(&mut map, "stderrOffset", "stderr_offset");
     rename(&mut map, "timeoutMs", "timeout_ms");
     if let Some(Value::Object(params)) = map.get_mut("params") {
         rename(params, "taskId", "task_id");
         rename(params, "outputMode", "output_mode");
+        rename(params, "outputOffset", "output_offset");
+        rename(params, "stderrOffset", "stderr_offset");
         rename(params, "timeoutMs", "timeout_ms");
     }
     Translated {
@@ -1497,6 +1504,32 @@ fn translate_bash(args: Value, project_root: &Path) -> Result<Translated, Transl
         };
         if !demand.trim().is_empty() {
             out.insert("runon".to_string(), Value::String(demand.to_string()));
+        }
+    }
+    // `return_paths` is forwarded as written; the bash handler checks each
+    // path and refuses it without `runon`. Like a blank `runon`, an empty or
+    // null list asks for nothing.
+    if let Some(paths) = map_in.get("return_paths").filter(|value| !value.is_null()) {
+        let paths = match paths {
+            // Some models send a list as its JSON text.
+            Value::String(text) => serde_json::from_str::<Value>(text)
+                .ok()
+                .filter(Value::is_array)
+                .ok_or_else(|| {
+                    invalid_request("bash: 'return_paths' must be an array of strings")
+                })?,
+            other => other.clone(),
+        };
+        let valid = paths
+            .as_array()
+            .is_some_and(|items| items.iter().all(Value::is_string));
+        if !valid {
+            return Err(invalid_request(
+                "bash: 'return_paths' must be an array of strings",
+            ));
+        }
+        if paths.as_array().is_some_and(|items| !items.is_empty()) {
+            out.insert("return_paths".to_string(), paths);
         }
     }
 
@@ -2597,6 +2630,14 @@ fn translate_outline(args: Value, project_root: &Path) -> Result<Translated, Tra
                 let entry = value.as_str().ok_or_else(|| {
                     invalid_request(format!("outline: target[{index}] must be a string"))
                 })?;
+                if is_http_url(entry) {
+                    if files_flag {
+                        return Err(invalid_request(
+                            "files mode requires directory targets; URLs aren't directories",
+                        ));
+                    }
+                    return Ok(Value::String(entry.to_string()));
+                }
                 let path = resolve_path_from_project_root(project_root, entry);
                 Ok(Value::String(path.to_string_lossy().into_owned()))
             })
@@ -2617,6 +2658,11 @@ fn translate_outline(args: Value, project_root: &Path) -> Result<Translated, Tra
     }
 
     if let Some(url) = target.as_str() {
+        if files_flag && is_http_url(url) {
+            return Err(invalid_request(
+                "files mode requires directory targets; URLs aren't directories",
+            ));
+        }
         if !files_flag && (is_http_url(url) || is_github_resource_target(url)) {
             out.insert("file".to_string(), Value::String(url.to_string()));
             return Ok(Translated {
@@ -4674,6 +4720,49 @@ mod tests {
     }
 
     #[test]
+    fn bash_return_paths_forward_as_written_and_empty_lists_drop() {
+        let root = std::path::Path::new("/tmp/project");
+        let translated = subc_translate_owned(
+            "bash",
+            serde_json::json!({"command": "make", "runon": "linux", "return_paths": ["dist/a.bin"]}),
+            root,
+        )
+        .expect("return_paths must translate");
+        // Relative to the command's workdir, so never resolved to the project.
+        assert_eq!(
+            translated.args.get("return_paths"),
+            Some(&serde_json::json!(["dist/a.bin"]))
+        );
+        let text = subc_translate_owned(
+            "bash",
+            serde_json::json!({"command": "make", "return_paths": "[\"out.json\"]"}),
+            root,
+        )
+        .expect("a list sent as JSON text must translate");
+        assert_eq!(
+            text.args.get("return_paths"),
+            Some(&serde_json::json!(["out.json"]))
+        );
+        for empty in [serde_json::json!([]), serde_json::Value::Null] {
+            let translated = subc_translate_owned(
+                "bash",
+                serde_json::json!({"command": "make", "return_paths": empty}),
+                root,
+            )
+            .unwrap();
+            assert!(!translated.args.contains_key("return_paths"));
+        }
+        for invalid in [serde_json::json!([1]), serde_json::json!("dist/a.bin")] {
+            assert!(subc_translate_owned(
+                "bash",
+                serde_json::json!({"command": "make", "return_paths": invalid}),
+                root,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn blank_bash_runon_is_a_local_command() {
         for blank in ["", "  "] {
             let translated = subc_translate_owned(
@@ -5171,6 +5260,42 @@ mod outline_target_validation_tests {
     use super::*;
 
     #[test]
+    fn outline_target_arrays_preserve_urls_and_resolve_only_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let first = "https://example.com/docs/first.html";
+        let second = "http://example.com/docs/second.html";
+        let translated = subc_translate_owned(
+            "outline",
+            serde_json::json!({"target": [first, "src/lib.rs", second]}),
+            root.path(),
+        )
+        .unwrap();
+        assert_eq!(translated.command, "outline");
+        assert_eq!(
+            translated.args["files"],
+            serde_json::json!([first, root.path().join("src").join("lib.rs"), second])
+        );
+    }
+
+    #[test]
+    fn outline_files_mode_refuses_urls_as_non_directories() {
+        for target in [
+            serde_json::json!("https://example.com/docs"),
+            serde_json::json!(["https://example.com/docs"]),
+            serde_json::json!(["src", "http://example.com/docs"]),
+        ] {
+            let error = subc_translate_owned(
+                "outline",
+                serde_json::json!({"target": target, "files": true}),
+                Path::new("/project"),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "invalid_request");
+            assert!(error.message.contains("URLs aren't directories"));
+        }
+    }
+
+    #[test]
     fn legacy_outline_rejects_every_non_string_target_with_its_index() {
         for files in [false, true] {
             for invalid in [
@@ -5197,3 +5322,6 @@ mod outline_target_validation_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod latency_probe_tests;

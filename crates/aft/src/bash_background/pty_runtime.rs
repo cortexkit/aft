@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 #[allow(dead_code)]
 pub(crate) struct PtyRuntime {
+    pub(crate) bootstrap_release: Option<Box<dyn FnOnce() -> Result<(), String> + Send>>,
     pub(crate) master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     pub(crate) writer: Arc<Mutex<Box<dyn Write + Send>>>,
     pub(crate) killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
@@ -18,6 +19,38 @@ pub(crate) struct PtyRuntime {
     /// with a channel-controlled reader on any host.
     #[cfg(any(windows, test))]
     pub(crate) output_drain: Option<PtyOutputDrain>,
+}
+
+impl PtyRuntime {
+    pub(crate) fn release_bootstrap(&mut self) -> Result<(), String> {
+        self.bootstrap_release
+            .take()
+            .map_or(Ok(()), |release| release())
+    }
+
+    pub(crate) fn abort_bootstrap(&mut self) {
+        self.stop_bootstrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !self.exit_observed.load(std::sync::atomic::Ordering::SeqCst)
+            && std::time::Instant::now() < until
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    pub(crate) fn stop_bootstrap(&mut self) {
+        self.bootstrap_release.take();
+        self.was_killed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.master.take();
+        *self
+            .writer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Box::new(std::io::sink());
+        if !self.exit_observed.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = self.killer.kill();
+        }
+    }
 }
 
 #[cfg(any(windows, test))]

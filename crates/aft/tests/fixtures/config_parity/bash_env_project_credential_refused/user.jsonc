@@ -1,0 +1,7 @@
+{
+  "bash": {
+    "env": {
+      "PARITY_USER_ENV": "user-value"
+    }
+  }
+}

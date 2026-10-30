@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "storage-cleanup-task-bundles-and-retention-trash"
+  ],
+  "note": "Background task bundle deletion restores owner access to read-only directories (and clears the Windows read-only attribute) without following symlinks, and the retention trash reaper reclaims witness-less AFT cache retirements, oversized retirements across passes, and takes one durable census per pass. Only bash_background/persistence.rs, sandbox_spawn task scratch cleanup, storage_retention.rs and a health test change; no changed path matches RANKING_FENCE_PREFIXES."
+}

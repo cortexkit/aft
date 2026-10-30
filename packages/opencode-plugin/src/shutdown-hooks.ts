@@ -20,6 +20,13 @@ import { log } from "./logger.js";
 type Cleanup = (reason: string) => Promise<void> | void;
 type RegisteredCleanup = (reason: string) => Promise<void>;
 
+/** Passive notifications must not hold the host open; the owner can cancel them on disposal. */
+export function schedulePassiveTimer(callback: () => void, delayMs: number): () => void {
+  const timer = setTimeout(callback, delayMs);
+  (timer as { unref?: () => void }).unref?.();
+  return () => clearTimeout(timer);
+}
+
 export interface ShutdownCleanupRegistration {
   /** Run only this registration's cleanup and remove it from the process-exit registry. */
   dispose(reason: string): Promise<void>;
@@ -30,6 +37,7 @@ export interface ShutdownCleanupRegistration {
 interface GlobalState {
   cleanups: Set<RegisteredCleanup>;
   installed: boolean;
+  runningCleanups?: Promise<void> | null;
 }
 
 const GLOBAL_KEY = "__aftShutdownHooks__";
@@ -43,30 +51,32 @@ function getState(): GlobalState {
   return g[GLOBAL_KEY]!;
 }
 
-let runningCleanups = false;
 const cleanupInvocationCounts = new WeakMap<RegisteredCleanup, () => number>();
 
-export async function runCleanups(reason: string): Promise<void> {
-  if (runningCleanups) return;
-  runningCleanups = true;
-  try {
-    const state = getState();
-    if (state.cleanups.size === 0) return;
-    log(`Shutdown triggered by ${reason} — running ${state.cleanups.size} cleanup(s)`);
-    const cleanups = Array.from(state.cleanups);
-    state.cleanups.clear();
-    await Promise.allSettled(
-      cleanups.map(async (fn) => {
-        try {
-          await fn(reason);
-        } catch (err) {
-          log(`Cleanup error: ${(err as Error).message}`);
-        }
-      }),
-    );
-  } finally {
-    runningCleanups = false;
-  }
+export function runCleanups(reason: string): Promise<void> {
+  const state = getState();
+  if (state.runningCleanups) return state.runningCleanups;
+  // Publish the drain before invoking callbacks, including reentrant shutdown callers.
+  state.runningCleanups = Promise.resolve()
+    .then(async () => {
+      if (state.cleanups.size === 0) return;
+      log(`Shutdown triggered by ${reason} — running ${state.cleanups.size} cleanup(s)`);
+      const cleanups = Array.from(state.cleanups);
+      state.cleanups.clear();
+      await Promise.allSettled(
+        cleanups.map(async (fn) => {
+          try {
+            await fn(reason);
+          } catch (err) {
+            log(`Cleanup error: ${(err as Error).message}`);
+          }
+        }),
+      );
+    })
+    .finally(() => {
+      state.runningCleanups = null;
+    });
+  return state.runningCleanups;
 }
 
 /** Conventional exit codes for fatal signals (128 + signal number). */

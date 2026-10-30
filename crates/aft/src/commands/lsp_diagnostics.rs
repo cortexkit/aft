@@ -95,6 +95,12 @@ pub fn handle_lsp_diagnostics(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(message) => return Response::error(&req.id, "invalid_request", message),
     };
 
+    // Watcher changes still queued for the manager lock (an edit made by
+    // another program, say) have not reached the servers. Until they do,
+    // rust-analyzer owes no `cargo check` for them, and its old results
+    // would be read as describing the files as they are now.
+    ctx.lsp_forward_queued_watcher_changes();
+
     match (&params.file, &params.directory) {
         (Some(file), None) => handle_file_mode(req, ctx, file, severity_filter, wait_ms),
         (None, Some(directory)) => {
@@ -151,18 +157,9 @@ fn handle_file_mode(
     }
 
     if outcomes.successful.is_empty() {
-        // Servers matched but none could start. Return an empty result with
+        // Servers matched but none are ready. Return an empty result with
         // detailed per-server status so the user can see why.
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "diagnostics": [],
-                "total": 0,
-                "files_with_errors": 0,
-                "complete": false,
-                "lsp_servers_used": server_status,
-            }),
-        );
+        return Response::success(&req.id, startup_unavailable_response(&canonical, &outcomes));
     }
 
     // Step 2: snapshot before syncing/opening so push fallback freshness is
@@ -271,6 +268,10 @@ fn handle_file_mode(
     let mut complete = true;
     for entry in &server_status {
         match entry.status.as_str() {
+            crate::lsp::manager::START_IN_PROGRESS_STATUS => {
+                complete = false;
+                pending_servers.push(entry.server_id.clone());
+            }
             "pull_ok" | "pull_unchanged" => {}
             "push_only" | "pull_rejected_push_fallback" | "pull_no_cache_for_unchanged" => {
                 let fresh = outcomes.successful.iter().any(|key| {
@@ -297,11 +298,19 @@ fn handle_file_mode(
     // diagnostics stay stored.
     ctx.lsp()
         .close_documents_opened_for_pulls(&canonical, &pull_results);
+    let unchecked_files = if server_status
+        .iter()
+        .any(|entry| entry.status == crate::lsp::manager::START_IN_PROGRESS_STATUS)
+    {
+        vec![canonical.display().to_string()]
+    } else {
+        Vec::new()
+    };
     let mut response = build_response(
         &diagnostics,
         server_status,
         complete,
-        Vec::new(),
+        unchecked_files,
         None,
         pending_servers,
     );
@@ -326,6 +335,7 @@ fn handle_directory_mode(
     };
 
     let mut server_status: Vec<ServerStatusEntry> = Vec::new();
+    crate::lsp::manager::wait_for_pending_startups_unlocked(|| ctx.lsp(), Some(&canonical));
     let mut all_complete = true;
 
     // Pull workspace diagnostics from active servers that support it. We
@@ -383,7 +393,27 @@ fn handle_directory_mode(
     // Compute unchecked_files: walk the directory (capped) and list any
     // file that has no entry in the diagnostic cache. We cap at
     // DIRECTORY_FILE_CAP to avoid pathological large-directory walks.
-    let (unchecked_files, walk_truncated) = compute_unchecked_files(ctx, &canonical);
+    let (mut unchecked_files, walk_truncated) = compute_unchecked_files(ctx, &canonical);
+    let pending_starts: Vec<_> = ctx
+        .lsp()
+        .pending_startup_files()
+        .into_iter()
+        .filter(|(key, _)| key.root.starts_with(&canonical) || canonical.starts_with(&key.root))
+        .collect();
+    let mut pending_servers = Vec::new();
+    for (key, file) in pending_starts {
+        all_complete = false;
+        pending_servers.push(key.kind.id_str().to_string());
+        server_status.push(ServerStatusEntry {
+            server_id: key.kind.id_str().to_string(),
+            scope: ServerScope::Workspace,
+            status: crate::lsp::manager::START_IN_PROGRESS_STATUS.into(),
+        });
+        let file = file.display().to_string();
+        if Path::new(&file).starts_with(&canonical) && !unchecked_files.contains(&file) {
+            unchecked_files.push(file);
+        }
+    }
     if walk_truncated || !unchecked_files.is_empty() {
         all_complete = false;
     }
@@ -394,7 +424,7 @@ fn handle_directory_mode(
         all_complete,
         unchecked_files,
         Some(walk_truncated),
-        Vec::new(),
+        pending_servers,
     );
     Response::success(&req.id, response)
 }
@@ -414,7 +444,31 @@ fn handle_global_mode(
             .cloned()
             .collect()
     };
-    let response = build_response(&diagnostics, Vec::new(), true, Vec::new(), None, Vec::new());
+    let pending_starts = ctx.lsp().pending_startup_files();
+    let statuses = pending_starts
+        .iter()
+        .map(|(key, _)| ServerStatusEntry {
+            server_id: key.kind.id_str().to_string(),
+            scope: ServerScope::Workspace,
+            status: crate::lsp::manager::START_IN_PROGRESS_STATUS.into(),
+        })
+        .collect();
+    let pending = pending_starts
+        .iter()
+        .map(|(key, _)| key.kind.id_str().to_string())
+        .collect();
+    let unchecked = pending_starts
+        .iter()
+        .map(|(_, file)| file.display().to_string())
+        .collect();
+    let response = build_response(
+        &diagnostics,
+        statuses,
+        pending_starts.is_empty(),
+        unchecked,
+        None,
+        pending,
+    );
     Response::success(&req.id, response)
 }
 
@@ -809,11 +863,36 @@ struct ServerStatusEntry {
     status: String,
 }
 
+pub(crate) fn startup_unavailable_response(
+    file: &Path,
+    outcomes: &EnsureServerOutcomes,
+) -> serde_json::Value {
+    let statuses: Vec<_> = outcomes
+        .attempts
+        .iter()
+        .map(|attempt| ServerStatusEntry::from_attempt(attempt, ServerScope::File))
+        .collect();
+    let pending: Vec<_> = statuses
+        .iter()
+        .filter(|status| status.status == crate::lsp::manager::START_IN_PROGRESS_STATUS)
+        .map(|status| status.server_id.clone())
+        .collect();
+    let unchecked = if pending.is_empty() {
+        Vec::new()
+    } else {
+        vec![file.display().to_string()]
+    };
+    build_response(&[], statuses, false, unchecked, None, pending)
+}
+
 impl ServerStatusEntry {
     fn from_attempt(attempt: &crate::lsp::manager::ServerAttempt, scope: ServerScope) -> Self {
         let status = match &attempt.result {
             ServerAttemptResult::ProjectClosed => {
                 "project closed; reopen the project and retry".into()
+            }
+            ServerAttemptResult::InProgress { .. } => {
+                crate::lsp::manager::START_IN_PROGRESS_STATUS.into()
             }
             ServerAttemptResult::Ok { .. } => "ok".to_string(),
             ServerAttemptResult::NoRootMarker { looked_for } => {

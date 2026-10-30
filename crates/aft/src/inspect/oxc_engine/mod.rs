@@ -49,6 +49,7 @@ pub struct AnalyzeOptions {
 pub struct OxcFactsCache {
     entries_by_hash: BTreeMap<String, FileFacts>,
     entries_by_path: BTreeMap<PathBuf, OxcFactsPathEntry>,
+    references_by_hash: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -90,19 +91,26 @@ impl OxcFactsCache {
         let mtime = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
         let size = metadata.len();
         let path_key = path.to_path_buf();
+        let source = crate::project_content::read_to_string(path)?;
 
         if !force_reparse {
             if let Some(entry) = self.entries_by_path.get(&path_key) {
                 if entry.mtime == mtime && entry.size == size {
                     if let Some(cached) = self.entries_by_hash.get(&entry.cache_key) {
-                        stats.hits += 1;
-                        return Ok(rebind_facts(cached, file_id, path, &cached.content_hash));
+                        // Equal metadata can hide a same-size replacement that
+                        // preserves timestamps. Verify the parsed buffer too.
+                        let content_hash = crate::cache_freshness::hash_bytes(source.as_bytes())
+                            .to_hex()
+                            .to_string();
+                        if cached.content_hash == content_hash {
+                            stats.hits += 1;
+                            return Ok(rebind_facts(cached, file_id, path, &content_hash));
+                        }
                     }
                 }
             }
         }
 
-        let source = crate::project_content::read_to_string(path)?;
         Ok(self.facts_for_source_with_metadata(
             file_id,
             path,
@@ -130,8 +138,9 @@ impl OxcFactsCache {
         let cache_key = format!("v{FACTS_FORMAT_VERSION}:{source_type_key}:{content_hash}");
         if let Some(cached) = self.entries_by_hash.get(&cache_key) {
             stats.hits += 1;
+            let facts = rebind_facts(cached, file_id, path, &content_hash);
             if let Some((mtime, size)) = metadata {
-                self.entries_by_path.insert(
+                self.remember_path(
                     path.to_path_buf(),
                     OxcFactsPathEntry {
                         mtime,
@@ -140,7 +149,7 @@ impl OxcFactsCache {
                     },
                 );
             }
-            return rebind_facts(cached, file_id, path, &content_hash);
+            return facts;
         }
 
         stats.misses += 1;
@@ -148,7 +157,7 @@ impl OxcFactsCache {
         self.entries_by_hash
             .insert(cache_key.clone(), facts.clone());
         if let Some((mtime, size)) = metadata {
-            self.entries_by_path.insert(
+            self.remember_path(
                 path.to_path_buf(),
                 OxcFactsPathEntry {
                     mtime,
@@ -158,6 +167,27 @@ impl OxcFactsCache {
             );
         }
         facts
+    }
+
+    fn remember_path(&mut self, path: PathBuf, entry: OxcFactsPathEntry) {
+        let new_key = entry.cache_key.clone();
+        let previous = self.entries_by_path.insert(path, entry);
+        if previous
+            .as_ref()
+            .is_some_and(|entry| entry.cache_key == new_key)
+        {
+            return;
+        }
+        *self.references_by_hash.entry(new_key).or_default() += 1;
+        if let Some(previous) = previous {
+            if let Some(count) = self.references_by_hash.get_mut(&previous.cache_key) {
+                *count -= 1;
+                if *count == 0 {
+                    self.references_by_hash.remove(&previous.cache_key);
+                    self.entries_by_hash.remove(&previous.cache_key);
+                }
+            }
+        }
     }
 }
 
@@ -416,4 +446,62 @@ fn is_ts_js_file(path: &Path) -> bool {
                 "ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs"
             )
         })
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn audit05_oxc_detects_preserved_metadata_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.ts");
+        fs::write(&path, "export const old = 1;").unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let mut cache = OxcFactsCache::new();
+        let mut stats = OxcFactsCacheStats::default();
+        let before = cache
+            .facts_for_file(FileId(0), &path, false, &mut stats)
+            .unwrap();
+        fs::write(&path, "export const new = 1;").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let after = cache
+            .facts_for_file(FileId(0), &path, false, &mut stats)
+            .unwrap();
+        assert_ne!(before.content_hash, after.content_hash);
+        assert_eq!(stats.misses, 2);
+    }
+
+    #[test]
+    fn audit05_oxc_reclaims_only_unreferenced_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.ts");
+        let b = dir.path().join("b.ts");
+        fs::write(&a, "export const first = 1;").unwrap();
+        fs::write(&b, "export const first = 1;").unwrap();
+        let mut cache = OxcFactsCache::new();
+        let mut stats = OxcFactsCacheStats::default();
+        cache
+            .facts_for_file(FileId(0), &a, true, &mut stats)
+            .unwrap();
+        cache
+            .facts_for_file(FileId(1), &b, true, &mut stats)
+            .unwrap();
+        assert_eq!(cache.len(), 1);
+        fs::write(&a, "export const second = 2;").unwrap();
+        cache
+            .facts_for_file(FileId(0), &a, true, &mut stats)
+            .unwrap();
+        assert_eq!(cache.len(), 2, "b still references the first version");
+        fs::write(&b, "export const second = 2;").unwrap();
+        cache
+            .facts_for_file(FileId(1), &b, true, &mut stats)
+            .unwrap();
+        assert_eq!(cache.len(), 1, "neither path references the first version");
+    }
 }

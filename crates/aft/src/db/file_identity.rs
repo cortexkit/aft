@@ -52,22 +52,22 @@ impl std::fmt::Display for FileIdentity {
 
 /// Read the identity of the file currently at `path`.
 ///
-/// Returns `None` when the path names nothing, and on platforms that do not
-/// expose a stable per-file identity from a path stat. The open-connection half
-/// of this registry still works there; the WAL-index truncation this identity
-/// detects is a POSIX shared-memory behaviour, and Windows uses a different
-/// WAL-index implementation with locks that do conflict within a process.
-#[cfg(unix)]
+/// Unix uses device/inode; Windows uses volume serial number/file index from
+/// a metadata-only handle. Returns `None` when no identity is available.
 pub fn identity_of(path: &Path) -> Option<FileIdentity> {
     #[cfg(test)]
     stat_probe::record(path);
-    let metadata = std::fs::metadata(path).ok()?;
-    metadata_identity(&metadata)
+    native_identity(crate::file_identity::metadata(path).ok()?.1)
 }
 
-#[cfg(not(unix))]
-pub fn identity_of(_path: &Path) -> Option<FileIdentity> {
-    None
+fn native_identity(identity: crate::file_identity::FileIdentity) -> Option<FileIdentity> {
+    match identity {
+        crate::file_identity::FileIdentity::Known { volume, index } => Some(FileIdentity {
+            device: volume,
+            inode: index,
+        }),
+        crate::file_identity::FileIdentity::Unavailable => None,
+    }
 }
 
 fn metadata_identity(metadata: &std::fs::Metadata) -> Option<FileIdentity> {
@@ -105,17 +105,13 @@ impl LiveFileIdentity {
     }
 
     fn of(path: &Path) -> Option<Self> {
-        #[cfg(unix)]
-        {
-            #[cfg(test)]
-            stat_probe::record_followed(path);
-            Self::from_metadata(&std::fs::metadata(path).ok()?)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = path;
-            None
-        }
+        #[cfg(test)]
+        stat_probe::record_followed(path);
+        let (metadata, identity) = crate::file_identity::metadata(path).ok()?;
+        Some(Self {
+            file: native_identity(identity)?,
+            created: metadata.created().ok(),
+        })
     }
 }
 
@@ -202,6 +198,29 @@ struct LiveFiles {
 fn live_files() -> &'static RwLock<LiveFiles> {
     static FILES: OnceLock<RwLock<LiveFiles>> = OnceLock::new();
     FILES.get_or_init(RwLock::default)
+}
+
+/// Identity-admission caches must be revoked when an external database opens or
+/// changes identity. Ignore the publisher's storage, whose transient connections
+/// reopen on every publication; its paths are excluded by name instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AdmissionSnapshot(BTreeMap<PathBuf, HashSet<LiveFileIdentity>>);
+
+pub(crate) fn admission_snapshot(storage: &Path) -> AdmissionSnapshot {
+    #[cfg(unix)]
+    refresh_sidecar_identities();
+    let storage = storage
+        .canonicalize()
+        .unwrap_or_else(|_| storage.to_path_buf());
+    AdmissionSnapshot(
+        open_databases()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|(path, _)| !path.starts_with(&storage))
+            .map(|(path, database)| (path.clone(), database.identities.clone()))
+            .collect(),
+    )
 }
 
 fn database_files(key: &Path) -> [PathBuf; 4] {
@@ -314,9 +333,17 @@ fn write_stderr_line(line: &str) {
 /// keeps this gate while checking whether its file exists and calling the open
 /// helper; reentrancy permits that nested call. Connection lifetimes do not hold
 /// this gate; the registry protects live users.
-pub(crate) fn filesystem_guard() -> parking_lot::ReentrantMutexGuard<'static, ()> {
+fn filesystem_gate() -> &'static parking_lot::ReentrantMutex<()> {
     static GATE: parking_lot::ReentrantMutex<()> = parking_lot::ReentrantMutex::new(());
-    GATE.lock()
+    &GATE
+}
+
+pub(crate) fn filesystem_guard() -> parking_lot::ReentrantMutexGuard<'static, ()> {
+    filesystem_gate().lock()
+}
+
+pub(crate) fn try_filesystem_guard() -> Option<parking_lot::ReentrantMutexGuard<'static, ()>> {
+    filesystem_gate().try_lock()
 }
 
 /// Identity-only accounting for connections that retain SQLite's native WAL policy.
@@ -355,11 +382,41 @@ pub(crate) struct IdentityConnection {
 }
 
 impl IdentityConnection {
+    pub(crate) fn open_census(path: &Path, seam: &'static str) -> rusqlite::Result<Self> {
+        let flags =
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI;
+        let _guard = filesystem_guard();
+        crate::private_storage::prepare_sqlite(path, flags)?;
+        let connection = rusqlite::Connection::open_with_flags(
+            crate::db::lifecycle::census_open_path(path)?,
+            flags,
+        )?;
+        connection.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )?;
+        Ok(Self::new(connection, seam))
+    }
+
     pub(crate) fn open(path: impl AsRef<Path>, seam: &'static str) -> rusqlite::Result<Self> {
         super::lifecycle::production_write_gate(path.as_ref())?;
+        crate::views::donor::refuse_sealed_write(path.as_ref())?;
         let _guard = filesystem_guard();
         crate::private_storage::prepare_sqlite(path.as_ref(), rusqlite::OpenFlags::default())?;
-        Ok(Self::new(rusqlite::Connection::open(path)?, seam))
+        // Long view-store paths (and their `-journal`/`-wal` sidecars) pass
+        // Windows' MAX_PATH; `sqlite_open_path` spells those in `\\?\` form.
+        let sqlite_path = super::lifecycle::sqlite_open_path(path.as_ref());
+        #[cfg(test)]
+        let connection = crate::views::materialization::open_probe_connection(
+            &sqlite_path,
+            rusqlite::OpenFlags::default(),
+        )?;
+        #[cfg(not(test))]
+        let connection = crate::views::write_accounting::open_connection(
+            &sqlite_path,
+            rusqlite::OpenFlags::default(),
+        )?;
+        Ok(Self::new(connection, seam))
     }
 
     pub(crate) fn open_with_flags(
@@ -369,13 +426,25 @@ impl IdentityConnection {
     ) -> rusqlite::Result<Self> {
         if !flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) {
             super::lifecycle::production_write_gate(path.as_ref())?;
+            crate::views::donor::refuse_sealed_write(path.as_ref())?;
         }
         let _guard = filesystem_guard();
         crate::private_storage::prepare_sqlite(path.as_ref(), flags)?;
-        Ok(Self::new(
-            rusqlite::Connection::open_with_flags(path, flags)?,
-            seam,
-        ))
+        // A `file:` URI is SQLite syntax, not a filesystem path, so it is
+        // passed through; plain paths go through `sqlite_open_path`, which
+        // adds the Windows long-path spelling when a path needs it.
+        let sqlite_path = if flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_URI)
+            && path.as_ref().to_string_lossy().starts_with("file:")
+        {
+            std::borrow::Cow::Borrowed(path.as_ref())
+        } else {
+            super::lifecycle::sqlite_open_path(path.as_ref())
+        };
+        #[cfg(test)]
+        let connection = crate::views::materialization::open_probe_connection(&sqlite_path, flags)?;
+        #[cfg(not(test))]
+        let connection = crate::views::write_accounting::open_connection(&sqlite_path, flags)?;
+        Ok(Self::new(connection, seam))
     }
 
     pub(crate) fn new(connection: rusqlite::Connection, seam: &'static str) -> Self {
@@ -548,56 +617,82 @@ pub(crate) fn is_live_sqlite_file(path: &Path) -> bool {
     if is_registered_file_path(path) {
         return true;
     }
-    let metadata = candidate_metadata(path).ok();
-    is_live_sqlite_file_with_metadata(path, metadata.as_ref())
+    #[cfg(test)]
+    stat_probe::record(path);
+    let Ok((metadata, identity, links)) = crate::file_identity::metadata_with_link_count(path)
+    else {
+        return false;
+    };
+    let Some(file) = native_identity(identity) else {
+        return false;
+    };
+    is_live_identity(
+        LiveFileIdentity {
+            file,
+            created: metadata.created().ok(),
+        },
+        links,
+    )
+}
+
+fn is_live_identity(identity: LiveFileIdentity, links: u64) -> bool {
+    let known = || {
+        live_files()
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .identities
+            .contains_key(&identity)
+    };
+    if known() {
+        return true;
+    }
+    if links < 2 {
+        return false;
+    }
+    refresh_sidecar_identities();
+    known()
 }
 
 pub(crate) fn is_live_sqlite_file_with_metadata(
     path: &Path,
     metadata: Option<&std::fs::Metadata>,
 ) -> bool {
-    // A symlink's own inode and link count say nothing about SQLite's target.
-    // Resolve only this uncommon case; ordinary source reads need one stat.
-    if metadata.is_some_and(|metadata| metadata.file_type().is_symlink()) {
-        let key = registry_key(path);
-        if is_registered_file_path(&key) {
-            return true;
+    #[cfg(windows)]
+    {
+        // On Windows, std::fs::Metadata omits the file index; crate::file_identity
+        // reads it from a handle opened without data access.
+        let _ = metadata;
+        return is_live_sqlite_file(path);
+    }
+    #[cfg(not(windows))]
+    {
+        // A symlink's own inode and link count say nothing about SQLite's target.
+        // Resolve only this uncommon case; ordinary source reads need one stat.
+        if metadata.is_some_and(|metadata| metadata.file_type().is_symlink()) {
+            let key = registry_key(path);
+            if is_registered_file_path(&key) {
+                return true;
+            }
+            let target = std::fs::metadata(path).ok();
+            return is_live_sqlite_file_with_metadata(&key, target.as_ref());
         }
-        let target = std::fs::metadata(path).ok();
-        return is_live_sqlite_file_with_metadata(&key, target.as_ref());
-    }
-    let Some(metadata) = metadata else {
-        return false;
-    };
-    let Some(identity) = LiveFileIdentity::from_metadata(metadata) else {
-        return false;
-    };
-    if live_files()
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .identities
-        .contains_key(&identity)
-    {
-        return true;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        // A new sidecar with an innocent alias must have at least two links.
-        // Names protect the original, and cached identities also protect renames.
-        if metadata.nlink() < 2 {
+        let Some(metadata) = metadata else {
             return false;
-        }
-        refresh_sidecar_identities();
+        };
+        let Some(identity) = LiveFileIdentity::from_metadata(metadata) else {
+            return false;
+        };
+        #[cfg(unix)]
+        let links = {
+            use std::os::unix::fs::MetadataExt;
+            metadata.nlink()
+        };
+        #[cfg(not(unix))]
+        let links = 1;
+        is_live_identity(identity, links)
     }
-    live_files()
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .identities
-        .contains_key(&identity)
 }
 
-#[cfg(unix)]
 fn refresh_sidecar_identities() {
     let paths = open_databases()
         .lock()
@@ -632,8 +727,8 @@ fn refresh_sidecar_identities() {
 /// that made it look innocent may already be gone. Birth time keeps a
 /// recycled inode of an unlinked sidecar from refusing an unrelated file.
 ///
-/// Always false where the registry records no file identities (Windows),
-/// whose SQLite locks are not released by closing another handle.
+/// On Windows, std::fs::Metadata omits the file index. Use is_live_sqlite_file
+/// there to obtain the identity through a metadata-only handle.
 pub(crate) fn is_live_sqlite_handle(metadata: &std::fs::Metadata) -> bool {
     let Some(identity) = LiveFileIdentity::from_metadata(metadata) else {
         return false;
@@ -664,26 +759,6 @@ pub(crate) fn has_open_connections_under(path: &Path) -> bool {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
         .any(|(path, database)| path.starts_with(&key) && !database.openers.is_empty())
-}
-
-/// Describe every registered connection to a database under `path`, naming
-/// the database, the opener's store label and the thread that opened it.
-/// Tests use it to show what still holds files they are about to delete.
-#[cfg(test)]
-pub(crate) fn open_connections_under_for_test(path: &Path) -> Vec<String> {
-    let key = registry_key(path);
-    open_databases()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .filter(|(path, _)| path.starts_with(&key))
-        .flat_map(|(path, database)| {
-            database
-                .openers
-                .iter()
-                .map(move |opener| format!("{} held by {}", path.display(), opener.describe()))
-        })
-        .collect()
 }
 
 /// Report `action` if it is about to delete, rename, or replace the database
@@ -748,7 +823,6 @@ pub(crate) mod stat_probe {
         static CANDIDATES_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
-    #[cfg(unix)]
     pub(crate) fn record_followed(path: &Path) {
         if !CANDIDATES_ONLY.with(|only| only.get()) {
             record(path);
@@ -920,6 +994,40 @@ mod tests {
         );
         drop(connection);
         assert_eq!(open_connections(&path), 0);
+    }
+
+    #[test]
+    fn census_connection_tracks_identity_without_creating_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("census.sqlite");
+        {
+            let connection = IdentityConnection::open(&path, "census fixture").unwrap();
+            connection
+                .pragma_update(None, "journal_mode", "WAL")
+                .unwrap();
+            connection
+                .execute_batch("CREATE TABLE value (n INTEGER); INSERT INTO value VALUES (7);")
+                .unwrap();
+        }
+        assert_eq!(open_connections(&path), 0);
+        let before = std::fs::read(&path).unwrap();
+        let connection = IdentityConnection::open_census(&path, "census test").unwrap();
+        assert_eq!(
+            open_connections(&path),
+            1,
+            "URI opens must retain the real file identity"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT n FROM value", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            7
+        );
+        assert!(!PathBuf::from(format!("{}-wal", path.display())).exists());
+        assert!(!PathBuf::from(format!("{}-shm", path.display())).exists());
+        drop(connection);
+        assert_eq!(open_connections(&path), 0);
+        assert_eq!(std::fs::read(path).unwrap(), before);
     }
 
     #[cfg(unix)]

@@ -1,6 +1,6 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 
 // Spy on sessionLog/sessionWarn so we can assert on the structured trace
 // events emitted by the wake path (event names and
@@ -45,11 +45,15 @@ import {
   __setBusyWakeDeferCeilingForTests,
   __setWakeConfirmationWindowForTests,
   appendInTurnBgCompletions,
+  appendPendingWakeRecovery,
+  cancelPendingWakesForContext,
+  clearSessionBgState,
   consumeBgCompletion,
   formatPatternMatchReminder,
   formatSystemReminder,
   handleIdleBgCompletions,
   handlePushedBgCompletion,
+  handlePushedBgLongRunning,
   handlePushedPatternMatch,
   handleSubcBgEventsNudge,
   ingestBgCompletions,
@@ -57,6 +61,7 @@ import {
   markExplicitControl,
   markTaskWaiting,
   observeOpenCodeBgNotificationEvent,
+  type PatternMatchEntry,
   SESSION_BG_STATE_IDLE_TTL_MS,
   sessionBgStates,
   trackBgTask,
@@ -110,6 +115,36 @@ function findTraceEvent(eventName: string): Record<string, unknown> | undefined 
 }
 
 describe("OpenCode background notifications", () => {
+  test("failed memory-cap completion shows its reason without a capture warning", () => {
+    const reason = "Command stopped: exceeded the 64 MiB memory cap (test enforcement).";
+    expect(
+      formatSystemReminder([
+        {
+          task_id: "bash-memory",
+          command: "allocate",
+          status: "failed",
+          exit_code: 137,
+          status_reason: reason,
+        },
+      ]),
+    ).toContain(reason);
+  });
+  test("completion notice shows AFT's incomplete-listing sentence exactly", () => {
+    const sentence =
+      "AFT could not read every process in the task's group, so others may also be running.";
+    const text = formatSystemReminder([
+      {
+        task_id: "bash-hidden",
+        command: "deploy",
+        status: "timed_out",
+        exit_code: 124,
+        live_descendants: null,
+        live_descendants_unavailable: "listing_incomplete",
+        live_descendants_summary: sentence,
+      },
+    ]);
+    expect(text.split("\n")).toContain(`    ${sentence}`);
+  });
   test("PTY incomplete capture completion reminder preserves exit code and shows warning", () => {
     const reason = "PTY output may be incomplete: output drain deadline expired before EOF";
     for (const exitCode of [0, 17]) {
@@ -809,7 +844,7 @@ describe("OpenCode background notifications", () => {
     );
   });
 
-  test("promptAsync failure does not create an admission confirmation refire", async () => {
+  test("promptAsync pre-admission rejection does not create a confirmation refire", async () => {
     observeOpenCodeBgNotificationEvent({
       type: "session.status",
       properties: { sessionID: "s1", status: { type: "idle" } },
@@ -817,7 +852,7 @@ describe("OpenCode background notifications", () => {
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
     const promptAsync = mock(async () => {
-      throw new Error("send failed");
+      return preAdmissionRejection("send failed");
     });
 
     await handleIdleBgCompletions({
@@ -1242,11 +1277,11 @@ describe("OpenCode background notifications", () => {
     expect(text).toContain("- task task-1 (exit 0)");
   });
 
-  test("failed wake keeps pending completions and retries", async () => {
+  test("rejected wake keeps pending completions and retries", async () => {
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
     const promptAsync = mock(async () => {
-      throw new Error("send failed");
+      return preAdmissionRejection("send failed");
     });
     const fallbackClient = makeClient(promptAsync);
     await handleIdleBgCompletions({
@@ -1272,11 +1307,11 @@ describe("OpenCode background notifications", () => {
     expect(sessionBgStates.get("s1")?.debounceTimer).not.toBeNull();
   });
 
-  test("failed wake hard-stops after capped retries", async () => {
+  test("rejected wake hard-stops after capped retries", async () => {
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
     const promptAsync = mock(async () => {
-      throw new Error("send failed");
+      return preAdmissionRejection("send failed");
     });
     const fallbackClient = makeClient(promptAsync);
     await handleIdleBgCompletions({
@@ -1501,6 +1536,8 @@ describe("OpenCode background notifications", () => {
       trackBgTask("stale", "task-1");
       ingestBgCompletions("stale", [completion("task-1", "done")]);
       expect(sessionBgStates.get("stale")?.outstandingTaskIds.size).toBe(0);
+      // A finished task still has a queued reminder until delivery consumes it.
+      consumeBgCompletion("stale", "task-1");
 
       now += SESSION_BG_STATE_IDLE_TTL_MS + 1;
       trackBgTask("active", "task-2");
@@ -1509,6 +1546,46 @@ describe("OpenCode background notifications", () => {
       expect(sessionBgStates.has("active")).toBe(true);
     } finally {
       Date.now = originalDateNow;
+    }
+  });
+
+  test("idle eviction retains pending and in-flight notification work", () => {
+    const originalDateNow = Date.now;
+    let now = 1_000;
+    Date.now = () => now;
+    try {
+      const fields = [
+        "pendingCompletions",
+        "pendingLongRunning",
+        "pendingPatternMatches",
+        "deliveringTaskIds",
+        "deliveredAwaitingAckTaskIds",
+        "wakeDeferredTaskIds",
+        "unknownCompletions",
+      ] as const;
+      for (const field of fields) {
+        trackBgTask(field, "task");
+        const state = sessionBgStates.get(field)!;
+        state.outstandingTaskIds.clear();
+        const work = state[field];
+        if (work instanceof Set) work.add("task");
+        else (work as unknown[]).push({ task_id: "task" });
+      }
+      now += SESSION_BG_STATE_IDLE_TTL_MS + 1;
+      trackBgTask("trigger", "task");
+      for (const field of fields) expect(sessionBgStates.has(field)).toBe(true);
+    } finally {
+      Date.now = originalDateNow;
+    }
+  });
+
+  test("state access throttles full idle sweeps within the cleanup interval", () => {
+    const scan = spyOn(sessionBgStates, Symbol.iterator);
+    try {
+      for (let i = 0; i < 100; i++) trackBgTask("same-session", "task");
+      expect(scan.mock.calls.length).toBeLessThanOrEqual(1);
+    } finally {
+      scan.mockRestore();
     }
   });
 
@@ -1671,6 +1748,444 @@ describe("OpenCode background notifications", () => {
 });
 
 describe("subc forced-drain dedup (C-#1 / C-#3)", () => {
+  for (const { includeOtherTask, returnPending, name } of [
+    {
+      includeOtherTask: false,
+      returnPending: false,
+      name: "inline watch consumption cancels its in-flight wake without restoring exit or still-running reminders",
+    },
+    {
+      includeOtherTask: true,
+      returnPending: false,
+      name: "wake disposal restores unconsumed tasks but not inline-consumed reminders from the same batch",
+    },
+    {
+      includeOtherTask: true,
+      returnPending: true,
+      name: "inline watch consumption removes restored reminders without discarding another pending task",
+    },
+  ]) {
+    test(name, async () => {
+      const clock = controlledWakeTimers();
+      __setBgNotificationHopTimeoutForTests(50);
+      const promptAsync = mock(() => new Promise(() => {}));
+      const send = mock(async (command: string) =>
+        command === "bash_drain_completions"
+          ? { success: true, bg_completions: [] }
+          : { success: true, acked_task_ids: ["task-other"] },
+      );
+      const { ctx } = harness(send);
+      const sessionID = "inline-watch";
+      const drainCtx = {
+        ctx,
+        directory: "/project",
+        sessionID,
+        client: makeClient(promptAsync, []),
+      };
+      const tasks = includeOtherTask ? ["task-covered", "task-other"] : ["task-covered"];
+      try {
+        for (const task_id of tasks) {
+          await handlePushedPatternMatch(drainCtx, {
+            task_id,
+            session_id: sessionID,
+            watch_id: `watch-${task_id}`,
+            match_text: "",
+            match_offset: 0,
+            context: "",
+            once: true,
+            reason: "task_exit",
+          });
+          await handlePushedBgLongRunning(drainCtx, {
+            task_id,
+            session_id: sessionID,
+            command: "npm test",
+            elapsed_ms: 60_000,
+          });
+        }
+        await clock.fire(tasks.length * 400);
+        expect(promptAsync).toHaveBeenCalledTimes(1);
+        const request = promptAsync.mock.calls[0][0] as { signal: AbortSignal };
+        const state = sessionBgStates.get(sessionID)!;
+        expect(state.pendingPatternMatches).toHaveLength(0);
+        expect(state.pendingLongRunning).toHaveLength(0);
+
+        if (returnPending) {
+          await clock.fire(50);
+          await clock.fire(120_000);
+          await clock.fire(50);
+          expect(state.pendingPatternMatches.map((item) => item.task_id)).toEqual(tasks);
+          expect(state.pendingLongRunning.map((item) => item.task_id)).toEqual(tasks);
+        }
+
+        consumeBgCompletion(sessionID, "task-covered");
+        await clock.flush();
+        if (includeOtherTask && !returnPending) {
+          // The other task still needs delivery, so inline consumption alone must not cancel it.
+          expect(request.signal.aborted).toBe(false);
+          cancelPendingWakesForContext(ctx);
+          await clock.flush();
+        }
+        expect(request.signal.aborted).toBe(true);
+        expect(state.pendingWakeAdmissions.size).toBe(returnPending ? 1 : 0);
+        const remaining = includeOtherTask ? ["task-other"] : [];
+        expect(state.pendingLongRunning.map((item) => item.task_id)).toEqual(remaining);
+        expect(state.pendingPatternMatches.map((item) => item.task_id)).toEqual(remaining);
+
+        const nextReply = { output: "next tool result" };
+        await appendInTurnBgCompletions(drainCtx, nextReply);
+        expect(state.pendingWakeAdmissions.size).toBe(0);
+        expect(nextReply.output).not.toContain("task-covered");
+        if (includeOtherTask) {
+          expect(nextReply.output).toContain("task-other");
+          expect(nextReply.output).toContain("task task-other exited:");
+          expect(nextReply.output).toContain("[BACKGROUND BASH STILL RUNNING]");
+        } else {
+          expect(nextReply.output).toBe("next tool result");
+        }
+        const laterReply = { output: "later tool result" };
+        await appendInTurnBgCompletions(drainCtx, laterReply);
+        expect(laterReply.output).toBe("later tool result");
+        await handleIdleBgCompletions(drainCtx);
+        await clock.fireIfPresent(200);
+        await clock.fireIfPresent(120_000);
+        expect(promptAsync).toHaveBeenCalledTimes(returnPending ? 2 : 1);
+      } finally {
+        __resetBgNotificationStateForTests();
+        clock.restore();
+      }
+    });
+  }
+
+  test("deleted session cancels ambiguous SDK requests without recovery or acknowledgement", async () => {
+    const clock = controlledWakeTimers();
+    __setBgNotificationHopTimeoutForTests(50);
+    const promptAsync = mock(() => new Promise(() => {}));
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-deleted", "npm test")] }
+        : { success: true },
+    );
+    const { ctx } = harness(send);
+    try {
+      await handleSubcBgEventsNudge({
+        ctx,
+        directory: "/project",
+        sessionID: "deleted",
+        client: makeClient(promptAsync, []),
+      });
+      await clock.fire(200);
+      const request = promptAsync.mock.calls[0][0] as { signal: AbortSignal };
+      clearSessionBgState("deleted");
+      await clock.flush();
+      expect(request.signal.aborted).toBe(true);
+      expect(sessionBgStates.has("deleted")).toBe(false);
+      await clock.fireIfPresent(50);
+      await clock.fireIfPresent(120_000);
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+      expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(0);
+    } finally {
+      __resetBgNotificationStateForTests();
+      clock.restore();
+    }
+  });
+
+  test("ambiguous V1 wake timeout retains one identity and waits for late acceptance before ack", async () => {
+    const clock = controlledWakeTimers();
+    __setBgNotificationHopTimeoutForTests(50);
+    let accept!: (value: unknown) => void;
+    const operation = new Promise((resolve) => {
+      accept = resolve;
+    });
+    const promptAsync = mock(() => operation);
+    const client = makeClient(promptAsync, [
+      { info: { role: "assistant", agent: "build", providerID: "host", modelID: "previous" } },
+    ]);
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-ambiguous", "npm test")] }
+        : { success: true, acked_task_ids: ["task-ambiguous"] },
+    );
+    const { ctx } = harness(send);
+    const drainCtx = { ctx, directory: "/project", sessionID: "ambiguous", client };
+    try {
+      await handleSubcBgEventsNudge(drainCtx);
+      await clock.fire(200);
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+      const original = promptAsync.mock.calls[0][0] as {
+        body: { messageID: string };
+        signal?: AbortSignal;
+      };
+      const deliveryID = findTraceEvent("bash_completion_wake_prompt_async_start")?.delivery_id;
+      await clock.fire(50);
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+      expect(original.signal?.aborted).toBe(true);
+      expect(sessionBgStates.get("ambiguous")?.deliveringTaskIds.has("task-ambiguous")).toBe(true);
+      expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(0);
+
+      await handleSubcBgEventsNudge(drainCtx);
+      observeOpenCodeBgNotificationEvent({
+        type: "session.status",
+        properties: { sessionID: "ambiguous", status: { type: "busy" } },
+      });
+      observeOpenCodeBgNotificationEvent({
+        type: "session.idle",
+        properties: { sessionID: "ambiguous" },
+      });
+      await clock.flush();
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+      expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(0);
+
+      accept({ response: { status: 204 } });
+      await clock.flush();
+      const acks = send.mock.calls.filter((call) => call[0] === "bash_ack_completions");
+      expect(acks).toHaveLength(1);
+      expect(acks[0][1]).toMatchObject({ task_ids: ["task-ambiguous"] });
+      expect(findTraceEvent("bash_completion_ack_ok")?.delivery_id).toBe(deliveryID);
+      observeOpenCodeBgNotificationEvent({
+        type: "session.idle",
+        properties: { sessionID: "ambiguous" },
+      });
+      await clock.fireIfPresent(0);
+      await clock.fireIfPresent(5000);
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+      expect((promptAsync.mock.calls[0][0] as typeof original).body.messageID).toBe(
+        original.body.messageID,
+      );
+    } finally {
+      __resetBgNotificationStateForTests();
+      clock.restore();
+    }
+  });
+
+  test("unprovable V1 wake recovers once after the window and remains available in the next model turn", async () => {
+    const clock = controlledWakeTimers();
+    __setBgNotificationHopTimeoutForTests(50);
+    const promptAsync = mock(() => new Promise(() => {}));
+    const client = makeClient(promptAsync, []);
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-unproven", "npm test")] }
+        : { success: true, acked_task_ids: ["task-unproven"] },
+    );
+    const { ctx } = harness(send);
+    const drainCtx = { ctx, directory: "/project", sessionID: "unproven", client };
+    try {
+      await handleSubcBgEventsNudge(drainCtx);
+      await clock.fire(200);
+      const original = promptAsync.mock.calls[0][0] as { body: unknown };
+      await clock.fire(50);
+      await clock.fire(2000);
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+      expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(0);
+
+      await clock.fire(120_000);
+      expect(promptAsync).toHaveBeenCalledTimes(2);
+      expect((promptAsync.mock.calls[1][0] as { body: unknown }).body).toEqual(original.body);
+      const warnings = sessionWarnSpy.mock.calls.filter(
+        (call) => (call[2] as { event?: string })?.event === "bash_completion_wake_recovery",
+      );
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0][1]).toContain("task-unproven");
+      expect(warnings[0][1]).toContain("duplicate possible");
+      await clock.fire(50);
+      expect(
+        sessionBgStates.get("unproven")?.pendingCompletions.map((item) => item.task_id),
+      ).toEqual(["task-unproven"]);
+      expect(sessionBgStates.get("unproven")?.deliveringTaskIds.size).toBe(0);
+      expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(0);
+
+      for (let activity = 0; activity < 3; activity++) {
+        await handleSubcBgEventsNudge(drainCtx);
+        observeOpenCodeBgNotificationEvent({
+          type: "session.idle",
+          properties: { sessionID: "unproven" },
+        });
+        await clock.flush();
+        await clock.fireIfPresent(200);
+      }
+      await clock.fireIfPresent(120_000);
+      await clock.fireIfPresent(2000);
+      expect(promptAsync).toHaveBeenCalledTimes(2);
+      const nextTurn = { output: "" };
+      await appendPendingWakeRecovery(drainCtx, nextTurn);
+      expect(nextTurn.output).toContain("task-unproven");
+      expect(sessionBgStates.get("unproven")?.pendingCompletions).toHaveLength(0);
+      expect(sessionBgStates.get("unproven")?.pendingWakeAdmissions.size).toBe(0);
+      expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(1);
+      expect(promptAsync).toHaveBeenCalledTimes(2);
+    } finally {
+      __resetBgNotificationStateForTests();
+      clock.restore();
+    }
+  });
+
+  test("unknown V1 wake accepts only exact stored synthetic text and never replays after readback", async () => {
+    const clock = controlledWakeTimers();
+    __setBgNotificationHopTimeoutForTests(50);
+    let snapshot: unknown = { error: { name: "NotFoundError" }, response: { status: 404 } };
+    const promptAsync = mock(
+      (input: unknown) =>
+        new Promise((_, reject) => {
+          (input as { signal?: AbortSignal }).signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("aborted", "AbortError")),
+            { once: true },
+          );
+        }),
+    );
+    const message = mock(async () => snapshot);
+    const client = { session: { promptAsync, message, messages: async () => ({ data: [] }) } };
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-readback", "npm test")] }
+        : { success: true, acked_task_ids: ["task-readback"] },
+    );
+    const { ctx } = harness(send);
+    const drainCtx = { ctx, directory: "/project", sessionID: "readback", client };
+    try {
+      await handleSubcBgEventsNudge(drainCtx);
+      await clock.fire(200);
+      const posted = promptAsync.mock.calls[0][0] as {
+        body: { messageID: string; parts: Array<{ text: string; synthetic: boolean }> };
+      };
+      await clock.fire(50);
+      const info = { role: "user", id: posted.body.messageID, sessionID: "readback" };
+      for (const bad of [
+        { info: { ...info, sessionID: "other" }, parts: posted.body.parts },
+        { info, parts: [{ ...posted.body.parts[0], text: "different text" }] },
+        { info, parts: [{ ...posted.body.parts[0], ignored: true }] },
+        { info, parts: [] },
+      ]) {
+        snapshot = { data: bad };
+        await clock.fire(2000);
+        expect(promptAsync).toHaveBeenCalledTimes(1);
+        expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(
+          0,
+        );
+      }
+      snapshot = { data: { info, parts: posted.body.parts } };
+      await clock.fire(2000);
+      expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(1);
+      expect(sessionBgStates.get("readback")?.pendingWakeAdmissions.size).toBe(0);
+      await clock.fireIfPresent(120_000);
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+    } finally {
+      __resetBgNotificationStateForTests();
+      clock.restore();
+    }
+  });
+
+  test("matching assistant child reconciles an exhausted V1 wake without a third prompt", async () => {
+    const clock = controlledWakeTimers();
+    __setBgNotificationHopTimeoutForTests(50);
+    const promptAsync = mock(() => new Promise(() => {}));
+    const client = makeClient(promptAsync, []);
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-child", "npm test")] }
+        : { success: true, acked_task_ids: ["task-child"] },
+    );
+    const { ctx } = harness(send);
+    const drainCtx = { ctx, directory: "/project", sessionID: "child", client };
+    try {
+      await handleSubcBgEventsNudge(drainCtx);
+      await clock.fire(200);
+      const posted = promptAsync.mock.calls[0][0] as { body: { messageID: string } };
+      await clock.fire(50);
+      await clock.fire(120_000);
+      await clock.fire(50);
+      expect(sessionBgStates.get("child")?.pendingCompletions).toHaveLength(1);
+      observeOpenCodeBgNotificationEvent({
+        type: "message.updated",
+        properties: {
+          info: {
+            role: "assistant",
+            sessionID: "child",
+            parentID: "unrelated",
+            id: "assistant-unrelated",
+          },
+        },
+      });
+      await clock.flush();
+      expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(0);
+      observeOpenCodeBgNotificationEvent({
+        type: "message.updated",
+        properties: {
+          info: {
+            role: "assistant",
+            sessionID: "child",
+            parentID: posted.body.messageID,
+            id: "assistant-child",
+          },
+        },
+      });
+      await clock.flush();
+      expect(sessionBgStates.get("child")?.pendingCompletions).toHaveLength(0);
+      expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(1);
+      const output = { output: "next reply" };
+      await appendInTurnBgCompletions(drainCtx, output);
+      expect(output.output).toBe("next reply");
+      expect(promptAsync).toHaveBeenCalledTimes(2);
+    } finally {
+      __resetBgNotificationStateForTests();
+      clock.restore();
+    }
+  });
+
+  test("disposing one V1 wake owner cancels its recovery but preserves other owners and unacked work", async () => {
+    const clock = controlledWakeTimers();
+    __setBgNotificationHopTimeoutForTests(50);
+    const send = mock(async (command: string, params: Record<string, unknown>) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion(`task-${params.session_id}`, "npm test")] }
+        : { success: true },
+    );
+    const { ctx: first } = harness(send);
+    const { ctx: second } = harness(send);
+    const promptA = mock(() => new Promise(() => {}));
+    const promptB = mock(() => new Promise(() => {}));
+    const a = {
+      ctx: first,
+      directory: "/project",
+      sessionID: "owner-a",
+      client: makeClient(promptA, []),
+    };
+    const b = {
+      ctx: second,
+      directory: "/project",
+      sessionID: "owner-b",
+      client: makeClient(promptB, []),
+    };
+    try {
+      await handleSubcBgEventsNudge(a);
+      await handleSubcBgEventsNudge(b);
+      await clock.fire(200);
+      await clock.fire(200);
+      cancelPendingWakesForContext(first);
+      await clock.flush();
+      expect(
+        sessionBgStates.get("owner-a")?.pendingCompletions.map((item) => item.task_id),
+      ).toEqual(["task-owner-a"]);
+      expect(sessionBgStates.get("owner-a")?.pendingWakeAdmissions.size).toBe(0);
+      expect(sessionBgStates.get("owner-b")?.pendingWakeAdmissions.size).toBe(1);
+      await clock.fire(50);
+      await clock.fire(120_000);
+      expect(promptA).toHaveBeenCalledTimes(1);
+      expect(promptB).toHaveBeenCalledTimes(2);
+      const reply = { output: "next reply" };
+      await appendInTurnBgCompletions(a, reply);
+      expect(reply.output).toContain("task-owner-a");
+      expect(
+        send.mock.calls.filter(
+          (call) => call[0] === "bash_ack_completions" && call[1].session_id === "owner-a",
+        ),
+      ).toHaveLength(1);
+    } finally {
+      __resetBgNotificationStateForTests();
+      clock.restore();
+    }
+  });
+
   test("a forced drain delivers and acknowledges a durable pattern match", async () => {
     const send = mock(async (command: string) =>
       command === "bash_drain_completions"
@@ -1690,7 +2205,11 @@ describe("subc forced-drain dedup (C-#1 / C-#3)", () => {
               },
             ],
           }
-        : { success: true, acked_task_ids: ["task-pattern"] },
+        : {
+            success: true,
+            acked_task_ids: [],
+            acked_matches: [{ task_id: "task-pattern", watch_id: "watch-1", match_offset: 42 }],
+          },
     );
     const { ctx } = harness(send);
     const promptAsync = mock(async () => {});
@@ -1710,7 +2229,7 @@ describe("subc forced-drain dedup (C-#1 / C-#3)", () => {
     expect(prompt.body.parts[0].text).toContain('task task-pattern matched "READY"');
     expect(send.mock.calls.find((call) => call[0] === "bash_ack_completions")?.[1]).toEqual({
       session_id: "s1",
-      task_ids: ["task-pattern"],
+      matches: [{ task_id: "task-pattern", watch_id: "watch-1", match_offset: 42 }],
     });
   });
 
@@ -1908,10 +2427,10 @@ describe("subc forced-drain dedup (C-#1 / C-#3)", () => {
     expect(sessionBgStates.get("s1")?.deliveredAwaitingAckTaskIds.has("task-1")).toBe(false);
   });
 
-  test("delivery FAILURE re-pends the completion (redeliverable, not stuck in-flight)", async () => {
+  test("pre-admission rejection re-pends the completion (redeliverable, not stuck in-flight)", async () => {
     trackBgTask("s1", "task-1");
     const promptAsync = mock(async () => {
-      throw new Error("promptAsync rejected");
+      return preAdmissionRejection("promptAsync rejected");
     });
     const client = makeClient(promptAsync);
     const send = mock(async () => ({ success: true, acked_task_ids: [] }));
@@ -1924,17 +2443,17 @@ describe("subc forced-drain dedup (C-#1 / C-#3)", () => {
     await sleep(50);
 
     const state = sessionBgStates.get("s1");
-    // Delivery failed before departing → cleared from in-flight, back in pending.
+    // The host rejected before scheduling work, so retrying cannot duplicate admission.
     expect(state?.deliveringTaskIds.has("task-1")).toBe(false);
     expect(state?.deliveredAwaitingAckTaskIds.has("task-1")).toBe(false);
     expect(state?.pendingCompletions.some((c) => c.task_id === "task-1")).toBe(true);
   });
 
-  test("legacy model rejection retries the same wake without model before ack", async () => {
+  test("pre-admission model-context rejection retries the same identity without model before ack", async () => {
     const promptAsync = mock(async (input: unknown) => {
       const body = (input as { body?: { model?: unknown } }).body;
       if (body?.model) {
-        throw new Error("ProviderModelNotFoundError: migrated session model is stale");
+        return preAdmissionRejection("model context rejected before admission");
       }
     });
     const client = makeClient(promptAsync, [
@@ -1960,6 +2479,13 @@ describe("subc forced-drain dedup (C-#1 / C-#3)", () => {
     await sleep(50);
 
     expect(promptAsync).toHaveBeenCalledTimes(2);
+    const firstIdentity = (promptAsync.mock.calls[0][0] as { body: { messageID?: string } }).body
+      .messageID;
+    const retryIdentity = (promptAsync.mock.calls[1][0] as { body: { messageID?: string } }).body
+      .messageID;
+    expect(firstIdentity).toEqual(expect.any(String));
+    expect(firstIdentity).not.toBe("");
+    expect(retryIdentity).toBe(firstIdentity);
     expect(
       (promptAsync.mock.calls[0][0] as { body: { model?: unknown } }).body.model,
     ).toBeDefined();
@@ -1973,7 +2499,7 @@ describe("subc forced-drain dedup (C-#1 / C-#3)", () => {
     let rejectInjection = true;
     const promptAsync = mock(async () => {
       if (rejectInjection) {
-        throw new Error("ProviderModelNotFoundError: migrated session model is stale");
+        return preAdmissionRejection("model context rejected before admission");
       }
     });
     const client = makeClient(promptAsync);
@@ -2013,11 +2539,12 @@ describe("subc forced-drain dedup (C-#1 / C-#3)", () => {
     expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
   });
 
-  test("a hung session injection times out, clears in-flight state, and redelivers", async () => {
+  test("a hung V1 injection retries only at the bounded readback window with the same identity", async () => {
+    const clock = controlledWakeTimers();
     __setBgNotificationHopTimeoutForTests(50);
     let hangInjection = true;
     const promptAsync = mock(() =>
-      hangInjection ? new Promise<void>(() => {}) : Promise.resolve(undefined),
+      hangInjection ? new Promise(() => {}) : Promise.resolve({ response: { status: 204 } }),
     );
     const client = makeClient(promptAsync);
     const send = mock(async (command: string) =>
@@ -2026,28 +2553,25 @@ describe("subc forced-drain dedup (C-#1 / C-#3)", () => {
         : { success: true, acked_task_ids: ["task-hung"] },
     );
     const { ctx } = harness(send);
-    const drainCtx = { ctx, directory: "/tmp/project", sessionID: "s1", client };
-
-    await handleSubcBgEventsNudge(drainCtx);
-    await waitForMockCallCount(promptAsync, 1);
-    await waitUntil(
-      () =>
-        sessionBgStates.get("s1")?.deliveringTaskIds.has("task-hung") === false &&
-        sessionBgStates
-          .get("s1")
-          ?.pendingCompletions.some((item) => item.task_id === "task-hung") === true,
-      1_000,
-    );
-
-    expect(sessionBgStates.get("s1")?.deliveredAwaitingAckTaskIds.has("task-hung")).toBe(false);
-    expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(0);
-
-    hangInjection = false;
-    await handleSubcBgEventsNudge(drainCtx);
-    await waitForMockCallCount(promptAsync, 2);
-    await waitUntil(
-      () => send.mock.calls.filter((call) => call[0] === "bash_ack_completions").length === 1,
-    );
+    const drainCtx = { ctx, directory: "/project", sessionID: "s1", client };
+    try {
+      await handleSubcBgEventsNudge(drainCtx);
+      await clock.fire(200);
+      const original = promptAsync.mock.calls[0][0] as { body: unknown };
+      await clock.fire(50);
+      expect(sessionBgStates.get("s1")?.deliveringTaskIds.has("task-hung")).toBe(true);
+      expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(0);
+      hangInjection = false;
+      await handleSubcBgEventsNudge(drainCtx);
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+      await clock.fire(120_000);
+      expect(promptAsync).toHaveBeenCalledTimes(2);
+      expect((promptAsync.mock.calls[1][0] as { body: unknown }).body).toEqual(original.body);
+      expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(1);
+    } finally {
+      __resetBgNotificationStateForTests();
+      clock.restore();
+    }
   });
 
   test("a hung drain times out and releases nudge coalescing for the next drain", async () => {
@@ -2128,4 +2652,510 @@ async function waitUntil(
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function controlledWakeTimers() {
+  type Handle = ReturnType<typeof setTimeout>;
+  const active = new Map<
+    Handle,
+    { callback: (...args: any[]) => void; delay: number; args: any[] }
+  >();
+  const time = spyOn(Date, "now").mockReturnValue(1000);
+  const set = spyOn(globalThis, "setTimeout").mockImplementation(((
+    callback: (...args: any[]) => void,
+    delay = 0,
+    ...args: any[]
+  ) => {
+    const handle = { unref: () => handle } as unknown as Handle;
+    active.set(handle, { callback, delay, args });
+    return handle;
+  }) as typeof setTimeout);
+  const clear = spyOn(globalThis, "clearTimeout").mockImplementation((handle) => {
+    active.delete(handle as Handle);
+  });
+  const flush = async () => {
+    for (let turn = 0; turn < 30; turn++) await Promise.resolve();
+  };
+  const fireIfPresent = async (delay: number) => {
+    const entry = [...active].find(([, timer]) => timer.delay === delay);
+    if (!entry) return false;
+    const [handle, timer] = entry;
+    active.delete(handle);
+    timer.callback(...timer.args);
+    await flush();
+    return true;
+  };
+  return {
+    flush,
+    fireIfPresent,
+    async fire(delay: number) {
+      expect(await fireIfPresent(delay)).toBe(true);
+    },
+    restore() {
+      set.mockRestore();
+      clear.mockRestore();
+      time.mockRestore();
+    },
+  };
+}
+
+/** SDK-shaped validation failure: the host returns this before forking prompt work. */
+function preAdmissionRejection(message: string) {
+  return {
+    error: { name: "BadRequest", data: { message, kind: "Body" } },
+    response: { status: 400 },
+  };
+}
+
+test.each([
+  [
+    2,
+    1,
+    'Some watch notices were lost: a stalled connection dropped 2 of them, and they cannot be recovered. At least 1 match is missing. Read the task output with bash_status({ taskId: "bash-gap", stderrOffset: 16 }).',
+  ],
+  [
+    1,
+    0,
+    'Some watch notices were lost: a stalled connection dropped 1 of them, and they cannot be recovered. Some matches may be missing. Read the task output with bash_status({ taskId: "bash-gap", stderrOffset: 16 }).',
+  ],
+  [
+    1,
+    1,
+    'Some watch notices were lost: a stalled connection dropped 1 of them, and they cannot be recovered. At least 1 match is missing. Read the task output with bash_status({ taskId: "bash-gap", stderrOffset: 16 }).',
+  ],
+  [
+    2,
+    3,
+    'Some watch notices were lost: a stalled connection dropped 2 of them, and they cannot be recovered. At least 3 matches are missing. Read the task output with bash_status({ taskId: "bash-gap", stderrOffset: 16 }).',
+  ],
+] as const)("retry gap-only reminder pins wording (%i notices, %i missing)", (notices, missing, expected) => {
+  const reminder = formatPatternMatchReminder([
+    {
+      task_id: "bash-gap",
+      session_id: "s1",
+      watch_id: "watch-gap",
+      match_text: "watch delivery gap",
+      match_offset: 9,
+      context: "",
+      once: false,
+      batch: {
+        lines: [],
+        dropped_lines: 0,
+        skipped_long_lines: 0,
+        first_dropped_offset: null,
+        first_dropped_stream: null,
+        retry_gap: {
+          reason: "retry_overflow",
+          dropped_notifications: notices,
+          known_missing_occurrences: missing,
+          first_offset: 16,
+          last_offset: 24,
+          stream: "stderr",
+        },
+      },
+    },
+  ]);
+  expect(reminder).toContain("[BG BASH NOTIFY]");
+  expect(reminder).toContain(expected);
+});
+
+test("each_line reminder keeps bounded rows and drop recovery hint", () => {
+  const reminder = formatPatternMatchReminder([
+    {
+      task_id: "bash-lines",
+      session_id: "s1",
+      watch_id: "watch-lines",
+      match_text: "matching lines",
+      match_offset: 0,
+      context:
+        'stdout byte 0 ×2: ERROR a\n3 matching lines dropped. Read them with bash_status({ taskId: "bash-lines", outputOffset: 16 }).',
+      once: false,
+      batch: {
+        lines: [{ stream: "stdout", offset: 0, end_offset: 8, text: "ERROR a", count: 2 }],
+        dropped_lines: 3,
+        first_dropped_offset: 16,
+        first_dropped_stream: "stdout",
+        skipped_long_lines: 0,
+      },
+    },
+  ]);
+  expect(reminder).toContain("task bash-lines matching lines:");
+  expect(reminder).toContain("stdout byte 0 ×2: ERROR a");
+  expect(reminder).toContain(
+    '3 matching lines dropped. Read them with bash_status({ taskId: "bash-lines", outputOffset: 16 }).',
+  );
+});
+
+test("each_line queue replaces snapshots without discarding another watch", async () => {
+  markTaskWaiting("s-lines", "bash-lines");
+  const { ctx } = harness(() => ({ success: true, acked_task_ids: [] }));
+  const base = {
+    task_id: "bash-lines",
+    session_id: "s-lines",
+    watch_id: "watch-a",
+    match_text: "matching lines",
+    match_offset: 0,
+    context: "rows",
+    once: false,
+  };
+  const batch = {
+    lines: [{ stream: "stdout", offset: 0, end_offset: 8, text: "ERROR a", count: 1 }],
+    dropped_lines: 0,
+    first_dropped_offset: null,
+    first_dropped_stream: null,
+    skipped_long_lines: 0,
+  };
+  const drain = { ctx, directory: "/tmp/project", sessionID: "s-lines", client: {} };
+  await handlePushedPatternMatch(drain, { ...base, batch });
+  await handlePushedPatternMatch(drain, {
+    ...base,
+    batch: {
+      ...batch,
+      snapshot: true,
+      dropped_lines: 3,
+      first_dropped_offset: 8,
+      first_dropped_stream: "stdout",
+    },
+  });
+  await handlePushedPatternMatch(drain, { ...base, watch_id: "watch-b", batch });
+  const pending = sessionBgStates.get("s-lines")?.pendingPatternMatches;
+  expect(pending).toHaveLength(2);
+  expect(pending?.find((entry) => entry.watch_id === "watch-a")?.batch?.dropped_lines).toBe(3);
+});
+
+for (const route of ["push", "forced-drain", "restart-replay"] as const) {
+  test(`busy each_line batches render once in order with an exact ack (${route})`, async () => {
+    const sessionID = "s-busy-lines";
+    const frames = [0, 18, 36].map((offset, index) => ({
+      task_id: "bash-busy-lines",
+      session_id: sessionID,
+      watch_id: "watch-busy-lines",
+      match_text: "matching lines",
+      match_offset: offset,
+      context: "unused: render the batch",
+      once: false,
+      reason: "pattern_match" as const,
+      batch: {
+        pending_id: "watch-busy-lines:0",
+        version: offset,
+        lines: [
+          {
+            stream: "stdout",
+            offset,
+            end_offset: offset + 18,
+            text: `LIVECHECK3 line ${index + 1}`,
+            count: 1,
+          },
+        ],
+        dropped_lines: 0,
+        first_dropped_offset: null,
+        first_dropped_stream: null,
+        skipped_long_lines: 0,
+      },
+    }));
+    let pending: PatternMatchEntry[] = [];
+    const acks: Record<string, unknown>[] = [];
+    const { ctx } = harness((command, params) => {
+      if (command === "bash_drain_completions")
+        return { success: true, bg_completions: [], pending_matches: pending };
+      if (command === "bash_ack_completions") {
+        acks.push(params);
+        pending = [];
+        return { success: true, acked_matches: params.matches ?? [] };
+      }
+      return { success: true };
+    });
+    const promptAsync = mock(async () => {});
+    const context = { ctx, directory: "/project", sessionID, client: makeClient(promptAsync) };
+    const busy = () =>
+      observeOpenCodeBgNotificationEvent({
+        type: "session.status",
+        properties: { sessionID, status: { type: "busy" } },
+      });
+    busy();
+    trackBgTask(sessionID, "bash-busy-lines");
+    // Registration can be followed by a drain before any matching output exists.
+    await handleSubcBgEventsNudge(context);
+    for (const [index, frame] of frames.entries()) {
+      pending = [
+        {
+          ...frame,
+          batch: {
+            ...frame.batch,
+            snapshot: true,
+            lines: frames.slice(0, index + 1).flatMap((entry) => entry.batch.lines),
+          },
+        },
+      ];
+      if (route === "forced-drain") await handleSubcBgEventsNudge(context);
+      else await handlePushedPatternMatch(context, frame);
+      if (route === "restart-replay" && index === 1) {
+        clearSessionBgState(sessionID);
+        busy();
+        await handleSubcBgEventsNudge(context);
+      }
+    }
+    expect(promptAsync).not.toHaveBeenCalled();
+    expect(acks).toEqual([]);
+    expect(sessionBgStates.get(sessionID)?.pendingPatternMatches).toMatchObject([
+      {
+        match_offset: 36,
+        batch: {
+          lines: [
+            { offset: 0, text: "LIVECHECK3 line 1", count: 1 },
+            { offset: 18, text: "LIVECHECK3 line 2", count: 1 },
+            { offset: 36, text: "LIVECHECK3 line 3", count: 1 },
+          ],
+        },
+      },
+    ]);
+    const output = { output: "foreground result" };
+    await appendInTurnBgCompletions(context, output);
+    expect(output.output.split("\n").filter((line) => line.includes("stdout byte"))).toEqual([
+      "      > stdout byte 0: LIVECHECK3 line 1",
+      "      > stdout byte 18: LIVECHECK3 line 2",
+      "      > stdout byte 36: LIVECHECK3 line 3",
+    ]);
+    expect(acks).toEqual([
+      {
+        session_id: sessionID,
+        matches: [{ task_id: "bash-busy-lines", watch_id: "watch-busy-lines", match_offset: 36 }],
+      },
+    ]);
+    const next = { output: "next result" };
+    await appendInTurnBgCompletions(context, next);
+    expect(next.output).toBe("next result");
+    expect(acks).toHaveLength(1);
+  });
+}
+
+test("exact pattern ack retries keep sibling watches and newer versions deliverable", async () => {
+  const old = {
+    task_id: "task-pattern",
+    session_id: "s1",
+    watch_id: "watch-one",
+    match_offset: 40,
+    match_text: "READY",
+    context: "READY old",
+    once: false,
+    reason: "pattern_match",
+  };
+  let pending = [old];
+  let confirm = false;
+  const calls: Array<{ command: string; params: Record<string, unknown> }> = [];
+  const { ctx } = harness((command, params) => {
+    calls.push({ command, params });
+    if (command === "bash_drain_completions")
+      return { success: true, bg_completions: [], pending_matches: pending };
+    return { success: true, acked_matches: confirm ? (params.matches ?? []) : [] };
+  });
+  const context = { ctx, directory: "/tmp/project", sessionID: "s1" };
+  const deliver = async () => {
+    const output = { output: "tool" };
+    await appendInTurnBgCompletions(context, output);
+    return output.output;
+  };
+  expect(await deliver()).toContain("READY old");
+  expect(await deliver()).not.toContain("READY old");
+  pending = [
+    { ...old, watch_id: "watch-two", context: "READY sibling" },
+    { ...old, match_offset: 41, context: "READY newer" },
+  ];
+  confirm = true;
+  const next = await deliver();
+  expect(next).toContain("READY sibling");
+  expect(next).toContain("READY newer");
+  expect(next).not.toContain("READY old");
+  const acks = calls.filter((call) => call.command === "bash_ack_completions");
+  expect(
+    acks.some(
+      (call) =>
+        JSON.stringify(call.params.matches) ===
+        JSON.stringify([{ task_id: "task-pattern", watch_id: "watch-one", match_offset: 40 }]),
+    ),
+  ).toBe(true);
+  expect(
+    acks.some((call) => Array.isArray(call.params.matches) && call.params.matches.length === 2),
+  ).toBe(true);
+  for (const call of acks) expect(call.params.task_ids ?? []).not.toContain("task-pattern");
+});
+
+for (const route of ["in-turn", "wake"] as const) {
+  test(`admitted each_line snapshot rows and counters are not repeated after a failed ack (${route})`, async () => {
+    const first = {
+      task_id: "task-batch",
+      session_id: "s1",
+      watch_id: "watch-batch",
+      match_offset: 0,
+      match_text: "matching lines",
+      context: "batch",
+      once: false,
+      reason: "pattern_match",
+      batch: {
+        pending_id: "pending-a",
+        version: 0,
+        snapshot: true,
+        lines: [{ stream: "stdout", offset: 0, end_offset: 8, text: "ERROR A", count: 1 }],
+        dropped_lines: 3,
+        skipped_long_lines: 1,
+        first_dropped_offset: 20,
+        first_dropped_stream: "stdout",
+      },
+    };
+    let current = first;
+    let failAck = true;
+    const acknowledgements: Record<string, unknown>[] = [];
+    const { ctx } = harness((command, params) => {
+      if (command === "bash_drain_completions")
+        return { success: true, bg_completions: [], pending_matches: [current] };
+      if (command === "bash_ack_completions") {
+        acknowledgements.push(params);
+        if (failAck) {
+          failAck = false;
+          return { success: false, message: "ack response lost" };
+        }
+        return { success: true, acked_matches: params.matches ?? [] };
+      }
+      return { success: true };
+    });
+    const sent: string[] = [];
+    const client = makeClient(
+      mock(async (input: unknown) => {
+        sent.push((input as { body: { parts: { text: string }[] } }).body.parts[0].text);
+      }),
+    );
+    const context = { ctx, directory: "/tmp/project", sessionID: "s1", client };
+    const deliver = async () => {
+      if (route === "in-turn") {
+        const output = { output: "tool" };
+        await appendInTurnBgCompletions(context, output);
+        return output.output;
+      }
+      const wanted = sent.length + 1;
+      await handleSubcBgEventsNudge(context);
+      await waitUntil(() => sent.length === wanted && acknowledgements.length >= wanted);
+      return sent.at(-1)!;
+    };
+    const old = await deliver();
+    expect(old).toContain("stdout byte 0: ERROR A");
+    expect(old).toContain("3 matching lines dropped.");
+    expect(old).toContain("1 lines longer than 64 KiB");
+    current = {
+      ...first,
+      match_offset: 1,
+      batch: {
+        ...first.batch,
+        version: 1,
+        lines: [
+          { ...first.batch.lines[0] },
+          { stream: "stderr", offset: 0, end_offset: 8, text: "ERROR B", count: 1 },
+        ],
+        dropped_lines: 5,
+        skipped_long_lines: 2,
+      },
+    };
+    const next = await deliver();
+    expect(next).toContain("stderr byte 0: ERROR B");
+    expect(next).not.toContain("ERROR A");
+    expect(next).toContain("2 matching lines dropped.");
+    expect(next).not.toContain("5 matching lines dropped.");
+    expect(next).toContain("1 lines longer than 64 KiB");
+    expect(next).not.toContain("2 lines longer than 64 KiB");
+    expect(acknowledgements.at(-1)).toEqual({
+      session_id: "s1",
+      matches: [{ task_id: "task-batch", watch_id: "watch-batch", match_offset: 1 }],
+    });
+  });
+}
+
+for (const route of ["in-turn", "wake"] as const) {
+  test(`admitted retry gap-only snapshots wake once per new version after a failed ack (${route})`, async () => {
+    const first = {
+      task_id: "task-batch",
+      session_id: "s1",
+      watch_id: "watch-batch",
+      match_offset: 0,
+      match_text: "matching lines",
+      context: "batch",
+      once: false,
+      reason: "pattern_match",
+      batch: {
+        pending_id: "pending-a",
+        version: 0,
+        snapshot: true,
+        lines: [],
+        retry_gap: {
+          reason: "retry_overflow" as const,
+          dropped_notifications: 2,
+          known_missing_occurrences: 1,
+          first_offset: 10,
+        },
+        dropped_lines: 0,
+        skipped_long_lines: 0,
+        first_dropped_offset: 20,
+        first_dropped_stream: "stdout",
+      },
+    };
+    let current = first;
+    let failAck = true;
+    const acknowledgements: Record<string, unknown>[] = [];
+    const { ctx } = harness((command, params) => {
+      if (command === "bash_drain_completions")
+        return { success: true, bg_completions: [], pending_matches: [current] };
+      if (command === "bash_ack_completions") {
+        acknowledgements.push(params);
+        if (failAck) {
+          failAck = false;
+          return { success: false, message: "ack response lost" };
+        }
+        return { success: true, acked_matches: params.matches ?? [] };
+      }
+      return { success: true };
+    });
+    const sent: string[] = [];
+    const client = makeClient(
+      mock(async (input: unknown) => {
+        sent.push((input as { body: { parts: { text: string }[] } }).body.parts[0].text);
+      }),
+    );
+    const context = { ctx, directory: "/tmp/project", sessionID: "s1", client };
+    const deliver = async () => {
+      if (route === "in-turn") {
+        const output = { output: "tool" };
+        await appendInTurnBgCompletions(context, output);
+        return output.output;
+      }
+      const wanted = sent.length + 1;
+      await handleSubcBgEventsNudge(context);
+      await waitUntil(() => sent.length === wanted && acknowledgements.length >= wanted);
+      return sent.at(-1)!;
+    };
+    const old = await deliver();
+    expect(old).toContain("a stalled connection dropped 2 of them, and they cannot be recovered.");
+    expect(old).toContain("At least 1 match is missing.");
+    current = {
+      ...first,
+      match_offset: 1,
+      batch: {
+        ...first.batch,
+        version: 1,
+        lines: [],
+        retry_gap: {
+          ...first.batch.retry_gap,
+          dropped_notifications: 3,
+          known_missing_occurrences: 2,
+        },
+        dropped_lines: 0,
+        skipped_long_lines: 0,
+      },
+    };
+    const next = await deliver();
+    expect(next).toContain("a stalled connection dropped 1 of them, and they cannot be recovered.");
+    expect(next).not.toContain("dropped 3 of them");
+    expect(next).toContain("At least 1 match is missing.");
+    expect(acknowledgements.at(-1)).toEqual({
+      session_id: "s1",
+      matches: [{ task_id: "task-batch", watch_id: "watch-batch", match_offset: 1 }],
+    });
+  });
 }

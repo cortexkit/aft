@@ -98,6 +98,18 @@
         "task_id"
       ],
       "properties": {
+        "output_offset": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Read a bounded stdout/PTY byte page from this offset; returns masked text and the next byte offset."
+        },
+        "stderr_offset": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Read a bounded stderr byte page from this offset; returns masked text and the next byte offset."
+        },
         "task_id": {
           "type": "string",
           "description": "Background bash task id returned by bash({ background: true })."
@@ -169,6 +181,11 @@
             }
           ],
           "description": "Sync-only timeout in milliseconds. In a main session: default 30000, max `bash.watch_sync_max_ms` (120000 by default). In a delegated session: omit it to wait up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), after which the watch reports the command is still running; a value you pass is clamped to that worker limit."
+        },
+        "deliver": {
+          "type": "string",
+          "const": "each_line",
+          "description": "Async-only: batch every matching complete line, fold consecutive duplicates, and report cap drops with byte offsets."
         },
         "once": {
           "type": "boolean"

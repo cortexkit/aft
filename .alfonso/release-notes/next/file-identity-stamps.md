@@ -1,1 +1,0 @@
-- AFT notices a file replaced within the same timestamp tick by one of the same size (on Windows and for store version files on every platform), instead of trusting stale cached state.

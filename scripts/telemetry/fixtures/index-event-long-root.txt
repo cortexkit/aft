@@ -1,0 +1,1 @@
+index_event kind=first_query plane=semantic build_id=b-12345-123 root=.../f2f0351c/typescript-eslint/worker key=workspace queue_ms=12 service_ms=34 elapsed_ms=5678 ready_to_first_query_ms=9012 completed=345 total=678 tool=semantic_search status=ok

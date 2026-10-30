@@ -1,0 +1,12 @@
+{
+  "bash": {
+    "memory_limit_mib": 64
+  },
+  "harnesses": {
+    "opencode": {
+      "bash": {
+        "memory_limit_mib": 128
+      }
+    }
+  }
+}

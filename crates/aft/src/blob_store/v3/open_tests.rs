@@ -164,7 +164,9 @@ fn old_store_dispatch_and_copy_readers_never_migrate_on_open() {
     let root = tempfile::tempdir().unwrap();
     let family = "0123456789abcdef";
     let registry = crate::views::registry::FamilyRegistry::open(root.path(), family).unwrap();
-    let registration = registry.register_view("holder", root.path()).unwrap();
+    let registration = registry
+        .register_view_with_storage(root.path(), "holder", root.path())
+        .unwrap();
     drop(registration.open_store(FamilyPlane::Semantic).unwrap());
     let v2 = super::super::v2::plane_path(root.path(), family, FamilyPlane::Semantic).unwrap();
     {

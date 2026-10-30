@@ -195,11 +195,38 @@ pub(crate) mod simulated_volumes {
     /// Report `path` and everything below it as device `device`.
     pub(crate) fn simulate(path: &Path, device: u64) -> SimulatedVolume {
         let mut paths = vec![path.to_path_buf()];
-        // Register the resolved spelling too (macOS /var is /private/var), so
-        // a caller that canonicalized the path still matches.
-        if let Ok(canonical) = std::fs::canonicalize(path) {
-            if canonical != path {
-                paths.push(canonical);
+        // Register every resolved spelling too, so a caller that resolved the
+        // path before asking for its device still matches: macOS `/var` is
+        // `/private/var`; on Windows `fs::canonicalize` returns a verbatim
+        // `\\?\C:\...` path with 8.3 short names (GitHub runners keep TEMP
+        // under `C:\Users\RUNNER~1`) expanded, and AFT opens configured roots
+        // under the plain `C:\Users\runneradmin\...` spelling that
+        // `canonical_root_path` returns. Missing that last spelling made the
+        // simulated cache volume invisible and enrollment saw the real, shared
+        // volume.
+        // A folder the test creates only later resolves through its nearest
+        // existing ancestor.
+        let mut existing = path;
+        let mut missing = Vec::new();
+        while !existing.exists() {
+            match (existing.parent(), existing.file_name()) {
+                (Some(parent), Some(name)) => {
+                    missing.push(name.to_os_string());
+                    existing = parent;
+                }
+                _ => break,
+            }
+        }
+        let resolved = [
+            std::fs::canonicalize(existing).ok(),
+            crate::bash_background::persistence::canonical_root_path(existing).ok(),
+        ];
+        for mut spelling in resolved.into_iter().flatten() {
+            for name in missing.iter().rev() {
+                spelling.push(name);
+            }
+            if !paths.contains(&spelling) {
+                paths.push(spelling);
             }
         }
         registry()
@@ -239,6 +266,38 @@ mod tests {
             .expect("valid glob");
         matches.sort();
         (matches, visited)
+    }
+
+    #[test]
+    fn simulated_volume_covers_the_plain_resolved_spelling_of_its_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("detour")).unwrap();
+        std::fs::create_dir(temp.path().join("cache-volume")).unwrap();
+        // A spelling that names the folder only after normalization, as an
+        // 8.3 short name such as `C:\Users\RUNNER~1` does on GitHub's
+        // Windows runners.
+        let spelled = temp.path().join("detour").join("..").join("cache-volume");
+        let _volume = super::simulated_volumes::simulate(&spelled, u64::MAX - 90);
+        // AFT opens configured roots under this spelling (plain `C:\...` on
+        // Windows, not the verbatim `\\?\C:\...` that fs::canonicalize gives).
+        let resolved = crate::bash_background::persistence::canonical_root_path(&spelled).unwrap();
+        assert_eq!(
+            super::simulated_volumes::device_of(&resolved),
+            Some(u64::MAX - 90)
+        );
+        assert_eq!(
+            super::simulated_volumes::device_of(&resolved.join("aft")),
+            Some(u64::MAX - 90)
+        );
+        // A folder registered before the test creates it.
+        let later = temp.path().join("detour").join("..").join("created-later");
+        let _later = super::simulated_volumes::simulate(&later, u64::MAX - 91);
+        std::fs::create_dir(&later).unwrap();
+        let resolved = crate::bash_background::persistence::canonical_root_path(&later).unwrap();
+        assert_eq!(
+            super::simulated_volumes::device_of(&resolved),
+            Some(u64::MAX - 91)
+        );
     }
 
     #[test]

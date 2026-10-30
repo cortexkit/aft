@@ -223,14 +223,27 @@ pub(crate) fn kill_deadline_note(
     session_id: &str,
     worker_session: bool,
 ) -> String {
-    if let Some(note) = registry.execution_note(task_id, session_id) {
+    let note = registry.execution_note(task_id, session_id);
+    let deadline = note
+        .is_none()
+        .then(|| registry.hard_kill_deadline_with_start(task_id, session_id))
+        .flatten();
+    kill_deadline_note_from_parts(note.as_deref(), deadline, worker_session)
+}
+
+/// Formats published deadline inputs at reply time so remaining-time wording
+/// stays current without reacquiring the task's state lock.
+pub(crate) fn kill_deadline_note_from_parts(
+    execution_note: Option<&str>,
+    deadline: Option<(HardKillDeadline, u64)>,
+    worker_session: bool,
+) -> String {
+    if let Some(note) = execution_note {
         // Remote timeouts are enforced from run start, not queue entry; AFT
         // cannot infer their remaining wall-clock time or renew the runner.
         return format!("\n{note}");
     }
-    let Some((deadline, started_at_ms)) =
-        registry.hard_kill_deadline_with_start(task_id, session_id)
-    else {
+    let Some((deadline, started_at_ms)) = deadline else {
         return "\nThis task has no kill deadline.".to_string();
     };
     format!(
@@ -465,13 +478,14 @@ pub fn build_bash_outcome(
                 .remove("_bash_duplicate_warning")
                 .and_then(|value| value.as_str().map(str::to_owned));
             let keys = data.remove("_bash_env_keys").and_then(|value| {
-                value.as_array().map(|items| {
-                    items
+                let lines = value.get("lines")?.as_array()?;
+                Some(
+                    lines
                         .iter()
                         .filter_map(Value::as_str)
                         .map(str::to_owned)
-                        .collect::<Vec<_>>()
-                })
+                        .collect::<Vec<_>>(),
+                )
             });
             (warning, keys)
         })
@@ -556,14 +570,28 @@ pub fn build_bash_outcome(
     // A capped blocking wait detaches at its deadline instead of blocking on.
     let block_to_completion =
         (params.block_to_completion || params.wait) && worker_cap_ms.is_none();
+    let flush_budget = (ctx.config().bash.changed_files != crate::config::BashChangedFiles::Off)
+        .then(|| {
+            ctx.bash_background()
+                .changed_files_budget(&task_id, (!block_to_completion).then_some(deadline))
+        });
     let timeout = params.timeout;
     let storage_dir = crate::bash_background::task_storage_dir(ctx);
     let project_root = ctx.config().project_root.clone();
     let task_id_for_poll = task_id.clone();
     let request_id_for_poll = request_id.clone();
     let session_id_for_poll = session_id.clone();
+    let mut progress = ctx.request_handles_progress(&req.id).then(|| {
+        crate::bash_background::progress::BashProgressPump::new(
+            ctx,
+            task_id.clone(),
+            session_id.clone(),
+            request_id.clone(),
+        )
+    });
 
     let mut poll: PendingResponsePoll = Box::new(move |ctx| {
+        let _keep_flush_budget = &flush_budget;
         // All blocking calls have a wait cap, but only delegated workers renew
         // the default hard kill. A primary session keeps its original limit.
         if worker_session && worker_cap_ms.is_some() {
@@ -660,6 +688,9 @@ pub fn build_bash_outcome(
 
         if response.is_some() {
             wait_registration.take();
+        }
+        if let Some(progress) = &mut progress {
+            progress.poll(response.is_some(), &mut |frame| ctx.emit_progress(frame));
         }
         response
     });
@@ -991,6 +1022,9 @@ pub(crate) const REMOTE_INPUT_CAPTURE_WARNING: &str = "The runner hasn't confirm
 /// Accepted stream record confirms input capture. The warning tells the caller to
 /// wait for the job to be queued or running, which is true only for a task still
 /// in flight; a reply that already carries a finished status is returned as is.
+/// A live reply always names the phase, even when the reply it wraps carries
+/// no phase of its own (the worker-limit and drain-detach replies only carry
+/// `status`), so an agent waiting on acceptance never sees a phaseless task.
 pub(crate) fn with_capture_warning(response: &Response) -> Response {
     let mut response = Response {
         id: response.id.clone(),
@@ -1002,19 +1036,26 @@ pub(crate) fn with_capture_warning(response: &Response) -> Response {
     }
     response.data["status"] = json!("starting");
     response.data["phase"] = json!("submitting");
-    if response.data.get("remote_phase").is_some() {
-        response.data["remote_phase"] = json!("submitting");
-    }
+    response.data["remote_phase"] = json!("submitting");
     let field =
         if response.data.get("output").is_none() && response.data.get("output_preview").is_some() {
             "output_preview"
         } else {
             "output"
         };
-    let output = response.data[field].as_str().unwrap_or("");
-    if !output.ends_with(REMOTE_INPUT_CAPTURE_WARNING) {
-        response.data[field] = json!(format!("{output}\n{REMOTE_INPUT_CAPTURE_WARNING}"));
+    let mut output = response.data[field].as_str().unwrap_or("").to_owned();
+    if let Some(prefix) = output.strip_suffix(REMOTE_INPUT_CAPTURE_WARNING) {
+        output = prefix.trim_end_matches('\n').to_owned();
     }
+    if let Some(note) = response.data["remote_admission_note"].as_str() {
+        if !output.contains(note) {
+            output.push('\n');
+            output.push_str(note);
+        }
+    }
+    output.push('\n');
+    output.push_str(REMOTE_INPUT_CAPTURE_WARNING);
+    response.data[field] = json!(output);
     response
 }
 
@@ -1044,7 +1085,18 @@ pub(crate) fn runon_uncaptured_reply(
             return foreground_result_response(&response.id, snapshot);
         }
     }
-    with_capture_warning(response)
+    let mut response = Response {
+        id: response.id.clone(),
+        success: response.success,
+        data: response.data.clone(),
+    };
+    if let Some(note) = registry
+        .runon_launch_state(task_id, session)
+        .and_then(|launch| launch.admission_note)
+    {
+        response.data["remote_admission_note"] = json!(note);
+    }
+    with_capture_warning(&response)
 }
 
 /// Whether this reply describes a task still in flight (`running`, `starting`,
@@ -1072,9 +1124,9 @@ pub(crate) fn with_runon_capture_state(
 /// A finished task's reply. It never carries the input-capture warning: that
 /// warning asks the caller to wait for queued or running states a finished task
 /// will not reach, even when the runner never confirmed capture.
-fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Response {
+pub(crate) fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Response {
     let task_line = foreground_task_line(&snapshot);
-    let (output, foreground_envelope) =
+    let (mut output, foreground_envelope) =
         if let Some(envelope) = snapshot.bash_output_list_envelope.as_ref() {
             let trailer = crate::list_surfaces::bash::envelope_trailer(envelope);
             let mut foreground_snapshot = snapshot.clone();
@@ -1100,6 +1152,9 @@ fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Res
             push_line(&mut output, &task_line);
             (output, None)
         };
+    if let Some(report) = &snapshot.changed_files {
+        push_line(&mut output, &report.text);
+    }
     if let Some(refusal) = &snapshot.remote_refusal {
         return Response::error_with_data(
             request_id,
@@ -1150,6 +1205,9 @@ fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Res
             .expect("foreground bash data is an object"),
         &foreground_envelope,
     );
+    if let Some(report) = &snapshot.changed_files {
+        data["_bash_changed_files"] = json!(report);
+    }
     if let Some(job_id) = &snapshot.remote_job_id {
         data["remote_job_id"] = json!(job_id);
     }
@@ -1214,11 +1272,10 @@ fn append_bash_reply_notices(
     if let Some(warning) = duplicate_warning {
         notices.push(warning.to_string());
     }
-    if let Some(keys) = env_keys.filter(|keys| !keys.is_empty()) {
-        notices.push(format!(
-            "Configured bash.env keys applied (values not shown): {}.",
-            keys.join(", ")
-        ));
+    if let Some(lines) = env_keys.filter(|lines| !lines.is_empty()) {
+        // Each configured-environment line already reads as a sentence and
+        // never contains a value.
+        notices.extend(lines.iter().cloned());
     }
     if notices.is_empty() {
         return;
@@ -1452,7 +1509,9 @@ mod tests {
                     "status": "failed",
                     "mode": if pty { "pty" } else { "pipes" },
                     "_bash_duplicate_warning": "Duplicate running command: earlier-task",
-                    "_bash_env_keys": ["BUILD_LABEL"],
+                    "_bash_env_keys": {"lines": [
+                        "Configured bash.env keys applied (values not shown): BUILD_LABEL (user)."
+                    ]},
                 }),
             );
             let response = match build_bash_outcome(&request, &ctx, spawn) {
@@ -1475,8 +1534,9 @@ mod tests {
                 "{output}"
             );
             assert!(
-                output
-                    .contains("Configured bash.env keys applied (values not shown): BUILD_LABEL."),
+                output.contains(
+                    "Configured bash.env keys applied (values not shown): BUILD_LABEL (user)."
+                ),
                 "{output}"
             );
             assert!(response.data.get("_bash_duplicate_warning").is_none());
@@ -1499,6 +1559,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bash_changed_files_foreground_block_follows_output_and_is_namespaced() {
+        let mut task = snapshot(
+            "command output",
+            false,
+            None,
+            BgTaskStatus::Completed,
+            Some(0),
+        );
+        task.changed_files = Some(crate::bash_changed_files::Report {
+            text: "Files changed while the command ran (changes by other processes may be included):\n  added new.txt".into(),
+            files: vec![],
+            incomplete: vec![],
+            changed_files_list_envelope: crate::list_surfaces::bash::build_changed_files_envelope(1, 1, false, false),
+        });
+        let response = foreground_result_response("request", task);
+        let text = response.data["output"].as_str().unwrap();
+        assert!(text.starts_with("command output"));
+        assert!(text.ends_with("  added new.txt"));
+        assert_eq!(text.matches("Files changed while").count(), 1);
+        assert!(response.data["_bash_changed_files"].is_object());
+    }
+
     fn snapshot(
         output_preview: &str,
         output_truncated: bool,
@@ -1507,6 +1590,7 @@ mod tests {
         exit_code: Option<i64>,
     ) -> BgTaskSnapshot {
         BgTaskSnapshot {
+            changed_files: None,
             exit_marker_unavailable: None,
             info: BgTaskInfo {
                 task_id: "bash-test".to_string(),
@@ -1537,14 +1621,36 @@ mod tests {
             phase: None,
             live_descendants: Some(Vec::new()),
             live_descendants_omitted: 0,
+            live_descendants_unavailable: None,
             live_descendants_summary: None,
             kill_signaled: false,
             kill_reached: 0,
+            remote_cancel: None,
             hard_kill: None,
             elapsed_ms: None,
             remote_job_id: None,
             remote_phase_note: None,
         }
+    }
+
+    #[test]
+    fn capture_warning_names_submitting_phase_without_a_prior_phase() {
+        // The worker-limit and drain-detach replies wrapped for an unaccepted
+        // runon task carry `status` but no phase of their own. The capture
+        // reply built from them must still name the phase, so an agent that
+        // timed out waiting for acceptance never sees a phaseless task.
+        let base = Response::success(
+            "uncaptured",
+            json!({"task_id": "task", "status": "running", "output": "launch"}),
+        );
+        let reply = with_capture_warning(&base);
+        assert_eq!(reply.data["status"], "starting", "{reply:?}");
+        assert_eq!(reply.data["phase"], "submitting", "{reply:?}");
+        assert_eq!(reply.data["remote_phase"], "submitting", "{reply:?}");
+        assert!(reply.data["output"]
+            .as_str()
+            .unwrap()
+            .ends_with(REMOTE_INPUT_CAPTURE_WARNING));
     }
 
     #[test]
@@ -1950,7 +2056,8 @@ mod tests {
         task.output_preview = format!("line 1\nline 2\n{trailer}");
         task.bash_output_list_envelope = Some(envelope);
         let mut response = foreground_result_response("req", task);
-        let keys = ["API_KEY".to_string()];
+        let keys =
+            ["Configured bash.env keys applied (values not shown): API_KEY (user).".to_string()];
 
         append_bash_reply_notices(
             &mut response,
@@ -1963,7 +2070,7 @@ mod tests {
             output,
             format!(
                 "line 1\nline 2\nSame command as the previous call.\n\
-                 Configured bash.env keys applied (values not shown): API_KEY.\n\
+                 Configured bash.env keys applied (values not shown): API_KEY (user).\n\
                  [task bash-test]\n{trailer}"
             )
         );

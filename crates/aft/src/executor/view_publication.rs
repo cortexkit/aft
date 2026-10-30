@@ -280,11 +280,47 @@ impl Drop for ActorScope {
 struct Running {
     root: PathBuf,
     context: usize,
+    content_generation: u64,
     token: JobCancellation,
     phase: String,
     started: Instant,
     phase_started: Instant,
     paths: BTreeSet<Vec<u8>>,
+    rescan: bool,
+    pending: Option<Submission>,
+    #[cfg(test)]
+    completion_outcome: Option<tests::CompletionOutcome>,
+}
+
+struct Submission {
+    reason: crate::views::publication_reason::Reason,
+    target: Target,
+    content_generation: u64,
+    paths: BTreeSet<Vec<u8>>,
+    allow_semantic_blob_put: bool,
+    rescan: bool,
+}
+
+fn union_paths(paths: &mut BTreeSet<Vec<u8>>, other: &BTreeSet<Vec<u8>>) {
+    if other.is_empty() {
+        paths.clear();
+    } else if !paths.is_empty() {
+        paths.extend(other.iter().cloned());
+    }
+}
+
+impl Submission {
+    fn same_content(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.target.ctx, &other.target.ctx)
+            && self.content_generation == other.content_generation
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.reason.merge(other.reason);
+        union_paths(&mut self.paths, &other.paths);
+        self.allow_semantic_blob_put |= other.allow_semantic_blob_put;
+        self.rescan |= other.rescan;
+    }
 }
 static JOBS: LazyLock<Mutex<HashMap<u64, Running>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -308,7 +344,13 @@ pub(super) fn running_for_context(ctx: &Arc<AppContext>) -> bool {
 /// True while a view publication for `ctx` is queued or running.
 pub(crate) fn running_for(ctx: &AppContext) -> bool {
     let address = ctx as *const AppContext as usize;
-    JOBS.lock().values().any(|job| job.context == address)
+    JOBS.lock().values().any(|job| {
+        job.context == address
+            || job
+                .pending
+                .as_ref()
+                .is_some_and(|pending| Arc::as_ptr(&pending.target.ctx) as usize == address)
+    })
 }
 
 /// What the queued or running view publications for `ctx` have yet to
@@ -321,7 +363,13 @@ pub(crate) fn unpublished_paths_for(ctx: &AppContext) -> Option<BTreeSet<Vec<u8>
     let jobs = JOBS.lock();
     let mut running = jobs
         .values()
-        .filter(|job| job.context == address)
+        .filter(|job| {
+            job.context == address
+                || job
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| Arc::as_ptr(&pending.target.ctx) as usize == address)
+        })
         .peekable();
     running.peek()?;
     let mut paths = BTreeSet::new();
@@ -330,6 +378,12 @@ pub(crate) fn unpublished_paths_for(ctx: &AppContext) -> Option<BTreeSet<Vec<u8>
             return Some(BTreeSet::new());
         }
         paths.extend(job.paths.iter().cloned());
+        if let Some(pending) = &job.pending {
+            if pending.paths.is_empty() {
+                return Some(BTreeSet::new());
+            }
+            paths.extend(pending.paths.iter().cloned());
+        }
     }
     Some(paths)
 }
@@ -413,6 +467,67 @@ impl Drop for PublicationSlot {
 
 struct Lifecycle(u64);
 impl Lifecycle {
+    fn remove(&self, jobs: &mut HashMap<u64, Running>) {
+        let job = jobs.remove(&self.0);
+        #[cfg(test)]
+        if let Some(job) = job.as_ref() {
+            let outcome = if std::thread::panicking() {
+                tests::CompletionOutcome::Failed {
+                    reason: format!("publication worker panicked during {}", job.phase),
+                }
+            } else {
+                job.completion_outcome
+                    .clone()
+                    .unwrap_or_else(|| tests::CompletionOutcome::Failed {
+                        reason: format!(
+                            "publication worker exited during {} without a terminal outcome",
+                            job.phase
+                        ),
+                    })
+            };
+            tests::settled(self.0, &job.root, outcome);
+        }
+        drop(job);
+    }
+
+    /// Taking the next batch and retiring an idle worker share the scheduler's
+    /// lock, so an edit cannot land between the last pending check and retirement.
+    fn advance(&self, current: &mut Submission, retry: bool) -> bool {
+        let mut jobs = JOBS.lock();
+        let job = jobs.get_mut(&self.0).expect("live view publication");
+        let retry = retry && !job.token.cancel_requested_before_commit();
+        if let Some(mut pending) = job.pending.take() {
+            if retry && pending.same_content(current) {
+                pending.merge(current);
+            }
+            *current = pending;
+        } else if !retry {
+            self.remove(&mut jobs);
+            return false;
+        }
+        #[cfg(test)]
+        {
+            job.completion_outcome = None;
+        }
+        job.context = Arc::as_ptr(&current.target.ctx) as usize;
+        job.content_generation = current.content_generation;
+        job.paths = current.paths.clone();
+        job.rescan = current.rescan;
+        job.token = JobCancellation::new()
+            .with_root(&job.root)
+            .with_lifecycle(current.target.ctx.subc_lifecycle_admission());
+        job.token.mark_running();
+        true
+    }
+
+    #[cfg(test)]
+    fn outcome(&self, outcome: tests::CompletionOutcome) {
+        JOBS.lock()
+            .get_mut(&self.0)
+            .expect("live view publication")
+            .completion_outcome = Some(outcome);
+    }
+
     fn phase(&self, phase: &str) -> crate::views::Result<()> {
         let mut jobs = JOBS.lock();
         let job = jobs.get_mut(&self.0).expect("live view publication");
@@ -435,12 +550,7 @@ impl Lifecycle {
 }
 impl Drop for Lifecycle {
     fn drop(&mut self) {
-        let job = JOBS.lock().remove(&self.0);
-        #[cfg(test)]
-        if let Some(job) = job.as_ref() {
-            tests::settled(self.0, &job.root);
-        }
-        drop(job);
+        self.remove(&mut JOBS.lock());
     }
 }
 
@@ -536,8 +646,19 @@ pub fn install_standalone_scope(ctx: Arc<AppContext>) -> StandaloneScope {
 
 pub(crate) fn cancel_for_context(ctx: &AppContext) {
     let context = ctx as *const AppContext as usize;
-    for job in JOBS.lock().values().filter(|job| job.context == context) {
-        job.token.request_cancel();
+    for job in JOBS.lock().values_mut() {
+        if job.context == context {
+            // Root deletion, unbind and content-changing configure invalidate
+            // the inputs or permission to publish; unlike edits they must cancel.
+            job.token.request_cancel();
+        }
+        if job
+            .pending
+            .as_ref()
+            .is_some_and(|pending| Arc::as_ptr(&pending.target.ctx) as usize == context)
+        {
+            job.pending = None;
+        }
     }
 }
 
@@ -546,10 +667,34 @@ pub(crate) fn cancel_for_context(ctx: &AppContext) {
 /// configure maintenance themselves) retain the synchronous API.
 pub(crate) fn schedule(
     ctx: &AppContext,
-    mut paths: BTreeSet<Vec<u8>>,
+    paths: BTreeSet<Vec<u8>>,
     allow_semantic_blob_put: bool,
 ) -> Result<(), String> {
+    schedule_with_reason(
+        ctx,
+        paths,
+        allow_semantic_blob_put,
+        crate::views::publication_reason::Reason {
+            events: crate::views::publication_reason::Reason::CONFIGURE,
+            ..Default::default()
+        },
+    )
+}
+
+pub(crate) fn schedule_with_reason(
+    ctx: &AppContext,
+    paths: BTreeSet<Vec<u8>>,
+    allow_semantic_blob_put: bool,
+    reason: crate::views::publication_reason::Reason,
+) -> Result<(), String> {
+    let _reason = reason.enter();
     if ctx.retire_deleted_view_root() {
+        return Ok(());
+    }
+    // A root whose reads all go through its v3 checkout views has no reader
+    // of the content-addressed v1 view, so nothing is assembled, put into
+    // the v1 blob store or published for it.
+    if ctx.views_route_root() {
         return Ok(());
     }
     let target = CURRENT.with(|slot| slot.borrow().clone());
@@ -576,10 +721,17 @@ pub(crate) fn schedule(
     let root = ctx
         .canonical_cache_root_opt()
         .ok_or("view root is not configured")?;
-    let content_generation = ctx.configure_content_generation();
     if ctx.subc_unbound_quiesced() || !root.is_dir() {
         return Err("view root is unbound or missing".to_owned());
     }
+    let mut current = Submission {
+        reason,
+        target,
+        content_generation: ctx.configure_content_generation(),
+        rescan: paths.is_empty(),
+        paths,
+        allow_semantic_blob_put,
+    };
     let token = JobCancellation::new()
         .with_root(&root)
         .with_lifecycle(ctx.subc_lifecycle_admission());
@@ -587,24 +739,45 @@ pub(crate) fn schedule(
     let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     {
         let mut jobs = JOBS.lock();
-        for job in jobs.values_mut().filter(|job| job.root == root) {
-            job.token.request_cancel();
-            if paths.is_empty() || job.paths.is_empty() {
-                paths.clear();
-            } else {
-                paths.extend(job.paths.iter().cloned());
+        if let Some(job) = jobs.values_mut().find(|job| job.root == root) {
+            if job.context != Arc::as_ptr(&current.target.ctx) as usize
+                || job.content_generation != current.content_generation
+            {
+                // A new configuration cannot inherit either the active batch's
+                // partial inputs or paths queued for the previous configuration.
+                current.paths.clear();
+                current.rescan = true;
+            } else if job.rescan {
+                // A rescan's changed files are unknown. Read them once more in
+                // its follow-up, without turning subsequent edits into rescans.
+                current.paths.clear();
             }
+            if let Some(pending) = job.pending.as_mut().filter(|p| p.same_content(&current)) {
+                pending.merge(&current);
+            } else {
+                if job.pending.is_some() {
+                    current.paths.clear();
+                    current.rescan = true;
+                }
+                job.pending = Some(current);
+            }
+            return Ok(());
         }
         jobs.insert(
             id,
             Running {
                 root,
-                context: Arc::as_ptr(&target.ctx) as usize,
+                context: Arc::as_ptr(&current.target.ctx) as usize,
+                content_generation: current.content_generation,
                 token: token.clone(),
                 phase: "manifest".to_owned(),
                 started: Instant::now(),
                 phase_started: Instant::now(),
-                paths: paths.clone(),
+                paths: current.paths.clone(),
+                rescan: current.rescan,
+                pending: None,
+                #[cfg(test)]
+                completion_outcome: None,
             },
         );
     }
@@ -613,19 +786,35 @@ pub(crate) fn schedule(
         .name("aft-view-publication".to_owned())
         .stack_size(super::EXECUTOR_WORKER_STACK_BYTES)
         .spawn(move || {
-            let _cancellation = super::install_job_cancellation(token.clone());
             // Whether the last attempt could publish without a linked
             // worktree's derived call graph. A query may need that graph while
             // such an attempt runs; see the follow-up after the loop.
             let mut ran_deferred = false;
             loop {
-                if target.ctx.retire_deleted_view_root() {
-                    break;
-                }
-                if token.cancel_requested_before_commit()
-                    || target.ctx.configure_content_generation() != content_generation
-                    || !target.ctx.config().views.enabled
-                {
+                let target = &current.target;
+                let token = JOBS.lock()[&id].token.clone();
+                let _cancellation = super::install_job_cancellation(token.clone());
+                let content_generation = current.content_generation;
+                let paths = &current.paths;
+                let stop_reason = if target.ctx.retire_deleted_view_root() {
+                    Some("view root was retired")
+                } else if token.cancel_requested_before_commit() {
+                    Some("publication cancellation was requested")
+                } else if target.ctx.configure_content_generation() != content_generation {
+                    Some("view configuration was replaced")
+                } else if !target.ctx.config().views.enabled {
+                    Some("views were disabled")
+                } else {
+                    None
+                };
+                if let Some(_reason) = stop_reason {
+                    #[cfg(test)]
+                    lifecycle.outcome(tests::CompletionOutcome::Cancelled {
+                        reason: _reason.to_owned(),
+                    });
+                    if lifecycle.advance(&mut current, false) {
+                        continue;
+                    }
                     break;
                 }
                 let retry_due = target.ctx.view_publication_retry().lock().due();
@@ -640,7 +829,14 @@ pub(crate) fn schedule(
                 }
                 ran_deferred = target.ctx.defer_callgraph_build();
                 let result = (|| {
+                    let _reason = current.reason.enter();
                     lifecycle.phase("manifest")?;
+                    if target.ctx.can_skip_irrelevant_view_paths(paths) {
+                        log::info!("view publication skipped reason=non_manifest_paths paths={} root={}", paths.len(), target.ctx.canonical_cache_root().display());
+                        #[cfg(test)]
+                        lifecycle.outcome(tests::CompletionOutcome::Noop);
+                        return Ok(());
+                    }
                     let mut slot = PublicationSlot::acquire(
                         &target.ctx.cold_build_limiter(),
                         &target.ctx.canonical_cache_root(),
@@ -656,7 +852,7 @@ pub(crate) fn schedule(
                     crate::cold_build_limiter::progress::phase("preparing", if paths.is_empty() { None } else { Some(paths.len()) });
                     let mut prepared = target.ctx.prepare_view_paths(
                         paths.clone(),
-                        allow_semantic_blob_put,
+                        current.allow_semantic_blob_put,
                         &mut |phase| {
                             if phase == crate::context::VIEW_PUBLICATION_PIN_PHASE {
                                 slot.release();
@@ -674,8 +870,8 @@ pub(crate) fn schedule(
                     let report = {
                         let _epoch = write_epoch_as_detached_writer(&target);
                         lifecycle.phase("cas")?;
-                        // Sealing and cancellation are atomic with respect to superseding
-                        // submissions, which hold JOBS while signaling this token.
+                        // Sealing and invalidation are atomic with respect to
+                        // cancellation, which also holds the job table.
                         let _jobs = JOBS.lock();
                         #[cfg(test)]
                         let _barrier = CommitBarrierMark::enter();
@@ -701,6 +897,12 @@ pub(crate) fn schedule(
                     report.pending_paths.len(),
                     target.ctx.canonical_cache_root().display()
                 );
+                    #[cfg(test)]
+                    lifecycle.outcome(if report.published {
+                        tests::CompletionOutcome::Published
+                    } else {
+                        tests::CompletionOutcome::Noop
+                    });
                     Ok::<(), PublicationFailure>(())
                 })();
                 match result {
@@ -709,21 +911,46 @@ pub(crate) fn schedule(
                         // lock never waits on another one while held.
                         let root = target.ctx.canonical_cache_root();
                         target.ctx.view_publication_retry().lock().reset(&root);
-                        break;
+                        if !lifecycle.advance(&mut current, false) {
+                            break;
+                        }
                     }
                     Err(error) => {
                         // Root deletion also cancels its token. Retire the view
                         // before testing cancellation, or the short circuit
                         // would leave readers attached to a vanished checkout.
-                        if target.ctx.retire_deleted_view_root() || target.ctx.view_runtime_snapshot().is_none()
-                            || token.cancel_requested_before_commit()
-                            || target.ctx.configure_content_generation() != content_generation {
-                            break;
+                        let stop_reason = if target.ctx.retire_deleted_view_root() {
+                            Some("view root was retired")
+                        } else if target.ctx.view_runtime_snapshot().is_none() {
+                            Some("view runtime was removed")
+                        } else if token.cancel_requested_before_commit() {
+                            Some("publication cancellation was requested")
+                        } else if target.ctx.configure_content_generation() != content_generation {
+                            Some("view configuration was replaced")
+                        } else {
+                            None
+                        };
+                        if let Some(_reason) = stop_reason {
+                            #[cfg(test)]
+                            lifecycle.outcome(tests::CompletionOutcome::Cancelled {
+                                reason: format!("{_reason}: {error}"),
+                            });
+                            if !lifecycle.advance(&mut current, false) {
+                                break;
+                            }
+                            continue;
                         }
                         // Retain the complete path union until a successful install;
                         // scheduling acknowledgement is not publication completion.
                         let root = target.ctx.canonical_cache_root();
                         target.ctx.view_publication_retry().lock().failed_publication(&root, &error);
+                        #[cfg(test)]
+                        lifecycle.outcome(tests::CompletionOutcome::Failed {
+                            reason: error.to_string(),
+                        });
+                        if !lifecycle.advance(&mut current, true) {
+                            break;
+                        }
                     }
                 }
             }
@@ -732,6 +959,7 @@ pub(crate) fn schedule(
             // without it. Now that this job has left the job table, schedule
             // that build. The scheduled publication builds the graph instead of
             // deferring it, so it does not trigger another follow-up like this.
+            let target = current.target;
             if ran_deferred && target.ctx.lazy_callgraph_build_outstanding() {
                 let _scope = ActorScope::install(
                     Arc::clone(&target.ctx),
@@ -772,12 +1000,6 @@ impl Drop for CommitBarrierMark {
     fn drop(&mut self) {
         IN_COMMIT_BARRIER.set(false);
     }
-}
-
-/// Whether this thread is inside a publication's commit barrier.
-#[cfg(test)]
-pub(crate) fn in_commit_barrier_for_test() -> bool {
-    IN_COMMIT_BARRIER.get()
 }
 
 #[cfg(test)]

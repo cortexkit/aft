@@ -22,6 +22,26 @@ pub const EXPIRED_ENTRIES_MAX: usize = 1_000;
 pub const LATE_RESULTS_PAGE_MAX: u32 = 256;
 /// The `not_started` reason of a held call that `tool.withdraw` settled.
 pub const WITHDRAWN_REASON: &str = "withdrawn";
+/// One trust-independent result snapshot per retained call, under the reply-size cap.
+pub const MAX_TOOL_RESULT_SOURCE_BYTES: usize =
+    cortexkit_role_tool_provider::result::MAX_RESULT_BYTES;
+
+pub(super) const RESULT_SOURCE_MIGRATION: &str = r#"
+ALTER TABLE call_ledger ADD COLUMN tool_result_source BLOB
+    CHECK(tool_result_source IS NULL OR
+        (typeof(tool_result_source) = 'blob' AND length(tool_result_source) > 0
+            AND length(tool_result_source) < 3145728));
+"#;
+
+pub(super) fn migrate_result_source(conn: &Connection) -> rusqlite::Result<()> {
+    let present: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('call_ledger') WHERE name='tool_result_source')", [], |row| row.get(0),
+    )?;
+    if !present {
+        conn.execute_batch(RESULT_SOURCE_MIGRATION)?;
+    }
+    Ok(())
+}
 
 /// One process-wide cursor identity, deliberately never persisted in aft.db.
 /// Reconnecting or binding another project must not look like a restart.
@@ -125,6 +145,7 @@ pub struct Row {
     pub settled_at: Option<i64>,
     pub seq: Option<u64>,
     pub late_entry: Option<String>,
+    pub tool_result_source: Option<Vec<u8>>,
 }
 
 pub fn now_ms() -> i64 {
@@ -135,27 +156,72 @@ pub fn now_ms() -> i64 {
 }
 
 pub fn get(conn: &Connection, key: &Key) -> rusqlite::Result<Option<Row>> {
-    conn.query_row(
-        "SELECT digest,state,owner,scope_ref,scope_epoch,task_id,withdraw_answer,frame_type,frame_body,outcome,event_id,settled_at,seq,late_entry
-         FROM call_ledger WHERE carrier=?1 AND call_key=?2",
-        params![key.carrier, key.call_key],
-        |r| {
-            let owner: Option<String> = r.get(2)?;
-            let ty: Option<String> = r.get(7)?;
-            let body: Option<Vec<u8>> = r.get(8)?;
-            Ok(Row {
-                key: key.clone(), digest: r.get(0)?,
-                state: match r.get::<_, String>(1)?.as_str() {
-                    "Prepared" => State::Prepared, "Authorized" => State::Authorized,
-                    "DispatchStarted" => State::DispatchStarted, _ => State::Settled,
+    get_impl(conn, key, false)
+}
+
+fn get_impl(conn: &Connection, key: &Key, include_source: bool) -> rusqlite::Result<Option<Row>> {
+    let sql = if include_source {
+        "SELECT digest,state,owner,scope_ref,scope_epoch,task_id,withdraw_answer,frame_type,frame_body,outcome,event_id,settled_at,seq,late_entry,tool_result_source FROM call_ledger WHERE carrier=?1 AND call_key=?2"
+    } else {
+        "SELECT digest,state,owner,scope_ref,scope_epoch,task_id,withdraw_answer,frame_type,frame_body,outcome,event_id,settled_at,seq,late_entry FROM call_ledger WHERE carrier=?1 AND call_key=?2"
+    };
+    conn.query_row(sql, params![key.carrier, key.call_key], |r| {
+        let owner: Option<String> = r.get(2)?;
+        let ty: Option<String> = r.get(7)?;
+        let body: Option<Vec<u8>> = r.get(8)?;
+        Ok(Row {
+            key: key.clone(),
+            digest: r.get(0)?,
+            state: match r.get::<_, String>(1)?.as_str() {
+                "Prepared" => State::Prepared,
+                "Authorized" => State::Authorized,
+                "DispatchStarted" => State::DispatchStarted,
+                _ => State::Settled,
+            },
+            scope: owner
+                .map(|owner| {
+                    Ok::<_, rusqlite::Error>(ScopeIdentity {
+                        owner,
+                        scope_ref: r.get(3)?,
+                        scope_epoch: r.get(4)?,
+                    })
+                })
+                .transpose()?,
+            task_id: r.get(5)?,
+            withdraw_answer: r.get(6)?,
+            frame: ty.zip(body).map(|(ty, body)| RecordedFrame {
+                ty: match ty.as_str() {
+                    "Response" => FrameType::Response,
+                    "StreamEnd" => FrameType::StreamEnd,
+                    _ => FrameType::Error,
                 },
-                scope: owner.map(|owner| Ok::<_, rusqlite::Error>(ScopeIdentity { owner, scope_ref: r.get(3)?, scope_epoch: r.get(4)? })).transpose()?,
-                task_id: r.get(5)?, withdraw_answer: r.get(6)?,
-                frame: ty.zip(body).map(|(ty, body)| RecordedFrame { ty: match ty.as_str() { "Response" => FrameType::Response, "StreamEnd" => FrameType::StreamEnd, _ => FrameType::Error }, body }),
-                outcome: r.get(9)?, event_id: r.get(10)?, settled_at: r.get(11)?, seq: r.get(12)?, late_entry: r.get(13)?,
-            })
-        },
-    ).optional()
+                body,
+            }),
+            outcome: r.get(9)?,
+            event_id: r.get(10)?,
+            settled_at: r.get(11)?,
+            seq: r.get(12)?,
+            late_entry: r.get(13)?,
+            tool_result_source: if include_source { r.get(14)? } else { None },
+        })
+    })
+    .optional()
+}
+
+/// Replay alone loads the extra source; custody and maintenance keep reading the
+/// original terminal bytes without pulling image blobs into their scans.
+pub fn get_for_replay(conn: &Connection, key: &Key) -> rusqlite::Result<Option<Row>> {
+    get_impl(conn, key, true)
+}
+
+fn load_tool_result_source(conn: &Connection, key: &Key) -> rusqlite::Result<Option<Vec<u8>>> {
+    conn.query_row(
+        "SELECT tool_result_source FROM call_ledger WHERE carrier=?1 AND call_key=?2",
+        params![key.carrier, key.call_key],
+        |record| record.get(0),
+    )
+    .optional()
+    .map(Option::flatten)
 }
 
 pub enum Admission {
@@ -171,9 +237,23 @@ pub fn admit(
     scope: Option<&ScopeIdentity>,
     state: State,
 ) -> rusqlite::Result<Admission> {
+    admit_with_tool_result_source(conn, key, digest, scope, state, false)
+}
+
+pub fn admit_with_tool_result_source(
+    conn: &Connection,
+    key: &Key,
+    digest: &str,
+    scope: Option<&ScopeIdentity>,
+    state: State,
+    include_body: bool,
+) -> rusqlite::Result<Admission> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    if let Some(row) = get(&tx, key)? {
+    if let Some(mut row) = get(&tx, key)? {
         return Ok(if row.digest == digest && row.scope.as_ref() == scope {
+            if include_body && row.state == State::Settled {
+                row.tool_result_source = load_tool_result_source(&tx, key)?;
+            }
             Admission::Repeat(row)
         } else {
             Admission::Conflict
@@ -249,6 +329,30 @@ pub fn settle(
     reason: Option<&str>,
     now: i64,
 ) -> rusqlite::Result<bool> {
+    settle_with_tool_result_source(conn, key, frame, outcome, reason, now, None)
+}
+
+pub fn settle_with_tool_result_source(
+    conn: &Connection,
+    key: &Key,
+    frame: &RecordedFrame,
+    outcome: &str,
+    reason: Option<&str>,
+    now: i64,
+    source: Option<&[u8]>,
+) -> rusqlite::Result<bool> {
+    if source.is_some_and(|source| {
+        source.is_empty()
+            || source.len() >= MAX_TOOL_RESULT_SOURCE_BYTES
+            || frame.ty != FrameType::Response
+    }) {
+        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "tool result source requires a Response and must be nonempty and under 3 MiB",
+            ),
+        )));
+    }
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let Some(row) = get(&tx, key)? else {
         return Ok(false);
@@ -258,7 +362,7 @@ pub fn settle(
     }
     #[cfg(test)]
     run_after_ledger_read(&tx);
-    settle_row(&tx, &row, frame, outcome, reason, now)?;
+    settle_row(&tx, &row, frame, outcome, reason, now, source)?;
     tx.commit()?;
     Ok(true)
 }
@@ -289,6 +393,7 @@ pub fn end_scope(conn: &Connection, scope: &ScopeIdentity, now: i64) -> rusqlite
                 "not_started",
                 Some("scope_ended"),
                 now,
+                None,
             )?;
         }
     }
@@ -310,6 +415,7 @@ fn settle_row(
     outcome: &str,
     reason: Option<&str>,
     now: i64,
+    tool_result_source: Option<&[u8]>,
 ) -> rusqlite::Result<()> {
     let key = &row.key;
     let tx = conn;
@@ -333,8 +439,8 @@ fn settle_row(
         entry = Some(value.to_string());
     }
     let never_ran_answer = reason.map(|reason| answer_bytes(&never_ran_answer(reason)));
-    tx.execute("UPDATE call_ledger SET state='Settled',frame_type=?3,frame_body=?4,outcome=?5,settled_at=?6,seq=?7,late_entry=?8,withdraw_answer=COALESCE(withdraw_answer,?10) WHERE carrier=?1 AND call_key=?2 AND state=?9",
-        params![key.carrier,key.call_key,frame.type_name(),frame.body,outcome,now,seq,entry,row.state.as_str(),never_ran_answer])?;
+    tx.execute("UPDATE call_ledger SET state='Settled',frame_type=?3,frame_body=?4,outcome=?5,settled_at=?6,seq=?7,late_entry=?8,withdraw_answer=COALESCE(withdraw_answer,?10),tool_result_source=?11 WHERE carrier=?1 AND call_key=?2 AND state=?9",
+        params![key.carrier,key.call_key,frame.type_name(),frame.body,outcome,now,seq,entry,row.state.as_str(),never_ran_answer,tool_result_source])?;
     if let Some(scope) = &row.scope {
         enforce_retention_bounds(tx, &scope.owner)?;
     }
@@ -393,7 +499,7 @@ pub fn reduce_expired(conn: &Connection, key: &Key, now: i64) -> rusqlite::Resul
             Ok(value.to_string())
         })
         .transpose()?;
-    conn.execute("UPDATE call_ledger SET frame_type='Error',frame_body=?3,late_entry=?4 WHERE carrier=?1 AND call_key=?2", params![key.carrier,key.call_key,frame.body,entry])?;
+    conn.execute("UPDATE call_ledger SET frame_type='Error',frame_body=?3,late_entry=?4,tool_result_source=NULL WHERE carrier=?1 AND call_key=?2", params![key.carrier,key.call_key,frame.body,entry])?;
     Ok(())
 }
 
@@ -494,7 +600,7 @@ fn reduce_payload(conn: &Connection, row: &Row) -> rusqlite::Result<String> {
         })
         .transpose()?;
     conn.execute(
-        "UPDATE call_ledger SET frame_type='Error',frame_body=?3,late_entry=?4 WHERE carrier=?1 AND call_key=?2",
+        "UPDATE call_ledger SET frame_type='Error',frame_body=?3,late_entry=?4,tool_result_source=NULL WHERE carrier=?1 AND call_key=?2",
         params![row.key.carrier, row.key.call_key, frame.body, entry],
     )?;
     Ok(outcome)
@@ -571,6 +677,7 @@ pub fn withdraw(
                 "not_started",
                 Some(WITHDRAWN_REASON),
                 now,
+                None,
             )?;
             held_withdrawn = true;
             WithdrawAnswer::Withdrawn
@@ -792,8 +899,34 @@ pub fn ack_through(
     ack(conn, custodian, through.seq).map(Ok)
 }
 
+/// Whether this process admits keyed tool-provider calls and therefore owns
+/// restart recovery of the call ledger. Only the subc module admits ledger
+/// rows; standalone sessions and CLI commands share the same aft.db but never
+/// write a row, so they must not settle the module's in-flight calls. Unit
+/// tests run as a provider so their direct ledger fixtures keep recovering.
+static LEDGER_PROVIDER_PROCESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(cfg!(test));
+
+/// Marks this process as the call ledger's provider. The subc module calls it
+/// before it can open a database, so its first pool runs restart recovery.
+pub fn mark_provider_process() {
+    LEDGER_PROVIDER_PROCESS.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn is_provider_process() -> bool {
+    LEDGER_PROVIDER_PROCESS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Called once when a process installs its database, before admitting calls.
 /// A dispatch with a durable task is observed, never re-sent.
+///
+/// Recovery settles every unsettled row in the file. Rows record no owning
+/// process, so this is correct only while one module process owns a given
+/// aft.db's call ledger: a second module sharing the file would have its
+/// in-flight calls settled here as not_started or unknown. A change that lets
+/// two modules share one storage root must first add an owner column and limit
+/// recovery to rows whose owner is gone. Processes that never admit calls skip
+/// recovery entirely (see [`recover_pool_once`]).
 pub fn recover(conn: &Connection) -> rusqlite::Result<()> {
     let mut stmt =
         conn.prepare("SELECT carrier,call_key FROM call_ledger WHERE state!='Settled'")?;
@@ -846,9 +979,16 @@ pub fn recover(conn: &Connection) -> rusqlite::Result<()> {
 /// Project actors share the tracked connection. Attaching a second registry
 /// to that connection is not a provider restart. Weak references also avoid
 /// keeping closed databases alive or confusing a reused allocation address.
+///
+/// Does nothing outside the provider process: a standalone session opening
+/// the shared aft.db has no ledger rows of its own, and every unsettled row
+/// there may belong to a module that is still running the call.
 pub fn recover_pool_once(
     pool: &std::sync::Arc<std::sync::Mutex<super::TrackedConnection>>,
 ) -> rusqlite::Result<()> {
+    if !is_provider_process() {
+        return Ok(());
+    }
     type Pool = std::sync::Mutex<super::TrackedConnection>;
     static RECOVERED: std::sync::LazyLock<std::sync::Mutex<Vec<std::sync::Weak<Pool>>>> =
         std::sync::LazyLock::new(Default::default);
@@ -885,6 +1025,18 @@ pub fn observe_task(
     result: Option<&RecordedFrame>,
     outcome: &str,
 ) -> rusqlite::Result<bool> {
+    observe_task_with_tool_result_source(conn, carrier, call_key, task_id, result, outcome, None)
+}
+
+pub fn observe_task_with_tool_result_source(
+    conn: &Connection,
+    carrier: &str,
+    call_key: &str,
+    task_id: &str,
+    result: Option<&RecordedFrame>,
+    outcome: &str,
+    body: Option<&[u8]>,
+) -> rusqlite::Result<bool> {
     let key = Key {
         carrier: carrier.into(),
         call_key: call_key.into(),
@@ -898,7 +1050,7 @@ pub fn observe_task(
         .optional()?
         .unwrap_or(false);
     if let Some(frame) = result.filter(|_| recovered) {
-        settle(conn, &key, frame, outcome, None, now_ms())?;
+        settle_with_tool_result_source(conn, &key, frame, outcome, None, now_ms(), body)?;
     }
     Ok(recovered)
 }
@@ -1202,6 +1354,124 @@ mod tests {
             ty: FrameType::Response,
             body: br#"{ "isError":false,"content":[{"type":"text","text":"kept"}] }"#.to_vec(),
         }
+    }
+
+    #[test]
+    fn tool_result_source_is_bounded_atomic_and_cleared_with_payload() {
+        let conn = database();
+        let key = key("retained-body");
+        let scope = scope("owner");
+        assert!(matches!(
+            admit(&conn, &key, "digest", Some(&scope), State::DispatchStarted).unwrap(),
+            Admission::New
+        ));
+        let legacy = success();
+        let oversized = vec![b'x'; MAX_TOOL_RESULT_SOURCE_BYTES];
+        assert!(settle_with_tool_result_source(
+            &conn,
+            &key,
+            &legacy,
+            "ok",
+            None,
+            1,
+            Some(&oversized)
+        )
+        .is_err());
+        assert!(conn
+            .execute("UPDATE call_ledger SET tool_result_source=?1", [&oversized])
+            .is_err());
+        assert_eq!(
+            get(&conn, &key).unwrap().unwrap().state,
+            State::DispatchStarted
+        );
+        let body = br#"{"content":[{"type":"text","text":"private-projection"}],"isError":false}"#;
+        conn.execute_batch("CREATE TRIGGER fail_result_body BEFORE UPDATE OF tool_result_source ON call_ledger WHEN NEW.tool_result_source IS NOT NULL BEGIN SELECT RAISE(ABORT,'injected result body failure'); END;").unwrap();
+        assert!(
+            settle_with_tool_result_source(&conn, &key, &legacy, "ok", None, 1, Some(body))
+                .is_err()
+        );
+        let row = get_for_replay(&conn, &key).unwrap().unwrap();
+        assert_eq!(row.state, State::DispatchStarted);
+        assert!(
+            row.frame.is_none() && row.tool_result_source.is_none() && row.late_entry.is_none()
+        );
+        conn.execute_batch("DROP TRIGGER fail_result_body").unwrap();
+        assert!(
+            settle_with_tool_result_source(&conn, &key, &legacy, "ok", None, 1, Some(body))
+                .unwrap()
+        );
+        let row = get_for_replay(&conn, &key).unwrap().unwrap();
+        assert_eq!(row.frame.as_ref().unwrap().body, legacy.body);
+        assert_eq!(row.tool_result_source.as_deref(), Some(body.as_slice()));
+        assert!(
+            get(&conn, &key)
+                .unwrap()
+                .unwrap()
+                .tool_result_source
+                .is_none(),
+            "ordinary scans do not load cached images"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(row.late_entry.as_ref().unwrap()).unwrap()["result"],
+            serde_json::from_slice::<Value>(&legacy.body).unwrap()
+        );
+        assert!(!settled_answer(&row)
+            .encode()
+            .to_string()
+            .contains("private-projection"));
+        reduce_expired(&conn, &key, RETENTION_MS + 2).unwrap();
+        assert!(get_for_replay(&conn, &key)
+            .unwrap()
+            .unwrap()
+            .tool_result_source
+            .is_none());
+
+        let reduced = Key {
+            carrier: "retained-body".into(),
+            call_key: "reduced".into(),
+        };
+        admit(
+            &conn,
+            &reduced,
+            "digest",
+            Some(&scope),
+            State::DispatchStarted,
+        )
+        .unwrap();
+        settle_with_tool_result_source(&conn, &reduced, &legacy, "ok", None, 1, Some(body))
+            .unwrap();
+        reduce_payload(&conn, &get(&conn, &reduced).unwrap().unwrap()).unwrap();
+        assert!(get_for_replay(&conn, &reduced)
+            .unwrap()
+            .unwrap()
+            .tool_result_source
+            .is_none());
+        let near_limit = Key {
+            carrier: "retained-body".into(),
+            call_key: "near-limit".into(),
+        };
+        admit(&conn, &near_limit, "digest", None, State::DispatchStarted).unwrap();
+        let mut large_body = body.to_vec();
+        large_body.resize(MAX_TOOL_RESULT_SOURCE_BYTES - 1, b' ');
+        assert!(settle_with_tool_result_source(
+            &conn,
+            &near_limit,
+            &legacy,
+            "ok",
+            None,
+            1,
+            Some(&large_body)
+        )
+        .unwrap());
+        assert_eq!(
+            get_for_replay(&conn, &near_limit)
+                .unwrap()
+                .unwrap()
+                .tool_result_source
+                .unwrap()
+                .len(),
+            MAX_TOOL_RESULT_SOURCE_BYTES - 1
+        );
     }
 
     #[test]

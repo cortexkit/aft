@@ -1,5 +1,6 @@
 //! Source-independent method linking for manifest views. Extraction records only
 //! syntactic receiver evidence; joining never reparses or opens checkout files.
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
@@ -254,6 +255,7 @@ pub fn complete_members(
             .entry(position)
             .or_insert_with(|| scoped_name.clone());
         parse.symbols.push(BlobSymbol {
+            is_test: None,
             ordinal,
             name,
             scoped_name: scoped_name.clone(),
@@ -354,6 +356,11 @@ pub fn extract(
     parse: &ParseBlob,
 ) -> Result<DispatchFacts, ManifestJoinError> {
     let all = descendants(root);
+    let language = parse.language.as_str();
+    let index_receivers = language == "rust";
+    #[cfg(test)]
+    let index_receivers = index_receivers && !UNINDEXED_RECEIVERS.with(|mode| mode.get());
+    let receiver_index = index_receivers.then(|| RustReceiverIndex::new(&all, source));
     let spans = exact_ordinals(parse);
     let callers = symbol_callers(parse);
     let mut symbols_by_name_line = HashMap::new();
@@ -378,7 +385,6 @@ pub fn extract(
             })
             .or_insert(node);
     }
-    let language = parse.language.as_str();
     let mut facts = DispatchFacts::default();
     if language == "rust" {
         for node in &all {
@@ -660,8 +666,16 @@ pub fn extract(
             // unknown object receiver. Preserve the ordinary manifest resolver.
             continue;
         }
-        let receiver = receiver_node
-            .and_then(|receiver| receiver_type(receiver, call, source, language, &facts));
+        let receiver = receiver_node.and_then(|receiver| {
+            receiver_type(
+                receiver,
+                call,
+                source,
+                language,
+                &facts,
+                receiver_index.as_ref(),
+            )
+        });
         facts.sites.push(SiteHint {
             ordinal: reference.ordinal,
             caller: enclosing(call, FUNCTIONS)
@@ -791,13 +805,104 @@ fn syntactic_dynamic(callee: Node<'_>, source: &str, language: &str) -> bool {
     }
 }
 
-fn receiver_type(
-    receiver: Node<'_>,
-    call: Node<'_>,
+/// Rust receiver inference repeatedly consults the same function bodies and
+/// constructor declarations. Borrow subtree slices from the file's existing
+/// preorder instead of collecting another descendant vector for each receiver.
+struct RustReceiverIndex<'nodes, 'tree> {
+    nodes: &'nodes [Node<'tree>],
+    functions: HashMap<usize, (usize, usize)>,
+    constructors: HashSet<String>,
+}
+
+impl<'nodes, 'tree> RustReceiverIndex<'nodes, 'tree> {
+    fn new(nodes: &'nodes [Node<'tree>], source: &str) -> Self {
+        #[cfg(test)]
+        super::extraction_work::note(|work| {
+            work.receiver_index_passes += 1;
+            work.receiver_index_nodes += nodes.len();
+        });
+        let mut index = Self {
+            nodes,
+            functions: HashMap::new(),
+            constructors: HashSet::new(),
+        };
+        let mut ancestors = Vec::<(Node<'tree>, usize, usize)>::new();
+        for (position, &node) in nodes.iter().enumerate() {
+            // Named-child counts close subtrees without parent searches or
+            // ambiguous byte containment at identical and zero-width spans.
+            while ancestors
+                .last()
+                .is_some_and(|(_, _, remaining)| *remaining == 0)
+            {
+                let (ancestor, start, _) = ancestors.pop().unwrap();
+                if FUNCTIONS.contains(&ancestor.kind()) {
+                    index.functions.insert(ancestor.id(), (start, position));
+                }
+            }
+            if let Some((_, _, remaining)) = ancestors.last_mut() {
+                *remaining -= 1;
+            }
+            ancestors.push((node, position, node.named_child_count()));
+            if node.kind() == "function_item" && named(node, source).as_deref() == Some("new") {
+                if let Some((owner, _)) = owner(node, source, "rust") {
+                    if field(node, &["return_type"])
+                        .is_some_and(|ty| ["Self", owner.as_str()].contains(&text(ty, source)))
+                    {
+                        index.constructors.insert(owner);
+                    }
+                }
+            }
+        }
+        for (ancestor, start, _) in ancestors {
+            if FUNCTIONS.contains(&ancestor.kind()) {
+                index.functions.insert(ancestor.id(), (start, nodes.len()));
+            }
+        }
+        index
+    }
+
+    fn function_nodes(&self, function: Node<'tree>) -> Option<&'nodes [Node<'tree>]> {
+        let &(start, end) = self.functions.get(&function.id())?;
+        self.nodes.get(start..end)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static UNINDEXED_RECEIVERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn unindexed_constructor_present(
+    function: Node<'_>,
+    source: &str,
+    language: &str,
+    ty: &str,
+) -> Option<bool> {
+    let constructor_nodes = descendants(enclosing(function, &["source_file"])?);
+    #[cfg(test)]
+    super::extraction_work::note(|work| {
+        work.receiver_constructor_scans += 1;
+        work.receiver_constructor_nodes += constructor_nodes.len();
+    });
+    Some(constructor_nodes.into_iter().any(|node| {
+        node.kind() == "function_item"
+            && named(node, source).as_deref() == Some("new")
+            && owner(node, source, language).is_some_and(|(owner, _)| owner == ty)
+            && field(node, &["return_type"])
+                .is_some_and(|result| ["Self", ty].contains(&text(result, source)))
+    }))
+}
+
+fn receiver_type<'tree>(
+    receiver: Node<'tree>,
+    call: Node<'tree>,
     source: &str,
     language: &str,
     facts: &DispatchFacts,
+    rust_index: Option<&RustReceiverIndex<'_, 'tree>>,
 ) -> Option<String> {
+    #[cfg(test)]
+    super::extraction_work::note(|work| work.receiver_type_calls += 1);
     let value = text(receiver, source);
     let function = enclosing(call, FUNCTIONS)?;
     let current_owner = owner(function, source, language).map(|(o, _)| o);
@@ -806,7 +911,14 @@ fn receiver_type(
             return field(receiver, &["function"]).map(|n| format!("@return:{}", text(n, source)));
         }
         if receiver.kind() == "field_expression" {
-            let base = receiver_type(field(receiver, &["value"])?, call, source, language, facts)?;
+            let base = receiver_type(
+                field(receiver, &["value"])?,
+                call,
+                source,
+                language,
+                facts,
+                rust_index,
+            )?;
             let member = text(field(receiver, &["field"])?, source);
             return Some(format!("@field:{base}|{member}"));
         }
@@ -877,21 +989,31 @@ fn receiver_type(
     }
     // Only declarations in the enclosing function are evidence. Assignments
     // invalidate constructor inference; arbitrary return-value inference is absent.
-    let mut nodes = descendants(function);
+    let indexed_nodes = rust_index.and_then(|index| index.function_nodes(function));
+    let mut nodes: Cow<'_, [Node<'tree>]> = match indexed_nodes {
+        Some(nodes) => Cow::Borrowed(nodes),
+        None => Cow::Owned(descendants(function)),
+    };
     if ["java", "csharp", "kotlin"].contains(&language) {
         if let Some(class) = enclosing(function, TYPES) {
-            nodes.extend(descendants(class).into_iter().filter(|n| {
-                enclosing(*n, FUNCTIONS).is_none()
-                    && [
-                        "field_declaration",
-                        "variable_declarator",
-                        "property_declaration",
-                    ]
-                    .contains(&n.kind())
-            }));
+            nodes
+                .to_mut()
+                .extend(descendants(class).into_iter().filter(|n| {
+                    enclosing(*n, FUNCTIONS).is_none()
+                        && [
+                            "field_declaration",
+                            "variable_declarator",
+                            "property_declaration",
+                        ]
+                        .contains(&n.kind())
+                }));
         }
     }
-    for declaration in &nodes {
+    #[cfg(test)]
+    if indexed_nodes.is_none() {
+        super::extraction_work::note(|work| work.receiver_function_nodes += nodes.len());
+    }
+    for declaration in nodes.iter() {
         if ![
             "required_parameter",
             "optional_parameter",
@@ -1091,15 +1213,10 @@ fn receiver_type(
                     if method != "new" {
                         return Some(format!("@return:{name}"));
                     }
-                    let valid = descendants(enclosing(function, &["source_file"])?)
-                        .into_iter()
-                        .any(|n| {
-                            n.kind() == "function_item"
-                                && named(n, source).as_deref() == Some("new")
-                                && owner(n, source, language).is_some_and(|(o, _)| o == ty)
-                                && field(n, &["return_type"])
-                                    .is_some_and(|t| ["Self", ty].contains(&text(t, source)))
-                        });
+                    let valid = match (rust_index, indexed_nodes) {
+                        (Some(index), Some(_)) => index.constructors.contains(ty),
+                        _ => unindexed_constructor_present(function, source, language, ty)?,
+                    };
                     if valid {
                         return Some(ty.to_string());
                     }

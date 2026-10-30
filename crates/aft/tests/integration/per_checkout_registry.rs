@@ -194,10 +194,18 @@ fn a_sweep_keeps_keys_that_only_another_view_references() {
     let storage = tempdir().unwrap();
     let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
     let a = registry
-        .register_view("scope-a", &storage.path().join("root-a"))
+        .register_view_with_storage(
+            registry.storage(),
+            "scope-a",
+            &storage.path().join("root-a"),
+        )
         .unwrap();
     let b = registry
-        .register_view("scope-b", &storage.path().join("root-b"))
+        .register_view_with_storage(
+            registry.storage(),
+            "scope-b",
+            &storage.path().join("root-b"),
+        )
         .unwrap();
     let published_a = publish(&a, &[("a.txt", b"only in a")], None);
     let published_b = publish(&b, &[("b.txt", b"only in b")], None);
@@ -218,7 +226,11 @@ fn a_reader_pinned_on_a_non_current_generation_keeps_it() {
     let storage = tempdir().unwrap();
     let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
     let b = registry
-        .register_view("scope-b", &storage.path().join("root-b"))
+        .register_view_with_storage(
+            registry.storage(),
+            "scope-b",
+            &storage.path().join("root-b"),
+        )
         .unwrap();
     let old = publish(&b, &[("b.txt", b"old contents")], None);
     let reader = registry.register_reader("parent-folder").unwrap();
@@ -247,7 +259,11 @@ fn a_malformed_pin_aborts_the_sweep_with_nothing_deleted() {
     let storage = tempdir().unwrap();
     let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
     let a = registry
-        .register_view("scope-a", &storage.path().join("root-a"))
+        .register_view_with_storage(
+            registry.storage(),
+            "scope-a",
+            &storage.path().join("root-a"),
+        )
         .unwrap();
     publish(&a, &[("a.txt", b"kept")], None);
     let garbage = put_garbage(&a, b"would be garbage");
@@ -268,7 +284,11 @@ fn an_unreadable_readers_directory_aborts_the_sweep() {
     let storage = tempdir().unwrap();
     let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
     let a = registry
-        .register_view("scope-a", &storage.path().join("root-a"))
+        .register_view_with_storage(
+            registry.storage(),
+            "scope-a",
+            &storage.path().join("root-a"),
+        )
         .unwrap();
     publish(&a, &[("a.txt", b"kept")], None);
     let garbage = put_garbage(&a, b"would be garbage");
@@ -287,7 +307,11 @@ fn a_touch_needs_a_durable_protection_first() {
     let storage = tempdir().unwrap();
     let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
     let a = registry
-        .register_view("scope-a", &storage.path().join("root-a"))
+        .register_view_with_storage(
+            registry.storage(),
+            "scope-a",
+            &storage.path().join("root-a"),
+        )
         .unwrap();
     let key = put_garbage(&a, b"payload");
     let store = a.open_store(FamilyPlane::Trigram).unwrap();
@@ -307,7 +331,9 @@ fn a_removed_root_with_a_marker_only_reader_is_kept_until_two_sweeps_after_it_le
     let root = storage.path().join("root-gone");
     fs::create_dir_all(&root).unwrap();
     let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
-    let view = registry.register_view("scope-gone", &root).unwrap();
+    let view = registry
+        .register_view_with_storage(registry.storage(), "scope-gone", &root)
+        .unwrap();
     let published = publish(&view, &[("gone.txt", b"protected bytes")], None);
     let view_dir = view.view_dir().to_path_buf();
     drop(view);
@@ -404,7 +430,9 @@ fn an_owner_pin_taken_while_removal_is_pending_keeps_the_member() {
     let root = storage.path().join("root-gone");
     fs::create_dir_all(&root).unwrap();
     let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
-    let view = registry.register_view("scope-gone", &root).unwrap();
+    let view = registry
+        .register_view_with_storage(registry.storage(), "scope-gone", &root)
+        .unwrap();
     publish(&view, &[("gone.txt", b"owner bytes")], None);
     let _mounted_volume = age_retention_binding(&registry, &root, true);
     fs::remove_dir_all(&root).unwrap();
@@ -442,7 +470,9 @@ fn a_deregistered_view_cannot_be_pinned() {
     let root = storage.path().join("root-gone");
     fs::create_dir_all(&root).unwrap();
     let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
-    let view = registry.register_view("scope-gone", &root).unwrap();
+    let view = registry
+        .register_view_with_storage(registry.storage(), "scope-gone", &root)
+        .unwrap();
     let _mounted_volume = age_retention_binding(&registry, &root, true);
     fs::remove_dir_all(&root).unwrap();
     for _ in 0..2 {
@@ -508,7 +538,9 @@ fn a_missing_root_without_durable_volume_identity_is_kept() {
     let root = storage.path().join("root-gone");
     fs::create_dir_all(&root).unwrap();
     let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
-    let _view = registry.register_view("scope-gone", &root).unwrap();
+    let _view = registry
+        .register_view_with_storage(registry.storage(), "scope-gone", &root)
+        .unwrap();
     let _unmounted = age_retention_binding(&registry, &root, false);
     let scope = aft::path_identity::project_scope_key(&root);
     let path = registry
@@ -535,7 +567,9 @@ fn a_fixture_volume_override_is_scoped_and_released_by_its_guard() {
     let root = storage.path().join("root-gone");
     fs::create_dir_all(&root).unwrap();
     let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
-    let _view = registry.register_view("scope-gone", &root).unwrap();
+    let _view = registry
+        .register_view_with_storage(registry.storage(), "scope-gone", &root)
+        .unwrap();
     assert!(registry
         .test_volume_uuid_guard(storage.path().parent().unwrap(), "outside")
         .is_err());
@@ -567,7 +601,9 @@ fn an_unreadable_marker_keeps_a_removed_roots_member() {
     let root = storage.path().join("root-gone");
     fs::create_dir_all(&root).unwrap();
     let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
-    let view = registry.register_view("scope-gone", &root).unwrap();
+    let view = registry
+        .register_view_with_storage(registry.storage(), "scope-gone", &root)
+        .unwrap();
     let published = publish(&view, &[("gone.txt", b"bytes")], None);
     let marker_dir = view.view_dir().join("readers").join(&published.generation);
     fs::create_dir_all(&marker_dir).unwrap();
@@ -593,7 +629,11 @@ fn concurrent_equal_manifest_builders_write_privately_and_agree() {
     let storage = tempdir().unwrap();
     let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
     let view = registry
-        .register_view("scope-a", &storage.path().join("root-a"))
+        .register_view_with_storage(
+            registry.storage(),
+            "scope-a",
+            &storage.path().join("root-a"),
+        )
         .unwrap();
     let mut manifest = ManifestV2::new(ManifestHeader {
         producers: producers(),
@@ -635,11 +675,72 @@ fn concurrent_equal_manifest_builders_write_privately_and_agree() {
         .filter(|(_, outcome)| matches!(outcome, PublishV2::EquivalentWinner { .. }))
         .count();
     assert_eq!((published, equivalent), (1, 1), "{outcomes:?}");
-    for (name, _) in &outcomes {
-        assert!(view
-            .view_dir()
-            .join(format!("manifest-{name}.json"))
-            .is_file());
+    let published_name = &outcomes
+        .iter()
+        .find(|(_, outcome)| *outcome == PublishV2::Published)
+        .unwrap()
+        .0;
+    let store = view.view_store().unwrap();
+    store.sweep_generations().unwrap();
+    assert_eq!(
+        store.current_generation().unwrap().as_ref(),
+        Some(published_name)
+    );
+    assert!(store.load_manifest_v2(published_name).is_ok());
+    for (_, outcome) in &outcomes {
+        if let PublishV2::EquivalentWinner { current } = outcome {
+            assert_eq!(current, published_name);
+            assert!(store.load_manifest_v2(current).is_ok());
+        }
+    }
+}
+
+/// Inspecting a builder's private file after commit requires an explicit pin;
+/// an uninstalled losing name is not the generation an EquivalentWinner names.
+#[test]
+fn equal_manifest_builders_can_pin_private_files_after_return() {
+    let storage = tempdir().unwrap();
+    let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+    let view = registry
+        .register_view_with_storage(
+            registry.storage(),
+            "pinned-builders",
+            &storage.path().join("root"),
+        )
+        .unwrap();
+    let manifest = ManifestV2::new(ManifestHeader {
+        producers: producers(),
+        head_tree: None,
+        ignore_fingerprint: None,
+        segment: None,
+    });
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let outcomes = (0..2)
+        .map(|_| {
+            let view = view.clone();
+            let manifest = manifest.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                let store = view.view_store().unwrap();
+                let name = GenerationName::for_manifest(&manifest).unwrap();
+                let pin = AssemblyPin::create_v2(&view, name.to_string(), &[]).unwrap();
+                let prepared = store.prepare_v2(&name, None, &manifest, None).unwrap();
+                barrier.wait();
+                (
+                    name.to_string(),
+                    store.commit_v2(prepared, None).unwrap(),
+                    pin,
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect::<Vec<_>>();
+    let store = view.view_store().unwrap();
+    store.sweep_generations().unwrap();
+    for (name, _, _pin) in &outcomes {
+        assert!(store.load_manifest_v2(name).is_ok());
     }
 }
 
@@ -720,7 +821,9 @@ fn per_checkout_child() {
         "hold-assembly-pin" => {
             let scope = std::env::var("PER_CHECKOUT_SCOPE").unwrap();
             let root = var("PER_CHECKOUT_ROOT").unwrap();
-            let registration = registry.register_view(&scope, &root).unwrap();
+            let registration = registry
+                .register_view_with_storage(registry.storage(), &scope, &root)
+                .unwrap();
             let key_hex = std::env::var("PER_CHECKOUT_KEY").unwrap();
             let key = FamilyKey::new(
                 FamilyPlane::Trigram,
@@ -739,7 +842,9 @@ fn per_checkout_child() {
             let scope = std::env::var("PER_CHECKOUT_SCOPE").unwrap();
             let root = var("PER_CHECKOUT_ROOT").unwrap();
             let step = std::env::var("PER_CHECKOUT_STEP").unwrap();
-            let registration = registry.register_view(&scope, &root).unwrap();
+            let registration = registry
+                .register_view_with_storage(registry.storage(), &scope, &root)
+                .unwrap();
             let files: [(&str, &[u8]); 2] = [
                 ("a.txt", b"generation two a"),
                 ("c.txt", b"generation two c"),
@@ -849,7 +954,11 @@ fn a_key_reused_after_marking_survives_the_sweep() {
     let storage = tempdir().unwrap();
     let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
     let a = registry
-        .register_view("scope-a", &storage.path().join("root-a"))
+        .register_view_with_storage(
+            registry.storage(),
+            "scope-a",
+            &storage.path().join("root-a"),
+        )
         .unwrap();
     publish(&a, &[("a.txt", b"published")], None);
     let reused = put_garbage(&a, b"old payload that gets reused");
@@ -881,7 +990,11 @@ fn registration_and_publication_during_a_sweep_are_safe() {
     let storage = tempdir().unwrap();
     let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
     let a = registry
-        .register_view("scope-a", &storage.path().join("root-a"))
+        .register_view_with_storage(
+            registry.storage(),
+            "scope-a",
+            &storage.path().join("root-a"),
+        )
         .unwrap();
     publish(&a, &[("a.txt", b"a")], None);
     put_garbage(&a, b"unreferenced sweep candidate");
@@ -889,7 +1002,11 @@ fn registration_and_publication_during_a_sweep_are_safe() {
     let mut late = None;
     with_sweep_paused_after_marking(storage.path(), || {
         let c = registry
-            .register_view("scope-c", &storage.path().join("root-c"))
+            .register_view_with_storage(
+                registry.storage(),
+                "scope-c",
+                &storage.path().join("root-c"),
+            )
             .unwrap();
         late = Some(publish(
             &c,
@@ -911,7 +1028,11 @@ fn a_stopped_but_live_pin_owner_keeps_its_keys() {
     let storage = tempdir().unwrap();
     let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
     let a = registry
-        .register_view("scope-a", &storage.path().join("root-a"))
+        .register_view_with_storage(
+            registry.storage(),
+            "scope-a",
+            &storage.path().join("root-a"),
+        )
         .unwrap();
     let key = put_garbage(&a, b"relied on by a stopped assembler");
     let control = tempdir().unwrap();
@@ -979,7 +1100,8 @@ fn a_publisher_killed_at_any_durability_boundary_leaves_protected_bytes_readable
         v2_steps.to_vec(),
         DurabilityStep::ALL
             .into_iter()
-            .filter(|step| !DurabilityStep::V3_ONLY.contains(step))
+            .filter(|step| !DurabilityStep::V3_ONLY.contains(step)
+                && !DurabilityStep::BASE_PATH.contains(step))
             .collect::<Vec<_>>()
     );
     for step in v2_steps {
@@ -987,7 +1109,9 @@ fn a_publisher_killed_at_any_durability_boundary_leaves_protected_bytes_readable
         let root = storage.path().join("root-a");
         fs::create_dir_all(&root).unwrap();
         let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
-        let view = registry.register_view("scope-a", &root).unwrap();
+        let view = registry
+            .register_view_with_storage(registry.storage(), "scope-a", &root)
+            .unwrap();
         let first = publish(
             &view,
             &[
@@ -1098,7 +1222,9 @@ fn a_v3_copy_killed_at_either_v3_boundary_keeps_its_source_and_restarts() {
         let root = storage.path().join("root-a");
         fs::create_dir_all(&root).unwrap();
         let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
-        let view = registry.register_view("scope-a", &root).unwrap();
+        let view = registry
+            .register_view_with_storage(storage.path(), "scope-a", &root)
+            .unwrap();
         let key = put_garbage(&view, b"payload copied into v3");
         let payload = trigram_store(storage.path()).get(&key).unwrap().unwrap();
         let control = tempdir().unwrap();
@@ -1222,7 +1348,7 @@ fn a_v2_publication_crosses_no_v3_boundary_and_keeps_its_schema() {
     let storage = tempdir().unwrap();
     let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
     let view = registry
-        .register_view("scope-a", &storage.path().join("root-a"))
+        .register_view_with_storage(storage.path(), "scope-a", &storage.path().join("root-a"))
         .unwrap();
     publish(&view, &[("a.txt", b"first")], None);
     let store =
@@ -1269,7 +1395,9 @@ fn a_generation_published_by_an_exited_process_survives_restart_and_sweeps() {
     assert_eq!(member.view_dir, view);
     let reader = registry.register_reader("restart-check").unwrap();
     let pinned = reader.protect_current("scope-a").unwrap().unwrap();
-    let registration = registry.register_view("scope-a", &root).unwrap();
+    let registration = registry
+        .register_view_with_storage(registry.storage(), "scope-a", &root)
+        .unwrap();
     let manifest = registration
         .view_store()
         .unwrap()
@@ -1384,7 +1512,9 @@ impl aft::views::parity_harness::PlaneOracle for MembershipOracle {
     ) -> Membership {
         // Publish the frozen checkout into the empty store and read it back.
         let registry = FamilyRegistry::open(store.path(), FAMILY).unwrap();
-        let view = registry.register_view("cold", frozen.root()).unwrap();
+        let view = registry
+            .register_view_with_storage(registry.storage(), "cold", frozen.root())
+            .unwrap();
         let manifest =
             manifest_of(&aft::views::parity_harness::walker_membership(frozen.root()).unwrap());
         let view_store = view.view_store().unwrap();

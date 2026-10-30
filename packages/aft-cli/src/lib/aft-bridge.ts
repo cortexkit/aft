@@ -108,6 +108,7 @@ export async function sendAftRequest(
 export async function sendAftRequests(
   binaryPath: string,
   requests: AftRequest[],
+  timeoutMs = 120_000,
 ): Promise<AftResponse[]> {
   return new Promise((resolve, reject) => {
     const child = spawn(binaryPath, [], {
@@ -119,10 +120,17 @@ export async function sendAftRequests(
     let noiseLineCount = 0;
     let stderr = "";
     let settled = false;
+    let timedOut = false;
+    const deadline = setTimeout(() => {
+      timedOut = true;
+      // Rejection waits for close so the child is reaped and stderr has drained.
+      child.kill("SIGKILL");
+    }, timeoutMs);
 
     const finish = (fn: () => void): void => {
       if (settled) return;
       settled = true;
+      clearTimeout(deadline);
       child.kill();
       fn();
     };
@@ -173,7 +181,7 @@ export async function sendAftRequests(
     });
     child.stdout.setEncoding("utf-8");
     child.stdout.on("data", (chunk: string) => {
-      if (settled) return;
+      if (settled || timedOut) return;
       stdoutLines.push(chunk);
     });
 
@@ -195,6 +203,21 @@ export async function sendAftRequests(
     // every line has been processed by handleLine.
     child.on("close", (code) => {
       if (settled) return;
+      if (timedOut) {
+        const received = new Set(responses.map((response) => response.id));
+        const pending = requests
+          .filter((request) => !received.has(request.id))
+          .map((request) => request.command);
+        finish(() =>
+          reject(
+            new Error(
+              `aft request deadline exceeded; pending: ${pending.join(", ")}.\n${stderr.trim()}`,
+              { cause: { exitCode: code, signal: child.signalCode } },
+            ),
+          ),
+        );
+        return;
+      }
       finish(() =>
         reject(
           buildBridgeError({ binaryPath, code, stderr, noiseLines, noiseLineCount, responses }),

@@ -330,6 +330,8 @@ pub(crate) fn rank_collection(
 
     RankedFiles {
         summary: GrepResult {
+            index_sources_unavailable: false,
+            index_read_gaps: Vec::new(),
             matches: files.iter().map(|file| file.lines[0].clone()).collect(),
             total_matches,
             files_searched: collection.files_examined,
@@ -416,9 +418,14 @@ pub(crate) struct RankedFiles {
     pub files: Vec<RankedFile>,
 }
 
+/// The count line of a ranked page. A ranked page lists one result per
+/// file, so the line counts files first, then the matching lines in them.
+pub(crate) const RANKED_COUNT_LINE: &str =
+    "{files} files match ({lines} matching lines); one result per file, definitions first.";
+
 /// Render one page of ranked files the way grep renders matches: each file's
-/// path, then its listed lines, then how many more lines it has. The footer
-/// counts every match in the examined files.
+/// path, then its listed lines, then how many more lines it has. The count
+/// line under them covers every match in the examined files.
 pub(crate) fn format_ranked_page(
     page: &[RankedFile],
     summary: &GrepResult,
@@ -444,13 +451,14 @@ pub(crate) fn format_ranked_page(
         }
         sections.push(section);
     }
-    // grep's renderer with no matches is exactly its footer.
-    let footer = crate::commands::grep::format_grep_text(
-        &GrepResult {
-            matches: Vec::new(),
-            ..summary.clone()
-        },
-        project_root,
+    // The count line ends with the same cap and index tags grep's footer
+    // carries, so a floor or a non-ready index is still disclosed.
+    let footer = format!(
+        "{}{}",
+        RANKED_COUNT_LINE
+            .replace("{files}", &summary.files_with_matches.to_string())
+            .replace("{lines}", &summary.total_matches.to_string()),
+        crate::commands::grep::grep_footer_tags(summary)
     );
     if sections.is_empty() {
         footer
@@ -783,7 +791,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("\n4:   addToCart(item);\n+25 more in this file\n\nFound 0 match"),
+            text.contains("\n4:   addToCart(item);\n+25 more in this file\n\n0 files match"),
             "{text}"
         );
     }
@@ -807,19 +815,21 @@ mod tests {
             panic!("pattern compiles");
         };
         let collect = |max_files: usize, max_lines_per_file: usize| {
-            snapshot.collect_grep_matches_by_file(
-                &pattern,
-                &PathFilters::default(),
-                &root,
-                None,
-                GrepExaminationLimits {
-                    max_files,
-                    budget: Duration::from_secs(60),
-                    max_lines_per_file,
-                },
-                &examine_priority,
-                &|grep_match: &GrepMatch| grep_match.line_text.contains("alpha(); alpha"),
-            )
+            snapshot
+                .collect_grep_matches_by_file(
+                    &pattern,
+                    &PathFilters::default(),
+                    &root,
+                    None,
+                    GrepExaminationLimits {
+                        max_files,
+                        budget: Duration::from_secs(60),
+                        max_lines_per_file,
+                    },
+                    &examine_priority,
+                    &|grep_match: &GrepMatch| grep_match.line_text.contains("alpha(); alpha"),
+                )
+                .unwrap()
         };
 
         let all = collect(100, 100);

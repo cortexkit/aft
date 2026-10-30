@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "macos-kill-exiting-process"
+  ],
+  "note": "macOS process-group listing reads kp_proc.p_flag so a process whose exit has started counts as gone. No search code changed and no changed path matches RANKING_FENCE_PREFIXES."
+}

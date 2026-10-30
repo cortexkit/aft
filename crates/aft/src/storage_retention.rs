@@ -1,10 +1,12 @@
 //! Durable checkout retention, independent of the roots an actor has opened.
 //!
-//! A missing path is necessary but not sufficient for deletion: binding history
+//! For age-based deletion, a missing path is necessary but not sufficient: binding history
 //! must also be old, and all writers, pins, readers and local SQLite handles must
 //! have gone. Unknown keys receive a fresh observation grace instead of treating
 //! an old payload mtime as proof that a root has not recently been bound.
-use std::collections::{BTreeMap, HashMap, HashSet};
+//! V3 families also shed idle view members above their allocated-byte target,
+//! even when the checkout still exists, without bypassing reader or writer holds.
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, ReadDir};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -25,6 +27,7 @@ pub(crate) const ROOT_GRACE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// other check still applies: the root must be confirmed missing, its volume
 /// must match, and nothing may hold a writer, pin, reader or SQLite handle.
 const LINKED_WORKTREE_REBIND_MARGIN_MS: u64 = 10 * 60 * 1000;
+use crate::root_cache::StoragePaths;
 /// A checkout view folder (`views/<scope>`) that no family registry lists and
 /// no binding history describes was never tied to a checkout this storage
 /// knows about, typically an abandoned build. It is reclaimed once it has
@@ -39,7 +42,8 @@ const INTERVAL: Duration = Duration::from_secs(10 * 60);
 const STARTUP_GRACE: Duration = Duration::from_secs(5 * 60);
 const PASS_BUDGET: Duration = Duration::from_secs(5);
 const PASS_ENTRIES: usize = 64;
-const TREE_ENTRIES: usize = 4096;
+pub(crate) const TREE_ENTRIES: usize = 4096;
+const TRASH_SCAN_HANDLES: usize = 64;
 const HISTORY_ENTRIES: usize = 8192;
 static REPORTED_BINDING_READ_ERRORS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 const DOMAINS: [&str; 6] = [
@@ -93,6 +97,8 @@ pub(crate) struct SweepReport {
     /// Vanished-checkout view folders still due after this pass. Protected
     /// folders remain in this count so a stalled backlog is visible in health.
     pub due_views_remaining: usize,
+    /// Last background trash census, updated independently of the root sweep.
+    pub trash: TrashReport,
     /// The share of this pass spent on keys already past their grace.
     pub due_first: DomainReport,
     /// The share of this pass spent on view folders with no registry member
@@ -101,12 +107,80 @@ pub(crate) struct SweepReport {
     pub stopped_early: bool,
     pub cancelled: bool,
     pub errors: Vec<String>,
+    /// View folders larger than one generation-cleanup pass examines, each
+    /// with what that pass could not prove. Cleanup still shrinks them a
+    /// bounded window at a time, keeping anything it cannot prove unshared.
+    pub oversized_views: Vec<String>,
     /// Blob families this pass left for a later pass, each with the reason,
     /// such as `blobs/v3/<family>: reservation_busy`.
     pub skipped_families: Vec<String>,
     pub domains: BTreeMap<String, DomainReport>,
     /// Wall time by stage, including setup and blob work outside the root budget.
     pub timings_ms: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct TrashReport {
+    pub at_ms: u64,
+    /// Remaining entries and logical bytes observed by a bounded, no-follow walk.
+    pub entries: usize,
+    pub bytes_estimate: u64,
+    pub oldest_age_ms: Option<u64>,
+    pub removed_entries: usize,
+    /// The census could not examine all trash or measure every remaining tree.
+    pub incomplete: bool,
+    /// Counts kept entries, or deferred containers when admission or census failed.
+    pub kept_by_reason: BTreeMap<String, usize>,
+    /// Work examined by the pass's read-only durable-directory census.
+    pub protection_census: crate::bash_background::persistence::IdentityCensus,
+    pub protection_failure: Option<ProtectionFailure>,
+    /// A failed protection decision remains visible while reaping backs off.
+    pub protection_retry_at_ms: Option<u64>,
+    /// The durable-storage census (directory identities no trash removal may
+    /// touch), taken at most once per reaper pass and shared by every trash
+    /// container that pass visits. Taking it again for each container spent
+    /// the pass budget before later domains (`inspect` and after) were
+    /// reached. Not part of the published report.
+    #[serde(skip)]
+    pub(crate) protections: Option<Result<Arc<Vec<(u64, u64)>>, Arc<io::Error>>>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProtectionFailure {
+    Budget,
+    Cancelled,
+    Unavailable,
+}
+
+impl ProtectionFailure {
+    fn from_error(error: &io::Error) -> Self {
+        if error.kind() == io::ErrorKind::Interrupted {
+            Self::Cancelled
+        } else if crate::bash_background::persistence::is_repair_budget_stop(error) {
+            Self::Budget
+        } else {
+            Self::Unavailable
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Budget => "protections_budget",
+            Self::Cancelled => "protections_cancelled",
+            Self::Unavailable => "protections_unavailable",
+        }
+    }
+}
+
+impl TrashReport {
+    fn keep(&mut self, path: &Path, reason: &str, detail: impl std::fmt::Display) {
+        *self.kept_by_reason.entry(reason.into()).or_default() += 1;
+        crate::slog_warn!(
+            "storage retention trash={} retained reason={reason}: {detail}",
+            path.display()
+        );
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -175,7 +249,69 @@ struct State {
     /// The last key the due-first lane processed, so keys that stay protected
     /// cannot starve the ones after them.
     due_cursor: Option<String>,
+    /// Process-local LRU windows resume past held members. Restarting merely
+    /// repeats protection checks; no cache or registry format is changed.
+    v3_idle_after: HashMap<String, (u64, String)>,
     reaping: bool,
+    trash: TrashReport,
+    reaper_cancelled: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    protection_failures: u32,
+    protection_retry: Option<Instant>,
+}
+
+impl State {
+    fn record_trash(&mut self, mut report: TrashReport, now: Instant) {
+        if report.protection_failure.is_some() {
+            self.protection_failures = self.protection_failures.saturating_add(1);
+            // Skip at least one scheduled pass after a failed census. Repeated
+            // failures reach an hourly retry without spending CPU every interval.
+            let delay = (INTERVAL * 2u32.saturating_pow(self.protection_failures.min(3)))
+                .min(Duration::from_secs(60 * 60));
+            self.protection_retry = Some(now + delay);
+            report.protection_retry_at_ms =
+                Some(crate::pins::now_ms().saturating_add(delay.as_millis() as u64));
+        } else {
+            self.protection_failures = 0;
+            self.protection_retry = None;
+        }
+        self.trash = report.clone();
+        if let Some(sweep) = &mut self.report {
+            sweep.trash = report;
+        }
+    }
+
+    fn reaper_ready(&self, now: Instant) -> bool {
+        !self.reaping && self.protection_retry.is_none_or(|retry| now >= retry)
+    }
+}
+
+struct TrashScan {
+    identity: (u64, u64),
+    entries: Option<ReadDir>,
+    deferred: VecDeque<fs::DirEntry>,
+    omitted_prefix: bool,
+    touched: Instant,
+}
+
+type TrashScans = HashMap<(PathBuf, PathBuf), Option<TrashScan>>;
+
+fn trash_scans() -> &'static Mutex<TrashScans> {
+    static SCANS: OnceLock<Mutex<TrashScans>> = OnceLock::new();
+    SCANS.get_or_init(Mutex::default)
+}
+
+struct TrashScanLease(Option<(PathBuf, PathBuf)>);
+
+impl Drop for TrashScanLease {
+    fn drop(&mut self) {
+        if let Some(key) = self.0.take() {
+            let cursor = trash_scans()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&key);
+            drop(cursor);
+        }
+    }
 }
 
 pub(crate) fn startup_sweeps_ready(storage: &Path) -> bool {
@@ -278,6 +414,15 @@ pub(crate) fn allow_next_scheduled_pass_for_test(storage: &Path) {
 }
 
 #[cfg(test)]
+fn reaper_running_for_test(artifacts: &Path) -> bool {
+    states()
+        .lock()
+        .unwrap()
+        .get(artifacts)
+        .is_some_and(|state| state.reaping)
+}
+
+#[cfg(test)]
 pub(crate) fn scheduled_pass_finished_for_test(storage: &Path) -> bool {
     states()
         .lock()
@@ -290,13 +435,34 @@ fn key_valid(key: &str) -> bool {
     key.len() == 16 && key.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+pub(crate) struct Barrier {
+    _metadata: crate::fs_lock::LockGuard,
+    _artifacts: crate::fs_lock::LockGuard,
+}
 pub(crate) fn barrier(storage: &Path) -> io::Result<crate::fs_lock::LockGuard> {
-    fs::create_dir_all(storage.join("retention"))?;
-    crate::fs_lock::try_acquire(
+    crate::private_storage::create_dir_all(storage.join("retention"))?;
+    let metadata = crate::fs_lock::try_acquire(
         &storage.join("retention/sweep.lock"),
         Duration::from_secs(5),
     )
-    .map_err(|error| io::Error::other(error.to_string()))
+    .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(metadata)
+}
+pub(crate) fn cache_barrier(storage: &StoragePaths) -> io::Result<Barrier> {
+    Ok(Barrier {
+        _metadata: barrier(&storage.durable)?,
+        _artifacts: artifact_barrier(&storage.artifacts)?,
+    })
+}
+
+fn artifact_barrier(artifacts: &Path) -> io::Result<crate::fs_lock::LockGuard> {
+    crate::root_cache::check_cache_access(artifacts)?;
+    crate::private_storage::create_dir_all(artifacts)?;
+    crate::fs_lock::try_acquire(
+        &artifacts.join(".retention-sweep.lock"),
+        Duration::from_secs(5),
+    )
+    .map_err(io::Error::other)
 }
 
 // Keep admission on sweep.lock so older binaries sharing this storage still
@@ -325,14 +491,27 @@ fn yield_to_bind(storage: &Path) -> io::Result<()> {
 
 /// V1 has no ref-epoch handoff. Serialize pin admission with its marking pass.
 /// V2 pins use the family registry's epoch/barrier protocol instead.
-pub(crate) fn pin_barrier(view_dir: &Path) -> io::Result<Option<crate::fs_lock::LockGuard>> {
-    let Some(views) = view_dir
+///
+/// Pin creation takes both retention locks, through [`cache_barrier`]: the
+/// durable root's `retention/sweep.lock` first, then the artifact root's
+/// `.retention-sweep.lock`, the one order every path that takes both uses.
+/// Older AFT releases sharing the storage root collect blobs holding only
+/// `retention/sweep.lock`; a pin written without it could land after such a
+/// collector read the pins and before it deleted blobs. With no separate
+/// cache root both names are under the same root but are different files, so
+/// nothing is locked twice.
+pub(crate) fn pin_barrier(view_dir: &Path) -> io::Result<Option<Barrier>> {
+    let Some(artifacts) = view_dir
         .parent()
         .filter(|parent| parent.file_name().is_some_and(|name| name == "views"))
+        .and_then(Path::parent)
     else {
         return Ok(None);
     };
-    views.parent().map(barrier).transpose()
+    // A prepared cache root resolves to the durable root that owns it; any
+    // other root is its own durable root.
+    let durable = crate::root_cache::identity_storage_root(artifacts).into_owned();
+    cache_barrier(&StoragePaths::new(durable, artifacts.to_path_buf())).map(Some)
 }
 
 fn atomic_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
@@ -348,9 +527,16 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
 }
 
 /// Called before cache acquisition, on every configure, even a same-key rebind.
-pub(crate) fn record_bind(storage: &Path, root: &Path, artifact_key: &str) -> io::Result<()> {
+pub(crate) fn record_bind(
+    storage: &StoragePaths,
+    root: &Path,
+    artifact_key: &str,
+) -> io::Result<()> {
+    // Cache-root enrollment completes before binding. Binding history and unknown
+    // observations belong to the durable owner, even when artifacts live elsewhere;
+    // publish both in the group round rather than reacquiring its lock per caller.
     record_bind_until(
-        storage,
+        &storage.durable,
         root,
         artifact_key,
         Instant::now() + BIND_QUEUE_WAIT,
@@ -948,7 +1134,8 @@ fn device(path: &Path) -> Option<u64> {
             filesystem_length: u32,
         ) -> i32;
     }
-    let path = path
+    // A deep cache parent is past the plain-path limit of GetVolumePathNameW.
+    let path = crate::windows_path::win32_call_path(path)
         .as_os_str()
         .encode_wide()
         .chain(Some(0))
@@ -1062,7 +1249,7 @@ fn volume_uuid(_path: &Path) -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn boot_id() -> Option<String> {
+pub(crate) fn boot_id() -> Option<String> {
     let mut buffer = [0_u8; 128];
     let mut size = buffer.len();
     let result = unsafe {
@@ -1114,6 +1301,9 @@ pub(crate) fn volume_anchor(root: &Path) -> Option<(PathBuf, u64)> {
         }
         Some((anchor.to_path_buf(), dev))
     }
+}
+pub(crate) fn cache_volume_uuid(root: &Path) -> Option<String> {
+    volume_uuid(root)
 }
 
 fn mount_matches(binding: &Binding) -> bool {
@@ -1497,7 +1687,7 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {
     serde_json::from_slice(&fs::read(path)?).map_err(io::Error::other)
 }
 
-fn bounded_dirs(directory: &Path, cap: usize) -> io::Result<Vec<fs::DirEntry>> {
+pub(crate) fn bounded_dirs(directory: &Path, cap: usize) -> io::Result<Vec<fs::DirEntry>> {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1513,13 +1703,52 @@ fn bounded_dirs(directory: &Path, cap: usize) -> io::Result<Vec<fs::DirEntry>> {
     Ok(result)
 }
 
-fn bindings(storage: &Path) -> io::Result<BTreeMap<String, Vec<Binding>>> {
-    bindings_with_admission(storage, false)
+#[derive(Default)]
+struct RootIdentities {
+    // History is reread under admission before retirement. Reuse the same
+    // canonical_root output across those reads, but never across passes: a
+    // checkout path can be removed or repointed between retention runs.
+    by_root: HashMap<PathBuf, PathBuf>,
+    #[cfg(test)]
+    resolutions: usize,
 }
 
+impl RootIdentities {
+    fn canonical_root(&mut self, root: &Path) -> PathBuf {
+        if let Some(canonical) = self.by_root.get(root) {
+            return canonical.clone();
+        }
+        #[cfg(test)]
+        {
+            self.resolutions += 1;
+        }
+        let canonical = crate::root_cache::canonical_root(root);
+        self.by_root.insert(root.to_path_buf(), canonical.clone());
+        canonical
+    }
+}
+
+fn bindings(
+    storage: &StoragePaths,
+    roots: &mut RootIdentities,
+) -> io::Result<BTreeMap<String, Vec<Binding>>> {
+    bindings_with_admission(storage, false, roots)
+}
+
+/// Retention bookkeeping (root bindings, the cache-key memo, owner manifests,
+/// the bind-pending lock) is durable state under `storage.durable`.
 fn bindings_with_admission(
-    storage: &Path,
+    storage: &StoragePaths,
     admission: bool,
+    roots: &mut RootIdentities,
+) -> io::Result<BTreeMap<String, Vec<Binding>>> {
+    bindings_with_root_resolver(storage, admission, &mut |root| roots.canonical_root(root))
+}
+
+fn bindings_with_root_resolver(
+    storage: &StoragePaths,
+    admission: bool,
+    canonical_root: &mut impl FnMut(&Path) -> PathBuf,
 ) -> io::Result<BTreeMap<String, Vec<Binding>>> {
     #[derive(Deserialize)]
     struct Memo {
@@ -1528,16 +1757,16 @@ fn bindings_with_admission(
     }
     let mut result: BTreeMap<String, Vec<Binding>> = BTreeMap::new();
     #[cfg(test)]
-    test_hook(storage, "history-read");
+    test_hook(&storage.artifacts, "history-read");
     if admission {
-        yield_to_bind(storage)?;
+        yield_to_bind(&storage.durable)?;
     }
     #[cfg(test)]
     if admission {
-        test_hook(&storage.join("retention"), "admission-history");
+        test_hook(&storage.durable.join("retention"), "admission-history");
     }
     let mut linked_roots = HashMap::new();
-    let memo = storage.join("cache-keys.json");
+    let memo = storage.durable.join("cache-keys.json");
     if memo.exists() {
         let memo: BTreeMap<String, Memo> = read_json(&memo)?;
         if memo.len() > HISTORY_ENTRIES {
@@ -1545,7 +1774,7 @@ fn bindings_with_admission(
         }
         for (root, entry) in memo {
             if admission {
-                yield_to_bind(storage)?;
+                yield_to_bind(&storage.durable)?;
             }
             let binding = Binding {
                 root: root.into(),
@@ -1566,9 +1795,9 @@ fn bindings_with_admission(
         }
     }
     let mut root_binding_scopes = HashSet::new();
-    for entry in bounded_dirs(&storage.join("retention/roots"), HISTORY_ENTRIES)? {
+    for entry in bounded_dirs(&storage.durable.join("retention/roots"), HISTORY_ENTRIES)? {
         if admission {
-            yield_to_bind(storage)?;
+            yield_to_bind(&storage.durable)?;
         }
         if entry
             .path()
@@ -1587,19 +1816,19 @@ fn bindings_with_admission(
         let binding = match read_binding_record(&path) {
             Ok((_, binding)) => binding,
             Err(error) => {
-                handle_binding_read_error(storage, &path, error, false, false);
+                handle_binding_read_error(&storage.durable, &path, error, false, false);
                 // The filename still identifies this scope. Keep it out of
                 // orphan cleanup until a readable binding replaces the record.
                 result
                     .entry(scope.clone())
                     .or_default()
-                    .push(unreadable_binding_sentinel(storage, &scope));
+                    .push(unreadable_binding_sentinel(&storage.durable, &scope));
                 continue;
             }
         };
         if binding.linked_worktree {
             linked_roots.insert(
-                crate::root_cache::canonical_root(&binding.root),
+                canonical_root(&binding.root),
                 (binding.volume.clone(), binding.stable_volume.clone()),
             );
         }
@@ -1610,7 +1839,7 @@ fn bindings_with_admission(
             .or_default()
             .push(binding);
     }
-    let quarantine_root = storage.join("retention/quarantine/roots");
+    let quarantine_root = storage.durable.join("retention/quarantine/roots");
     for entry in bounded_dirs(&quarantine_root, HISTORY_ENTRIES)? {
         let path = entry.path();
         if path.extension().is_none_or(|extension| extension != "json") {
@@ -1627,12 +1856,12 @@ fn bindings_with_admission(
             result
                 .entry(scope.to_owned())
                 .or_default()
-                .push(unreadable_binding_sentinel(storage, scope));
+                .push(unreadable_binding_sentinel(&storage.durable, scope));
         }
     }
-    for entry in bounded_dirs(&storage.join("artifact-owners"), HISTORY_ENTRIES)? {
+    for entry in bounded_dirs(&storage.durable.join("artifact-owners"), HISTORY_ENTRIES)? {
         if admission {
-            yield_to_bind(storage)?;
+            yield_to_bind(&storage.durable)?;
         }
         if !entry.file_type()?.is_dir() {
             continue;
@@ -1668,10 +1897,14 @@ fn bindings_with_admission(
     for records in result.values_mut() {
         for binding in records {
             if admission {
-                yield_to_bind(storage)?;
+                yield_to_bind(&storage.durable)?;
             }
-            if let Some((volume, stable_volume)) =
-                linked_roots.get(&crate::root_cache::canonical_root(&binding.root))
+            // Keep yield_to_bind above the empty-map check so checkout binding
+            // can still interrupt this scan, even when there is no topology to copy.
+            if linked_roots.is_empty() {
+                continue;
+            }
+            if let Some((volume, stable_volume)) = linked_roots.get(&canonical_root(&binding.root))
             {
                 binding.linked_worktree = true;
                 if binding.volume.is_none() {
@@ -1684,12 +1917,12 @@ fn bindings_with_admission(
     Ok(result)
 }
 
-fn domain_paths(storage: &Path) -> io::Result<Vec<(PathBuf, bool)>> {
+fn domain_paths(storage: &StoragePaths) -> io::Result<Vec<(PathBuf, bool)>> {
     let mut result = DOMAINS
         .iter()
-        .map(|domain| (storage.join(domain), false))
+        .map(|domain| (storage.artifacts.join(domain), false))
         .collect::<Vec<_>>();
-    for entry in bounded_dirs(storage, 128)? {
+    for entry in bounded_dirs(&storage.durable, 128)? {
         let name = entry.file_name().to_string_lossy().into_owned();
         if entry.file_type()?.is_dir()
             && (matches!(name.as_str(), "opencode" | "pi" | "runner")
@@ -1702,6 +1935,12 @@ fn domain_paths(storage: &Path) -> io::Result<Vec<(PathBuf, bool)>> {
         }
     }
     Ok(result)
+}
+fn relative_domain(storage: &StoragePaths, path: &Path) -> io::Result<PathBuf> {
+    path.strip_prefix(&storage.artifacts)
+        .or_else(|_| path.strip_prefix(&storage.durable))
+        .map(Path::to_path_buf)
+        .map_err(io::Error::other)
 }
 
 /// A lexical entry name, rather than a ReadDir offset, survives process and
@@ -1728,7 +1967,7 @@ struct TraversalBatch {
 /// Retain at most `limit` names, ordered lexically after the last processed name.
 /// Directory enumeration is metadata-only; no cache payload or SQLite file is opened.
 fn traversal_batch(
-    storage: &Path,
+    storage: &StoragePaths,
     domains: &[(PathBuf, bool)],
     kind: &str,
     limit: usize,
@@ -1736,16 +1975,27 @@ fn traversal_batch(
     traversal_batch_filtered(storage, domains, kind, limit, &|_| true)
 }
 
+/// Retention cursors are durable state. With a separate cache root they are
+/// kept per artifact-root identity, so a different cache volume starts its
+/// own laps instead of resuming another volume's position.
+fn cursor_root(storage: &StoragePaths) -> io::Result<PathBuf> {
+    let cursor_root = storage.durable.join("retention/cursors");
+    if storage.durable == storage.artifacts {
+        return Ok(cursor_root);
+    }
+    let identity = crate::config_live::dir_identity(&storage.artifacts)
+        .ok_or_else(|| io::Error::other("artifact-root identity unavailable"))?;
+    Ok(cursor_root.join(format!("{}-{}", identity.0, identity.1)))
+}
+
 fn traversal_batch_filtered(
-    storage: &Path,
+    storage: &StoragePaths,
     domains: &[(PathBuf, bool)],
     kind: &str,
     limit: usize,
     include: &dyn Fn(&fs::DirEntry) -> bool,
 ) -> io::Result<TraversalBatch> {
-    let cursor_path = storage
-        .join("retention/cursors")
-        .join(format!("{kind}.json"));
+    let cursor_path = cursor_root(storage)?.join(format!("{kind}.json"));
     let mut cursor: TraversalCursor = match read_json(&cursor_path) {
         Ok(cursor) => cursor,
         Err(error) if error.kind() == io::ErrorKind::NotFound => TraversalCursor::default(),
@@ -1753,7 +2003,9 @@ fn traversal_batch_filtered(
     };
     let mut domain = domains
         .iter()
-        .position(|(path, _)| path.strip_prefix(storage).ok() == Some(cursor.domain.as_path()))
+        .position(|(path, _)| {
+            relative_domain(storage, path).ok().as_deref() == Some(cursor.domain.as_path())
+        })
         .unwrap_or(0);
     if domains.is_empty() {
         return Ok(TraversalBatch {
@@ -1765,10 +2017,7 @@ fn traversal_batch_filtered(
     let mut result = Vec::new();
     for _ in 0..domains.len() {
         let (directory, flat) = &domains[domain];
-        let relative = directory
-            .strip_prefix(storage)
-            .map_err(io::Error::other)?
-            .to_path_buf();
+        let relative = relative_domain(storage, &directory)?;
         if cursor.domain != relative {
             cursor = TraversalCursor {
                 domain: relative.clone(),
@@ -1815,11 +2064,7 @@ fn traversal_batch_filtered(
         }
         domain = (domain + 1) % domains.len();
         cursor = TraversalCursor {
-            domain: domains[domain]
-                .0
-                .strip_prefix(storage)
-                .map_err(io::Error::other)?
-                .to_path_buf(),
+            domain: relative_domain(storage, &domains[domain].0)?,
             last_processed: None,
         };
     }
@@ -1830,18 +2075,241 @@ fn traversal_batch_filtered(
     })
 }
 
-fn next_batch(storage: &Path, domains: &[(PathBuf, bool)]) -> io::Result<TraversalBatch> {
+fn next_batch(storage: &StoragePaths, domains: &[(PathBuf, bool)]) -> io::Result<TraversalBatch> {
     traversal_batch(storage, domains, "roots", PASS_ENTRIES)
 }
 
+/// Generation cleanup has its own durable cursor and a count budget, not the
+/// root-retirement deadline. Recursive byte accounting and due-root work can
+/// consume that deadline before the first view is visited. For a stable set of
+/// V views, 64 per pass reaches all of them in ceil(V / 64) + 1 uninterrupted
+/// passes, including a partial lap and wraparound. No payload tree is walked.
+fn sweep_view_generations(
+    storage: &StoragePaths,
+    cancelled: &dyn Fn() -> bool,
+    report: &mut SweepReport,
+) -> io::Result<()> {
+    let batch = traversal_batch_filtered(
+        storage,
+        &[
+            (storage.artifacts.join("views"), false),
+            (storage.artifacts.join("views/v2"), false),
+        ],
+        "generations",
+        64,
+        &|entry| {
+            (key_valid(&entry.file_name().to_string_lossy()) || directory_is_v2_view(&entry.path()))
+                && entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && entry.path().join("pointer.sqlite").is_file()
+        },
+    )?;
+    if batch.entries.is_empty() && !batch.cursor_path.exists() {
+        return Ok(());
+    }
+    let registries = match generation_registries(storage, &batch.entries, report) {
+        Ok(registries) => {
+            generation_registry_errors()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&storage.artifacts.join("blobs/v2"));
+            registries
+        }
+        Err(error) => {
+            // An unavailable family census protects unknown V2 owners, but it
+            // must not prevent direct-view cleanup or cursor/root progress.
+            report_generation_registry_error(&storage.artifacts.join("blobs/v2"), &error, report);
+            HashMap::new()
+        }
+    };
+    let mut cursor = None;
+    let mut completed = true;
+    for item in batch.entries {
+        if cancelled() || bind_pending(&storage.durable) {
+            report.cancelled |= cancelled();
+            report.stopped_early = true;
+            completed = false;
+            break;
+        }
+        let path = item.entry.path();
+        if let Some(mut store) = crate::views::ViewStore::existing_dir(path.clone()) {
+            if directory_is_v2_view(&path) {
+                let Some(registry) = registries.get(&path) else {
+                    report.skipped_protected += 1;
+                    cursor = Some(item.after);
+                    continue;
+                };
+                store = store.with_sweep_registry(registry.clone());
+            }
+            #[cfg(test)]
+            test_hook(&path, "walk");
+            if cancelled() || bind_pending(&storage.durable) {
+                report.cancelled |= cancelled();
+                report.stopped_early = true;
+                completed = false;
+                break;
+            }
+            match store.sweep_generations_with_bytes() {
+                Ok(removed) => {
+                    if removed.over_limit && report.oversized_views.len() < 16 {
+                        report.oversized_views.push(format!(
+                            "{}: over the generation directory limit; partial cleanup removed {} generation(s) and kept {} whose derived database could be shared by an unseen reference",
+                            path.display(),
+                            removed.removed_generations,
+                            removed.kept_unproven_owners
+                        ));
+                    }
+                    report.removed_generations += removed.removed_generations;
+                    report.removed_bytes += removed.removed_bytes;
+                    report
+                        .domains
+                        .entry("views/generations".into())
+                        .or_default()
+                        .removed_bytes += removed.removed_bytes;
+                    if removed.removed_generations > 0 || removed.removed_bytes > 0 {
+                        log::info!(
+                            "views: retention removed_generations={} removed_bytes={} view={}",
+                            removed.removed_generations,
+                            removed.removed_bytes,
+                            path.display()
+                        );
+                    }
+                }
+                Err(error) => {
+                    report.skipped_protected += 1;
+                    if report.errors.len() < 16 {
+                        report.errors.push(format!("{}: {error}", path.display()));
+                    }
+                }
+            }
+        }
+        report
+            .domains
+            .entry("views/generations".into())
+            .or_default()
+            .examined += 1;
+        report.examined += 1;
+        // A blocked or malformed view cannot starve the rest of the lap.
+        cursor = Some(item.after);
+    }
+    if completed {
+        cursor = Some(batch.end);
+    }
+    if let Some(cursor) = cursor {
+        persist_cursor(storage, &batch.cursor_path, &cursor)?;
+    }
+    Ok(())
+}
+
+fn directory_is_v2_view(path: &Path) -> bool {
+    path.parent()
+        .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "v2"))
+}
+
+/// Resolve owners once for the batch, not once per view. Existing registries
+/// share their tracked SQLite connection with publishers and readers.
+fn generation_registries(
+    storage: &StoragePaths,
+    entries: &[TraversalEntry],
+    report: &mut SweepReport,
+) -> io::Result<HashMap<PathBuf, crate::views::registry::FamilyRegistry>> {
+    let wanted: HashSet<_> = entries
+        .iter()
+        .map(|entry| entry.entry.path())
+        .filter(|path| directory_is_v2_view(path))
+        .collect();
+    let mut owners = HashMap::new();
+    if wanted.is_empty() {
+        return Ok(owners);
+    }
+    for entry in bounded_dirs(&storage.artifacts.join("blobs/v2"), HISTORY_ENTRIES)? {
+        let registry_path = entry.path().join(crate::views::registry::REGISTRY_FILE);
+        let family = (|| -> io::Result<Option<_>> {
+            if !entry.file_type()?.is_dir() {
+                return Ok(None);
+            }
+            match fs::metadata(&registry_path) {
+                Ok(metadata) if metadata.is_file() => {}
+                Ok(_) => return Err(io::Error::other("family registry is not a regular file")),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            }
+            let family = entry.file_name().to_string_lossy().into_owned();
+            let Some(registry) = crate::views::registry::FamilyRegistry::open_existing_read_only(
+                &storage.artifacts,
+                &family,
+            )
+            .map_err(io::Error::other)?
+            else {
+                return Ok(None);
+            };
+            registry
+                .bind_durable_storage(&storage.durable)
+                .map_err(io::Error::other)?;
+            let members = registry
+                .members_bounded(HISTORY_ENTRIES)
+                .map_err(io::Error::other)?;
+            Ok(Some((registry, members)))
+        })();
+        let (registry, members) = match family {
+            Ok(family) => {
+                generation_registry_errors()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&registry_path);
+                let Some(family) = family else { continue };
+                family
+            }
+            Err(error) => {
+                report_generation_registry_error(&registry_path, &error, report);
+                continue;
+            }
+        };
+        // Publish no owners from a family until its complete membership census
+        // succeeded. A bad family's views remain protected, not partly swept.
+        for member in members {
+            if wanted.contains(&member.view_dir) {
+                owners.insert(member.view_dir, registry.clone());
+            }
+        }
+    }
+    Ok(owners)
+}
+
+fn generation_registry_errors() -> &'static Mutex<HashSet<PathBuf>> {
+    static ERRORS: std::sync::OnceLock<Mutex<HashSet<PathBuf>>> = std::sync::OnceLock::new();
+    ERRORS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn report_generation_registry_error(path: &Path, error: &io::Error, report: &mut SweepReport) {
+    if report.errors.len() < 16 {
+        report
+            .errors
+            .push(format!("{}: generation registry: {error}", path.display()));
+    }
+    // Emit once per failing family until a successful census resets it. Keep
+    // the per-pass health error even when the warning is rate-limited.
+    let first = generation_registry_errors()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(path.to_path_buf());
+    if first {
+        log::warn!(
+            "views: generation registry skipped registry={} error={error}",
+            path.display()
+        );
+        #[cfg(test)]
+        test_hook(path, "generation-registry-error");
+    }
+}
+
 fn visit_one_family(
-    storage: &Path,
+    storage: &StoragePaths,
     domain: &str,
     kind: &str,
     cancelled: &dyn Fn() -> bool,
     mut work: impl FnMut(&fs::DirEntry) -> io::Result<()>,
 ) -> io::Result<()> {
-    let batch = traversal_batch(storage, &[(storage.join(domain), false)], kind, 1)?;
+    let batch = traversal_batch(storage, &[(storage.artifacts.join(domain), false)], kind, 1)?;
     if cancelled() {
         return Ok(());
     }
@@ -1884,11 +2352,150 @@ fn protected(cache: &Path) -> io::Result<bool> {
     Ok(false)
 }
 
+/// Whether a due legacy cache must stay because a v3 import is reading it.
+///
+/// The v3 importer reads `index/<key>`, `semantic/<key>` and `symbols/<key>`
+/// while it holds a claim in the family's import ledger
+/// (`migration::v3_ledger`). Retiring such a set would pull the source out
+/// from under that import, so a live claim protects it, and a ledger that
+/// cannot be read is uncertainty and protects it too. A finished, abandoned
+/// or absent import leaves the binding-age rules alone.
+fn legacy_import_source_pinned(storage: &StoragePaths, cache: &Path, key: &str) -> bool {
+    let domain = cache
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str());
+    if !matches!(domain, Some("index" | "semantic" | "symbols")) {
+        return false;
+    }
+    match crate::migration::v3_ledger::legacy_key_status(&storage.artifacts, key) {
+        Ok(Some(status)) => status.live_claim,
+        Ok(None) => false,
+        Err(_) => true,
+    }
+}
+
+/// One kind of legacy (pre-v3) data that stays on disk for an offline
+/// rollback to the previous binary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum RetainedKind {
+    /// `symbols/<key>`: a parsed-symbol cache, a source of the v3 symbol import.
+    SymbolCache,
+    /// `views/<scope>`: a v1 view, whose generations name v1 blob rows.
+    V1View,
+    /// `blobs/<family>`: v1 blob stores, the copy-on-first-use donors of v3.
+    V1BlobFamily,
+    /// `blobs/v2/<family>`: v2 family stores, also copy-on-first-use donors.
+    V2FamilyStore,
+}
+
+impl RetainedKind {
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::SymbolCache => "symbol cache",
+            Self::V1View => "v1 view",
+            Self::V1BlobFamily => "v1 blob family",
+            Self::V2FamilyStore => "v2 family store",
+        }
+    }
+}
+
+/// One retained legacy item.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetainedItem {
+    pub kind: RetainedKind,
+    pub path: PathBuf,
+    pub bytes: u64,
+    /// The v3 family of the same name exists, so rows of this item may have
+    /// been copied into v3 (a copy never removes or changes its source).
+    pub copied_into_v3: bool,
+    /// Why the item is protected right now (a live import claim, live pins
+    /// or readers), or `None`. A protected item is never retired.
+    pub pinned: Option<String>,
+}
+
+/// Upper bound on items listed per retained kind.
+const RETAINED_ITEMS_PER_KIND: usize = 10_000;
+
+/// Lists the legacy data this build keeps but never writes: symbol caches,
+/// v1 views and blob families, and v2 family stores, with whether v3 holds
+/// a family of the same name and whether something protects them now. It
+/// reads directory listings, sizes, ledgers and pin files only; it writes
+/// nothing under the storage root.
+pub fn retained_legacy_inventory(storage: &Path) -> io::Result<Vec<RetainedItem>> {
+    let paths = StoragePaths::same(storage);
+    let v3_family = |name: &str| storage.join("blobs/v3").join(name).is_dir();
+    let mut items = Vec::new();
+    for (kind, parent) in [
+        (RetainedKind::SymbolCache, storage.join("symbols")),
+        (RetainedKind::V1View, storage.join("views")),
+        (RetainedKind::V1BlobFamily, storage.join("blobs")),
+        (RetainedKind::V2FamilyStore, storage.join("blobs/v2")),
+    ] {
+        let entries = match fs::read_dir(&parent) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let mut names = Vec::new();
+        for entry in entries.take(RETAINED_ITEMS_PER_KIND) {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let listed = match kind {
+                RetainedKind::SymbolCache => {
+                    crate::migration::per_checkout::validate_legacy_key(&name).is_ok()
+                }
+                RetainedKind::V1View | RetainedKind::V1BlobFamily => key_valid(&name),
+                RetainedKind::V2FamilyStore => {
+                    crate::blob_store::v2::validate_family(&name).is_ok()
+                }
+            };
+            if listed {
+                names.push(name);
+            }
+        }
+        names.sort();
+        for name in names {
+            let path = parent.join(&name);
+            let bytes = crate::migration::prune_legacy::tree_size(&path, TREE_ENTRIES)
+                .map(|(bytes, _, _)| bytes)
+                .unwrap_or(0);
+            let pinned = match kind {
+                RetainedKind::SymbolCache => legacy_import_source_pinned(&paths, &path, &name)
+                    .then(|| "a v3 import is reading it".to_owned()),
+                RetainedKind::V1View => match protected(&path) {
+                    Ok(true) => Some("live pins or readers".to_owned()),
+                    Ok(false) => None,
+                    Err(error) => Some(format!("pins unreadable: {error}")),
+                },
+                // Their rows are protected one by one: a copier pins each
+                // source row before reading it, and the v1/v2 sweeps honour
+                // those pins. Nothing protects the store as a whole.
+                RetainedKind::V1BlobFamily | RetainedKind::V2FamilyStore => None,
+            };
+            items.push(RetainedItem {
+                kind,
+                copied_into_v3: v3_family(&name),
+                path,
+                bytes,
+                pinned,
+            });
+        }
+    }
+    Ok(items)
+}
+
 fn owner_has_residency_marker(
-    storage: &Path,
+    storage: &StoragePaths,
     owner: &crate::artifact_owner::ArtifactOwnerManifest,
 ) -> bool {
     let directory = storage
+        .durable
         .join("retention/readers")
         .join(&owner.project_scope_key);
     let Ok(entries) = bounded_dirs(&directory, TREE_ENTRIES) else {
@@ -1909,12 +2516,57 @@ fn tree_files(cache: &Path, deadline: Instant) -> io::Result<Vec<(PathBuf, u64)>
     validate_tree(cache, deadline, true)
 }
 
+#[derive(Debug)]
+struct RetentionDeadline;
+
+impl std::fmt::Display for RetentionDeadline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("retention deadline reached")
+    }
+}
+
+impl std::error::Error for RetentionDeadline {}
+
+/// A validation walk met more than [`TREE_ENTRIES`] entries and stopped
+/// before it saw the whole tree.
+#[derive(Debug)]
+struct TreeEntryLimit;
+
+impl std::fmt::Display for TreeEntryLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("retention tree entry limit reached")
+    }
+}
+
+impl std::error::Error for TreeEntryLimit {}
+
+fn is_tree_entry_limit(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|error| error.is::<TreeEntryLimit>())
+}
+
+fn is_retention_deadline(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|error| error.is::<RetentionDeadline>())
+}
+
 /// A due root needs the filesystem safety checks, not payload sizes. Avoid a
 /// stat of every file merely to report bytes that the background reaper frees.
 fn validate_tree(
     cache: &Path,
     deadline: Instant,
     measure: bool,
+) -> io::Result<Vec<(PathBuf, u64)>> {
+    validate_tree_with_admission(cache, deadline, measure, &|| Ok(()))
+}
+
+fn validate_tree_with_admission(
+    cache: &Path,
+    deadline: Instant,
+    measure: bool,
+    admission: &dyn Fn() -> io::Result<()>,
 ) -> io::Result<Vec<(PathBuf, u64)>> {
     #[cfg(test)]
     test_hook(cache, "walk");
@@ -1926,12 +2578,20 @@ fn validate_tree(
     let mut result = Vec::new();
     let mut examined = 0;
     while let Some(directory) = pending.pop() {
+        admission()?;
         if Instant::now() >= deadline {
-            return Err(io::Error::other("retention deadline reached"));
+            return Err(io::Error::new(io::ErrorKind::TimedOut, RetentionDeadline));
         }
-        for entry in bounded_dirs(&directory, TREE_ENTRIES.saturating_sub(examined))? {
+        let mut entries = fs::read_dir(&directory)?;
+        loop {
+            admission()?;
             if Instant::now() >= deadline {
-                return Err(io::Error::other("retention deadline reached"));
+                return Err(io::Error::new(io::ErrorKind::TimedOut, RetentionDeadline));
+            }
+            let Some(entry) = entries.next() else { break };
+            let entry = entry?;
+            if examined >= TREE_ENTRIES {
+                return Err(io::Error::other(TreeEntryLimit));
             }
             examined += 1;
             let kind = entry.file_type()?;
@@ -1953,74 +2613,321 @@ fn validate_tree(
     Ok(result)
 }
 
-/// Keep trash on the cache's filesystem so retiring a root is a single rename.
-/// A failed unlink or daemon exit leaves a recognizable directory for retry.
+const RETIREMENT_WITNESS: &str = crate::bash_background::persistence::REPAIR_WITNESS_LEAF;
+
+#[derive(Serialize, Deserialize)]
+struct RetirementWitness {
+    version: u32,
+    nonce: String,
+    owner: (u64, u64),
+    directory: (u64, u64),
+    members: BTreeMap<String, (u64, u64)>,
+}
+
+fn retirement_members(
+    directory: &crate::bash_background::persistence::PinnedDir,
+) -> io::Result<BTreeMap<String, (u64, u64)>> {
+    retirement_members_with_budget(
+        directory,
+        &mut crate::bash_background::persistence::RepairBudget::with_entries(TREE_ENTRIES + 1),
+    )
+}
+
+fn retirement_members_with_budget(
+    directory: &crate::bash_background::persistence::PinnedDir,
+    budget: &mut crate::bash_background::persistence::RepairBudget,
+) -> io::Result<BTreeMap<String, (u64, u64)>> {
+    let mut members = BTreeMap::new();
+    for name in directory.repair_names(&mut budget.limited(TREE_ENTRIES + 1))? {
+        budget.entry()?;
+        if name == RETIREMENT_WITNESS || name == ".retention-trash" {
+            continue;
+        }
+        if members.len() >= TREE_ENTRIES {
+            return Err(io::Error::other(
+                "retirement member census exceeds entry limit",
+            ));
+        }
+        let text = name
+            .to_str()
+            .ok_or_else(|| io::Error::other("unrepresentable retirement entry name"))?
+            .to_owned();
+        let entry = directory.repair_entry_for_rename(&name)?;
+        members.insert(text, entry.identity()?);
+    }
+    Ok(members)
+}
+
+fn write_retirement_witness(
+    storage: &Path,
+    directory: &crate::bash_background::persistence::PinnedDir,
+    nonce: &str,
+    members: BTreeMap<String, (u64, u64)>,
+) -> io::Result<()> {
+    let witness = RetirementWitness {
+        version: 1,
+        nonce: nonce.to_owned(),
+        owner: crate::bash_background::persistence::PinnedDir::repair_open_path(storage)?
+            .directory_identity()?,
+        directory: directory.directory_identity()?,
+        members,
+    };
+    let bytes = serde_json::to_vec(&witness).map_err(io::Error::other)?;
+    if bytes.len() > 2 * 1024 * 1024 {
+        return Err(io::Error::other("retirement witness exceeds byte limit"));
+    }
+    directory.repair_write_durable(std::ffi::OsStr::new(RETIREMENT_WITNESS), &bytes)
+}
+
+fn verify_retirement_witness(
+    storage: &StoragePaths,
+    directory: &crate::bash_background::persistence::PinnedDir,
+    nonce: &str,
+    budget: &mut crate::bash_background::persistence::RepairBudget,
+) -> io::Result<()> {
+    use std::io::Read;
+    let file = directory.repair_read_file(std::ffi::OsStr::new(RETIREMENT_WITNESS))?;
+    if file.metadata()?.len() > 2 * 1024 * 1024 {
+        return Err(io::Error::other("retirement witness exceeds byte limit"));
+    }
+    let mut bytes = Vec::new();
+    file.take(2 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > 2 * 1024 * 1024 {
+        return Err(io::Error::other("retirement witness exceeds byte limit"));
+    }
+    let witness: RetirementWitness = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    if witness.version != 1
+        || witness.nonce != nonce
+        || witness.directory != directory.directory_identity()?
+        || witness.owner
+            != crate::bash_background::persistence::PinnedDir::repair_open_path(&storage.durable)?
+                .directory_identity()?
+    {
+        return Err(io::Error::other("unverified retirement identity retained"));
+    }
+    for (name, actual) in retirement_members_with_budget(directory, budget)? {
+        if witness.members.get(&name) != Some(&actual) {
+            return Err(io::Error::other("unverified retirement member retained"));
+        }
+    }
+    Ok(())
+}
+
+/// Retirement directories made by AFT releases up to v0.62.0 carry no witness:
+/// those releases renamed a cache into `.retention-trash` without writing one,
+/// and the reaper that ships witnesses refuses every entry without one, so
+/// their disk space was never reclaimed. The current retirement writes the
+/// witness before the rename, so a witness-less entry it leaves behind is a
+/// source that was swapped during the rename, which can hold anything.
 ///
-/// A cache folder that is itself a mount point (its own volume, separate from
-/// the domain folder above it) cannot be renamed into the domain's trash: the
-/// rename would cross volumes, and a mount point cannot be moved anyway. Its
-/// contents are retired instead, see `retire_mount_point_contents`.
+/// A witness-less entry is therefore deleted only when its contents prove it
+/// is an AFT root cache (the `inspect`, `index`, `callgraph` and similar
+/// per-checkout folders): every entry is a file name AFT itself creates there,
+/// nothing is a symlink, every entry is owned by the current user and not
+/// writable by anyone else, and no live process still holds a read marker in
+/// it. Anything else is kept, and the error names what is missing.
+fn verify_retirement_proof(
+    storage: &StoragePaths,
+    directory: &crate::bash_background::persistence::PinnedDir,
+    nonce: &str,
+    budget: &mut crate::bash_background::persistence::RepairBudget,
+) -> io::Result<()> {
+    match directory.repair_read_file(std::ffi::OsStr::new(RETIREMENT_WITNESS)) {
+        Ok(_) => verify_retirement_witness(storage, directory, nonce, budget),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            verify_unwitnessed_cache_retirement(directory, budget).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "retirement witness {RETIREMENT_WITNESS} is missing (retired by AFT \
+                         v0.62.0 or earlier, or a source swapped during retirement) and the \
+                         contents do not prove an AFT cache: {error}; AFT keeps it, delete {} \
+                         by hand if its contents are not needed",
+                        directory.path().display()
+                    ),
+                )
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether `name` is a file AFT creates directly inside a root cache folder.
+fn unwitnessed_cache_file(name: &str) -> bool {
+    if matches!(
+        name,
+        "writer.lease" | "cache.lock" | "semantic.lock" | "symbols.lock"
+    ) {
+        return true;
+    }
+    if let Some(key) = name.strip_suffix(".current") {
+        return key_valid(key);
+    }
+    let database = ["-wal", "-shm", "-journal"]
+        .iter()
+        .find_map(|suffix| name.strip_suffix(suffix))
+        .unwrap_or(name);
+    unwitnessed_generation_name(database)
+}
+
+/// `<key>.sqlite` or `<key>.g<ordinal>.<pid>.sqlite`: a cache database, also
+/// used as the generation label of its `readers/` folder.
+fn unwitnessed_generation_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".sqlite") else {
+        return false;
+    };
+    let mut parts = stem.split('.');
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(key), None, None, None) => key_valid(key),
+        (Some(key), Some(ordinal), Some(pid), None) => {
+            key_valid(key) && ordinal.strip_prefix('g').is_some_and(digits) && digits(pid)
+        }
+        _ => false,
+    }
+}
+
+fn verify_unwitnessed_cache_retirement(
+    directory: &crate::bash_background::persistence::PinnedDir,
+    budget: &mut crate::bash_background::persistence::RepairBudget,
+) -> io::Result<()> {
+    let refuse = |what: String| Err(io::Error::other(what));
+    if !directory.repair_status()?.private {
+        return refuse("the directory is writable by other users or not owned by this user".into());
+    }
+    let mut cache_files = 0;
+    let mut names = directory.repair_names(budget)?;
+    names.sort();
+    for name in names {
+        let status = directory.repair_entry_status(&name)?;
+        let text = name.to_string_lossy();
+        if !status.private {
+            return refuse(format!(
+                "{text} is writable by other users or not owned by this user"
+            ));
+        }
+        if status.is_file && unwitnessed_cache_file(&text) {
+            cache_files += 1;
+            continue;
+        }
+        if !(status.is_dir && name == "readers") {
+            return refuse(format!(
+                "{text} is not an entry AFT creates in a cache folder"
+            ));
+        }
+        let readers = directory.repair_child(&name)?;
+        for generation in readers.repair_names(budget)? {
+            let label = generation.to_string_lossy();
+            let status = readers.repair_entry_status(&generation)?;
+            if !(status.is_dir && status.private && unwitnessed_generation_name(&label)) {
+                return refuse(format!(
+                    "readers/{label} is not a private read-marker generation folder"
+                ));
+            }
+            let markers = readers.repair_child(&generation)?;
+            for marker in markers.repair_names(budget)? {
+                let status = markers.repair_entry_status(&marker)?;
+                let marker = marker.to_string_lossy();
+                if !(status.is_file && status.private && marker.ends_with(".json")) {
+                    return refuse(format!(
+                        "readers/{label}/{marker} is not a private read marker"
+                    ));
+                }
+            }
+        }
+    }
+    if cache_files == 0 {
+        return refuse("it holds no AFT cache files".into());
+    }
+    if crate::root_cache::sweep_all_read_markers_pinned(directory, budget, false)?.protected {
+        return refuse("a live process still holds a read marker in it".into());
+    }
+    Ok(())
+}
+
+/// Keep retirement on the cache filesystem, anchored to the opened domain.
+/// Mount-point caches retire their contents into their own mount-local trash.
 fn retire_directory(storage: &Path, cache: &Path) -> io::Result<()> {
     let parent = cache
         .parent()
         .ok_or_else(|| io::Error::other("missing cache parent"))?;
+    let parent = crate::bash_background::persistence::PinnedDir::repair_open_path(parent)?;
+    let name = cache
+        .file_name()
+        .ok_or_else(|| io::Error::other("missing cache name"))?;
+    let source = parent.repair_entry_for_rename(name)?;
+    let child = source.directory()?;
     if crate::cross_volume::is_mount_point(cache)? {
-        return retire_mount_point_contents(storage, cache);
+        return retire_mount_point_contents(storage, cache, &child);
     }
-    let trash = parent.join(".retention-trash");
-    fs::create_dir_all(&trash)?;
-    if !fs::symlink_metadata(&trash)?.is_dir() {
-        return Err(io::Error::other("non-directory retention trash retained"));
-    }
-    #[cfg(test)]
-    test_hook(cache, "rename-root");
-    let mut nonce = [0_u8; 16];
-    getrandom::fill(&mut nonce).map_err(io::Error::other)?;
-    crate::cross_volume::rename(
-        cache,
-        &trash.join(format!("retired-{:032x}", u128::from_le_bytes(nonce))),
-    )
-}
-
-/// Retire a mount-point cache folder by emptying it. Its entries are first
-/// renamed into a trash folder inside the mount, so every rename stays on that
-/// volume and a crash leaves recognizable `retired-*` folders. Only move entries
-/// while the caller holds admission and SQLite's filesystem guard; the reaper
-/// discovers mount-local trash independently and does the slow unlink later.
-/// The mount point itself stays even after its retired contents are reclaimed.
-fn retire_mount_point_contents(storage: &Path, cache: &Path) -> io::Result<()> {
-    let trash = cache.join(".retention-trash");
+    child.repair_check_boundary(&parent, &[])?;
+    let trash_name = std::ffi::OsStr::new(".retention-trash");
+    let trash = match parent.repair_create_dir(trash_name) {
+        Ok(trash) => trash,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            parent.repair_child_same_mount(trash_name)?
+        }
+        Err(error) => return Err(error),
+    };
     let mut nonce = [0_u8; 16];
     getrandom::fill(&mut nonce).map_err(io::Error::other)?;
     let nonce = format!("{:032x}", u128::from_le_bytes(nonce));
-    // Cache-level mounts are rare. Publish a durable hint before moving data
-    // so ordinary reaper passes need not probe every cache's filesystem. Each
-    // retirement replaces the generation under admission, letting the reaper
-    // detect a newer retirement before it clears the hint.
-    atomic_json(&storage.join("retention/mount-trash-pending"), &nonce)?;
+    write_retirement_witness(storage, &child, &nonce, retirement_members(&child)?)?;
     #[cfg(test)]
     test_hook(cache, "rename-root");
-    let retired = trash.join(format!("retired-{nonce}"));
-    loop {
-        fs::create_dir_all(&trash)?;
-        if !fs::symlink_metadata(&trash)?.is_dir() {
-            return Err(io::Error::other("non-directory retention trash retained"));
-        }
-        match fs::create_dir(&retired) {
-            Ok(()) => break,
-            // A previous reaper can remove the empty container after taking
-            // its snapshot, but cannot discover this new tombstone until the
-            // caller releases admission. Recreate the container if it vanished.
+    parent.repair_rename_entry_to(
+        name,
+        &source,
+        &trash,
+        std::ffi::OsStr::new(&format!("retired-{nonce}")),
+    )
+}
+
+/// Mount points stay in place; only their entries move into mount-local trash.
+fn retire_mount_point_contents(
+    storage: &Path,
+    _cache: &Path,
+    cache_pin: &crate::bash_background::persistence::PinnedDir,
+) -> io::Result<()> {
+    use crate::bash_background::persistence::RepairBudget;
+    let members = retirement_members(cache_pin)?;
+    let mut nonce = [0_u8; 16];
+    getrandom::fill(&mut nonce).map_err(io::Error::other)?;
+    let nonce = format!("{:032x}", u128::from_le_bytes(nonce));
+    atomic_json(&storage.join("retention/mount-trash-pending"), &nonce)?;
+    let retired_name = format!("retired-{nonce}");
+    let mut budget = RepairBudget::new();
+    let retired = loop {
+        budget.entry()?;
+        let trash = match cache_pin.repair_create_dir(std::ffi::OsStr::new(".retention-trash")) {
+            Ok(trash) => trash,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                cache_pin.repair_child_same_mount(std::ffi::OsStr::new(".retention-trash"))?
+            }
+            Err(error) => return Err(error),
+        };
+        match trash.repair_create_dir(std::ffi::OsStr::new(&retired_name)) {
+            Ok(retired) => break retired,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         }
-    }
-    for entry in fs::read_dir(cache)? {
-        let entry = entry?;
-        if entry.file_name() == ".retention-trash" {
-            continue;
+    };
+    write_retirement_witness(storage, &retired, &nonce, members.clone())?;
+    #[cfg(test)]
+    test_hook(_cache, "rename-root");
+    for (name, expected) in members {
+        budget.entry()?;
+        let name = std::ffi::OsStr::new(&name);
+        let source = cache_pin.repair_entry_for_rename(name)?;
+        if source.identity()? != expected {
+            return Err(io::Error::other("mount retirement source identity changed"));
         }
-        crate::cross_volume::rename(&entry.path(), &retired.join(entry.file_name()))?;
+        cache_pin.repair_rename_entry_to(name, &source, &retired, name)?;
+    }
+    match cache_pin.repair_read_file(std::ffi::OsStr::new(RETIREMENT_WITNESS)) {
+        Ok(_) => cache_pin.repair_remove_file(std::ffi::OsStr::new(RETIREMENT_WITNESS))?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     Ok(())
 }
@@ -2041,30 +2948,228 @@ fn retired_mount_point(cache: &Path) -> bool {
         })
 }
 
-/// Returns whether any recognizable tombstones could not be reclaimed. A busy
+/// Returns whether any trash remains or the census was incomplete. A busy
 /// mount-local snapshot also keeps the pending hint for a later reaper pass.
-fn reap_trash(storage: &Path, trash: &Path, mount_local: bool) -> io::Result<bool> {
+fn reap_trash(
+    storage: &StoragePaths,
+    trash: &Path,
+    mount_local: bool,
+    deadline: Instant,
+    budget: &mut crate::bash_background::persistence::RepairBudget,
+    report: &mut TrashReport,
+) -> io::Result<bool> {
+    reap_trash_with_snapshot_budget(
+        storage,
+        trash,
+        mount_local,
+        deadline,
+        budget,
+        report,
+        Duration::from_millis(10),
+    )
+}
+
+fn reap_trash_with_snapshot_budget(
+    storage: &StoragePaths,
+    trash: &Path,
+    mount_local: bool,
+    deadline: Instant,
+    budget: &mut crate::bash_background::persistence::RepairBudget,
+    report: &mut TrashReport,
+    admission_budget: Duration,
+) -> io::Result<bool> {
+    let key = (storage.artifacts.clone(), trash.to_path_buf());
+    let (mut cursor, full, expired) = {
+        let mut scans = trash_scans()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Close idle cached iterators after two retention intervals. Active
+        // passes keep their reserved slots until they finish or unwind.
+        let expired = scans
+            .extract_if(|_, scan| {
+                scan.as_ref()
+                    .is_some_and(|scan| scan.touched.elapsed() >= INTERVAL * 2)
+            })
+            .map(|(_, scan)| scan)
+            .collect::<Vec<_>>();
+        let (cursor, full) = if let Some(slot) = scans.get_mut(&key) {
+            let cursor = slot.take();
+            let busy = cursor.is_none();
+            (cursor, busy)
+        } else if scans.len() < TRASH_SCAN_HANDLES {
+            // A None slot reserves a handle for the active pass, so concurrent
+            // reapers cannot exceed the bound before publishing their cursors.
+            scans.insert(key.clone(), None);
+            (None, false)
+        } else {
+            (None, true)
+        };
+        (cursor, full, expired)
+    };
+    drop(expired);
+    if full {
+        report.incomplete = true;
+        report.keep(
+            trash,
+            "cursor_capacity",
+            "waiting for an open trash scan to finish",
+        );
+        return Ok(true);
+    }
+    let mut lease = TrashScanLease(Some(key.clone()));
+    let result = reap_trash_with_cursor(
+        storage,
+        trash,
+        mount_local,
+        deadline,
+        budget,
+        report,
+        admission_budget,
+        &mut cursor,
+    );
+    if let Some(mut cursor) = cursor.filter(|scan| {
+        (scan.entries.is_some() || !scan.deferred.is_empty())
+            && (scan.omitted_prefix || !scan.deferred.is_empty())
+    }) {
+        cursor.touched = Instant::now();
+        let previous = {
+            trash_scans()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key, Some(cursor))
+        };
+        drop(previous);
+        lease.0 = None;
+    }
+    result
+}
+
+fn reap_trash_with_cursor(
+    storage: &StoragePaths,
+    trash: &Path,
+    mount_local: bool,
+    deadline: Instant,
+    budget: &mut crate::bash_background::persistence::RepairBudget,
+    report: &mut TrashReport,
+    admission_budget: Duration,
+    cursor: &mut Option<TrashScan>,
+) -> io::Result<bool> {
     let entries = {
         // Snapshot mount-local tombstones under admission so a concurrent
         // retirement finishes moving entries before any of them are unlinked.
         // Domain-local retirement publishes a whole tree with one rename.
         let _admission = if mount_local {
-            match crate::fs_lock::try_acquire(&storage.join("retention/sweep.lock"), Duration::ZERO)
-            {
+            match crate::fs_lock::try_acquire(
+                &storage.durable.join("retention/sweep.lock"),
+                Duration::ZERO,
+            ) {
                 Ok(lease) => Some(lease),
-                Err(_) => return Ok(true),
+                Err(error) => {
+                    report.incomplete = true;
+                    report.keep(trash, "admission_busy", error);
+                    return Ok(true);
+                }
             }
         } else {
             None
         };
-        match fs::read_dir(trash) {
-            Ok(entries) if fs::symlink_metadata(trash)?.is_dir() => {
+        let previous = cursor.take();
+        match fs::symlink_metadata(trash) {
+            Ok(metadata) if metadata.is_dir() => {
                 if mount_local && crate::cross_volume::is_mount_point(trash)? {
                     return Err(io::Error::other(
                         "foreign retention trash filesystem retained",
                     ));
                 }
-                entries.collect::<io::Result<Vec<_>>>()?
+                let identity =
+                    crate::bash_background::persistence::PinnedDir::repair_open_path(trash)?
+                        .directory_identity()?;
+                // Keep the live iterator, not a name to skip after reopening:
+                // rereading a retained prefix can itself exhaust admission.
+                let scan = match previous.filter(|scan| scan.identity == identity) {
+                    Some(scan) => scan,
+                    None => TrashScan {
+                        identity,
+                        entries: Some(fs::read_dir(trash)?),
+                        deferred: VecDeque::new(),
+                        omitted_prefix: false,
+                        touched: Instant::now(),
+                    },
+                };
+                if scan.omitted_prefix {
+                    report.incomplete = true;
+                    report.keep(
+                        trash,
+                        "scan_resumed",
+                        "earlier entries in this lap were examined by previous passes",
+                    );
+                }
+                *cursor = Some(scan);
+                let scan = cursor.as_mut().unwrap();
+                let mut snapshot = Vec::new();
+                // Mount-local retirement needs admission only for the snapshot.
+                // Yield promptly to binders and cap this lock hold separately
+                // from the much slower, admission-free unlink work.
+                let admission_deadline = Instant::now() + admission_budget;
+                #[cfg(test)]
+                test_hook(trash, "trash-snapshot");
+                loop {
+                    if snapshot.len() == PASS_ENTRIES {
+                        report.incomplete = true;
+                        report.keep(
+                            trash,
+                            "snapshot_entries",
+                            "trash snapshot entry limit reached",
+                        );
+                        break;
+                    }
+                    if mount_local && bind_pending(&storage.durable) {
+                        report.incomplete = true;
+                        report.keep(
+                            trash,
+                            "bind_pending",
+                            "snapshot yielded to checkout binding",
+                        );
+                        break;
+                    }
+                    if mount_local && Instant::now() >= admission_deadline {
+                        report.incomplete = true;
+                        report.keep(
+                            trash,
+                            "admission_budget",
+                            "mount snapshot admission deadline reached",
+                        );
+                        break;
+                    }
+                    if let Err(error) = budget.entry() {
+                        report.incomplete = true;
+                        report.keep(trash, "enumeration_budget", error);
+                        break;
+                    }
+                    let next = scan
+                        .deferred
+                        .pop_front()
+                        .map(Ok)
+                        .or_else(|| scan.entries.as_mut().and_then(Iterator::next));
+                    match next {
+                        Some(Ok(entry)) => {
+                            snapshot.push(entry);
+                            #[cfg(test)]
+                            test_hook(trash, "trash-snapshot-entry");
+                        }
+                        Some(Err(error)) => {
+                            scan.entries = None;
+                            report.incomplete = true;
+                            report.keep(trash, "enumeration_error", error);
+                            break;
+                        }
+                        None => {
+                            scan.entries = None;
+                            break;
+                        }
+                    }
+                }
+                snapshot
             }
             Ok(_) => return Err(io::Error::other("non-directory retention trash retained")),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -2078,45 +3183,217 @@ fn reap_trash(storage: &Path, trash: &Path, mount_local: bool) -> io::Result<boo
             Err(error) => return Err(error),
         }
     };
-    let mut pending = false;
-    for entry in entries {
+    if entries.is_empty() && !mount_local {
+        return Ok(report.incomplete);
+    }
+    let protected = report
+        .protections
+        .get_or_insert_with(|| {
+            crate::root_cache::retention_protections_with_budget(
+                storage,
+                budget,
+                &mut report.protection_census,
+            )
+            .map(Arc::new)
+            .map_err(Arc::new)
+        })
+        .clone();
+    let protected = match protected {
+        Ok(protected) => protected,
+        Err(error) => {
+            let reason = ProtectionFailure::from_error(&error);
+            report.protection_failure = Some(reason);
+            report.incomplete = true;
+            report.entries += entries.len();
+            report.keep(trash, reason.reason(), error);
+            // An incomplete census authorizes no unlink or tree walk. Retry the
+            // prefetched entries with fresh protections on the next pass.
+            cursor.as_mut().unwrap().deferred.extend(entries);
+            return Ok(true);
+        }
+    };
+    let parent = crate::bash_background::persistence::PinnedDir::repair_open_path(
+        trash
+            .parent()
+            .ok_or_else(|| io::Error::other("missing trash parent"))?,
+    )
+    .and_then(|parent| parent.repair_child_same_mount(std::ffi::OsStr::new(".retention-trash")));
+    let mut pending = report.incomplete;
+    let mut retained = false;
+    let mut entries = entries.into_iter();
+    while entries.len() != 0 {
+        if let Err(error) = budget.enter(0) {
+            pending = true;
+            report.incomplete = true;
+            report.keep(trash, "entry_budget", error);
+            break;
+        }
+        let entry = entries.next().unwrap();
+        cursor.as_mut().unwrap().omitted_prefix = true;
+        report.entries += 1;
+        let path = entry.path();
+        let age = entry
+            .metadata()
+            .ok()
+            .map(|metadata| {
+                if metadata.is_dir() {
+                    fs::symlink_metadata(path.join(RETIREMENT_WITNESS)).unwrap_or(metadata)
+                } else {
+                    metadata
+                }
+            })
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+            .map(|age| age.as_millis().min(u64::MAX as u128) as u64);
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !name.strip_prefix("retired-").is_some_and(|nonce| {
-            nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
-        }) {
-            continue;
-        }
-        let path = entry.path();
-        if mount_local && crate::cross_volume::is_mount_point(&path)? {
+        let mut bytes = 0;
+        let mut measured = false;
+        let result = (|| -> Result<(), (&str, io::Error)> {
+            budget.enter(0).map_err(|error| ("budget", error))?;
+            // Measure only safe, same-filesystem trees. Measurements omit unsafe
+            // or unexamined trees and can precede a partially successful unlink.
+            let oversized =
+                match validate_tree_with_admission(&path, deadline, true, &|| budget.enter(0)) {
+                    Ok(files) => {
+                        bytes = files.iter().map(|(_, size)| *size).sum();
+                        measured = true;
+                        false
+                    }
+                    // A tree larger than one validation walk may examine could
+                    // never be validated, so it would never be reclaimed. It is
+                    // removed below by a walk that applies the same rules as it
+                    // goes and keeps its progress when a pass ends.
+                    Err(error) if is_tree_entry_limit(&error) => true,
+                    Err(error) => return Err(("tree_guard", error)),
+                };
+            if !name.strip_prefix("retired-").is_some_and(|nonce| {
+                nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }) {
+                return Err(("foreign_name", io::Error::other("unrecognized trash entry")));
+            }
+            if mount_local
+                && crate::cross_volume::is_mount_point(&path)
+                    .map_err(|error| ("mount_guard", error))?
+            {
+                return Err(("mount_guard", io::Error::other("foreign trash mount")));
+            }
+            let parent = parent
+                .as_ref()
+                .map_err(|error| ("open_parent", io::Error::other(error.to_string())))?;
+            let child = parent
+                .repair_child(entry.file_name().as_os_str())
+                .map_err(|error| ("open_child", error))?;
+            child
+                .repair_check_boundary(parent, &[])
+                .map_err(|error| ("mount_guard", error))?;
+            let expected = child
+                .directory_identity()
+                .map_err(|error| ("identity", error))?;
+            verify_retirement_proof(storage, &child, &name["retired-".len()..], budget)
+                .map_err(|error| ("witness", error))?;
+            #[cfg(test)]
+            test_hook(&storage.artifacts, "reap-root");
+            let mut warnings = Vec::new();
+            let mut removed = 0;
+            let result = if oversized {
+                parent.repair_remove_regular_child_with_budget(
+                    entry.file_name().as_os_str(),
+                    expected,
+                    &protected,
+                    &mut removed,
+                    &mut warnings,
+                    budget,
+                )
+            } else {
+                parent.repair_remove_child_with_budget(
+                    entry.file_name().as_os_str(),
+                    expected,
+                    &protected,
+                    &mut removed,
+                    &mut warnings,
+                    budget,
+                )
+            };
+            for warning in warnings {
+                crate::slog_warn!("{warning}");
+            }
+            match result {
+                Ok(()) => {}
+                // What this pass removed stays removed, and the witness is
+                // deleted last, so the next pass verifies the rest and
+                // continues instead of starting over.
+                Err(error)
+                    if oversized
+                        && crate::bash_background::persistence::is_repair_budget_stop(&error) =>
+                {
+                    return Err((
+                        "removal_in_progress",
+                        io::Error::new(
+                            error.kind(),
+                            format!(
+                                "oversized entry: removed {removed} entries this pass, \
+                                 later passes continue: {error}"
+                            ),
+                        ),
+                    ));
+                }
+                Err(error)
+                    if error.get_ref().is_some_and(|inner| {
+                        inner.is::<crate::bash_background::persistence::NonRegularEntryRetained>()
+                    }) =>
+                {
+                    return Err(("tree_guard", error));
+                }
+                Err(error) => return Err(("unlink_guard", error)),
+            }
+            match parent.repair_child(entry.file_name().as_os_str()) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(("unlink_status", error)),
+                Ok(_) => Err((
+                    "unlink_pending",
+                    io::Error::other("directory still present after unlink"),
+                )),
+            }
+        })();
+        if let Err((reason, error)) = result {
             pending = true;
-            continue;
+            retained = true;
+            report.incomplete |= !measured;
+            report.bytes_estimate = report.bytes_estimate.saturating_add(bytes);
+            if let Some(age) = age {
+                report.oldest_age_ms = Some(report.oldest_age_ms.unwrap_or(0).max(age));
+            }
+            report.keep(&path, reason, error);
+        } else {
+            report.entries -= 1;
+            report.removed_entries += 1;
         }
-        // Check entry types and filesystem boundaries again after a restart;
-        // an unexpected symlink or mount must keep the trash, not be unlinked.
-        if let Err(error) = validate_tree(&path, Instant::now() + Duration::from_secs(60), false) {
-            pending = true;
-            crate::slog_warn!(
-                "storage retention trash={} retained: {error}",
-                path.display()
-            );
-            continue;
-        }
-        #[cfg(test)]
-        test_hook(storage, "reap-root");
-        if let Err(error) = fs::remove_dir_all(&path) {
-            pending = true;
-            crate::slog_warn!(
-                "storage retention trash={} unlink deferred: {error}",
-                path.display()
-            );
-        }
+    }
+    // A stopped unlink/measurement lane must retry its prefetched tail before
+    // advancing the directory iterator in a later pass.
+    for entry in entries.rev() {
+        cursor.as_mut().unwrap().deferred.push_front(entry);
     }
     if mount_local {
         // Never recursively delete the container: a concurrent retirement may
         // have populated it since the snapshot. An empty-directory unlink is
         // safe outside admission and leaves any new tombstones for a later pass.
-        let _ = fs::remove_dir(trash);
+        match fs::remove_dir(trash) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => {
+                pending = true;
+                // DirectoryNotEmpty is expected when a scanned entry was
+                // retained, not an incomplete census. Otherwise an unseen
+                // entry arrived, so the census must be marked incomplete.
+                if !retained {
+                    report.incomplete = true;
+                }
+                report.keep(trash, "container_not_empty", error);
+            }
+            Err(error) => return Err(error),
+        }
         // Flush the remaining container's unlinks, then the container's own
         // deletion in its mount-local parent before clearing the durable hint.
         match crate::durability::sync_dir(trash) {
@@ -2129,12 +3406,62 @@ fn reap_trash(storage: &Path, trash: &Path, mount_local: bool) -> io::Result<boo
     Ok(pending)
 }
 
-fn reap_retired(storage: &Path) -> io::Result<()> {
+fn reap_retired(storage: &StoragePaths) -> io::Result<()> {
+    let cancelled = states()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&storage.artifacts)
+        .and_then(|state| state.reaper_cancelled.clone())
+        .unwrap_or_else(|| Arc::new(|| false));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut budget = crate::bash_background::persistence::RepairBudget::until(deadline, cancelled);
+    let mut report = TrashReport {
+        at_ms: crate::pins::now_ms(),
+        ..Default::default()
+    };
+    let result = reap_retired_with_budget(storage, deadline, &mut budget, &mut report);
+    // The census belongs to this pass only; a later pass takes a fresh one.
+    report.protections = None;
+    if let Err(error) = &result {
+        report.incomplete = true;
+        if report.kept_by_reason.is_empty() {
+            report.keep(&storage.artifacts, "reaper_pass", error);
+        }
+    }
+    let report = {
+        let mut states = states()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = states.entry(storage.artifacts.clone()).or_default();
+        state.record_trash(report, Instant::now());
+        state.trash.clone()
+    };
+    crate::slog_info!(
+        "storage retention trash root={} report={}",
+        storage.artifacts.display(),
+        serde_json::to_string(&report).unwrap_or_default()
+    );
+    result
+}
+
+fn reap_retired_with_budget(
+    storage: &StoragePaths,
+    deadline: Instant,
+    budget: &mut crate::bash_background::persistence::RepairBudget,
+    report: &mut TrashReport,
+) -> io::Result<()> {
+    crate::root_cache::check_cache_access(&storage.artifacts)?;
+    if !crate::root_cache::storage_allows_root_keyed(&storage.durable)? {
+        return Err(io::Error::other("network storage retained"));
+    }
     // Different daemon processes may discover the same tombstones. This lock
     // is separate from admission: slow unlinks must not block binds or pins.
-    let _lease = crate::fs_lock::try_acquire(&storage.join("retention/reap.lock"), Duration::ZERO)
-        .map_err(|error| io::Error::other(error.to_string()))?;
-    let marker = storage.join("retention/mount-trash-pending");
+    let lock = storage.durable.join("retention/reap.lock");
+    let _lease = crate::fs_lock::try_acquire(&lock, Duration::ZERO).map_err(|error| {
+        report.keep(&lock, "reap_lock", &error);
+        io::Error::other(error.to_string())
+    })?;
+    let marker = storage.durable.join("retention/mount-trash-pending");
     let mount_scan = match fs::read(&marker) {
         Ok(generation) => Some(generation),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -2142,10 +3469,16 @@ fn reap_retired(storage: &Path) -> io::Result<()> {
     };
     let mut mount_trash_pending = false;
     for (domain, flat) in domain_paths(storage)? {
+        budget.enter(0)?;
         if flat {
             continue;
         }
-        reap_trash(storage, &domain.join(".retention-trash"), false)?;
+        let trash = domain.join(".retention-trash");
+        if let Err(error) = reap_trash(storage, &trash, false, deadline, budget, report) {
+            report.incomplete = true;
+            report.keep(&trash, "trash_container", &error);
+            return Err(error);
+        }
         if mount_scan.is_none() {
             continue;
         }
@@ -2154,14 +3487,17 @@ fn reap_retired(storage: &Path) -> io::Result<()> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
-        for entry in entries {
+        let mut entries = entries;
+        loop {
+            budget.entry()?;
+            let Some(entry) = entries.next() else { break };
             let entry = entry?;
             let cache = entry.path();
             if !key_valid(&entry.file_name().to_string_lossy()) || !entry.file_type()?.is_dir() {
                 continue;
             }
             #[cfg(test)]
-            test_hook(storage, "mount-trash-probe");
+            test_hook(&storage.artifacts, "mount-trash-probe");
             let mounted = match crate::cross_volume::is_mount_point(&cache) {
                 Ok(mounted) => mounted,
                 // A normal cache can be retired while the reaper lists mounts.
@@ -2169,17 +3505,27 @@ fn reap_retired(storage: &Path) -> io::Result<()> {
                 Err(error) => return Err(error),
             };
             if mounted {
-                mount_trash_pending |= reap_trash(storage, &cache.join(".retention-trash"), true)?;
+                let trash = cache.join(".retention-trash");
+                match reap_trash(storage, &trash, true, deadline, budget, report) {
+                    Ok(pending) => mount_trash_pending |= pending,
+                    Err(error) => {
+                        report.incomplete = true;
+                        report.keep(&trash, "trash_container", &error);
+                        return Err(error);
+                    }
+                }
             }
         }
     }
     if !mount_trash_pending {
         if let Some(scanned) = mount_scan {
             #[cfg(test)]
-            test_hook(storage, "mount-trash-scanned");
-            let Ok(_admission) =
-                crate::fs_lock::try_acquire(&storage.join("retention/sweep.lock"), Duration::ZERO)
-            else {
+            test_hook(&storage.artifacts, "mount-trash-scanned");
+            let Ok(_admission) = crate::fs_lock::try_acquire(
+                &storage.durable.join("retention/sweep.lock"),
+                Duration::ZERO,
+            ) else {
+                report.keep(&marker, "marker_admission_busy", "sweep admission is busy");
                 return Ok(());
             };
             // Retirements publish under the same sweep.lock held by _admission.
@@ -2188,9 +3534,16 @@ fn reap_retired(storage: &Path) -> io::Result<()> {
             match fs::read(&marker) {
                 Ok(current) if current == scanned => {
                     fs::remove_file(&marker)?;
-                    crate::durability::sync_dir(&storage.join("retention"))?;
+                    crate::durability::sync_dir(&storage.durable.join("retention"))?;
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    report.incomplete = true;
+                    report.keep(
+                        &marker,
+                        "marker_generation_changed",
+                        "a concurrent retirement published more trash",
+                    );
+                }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
@@ -2199,20 +3552,20 @@ fn reap_retired(storage: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn schedule_reaper(storage: &Path) {
-    #[cfg(test)]
-    test_hook(storage, "reaper-launch");
+fn schedule_reaper(storage: &StoragePaths) {
     {
         let mut states = states()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let state = states.entry(storage.to_path_buf()).or_default();
-        if state.reaping {
+        let state = states.entry(storage.artifacts.clone()).or_default();
+        if !state.reaper_ready(Instant::now()) {
             return;
         }
         state.reaping = true;
     }
-    let storage = storage.to_path_buf();
+    #[cfg(test)]
+    test_hook(&storage.artifacts, "reaper-launch");
+    let storage = storage.clone();
     let worker_storage = storage.clone();
     let spawned = std::thread::Builder::new()
         .name("aft-retention-reaper".into())
@@ -2229,11 +3582,11 @@ fn schedule_reaper(storage: &Path) {
                     }
                 }
             }
-            let _reset = Reset(worker_storage.clone());
+            let _reset = Reset(worker_storage.artifacts.clone());
             if let Err(error) = reap_retired(&worker_storage) {
                 crate::slog_warn!(
                     "storage retention reaper root={} error={error}",
-                    worker_storage.display()
+                    worker_storage.artifacts.display()
                 );
             }
         });
@@ -2241,22 +3594,26 @@ fn schedule_reaper(storage: &Path) {
         states()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(storage.clone())
+            .entry(storage.artifacts.clone())
             .or_default()
             .reaping = false;
         crate::slog_warn!(
             "storage retention reaper spawn root={} error={error}",
-            storage.display()
+            storage.artifacts.display()
         );
     }
 }
 
-fn root_resident(storage: &Path, key: &str, history: &BTreeMap<String, Vec<Binding>>) -> bool {
-    crate::root_cache::protected_read_marker_exists(&storage.join("retention"), key)
+fn root_resident(
+    storage: &StoragePaths,
+    key: &str,
+    history: &BTreeMap<String, Vec<Binding>>,
+) -> bool {
+    crate::root_cache::protected_read_marker_exists(&storage.durable.join("retention"), key)
         || history.get(key).is_some_and(|records| {
             records.iter().any(|binding| {
                 crate::root_cache::protected_read_marker_exists(
-                    &storage.join("retention"),
+                    &storage.durable.join("retention"),
                     &crate::path_identity::project_scope_key(&binding.root),
                 )
             })
@@ -2277,34 +3634,36 @@ struct OwnerManifests(
 );
 
 impl OwnerManifests {
-    fn read(storage: &Path) -> Self {
+    fn read(storage: &StoragePaths) -> Self {
         Self::read_with_admission(storage, false)
     }
 
-    fn read_with_admission(storage: &Path, admission: bool) -> Self {
+    fn read_with_admission(storage: &StoragePaths, admission: bool) -> Self {
         #[cfg(test)]
-        test_hook(storage, "owner-scan");
+        test_hook(&storage.artifacts, "owner-scan");
         Self(
-            bounded_dirs(&storage.join("artifact-owners"), HISTORY_ENTRIES).and_then(|owners| {
-                let mut records = Vec::new();
-                for owner in owners {
-                    if admission {
-                        yield_to_bind(storage)?;
+            bounded_dirs(&storage.durable.join("artifact-owners"), HISTORY_ENTRIES).and_then(
+                |owners| {
+                    let mut records = Vec::new();
+                    for owner in owners {
+                        if admission {
+                            yield_to_bind(&storage.durable)?;
+                        }
+                        let path = owner.path().join("owner.json");
+                        if path.exists() {
+                            records.push((owner.file_name(), read_json(&path)));
+                        }
                     }
-                    let path = owner.path().join("owner.json");
-                    if path.exists() {
-                        records.push((owner.file_name(), read_json(&path)));
-                    }
-                }
-                Ok(records)
-            }),
+                    Ok(records)
+                },
+            ),
         )
     }
 
     /// Whether a live owner protects `key`. `known` says whether the key has
     /// binding history; without it, any protected owner lacking a residency
     /// marker protects the key as well.
-    fn protect(&self, storage: &Path, key: &str, known: bool) -> io::Result<bool> {
+    fn protect(&self, storage: &StoragePaths, key: &str, known: bool) -> io::Result<bool> {
         let owners = self
             .0
             .as_ref()
@@ -2369,7 +3728,8 @@ impl DueBatch {
     /// had it been retired when its lane met it.
     fn flush(
         &mut self,
-        storage: &Path,
+        storage: &StoragePaths,
+        roots: &mut RootIdentities,
         now: u64,
         deadline: Instant,
         clock: &dyn Fn() -> Instant,
@@ -2391,8 +3751,8 @@ impl DueBatch {
             return Ok(());
         }
         #[cfg(test)]
-        test_hook(storage, "due-ready");
-        if bind_pending(storage) {
+        test_hook(&storage.artifacts, "due-ready");
+        if bind_pending(&storage.durable) {
             for item in items {
                 let before = DomainReport::from_report(report);
                 report.skipped_protected += 1;
@@ -2408,27 +3768,38 @@ impl DueBatch {
         // Try the retention barrier without waiting. If a bind or pin holds it,
         // that caller is protecting this storage right now, so retention backs
         // off instead of spending its pass budget waiting.
-        let admission =
-            crate::fs_lock::try_acquire(&storage.join("retention/sweep.lock"), Duration::ZERO)
-                .map_err(|error| io::Error::other(error.to_string()))
-                .and_then(|barrier| {
-                    #[cfg(test)]
-                    test_hook(storage, "due-admitted");
-                    if cancelled() {
-                        report.cancelled = true;
-                        return Ok(None);
-                    }
-                    if clock() >= deadline {
-                        report.stopped_early = true;
-                        return Ok(None);
-                    }
-                    yield_to_bind(storage)?;
-                    Ok(Some((
-                        barrier,
-                        bindings_with_admission(storage, true)?,
-                        OwnerManifests::read_with_admission(storage, true),
-                    )))
-                });
+        let admission = crate::fs_lock::try_acquire(
+            &storage.durable.join("retention/sweep.lock"),
+            Duration::ZERO,
+        )
+        .map_err(|error| io::Error::other(error.to_string()))
+        .and_then(|barrier| {
+            let artifacts = crate::fs_lock::try_acquire(
+                &storage.artifacts.join(".retention-sweep.lock"),
+                Duration::ZERO,
+            )
+            .map_err(io::Error::other)?;
+            let barrier = Barrier {
+                _metadata: barrier,
+                _artifacts: artifacts,
+            };
+            #[cfg(test)]
+            test_hook(&storage.artifacts, "due-admitted");
+            if cancelled() {
+                report.cancelled = true;
+                return Ok(None);
+            }
+            if clock() >= deadline {
+                report.stopped_early = true;
+                return Ok(None);
+            }
+            yield_to_bind(&storage.durable)?;
+            Ok(Some((
+                barrier,
+                bindings_with_admission(storage, true, roots)?,
+                OwnerManifests::read_with_admission(storage, true),
+            )))
+        });
         *report
             .timings_ms
             .entry("due_admission_history".into())
@@ -2451,7 +3822,7 @@ impl DueBatch {
                 report.stopped_early = true;
                 break;
             }
-            if yield_to_bind(storage).is_err() {
+            if yield_to_bind(&storage.durable).is_err() {
                 break;
             }
             let before = DomainReport::from_report(report);
@@ -2476,7 +3847,7 @@ impl DueBatch {
         }
         drop(barrier);
         #[cfg(test)]
-        test_hook(storage, "due-released");
+        test_hook(&storage.durable, "due-released");
         drop(files);
         // These lookups can walk legacy flat cache domains. The roots are
         // already retired; a bind must not queue behind this bookkeeping.
@@ -2490,7 +3861,7 @@ impl DueBatch {
 }
 
 fn attribute_due(
-    storage: &Path,
+    storage: &StoragePaths,
     directory: &Path,
     due_lane: bool,
     before: &DomainReport,
@@ -2503,9 +3874,7 @@ fn attribute_due(
     report
         .domains
         .entry(
-            directory
-                .strip_prefix(storage)
-                .map_err(io::Error::other)?
+            relative_domain(storage, &directory)?
                 .to_string_lossy()
                 .into_owned(),
         )
@@ -2517,7 +3886,7 @@ fn attribute_due(
 impl PreparedDue {
     fn attribute(
         &self,
-        storage: &Path,
+        storage: &StoragePaths,
         before: &DomainReport,
         report: &mut SweepReport,
     ) -> io::Result<()> {
@@ -2541,7 +3910,7 @@ impl PreparedDue {
     /// and new binaries take before recording a binding.
     fn retire(
         self,
-        storage: &Path,
+        storage: &StoragePaths,
         current: &BTreeMap<String, Vec<Binding>>,
         owners: &OwnerManifests,
         now: u64,
@@ -2551,7 +3920,7 @@ impl PreparedDue {
         let Self {
             directory,
             key,
-            leases,
+            mut leases,
             deadline: _,
             ..
         } = self;
@@ -2559,9 +3928,10 @@ impl PreparedDue {
         let key = key.as_str();
         if !eligible(storage, key, current, now, ROOT_GRACE_MS, report)?
             || root_resident(storage, key, current)
-            || crate::root_cache::live_scope_keys_for_storage(storage).contains(key)
+            || crate::root_cache::live_scope_keys_for_storage(&storage.durable).contains(key)
             || owners.protect(storage, key, current.contains_key(key))?
             || protected(&cache)?
+            || legacy_import_source_pinned(storage, &cache, key)
         {
             report.skipped_protected += 1;
             return Ok(());
@@ -2574,14 +3944,17 @@ impl PreparedDue {
             report.cancelled = true;
             return Ok(());
         }
-        yield_to_bind(storage)?;
+        yield_to_bind(&storage.durable)?;
         let phase = Instant::now();
-        retire_directory(storage, &cache)?;
+        for lease in &mut leases {
+            lease.stop_heartbeat_for_removal();
+        }
+        retire_directory(&storage.durable, &cache)?;
         *report.timings_ms.entry("due_rename".into()).or_default() +=
             phase.elapsed().as_millis() as u64;
         report.removed_roots += 1;
         report.unmeasured_removed_roots += 1;
-        if directory == storage.join("views") {
+        if directory == storage.artifacts.join("views") {
             report.due_views_remaining = report.due_views_remaining.saturating_sub(1);
         }
         // Lease guards address the old pathname. Drop them before releasing
@@ -2596,7 +3969,7 @@ impl PreparedDue {
 /// that other candidates get. Validate its tree once without measuring, then
 /// queue it in `batch` for the admission recheck that retires it.
 fn prepare_due_cache(
-    storage: &Path,
+    storage: &StoragePaths,
     directory: &Path,
     key: &str,
     history: &BTreeMap<String, Vec<Binding>>,
@@ -2639,7 +4012,7 @@ fn prepare_due_cache(
         report.skipped_protected += 1;
         return Ok(());
     }
-    if crate::root_cache::live_scope_keys_for_storage(storage).contains(key) {
+    if crate::root_cache::live_scope_keys_for_storage(&storage.durable).contains(key) {
         report.skipped_live += 1;
         return Ok(());
     }
@@ -2660,12 +4033,32 @@ fn prepare_due_cache(
 }
 
 pub(crate) fn remove_directory_if_closed(cache: &Path) -> io::Result<()> {
+    remove_directory_if_closed_with(cache, |_| Ok(()))
+}
+
+pub(crate) fn remove_directory_if_closed_with(
+    cache: &Path,
+    before_remove: impl FnOnce(&crate::bash_background::persistence::PinnedDir) -> io::Result<()>,
+) -> io::Result<()> {
+    let access = crate::root_cache::pin_owned_cache_path(cache)?;
+    #[cfg(test)]
+    test_hook(cache, "remove-pinned");
+    let (parent, name) = access.parent()?;
+    let child = parent.repair_child_same_mount(&name)?;
+    child.repair_check_boundary(&access.root, &[])?;
+    let expected = child.directory_identity()?;
+    let protected = crate::root_cache::cache_deletion_protections(cache)?;
     tree_files(cache, Instant::now() + PASS_BUDGET)?;
     let _files = crate::db::file_identity::filesystem_guard();
+    // Eviction clears its pointer through this same admitted handle before
+    // payload removal; a still-open payload database can then retain the tree.
+    before_remove(&child)?;
     if crate::db::file_identity::has_open_connections_under(cache) {
         return Err(io::Error::other("open SQLite cache retained"));
     }
-    fs::remove_dir_all(cache)
+    #[cfg(test)]
+    test_hook(cache, "remove-root");
+    parent.repair_remove_child(&name, expected, &protected, &mut 0)
 }
 
 pub(crate) fn retention_tree_bytes(directory: &Path, deadline: Instant) -> io::Result<u64> {
@@ -2673,7 +4066,7 @@ pub(crate) fn retention_tree_bytes(directory: &Path, deadline: Instant) -> io::R
 }
 
 fn eligible(
-    storage: &Path,
+    storage: &StoragePaths,
     key: &str,
     history: &BTreeMap<String, Vec<Binding>>,
     now: u64,
@@ -2699,6 +4092,7 @@ fn eligible(
         return Ok(false);
     }
     let path = storage
+        .durable
         .join("retention/unknown")
         .join(format!("{key}.json"));
     // The first observation is an on-disk clock, not scheduling state. Reload
@@ -2726,7 +4120,7 @@ struct ViewMembers(Option<Result<HashSet<String>, String>>);
 impl ViewMembers {
     /// `Err` when any family registry could not be read completely: a scope
     /// that registry might list is then unknown, never absent.
-    fn contains(&mut self, storage: &Path, scope: &str) -> Result<bool, String> {
+    fn contains(&mut self, storage: &StoragePaths, scope: &str) -> Result<bool, String> {
         self.0
             .get_or_insert_with(|| view_member_scopes(storage).map_err(|error| error.to_string()))
             .as_ref()
@@ -2735,9 +4129,9 @@ impl ViewMembers {
     }
 }
 
-fn view_member_scopes(storage: &Path) -> io::Result<HashSet<String>> {
+fn view_member_scopes(storage: &StoragePaths) -> io::Result<HashSet<String>> {
     let mut scopes = HashSet::new();
-    for entry in bounded_dirs(&storage.join("blobs/v2"), TREE_ENTRIES)? {
+    for entry in bounded_dirs(&storage.artifacts.join("blobs/v2"), TREE_ENTRIES)? {
         if !entry
             .path()
             .join(crate::views::registry::REGISTRY_FILE)
@@ -2746,9 +4140,10 @@ fn view_member_scopes(storage: &Path) -> io::Result<HashSet<String>> {
             continue;
         }
         let family = entry.file_name().to_string_lossy().into_owned();
-        let registry = crate::views::registry::FamilyRegistry::open_existing(storage, &family)
-            .map_err(|error| io::Error::other(format!("family registry {family}: {error}")))?
-            .ok_or_else(|| io::Error::other(format!("family registry {family} vanished")))?;
+        let registry =
+            crate::views::registry::FamilyRegistry::open_existing(&storage.artifacts, &family)
+                .map_err(|error| io::Error::other(format!("family registry {family}: {error}")))?
+                .ok_or_else(|| io::Error::other(format!("family registry {family} vanished")))?;
         let members = registry
             .members_bounded(HISTORY_ENTRIES + 1)
             .map_err(|error| io::Error::other(format!("family registry {family}: {error}")))?;
@@ -2762,8 +4157,23 @@ fn view_member_scopes(storage: &Path) -> io::Result<HashSet<String>> {
     Ok(scopes)
 }
 
+fn report_candidate_error(cache: &Path, error: &io::Error, report: &mut SweepReport) {
+    // An unfinished walk has not established protection. Keep its reason and
+    // mark the pass incomplete, without conflating filesystem timeouts with
+    // the collector's own deadline.
+    if is_retention_deadline(error) {
+        report.stopped_early = true;
+    } else {
+        report.skipped_protected += 1;
+    }
+    if report.errors.len() < 16 {
+        report.errors.push(format!("{}: {error}", cache.display()));
+    }
+}
+
 fn candidate(
-    storage: &Path,
+    storage: &StoragePaths,
+    roots: &mut RootIdentities,
     directory: &Path,
     key: &str,
     flat: bool,
@@ -2779,6 +4189,7 @@ fn candidate(
     let mut orphan = false;
     let result = candidate_inner(
         storage,
+        roots,
         directory,
         key,
         flat,
@@ -2794,11 +4205,12 @@ fn candidate(
     if orphan {
         let mut delta = DomainReport::from_report(report).difference(&before);
         delta.examined += 1;
-        if result.is_err() {
-            // The caller adds one to skipped_protected for a candidate that
-            // returned an error, after this wrapper has run. Add the same
-            // count here so the orphan_views figures stay a subset of the
-            // pass totals rather than disagreeing with them.
+        if result
+            .as_ref()
+            .is_err_and(|error| !is_retention_deadline(error))
+        {
+            // The caller counts non-deadline errors as protected after this
+            // wrapper returns. Mirror that count in the orphan subtotal.
             delta.skipped_protected += 1;
         }
         report.orphan_views.add(&delta);
@@ -2807,7 +4219,8 @@ fn candidate(
 }
 
 fn candidate_inner(
-    storage: &Path,
+    storage: &StoragePaths,
+    roots: &mut RootIdentities,
     directory: &Path,
     key: &str,
     flat: bool,
@@ -2836,20 +4249,9 @@ fn candidate_inner(
     {
         return prepare_due_cache(storage, directory, key, history, deadline, batch, report);
     }
-    let before = tree_files(&cache, deadline)?;
-    if directory.file_name().is_some_and(|name| name == "views") {
-        if let Some(store) = crate::views::ViewStore::existing_dir(cache.clone()) {
-            report.removed_generations += store
-                .sweep_generations()
-                .map_err(|error| io::Error::other(error.to_string()))?;
-        }
-    }
-    let after_views = tree_files(&cache, deadline)?;
-    report.removed_bytes += before
-        .iter()
-        .map(|(_, bytes)| bytes)
-        .sum::<u64>()
-        .saturating_sub(after_views.iter().map(|(_, bytes)| bytes).sum());
+    let flat_pin = flat
+        .then(|| crate::bash_background::persistence::PinnedDir::repair_open_path(&cache))
+        .transpose()?;
     let mut leases = Vec::new();
     let local_writer = crate::root_cache::local_callgraph_writer(&cache);
     for name in [
@@ -2891,11 +4293,11 @@ fn candidate_inner(
     report.removed_bytes += old_bytes.saturating_sub(new_bytes);
     // Residency protects the root, not unheld obsolete generations. An owner
     // can be alive while using a different plane in the same repository family.
-    if crate::root_cache::protected_read_marker_exists(&storage.join("retention"), key)
+    if crate::root_cache::protected_read_marker_exists(&storage.durable.join("retention"), key)
         || history.get(key).is_some_and(|records| {
             records.iter().any(|binding| {
                 crate::root_cache::protected_read_marker_exists(
-                    &storage.join("retention"),
+                    &storage.durable.join("retention"),
                     &crate::path_identity::project_scope_key(&binding.root),
                 )
             })
@@ -2904,11 +4306,11 @@ fn candidate_inner(
         report.skipped_protected += 1;
         return Ok(());
     }
-    if crate::root_cache::live_scope_keys_for_storage(storage).contains(key) {
+    if crate::root_cache::live_scope_keys_for_storage(&storage.durable).contains(key) {
         report.skipped_live += 1;
         return Ok(());
     }
-    for owner in bounded_dirs(&storage.join("artifact-owners"), HISTORY_ENTRIES)? {
+    for owner in bounded_dirs(&storage.durable.join("artifact-owners"), HISTORY_ENTRIES)? {
         let path = owner.path().join("owner.json");
         if !path.exists() {
             continue;
@@ -2954,7 +4356,7 @@ fn candidate_inner(
         return Ok(());
     }
     if !history.contains_key(key)
-        && after_views.iter().any(|(path, _)| {
+        && before.iter().any(|(path, _)| {
             path.file_name().is_none_or(|name| {
                 !matches!(
                     name.to_str(),
@@ -2982,14 +4384,33 @@ fn candidate_inner(
     // Walks run without either admission or SQLite's process-wide open gate.
     // Both old and new binders use sweep.lock. Reread history under it, but
     // never wait for SQLite's open gate while holding binding admission.
+    // Recheck protection and binding history under admission immediately before
+    // deletion, since a configure or query may have arrived during the walks.
+    // A registration binds its root under this barrier before it creates a
+    // view folder, so an orphan that gained history here is no longer one.
+    // With a separate cache root the cache-side lock is taken too, as in
+    // `cache_barrier`, without waiting.
     #[cfg(test)]
-    test_hook(storage, "candidate-ready");
-    yield_to_bind(storage)?;
+    test_hook(&storage.artifacts, "candidate-ready");
+    yield_to_bind(&storage.durable)?;
     let files_guard = crate::db::file_identity::filesystem_guard();
-    let admission =
-        crate::fs_lock::try_acquire(&storage.join("retention/sweep.lock"), Duration::ZERO)
-            .map_err(|error| io::Error::other(error.to_string()))?;
-    let current_history = bindings_with_admission(storage, true)?;
+    let admission = crate::fs_lock::try_acquire(
+        &storage.durable.join("retention/sweep.lock"),
+        Duration::ZERO,
+    )
+    .map_err(|error| io::Error::other(error.to_string()))
+    .and_then(|metadata| {
+        let artifacts = crate::fs_lock::try_acquire(
+            &storage.artifacts.join(".retention-sweep.lock"),
+            Duration::ZERO,
+        )
+        .map_err(io::Error::other)?;
+        Ok(Barrier {
+            _metadata: metadata,
+            _artifacts: artifacts,
+        })
+    })?;
+    let current_history = bindings_with_admission(storage, true, roots)?;
     if !eligible(
         storage,
         key,
@@ -2997,8 +4418,9 @@ fn candidate_inner(
         now,
         unknown_grace_ms,
         report,
-    )? || crate::root_cache::live_scope_keys_for_storage(storage).contains(key)
+    )? || crate::root_cache::live_scope_keys_for_storage(&storage.durable).contains(key)
         || protected(&cache)?
+        || legacy_import_source_pinned(storage, &cache, key)
     {
         report.skipped_protected += 1;
         return Ok(());
@@ -3011,23 +4433,31 @@ fn candidate_inner(
         report.cancelled = true;
         return Ok(());
     }
-    yield_to_bind(storage)?;
+    yield_to_bind(&storage.durable)?;
     if flat {
         // Legacy domains contain several roots. Delete only the key's file set,
         // never the directory or another key's files/coordination records.
+        #[cfg(test)]
+        test_hook(&cache, "flat-unlink");
         for (path, bytes) in after {
             if path.parent() == Some(cache.as_path())
                 && path
                     .file_name()
                     .is_some_and(|name| name.to_string_lossy().starts_with(&format!("{key}.")))
             {
-                fs::remove_file(path)?;
+                flat_pin
+                    .as_ref()
+                    .unwrap()
+                    .repair_remove_file(path.file_name().unwrap())?;
                 report.removed_bytes += bytes;
             }
         }
     } else {
-        retire_directory(storage, &cache)?;
-        report.removed_bytes += after_views
+        for lease in &mut leases {
+            lease.stop_heartbeat_for_removal();
+        }
+        retire_directory(&storage.durable, &cache)?;
+        report.removed_bytes += before
             .iter()
             .map(|(_, bytes)| bytes)
             .sum::<u64>()
@@ -3045,7 +4475,7 @@ fn candidate_inner(
     Ok(())
 }
 
-pub(crate) fn run_pass(storage: &Path, cancelled: &dyn Fn() -> bool) -> SweepReport {
+pub(crate) fn run_pass(storage: &StoragePaths, cancelled: &dyn Fn() -> bool) -> SweepReport {
     run_pass_with_clock(storage, cancelled, &Instant::now)
 }
 
@@ -3070,7 +4500,8 @@ fn due_keys(history: &BTreeMap<String, Vec<Binding>>, now: u64) -> Vec<String> {
 /// Runs the full candidate checks on the checkout caches of keys that are
 /// already due, starting after the key the previous pass ended on.
 fn due_first(
-    storage: &Path,
+    storage: &StoragePaths,
+    roots: &mut RootIdentities,
     domains: &[(PathBuf, bool)],
     history: &BTreeMap<String, Vec<Binding>>,
     deadline: Instant,
@@ -3099,7 +4530,7 @@ fn due_first(
                 && !retired_mount_point(&directory.join(&key))
             {
                 present = true;
-                if directory == &storage.join("views") {
+                if directory == &storage.artifacts.join("views") {
                     report.due_views_remaining += 1;
                 }
                 caches.push((key.clone(), directory.clone()));
@@ -3110,13 +4541,13 @@ fn due_first(
     let cursor = states()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(storage)
+        .get(storage.artifacts.as_path())
         .and_then(|state| state.due_cursor.clone());
     // Large per-checkout views dominate disk usage. Process them before other
     // planes, retaining a rotating key order within each priority class.
     caches.sort_by_key(|(key, directory)| {
         (
-            directory != &storage.join("views"),
+            directory != &storage.artifacts.join("views"),
             cursor.as_ref().is_some_and(|last| key <= last),
             key.clone(),
         )
@@ -3136,6 +4567,7 @@ fn due_first(
         report.examined += 1;
         if let Err(error) = candidate(
             storage,
+            roots,
             &directory,
             &key,
             false,
@@ -3147,21 +4579,14 @@ fn due_first(
             batch,
             report,
         ) {
-            report.skipped_protected += 1;
-            if report.errors.len() < 16 {
-                report
-                    .errors
-                    .push(format!("{}: {error}", directory.join(&key).display()));
-            }
+            report_candidate_error(&directory.join(&key), &error, report);
         }
         let delta = DomainReport::from_report(report).difference(&before);
         report.due_first.add(&delta);
         report
             .domains
             .entry(
-                directory
-                    .strip_prefix(storage)
-                    .map_err(io::Error::other)?
+                relative_domain(storage, &directory)?
                     .to_string_lossy()
                     .into_owned(),
             )
@@ -3169,17 +4594,33 @@ fn due_first(
             .add(&delta);
         last = Some(key);
         if batch.full() {
-            batch.flush(storage, report.at_ms, deadline, clock, cancelled, report)?;
+            batch.flush(
+                storage,
+                roots,
+                report.at_ms,
+                deadline,
+                clock,
+                cancelled,
+                report,
+            )?;
         }
     }
-    let flushed = batch.flush(storage, report.at_ms, deadline, clock, cancelled, report);
+    let flushed = batch.flush(
+        storage,
+        roots,
+        report.at_ms,
+        deadline,
+        clock,
+        cancelled,
+        report,
+    );
     batch.due_lane = false;
     flushed?;
     if let Some(last) = last {
         states()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(storage.to_path_buf())
+            .entry(storage.artifacts.clone())
             .or_default()
             .due_cursor = Some(last);
     }
@@ -3187,16 +4628,16 @@ fn due_first(
 }
 
 fn run_pass_with_clock(
-    storage: &Path,
+    storage: &StoragePaths,
     cancelled: &dyn Fn() -> bool,
     clock: &dyn Fn() -> Instant,
 ) -> SweepReport {
     run_pass_with_budget(storage, cancelled, clock, PASS_BUDGET)
 }
 
-fn persist_cursor(storage: &Path, path: &Path, cursor: &TraversalCursor) -> io::Result<()> {
+fn persist_cursor(storage: &StoragePaths, path: &Path, cursor: &TraversalCursor) -> io::Result<()> {
     #[cfg(test)]
-    test_hook(storage, "cursor-commit");
+    test_hook(&storage.artifacts, "cursor-commit");
     #[cfg(not(test))]
     let _ = storage;
     atomic_json(path, cursor)
@@ -3205,7 +4646,8 @@ fn persist_cursor(storage: &Path, path: &Path, cursor: &TraversalCursor) -> io::
 /// Unbound views have their own cursor and reserved budget. A long due queue
 /// or a lexical batch full of bound views must not postpone orphan observation.
 fn orphan_first(
-    storage: &Path,
+    storage: &StoragePaths,
+    roots: &mut RootIdentities,
     history: &BTreeMap<String, Vec<Binding>>,
     deadline: Instant,
     clock: &dyn Fn() -> Instant,
@@ -3216,7 +4658,7 @@ fn orphan_first(
 ) -> io::Result<HashSet<PathBuf>> {
     let batch = traversal_batch_filtered(
         storage,
-        &[(storage.join("views"), false)],
+        &[(storage.artifacts.join("views"), false)],
         "orphans",
         PASS_ENTRIES,
         &|entry| {
@@ -3244,6 +4686,7 @@ fn orphan_first(
         if item.entry.file_type()?.is_dir() {
             if let Err(error) = candidate(
                 storage,
+                roots,
                 &item.directory,
                 &key,
                 false,
@@ -3255,12 +4698,7 @@ fn orphan_first(
                 due,
                 report,
             ) {
-                report.skipped_protected += 1;
-                if report.errors.len() < 16 {
-                    report
-                        .errors
-                        .push(format!("{}: {error}", item.entry.path().display()));
-                }
+                report_candidate_error(&item.entry.path(), &error, report);
             }
         }
         let delta = DomainReport::from_report(report).difference(&before);
@@ -3274,7 +4712,15 @@ fn orphan_first(
     }
     // Views this lane visits have no binding history, so none is due; flush
     // anyway so nothing prepared here can outlive the lane.
-    due.flush(storage, report.at_ms, deadline, clock, cancelled, report)?;
+    due.flush(
+        storage,
+        roots,
+        report.at_ms,
+        deadline,
+        clock,
+        cancelled,
+        report,
+    )?;
     if completed {
         last = Some(batch.end);
     }
@@ -3287,11 +4733,35 @@ fn orphan_first(
 /// One pass with an explicit time budget. Production always passes
 /// PASS_BUDGET; tests that check the entry bound pass a budget no runner can
 /// exhaust, so a slow machine cannot stop the pass by wall clock first.
+#[cfg(test)]
+pub(crate) fn run_pass_with_budget_for_test(
+    storage: &StoragePaths,
+    budget: Duration,
+) -> SweepReport {
+    run_pass_with_budget(storage, &|| false, &Instant::now, budget)
+}
+
 fn run_pass_with_budget(
-    storage: &Path,
+    storage: &StoragePaths,
     cancelled: &dyn Fn() -> bool,
     clock: &dyn Fn() -> Instant,
     budget: Duration,
+) -> SweepReport {
+    run_pass_with_root_identities(
+        storage,
+        cancelled,
+        clock,
+        budget,
+        &mut RootIdentities::default(),
+    )
+}
+
+fn run_pass_with_root_identities(
+    storage: &StoragePaths,
+    cancelled: &dyn Fn() -> bool,
+    clock: &dyn Fn() -> Instant,
+    budget: Duration,
+    roots: &mut RootIdentities,
 ) -> SweepReport {
     let started = Instant::now();
     let mut report = SweepReport {
@@ -3299,23 +4769,33 @@ fn run_pass_with_budget(
         ..Default::default()
     };
     let result = (|| -> io::Result<()> {
-        if bind_pending(storage) {
+        if bind_pending(&storage.durable) {
             report.stopped_early = true;
             return Ok(());
         }
-        if !crate::root_cache::storage_allows_root_keyed(storage)? {
+        crate::root_cache::check_cache_access(&storage.artifacts)?;
+        if !crate::root_cache::storage_allows_root_keyed(&storage.durable)? {
             return Err(io::Error::other("network storage retained"));
         }
+        // Residency probes distinguish an absent readers directory from an
+        // unavailable cache root. Establish the durable metadata root first.
+        crate::private_storage::create_dir_all(storage.durable.join("retention"))?;
+        let phase = Instant::now();
+        sweep_view_generations(storage, cancelled, &mut report)?;
+        report
+            .timings_ms
+            .insert("generations".into(), phase.elapsed().as_millis() as u64);
+        if report.cancelled || bind_pending(&storage.durable) {
+            return Ok(());
+        }
         prune_bindings(storage, cancelled, &mut report)?;
-        let history = bindings(storage)?;
+        let history = bindings(storage, roots)?;
         let domains = domain_paths(storage)?;
         for (directory, _) in &domains {
             report
                 .domains
                 .entry(
-                    directory
-                        .strip_prefix(storage)
-                        .map_err(io::Error::other)?
+                    relative_domain(storage, &directory)?
                         .to_string_lossy()
                         .into_owned(),
                 )
@@ -3334,6 +4814,7 @@ fn run_pass_with_budget(
         // at the rate new checkouts arrive.
         due_first(
             storage,
+            roots,
             &domains,
             &history,
             deadline - budget / 2,
@@ -3352,6 +4833,7 @@ fn run_pass_with_budget(
         let phase = Instant::now();
         let orphan_visited = orphan_first(
             storage,
+            roots,
             &history,
             deadline - budget / 4,
             clock,
@@ -3403,6 +4885,7 @@ fn run_pass_with_budget(
             {
                 if let Err(error) = candidate(
                     storage,
+                    roots,
                     &directory,
                     key,
                     flat,
@@ -3414,12 +4897,7 @@ fn run_pass_with_budget(
                     &mut due,
                     &mut report,
                 ) {
-                    report.skipped_protected += 1;
-                    if report.errors.len() < 16 {
-                        report
-                            .errors
-                            .push(format!("{}: {error}", entry.path().display()));
-                    }
+                    report_candidate_error(&entry.path(), &error, &mut report);
                 }
             }
             let delta = DomainReport::from_report(&report).difference(&before);
@@ -3432,6 +4910,7 @@ fn run_pass_with_budget(
             if due.full() {
                 due.flush(
                     storage,
+                    roots,
                     report.at_ms,
                     deadline,
                     clock,
@@ -3442,6 +4921,7 @@ fn run_pass_with_budget(
         }
         due.flush(
             storage,
+            roots,
             report.at_ms,
             deadline,
             clock,
@@ -3459,11 +4939,6 @@ fn run_pass_with_budget(
         report
             .timings_ms
             .insert("roots".into(), phase.elapsed().as_millis() as u64);
-        // A stopped pass leaves pending mount trash for a later pass instead
-        // of starting new mount scans and unlinks after cancellation or expiry.
-        if !report.cancelled && !cancelled() && clock() < deadline {
-            schedule_reaper(storage);
-        }
         Ok(())
     })();
     if let Err(error) = result {
@@ -3471,9 +4946,14 @@ fn run_pass_with_budget(
             report.errors.push(error.to_string());
         }
     }
+    // Trash is already detached from live caches. Its independent deadline and
+    // lock must not depend on how much of the root sweep's budget remains.
+    if !report.cancelled && !cancelled() {
+        schedule_reaper(storage);
+    }
     // Blob stores have their own mark-before-sweep barrier. Release the root
     // barrier before entering it; otherwise pin admission would deadlock.
-    if !report.cancelled && !cancelled() && !bind_pending(storage) {
+    if !report.cancelled && !cancelled() && !bind_pending(&storage.durable) {
         let phase = Instant::now();
         if let Err(error) = collect_one_family(storage, cancelled, &mut report) {
             report.errors.push(error.to_string());
@@ -3503,7 +4983,8 @@ fn run_pass_with_budget(
     let mut states = states()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let state = states.entry(storage.to_path_buf()).or_default();
+    let state = states.entry(storage.artifacts.clone()).or_default();
+    report.trash = state.trash.clone();
     if report.cancelled {
         state.last_run = None;
     }
@@ -3512,7 +4993,7 @@ fn run_pass_with_budget(
 }
 
 fn collect_one_v2_family(
-    storage: &Path,
+    storage: &StoragePaths,
     cancelled: &dyn Fn() -> bool,
     report: &mut SweepReport,
 ) -> io::Result<()> {
@@ -3521,33 +5002,18 @@ fn collect_one_v2_family(
         if !key_valid(&family) || !entry.file_type()?.is_dir() || cancelled() {
             return Ok(());
         }
-        let registry = crate::views::registry::FamilyRegistry::open_existing(storage, &family)
-            .map_err(|error| io::Error::other(error.to_string()))?;
+        let registry =
+            crate::views::registry::FamilyRegistry::open_existing(&storage.artifacts, &family)
+                .map_err(|error| io::Error::other(error.to_string()))?;
         let Some(registry) = registry else {
             return Ok(());
         };
+        registry
+            .bind_durable_storage(&storage.durable)
+            .map_err(io::Error::other)?;
         let deadline = Instant::now() + PASS_BUDGET;
-        for member in registry
-            .members_bounded(HISTORY_ENTRIES)
-            .map_err(|error| io::Error::other(error.to_string()))?
-        {
-            if cancelled() || Instant::now() >= deadline {
-                report.stopped_early = true;
-                return Ok(());
-            }
-            // V2 pin admission uses this same registry barrier. It cannot race the
-            // generation protection snapshot and removal under the pointer lock.
-            if let Some(store) = crate::views::ViewStore::existing_dir(member.view_dir) {
-                let removed = registry
-                    .with_barrier(|_| {
-                        store
-                            .sweep_generations_locked()
-                            .map_err(crate::views::registry::RegistryError::View)
-                    })
-                    .map_err(|error| io::Error::other(error.to_string()))?;
-                report.removed_generations += removed;
-            }
-        }
+        // Generation cleanup uses the independent view cursor above; starting
+        // at the first registry member on every family visit starves its tail.
         if cancelled() {
             return Ok(());
         }
@@ -3632,7 +5098,7 @@ enum V3Step {
 /// way, so they never keep a member. `Err` is uncertainty (an unreadable pin,
 /// or a `pins/` or `readers/` listing longer than the bound) and keeps the
 /// member without resetting its count, as the v2 family sweep does.
-fn v3_member_protected(
+pub(crate) fn v3_member_protected(
     tx: &rusqlite::Transaction<'_>,
     scope: &str,
     view_dir: &Path,
@@ -3796,6 +5262,7 @@ fn v3_count_missing_pass(
 /// appeared since the first step keeps the member.
 fn v3_recheck_and_mark_evicting(
     tx: &rusqlite::Transaction<'_>,
+    // The durable root, where retention keeps root bindings.
     storage: &Path,
     scope: &str,
     view_dir: &Path,
@@ -3858,10 +5325,16 @@ fn v3_finish_eviction(
     crate::views::registry::remove_view_dir(view_dir)?;
     registry
         .with_barrier(|tx| {
-            tx.execute(
+            let removed = tx.execute(
                 "DELETE FROM members WHERE scope=?1 AND state=?2",
                 rusqlite::params![scope, crate::views::registry::STATE_EVICTING],
             )?;
+            // A deregistered worker's referrer and strict-rebuild rows go in
+            // the same transaction as its member row, after its directory.
+            if removed > 0 && crate::views::base_refs::has_base_refs(tx)? {
+                tx.execute("DELETE FROM base_refs WHERE worker_scope=?1", [scope])?;
+                tx.execute("DELETE FROM strict_rebuild WHERE worker_scope=?1", [scope])?;
+            }
             Ok(())
         })
         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -3879,7 +5352,8 @@ fn v3_finish_eviction(
 /// been missing, unprotected and past the recency and mount guards for
 /// `MISSING_ROOT_SWEEPS` consecutive passes. `kind = base` members and
 /// members with no root are never removed. Plane rows stay for the v3 plane
-/// sweep.
+/// sweep. Above the unified namespace target it also evicts idle views in
+/// least-recently-bound order, with the same protection checks.
 ///
 /// It only opens registries that already exist. A storage root with no
 /// `blobs/v3/` lists nothing, and a family directory without `members.sqlite`
@@ -3892,14 +5366,17 @@ fn v3_finish_eviction(
 struct V3Bounds {
     /// Time for the lock wait, the member work and the measurements together.
     budget: Duration,
-    /// Members examined in one visit, as `collect_one_v2_family` caps them.
+    /// Members examined in each missing-root or idle window of one visit.
     members: usize,
+    /// Allocated bytes retained in the unified v3 family namespace.
+    soft_bytes: u64,
 }
 
 impl V3Bounds {
     const PASS: Self = Self {
         budget: PASS_BUDGET,
         members: HISTORY_ENTRIES,
+        soft_bytes: crate::views::eviction::FAMILY_PAYLOAD_BUDGET_BYTES,
     };
 }
 
@@ -3912,14 +5389,18 @@ struct V3MemberCursor {
     last_scope: Option<String>,
 }
 
-fn v3_member_cursor_path(storage: &Path, family: &str) -> PathBuf {
-    storage
-        .join("retention/cursors/v3-members")
-        .join(format!("{family}.json"))
+fn v3_member_cursor_path(storage: &StoragePaths, family: &str) -> io::Result<PathBuf> {
+    Ok(cursor_root(storage)?
+        .join("v3-members")
+        .join(format!("{family}.json")))
 }
 
+/// v3 family stores live where v2 ones do: under the artifact root (the
+/// `storage.cache_dir` volume when one is set; `blobs` is a cache domain).
+/// Retention bindings, which decide whether a missing root is due, and the
+/// collector's cursors are durable state under the durable root.
 fn collect_one_v3_family(
-    storage: &Path,
+    storage: &StoragePaths,
     cancelled: &dyn Fn() -> bool,
     report: &mut SweepReport,
     bounds: V3Bounds,
@@ -3929,7 +5410,7 @@ fn collect_one_v3_family(
     let next = || {
         traversal_batch_filtered(
             storage,
-            &[(storage.join("blobs/v3"), false)],
+            &[(storage.artifacts.join("blobs/v3"), false)],
             "families-v3",
             1,
             &|entry| {
@@ -3979,13 +5460,219 @@ fn reservation_lock_busy(error: &crate::blob_store::v3::Error) -> bool {
         crate::blob_store::v3::Error::Io(error)
             if error
                 .get_ref()
-                .and_then(|source| source.downcast_ref::<crate::fs_lock::AcquireError>())
-                .is_some_and(|source| matches!(source, crate::fs_lock::AcquireError::Timeout))
+                .and_then(|source| {
+                    source.downcast_ref::<crate::blob_store::v3::ReservationLockError>()
+                })
+                .is_some_and(crate::blob_store::v3::ReservationLockError::is_timeout)
     )
 }
 
+enum V3IdleStep {
+    Evicting,
+    Held,
+    Unknown(String),
+}
+
+fn report_v3_idle_unknown(
+    view_dir: &Path,
+    error: &io::Error,
+    report: &mut SweepReport,
+    domain: &mut DomainReport,
+) {
+    domain.skipped_unknown += 1;
+    report.stopped_early |= is_retention_deadline(error);
+    if report.errors.len() < 16 {
+        report
+            .errors
+            .push(format!("{}: {error}", view_dir.display()));
+    }
+}
+
+fn v3_mark_idle_evicting(
+    tx: &rusqlite::Transaction<'_>,
+    observed: &V3Member,
+    view_dir: &Path,
+) -> rusqlite::Result<V3IdleStep> {
+    let Some(current) = v3_member(tx, &observed.scope)? else {
+        return Ok(V3IdleStep::Held);
+    };
+    if current.kind != "view"
+        || current.state != "active"
+        || current.last_bind_ms != observed.last_bind_ms
+        || current.root != observed.root
+        || current.view_dir != observed.view_dir
+    {
+        return Ok(V3IdleStep::Held);
+    }
+    // Worker pointer publication can outlive the reservation lock. Its intent
+    // protects the worker even when the insertion marker lives in its base.
+    if crate::views::base_refs::has_base_refs(tx)?
+        && tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM base_refs WHERE worker_scope=?1 AND state='intent')",
+            [&current.scope],
+            |row| row.get::<_, bool>(0),
+        )?
+    {
+        return Ok(V3IdleStep::Held);
+    }
+    match v3_member_protected(tx, &current.scope, view_dir) {
+        Ok(true) => return Ok(V3IdleStep::Held),
+        Err(reason) => return Ok(V3IdleStep::Unknown(reason)),
+        Ok(false) => {}
+    }
+    let _files = crate::db::file_identity::filesystem_guard();
+    if crate::db::file_identity::has_open_connections_under(view_dir) {
+        return Ok(V3IdleStep::Held);
+    }
+    tx.execute(
+        "UPDATE members SET state=?2 WHERE scope=?1",
+        rusqlite::params![current.scope, crate::views::registry::STATE_EVICTING],
+    )?;
+    Ok(V3IdleStep::Evicting)
+}
+
+/// The v3 ledger charges one namespace, including view directories and shared
+/// search, semantic and call-graph indexes. Use its allocated-byte target, not
+/// the separate v2 view-store limit.
+/// Fetch one LRU candidate only while over target: an unexamined tail is not a
+/// claim that those members are idle. Held windows resume on the next pass.
+fn collect_v3_idle(
+    paths: &StoragePaths,
+    family: &str,
+    registry: &mut crate::blob_store::v3::RegistryWriter<'_>,
+    cancelled: &dyn Fn() -> bool,
+    report: &mut SweepReport,
+    domain: &mut DomainReport,
+    bounds: V3Bounds,
+    deadline: Instant,
+) -> io::Result<bool> {
+    use rusqlite::OptionalExtension;
+    let v3 = |error: crate::blob_store::v3::Error| io::Error::other(error.to_string());
+    // Reservations have no member scope and can survive a lock release during
+    // construction. Conservatively keep the whole family until they settle.
+    let publishing = registry
+        .with_barrier(|tx| {
+            Ok(tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM reservations WHERE state='reserved')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?)
+        })
+        .map_err(v3)?;
+    if publishing {
+        report
+            .skipped_families
+            .push(format!("blobs/v3/{family}: publication_active"));
+        return Ok(false);
+    }
+    let resume = states()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(paths.artifacts.clone())
+        .or_default()
+        .v3_idle_after
+        .get(family)
+        .cloned();
+    let mut after = resume.clone();
+    let mut wrapped = false;
+    let mut last_examined = None;
+    let mut owed = false;
+    let mut usage = registry.accounting().map_err(v3)?.usage();
+    while usage > bounds.soft_bytes && domain.examined < bounds.members {
+        if cancelled() || Instant::now() >= deadline {
+            report.stopped_early = true;
+            break;
+        }
+        let ceiling = if wrapped { resume.as_ref() } else { None };
+        let member = registry
+            .with_barrier(|tx| {
+                Ok(tx
+                    .query_row(
+                        "SELECT scope,kind,root,view_dir,last_bind_ms,state FROM members
+                 WHERE kind='view' AND state='active'
+                   AND (?1 IS NULL OR (last_bind_ms,scope) > (?1,?2))
+                   AND (?3 IS NULL OR (last_bind_ms,scope) <= (?3,?4))
+                 ORDER BY last_bind_ms,scope LIMIT 1",
+                        rusqlite::params![
+                            after.as_ref().map(|key| key.0),
+                            after.as_ref().map(|key| &key.1),
+                            ceiling.map(|key| key.0),
+                            ceiling.map(|key| &key.1)
+                        ],
+                        v3_member_row,
+                    )
+                    .optional()?)
+            })
+            .map_err(v3)?;
+        let Some(member) = member else {
+            if resume.is_some() && !wrapped {
+                after = None;
+                wrapped = true;
+                continue;
+            }
+            break;
+        };
+        after = Some((member.last_bind_ms, member.scope.clone()));
+        last_examined = after.clone();
+        domain.examined += 1;
+        let expected = crate::blob_store::v3::view_dir(&paths.artifacts, family, &member.scope);
+        let Some(view_dir) = expected.ok().filter(|path| {
+            Path::new(&member.view_dir) == path
+                && member.root.as_deref().and_then(v3_root_path).is_some()
+        }) else {
+            domain.skipped_unknown += 1;
+            continue;
+        };
+        #[cfg(test)]
+        test_hook(&paths.artifacts, "v3-idle-before-recheck");
+        let step = registry
+            .with_barrier(|tx| Ok(v3_mark_idle_evicting(tx, &member, &view_dir)?))
+            .map_err(v3)?;
+        match step {
+            V3IdleStep::Held => domain.skipped_protected += 1,
+            V3IdleStep::Unknown(reason) => {
+                report_v3_idle_unknown(&view_dir, &io::Error::other(reason), report, domain);
+            }
+            V3IdleStep::Evicting => {
+                let bytes = retention_tree_bytes(&view_dir, deadline).ok();
+                match v3_finish_eviction(
+                    &paths.artifacts,
+                    registry,
+                    &member.scope,
+                    &view_dir,
+                    deadline,
+                ) {
+                    Ok(measured) => {
+                        record_v3_removal(domain, bytes);
+                        owed = measured == crate::blob_store::v3::Measurement::Owed;
+                        if owed {
+                            break;
+                        }
+                        usage = registry.accounting().map_err(v3)?.usage();
+                    }
+                    Err(error) => {
+                        report_v3_idle_unknown(&view_dir, &error, report, domain);
+                    }
+                }
+            }
+        }
+    }
+    report.stopped_early |= usage > bounds.soft_bytes && domain.examined == bounds.members;
+    let mut states = states().lock().unwrap_or_else(|e| e.into_inner());
+    let cursors = &mut states
+        .entry(paths.artifacts.clone())
+        .or_default()
+        .v3_idle_after;
+    if usage <= bounds.soft_bytes {
+        cursors.remove(family);
+    } else if let Some(last) = last_examined {
+        cursors.insert(family.to_owned(), last);
+    }
+    Ok(owed)
+}
+
 fn collect_v3_family(
-    storage: &Path,
+    paths: &StoragePaths,
     family: &str,
     cancelled: &dyn Fn() -> bool,
     report: &mut SweepReport,
@@ -3993,10 +5680,16 @@ fn collect_v3_family(
 ) -> io::Result<V3Visit> {
     use crate::blob_store::v3::{Measurement, RegistryWriter, ReservationLock};
     let v3 = |error: crate::blob_store::v3::Error| io::Error::other(error.to_string());
+    // Family data: the artifact root. Root bindings: the durable root.
+    let storage = paths.artifacts.as_path();
+    let durable = paths.durable.as_path();
     let registry_path = storage.join("blobs/v3").join(family).join("members.sqlite");
     if !registry_path.try_exists()? {
         return Ok(V3Visit::Done);
     }
+    // View-directory removal refuses a cache whose durable owner is unknown;
+    // declare it, as the v2 collector does when it binds its registry.
+    crate::root_cache::register_durable_owner(paths)?;
     let deadline = Instant::now() + bounds.budget;
     // Lock first, then the registry barrier, the order every v3 writer uses.
     // The wait for the lock comes out of the same budget as the member work:
@@ -4026,7 +5719,7 @@ fn collect_v3_family(
         return Ok(V3Visit::Done);
     }
     let mut owed = false;
-    let cursor_path = v3_member_cursor_path(storage, family);
+    let cursor_path = v3_member_cursor_path(paths, family)?;
     // An unreadable cursor only costs the resume position.
     let resume = read_json::<V3MemberCursor>(&cursor_path)
         .ok()
@@ -4105,7 +5798,7 @@ fn collect_v3_family(
             continue;
         };
         let eligibility = if v3_root_missing(&root) {
-            missing_root_eligibility(storage, &root, member.last_bind_ms)
+            missing_root_eligibility(durable, &root, member.last_bind_ms)
         } else {
             RootEligibility::Live
         };
@@ -4134,7 +5827,7 @@ fn collect_v3_family(
                     .with_barrier(|tx| {
                         Ok(v3_recheck_and_mark_evicting(
                             tx,
-                            storage,
+                            durable,
                             &member.scope,
                             &view_dir,
                             recorded,
@@ -4164,17 +5857,75 @@ fn collect_v3_family(
             },
         )?;
     }
+    // The base-reference sweep: referrer reconciliation, the two-sweep base
+    // reclaim and the plane-row sweep. It needs the registry's base-reference
+    // tables and runs under the reservation lock this visit already holds.
+    if !cancelled()
+        && Instant::now() < deadline
+        && registry.registry_version().map_err(v3)?
+            >= crate::blob_store::v3::REGISTRY_BASE_REFS_VERSION
+    {
+        let plane_cursor = cursor_root(paths)?
+            .join("v3-plane-rows")
+            .join(format!("{family}.json"));
+        let bounds = crate::views::base_sweep::SweepBounds {
+            deadline: Some(deadline),
+            ..Default::default()
+        };
+        match crate::views::base_sweep::sweep_family_locked(
+            storage,
+            family,
+            &lock,
+            None,
+            bounds,
+            Some(&plane_cursor),
+        ) {
+            Ok(swept) => {
+                report.removed_roots += swept.reclaimed_bases.len();
+                report.removed_blobs += swept.plane_rows_deleted as usize;
+                report.examined_blobs += swept.plane_rows_examined as usize;
+                report.stopped_early |= !swept.plane_rows_complete && swept.skipped.is_none();
+            }
+            Err(error) => {
+                if report.errors.len() < 16 {
+                    report
+                        .errors
+                        .push(format!("v3 base sweep of family {family}: {error}"));
+                }
+            }
+        }
+    }
     // Every collector pass ends with a covering measurement, so committed
     // usage also reflects files removed by anything else since the last one.
     // It is skipped once one is already owed: the deadline has passed.
     if !owed {
         owed = registry.covering_measurement_until(deadline).map_err(v3)? == Measurement::Owed;
     }
+    if !owed && !cancelled() && Instant::now() < deadline {
+        let mut idle = DomainReport::default();
+        let result = collect_v3_idle(
+            paths,
+            family,
+            &mut registry,
+            cancelled,
+            report,
+            &mut idle,
+            bounds,
+            deadline,
+        );
+        record_v3_domain(report, "views/v3-idle", &idle);
+        owed |= result?;
+    }
     if owed {
         report
             .skipped_families
             .push(format!("blobs/v3/{family}: measurement_owed"));
     }
+    record_v3_domain(report, "views/v3", &domain);
+    Ok(V3Visit::Done)
+}
+
+fn record_v3_domain(report: &mut SweepReport, name: &str, domain: &DomainReport) {
     report.examined += domain.examined;
     report.skipped_live += domain.skipped_live;
     report.skipped_recent += domain.skipped_recent;
@@ -4186,10 +5937,9 @@ fn collect_v3_family(
     report.unmeasured_removed_roots += domain.unmeasured_removed_roots;
     report
         .domains
-        .entry("views/v3".to_owned())
+        .entry(name.to_owned())
         .or_default()
-        .add(&domain);
-    Ok(V3Visit::Done)
+        .add(domain);
 }
 
 fn record_v3_removal(domain: &mut DomainReport, bytes: Option<u64>) {
@@ -4203,10 +5953,1516 @@ fn record_v3_removal(domain: &mut DomainReport, bytes: Option<u64>) {
 #[cfg(test)]
 mod storage_retention_tests {
     #[test]
+    fn retention_protection_failure_backs_off_and_stays_in_health() {
+        let now = Instant::now();
+        let mut state = State {
+            report: Some(SweepReport::default()),
+            ..Default::default()
+        };
+        for attempt in 1..=5 {
+            state.record_trash(
+                TrashReport {
+                    incomplete: true,
+                    protection_failure: Some(ProtectionFailure::Budget),
+                    ..Default::default()
+                },
+                now,
+            );
+            assert!(!state.reaper_ready(now + INTERVAL));
+            let retry = state.protection_retry.unwrap();
+            assert!(retry <= now + Duration::from_secs(60 * 60));
+            assert!(state.reaper_ready(retry));
+            assert_eq!(state.protection_failures, attempt);
+            let health = serde_json::to_value(state.report.as_ref().unwrap()).unwrap();
+            assert_eq!(health["trash"]["incomplete"], true);
+            assert_eq!(health["trash"]["protection_failure"], "budget");
+            assert!(health["trash"]["protection_retry_at_ms"].as_u64().is_some());
+        }
+        state.record_trash(TrashReport::default(), now);
+        assert!(state.reaper_ready(now));
+        assert_eq!(state.protection_failures, 0);
+        assert!(state.trash.protection_retry_at_ms.is_none());
+    }
+
+    #[test]
+    fn retention_protection_large_task_store_fixture() {
+        let stress = std::env::var("AFT_STRESS").as_deref() == Ok("1");
+        let tasks = if stress { 30_000 } else { 300 };
+        let sessions = if stress { 1_372 } else { 14 };
+        let files = tasks * 11 + tasks * 2 / 3;
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StoragePaths::same(temp.path());
+        fs::create_dir_all(temp.path().join("retention/bindings")).unwrap();
+        for root in 0..200 {
+            fs::write(
+                temp.path()
+                    .join(format!("retention/bindings/{root:016x}.json")),
+                b"{}",
+            )
+            .unwrap();
+        }
+        for task in 0..tasks {
+            let directory = temp
+                .path()
+                .join(format!("tasks/session-{:04}/{task:032x}", task % sessions));
+            fs::create_dir_all(directory.join("control")).unwrap();
+            fs::create_dir_all(directory.join("io")).unwrap();
+            for name in crate::bash_background::persistence::readable_task_file_names(
+                crate::bash_background::persistence::TaskLayout::Directory,
+            ) {
+                fs::write(directory.join(name), b"finished task artifact").unwrap();
+            }
+            if task < tasks * 2 / 3 {
+                fs::write(directory.join("control/environment.bin"), b"environment").unwrap();
+            }
+        }
+        for entry in 0..50 {
+            let domain = if entry % 2 == 0 { "index" } else { "inspect" };
+            let source = temp.path().join(format!("{domain}/{entry:016x}"));
+            fs::create_dir_all(&source).unwrap();
+            fs::write(source.join("payload"), b"retired cache").unwrap();
+            retire_directory(temp.path(), &source).unwrap();
+        }
+        // Even the default fixture exceeds a small census allowance. An
+        // incomplete protection set must authorize no deletion, then a fresh
+        // pass must be able to reclaim the same prefetched trash entries.
+        let mut cutoff = TrashReport::default();
+        assert!(reap_trash_with_snapshot_budget(
+            &storage,
+            &temp.path().join("index/.retention-trash"),
+            false,
+            Instant::now() + Duration::from_secs(60),
+            &mut crate::bash_background::persistence::RepairBudget::with_entries(500),
+            &mut cutoff,
+            NO_TIME_BOUND,
+        )
+        .unwrap());
+        assert_eq!(cutoff.protection_failure, Some(ProtectionFailure::Budget));
+        assert!(cutoff.incomplete);
+        assert_eq!(cutoff.removed_entries, 0);
+        let mut state = State::default();
+        let failed_at = Instant::now();
+        state.record_trash(cutoff, failed_at);
+        assert!(!state.reaper_ready(failed_at + INTERVAL));
+        assert!(state.reaper_ready(state.protection_retry.unwrap()));
+        for domain in ["index", "inspect"] {
+            let entries = fs::read_dir(temp.path().join(domain).join(".retention-trash"))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(entries.len(), 25);
+            for entry in entries {
+                assert_eq!(
+                    fs::read(entry.path().join("payload")).unwrap(),
+                    b"retired cache"
+                );
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut budget = crate::bash_background::persistence::RepairBudget::new();
+        let mut report = TrashReport::default();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let _hook = observe_test_hook(
+            temp.path(),
+            Arc::new(move |step| {
+                if step == "protection-census" {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }),
+        );
+        let started = Instant::now();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let cpu_started = thread_cpu_seconds();
+        for domain in ["index", "inspect"] {
+            reap_trash_with_snapshot_budget(
+                &storage,
+                &temp.path().join(domain).join(".retention-trash"),
+                false,
+                deadline,
+                &mut budget,
+                &mut report,
+                NO_TIME_BOUND,
+            )
+            .unwrap();
+        }
+        eprintln!(
+            "retention fixture: roots=200 finished_tasks={tasks} sessions={sessions} files={files} trash=50 elapsed_ms={:.3} report={}",
+            started.elapsed().as_secs_f64() * 1_000.0,
+            serde_json::to_string(&report).unwrap(),
+        );
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        eprintln!(
+            "retention fixture: thread_cpu_ms={:.3}",
+            (thread_cpu_seconds() - cpu_started) * 1_000.0
+        );
+        assert_eq!(report.removed_entries, 50, "{report:?}");
+        assert!(!report.incomplete, "{report:?}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(report.protection_census.directories >= tasks * 3);
+        state.record_trash(report, Instant::now());
+        assert!(state.reaper_ready(Instant::now()));
+        assert!(state.protection_retry.is_none());
+        assert!(state.trash.protection_retry_at_ms.is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn thread_cpu_seconds() -> f64 {
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
+            0
+        );
+        time.tv_sec as f64 + time.tv_nsec as f64 / 1_000_000_000.0
+    }
+
+    #[test]
+    fn retention_protection_cancelled_defers_without_deleting() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let (temp, entries) = followup_trash_fixture(3);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = cancelled.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let _hook = observe_test_hook(
+            temp.path(),
+            Arc::new(move |step| {
+                if step == "protection-census" {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    signal.store(true, Ordering::SeqCst);
+                }
+            }),
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut budget = crate::bash_background::persistence::RepairBudget::until(
+            deadline,
+            Arc::new(move || cancelled.load(Ordering::SeqCst)),
+        );
+        let mut report = TrashReport::default();
+        assert!(reap_trash_with_snapshot_budget(
+            &StoragePaths::same(temp.path()),
+            entries[0].parent().unwrap(),
+            false,
+            deadline,
+            &mut budget,
+            &mut report,
+            NO_TIME_BOUND,
+        )
+        .unwrap());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            report.protection_failure,
+            Some(ProtectionFailure::Cancelled)
+        );
+        assert_eq!(report.kept_by_reason.get("protections_cancelled"), Some(&1));
+        assert_eq!(report.removed_entries, 0);
+        assert!(report.incomplete);
+        for entry in &entries {
+            assert!(entry.join("payload").exists());
+        }
+    }
+
+    #[test]
+    fn retention_protection_entry_budget_defers_without_deleting() {
+        let (temp, entries) = followup_trash_fixture(3);
+        // Three entries plus iterator exhaustion consume the snapshot budget;
+        // no allowance remains for a complete protection census.
+        let mut budget = crate::bash_background::persistence::RepairBudget::with_entries(4);
+        let mut report = TrashReport::default();
+        assert!(reap_trash_with_snapshot_budget(
+            &StoragePaths::same(temp.path()),
+            entries[0].parent().unwrap(),
+            false,
+            Instant::now() + Duration::from_secs(60),
+            &mut budget,
+            &mut report,
+            NO_TIME_BOUND,
+        )
+        .unwrap());
+        assert_eq!(report.protection_failure, Some(ProtectionFailure::Budget));
+        assert_eq!(report.kept_by_reason.get("protections_budget"), Some(&1));
+        assert_eq!(report.removed_entries, 0);
+        assert!(report.incomplete);
+        for entry in &entries {
+            assert!(entry.join("payload").exists());
+        }
+        let storage = StoragePaths::same(temp.path());
+        states()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(storage.artifacts.clone())
+            .or_default()
+            .record_trash(report, Instant::now());
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = launches.clone();
+        let _hook = observe_test_hook(
+            temp.path(),
+            Arc::new(move |step| {
+                if step == "reaper-launch" {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }),
+        );
+        schedule_reaper(&storage);
+        schedule_reaper(&storage);
+        assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn retention_protection_unavailable_is_cached_across_containers() {
+        let (temp, mut entries) = followup_trash_fixture(2);
+        let source = temp.path().join("inspect/0123456789abcdef");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("payload"), b"retired inspect").unwrap();
+        retire_directory(temp.path(), &source).unwrap();
+        entries.extend(
+            fs::read_dir(temp.path().join("inspect/.retention-trash"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path()),
+        );
+        let mut deep = temp.path().join("durable");
+        for _ in 0..66 {
+            deep.push("d");
+        }
+        fs::create_dir_all(deep).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let _hook = observe_test_hook(
+            temp.path(),
+            Arc::new(move |step| {
+                if step == "protection-census" {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }),
+        );
+        let mut report = TrashReport::default();
+        let mut budget = crate::bash_background::persistence::RepairBudget::new();
+        for domain in ["views", "inspect"] {
+            assert!(reap_trash_with_snapshot_budget(
+                &StoragePaths::same(temp.path()),
+                &temp.path().join(domain).join(".retention-trash"),
+                false,
+                Instant::now() + Duration::from_secs(60),
+                &mut budget,
+                &mut report,
+                NO_TIME_BOUND,
+            )
+            .unwrap());
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            report.protection_failure,
+            Some(ProtectionFailure::Unavailable)
+        );
+        assert_eq!(
+            report.kept_by_reason.get("protections_unavailable"),
+            Some(&2)
+        );
+        assert!(report.protection_census.directories > 0);
+        assert_eq!(report.removed_entries, 0);
+        assert!(report.incomplete);
+        for entry in entries {
+            assert!(entry.join("payload").exists());
+        }
+    }
+
+    #[test]
+    fn retention_protection_keeps_a_nested_live_task_alias() {
+        assert_nested_task_alias_protected(false);
+    }
+
+    #[test]
+    fn retention_protection_keeps_a_nested_finished_task_alias() {
+        assert_nested_task_alias_protected(true);
+    }
+
+    fn assert_nested_task_alias_protected(finished: bool) {
+        use crate::bash_background::persistence::{PersistedTask, PinnedDir, REPAIR_IDENTITIES};
+        use crate::bash_background::BgTaskStatus;
+        let temp = tempfile::tempdir().unwrap();
+        let task = temp.path().join("tasks/session").join("a".repeat(32));
+        fs::create_dir_all(task.join("control")).unwrap();
+        fs::create_dir_all(task.join("io")).unwrap();
+        let mut metadata = PersistedTask::starting(
+            "a".repeat(32),
+            "session".into(),
+            "echo output".into(),
+            temp.path().into(),
+            None,
+            None,
+            false,
+            false,
+        );
+        metadata.status = if finished {
+            BgTaskStatus::Completed
+        } else {
+            BgTaskStatus::Running
+        };
+        if finished {
+            metadata.finished_at = Some(crate::pins::now_ms());
+            metadata.exit_code = Some(0);
+        }
+        let metadata = serde_json::to_vec(&metadata).unwrap();
+        fs::write(task.join("control/metadata.json"), &metadata).unwrap();
+        fs::write(task.join("io/stdout"), b"task output").unwrap();
+        let source = temp.path().join("views/0123456789abcdef");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("nested/output"), b"task output").unwrap();
+        retire_directory(temp.path(), &source).unwrap();
+        let trash = temp.path().join("views/.retention-trash");
+        let entry = fs::read_dir(&trash)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        // The identity seam is keyed by path, and the census may see the
+        // alias in its plain or canonical form (macOS /private/var, Windows
+        // verbatim prefixes), so the injected identity covers both.
+        let aliases = [
+            entry.join("nested"),
+            fs::canonicalize(entry.join("nested")).unwrap(),
+        ];
+        let task_id = PinnedDir::open(&task.join("io"))
+            .unwrap()
+            .directory_identity()
+            .unwrap();
+        REPAIR_IDENTITIES.with(|ids| {
+            for alias in &aliases {
+                ids.borrow_mut().insert(alias.clone(), task_id);
+            }
+        });
+        let mut report = TrashReport::default();
+        let result = reap_trash_with_snapshot_budget(
+            &StoragePaths::same(temp.path()),
+            &trash,
+            false,
+            Instant::now() + Duration::from_secs(60),
+            &mut crate::bash_background::persistence::RepairBudget::new(),
+            &mut report,
+            NO_TIME_BOUND,
+        );
+        REPAIR_IDENTITIES.with(|ids| {
+            for alias in &aliases {
+                ids.borrow_mut().remove(alias);
+            }
+        });
+        assert!(result.unwrap());
+        assert_eq!(report.removed_entries, 0, "{report:?}");
+        assert_eq!(
+            report.kept_by_reason.get("unlink_guard"),
+            Some(&1),
+            "{report:?}"
+        );
+        assert_eq!(
+            fs::read(entry.join("nested/output")).unwrap(),
+            b"task output"
+        );
+        assert_eq!(
+            fs::read(task.join("control/metadata.json")).unwrap(),
+            metadata
+        );
+        assert_eq!(fs::read(task.join("io/stdout")).unwrap(), b"task output");
+    }
+
+    fn followup_trash_fixture(count: usize) -> (tempfile::TempDir, Vec<PathBuf>) {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("retention")).unwrap();
+        for key in 0..count {
+            let view = temp.path().join(format!("views/{key:016x}"));
+            fs::create_dir_all(&view).unwrap();
+            fs::write(view.join("payload"), b"retired view bytes").unwrap();
+            retire_directory(temp.path(), &view).unwrap();
+        }
+        let entries = fs::read_dir(temp.path().join("views/.retention-trash"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        (temp, entries)
+    }
+
+    #[test]
+    fn retention_trash_followup_retained_prefix_does_not_starve_verified_tail() {
+        let (temp, entries) = followup_trash_fixture(9);
+        // Use the filesystem's actual enumeration order, not a name-order
+        // assumption: only the last entry in that order is reclaimable.
+        let tail = entries.last().unwrap();
+        for entry in &entries[..entries.len() - 1] {
+            fs::remove_file(entry.join(RETIREMENT_WITNESS)).unwrap();
+        }
+        let trash = tail.parent().unwrap();
+        let _hook = observe_test_hook(
+            trash,
+            Arc::new(|step| {
+                if step == "trash-snapshot-entry" {
+                    std::thread::sleep(Duration::from_millis(12));
+                }
+            }),
+        );
+        let mut examined = 0;
+        for _ in 0..entries.len() * 2 {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut budget = crate::bash_background::persistence::RepairBudget::new();
+            let mut report = TrashReport::default();
+            assert!(reap_trash(
+                &StoragePaths::same(temp.path()),
+                trash,
+                true,
+                deadline,
+                &mut budget,
+                &mut report
+            )
+            .unwrap());
+            let window = report.entries + report.removed_entries;
+            assert!(
+                window <= 1,
+                "injected delay must bound the snapshot: {report:?}"
+            );
+            examined += window;
+            if !tail.exists() {
+                break;
+            }
+        }
+        assert!(
+            !tail.exists(),
+            "verified tail was starved by retained prefixes"
+        );
+        assert!(
+            examined >= entries.len(),
+            "each pass must report its examined window"
+        );
+        for entry in &entries[..entries.len() - 1] {
+            assert!(
+                entry.join("payload").exists(),
+                "unverified trash must remain"
+            );
+        }
+    }
+
+    #[test]
+    fn retention_trash_followup_fully_measured_leftovers_are_not_incomplete() {
+        let (temp, entries) = followup_trash_fixture(1);
+        fs::remove_file(entries[0].join(RETIREMENT_WITNESS)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut budget = crate::bash_background::persistence::RepairBudget::new();
+        let mut report = TrashReport::default();
+        assert!(reap_trash_with_snapshot_budget(
+            &StoragePaths::same(temp.path()),
+            entries[0].parent().unwrap(),
+            true,
+            deadline,
+            &mut budget,
+            &mut report,
+            NO_TIME_BOUND
+        )
+        .unwrap());
+        assert_eq!(report.entries, 1, "{report:?}");
+        assert_eq!(
+            report.bytes_estimate,
+            b"retired view bytes".len() as u64,
+            "{report:?}"
+        );
+        assert_eq!(report.kept_by_reason.get("witness"), Some(&1), "{report:?}");
+        assert!(
+            !report.incomplete,
+            "known retained trash is not an incomplete census: {report:?}"
+        );
+        assert!(entries[0].join("payload").exists());
+    }
+
+    #[test]
+    fn retention_trash_followup_budget_stop_is_incomplete() {
+        let (temp, entries) = followup_trash_fixture(1);
+        let deadline = Instant::now();
+        let mut budget =
+            crate::bash_background::persistence::RepairBudget::until(deadline, Arc::new(|| false));
+        let mut report = TrashReport::default();
+        assert!(reap_trash_with_snapshot_budget(
+            &StoragePaths::same(temp.path()),
+            entries[0].parent().unwrap(),
+            true,
+            deadline,
+            &mut budget,
+            &mut report,
+            NO_TIME_BOUND
+        )
+        .unwrap());
+        assert!(
+            report.incomplete,
+            "a stopped iterator must leave an incomplete census"
+        );
+        assert_eq!(report.entries + report.removed_entries, 0);
+        assert_eq!(report.kept_by_reason.get("enumeration_budget"), Some(&1));
+        assert!(entries[0].join("payload").exists());
+    }
+
+    #[test]
+    fn retention_trash_cursor_retries_prefetched_unprocessed_entries() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (temp, entries) = followup_trash_fixture(3);
+        let trash = entries[0].parent().unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = cancelled.clone();
+        let hook = observe_test_hook(
+            temp.path(),
+            Arc::new(move |step| {
+                if step == "reap-root" {
+                    signal.store(true, Ordering::SeqCst);
+                }
+            }),
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut budget = crate::bash_background::persistence::RepairBudget::until(
+            deadline,
+            Arc::new(move || cancelled.load(Ordering::SeqCst)),
+        );
+        let mut report = TrashReport::default();
+        assert!(reap_trash_with_snapshot_budget(
+            &StoragePaths::same(temp.path()),
+            trash,
+            true,
+            deadline,
+            &mut budget,
+            &mut report,
+            NO_TIME_BOUND
+        )
+        .unwrap());
+        assert!(report.incomplete);
+        assert_eq!(report.entries, 1);
+        drop(hook);
+        for expected_removed in [2, 1] {
+            let mut budget = crate::bash_background::persistence::RepairBudget::new();
+            let mut report = TrashReport::default();
+            reap_trash_with_snapshot_budget(
+                &StoragePaths::same(temp.path()),
+                trash,
+                true,
+                Instant::now() + Duration::from_secs(60),
+                &mut budget,
+                &mut report,
+                NO_TIME_BOUND,
+            )
+            .unwrap();
+            assert_eq!(report.removed_entries, expected_removed, "{report:?}");
+        }
+        assert!(
+            !trash.exists(),
+            "the prefetched tail and cancelled entry must all be retried"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_trash_cursor_resets_when_container_identity_changes() {
+        let (temp, entries) = followup_trash_fixture(3);
+        for entry in &entries {
+            fs::remove_file(entry.join(RETIREMENT_WITNESS)).unwrap();
+        }
+        let trash = entries[0].parent().unwrap();
+        let hook = observe_test_hook(
+            trash,
+            Arc::new(|step| {
+                if step == "trash-snapshot-entry" {
+                    std::thread::sleep(Duration::from_millis(12));
+                }
+            }),
+        );
+        let mut budget = crate::bash_background::persistence::RepairBudget::new();
+        reap_trash(
+            &StoragePaths::same(temp.path()),
+            trash,
+            true,
+            Instant::now() + Duration::from_secs(60),
+            &mut budget,
+            &mut TrashReport::default(),
+        )
+        .unwrap();
+        drop(hook);
+        let old = temp.path().join("old-trash");
+        fs::rename(trash, &old).unwrap();
+        let fresh = temp.path().join("views/ffffffffffffffff");
+        fs::create_dir(&fresh).unwrap();
+        fs::write(fresh.join("payload"), b"fresh verified bytes").unwrap();
+        retire_directory(temp.path(), &fresh).unwrap();
+        let mut budget = crate::bash_background::persistence::RepairBudget::new();
+        let mut report = TrashReport::default();
+        reap_trash_with_snapshot_budget(
+            &StoragePaths::same(temp.path()),
+            trash,
+            true,
+            Instant::now() + Duration::from_secs(60),
+            &mut budget,
+            &mut report,
+            NO_TIME_BOUND,
+        )
+        .unwrap();
+        assert_eq!(
+            report.removed_entries, 1,
+            "replacement must start a new scan: {report:?}"
+        );
+        for entry in &entries {
+            assert!(old
+                .join(entry.file_name().unwrap())
+                .join("payload")
+                .exists());
+        }
+    }
+
+    #[test]
+    fn retention_trash_fully_measured_empty_unverified_directory_is_not_incomplete() {
+        let (temp, entries) = followup_trash_fixture(1);
+        fs::remove_file(entries[0].join("payload")).unwrap();
+        fs::remove_file(entries[0].join(RETIREMENT_WITNESS)).unwrap();
+        let mut budget = crate::bash_background::persistence::RepairBudget::new();
+        let mut report = TrashReport::default();
+        assert!(reap_trash_with_snapshot_budget(
+            &StoragePaths::same(temp.path()),
+            entries[0].parent().unwrap(),
+            true,
+            Instant::now() + Duration::from_secs(60),
+            &mut budget,
+            &mut report,
+            NO_TIME_BOUND
+        )
+        .unwrap());
+        assert!(
+            !report.incomplete,
+            "zero measured bytes do not mean measurement failed: {report:?}"
+        );
+        assert_eq!(report.bytes_estimate, 0);
+        assert!(entries[0].exists());
+    }
+
+    fn retired_view_fixture() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("retention")).unwrap();
+        let view = temp.path().join("views/0123456789abcdef");
+        fs::create_dir_all(&view).unwrap();
+        for name in [
+            "derived-abc.sqlite",
+            "derived-abc.sqlite-shm",
+            "derived-abc.sqlite-wal",
+            "derived-abc.ref",
+            "cache.lock",
+        ] {
+            fs::write(view.join(name), b"retired payload").unwrap();
+        }
+        fs::OpenOptions::new()
+            .write(true)
+            .open(view.join("derived-abc.sqlite"))
+            .unwrap()
+            .set_len(1_500_000_000)
+            .unwrap();
+        retire_directory(temp.path(), &view).unwrap();
+        let retired = fs::read_dir(temp.path().join("views/.retention-trash"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        (temp, retired)
+    }
+
+    #[test]
+    fn retention_trash_real_view_shape_is_reaped() {
+        let (temp, retired) = retired_view_fixture();
+        reap_retired(temp.path()).unwrap();
+        assert!(
+            !retired.exists(),
+            "a verified 1.5 GB view must be reclaimed"
+        );
+    }
+
+    #[test]
+    fn retention_trash_expired_sweep_still_reaps_verified_view() {
+        let (temp, retired) = retired_view_fixture();
+        fs::create_dir(temp.path().join("views/ffffffffffffffff")).unwrap();
+        let report = run_pass_with_budget(
+            temp.path(),
+            &|| false,
+            &|| Instant::now() + NO_TIME_BOUND * 2,
+            NO_TIME_BOUND,
+        );
+        assert!(report.stopped_early, "{report:?}");
+        let until = Instant::now() + Duration::from_secs(10);
+        while reaper_running_for_test(temp.path()) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !retired.exists(),
+            "expired sweep must still launch trash reclaim"
+        );
+        assert_eq!(trash_report(temp.path()).removed_entries, 1);
+    }
+
+    fn trash_report(storage: &Path) -> TrashReport {
+        states()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(storage)
+            .unwrap()
+            .trash
+            .clone()
+    }
+
+    fn assert_trash_kept_once(storage: &Path, entry: &Path, reason: &'static str) -> TrashReport {
+        let (result, logs) = crate::logging::capture_log_lines(|| reap_retired(storage));
+        if let Err(error) = result {
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+        }
+        let report = trash_report(storage);
+        assert!(entry.exists(), "guard {reason} removed the entry");
+        assert_eq!(report.entries, 1, "{report:?}");
+        assert_eq!(report.removed_entries, 0, "{report:?}");
+        assert_eq!(report.kept_by_reason.get(reason), Some(&1), "{report:?}");
+        assert_eq!(
+            logs.iter()
+                .filter(|line| warning_names_entry(line, entry, reason))
+                .count(),
+            1,
+            "one retention warning per kept entry: {logs:?}"
+        );
+        report
+    }
+
+    fn warning_names_entry(line: &str, entry: &Path, reason: &str) -> bool {
+        let Some(rest) = line.strip_prefix("WARN storage retention trash=") else {
+            return false;
+        };
+        let Some((logged_path, _)) = rest.split_once(&format!(" retained reason={reason}:")) else {
+            return false;
+        };
+        // Windows TEMP may use an 8.3 alias or different separators. Compare
+        // resolved identities of the path spellings, not the displayed bytes.
+        match (fs::canonicalize(logged_path), fs::canonicalize(entry)) {
+            (Ok(logged), Ok(expected)) => logged == expected,
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn retention_trash_warning_matches_equivalent_path_spellings_only() {
+        let (temp, entries) = followup_trash_fixture(2);
+        let entry = &entries[0];
+        let alias = entry
+            .parent()
+            .unwrap()
+            .join(".")
+            .join(entry.file_name().unwrap());
+        let line = format!(
+            "WARN storage retention trash={} retained reason=witness: missing",
+            alias.display()
+        );
+        assert!(warning_names_entry(&line, entry, "witness"));
+        assert!(!warning_names_entry(&line, &entries[1], "witness"));
+        assert!(!warning_names_entry(&line, entry, "foreign_name"));
+        drop(temp);
+    }
+
+    #[test]
+    fn retention_trash_guard_missing_witness_is_logged_and_counted() {
+        let (temp, retired) = retired_view_fixture();
+        fs::remove_file(retired.join(RETIREMENT_WITNESS)).unwrap();
+        let report = assert_trash_kept_once(temp.path(), &retired, "witness");
+        assert!(report.bytes_estimate >= 1_500_000_000, "{report:?}");
+        assert!(report.oldest_age_ms.is_some(), "{report:?}");
+    }
+
+    #[test]
+    fn retention_trash_guard_foreign_owner_is_logged_and_counted() {
+        let (temp, retired) = retired_view_fixture();
+        let path = retired.join(RETIREMENT_WITNESS);
+        let mut witness: RetirementWitness = read_json(&path).unwrap();
+        witness.owner = (0, 0);
+        fs::write(path, serde_json::to_vec(&witness).unwrap()).unwrap();
+        assert_trash_kept_once(temp.path(), &retired, "witness");
+    }
+
+    fn change_witness(entry: &Path, change: impl FnOnce(&mut RetirementWitness)) {
+        let path = entry.join(RETIREMENT_WITNESS);
+        let mut witness: RetirementWitness = read_json(&path).unwrap();
+        change(&mut witness);
+        fs::write(path, serde_json::to_vec(&witness).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn retention_trash_guard_witness_nonce() {
+        let (temp, retired) = retired_view_fixture();
+        change_witness(&retired, |witness| witness.nonce = "foreign".into());
+        assert_trash_kept_once(temp.path(), &retired, "witness");
+    }
+
+    #[test]
+    fn retention_trash_guard_witness_directory_identity() {
+        let (temp, retired) = retired_view_fixture();
+        change_witness(&retired, |witness| witness.directory = (0, 0));
+        assert_trash_kept_once(temp.path(), &retired, "witness");
+    }
+
+    #[test]
+    fn retention_trash_guard_witness_version() {
+        let (temp, retired) = retired_view_fixture();
+        change_witness(&retired, |witness| witness.version = 2);
+        assert_trash_kept_once(temp.path(), &retired, "witness");
+    }
+
+    #[test]
+    fn retention_trash_guard_changed_member_is_logged_and_counted() {
+        let (temp, retired) = retired_view_fixture();
+        fs::write(retired.join("unwitnessed.sqlite"), b"foreign").unwrap();
+        assert_trash_kept_once(temp.path(), &retired, "witness");
+    }
+
+    #[test]
+    fn retention_trash_guard_foreign_name_is_logged_and_counted() {
+        let (temp, retired) = retired_view_fixture();
+        let foreign = retired.with_file_name("foreign-view");
+        fs::rename(retired, &foreign).unwrap();
+        assert_trash_kept_once(temp.path(), &foreign, "foreign_name");
+    }
+
+    #[test]
+    fn retention_trash_guard_unverified_empty_directory_is_kept() {
+        let (temp, retired) = retired_view_fixture();
+        fs::remove_dir_all(&retired).unwrap();
+        fs::create_dir(&retired).unwrap();
+        assert_trash_kept_once(temp.path(), &retired, "witness");
+    }
+
+    const UNWITNESSED_GENERATION: &str = "0123456789abcdef.g1761300000000000000.4242.sqlite";
+
+    /// An `inspect` cache folder retired by AFT v0.62.0 or earlier, which
+    /// wrote no retirement witness: the files a real one holds, and a read
+    /// marker whose process (on another host) stopped heartbeating long ago.
+    fn unwitnessed_inspect_retirement() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("retention")).unwrap();
+        let retired = temp.path().join(format!(
+            "inspect/.retention-trash/retired-{}",
+            "0123456789abcdef".repeat(2)
+        ));
+        let generation = retired.join("readers").join(UNWITNESSED_GENERATION);
+        fs::create_dir_all(&generation).unwrap();
+        for name in [
+            "writer.lease".to_owned(),
+            "cache.lock".into(),
+            "semantic.lock".into(),
+            "symbols.lock".into(),
+            "0123456789abcdef.current".into(),
+            UNWITNESSED_GENERATION.into(),
+            format!("{UNWITNESSED_GENERATION}-wal"),
+        ] {
+            fs::write(retired.join(name), b"inspect cache").unwrap();
+        }
+        let marker = generation.join("4242.other-host.1761300000000.0.json");
+        fs::write(
+            &marker,
+            serde_json::to_vec(&crate::root_cache::ReadMarkerMetadata {
+                pid: 4242,
+                hostname: "other-host".into(),
+                created_at_ms: 1_761_300_000_000,
+                nonce: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        filetime::set_file_mtime(
+            &marker,
+            filetime::FileTime::from_unix_time(1_000_000_000, 0),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&retired, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        (temp, retired)
+    }
+
+    #[test]
+    fn retention_trash_reaps_unwitnessed_inspect_cache_retirement() {
+        let (temp, retired) = unwitnessed_inspect_retirement();
+        super::reap_retired(&StoragePaths::same(temp.path())).unwrap();
+        assert!(
+            !retired.exists(),
+            "a witness-less retirement holding only AFT cache files was kept"
+        );
+        assert_eq!(trash_report(temp.path()).removed_entries, 1);
+    }
+
+    #[test]
+    fn retention_trash_keeps_unwitnessed_retirements_it_cannot_prove() {
+        type Change = Box<dyn Fn(&Path, &Path)>;
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut cases: Vec<(&str, &str, Change)> = vec![
+            (
+                "foreign file",
+                "witness",
+                Box::new(|retired, _| fs::write(retired.join("notes.txt"), b"user data").unwrap()),
+            ),
+            (
+                "live reader",
+                "witness",
+                // A marker from another host that heartbeated just now.
+                Box::new(|retired, _| {
+                    let marker = retired
+                        .join("readers")
+                        .join(UNWITNESSED_GENERATION)
+                        .join("4242.other-host.1761300000000.0.json");
+                    filetime::set_file_mtime(marker, filetime::FileTime::now()).unwrap();
+                }),
+            ),
+        ];
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            cases.push((
+                "symlink",
+                "tree_guard",
+                Box::new(|retired, outside| {
+                    std::os::unix::fs::symlink(outside, retired.join("cache.lock-link")).unwrap()
+                }),
+            ));
+            cases.push((
+                "group-writable file",
+                "witness",
+                Box::new(|retired, _| {
+                    fs::set_permissions(
+                        retired.join("cache.lock"),
+                        fs::Permissions::from_mode(0o664),
+                    )
+                    .unwrap()
+                }),
+            ));
+        }
+        for (case, reason, change) in cases {
+            let (temp, retired) = unwitnessed_inspect_retirement();
+            let outside = temp.path().join("outside");
+            fs::write(&outside, b"outside").unwrap();
+            change(&retired, &outside);
+            assert_trash_kept_once(temp.path(), &retired, reason);
+            assert!(
+                retired.join(UNWITNESSED_GENERATION).exists(),
+                "{case}: cache payload was removed"
+            );
+            assert_eq!(fs::read(&outside).unwrap(), b"outside", "{case}");
+        }
+    }
+
+    #[test]
+    fn retention_trash_unwitnessed_reason_names_the_unrecognized_entry() {
+        let (temp, retired) = unwitnessed_inspect_retirement();
+        fs::write(retired.join("notes.txt"), b"user data").unwrap();
+        let directory = crate::bash_background::persistence::PinnedDir::open(&retired).unwrap();
+        let error = verify_retirement_proof(
+            &StoragePaths::same(temp.path()),
+            &directory,
+            &"0123456789abcdef".repeat(2),
+            &mut crate::bash_background::persistence::RepairBudget::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(".aft-retirement.json is missing"), "{error}");
+        assert!(
+            error.contains("notes.txt is not an entry AFT creates in a cache folder"),
+            "{error}"
+        );
+        assert!(error.contains("delete "), "{error}");
+    }
+
+    /// A retired cache with more entries than one validation walk examines
+    /// (`TREE_ENTRIES`), split over subfolders the way real caches are.
+    fn oversized_retirement(temp: &Path) -> PathBuf {
+        fs::create_dir_all(temp.join("retention")).unwrap();
+        let cache = temp.join("index/0123456789abcdef");
+        for folder in 0..8 {
+            let folder = cache.join(format!("shard-{folder}"));
+            fs::create_dir_all(&folder).unwrap();
+            for file in 0..TREE_ENTRIES / 6 {
+                fs::write(folder.join(format!("blob-{file}")), b"blob").unwrap();
+            }
+        }
+        retire_directory(temp, &cache).unwrap();
+        fs::read_dir(temp.join("index/.retention-trash"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+    }
+
+    fn reap_index_trash(
+        temp: &Path,
+        budget: &mut crate::bash_background::persistence::RepairBudget,
+    ) -> TrashReport {
+        let mut report = TrashReport::default();
+        reap_trash(
+            &StoragePaths::same(temp),
+            &temp.join("index/.retention-trash"),
+            false,
+            Instant::now() + Duration::from_secs(60),
+            budget,
+            &mut report,
+        )
+        .unwrap();
+        report
+    }
+
+    #[test]
+    fn retention_trash_removes_an_oversized_retirement_across_passes() {
+        let temp = tempfile::tempdir().unwrap();
+        let retired = oversized_retirement(temp.path());
+        let count = |path: &Path| walkdir_count(path);
+        let before = count(&retired);
+        assert!(
+            before > TREE_ENTRIES,
+            "fixture must exceed one walk: {before}"
+        );
+        // A pass whose entry budget runs out part-way through the removal.
+        let mut budget =
+            crate::bash_background::persistence::RepairBudget::with_entries(TREE_ENTRIES / 2);
+        let report = reap_index_trash(temp.path(), &mut budget);
+        assert_eq!(
+            report.kept_by_reason.get("removal_in_progress"),
+            Some(&1),
+            "{report:?}"
+        );
+        let after_first = count(&retired);
+        assert!(after_first < before, "the first pass removed nothing");
+        assert!(
+            retired.join(RETIREMENT_WITNESS).is_file(),
+            "the stopped removal lost the proof the next pass needs"
+        );
+        // The next pass continues from what is left, it does not start over.
+        let report = reap_index_trash(
+            temp.path(),
+            &mut crate::bash_background::persistence::RepairBudget::new(),
+        );
+        assert_eq!(report.removed_entries, 1, "{report:?}");
+        assert!(!retired.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_trash_oversized_removal_stops_at_a_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let retired = oversized_retirement(temp.path());
+        let before = walkdir_count(&retired);
+        let outside = temp.path().join("outside");
+        fs::write(&outside, b"outside").unwrap();
+        // Plant the link after the validation walk and right before removal,
+        // so the incremental removal (not the validation walk, whose reach
+        // depends on directory order) is what meets it.
+        let link = retired.join("shard-7/zz-link");
+        let planted = (outside.clone(), link.clone());
+        let _hook = observe_test_hook(
+            temp.path(),
+            Arc::new(move |step| {
+                if step == "reap-root" && fs::symlink_metadata(&planted.1).is_err() {
+                    std::os::unix::fs::symlink(&planted.0, &planted.1).unwrap();
+                }
+            }),
+        );
+        let (report, logs) = crate::logging::capture_log_lines(|| {
+            reap_index_trash(
+                temp.path(),
+                &mut crate::bash_background::persistence::RepairBudget::new(),
+            )
+        });
+        assert_eq!(
+            report.kept_by_reason.get("tree_guard"),
+            Some(&1),
+            "{report:?}"
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("retained reason=tree_guard")
+                    && line.contains("non-regular entry retained")
+                    && line.contains("zz-link")),
+            "the incremental removal did not report the link: {logs:?}"
+        );
+        assert!(
+            walkdir_count(&retired) < before,
+            "the incremental removal never ran"
+        );
+        assert!(fs::symlink_metadata(&link).is_ok());
+        assert!(retired.join(RETIREMENT_WITNESS).is_file());
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+    }
+
+    fn walkdir_count(path: &Path) -> usize {
+        let mut count = 0;
+        let mut pending = vec![path.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                count += 1;
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(entry.path());
+                }
+            }
+        }
+        count
+    }
+
+    /// Every trash container shares one durable-storage census per pass. A
+    /// census per container spent the pass budget before later domains, so
+    /// their entries were kept with "repair traversal limit exceeded".
+    #[test]
+    fn retention_trash_census_is_taken_once_per_pass() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("retention")).unwrap();
+        // Durable state the census walks: every name costs one budget entry.
+        let durable = temp.path().join("durable-state");
+        fs::create_dir(&durable).unwrap();
+        for file in 0..1500 {
+            fs::write(durable.join(format!("record-{file}")), b"r").unwrap();
+        }
+        let mut retired = Vec::new();
+        for domain in ["views", "inspect"] {
+            let cache = temp.path().join(domain).join("0123456789abcdef");
+            fs::create_dir_all(&cache).unwrap();
+            fs::write(cache.join("payload"), b"retired").unwrap();
+            retire_directory(temp.path(), &cache).unwrap();
+            retired.push(temp.path().join(domain).join(".retention-trash"));
+        }
+        // Room for one census of the durable state, not one per container.
+        let mut budget = crate::bash_background::persistence::RepairBudget::with_entries(2500);
+        let mut report = TrashReport::default();
+        reap_retired_with_budget(
+            &StoragePaths::same(temp.path()),
+            Instant::now() + Duration::from_secs(60),
+            &mut budget,
+            &mut report,
+        )
+        .unwrap();
+        assert_eq!(report.removed_entries, 2, "{report:?}");
+        for trash in retired {
+            assert_eq!(
+                fs::read_dir(&trash).unwrap().count(),
+                0,
+                "{}",
+                trash.display()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_trash_guard_symlink_is_logged_and_counted() {
+        let (temp, retired) = retired_view_fixture();
+        let canary = temp.path().join("canary");
+        fs::write(&canary, b"must survive").unwrap();
+        std::os::unix::fs::symlink(&canary, retired.join("symlink")).unwrap();
+        assert_trash_kept_once(temp.path(), &retired, "tree_guard");
+        assert_eq!(fs::read(canary).unwrap(), b"must survive");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_trash_guard_protected_directory_is_logged_and_counted() {
+        let (temp, retired) = retired_view_fixture();
+        std::os::unix::fs::symlink(&retired, temp.path().join("durable-alias")).unwrap();
+        assert_trash_kept_once(temp.path(), &retired, "unlink_guard");
+        assert!(retired.join("derived-abc.sqlite").exists());
+    }
+
+    #[test]
+    fn retention_trash_guard_foreign_filesystem_is_logged_and_counted() {
+        let (temp, retired) = retired_view_fixture();
+        let nested = retired.join("foreign-mount");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("canary"), b"foreign").unwrap();
+        // Windows raw metadata has no baseline device id; inject both sides
+        // so the portable boundary comparison is exercised on every platform.
+        let _baseline =
+            crate::walk_boundary::simulated_volumes::simulate(temp.path(), u64::MAX - 20);
+        let _mount = crate::walk_boundary::simulated_volumes::simulate(&nested, u64::MAX - 21);
+        assert_trash_kept_once(temp.path(), &retired, "tree_guard");
+        assert!(nested.join("canary").exists());
+    }
+
+    #[test]
+    fn retention_trash_guard_reap_lock_is_reported_without_waiting() {
+        let (temp, retired) = retired_view_fixture();
+        let lock = temp.path().join("retention/reap.lock");
+        let _lease = crate::fs_lock::try_acquire(&lock, Duration::ZERO).unwrap();
+        assert!(reap_retired(temp.path()).is_err());
+        let report = trash_report(temp.path());
+        assert_eq!(report.kept_by_reason.get("reap_lock"), Some(&1));
+        assert!(report.incomplete);
+        assert!(retired.exists());
+    }
+
+    #[test]
+    fn retention_trash_guard_deadline_and_cancellation_bound_the_iterator() {
+        let (temp, retired) = retired_view_fixture();
+        for cancelled in [false, true] {
+            let deadline = if cancelled {
+                Instant::now() + Duration::from_secs(60)
+            } else {
+                Instant::now()
+            };
+            let mut budget = crate::bash_background::persistence::RepairBudget::until(
+                deadline,
+                Arc::new(move || cancelled),
+            );
+            let mut report = TrashReport::default();
+            assert!(reap_trash(
+                &StoragePaths::same(temp.path()),
+                retired.parent().unwrap(),
+                false,
+                deadline,
+                &mut budget,
+                &mut report
+            )
+            .unwrap());
+            assert_eq!(
+                report.kept_by_reason.get("enumeration_budget"),
+                Some(&1),
+                "{report:?}"
+            );
+            assert!(report.incomplete);
+            assert!(retired.join("derived-abc.sqlite").exists());
+        }
+    }
+
+    #[test]
+    fn retention_trash_guard_cancellation_before_unlink() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (temp, retired) = retired_view_fixture();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let observed = cancelled.clone();
+        states()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(temp.path().to_path_buf())
+            .or_default()
+            .reaper_cancelled = Some(Arc::new(move || observed.load(Ordering::SeqCst)));
+        let _hook = observe_test_hook(
+            temp.path(),
+            Arc::new(move |step| {
+                if step == "reap-root" {
+                    cancelled.store(true, Ordering::SeqCst);
+                }
+            }),
+        );
+        assert_trash_kept_once(temp.path(), &retired, "unlink_guard");
+        assert!(retired.join("derived-abc.sqlite").exists());
+    }
+
+    #[test]
+    fn retention_trash_guard_mount_admission_is_logged_and_counted() {
+        let (temp, retired) = retired_view_fixture();
+        let _admission = barrier(temp.path()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut budget = crate::bash_background::persistence::RepairBudget::new();
+        let mut report = TrashReport::default();
+        let trash = retired.parent().unwrap();
+        let (result, logs) = crate::logging::capture_log_lines(|| {
+            reap_trash(
+                &StoragePaths::same(temp.path()),
+                trash,
+                true,
+                deadline,
+                &mut budget,
+                &mut report,
+            )
+        });
+        assert!(result.unwrap());
+        assert_eq!(report.kept_by_reason.get("admission_busy"), Some(&1));
+        assert_eq!(
+            logs.iter()
+                .filter(|line| line.contains("retained reason=admission_busy:"))
+                .count(),
+            1
+        );
+        assert!(report.incomplete);
+        assert!(retired.exists());
+    }
+
+    #[test]
+    fn retention_trash_guard_mount_root_is_logged_and_counted() {
+        let (temp, retired) = retired_view_fixture();
+        let _baseline =
+            crate::walk_boundary::simulated_volumes::simulate(temp.path(), u64::MAX - 23);
+        let _mount = crate::walk_boundary::simulated_volumes::simulate(&retired, u64::MAX - 22);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut budget = crate::bash_background::persistence::RepairBudget::new();
+        let mut report = TrashReport::default();
+        assert!(reap_trash(
+            &StoragePaths::same(temp.path()),
+            retired.parent().unwrap(),
+            true,
+            deadline,
+            &mut budget,
+            &mut report
+        )
+        .unwrap());
+        assert_eq!(
+            report.kept_by_reason.get("mount_guard"),
+            Some(&1),
+            "{report:?}"
+        );
+        assert!(retired.join("derived-abc.sqlite").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retention_trash_windows_pinned_removal_refuses_volume_and_mount_mismatch() {
+        use crate::bash_background::persistence::{PinnedDir, REPAIR_IDENTITIES, REPAIR_MOUNTS};
+        let (_temp, retired) = retired_view_fixture();
+        let parent = PinnedDir::repair_open_path(retired.parent().unwrap()).unwrap();
+        let name = retired.file_name().unwrap();
+        let child = parent.repair_child(name).unwrap();
+        let expected = child.directory_identity().unwrap();
+        let child_path = child.path().to_path_buf();
+        drop(child);
+        for foreign_volume in [true, false] {
+            if foreign_volume {
+                REPAIR_IDENTITIES.with(|ids| {
+                    ids.borrow_mut()
+                        .insert(child_path.clone(), (expected.0 ^ 1, expected.1))
+                });
+            } else {
+                REPAIR_MOUNTS.with(|ids| ids.borrow_mut().insert(child_path.clone(), u64::MAX));
+            }
+            let mut removed = 0;
+            let result = parent.repair_remove_child(name, expected, &[], &mut removed);
+            REPAIR_IDENTITIES.with(|ids| ids.borrow_mut().remove(&child_path));
+            REPAIR_MOUNTS.with(|ids| ids.borrow_mut().remove(&child_path));
+            let error = result.expect_err("pinned deletion must refuse a foreign handle boundary");
+            assert!(
+                error.to_string().contains("mounted or protected directory"),
+                "{error}"
+            );
+            assert_eq!(removed, 0);
+            assert!(retired.join("derived-abc.sqlite").exists());
+            assert!(retired.join(RETIREMENT_WITNESS).exists());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retention_trash_windows_pinned_removal_refuses_junction() {
+        use crate::bash_background::persistence::PinnedDir;
+        let temp = tempfile::tempdir().unwrap();
+        let parent_path = temp.path().join("parent");
+        let target = temp.path().join("foreign-target");
+        fs::create_dir(&parent_path).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("canary"), b"foreign junction bytes").unwrap();
+        let junction = parent_path.join("junction");
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "mklink /J failed: {output:?}");
+        let parent = PinnedDir::repair_open_path(&parent_path).unwrap();
+        let mut removed = 0;
+        let error = parent
+            .repair_remove_child(junction.file_name().unwrap(), (0, 0), &[], &mut removed)
+            .expect_err("pinned removal must reject the junction before its target");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        assert!(error.to_string().contains("reparse point"), "{error}");
+        assert_eq!(removed, 0);
+        assert_eq!(
+            fs::read(target.join("canary")).unwrap(),
+            b"foreign junction bytes"
+        );
+        fs::remove_dir(junction).unwrap();
+    }
+
+    #[test]
+    fn retention_trash_guard_mount_snapshot_yields_to_bind() {
+        let (temp, retired) = retired_view_fixture();
+        let pending = temp.path().join("retention/bind-pending.lock");
+        let _binder = crate::fs_lock::try_acquire(&pending, Duration::ZERO).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut budget = crate::bash_background::persistence::RepairBudget::new();
+        let mut report = TrashReport::default();
+        let (result, logs) = crate::logging::capture_log_lines(|| {
+            reap_trash(
+                &StoragePaths::same(temp.path()),
+                retired.parent().unwrap(),
+                true,
+                deadline,
+                &mut budget,
+                &mut report,
+            )
+        });
+        assert!(result.unwrap());
+        assert_eq!(
+            report.kept_by_reason.get("bind_pending"),
+            Some(&1),
+            "{report:?}"
+        );
+        assert_eq!(
+            logs.iter()
+                .filter(|line| line.contains("retained reason=bind_pending:"))
+                .count(),
+            1
+        );
+        assert!(report.incomplete);
+        assert!(retired.exists());
+    }
+
+    #[test]
+    fn retention_trash_guard_mount_snapshot_admission_deadline() {
+        let (temp, retired) = retired_view_fixture();
+        let trash = retired.parent().unwrap();
+        let _hook = observe_test_hook(
+            trash,
+            Arc::new(|step| {
+                if step == "trash-snapshot" {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }),
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut budget = crate::bash_background::persistence::RepairBudget::new();
+        let mut report = TrashReport::default();
+        let (result, logs) = crate::logging::capture_log_lines(|| {
+            reap_trash(
+                &StoragePaths::same(temp.path()),
+                trash,
+                true,
+                deadline,
+                &mut budget,
+                &mut report,
+            )
+        });
+        assert!(result.unwrap());
+        assert_eq!(
+            report.kept_by_reason.get("admission_budget"),
+            Some(&1),
+            "{report:?}"
+        );
+        assert_eq!(
+            logs.iter()
+                .filter(|line| line.contains("retained reason=admission_budget:"))
+                .count(),
+            1
+        );
+        assert!(report.incomplete);
+        assert!(retired.exists());
+    }
+
+    #[test]
     fn bind_profile_separates_waits_from_publication() {
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
-        super::record_bind(storage.path(), root.path(), "0123456789abcdef").unwrap();
+        super::record_bind(
+            &super::StoragePaths::same(storage.path()),
+            root.path(),
+            "0123456789abcdef",
+        )
+        .unwrap();
         let line = super::LAST_BIND_PROFILE.with(|slot| slot.borrow_mut().take().unwrap());
         assert!(line.starts_with("retention_bind_profile storage="));
         assert!(line.contains("phases_us=[metadata="));
@@ -4220,6 +7476,801 @@ mod storage_retention_tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn reaper_retains_a_source_swapped_in_the_final_unix_rename_window() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("retention")).unwrap();
+        let cache = temp.path().join("index/key");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("own"), "own").unwrap();
+        let foreign = temp.path().join("foreign");
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("precious"), "precious").unwrap();
+        let source = cache.clone();
+        let parked = temp.path().join("parked");
+        crate::bash_background::persistence::BEFORE_REPAIR_RENAME.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::rename(&source, &parked).unwrap();
+                fs::rename(&foreign, &source).unwrap();
+            }))
+        });
+        let error = retire_directory(temp.path(), &cache)
+            .expect_err("post-rename identity must reject the substituted source");
+        assert!(
+            error.to_string().contains("identity changed during rename"),
+            "{error}"
+        );
+        let retired = fs::read_dir(temp.path().join("index/.retention-trash"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        super::reap_retired(&StoragePaths::same(temp.path())).unwrap();
+        assert_eq!(
+            fs::read_to_string(retired.join("precious")).unwrap(),
+            "precious",
+            "unverified retirement was deleted after recovery"
+        );
+    }
+
+    #[test]
+    fn reaper_restarts_after_partial_removal_with_the_witness_still_present() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("retention")).unwrap();
+        let cache = temp.path().join("index/key");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("000-first"), "own").unwrap();
+        fs::write(cache.join("zzz-last"), "own").unwrap();
+        retire_directory(temp.path(), &cache).unwrap();
+        let retired = fs::read_dir(temp.path().join("index/.retention-trash"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        crate::bash_background::persistence::with_repair_failure_after_for_test(1, || {
+            super::reap_retired(&StoragePaths::same(temp.path()))
+        })
+        .unwrap();
+        assert!(!retired.join("000-first").exists());
+        assert!(
+            retired.join(RETIREMENT_WITNESS).is_file(),
+            "interrupted unlink lost its recovery proof"
+        );
+        super::reap_retired(&StoragePaths::same(temp.path())).unwrap();
+        assert!(!retired.exists());
+    }
+
+    #[test]
+    fn reaper_keeps_retired_directories_its_witness_does_not_vouch_for() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("retention")).unwrap();
+        // A directory carrying a tombstone name but no retirement proof, as a
+        // substituted source or a hand-made folder would after a crash.
+        let trash = temp.path().join("index/.retention-trash");
+        let forged = trash.join(format!("retired-{}", "a".repeat(32)));
+        fs::create_dir_all(&forged).unwrap();
+        fs::write(forged.join("precious"), "precious").unwrap();
+        // A genuine retirement whose contents changed after it was recorded.
+        let cache = temp.path().join("index/key");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("own"), "own").unwrap();
+        retire_directory(temp.path(), &cache).unwrap();
+        let altered = fs::read_dir(&trash)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path != &forged)
+            .unwrap();
+        fs::write(altered.join("added-later"), "precious").unwrap();
+        super::reap_retired(&StoragePaths::same(temp.path())).unwrap();
+        assert_eq!(
+            fs::read_to_string(forged.join("precious")).unwrap(),
+            "precious",
+            "a tombstone without a witness was deleted"
+        );
+        assert_eq!(
+            fs::read_to_string(altered.join("added-later")).unwrap(),
+            "precious",
+            "a member the witness never recorded was deleted"
+        );
+    }
+    #[test]
+    fn residency_listing_failure_keeps_unknown_keys_protected() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StoragePaths::same(temp.path());
+        let directory = temp.path().join("retention/readers/owner-scope");
+        fs::create_dir_all(directory.parent().unwrap()).unwrap();
+        fs::write(&directory, "not a directory").unwrap();
+        let owner = crate::artifact_owner::ArtifactOwnerManifest {
+            schema_version: 1,
+            project_scope_key: "owner-scope".into(),
+            checkout_path: "missing-checkout".into(),
+            git_common_dir: None,
+            pid: 0,
+            hostname: "different-host".into(),
+            created_at_ms: 0,
+            heartbeat_at_ms: 0,
+        };
+        assert!(!owner_has_residency_marker(&paths, &owner));
+        let owners = OwnerManifests(Ok(vec![("owner-family".into(), Ok(owner))]));
+        assert!(
+            owners.protect(&paths, "unknown-key", false).unwrap(),
+            "an unreadable residency census must broaden protection, not authorize deletion"
+        );
+    }
+    #[test]
+    fn directory_removal_carries_the_admitted_root_identity_into_its_pin() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let durable = temp.path().join("storage");
+        let parent = temp.path().join("cache-volume");
+        fs::create_dir(&parent).unwrap();
+        let mut config = crate::config::Config {
+            storage_dir: Some(durable),
+            cache_dir: Some(parent),
+            ..Default::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        let root = crate::root_cache::cache_root(&config);
+        let cache = root.join("views/key");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("own"), "own").unwrap();
+        let foreign = temp.path().join("foreign-root");
+        let precious = foreign.join("views/key/precious");
+        fs::create_dir_all(precious.parent().unwrap()).unwrap();
+        fs::write(&precious, "precious").unwrap();
+        let parked = temp.path().join("parked-root");
+        let a = root.clone();
+        let b = foreign.clone();
+        let p = parked.clone();
+        // Substitute a real directory before removal starts. If removal accepts
+        // that replacement, restore the admitted pathname immediately afterward
+        // so later path checks cannot hide that removal pinned the wrong directory.
+        let restored = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = restored.clone();
+        let _hook = observe_test_hook(
+            &cache,
+            Arc::new(move |step| {
+                if step == "remove-pinned" {
+                    fs::rename(&a, &b).unwrap();
+                    fs::rename(&p, &a).unwrap();
+                    done.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }),
+        );
+        // Windows will not rename a folder while a file inside it is open, and
+        // the cache lease keeps the root's in-use lock open. Release it so the
+        // substitution below can be staged; the removal must still refuse it.
+        #[cfg(windows)]
+        {
+            config.cache_lease = None;
+        }
+        fs::rename(&root, &parked).unwrap();
+        fs::rename(&foreign, &root).unwrap();
+        let result = remove_directory_if_closed(&cache);
+        if !restored.load(std::sync::atomic::Ordering::SeqCst) {
+            fs::rename(&root, &foreign).unwrap();
+            fs::rename(&parked, &root).unwrap();
+        }
+        let error = result.expect_err("removal ran on a substituted root");
+        assert!(
+            error.to_string().contains("identity changed while pinning"),
+            "{error}"
+        );
+        assert_eq!(fs::read_to_string(precious).unwrap(), "precious");
+        assert_eq!(fs::read_to_string(cache.join("own")).unwrap(), "own");
+    }
+
+    #[test]
+    fn retirement_refuses_a_source_replaced_after_validation() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("index/key");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("own"), "own").unwrap();
+        let foreign = temp.path().join("foreign");
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("precious"), "precious").unwrap();
+        let source = cache.clone();
+        let parked = temp.path().join("parked");
+        let _hook = observe_test_hook(
+            &cache,
+            Arc::new(move |step| {
+                if step == "rename-root" {
+                    fs::rename(&source, &parked).unwrap();
+                    fs::rename(&foreign, &source).unwrap();
+                }
+            }),
+        );
+        let result = retire_directory(temp.path(), &cache);
+        assert!(
+            result.is_err(),
+            "a different directory was retired under the validated name"
+        );
+        assert_eq!(
+            fs::read_to_string(cache.join("precious")).unwrap(),
+            "precious"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_flat_unlink_stays_on_pinned_domain_after_ancestor_swap() {
+        use super::*;
+        let (temp, root, key) = fixture();
+        fs::remove_dir(&root).unwrap();
+        let domain = temp.path().join("opencode/inspect");
+        fs::create_dir_all(&domain).unwrap();
+        let name = format!("{key}.payload");
+        fs::write(domain.join(&name), "own").unwrap();
+        let outside = temp.path().join("foreign");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join(&name), "precious").unwrap();
+        let parked = temp.path().join("parked");
+        let source = domain.clone();
+        let target = outside.clone();
+        let parked_hook = parked.clone();
+        let _hook = observe_test_hook(
+            &domain,
+            Arc::new(move |step| {
+                if step == "flat-unlink" {
+                    fs::rename(&source, &parked_hook).unwrap();
+                    std::os::unix::fs::symlink(&target, &source).unwrap();
+                }
+            }),
+        );
+        let paths = StoragePaths::same(temp.path());
+        let mut report = SweepReport::default();
+        let result = super::candidate(
+            &paths,
+            &mut RootIdentities::default(),
+            &domain,
+            &key,
+            true,
+            &super::bindings(&paths, &mut RootIdentities::default()).unwrap(),
+            crate::pins::now_ms(),
+            Instant::now() + PASS_BUDGET,
+            &|| false,
+            &mut ViewMembers::default(),
+            &mut DueBatch::default(),
+            &mut report,
+        );
+        assert_eq!(fs::read_to_string(outside.join(&name)).unwrap(), "precious");
+        if let Err(error) = result {
+            assert!(
+                error.to_string().contains("non-directory cache retained"),
+                "{error}"
+            );
+        }
+        assert!(
+            !parked.join(name).exists(),
+            "the original pinned file must be removed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_retirement_pins_domain_and_mount_local_trash() {
+        use super::*;
+        for mounted in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let domain = temp.path().join("index");
+            let cache = domain.join("key");
+            fs::create_dir_all(&cache).unwrap();
+            fs::write(cache.join("payload"), "own").unwrap();
+            let outside = temp.path().join("foreign");
+            fs::create_dir_all(outside.join("key/.retention-trash")).unwrap();
+            fs::write(outside.join("key/payload"), "precious").unwrap();
+            fs::create_dir_all(outside.join(".retention-trash")).unwrap();
+            let _mounted = mounted
+                .then(|| crate::walk_boundary::simulated_volumes::simulate(&cache, u64::MAX - 33));
+            let parked = temp.path().join("parked");
+            let source = domain.clone();
+            let target = outside.clone();
+            let _hook = observe_test_hook(
+                &cache,
+                Arc::new(move |step| {
+                    if step == "rename-root" {
+                        fs::rename(&source, &parked).unwrap();
+                        std::os::unix::fs::symlink(&target, &source).unwrap();
+                    }
+                }),
+            );
+            retire_directory(temp.path(), &cache).unwrap();
+            assert_eq!(
+                fs::read_to_string(outside.join("key/payload")).unwrap(),
+                "precious",
+                "retirement followed a swapped ancestor (mounted={mounted})"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_fd_reap_keeps_outside_canary_after_ancestor_swap() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StoragePaths::same(temp.path());
+        fs::create_dir_all(temp.path().join("retention")).unwrap();
+        let name = "retired-0123456789abcdef0123456789abcdef";
+        let own = temp.path().join("views/.retention-trash").join(name);
+        fs::create_dir_all(&own).unwrap();
+        fs::write(own.join("payload"), "own").unwrap();
+        let own_pin =
+            crate::bash_background::persistence::PinnedDir::repair_open_path(&own).unwrap();
+        write_retirement_witness(
+            temp.path(),
+            &own_pin,
+            "0123456789abcdef0123456789abcdef",
+            retirement_members(&own_pin).unwrap(),
+        )
+        .unwrap();
+        let outside = temp.path().join("outside");
+        let precious = outside.join(".retention-trash").join(name).join("payload");
+        fs::create_dir_all(precious.parent().unwrap()).unwrap();
+        fs::write(&precious, "outside").unwrap();
+        let source = temp.path().join("views");
+        let parked = temp.path().join("parked");
+        let _hook = observe_test_hook(
+            temp.path(),
+            Arc::new(move |step| {
+                if step == "reap-root" {
+                    fs::rename(&source, &parked).unwrap();
+                    std::os::unix::fs::symlink(&outside, &source).unwrap();
+                }
+            }),
+        );
+        reap_retired(&storage).unwrap();
+        assert!(
+            precious.is_file(),
+            "the reaper must unlink only through pinned handles"
+        );
+        assert!(!temp
+            .path()
+            .join("parked/.retention-trash")
+            .join(name)
+            .exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_fd_view_removal_keeps_outside_canary_after_ancestor_swap() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config {
+            storage_dir: Some(temp.path().to_path_buf()),
+            ..Default::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        let parent = temp.path().join("views");
+        let cache = parent.join("key");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("payload"), "own").unwrap();
+        let outside = temp.path().join("outside");
+        let precious = outside.join("key/payload");
+        fs::create_dir_all(precious.parent().unwrap()).unwrap();
+        fs::write(&precious, "outside").unwrap();
+        let parked = temp.path().join("parked");
+        let _hook = observe_test_hook(
+            &cache,
+            Arc::new(move |step| {
+                if step == "remove-root" {
+                    fs::rename(&parent, &parked).unwrap();
+                    std::os::unix::fs::symlink(&outside, &parent).unwrap();
+                }
+            }),
+        );
+        remove_directory_if_closed(&cache).unwrap();
+        assert!(precious.is_file());
+        assert!(!temp.path().join("parked/key").exists());
+    }
+
+    #[test]
+    fn retention_barrier_cannot_recreate_unavailable_configured_volume() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("volume");
+        fs::create_dir(&parent).unwrap();
+        let mut config = crate::config::Config {
+            cache_dir: Some(parent.clone()),
+            storage_dir: Some(temp.path().join("storage")),
+            ..Default::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        let paths = StoragePaths::for_config(&config);
+        // Windows will not move a folder while a file below it is open, and the
+        // cache lease keeps the root's in-use lock open. Release it so the
+        // volume can be taken away for this test.
+        #[cfg(windows)]
+        {
+            config.cache_lease = None;
+        }
+        fs::rename(&parent, temp.path().join("unmounted")).unwrap();
+        assert!(cache_barrier(&paths).is_err());
+        assert!(
+            !parent.exists(),
+            "retention admission must not recreate an absent volume"
+        );
+    }
+
+    #[test]
+    fn retention_legacy_domains_are_enumerated_on_the_durable_root() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let artifacts = temp.path().join("artifacts");
+        fs::create_dir_all(storage.join("opencode/callgraph")).unwrap();
+        fs::create_dir_all(artifacts.join("other-tool/inspect")).unwrap();
+        let paths = StoragePaths::new(storage.clone(), artifacts.clone());
+        let domains = domain_paths(&paths).unwrap();
+        assert!(domains.contains(&(storage.join("opencode/callgraph"), true)));
+        assert!(domains.contains(&(artifacts.join("index"), false)));
+        assert_eq!(
+            relative_domain(&paths, &storage.join("opencode/callgraph")).unwrap(),
+            PathBuf::from("opencode/callgraph")
+        );
+    }
+    // Existing fixtures intentionally put both roots in one temporary directory.
+    // Keep that explicit at this test boundary; production always passes both.
+    macro_rules! fixture_roots {
+        ($name:ident($($arg:ident: $ty:ty),* $(,)?) -> $result:ty) => {
+            fn $name(storage: &Path, $($arg: $ty),*) -> $result {
+                super::$name(&StoragePaths::same(storage), $($arg),*)
+            }
+        };
+    }
+    fixture_roots!(run_pass(cancelled: &dyn Fn() -> bool) -> SweepReport);
+    fixture_roots!(
+        run_pass_with_clock(
+            cancelled: &dyn Fn() -> bool,
+            clock: &dyn Fn() -> Instant,
+        ) -> SweepReport
+    );
+    fixture_roots!(
+        run_pass_with_budget(
+            cancelled: &dyn Fn() -> bool,
+            clock: &dyn Fn() -> Instant,
+            budget: Duration,
+        ) -> SweepReport
+    );
+    fixture_roots!(
+        visit_one_family(
+            domain: &str,
+            kind: &str,
+            cancelled: &dyn Fn() -> bool,
+            work: impl FnMut(&fs::DirEntry) -> io::Result<()>,
+        ) -> io::Result<()>
+    );
+    fn bindings(storage: &Path) -> io::Result<BTreeMap<String, Vec<Binding>>> {
+        super::bindings(&StoragePaths::same(storage), &mut RootIdentities::default())
+    }
+
+    fn root_identity_pass_fixture(linked: bool) -> (tempfile::TempDir, StoragePaths) {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StoragePaths::same(&temp.path().join("storage"));
+        for index in 0..20 {
+            fs::create_dir_all(temp.path().join(format!("checkout-{index}"))).unwrap();
+        }
+        for index in 0..1000 {
+            let binding = Binding {
+                root: temp.path().join(format!("checkout-{}", index % 20)),
+                artifact_key: format!("{index:016x}"),
+                last_bound_ms: crate::pins::now_ms(),
+                volume: None,
+                stable_volume: None,
+                linked_worktree: linked,
+            };
+            atomic_json(
+                &storage
+                    .durable
+                    .join(format!("retention/roots/{index:016x}.json")),
+                &binding,
+            )
+            .unwrap();
+        }
+        // candidate_inner rereads history under sweep.lock before deleting an
+        // unbound cache whose observation grace has expired.
+        let key = "fffffffffffffffe";
+        let cache = storage.artifacts.join("symbols").join(key);
+        fs::create_dir_all(&cache).unwrap();
+        atomic_json(
+            &storage
+                .durable
+                .join(format!("retention/unknown/{key}.json")),
+            &0u64,
+        )
+        .unwrap();
+        (temp, storage)
+    }
+
+    fn assert_pass_root_resolutions(linked: bool, expected: usize) {
+        let (_temp, storage) = root_identity_pass_fixture(linked);
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = reads.clone();
+        let _hook = observe_test_hook(
+            &storage.artifacts,
+            Arc::new(move |step| {
+                if step == "history-read" {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }),
+        );
+        let mut roots = RootIdentities::default();
+        let now = Instant::now();
+        let report = super::run_pass_with_root_identities(
+            &storage,
+            &|| false,
+            &|| now,
+            Duration::from_secs(3600),
+            &mut roots,
+        );
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert!(
+            reads.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "{report:?}"
+        );
+        assert_eq!(report.removed_roots, 1, "{report:?}");
+        assert_eq!(roots.resolutions, expected);
+    }
+
+    #[test]
+    fn storage_retention_skips_root_resolution_without_linked_roots() {
+        assert_pass_root_resolutions(false, 0);
+    }
+
+    #[test]
+    fn storage_retention_resolves_distinct_roots_once_per_pass() {
+        assert_pass_root_resolutions(true, 20);
+    }
+
+    #[test]
+    fn storage_retention_root_memo_preserves_merged_bindings_and_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StoragePaths::same(&temp.path().join("storage"));
+        let linked = temp.path().join("linked-worktree");
+        let live = temp.path().join("main-checkout");
+        let missing = temp.path().join("removed-worktree");
+        fs::create_dir(&linked).unwrap();
+        fs::create_dir(&live).unwrap();
+        let file = temp.path().join("not-a-directory");
+        fs::write(&file, b"file").unwrap();
+        let unresolved = file.join("checkout");
+        assert!(fs::canonicalize(&unresolved).is_err());
+        let now = crate::pins::now_ms();
+        let mut memo = BTreeMap::new();
+        for (index, root) in [&linked, &live, &missing, &unresolved]
+            .into_iter()
+            .enumerate()
+        {
+            memo.insert(
+                root.clone(),
+                serde_json::json!({
+                    "key": format!("{:016x}", index + 100), "recorded_at_ms": 0,
+                }),
+            );
+            let binding = Binding {
+                root: root.clone(),
+                artifact_key: format!("{index:016x}"),
+                last_bound_ms: if root == &live { now } else { 0 },
+                volume: Some((temp.path().to_path_buf(), 7)),
+                stable_volume: None,
+                linked_worktree: root != &live,
+            };
+            atomic_json(
+                &storage
+                    .durable
+                    .join(format!("retention/roots/{index:016x}.json")),
+                &binding,
+            )
+            .unwrap();
+        }
+        atomic_json(&storage.durable.join("cache-keys.json"), &memo).unwrap();
+        let owner_key = "fffffffffffffffc";
+        crate::artifact_owner::write_synthetic_manifest_for_test(
+            &storage.durable,
+            &linked,
+            owner_key,
+            &crate::path_identity::project_scope_key(&linked),
+            std::process::id(),
+            0,
+        );
+
+        // The reference reader resolves every binding independently, as it did
+        // before the pass-local memo, including nearest-ancestor fallbacks.
+        let expected =
+            bindings_with_root_resolver(&storage, false, &mut crate::root_cache::canonical_root)
+                .unwrap();
+        let mut roots = RootIdentities::default();
+        for admission in [false, true, true] {
+            let actual = bindings_with_admission(&storage, admission, &mut roots).unwrap();
+            assert_eq!(actual, expected);
+            for key in expected.keys() {
+                let mut old_report = SweepReport::default();
+                let mut new_report = SweepReport::default();
+                assert_eq!(
+                    eligible(&storage, key, &actual, now, ROOT_GRACE_MS, &mut new_report).unwrap(),
+                    eligible(
+                        &storage,
+                        key,
+                        &expected,
+                        now,
+                        ROOT_GRACE_MS,
+                        &mut old_report
+                    )
+                    .unwrap(),
+                    "{key}",
+                );
+                assert_eq!(new_report.skipped_live, old_report.skipped_live);
+                assert_eq!(new_report.skipped_recent, old_report.skipped_recent);
+                assert_eq!(
+                    new_report.skipped_mount_mismatch,
+                    old_report.skipped_mount_mismatch
+                );
+            }
+        }
+        assert_eq!(roots.resolutions, 4);
+        let inherited = &expected[owner_key][0];
+        assert!(inherited.linked_worktree);
+        assert_eq!(inherited.volume, Some((temp.path().to_path_buf(), 7)));
+        let unresolved_records = &expected[&format!("{:016x}", 103)];
+        assert!(unresolved_records
+            .iter()
+            .all(|binding| binding.linked_worktree));
+        assert_eq!(
+            roots.canonical_root(&unresolved),
+            crate::root_cache::canonical_root(&unresolved)
+        );
+
+        fs::write(
+            storage.durable.join("retention/bind-pending.lock"),
+            b"pending",
+        )
+        .unwrap();
+        assert_eq!(
+            bindings_with_admission(&storage, true, &mut roots)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted,
+        );
+        assert_eq!(
+            bindings_with_root_resolver(&storage, true, &mut crate::root_cache::canonical_root)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted,
+        );
+    }
+    fixture_roots!(record_bind(root: &Path, artifact_key: &str) -> io::Result<()>);
+    fixture_roots!(reap_retired() -> io::Result<()>);
+    fn schedule(
+        storage: PathBuf,
+        admission: SubcLifecycleAdmission,
+        generation: Arc<AtomicU64>,
+        expected: u64,
+    ) {
+        super::schedule(
+            StoragePaths::same(&storage),
+            admission,
+            generation,
+            expected,
+        );
+    }
+    #[test]
+    fn cache_root_retirement_trash_is_on_the_cache_volume() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("aft");
+        let cache = temp.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        let mut config = crate::config::Config {
+            storage_dir: Some(storage.clone()),
+            cache_dir: Some(cache),
+            ..Default::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        let cache = crate::root_cache::cache_root(&config);
+        let retired = cache.join("symbols/retired");
+        fs::create_dir_all(&retired).unwrap();
+        fs::write(retired.join("payload"), "cache").unwrap();
+        retire_directory(&storage, &retired).unwrap();
+        assert!(!retired.exists());
+        assert!(cache.join("symbols/.retention-trash").is_dir());
+        assert!(!storage.join("symbols").exists());
+    }
+
+    #[test]
+    fn cache_root_prunes_linked_binding_using_durable_family_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let durable = temp.path().join("storage");
+        let parent = temp.path().join("cache-volume");
+        fs::create_dir(&parent).unwrap();
+        let mut config = crate::config::Config {
+            storage_dir: Some(durable.clone()),
+            cache_dir: Some(parent),
+            ..Default::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        let paths = StoragePaths::for_config(&config);
+        let checkout = temp.path().join("retired-worktree");
+        let main = temp.path().join("main-checkout");
+        fs::create_dir(&checkout).unwrap();
+        fs::create_dir(&main).unwrap();
+        let family = "0123456789abcdef";
+        super::record_bind(&paths, &checkout, family).unwrap();
+        let scope = crate::path_identity::project_scope_key(&checkout);
+        let record = durable.join(format!("retention/roots/{scope}.json"));
+        let mut binding: Binding = read_json(&record).unwrap();
+        binding.linked_worktree = true;
+        binding.last_bound_ms = 0;
+        atomic_json(&record, &binding).unwrap();
+        fs::remove_dir(&checkout).unwrap();
+        crate::artifact_owner::write_synthetic_manifest_for_test(
+            &durable,
+            &main,
+            family,
+            &crate::path_identity::project_scope_key(&main),
+            std::process::id(),
+            crate::pins::now_ms(),
+        );
+        let family_cache = paths.artifacts.join("index").join(family);
+        fs::create_dir_all(&family_cache).unwrap();
+        let mut report = SweepReport {
+            at_ms: crate::pins::now_ms(),
+            ..Default::default()
+        };
+        super::prune_bindings(&paths, &|| false, &mut report).unwrap();
+        assert_eq!(report.pruned_bindings, 1);
+        assert!(
+            !record.exists(),
+            "retired checkout binding must not be kept by a family owned by the live main checkout"
+        );
+        assert!(family_cache.is_dir());
+        assert!(durable
+            .join("artifact-owners")
+            .join(family)
+            .join("owner.json")
+            .is_file());
+        assert!(!paths.artifacts.join("artifact-owners").exists());
+    }
+
+    #[test]
+    fn cache_root_retention_cursors_are_isolated_by_artifact_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let durable = temp.path().join("storage");
+        let first = StoragePaths::new(durable.clone(), temp.path().join("first"));
+        let second = StoragePaths::new(durable, temp.path().join("second"));
+        for paths in [&first, &second] {
+            for key in ["0000000000000001", "0000000000000002"] {
+                fs::create_dir_all(paths.artifacts.join("index").join(key)).unwrap();
+            }
+        }
+        let batch = super::traversal_batch(
+            &first,
+            &[(first.artifacts.join("index"), false)],
+            "roots",
+            1,
+        )
+        .unwrap();
+        assert_eq!(batch.entries[0].entry.file_name(), "0000000000000001");
+        super::persist_cursor(&first, &batch.cursor_path, &batch.entries[0].after).unwrap();
+        let next = super::traversal_batch(
+            &second,
+            &[(second.artifacts.join("index"), false)],
+            "roots",
+            1,
+        )
+        .unwrap();
+        assert_ne!(batch.cursor_path, next.cursor_path);
+        assert_eq!(
+            next.entries[0].entry.file_name(),
+            "0000000000000001",
+            "another root's cursor must not skip this root's first entry"
+        );
+    }
     use super::*;
 
     fn expired_pending_bind(root: &Path) -> Arc<PendingBind> {
@@ -4749,6 +8800,109 @@ mod storage_retention_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn record_bind_cache_dir_concurrent_binds_take_one_retention_lock_per_round() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const BINDS: usize = 16;
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("cache-volume");
+        fs::create_dir(&parent).unwrap();
+        let _volume = crate::walk_boundary::simulated_volumes::simulate(&parent, u64::MAX - 17);
+        let mut config = crate::config::Config {
+            storage_dir: Some(temp.path().join("durable")),
+            cache_dir: Some(parent),
+            ..Default::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root(&mut config).is_none());
+        let paths = StoragePaths::for_config(&config);
+        assert_ne!(paths.durable, paths.artifacts);
+        let directory = paths.durable.join("retention/roots");
+        let observations = paths.durable.join("retention/unknown");
+        fs::create_dir_all(&observations).unwrap();
+        let roots: Vec<_> = (0..BINDS)
+            .map(|index| {
+                let root = temp.path().join(format!("checkout-{index}"));
+                fs::create_dir(&root).unwrap();
+                let root = fs::canonicalize(root).unwrap();
+                let key = crate::path_identity::project_scope_key(&root);
+                fs::write(observations.join(format!("{key}.json")), b"{}").unwrap();
+                (root, key)
+            })
+            .collect();
+        let arrivals = Arc::new((Mutex::new(0_usize), Condvar::new()));
+        let rounds = Arc::new(AtomicUsize::new(0));
+        let acquisitions = AtomicUsize::new(0);
+        let _hook = {
+            let arrivals = arrivals.clone();
+            let rounds = rounds.clone();
+            observe_test_hook(
+                &paths.durable,
+                Arc::new(move |step| match step {
+                    "bind-enqueued" => {
+                        *arrivals.0.lock().unwrap() += 1;
+                        arrivals.1.notify_all();
+                    }
+                    "bind-round-collecting" => {
+                        let count = arrivals.0.lock().unwrap();
+                        let (count, timeout) = arrivals
+                            .1
+                            .wait_timeout_while(count, Duration::from_secs(20), |count| {
+                                *count < BINDS
+                            })
+                            .unwrap();
+                        assert!(!timeout.timed_out(), "only {count} callers enqueued");
+                    }
+                    "bind-round-acquired" => {
+                        rounds.fetch_add(1, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }),
+            )
+        };
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = roots
+                .iter()
+                .map(|(root, key)| {
+                    let paths = &paths;
+                    let acquisitions = &acquisitions;
+                    scope.spawn(move || {
+                        crate::fs_lock::io_ledger::take();
+                        let result = super::record_bind(paths, root, key);
+                        acquisitions.fetch_add(
+                            crate::fs_lock::io_ledger::take().acquisitions as usize,
+                            Ordering::SeqCst,
+                        );
+                        result
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().unwrap().unwrap();
+            }
+        });
+        assert_eq!(
+            rounds.load(Ordering::SeqCst),
+            1,
+            "binds did not share a round"
+        );
+        // Each bind round takes one bind-pending marker and one durable
+        // `retention/sweep.lock`, however many callers it carries. With the
+        // cache root on its own volume, binds must take no further retention
+        // lock of their own.
+        assert_eq!(
+            acquisitions.load(Ordering::SeqCst),
+            2 * rounds.load(Ordering::SeqCst),
+            "split-cache binds acquired retention locks outside the group round"
+        );
+        for (root, key) in roots {
+            let binding: Binding = read_json(&directory.join(format!("{key}.json"))).unwrap();
+            assert_eq!(binding.root, root);
+            assert_eq!(binding.artifact_key, key);
+            assert!(!observations.join(format!("{key}.json")).exists());
+        }
+        assert!(!paths.artifacts.join("retention").exists());
     }
 
     #[test]
@@ -5744,7 +9898,7 @@ mod storage_retention_tests {
         // Pin admission acquires this exact lock. A nonwaiting attempt must be
         // refused while the deletion is paused after its protection recheck.
         let admission =
-            crate::fs_lock::try_acquire(&temp.path().join("retention/sweep.lock"), Duration::ZERO);
+            crate::fs_lock::try_acquire(&temp.path().join(".retention-sweep.lock"), Duration::ZERO);
         release.send(()).unwrap();
         let report = worker.join().unwrap();
         assert!(matches!(
@@ -5754,6 +9908,99 @@ mod storage_retention_tests {
         assert_eq!(report.removed_generations, 1, "{report:?}");
         assert!(!old.exists());
         assert!(crate::pins::QueryPin::acquire(view.view_dir(), "next").is_ok());
+    }
+
+    /// An older AFT release on the same storage collects blobs holding only
+    /// the durable `retention/sweep.lock`. A new assembly pin must wait for
+    /// that collector, with and without a separate cache root.
+    #[test]
+    fn assembly_pin_waits_for_an_old_collector_holding_only_the_durable_lock() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for split in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let durable = temp.path().join("storage");
+            fs::create_dir_all(durable.join("retention")).unwrap();
+            let mut prepared = None;
+            let artifacts = if split {
+                let parent = temp.path().join("cache-volume");
+                fs::create_dir(&parent).unwrap();
+                let mut config = crate::config::Config {
+                    storage_dir: Some(durable.clone()),
+                    cache_dir: Some(parent),
+                    ..Default::default()
+                };
+                assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+                let artifacts = crate::root_cache::cache_root(&config);
+                prepared = Some(config);
+                artifacts
+            } else {
+                durable.clone()
+            };
+            let view_dir = artifacts.join("views").join("scope");
+            crate::private_storage::create_dir_all(&view_dir).unwrap();
+            let metadata = view_dir.join("pins/generation.json");
+
+            // The old collector takes only the durable lock.
+            let old_collector = crate::fs_lock::try_acquire(
+                &durable.join("retention/sweep.lock"),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            let waits = Arc::new(AtomicUsize::new(0));
+            let observer = waits.clone();
+            let pin_dir = view_dir.clone();
+            let writer = std::thread::spawn(move || {
+                let _observe = crate::fs_lock::observe_retry_sleeps_for_test(observer);
+                crate::pins::AssemblyPin::create(&pin_dir, "family", "scope", "generation", &[])
+            });
+            // Rendezvous: the writer records a retry on the busy lock before
+            // it can write anything.
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while waits.load(Ordering::SeqCst) == 0 {
+                assert!(
+                    !writer.is_finished(),
+                    "split={split}: pin written while an old collector held retention/sweep.lock"
+                );
+                assert!(Instant::now() < deadline, "split={split}: pin never waited");
+                std::thread::yield_now();
+            }
+            assert!(
+                !metadata.exists(),
+                "split={split}: pin visible during collection"
+            );
+            drop(old_collector);
+            let pin = writer
+                .join()
+                .unwrap()
+                .expect("pin after the old collector released its lock");
+            assert!(metadata.is_file(), "split={split}");
+            drop(pin);
+            drop(prepared);
+        }
+    }
+
+    /// With no separate cache root both retention locks live under one root.
+    /// Pin creation takes each once, never itself twice, and releases both.
+    #[test]
+    fn assembly_pin_on_a_shared_root_takes_each_retention_lock_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let view_dir = temp.path().join("views").join("scope");
+        crate::private_storage::create_dir_all(&view_dir).unwrap();
+        let pin = crate::pins::AssemblyPin::create(&view_dir, "family", "scope", "g1", &[])
+            .expect("pin on a shared root");
+        drop(pin);
+        let sweep = temp.path().join("retention/sweep.lock");
+        let artifact = temp.path().join(".retention-sweep.lock");
+        drop(crate::fs_lock::try_acquire(&sweep, Duration::ZERO).expect("durable lock released"));
+        drop(crate::fs_lock::try_acquire(&artifact, Duration::ZERO).expect("cache lock released"));
+        let barrier = pin_barrier(&view_dir)
+            .unwrap()
+            .expect("a views directory is pinned");
+        assert!(matches!(
+            crate::fs_lock::try_acquire(&sweep, Duration::ZERO),
+            Err(crate::fs_lock::AcquireError::Timeout)
+        ));
+        drop(barrier);
     }
 
     #[test]
@@ -5768,6 +10015,304 @@ mod storage_retention_tests {
         assert_eq!(report.removed_generations, 1, "{report:?}");
         assert!(!old.exists());
         assert!(view.view_dir().exists());
+    }
+
+    #[test]
+    fn storage_retention_generation_lane_visits_every_view_despite_expired_root_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_generation_lane_bound(&StoragePaths::same(temp.path()));
+    }
+
+    #[test]
+    fn storage_retention_generation_lane_reaches_nested_v2_views() {
+        let storage = tempfile::tempdir().unwrap();
+        let paths = StoragePaths::same(storage.path());
+        let root = storage.path().join("checkout");
+        fs::create_dir(&root).unwrap();
+        let registry =
+            crate::views::registry::FamilyRegistry::open(storage.path(), "0123456789abcdef")
+                .unwrap();
+        let mut registrations = Vec::new();
+        let mut views = Vec::new();
+        for index in 0..145 {
+            let scope = if index == 144 {
+                "named-scope".to_owned()
+            } else {
+                format!("{index:016x}")
+            };
+            let registration = registry
+                .register_view_with_storage(storage.path(), &scope, &root)
+                .unwrap();
+            let view = registration.view_store().unwrap();
+            fs::write(view.derived_path("old").unwrap(), b"obsolete").unwrap();
+            registrations.push(registration);
+            views.push(view);
+        }
+        let direct = crate::views::ViewStore::open(storage.path(), "ffffffffffffffff").unwrap();
+        fs::write(direct.derived_path("old").unwrap(), b"obsolete").unwrap();
+        views.push(direct);
+        atomic_json(
+            &super::cursor_root(&paths).unwrap().join("generations.json"),
+            &TraversalCursor {
+                domain: "views/v2".into(),
+                last_processed: Some("0000000000000048".into()),
+            },
+        )
+        .unwrap();
+        let mut removed = 0;
+        let mut bytes = 0;
+        for _ in 0..4 {
+            let report = super::run_pass_with_budget(
+                &paths,
+                &|| false,
+                &|| Instant::now() + Duration::from_secs(60),
+                Duration::ZERO,
+            );
+            assert!(report.errors.is_empty(), "{report:?}");
+            removed += report.removed_generations;
+            bytes += report.removed_bytes;
+        }
+        assert_eq!(removed, views.len(), "nested V2 views were not all swept");
+        assert_eq!(bytes, 8 * views.len() as u64);
+        assert!(views
+            .iter()
+            .all(|view| !view.derived_path("old").unwrap().exists()));
+    }
+
+    #[test]
+    fn storage_retention_generation_lane_isolates_corrupt_family_and_advances() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let storage = tempfile::tempdir().unwrap();
+        let paths = StoragePaths::same(storage.path());
+        let root = storage.path().join("checkout");
+        fs::create_dir(&root).unwrap();
+        let bad_registry =
+            crate::views::registry::FamilyRegistry::open(storage.path(), "0000000000000001")
+                .unwrap();
+        let good_registry =
+            crate::views::registry::FamilyRegistry::open(storage.path(), "0000000000000002")
+                .unwrap();
+        let bad_registration = bad_registry
+            .register_view_with_storage(storage.path(), "0000000000000001", &root)
+            .unwrap();
+        let good_registration = good_registry
+            .register_view_with_storage(storage.path(), "0000000000000002", &root)
+            .unwrap();
+        let bad_view = bad_registration.view_store().unwrap();
+        let good_view = good_registration.view_store().unwrap();
+        let bad_old = bad_view.derived_path("old").unwrap();
+        fs::write(&bad_old, b"must be retained").unwrap();
+        // Corrupt the schema through its tracked connection, never by opening
+        // the live SQLite file through a second, raw descriptor.
+        bad_registry
+            .with_barrier(|tx| {
+                tx.execute_batch("DROP TABLE members")?;
+                Ok(())
+            })
+            .unwrap();
+        let warnings = Arc::new(AtomicUsize::new(0));
+        let observed = warnings.clone();
+        let _hook = observe_test_hook(
+            bad_registry.path(),
+            Arc::new(move |step| {
+                if step == "generation-registry-error" {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+            }),
+        );
+        let cursor_path = super::cursor_root(&paths).unwrap().join("generations.json");
+        atomic_json(
+            &cursor_path,
+            &TraversalCursor {
+                domain: "views/v2".into(),
+                last_processed: Some("0000000000000000".into()),
+            },
+        )
+        .unwrap();
+        for pass in 0..2 {
+            let good_old = good_view.derived_path(&format!("old-{pass}")).unwrap();
+            fs::write(&good_old, b"reclaim this").unwrap();
+            let report = super::run_pass_with_budget(
+                &paths,
+                &|| false,
+                &|| Instant::now() + Duration::from_secs(60),
+                Duration::ZERO,
+            );
+            assert!(
+                !good_old.exists(),
+                "healthy family was starved by a corrupt neighbor: {report:?}"
+            );
+            assert!(bad_old.exists(), "unchecked family must remain protected");
+            let cursor: TraversalCursor = read_json(&cursor_path).unwrap();
+            assert!(
+                cursor.last_processed.is_none(),
+                "the completed generation lap was not committed: {cursor:?}"
+            );
+            assert!(
+                report.timings_ms.contains_key("roots"),
+                "generation lookup failure skipped root-retirement work: {report:?}"
+            );
+        }
+        assert_eq!(
+            warnings.load(Ordering::SeqCst),
+            1,
+            "a persistent bad family must not log on every pass"
+        );
+    }
+
+    #[test]
+    fn generation_registry_census_preserves_closed_wal_bytes() {
+        let storage = tempfile::tempdir().unwrap();
+        let paths = StoragePaths::same(storage.path());
+        let registry =
+            crate::views::registry::FamilyRegistry::open(storage.path(), "0000000000000001")
+                .unwrap();
+        let registration = registry
+            .register_view_with_storage(
+                storage.path(),
+                "scope",
+                &storage.path().join("absent-root"),
+            )
+            .unwrap();
+        drop(registration.view_store().unwrap());
+        drop(registration);
+        registry
+            .with_barrier(|tx| {
+                tx.set_db_config(
+                    rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                    true,
+                )?;
+                tx.execute("UPDATE registry_meta SET gc_epoch = gc_epoch + 1", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let database = registry.path().to_path_buf();
+        drop(registry);
+        assert_eq!(crate::db::file_identity::open_connections(&database), 0);
+        let wal = PathBuf::from(format!("{}-wal", database.display()));
+        let before_database = fs::read(&database).unwrap();
+        let before_wal = fs::read(&wal).unwrap();
+        assert!(
+            !before_wal.is_empty(),
+            "fixture must retain committed WAL frames"
+        );
+        let batch = super::traversal_batch(
+            &paths,
+            &[(storage.path().join("views/v2"), false)],
+            "census-audit",
+            64,
+        )
+        .unwrap();
+        let mut report = SweepReport::default();
+        let owners = generation_registries(&paths, &batch.entries, &mut report).unwrap();
+        assert_eq!(owners.len(), 1);
+        drop(owners);
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(crate::db::file_identity::open_connections(&database), 0);
+        assert_eq!(
+            fs::read(&database).unwrap(),
+            before_database,
+            "ownership census checkpointed the registry"
+        );
+        assert_eq!(
+            fs::read(&wal).unwrap(),
+            before_wal,
+            "ownership census removed or changed the WAL"
+        );
+    }
+
+    #[test]
+    fn storage_retention_generation_lane_reports_unlinked_bytes() {
+        let storage = tempfile::tempdir().unwrap();
+        let view = crate::views::ViewStore::open(storage.path(), "0123456789abcdef").unwrap();
+        for (name, bytes) in [
+            ("derived-old.sqlite", 17),
+            ("derived-old.sqlite-wal", 5),
+            ("derived-old.sqlite-shm", 3),
+            ("manifest-old.json", 11),
+            ("trigram-old.bin", 13),
+        ] {
+            fs::write(view.view_dir().join(name), vec![b'x'; bytes]).unwrap();
+        }
+        fs::write(view.view_dir().join("unrelated"), vec![b'x'; 101]).unwrap();
+        let report = run_pass_with_budget(
+            storage.path(),
+            &|| false,
+            &|| Instant::now() + Duration::from_secs(60),
+            Duration::ZERO,
+        );
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.removed_generations, 1);
+        assert_eq!(
+            report.removed_bytes, 49,
+            "must count only successful generation-owned unlinks"
+        );
+        assert_eq!(report.domains["views/generations"].removed_bytes, 49);
+        assert!(view.view_dir().join("unrelated").exists());
+    }
+
+    #[test]
+    fn storage_retention_generation_lane_uses_cache_views_and_durable_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        let durable = temp.path().join("storage");
+        let cache = temp.path().join("cache-volume");
+        fs::create_dir(&cache).unwrap();
+        let mut config = crate::config::Config {
+            storage_dir: Some(durable.clone()),
+            cache_dir: Some(cache),
+            ..Default::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        let paths = StoragePaths::for_config(&config);
+        assert_ne!(paths.artifacts, durable);
+        assert_generation_lane_bound(&paths);
+        assert!(super::cursor_root(&paths)
+            .unwrap()
+            .join("generations.json")
+            .is_file());
+        assert!(!paths.artifacts.join("retention/cursors").exists());
+        assert!(!durable.join("views").exists());
+    }
+
+    fn assert_generation_lane_bound(paths: &StoragePaths) {
+        let views: Vec<_> = (0..145)
+            .map(|index| {
+                let view =
+                    crate::views::ViewStore::open(&paths.artifacts, &format!("{index:016x}"))
+                        .unwrap();
+                fs::write(view.derived_path("old").unwrap(), b"obsolete").unwrap();
+                view
+            })
+            .collect();
+        // Start halfway through a lap, as a daemon resuming its durable cursor
+        // would. Three batches plus one wraparound must reach every view.
+        atomic_json(
+            &super::cursor_root(paths).unwrap().join("generations.json"),
+            &TraversalCursor {
+                domain: "views".into(),
+                last_processed: Some("0000000000000048".into()),
+            },
+        )
+        .unwrap();
+        let mut removed = 0;
+        for _ in 0..4 {
+            let report = super::run_pass_with_budget(
+                paths,
+                &|| false,
+                &|| Instant::now() + Duration::from_secs(60),
+                Duration::ZERO,
+            );
+            assert!(report.errors.is_empty(), "{report:?}");
+            removed += report.removed_generations;
+        }
+        let unvisited: Vec<_> = views
+            .iter()
+            .filter(|view| view.derived_path("old").unwrap().exists())
+            .map(|view| view.view_dir())
+            .collect();
+        assert!(unvisited.is_empty(), "unvisited views: {unvisited:?}");
+        assert_eq!(removed, views.len());
     }
 
     #[test]
@@ -6094,6 +10639,93 @@ mod storage_retention_tests {
         assert_eq!(report.removed_roots, 0, "{report:?}");
         assert!(path.exists());
         assert!(report.skipped_protected > 0);
+    }
+
+    #[test]
+    fn retention_due_legacy_cache_keeps_a_live_v3_import_source() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let (temp, root, scope) = fixture();
+        fs::remove_dir(&root).unwrap();
+        let path = cache(temp.path(), "index", &scope);
+        // The v3 importer of this key's family holds a live claim: it may be
+        // reading `index/<scope>` right now.
+        let held = crate::migration::v3_ledger::hold_claim_for_test(temp.path(), &scope, &scope);
+        let report = run_pass(temp.path(), &|| false);
+        assert_eq!(report.removed_roots, 0, "{report:?}");
+        assert!(path.join("payload.bin").exists());
+        assert!(report.skipped_protected > 0, "{report:?}");
+        // Once the import is gone the binding-age rule applies again.
+        drop(held);
+        let report = run_pass(temp.path(), &|| false);
+        assert_eq!(report.removed_roots, 1, "{report:?}");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn retained_legacy_inventory_lists_every_kind_without_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path();
+        for (path, bytes) in [
+            ("symbols/0123456789abcdef/symbols.bin", &b"symbols"[..]),
+            ("views/0123456789abcdef/manifest.json", b"view"),
+            ("views/v2/scope/manifest.json", b"v2 view"),
+            ("blobs/fedcba9876543210/semantic.sqlite", b"v1 blobs"),
+            ("blobs/v2/family/semantic.sqlite", b"v2 blobs"),
+            ("blobs/v3/family/members.sqlite", b"v3 registry"),
+        ] {
+            let path = storage.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+        let pins = storage.join("views/0123456789abcdef/pins");
+        fs::create_dir_all(&pins).unwrap();
+        let _pin =
+            crate::pins::QueryPin::acquire(&storage.join("views/0123456789abcdef"), "g").unwrap();
+        let snapshot = crate::migration::v3_import::tests::snapshot_tree;
+        let before = snapshot(storage);
+        let items = retained_legacy_inventory(storage).unwrap();
+        let summary = items
+            .iter()
+            .map(|item| {
+                (
+                    item.kind,
+                    item.path.strip_prefix(storage).unwrap().to_path_buf(),
+                    item.copied_into_v3,
+                    item.pinned.is_some(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    RetainedKind::SymbolCache,
+                    PathBuf::from("symbols/0123456789abcdef"),
+                    false,
+                    false
+                ),
+                (
+                    RetainedKind::V1View,
+                    PathBuf::from("views/0123456789abcdef"),
+                    false,
+                    true
+                ),
+                (
+                    RetainedKind::V1BlobFamily,
+                    PathBuf::from("blobs/fedcba9876543210"),
+                    false,
+                    false
+                ),
+                (
+                    RetainedKind::V2FamilyStore,
+                    PathBuf::from("blobs/v2/family"),
+                    true,
+                    false
+                ),
+            ]
+        );
+        assert!(items.iter().all(|item| item.bytes > 0));
+        assert_eq!(snapshot(storage), before);
     }
 
     #[test]
@@ -6502,16 +11134,22 @@ mod storage_retention_tests {
 
     #[test]
     fn retention_retires_a_mount_point_cache_by_emptying_it_on_its_own_volume() {
+        // The reaper runs on its own thread and reports why it deferred work
+        // only through warnings. Send them to this test's captured output so
+        // a failure explains itself.
+        let _ = env_logger::builder()
+            .is_test(true)
+            .filter_module("aft::storage_retention", log::LevelFilter::Warn)
+            .filter_module("aft::cache_location", log::LevelFilter::Warn)
+            .try_init();
         let (temp, _, _, path) = due_cache_fixture();
-        let (reap_tx, reap_rx) = std::sync::mpsc::channel();
+        let steps = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed = steps.clone();
         let _hook = observe_test_hook(
             temp.path(),
-            Arc::new(move |step| {
-                if step == "reap-root" {
-                    let _ = reap_tx.send(());
-                }
-            }),
+            Arc::new(move |step| observed.lock().unwrap().push(step.to_owned())),
         );
+        let seen = |step: &str| steps.lock().unwrap().iter().any(|seen| seen == step);
         fs::create_dir_all(path.join("nested")).unwrap();
         fs::write(path.join("nested/derived.bin"), b"rebuildable").unwrap();
         // The domain folder and the cache folder below it report different
@@ -6524,12 +11162,56 @@ mod storage_retention_tests {
         );
         let _mount = crate::walk_boundary::simulated_volumes::simulate(&path, u64::MAX - 11);
 
-        let report = run_pass(temp.path(), &|| false);
+        // A pass past its time budget skips scheduling the reaper, and a
+        // loaded runner can exhaust the budget; this test is about where the
+        // retired entries go, not about speed.
+        let report = run_pass_with_budget(temp.path(), &|| false, &Instant::now, NO_TIME_BOUND);
         assert_eq!(report.removed_roots, 1, "{report:?}");
         assert!(report.errors.is_empty(), "{report:?}");
-        reap_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        // The hook runs before unlink; wait for the worker to release its lock
-        // before checking that all mount-local trash has gone.
+        assert!(
+            seen("reaper-launch"),
+            "the pass did not schedule a reaper: {:?}",
+            steps.lock().unwrap()
+        );
+        // Hang guard, not a speed bound: wait for the scheduled reaper to
+        // finish however slow the runner is, and fail only if it never does.
+        let hang_guard = Instant::now() + Duration::from_secs(120);
+        while reaper_running_for_test(temp.path()) {
+            assert!(
+                Instant::now() < hang_guard,
+                "hang guard: the reaper scheduled for {} was still running after 120 s; steps: {:?}",
+                temp.path().display(),
+                steps.lock().unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // That reaper may leave the mount-local trash for a later reaper, by
+        // design: when sweep.lock is busy, or after a transient error it
+        // logs. Run later reaper passes, as the next retention pass would.
+        let mount_emptied = || fs::read_dir(&path).unwrap().next().is_none();
+        for _ in 0..3 {
+            if mount_emptied() {
+                break;
+            }
+            if let Err(error) = reap_retired(temp.path()) {
+                panic!(
+                    "a later reaper pass failed: {error}; steps: {:?}",
+                    steps.lock().unwrap()
+                );
+            }
+        }
+        assert!(
+            seen("reap-root") && mount_emptied(),
+            "the mount-local trash was never reaped; steps: {:?}; pending marker present: {}; left in the mount: {:?}",
+            steps.lock().unwrap(),
+            temp.path().join("retention/mount-trash-pending").exists(),
+            fs::read_dir(&path)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>()
+        );
+        // Every reaper has returned; take its lock anyway so the checks below
+        // cannot overlap a straggling unlink.
         let reaped = crate::fs_lock::try_acquire(
             &temp.path().join("retention/reap.lock"),
             Duration::from_secs(10),
@@ -6566,6 +11248,15 @@ mod storage_retention_tests {
             .join(format!("views/.retention-trash/retired-{:032x}", 1));
         fs::create_dir_all(&ordinary).unwrap();
         fs::write(ordinary.join("payload.bin"), b"retired").unwrap();
+        let ordinary_pin =
+            crate::bash_background::persistence::PinnedDir::repair_open_path(&ordinary).unwrap();
+        write_retirement_witness(
+            temp.path(),
+            &ordinary_pin,
+            &format!("{:032x}", 1),
+            retirement_members(&ordinary_pin).unwrap(),
+        )
+        .unwrap();
         let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = probes.clone();
         let _hook = observe_test_hook(
@@ -6661,11 +11352,15 @@ mod storage_retention_tests {
         assert!(cancel || report.stopped_early, "{report:?}");
         assert_eq!(
             launches.load(Ordering::SeqCst),
-            0,
-            "a cancelled or expired pass must not launch the reaper"
+            usize::from(!cancel),
+            "only cancellation, not root-budget expiry, prevents reaper launch"
         );
         assert_eq!(fs::read(&marker).unwrap(), generation);
         assert!(retired.join("payload.bin").exists());
+        let until = Instant::now() + Duration::from_secs(10);
+        while reaper_running_for_test(temp.path()) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         drop(hook);
         drop(reaper);
         reap_retired(temp.path()).unwrap();
@@ -6679,7 +11374,7 @@ mod storage_retention_tests {
     }
 
     #[test]
-    fn retention_expired_pass_does_not_launch_mount_trash_reaper() {
+    fn retention_expired_pass_launches_mount_trash_reaper() {
         stopped_pass_keeps_mount_trash(false);
     }
 
@@ -6781,14 +11476,28 @@ mod storage_retention_tests {
 
         crate::durability::take();
         reap_retired(temp.path()).unwrap();
-        assert!(!marker.exists(), "a durable reap clears the pending marker");
+        assert_eq!(
+            marker.exists(),
+            keep_container,
+            "unrecognized trash must remain discoverable after a durable reap"
+        );
         #[cfg(unix)]
         {
             let events = crate::durability::take();
             assert!(events.contains(&(crate::durability::EventKind::DirectorySync, path)));
             if keep_container {
-                assert!(events.contains(&(crate::durability::EventKind::DirectorySync, trash)));
+                assert!(
+                    events.contains(&(crate::durability::EventKind::DirectorySync, trash.clone()))
+                );
             }
+        }
+        if keep_container {
+            fs::remove_file(trash.join("unknown")).unwrap();
+            reap_retired(temp.path()).unwrap();
+            assert!(
+                !marker.exists(),
+                "only a clean durable reap clears the marker"
+            );
         }
     }
 
@@ -6903,7 +11612,7 @@ mod storage_retention_tests {
         let mut due = DueBatch::default();
         let deadline = Instant::now() + PASS_BUDGET;
         prepare_due_cache(
-            temp.path(),
+            &StoragePaths::same(temp.path()),
             &temp.path().join("views"),
             &scope,
             &bindings(temp.path()).unwrap(),
@@ -6913,7 +11622,8 @@ mod storage_retention_tests {
         )
         .unwrap();
         due.flush(
-            temp.path(),
+            &StoragePaths::same(temp.path()),
+            &mut RootIdentities::default(),
             crate::pins::now_ms(),
             deadline,
             &Instant::now,
@@ -6998,10 +11708,28 @@ mod storage_retention_tests {
         fs::create_dir(&outside).unwrap();
         fs::write(outside.join("important"), b"not a cache").unwrap();
         std::os::unix::fs::symlink(&outside, path.join("link")).unwrap();
+        // This fixture invokes the reaper itself below; avoid racing an
+        // independently scheduled pass for the same reap lock.
+        states()
+            .lock()
+            .unwrap()
+            .entry(temp.path().to_path_buf())
+            .or_default()
+            .reaping = true;
         let report = run_pass(temp.path(), &|| false);
         assert_eq!(report.removed_roots, 0, "{report:?}");
         assert!(path.exists());
-        retire_directory(temp.path(), &path).unwrap();
+        let error = retire_directory(temp.path(), &path)
+            .expect_err("retirement must refuse a symlinked member");
+        assert!(
+            matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)),
+            "{error}"
+        );
+        let retired = temp
+            .path()
+            .join("views/.retention-trash/retired-0123456789abcdef0123456789abcdef");
+        fs::create_dir_all(retired.parent().unwrap()).unwrap();
+        fs::rename(&path, &retired).unwrap();
         reap_retired(temp.path()).unwrap();
         assert_eq!(
             fs::read_dir(temp.path().join("views/.retention-trash"))
@@ -7044,7 +11772,10 @@ mod storage_retention_tests {
         let Some(storage) = std::env::var_os("AFT_RETENTION_RESTART_STORAGE") else {
             return;
         };
-        let storage = PathBuf::from(storage);
+        let storage = StoragePaths::same(&PathBuf::from(storage));
+        // This fixture calls the candidate lane directly rather than run_pass,
+        // so it supplies the same existing metadata root as production setup.
+        fs::create_dir_all(storage.durable.join("retention")).unwrap();
         let now: u64 = std::env::var("AFT_RETENTION_RESTART_NOW")
             .unwrap()
             .parse()
@@ -7053,9 +11784,11 @@ mod storage_retention_tests {
         let mut report = SweepReport::default();
         let mut due = DueBatch::default();
         let deadline = Instant::now() + Duration::from_secs(5);
+        let mut roots = RootIdentities::default();
         candidate(
             &storage,
-            &storage.join("symbols"),
+            &mut roots,
+            &storage.artifacts.join("symbols"),
             key,
             false,
             &BTreeMap::new(),
@@ -7069,6 +11802,7 @@ mod storage_retention_tests {
         .unwrap();
         due.flush(
             &storage,
+            &mut roots,
             now,
             deadline,
             &Instant::now,
@@ -7076,7 +11810,11 @@ mod storage_retention_tests {
             &mut report,
         )
         .unwrap();
-        atomic_json(&storage.join(format!("restart-result-{now}.json")), &report).unwrap();
+        atomic_json(
+            &storage.durable.join(format!("restart-result-{now}.json")),
+            &report,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -7199,21 +11937,70 @@ mod storage_retention_tests {
         let temp = tempfile::tempdir().unwrap();
         let key = "0123456789abcdef";
         let view = cache(temp.path(), "views", key);
+        // This tests the observation grace, not how fast the runner can walk
+        // the view. Keep the production pass deadline out of both sweeps.
         // Expected: the first pass keeps the folder. A folder seen for the
         // first time may belong to a build in progress, so it is counted as
         // recent and its observation clock starts.
-        let first = run_pass(temp.path(), &|| false);
+        let first = run_pass_entry_bound(temp.path());
         assert_eq!(first.removed_roots, 0, "{first:?}");
         assert_eq!(first.orphan_views.skipped_recent, 1, "{first:?}");
         assert!(view.exists());
         // Expected: once the folder has been observed, and left unchanged, for
         // over an hour, the next pass removes it and reports its bytes.
         age_orphan(temp.path(), &view, key);
-        let second = run_pass(temp.path(), &|| false);
+        let second = run_pass_entry_bound(temp.path());
         assert_eq!(second.removed_roots, 1, "{second:?}");
         assert_eq!(second.orphan_views.removed_roots, 1, "{second:?}");
         assert!(second.orphan_views.removed_bytes > 0, "{second:?}");
         assert!(!view.exists());
+    }
+
+    #[test]
+    fn storage_retention_orphan_walk_deadline_is_incomplete_not_protected() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = "0123456789abcdef";
+        let view = cache(temp.path(), "views", key);
+        let clock = Instant::now();
+        let delay = observe_test_hook(
+            &view,
+            Arc::new(|step| {
+                if step == "walk" {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }),
+        );
+        // Hold the lane clock before its deadline so only the real-time tree
+        // walk expires, even if the runner stalls before entering the lane.
+        let stopped =
+            run_pass_with_budget(temp.path(), &|| false, &|| clock, Duration::from_millis(10));
+        drop(delay);
+        assert_eq!(stopped.examined, 1, "{stopped:?}");
+        assert!(stopped.stopped_early, "{stopped:?}");
+        assert_eq!(stopped.skipped_protected, 0, "{stopped:?}");
+        assert_eq!(stopped.orphan_views.skipped_protected, 0, "{stopped:?}");
+        assert_eq!(stopped.domains["views"].skipped_protected, 0, "{stopped:?}");
+        assert_eq!(stopped.removed_roots, 0, "{stopped:?}");
+        assert_eq!(stopped.errors.len(), 1, "{stopped:?}");
+        assert!(stopped.errors[0].contains("retention deadline reached"));
+        assert!(view.exists());
+
+        let observed = run_pass_entry_bound(temp.path());
+        assert_eq!(observed.orphan_views.skipped_recent, 1, "{observed:?}");
+        age_orphan(temp.path(), &view, key);
+        let reclaimed = run_pass_entry_bound(temp.path());
+        assert_eq!(reclaimed.orphan_views.removed_roots, 1, "{reclaimed:?}");
+        assert!(!view.exists());
+    }
+
+    #[test]
+    fn storage_retention_candidate_io_timeout_is_not_a_pass_deadline() {
+        let mut report = SweepReport::default();
+        let error = io::Error::new(io::ErrorKind::TimedOut, "filesystem probe timed out");
+        report_candidate_error(Path::new("cache"), &error, &mut report);
+        assert_eq!(report.skipped_protected, 1, "{report:?}");
+        assert!(!report.stopped_early, "{report:?}");
+        assert_eq!(report.errors, ["cache: filesystem probe timed out"]);
     }
 
     #[test]
@@ -7272,7 +12059,7 @@ mod storage_retention_tests {
         // the registry is the only record of this scope.
         drop(
             registry
-                .register_view(scope, &temp.path().join("missing"))
+                .register_view_with_storage(registry.storage(), scope, &temp.path().join("missing"))
                 .unwrap(),
         );
         let view = cache(temp.path(), "views", scope);
@@ -7992,7 +12779,9 @@ mod storage_retention_tests {
     fn storage_retention_v2_recent_missing_root_survives_repeated_sweeps() {
         let (temp, root, scope) = fixture();
         let registry = crate::views::registry::FamilyRegistry::open(temp.path(), &scope).unwrap();
-        let view = registry.register_view(&scope, &root).unwrap();
+        let view = registry
+            .register_view_with_storage(registry.storage(), &scope, &root)
+            .unwrap();
         let path = view.view_dir().to_path_buf();
         drop(view);
         fs::remove_dir(root).unwrap();
@@ -8013,7 +12802,9 @@ mod storage_retention_tests {
     fn v2_mount_mismatch_is_counted_and_keeps_member() {
         let (temp, root, scope) = fixture();
         let registry = crate::views::registry::FamilyRegistry::open(temp.path(), &scope).unwrap();
-        let view = registry.register_view(&scope, &root).unwrap();
+        let view = registry
+            .register_view_with_storage(registry.storage(), &scope, &root)
+            .unwrap();
         let path = view.view_dir().to_path_buf();
         drop(view);
         registry
@@ -8092,7 +12883,7 @@ mod storage_retention_tests {
             ..Default::default()
         };
         let (result, lines) = crate::logging::capture_log_lines(|| {
-            prune_bindings(storage.path(), &|| false, &mut report)
+            prune_bindings(&StoragePaths::same(storage.path()), &|| false, &mut report)
         });
 
         assert!(
@@ -8182,7 +12973,7 @@ mod storage_retention_tests {
                 at_ms: u64::MAX,
                 ..Default::default()
             };
-            prune_bindings(storage.path(), &|| false, &mut report).unwrap();
+            prune_bindings(&StoragePaths::same(storage.path()), &|| false, &mut report).unwrap();
             assert!(!eligible_path.exists(), "cleanup stalled in cycle {cycle}");
             assert_eq!(report.skipped_unknown, 1);
 
@@ -8225,7 +13016,7 @@ mod storage_retention_tests {
 }
 
 fn collect_one_family(
-    storage: &Path,
+    storage: &StoragePaths,
     cancelled: &dyn Fn() -> bool,
     report: &mut SweepReport,
 ) -> io::Result<()> {
@@ -8236,9 +13027,10 @@ fn collect_one_family(
         }
         let swept = crate::gc::sweep_bounded(
             crate::gc::SweepRequest {
-                storage,
+                durable_storage: &storage.durable,
+                storage: &storage.artifacts,
                 family: &family,
-                view_dir: &storage.join("views/retention-no-view"),
+                view_dir: &storage.artifacts.join("views/retention-no-view"),
                 byte_budget: 0,
                 now_ms: report.at_ms,
                 references: Default::default(),
@@ -8265,8 +13057,21 @@ fn collect_one_family(
 
 // Forget history only after its checkout-private caches and registry member
 // have gone. A shared family still in use retains its own live owner's record.
+fn family_owner_checkout_live(storage: &StoragePaths, key: &str) -> bool {
+    if !key_valid(key) {
+        return false;
+    }
+    let path = storage
+        .durable
+        .join("artifact-owners")
+        .join(key)
+        .join("owner.json");
+    read_json::<crate::artifact_owner::ArtifactOwnerManifest>(&path)
+        .is_ok_and(|owner| Path::new(&owner.checkout_path).exists())
+}
+
 fn prune_bindings(
-    storage: &Path,
+    storage: &StoragePaths,
     cancelled: &dyn Fn() -> bool,
     report: &mut SweepReport,
 ) -> io::Result<()> {
@@ -8275,22 +13080,22 @@ fn prune_bindings(
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !records.contains_key(storage) {
-        match fs::read_dir(storage.join("retention/roots")) {
+    if !records.contains_key(&storage.artifacts) {
+        match fs::read_dir(storage.durable.join("retention/roots")) {
             Ok(entries) => {
-                records.insert(storage.to_path_buf(), entries);
+                records.insert(storage.artifacts.clone(), entries);
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error),
         }
     }
     let batch = records
-        .get_mut(storage)
+        .get_mut(&storage.artifacts)
         .map(|entries| entries.by_ref().take(32).collect::<io::Result<Vec<_>>>())
         .transpose()?
         .unwrap_or_default();
     if batch.len() < 32 {
-        records.remove(storage);
+        records.remove(&storage.artifacts);
     }
     drop(records);
     for entry in batch {
@@ -8310,7 +13115,7 @@ fn prune_bindings(
             Ok(record) => record,
             Err(error) => {
                 let message = error.error.to_string();
-                handle_binding_read_error(storage, &path, error, true, false);
+                handle_binding_read_error(&storage.durable, &path, error, true, false);
                 report.skipped_unknown += 1;
                 if report.errors.len() < 16 {
                     report
@@ -8331,31 +13136,32 @@ fn prune_bindings(
         let scope = crate::path_identity::project_scope_key(&binding.root);
         if DOMAINS
             .iter()
-            .any(|domain| storage.join(domain).join(&scope).exists())
-            || storage.join("views/v2").join(&scope).exists()
+            .any(|domain| storage.artifacts.join(domain).join(&scope).exists())
+            || storage.artifacts.join("views/v2").join(&scope).exists()
         {
             continue;
         }
-        if crate::root_cache::protected_read_marker_exists(&storage.join("retention"), &scope) {
+        if crate::root_cache::protected_read_marker_exists(
+            &storage.durable.join("retention"),
+            &scope,
+        ) {
             continue;
         }
         if key_valid(&binding.artifact_key) {
-            let owner_path = storage
-                .join("artifact-owners")
-                .join(&binding.artifact_key)
-                .join("owner.json");
-            let family_live =
-                read_json::<crate::artifact_owner::ArtifactOwnerManifest>(&owner_path)
-                    .is_ok_and(|owner| Path::new(&owner.checkout_path).exists());
+            let family_live = family_owner_checkout_live(storage, &binding.artifact_key);
             if !family_live
-                && DOMAINS
-                    .iter()
-                    .any(|domain| storage.join(domain).join(&binding.artifact_key).exists())
+                && DOMAINS.iter().any(|domain| {
+                    storage
+                        .artifacts
+                        .join(domain)
+                        .join(&binding.artifact_key)
+                        .exists()
+                })
             {
                 continue;
             }
             if let Some(registry) = crate::views::registry::FamilyRegistry::open_existing(
-                storage,
+                &storage.artifacts,
                 &binding.artifact_key,
             )
             .map_err(|error| io::Error::other(error.to_string()))?
@@ -8392,14 +13198,15 @@ fn prune_bindings(
         if legacy_present {
             continue;
         }
-        let _barrier = barrier(storage)?;
+        let _barrier = cache_barrier(storage)?;
         // A rebind can replace the record while the cache inventory is being
         // read. Never erase that newer observation or its root's history.
+        let family_live = family_owner_checkout_live(storage, &binding.artifact_key);
         let current_binding = match read_binding_record(&path) {
             Ok((_, current_binding)) => current_binding,
             Err(error) => {
                 let message = error.error.to_string();
-                handle_binding_read_error(storage, &path, error, true, true);
+                handle_binding_read_error(&storage.durable, &path, error, true, true);
                 report.skipped_unknown += 1;
                 if report.errors.len() < 16 {
                     report.errors.push(format!(
@@ -8412,11 +13219,19 @@ fn prune_bindings(
         };
         if current_binding != binding
             || DOMAINS.iter().any(|domain| {
-                storage.join(domain).join(&scope).exists()
-                    || storage.join(domain).join(&binding.artifact_key).exists()
+                storage.artifacts.join(domain).join(&scope).exists()
+                    || (!family_live
+                        && storage
+                            .artifacts
+                            .join(domain)
+                            .join(&binding.artifact_key)
+                            .exists())
             })
-            || storage.join("views/v2").join(&scope).exists()
-            || crate::root_cache::protected_read_marker_exists(&storage.join("retention"), &scope)
+            || storage.artifacts.join("views/v2").join(&scope).exists()
+            || crate::root_cache::protected_read_marker_exists(
+                &storage.durable.join("retention"),
+                &scope,
+            )
         {
             continue;
         }
@@ -8430,8 +13245,8 @@ fn prune_bindings(
 /// to the week-long grace, because the topology can no longer be proven once
 /// the checkout is gone. While the checkout still exists, record the verified
 /// topology in place. The bind clock and volume identity stay as recorded.
-fn upgrade_legacy_binding(storage: &Path, path: &Path) -> io::Result<bool> {
-    let _barrier = barrier(storage)?;
+fn upgrade_legacy_binding(storage: &StoragePaths, path: &Path) -> io::Result<bool> {
+    let _barrier = barrier(&storage.durable)?;
     let record: serde_json::Value = read_json(path)?;
     if record.get("linked_worktree").is_some() {
         return Ok(false);
@@ -8446,39 +13261,47 @@ fn upgrade_legacy_binding(storage: &Path, path: &Path) -> io::Result<bool> {
 }
 
 pub(crate) fn schedule(
-    storage: PathBuf,
+    storage: StoragePaths,
     admission: SubcLifecycleAdmission,
     generation: Arc<AtomicU64>,
     expected: u64,
 ) {
+    if crate::root_cache::check_cache_access(&storage.artifacts).is_err() {
+        return;
+    }
     if !admission.is_current(&generation, expected) {
         return;
     }
-    if !startup_sweeps_ready(&storage) {
+    if !startup_sweeps_ready(&storage.artifacts) {
         return;
     }
     {
         let mut states = states()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let state = states.entry(storage.clone()).or_default();
+        let state = states.entry(storage.artifacts.clone()).or_default();
         if state.running || state.last_run.is_some_and(|last| last.elapsed() < INTERVAL) {
             return;
         }
         state.running = true;
         state.last_run = Some(Instant::now());
+        let admission = admission.clone();
+        let generation = generation.clone();
+        state.reaper_cancelled = Some(Arc::new(move || {
+            !admission.is_current(&generation, expected)
+        }));
     }
     let key = storage.clone();
     if let Err(error) = std::thread::Builder::new()
         .name("aft-storage-retention".into())
         .spawn(move || {
-            scheduled_run(&storage, || {
+            scheduled_run(&storage.artifacts, || {
                 drain_due_views(|| {
                     let report =
                         run_pass(&storage, &|| !admission.is_current(&generation, expected));
                     crate::slog_info!(
                         "storage retention root={} report={}",
-                        storage.display(),
+                        storage.artifacts.display(),
                         serde_json::to_string(&report).unwrap_or_default()
                     );
                     report
@@ -8487,7 +13310,7 @@ pub(crate) fn schedule(
         })
     {
         drop(RunningReset {
-            storage: &key,
+            storage: &key.artifacts,
             completed: false,
         });
         crate::slog_warn!("storage retention worker could not start: {error}");
@@ -8540,11 +13363,12 @@ impl Drop for RunningReset<'_> {
     }
 }
 
-fn clear_unknown_observation(storage: &Path, key: &str) -> io::Result<()> {
+fn clear_unknown_observation(storage: &StoragePaths, key: &str) -> io::Result<()> {
     if !key_valid(key) {
         return Ok(());
     }
     let path = storage
+        .durable
         .join("retention/unknown")
         .join(format!("{key}.json"));
     match fs::remove_file(&path) {
@@ -8554,9 +13378,9 @@ fn clear_unknown_observation(storage: &Path, key: &str) -> io::Result<()> {
     }
 }
 
-fn cache_key_present(storage: &Path, key: &str, deadline: Instant) -> io::Result<bool> {
+fn cache_key_present(storage: &StoragePaths, key: &str, deadline: Instant) -> io::Result<bool> {
     #[cfg(test)]
-    test_hook(storage, "cache-presence");
+    test_hook(&storage.artifacts, "cache-presence");
     for (directory, flat) in domain_paths(storage)? {
         if !flat {
             let cache = directory.join(key);
@@ -8596,6 +13420,17 @@ mod v3_collector_tests {
     /// process-global free-space override that the `blob_store::v3` tests
     /// change under their own lock; a child keeps these tests out of that.
     fn seed(storage: &Path, members: &[(&str, &str, Option<&Path>)]) {
+        seed_with_durable(storage, None, members);
+    }
+
+    /// Seed a family under `storage`. With `durable`, `storage` is a prepared
+    /// `storage.cache_dir` cache root owned by that durable root, which the
+    /// child prepares too before it writes there.
+    fn seed_with_durable(
+        storage: &Path,
+        durable: Option<&Path>,
+        members: &[(&str, &str, Option<&Path>)],
+    ) {
         let spec = members
             .iter()
             .map(|(scope, kind, root)| {
@@ -8615,6 +13450,10 @@ mod v3_collector_tests {
                 "--test-threads=1",
             ])
             .env("AFT_V3_COLLECTOR_STORAGE", storage)
+            .env(
+                "AFT_V3_COLLECTOR_DURABLE",
+                durable.map(Path::as_os_str).unwrap_or_default(),
+            )
             .env("AFT_V3_COLLECTOR_MEMBERS", spec)
             .env("RUSTC_WRAPPER", "")
             .env("CARGO_BUILD_RUSTC_WRAPPER", "")
@@ -8639,6 +13478,20 @@ mod v3_collector_tests {
         };
         let storage = PathBuf::from(storage);
         let members = std::env::var("AFT_V3_COLLECTOR_MEMBERS").unwrap();
+        // A cache root is admitted for writes only once this process has
+        // prepared it, as the AFT process that publishes v3 data would have.
+        let _prepared = std::env::var_os("AFT_V3_COLLECTOR_DURABLE")
+            .filter(|durable| !durable.is_empty())
+            .map(|durable| {
+                let mut config = crate::config::Config {
+                    storage_dir: Some(PathBuf::from(durable)),
+                    cache_dir: storage.parent().map(Path::to_path_buf),
+                    ..Default::default()
+                };
+                let warning = crate::root_cache::prepare_cache_root_for_test(&mut config);
+                assert!(warning.is_none(), "{warning:?}");
+                config
+            });
         v3::set_free_space_for_test(u64::MAX, u64::MAX / 2);
         v3::publish(&storage, FAMILY, 1 << 20, None, |publication| {
             for line in members.lines() {
@@ -8692,7 +13545,7 @@ mod v3_collector_tests {
         fs::create_dir_all(&root).unwrap();
         let root = fs::canonicalize(root).unwrap();
         let scope = crate::path_identity::project_scope_key(&root);
-        record_bind(storage, &root, &scope).unwrap();
+        record_bind(&StoragePaths::same(storage), &root, &scope).unwrap();
         let record = storage.join(format!("retention/roots/{scope}.json"));
         let mut binding: Binding = read_json(&record).unwrap();
         binding.last_bound_ms = 0;
@@ -8702,7 +13555,13 @@ mod v3_collector_tests {
 
     fn pass(storage: &Path) -> SweepReport {
         let mut report = SweepReport::default();
-        collect_one_v3_family(storage, &|| false, &mut report, V3Bounds::PASS).unwrap();
+        collect_one_v3_family(
+            &StoragePaths::same(storage),
+            &|| false,
+            &mut report,
+            V3Bounds::PASS,
+        )
+        .unwrap();
         assert!(report.errors.is_empty(), "{report:?}");
         report
     }
@@ -8757,6 +13616,253 @@ mod v3_collector_tests {
     fn fill_view_dir(view_dir: &Path) {
         fs::create_dir_all(view_dir).unwrap();
         fs::write(view_dir.join("data.bin"), vec![7u8; 64 * 1024]).unwrap();
+    }
+
+    #[test]
+    fn v3_budget_evicts_idle_live_roots_lru_and_stops_at_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp = fs::canonicalize(temp.path()).unwrap();
+        let storage = temp.join("storage");
+        fs::create_dir_all(&storage).unwrap();
+        let names = ["a-newest", "b-middle", "z-oldest"];
+        let roots = names
+            .iter()
+            .map(|name| bound_root(&temp, &storage, name))
+            .collect::<Vec<_>>();
+        let members = names
+            .iter()
+            .zip(&roots)
+            .map(|(name, root)| (*name, "view", Some(root.as_path())))
+            .collect::<Vec<_>>();
+        seed(&storage, &members);
+        with_registry(&storage, |tx| {
+            for (scope, bound) in [("z-oldest", 10), ("b-middle", 20), ("a-newest", 30)] {
+                tx.execute(
+                    "UPDATE members SET last_bind_ms=?2 WHERE scope=?1",
+                    rusqlite::params![scope, bound],
+                )?;
+            }
+            Ok(())
+        });
+        for name in names {
+            fill_view_dir(&view_dir(&storage, name));
+        }
+        // Hold the registry connection across both inventories: closing the
+        // last handle removes its shared-memory file and changes disk usage.
+        let ledger = v3::LedgerReader::open_existing(&storage, FAMILY).unwrap();
+        // Settle registry bookkeeping before choosing a one-view threshold.
+        pass(&storage);
+        let family = v3::family_dir(&storage, FAMILY).unwrap();
+        let before = v3::allocated_bytes(&family).unwrap();
+        // Leave room for registry bookkeeping, but require one whole view to go.
+        let bounds = V3Bounds {
+            soft_bytes: before - 64 * 1024 + 16 * 1024,
+            ..V3Bounds::PASS
+        };
+        let mut report = SweepReport::default();
+        collect_one_v3_family(
+            &StoragePaths::same(&storage),
+            &|| false,
+            &mut report,
+            bounds,
+        )
+        .unwrap();
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.removed_roots, 1, "{report:?}");
+        assert_eq!(member_scopes(&storage), ["a-newest", "b-middle"]);
+        assert_eq!(report.domains["views/v3-idle"].examined, 1, "{report:?}");
+        assert!(!view_dir(&storage, "z-oldest").exists());
+        assert!(roots.iter().all(|root| root.exists()));
+        assert!(v3::allocated_bytes(&family).unwrap() <= bounds.soft_bytes);
+        let charged = ledger.accounting().unwrap().usage();
+        assert!(charged <= bounds.soft_bytes);
+        #[cfg(unix)]
+        {
+            let disk = inventory(&family);
+            assert!(
+                charged.abs_diff(disk) <= 16 * 1024,
+                "ledger={charged} disk={disk}"
+            );
+            assert!(before.saturating_sub(disk).abs_diff(64 * 1024) <= 16 * 1024);
+        }
+    }
+
+    fn idle_pass(storage: &Path, bounds: V3Bounds) -> SweepReport {
+        crate::root_cache::register_durable_owner(&StoragePaths::same(storage)).unwrap();
+        let lock = ReservationLock::acquire(storage).unwrap();
+        let mut registry = RegistryWriter::open_existing(storage, FAMILY, &lock).unwrap();
+        let mut report = SweepReport::default();
+        let mut domain = DomainReport::default();
+        let owed = collect_v3_idle(
+            &StoragePaths::same(storage),
+            FAMILY,
+            &mut registry,
+            &|| false,
+            &mut report,
+            &mut domain,
+            bounds,
+            Instant::now() + bounds.budget,
+        )
+        .unwrap();
+        assert!(!owed, "{report:?}");
+        record_v3_domain(&mut report, "views/v3-idle", &domain);
+        report
+    }
+
+    #[test]
+    fn v3_budget_keeps_readers_pins_sessions_intents_and_uncertain_members() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp = fs::canonicalize(temp.path()).unwrap();
+        let storage = temp.join("storage");
+        fs::create_dir_all(&storage).unwrap();
+        let root = bound_root(&temp, &storage, "live");
+        let names = [
+            "a-late-pin",
+            "b-pin",
+            "c-reader",
+            "d-session",
+            "e-intent",
+            "f-unknown",
+            "z-idle",
+        ];
+        let members = names
+            .iter()
+            .map(|name| (*name, "view", Some(root.as_path())))
+            .collect::<Vec<_>>();
+        seed(&storage, &members);
+        for name in names {
+            fill_view_dir(&view_dir(&storage, name));
+        }
+        write_pin(&view_dir(&storage, "b-pin"), "g1", live_owner());
+        let _reader =
+            crate::root_cache::ReadMarker::create(&view_dir(&storage, "c-reader"), "g1").unwrap();
+        let unknown = view_dir(&storage, "f-unknown").join("pins");
+        fs::create_dir_all(&unknown).unwrap();
+        fs::write(unknown.join("broken.json"), b"not json").unwrap();
+        {
+            let lock = ReservationLock::acquire(&storage).unwrap();
+            let mut registry = RegistryWriter::open_existing(&storage, FAMILY, &lock).unwrap();
+            registry.upgrade_to_base_refs().unwrap();
+        }
+        let owner = live_owner();
+        with_registry(&storage, |tx| {
+            tx.execute("UPDATE members SET last_bind_ms=0", [])?;
+            tx.execute(
+                "INSERT INTO view_sessions VALUES('session','d-session',?1,?2,0)",
+                rusqlite::params![owner.pid, owner.start_time],
+            )?;
+            tx.execute("INSERT INTO base_refs VALUES('e-intent','base','nonce','digest',NULL,'intent',?1,?2,0)",
+                rusqlite::params![owner.pid, owner.start_time])?;
+            Ok(())
+        });
+        let late_dir = view_dir(&storage, "a-late-pin");
+        let _hook = observe_test_hook(
+            &storage,
+            Arc::new(move |step| {
+                if step == "v3-idle-before-recheck" {
+                    write_pin(&late_dir, "g1", live_owner());
+                }
+            }),
+        );
+        let report = idle_pass(
+            &storage,
+            V3Bounds {
+                soft_bytes: 0,
+                ..V3Bounds::PASS
+            },
+        );
+        let idle = &report.domains["views/v3-idle"];
+        assert_eq!(idle.examined, 7, "{report:?}");
+        assert_eq!(idle.skipped_protected, 5, "{report:?}");
+        assert_eq!(idle.skipped_unknown, 1, "{report:?}");
+        assert_eq!(idle.removed_roots, 1, "{report:?}");
+        assert_eq!(report.skipped_protected, 5, "{report:?}");
+        assert_eq!(report.skipped_unknown, 1, "{report:?}");
+        assert_eq!(report.errors.len(), 1, "{report:?}");
+        assert!(report.errors[0].contains("malformed pin"), "{report:?}");
+        assert_eq!(member_scopes(&storage), &names[..6]);
+        assert!(!view_dir(&storage, "z-idle").exists());
+        for name in &names[..6] {
+            assert!(view_dir(&storage, name).join("data.bin").exists());
+        }
+    }
+
+    #[test]
+    fn v3_budget_keeps_a_family_with_a_live_publication_reservation() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp = fs::canonicalize(temp.path()).unwrap();
+        let storage = temp.join("storage");
+        fs::create_dir_all(&storage).unwrap();
+        let root = bound_root(&temp, &storage, "live");
+        seed(&storage, &[("idle", "view", Some(&root))]);
+        fill_view_dir(&view_dir(&storage, "idle"));
+        let owner = live_owner();
+        with_registry(&storage, |tx| {
+            // Even a zero-byte live reservation is an in-flight publisher.
+            tx.execute("INSERT INTO reservations(owner_pid,owner_start,state,reserved_bytes,charge_bytes) VALUES(?1,?2,'reserved',0,0)",
+                rusqlite::params![owner.pid, owner.start_time])?;
+            Ok(())
+        });
+        let bounds = V3Bounds {
+            soft_bytes: 0,
+            ..V3Bounds::PASS
+        };
+        let report = idle_pass(&storage, bounds);
+        assert_eq!(report.removed_roots, 0);
+        assert_eq!(report.examined, 0);
+        assert_eq!(
+            report.skipped_families,
+            [format!("blobs/v3/{FAMILY}: publication_active")]
+        );
+        assert_eq!(member_scopes(&storage), ["idle"]);
+        assert!(view_dir(&storage, "idle").join("data.bin").exists());
+        with_registry(&storage, |tx| {
+            tx.execute(
+                "UPDATE reservations SET state='released' WHERE state='reserved'",
+                [],
+            )?;
+            Ok(())
+        });
+        assert_eq!(idle_pass(&storage, bounds).removed_roots, 1);
+    }
+
+    #[test]
+    fn v3_budget_resumes_past_a_window_of_held_members() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp = fs::canonicalize(temp.path()).unwrap();
+        let storage = temp.join("storage");
+        fs::create_dir_all(&storage).unwrap();
+        let root = bound_root(&temp, &storage, "live");
+        seed(
+            &storage,
+            &[
+                ("a-pin", "view", Some(&root)),
+                ("b-pin", "view", Some(&root)),
+                ("z-idle", "view", Some(&root)),
+            ],
+        );
+        for name in ["a-pin", "b-pin", "z-idle"] {
+            fill_view_dir(&view_dir(&storage, name));
+        }
+        for name in ["a-pin", "b-pin"] {
+            write_pin(&view_dir(&storage, name), "g1", live_owner());
+        }
+        with_registry(&storage, |tx| {
+            tx.execute("UPDATE members SET last_bind_ms=0", [])?;
+            Ok(())
+        });
+        let bounds = V3Bounds {
+            soft_bytes: 0,
+            members: 2,
+            ..V3Bounds::PASS
+        };
+        let first = idle_pass(&storage, bounds);
+        assert_eq!(first.examined, 2);
+        assert_eq!(first.removed_roots, 0);
+        assert!(first.stopped_early);
+        let next = idle_pass(&storage, bounds);
+        assert_eq!(next.removed_roots, 1, "{next:?}");
+        assert_eq!(member_scopes(&storage), ["a-pin", "b-pin"]);
     }
 
     #[test]
@@ -8903,6 +14009,62 @@ mod v3_collector_tests {
         );
     }
 
+    /// With `storage.cache_dir` set, v3 family stores are under the cache
+    /// root and root bindings under the durable root. The collector must
+    /// read each where it lives, and keep its cursors durable.
+    #[test]
+    fn v3_collector_reads_families_on_the_cache_root_and_bindings_on_the_durable_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp = fs::canonicalize(temp.path()).unwrap();
+        let durable = temp.join("storage");
+        let cache_parent = temp.join("cache-volume");
+        fs::create_dir_all(&cache_parent).unwrap();
+        let mut config = crate::config::Config {
+            storage_dir: Some(durable.clone()),
+            cache_dir: Some(cache_parent),
+            ..Default::default()
+        };
+        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        let cache = crate::root_cache::cache_root(&config);
+        let root = bound_root(&temp, &durable, "eligible");
+        seed_with_durable(
+            &cache,
+            Some(&durable),
+            &[("eligible", "view", Some(root.as_path()))],
+        );
+        with_registry(&cache, |tx| {
+            tx.execute("UPDATE members SET last_bind_ms=0", [])?;
+            Ok(())
+        });
+        fill_view_dir(&view_dir(&cache, "eligible"));
+        fs::remove_dir(&root).unwrap();
+        let paths = StoragePaths::new(durable.clone(), cache.clone());
+
+        assert_eq!(crate::views::registry::MISSING_ROOT_SWEEPS, 2);
+        for _ in 0..2 {
+            let mut report = SweepReport::default();
+            collect_one_v3_family(&paths, &|| false, &mut report, V3Bounds::PASS).unwrap();
+            assert!(report.errors.is_empty(), "{report:?}");
+        }
+        assert!(member_scopes(&cache).is_empty(), "the due member was kept");
+        assert!(!view_dir(&cache, "eligible").exists());
+        assert!(
+            !durable.join("blobs").exists(),
+            "the collector created v3 data on the durable root"
+        );
+        assert!(
+            !cache.join("retention").exists(),
+            "the collector wrote its cursors on the cache root"
+        );
+        let cursors = cursor_root(&paths).unwrap();
+        assert!(cursors.starts_with(durable.join("retention/cursors")));
+        assert!(cursors.join("families-v3.json").exists());
+        assert!(cursors
+            .join("v3-members")
+            .join(format!("{FAMILY}.json"))
+            .exists());
+    }
+
     #[test]
     fn v3_eviction_interrupted_after_its_evicting_commit_is_finished_next_pass() {
         let temp = tempfile::tempdir().unwrap();
@@ -8929,7 +14091,12 @@ mod v3_collector_tests {
             );
             let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut report = SweepReport::default();
-                let _ = collect_one_v3_family(&storage, &|| false, &mut report, V3Bounds::PASS);
+                let _ = collect_one_v3_family(
+                    &StoragePaths::same(&storage),
+                    &|| false,
+                    &mut report,
+                    V3Bounds::PASS,
+                );
             }));
             assert!(crashed.is_err());
         }
@@ -8995,7 +14162,13 @@ mod v3_collector_tests {
             passes += 1;
             assert!(passes <= 4, "z-target was never collected");
             let mut report = SweepReport::default();
-            collect_one_v3_family(&storage, &|| false, &mut report, bounds).unwrap();
+            collect_one_v3_family(
+                &StoragePaths::same(&storage),
+                &|| false,
+                &mut report,
+                bounds,
+            )
+            .unwrap();
             assert!(report.errors.is_empty(), "{report:?}");
         }
         assert_eq!(member_scopes(&storage), ["p1", "p2", "p3"]);
@@ -9035,7 +14208,7 @@ mod v3_collector_tests {
         let started = Instant::now();
         let mut report = SweepReport::default();
         let result = collect_one_v3_family(
-            &storage,
+            &StoragePaths::same(&storage),
             &|| false,
             &mut report,
             V3Bounds {
@@ -9095,8 +14268,13 @@ mod v3_collector_tests {
                 budget,
                 ..V3Bounds::PASS
             };
-            let result = collect_one_v3_family(&pass_storage, &|| false, &mut report, bounds)
-                .map_err(|error| error.to_string());
+            let result = collect_one_v3_family(
+                &StoragePaths::same(&pass_storage),
+                &|| false,
+                &mut report,
+                bounds,
+            )
+            .map_err(|error| error.to_string());
             let _ = sender.send((result, report, started.elapsed()));
         });
         let (result, report, elapsed) = receiver
@@ -9256,14 +14434,104 @@ mod v3_collector_tests {
         }
     }
 
-    /// Every path this build runs for ordinary users, with views off and on,
-    /// leaves a storage root that v0.60.0 prepared without any v3 file and
-    /// with its reader floor unchanged: configure, the deferred configure
-    /// work, an enforcement pass, two retention passes (which include the v3
-    /// collector) and both modes of `aft cache prune-legacy`.
+    #[test]
+    fn v3_first_registration_and_lock_raise_floor_before_namespace() {
+        use crate::persisted_format::PersistedStore;
+
+        for entry in ["registration", "lock", "deadline-lock"] {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = fs::canonicalize(temp.path()).unwrap();
+            fs::write(storage.join("reader-floor.json"), V0_60_0_FLOOR).unwrap();
+            let boundaries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = Arc::clone(&boundaries);
+            let root = storage.clone();
+            let _hook = observe_test_hook(
+                &storage,
+                Arc::new(move |step| {
+                    if step == "v3-floor-raising" {
+                        crate::durability::take();
+                    } else if step.starts_with("v3-floor-raised:")
+                        && observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+                    {
+                        assert!(
+                            !root.join("blobs/v3").exists(),
+                            "{entry}: namespace created before the first durable floor boundary"
+                        );
+                        let floor = crate::reader_floor::read(&root).unwrap().unwrap();
+                        for domain in [
+                            PersistedStore::ViewsV3Registry,
+                            PersistedStore::ViewsV3Store,
+                        ] {
+                            assert!(floor.get(domain).is_some_and(|version| version >= 1));
+                        }
+                        #[cfg(unix)]
+                        assert!(crate::durability::take().contains(&(
+                            crate::durability::EventKind::DirectorySync,
+                            root.clone(),
+                        )));
+                    }
+                }),
+            );
+            // Registration must be safe even when no semantic or callgraph
+            // publisher has won the race to raise the floor first.
+            match entry {
+                "registration" => {
+                    crate::views::base_refs::with_base_barrier(&storage, FAMILY, |_| Ok(()))
+                        .unwrap();
+                }
+                "lock" => drop(ReservationLock::acquire(&storage).unwrap()),
+                "deadline-lock" => {
+                    drop(ReservationLock::acquire_until(&storage, Instant::now()).unwrap());
+                }
+                _ => unreachable!(),
+            }
+            assert!(boundaries.load(std::sync::atomic::Ordering::SeqCst) > 0);
+            assert!(storage.join("blobs/v3").is_dir());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v3_first_lock_sync_failure_leaves_no_namespace_and_retry_must_sync() {
+        for timed in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = fs::canonicalize(temp.path()).unwrap();
+            fs::write(storage.join("reader-floor.json"), V0_60_0_FLOOR).unwrap();
+            let acquire = || {
+                if timed {
+                    ReservationLock::acquire_until(&storage, Instant::now())
+                } else {
+                    ReservationLock::acquire(&storage)
+                }
+            };
+            // The first failure leaves a replaced but unsynced floor. A retry
+            // must not mistake its covering versions for a durability proof.
+            for _ in 0..2 {
+                crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| {
+                    *slot.borrow_mut() = Some(storage.clone());
+                });
+                assert!(
+                    acquire().is_err(),
+                    "floor sync failure must refuse the lock"
+                );
+                assert!(!storage.join("blobs/v3").exists());
+                assert!(crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| slot.borrow().is_none()));
+            }
+            crate::durability::take();
+            let _lock = acquire().unwrap();
+            assert!(crate::durability::take()
+                .contains(&(crate::durability::EventKind::DirectorySync, storage.clone(),)));
+            assert!(storage.join("blobs/v3/reservations.lock").is_file());
+        }
+    }
+
+    /// Views-off configure must not promote a v0.60.0 root to v3. Views-on
+    /// configure may promote it, but both v3 floor domains must be durable before
+    /// its first v3 publication. Maintenance must preserve that boundary.
     #[test]
     fn no_production_path_writes_v3_over_a_v0_60_0_floor() {
         use crate::migration::prune_legacy::{prune_legacy, PruneOptions};
+        use crate::persisted_format::PersistedStore;
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let temp = tempfile::tempdir().unwrap();
         let temp = fs::canonicalize(temp.path()).unwrap();
@@ -9292,6 +14560,63 @@ mod v3_collector_tests {
             assert!(output.status.success(), "git {args:?}: {output:?}");
         }
         fs::write(storage.join("reader-floor.json"), V0_60_0_FLOOR).unwrap();
+        let stores = |text: &str| -> BTreeMap<String, u64> {
+            serde_json::from_value(
+                serde_json::from_str::<serde_json::Value>(text).unwrap()["stores"].take(),
+            )
+            .unwrap()
+        };
+        let before = stores(V0_60_0_FLOOR);
+        let check_baseline = |after: &BTreeMap<String, u64>| {
+            for (name, version) in after {
+                let store = PersistedStore::from_name(name)
+                    .unwrap_or_else(|| panic!("unknown store {name} in the floor: {after:?}"));
+                assert!(
+                    before.get(name) == Some(version) || u64::from(store.written()) == *version,
+                    "{name} at {version} is neither v0.60.0's value nor this build's: {after:?}"
+                );
+            }
+            for name in before.keys() {
+                assert!(after.contains_key(name), "{name} left the floor: {after:?}");
+            }
+        };
+        let publications = Arc::new(Mutex::new(Vec::new()));
+        let publication_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::clone(&publication_calls);
+        let observed = Arc::clone(&publications);
+        let observed_storage = storage.clone();
+        let _hook = observe_test_hook(
+            &storage,
+            Arc::new(move |step| {
+                if step == "v3-floor-raising" {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // Isolate syncs performed by this floor raise, not earlier
+                    // configure work on the same worker thread.
+                    crate::durability::take();
+                    return;
+                }
+                let Some(versions) = step.strip_prefix("v3-floor-raised:") else {
+                    return;
+                };
+                let (registry, store) = versions.split_once(':').unwrap();
+                observed.lock().unwrap().push((
+                    crate::reader_floor::read(&observed_storage)
+                        .unwrap()
+                        .unwrap(),
+                    observed_storage.join("blobs/v3").exists(),
+                    crate::durability::take(),
+                    (
+                        registry.parse::<u64>().unwrap(),
+                        store.parse::<u64>().unwrap(),
+                    ),
+                    crate::file_identity::metadata(&crate::reader_floor::floor_path(
+                        &observed_storage,
+                    ))
+                    .unwrap()
+                    .1,
+                ));
+            }),
+        );
         let embedder = fixed_vector_embedder();
         for views in [false, true] {
             let ctx = crate::context::AppContext::new(
@@ -9327,7 +14652,7 @@ mod v3_collector_tests {
             assert!(response.success, "{}", response.data);
             crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
             if views {
-                // The checkout's semantic runtime owns the v2 family registry;
+                // The checkout's semantic runtime owns the v3 family registry;
                 // wait for it to load as the binary's drain loop would.
                 let deadline = Instant::now() + Duration::from_secs(120);
                 let registry = loop {
@@ -9343,10 +14668,31 @@ mod v3_collector_tests {
                     std::thread::sleep(Duration::from_millis(50));
                 };
                 crate::views::eviction::enforce(&registry, Default::default()).unwrap();
+            } else {
+                assert!(!storage.join("blobs/v3").exists());
+                assert!(publications.lock().unwrap().is_empty());
+                assert_eq!(
+                    publication_calls.load(std::sync::atomic::Ordering::SeqCst),
+                    0
+                );
+                let after = stores(&fs::read_to_string(storage.join("reader-floor.json")).unwrap());
+                check_baseline(&after);
+                for v3 in [
+                    PersistedStore::ViewsV3Registry,
+                    PersistedStore::ViewsV3Store,
+                ] {
+                    assert_eq!(after.get(v3.name()), before.get(v3.name()));
+                    assert!(!after.contains_key(v3.name()), "views-off promoted {v3:?}");
+                }
             }
         }
         for _ in 0..2 {
-            let report = run_pass_with_budget(&storage, &|| false, &Instant::now, PASS_BUDGET);
+            let report = run_pass_with_budget(
+                &StoragePaths::same(&storage),
+                &|| false,
+                &Instant::now,
+                PASS_BUDGET,
+            );
             assert!(report.timings_ms.contains_key("blobs_v3"), "{report:?}");
         }
         for yes in [false, true] {
@@ -9364,39 +14710,66 @@ mod v3_collector_tests {
             .unwrap();
             assert!(!out.is_empty());
         }
-        assert!(storage.join("blobs/v2").exists(), "views-on never ran");
-        assert!(!storage.join("blobs/v3").exists());
-        // No production path may write a v3 floor key. Every other store in
-        // the floor is either as v0.60.0 left it or at the version this build
-        // writes for it (`PersistedStore::written`, the value its startup
-        // baseline raises to), so version bumps of other stores do not fail
-        // this test while a stray or invented key does.
-        use crate::persisted_format::PersistedStore;
-        let stores = |text: &str| -> BTreeMap<String, u64> {
-            serde_json::from_value(
-                serde_json::from_str::<serde_json::Value>(text).unwrap()["stores"].take(),
-            )
-            .unwrap()
-        };
-        let before = stores(V0_60_0_FLOOR);
+        assert!(storage.join("blobs/v3").exists(), "views-on never ran");
+        // Non-v3 stores may advance to this build's baseline, but publication
+        // must never invent a store key or remove an older reader requirement.
         let floor = fs::read_to_string(storage.join("reader-floor.json")).unwrap();
         let after = stores(&floor);
+        check_baseline(&after);
+        let publications = publications.lock().unwrap();
+        let (_, v3_existed, _, _, _) = publications.first().expect("v3 publication observed");
+        assert!(
+            !v3_existed,
+            "v3 data existed before the first floor boundary"
+        );
+        #[cfg(unix)]
+        let mut durable_floor = None;
+        for (published_floor, _, syncs, (registry, store), identity) in publications.iter() {
+            for (domain, required) in [
+                (PersistedStore::ViewsV3Registry, registry),
+                (PersistedStore::ViewsV3Store, store),
+            ] {
+                assert!(
+                    published_floor
+                        .get(domain)
+                        .is_some_and(|version| version >= *required),
+                    "{domain:?} must cover {required} before publication: {published_floor:?}"
+                );
+            }
+            #[cfg(unix)]
+            {
+                let proof = (*identity, published_floor.clone());
+                // The first boundary, and every replaced floor entry, must
+                // perform a real sync. Later boundaries may reuse that exact
+                // entry's observed successful sync, never just its versions.
+                if syncs.contains(&(crate::durability::EventKind::DirectorySync, storage.clone())) {
+                    durable_floor = Some(proof.clone());
+                }
+                assert_eq!(
+                    durable_floor.as_ref(),
+                    Some(&proof),
+                    "the current reader floor must be durable before publication: {syncs:?}"
+                );
+            }
+            #[cfg(not(unix))]
+            let _ = (syncs, identity);
+        }
+        for required_registry in [
+            crate::blob_store::v3::REGISTRY_BASE_REFS_VERSION,
+            crate::blob_store::v3::REGISTRY_VERIFICATION_VERSION,
+        ] {
+            assert!(
+                publications
+                    .iter()
+                    .any(|(_, _, _, (registry, _), _)| *registry == u64::from(required_registry)),
+                "the production path must exercise registry schema {required_registry}"
+            );
+        }
         for v3 in [
             PersistedStore::ViewsV3Registry,
             PersistedStore::ViewsV3Store,
         ] {
-            assert!(!after.contains_key(v3.name()), "v3 floor key: {floor}");
-        }
-        for (name, version) in &after {
-            let store = PersistedStore::from_name(name)
-                .unwrap_or_else(|| panic!("unknown store {name} in the floor: {floor}"));
-            assert!(
-                before.get(name) == Some(version) || u64::from(store.written()) == *version,
-                "{name} at {version} is neither v0.60.0's value nor this build's: {floor}"
-            );
-        }
-        for name in before.keys() {
-            assert!(after.contains_key(name), "{name} left the floor: {floor}");
+            assert_eq!(after.get(v3.name()), Some(&u64::from(v3.written())));
         }
     }
 
@@ -9421,5 +14794,79 @@ mod v3_collector_tests {
             .exists());
         assert!(!storage.join("blobs/v3/reservations.lock").exists());
         assert!(member.join("data.bin").exists());
+    }
+}
+
+#[cfg(test)]
+mod v3_base_reference_collector_tests {
+    use super::*;
+    use crate::views::base_refs::tests::{
+        bind, plane_has, publish_test_base, published, put_rows, refs, worker_delta, FAMILY,
+    };
+    use crate::views::base_refs::with_base_barrier;
+
+    fn pass(storage: &Path) -> SweepReport {
+        let mut report = SweepReport::default();
+        collect_one_v3_family(
+            &StoragePaths::same(storage),
+            &|| false,
+            &mut report,
+            V3Bounds::PASS,
+        )
+        .unwrap();
+        assert!(report.errors.is_empty(), "{report:?}");
+        report
+    }
+
+    fn registered(storage: &Path, scope: &str) -> bool {
+        crate::blob_store::v3::LedgerReader::open_existing(storage, FAMILY)
+            .unwrap()
+            .member(scope)
+            .unwrap()
+            .is_some()
+    }
+
+    #[test]
+    fn the_collector_keeps_a_referenced_base_and_reclaims_it_two_passes_after_its_worker_goes() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let storage = tempfile::tempdir().unwrap();
+        let (identity, generation) = publish_test_base(storage.path(), &[("src/a.rs", b"alpha")]);
+        put_rows(storage.path(), &[b"new"]);
+        let (_, composed) = published(
+            bind(
+                storage.path(),
+                "worker-a",
+                &identity,
+                &generation,
+                worker_delta(&identity, &generation, b"new"),
+                None,
+            )
+            .unwrap(),
+        );
+        drop(composed);
+        for _ in 0..3 {
+            pass(storage.path());
+            assert!(registered(storage.path(), &identity.scope));
+            assert!(plane_has(storage.path(), b"alpha"));
+        }
+        // The worker is deregistered: its rows go with its member row.
+        with_base_barrier(storage.path(), FAMILY, |tx| {
+            tx.execute(
+                "UPDATE members SET state='evicting' WHERE scope='worker-a'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        pass(storage.path());
+        assert!(!registered(storage.path(), "worker-a"));
+        assert!(refs(storage.path()).is_empty());
+        // That same pass counted the base once; the next one reclaims it.
+        assert!(registered(storage.path(), &identity.scope));
+        pass(storage.path());
+        assert!(!registered(storage.path(), &identity.scope));
+        pass(storage.path());
+        assert!(!plane_has(storage.path(), b"alpha"));
+        assert!(!storage.path().join("views/v3").exists());
     }
 }

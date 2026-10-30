@@ -774,6 +774,7 @@ mod tests {
                 1_000,
                 Duration::from_secs(5),
             )
+            .unwrap()
             .matches
             .into_iter()
             .map(|grep_match| grep_match.file)
@@ -1021,19 +1022,29 @@ mod tests {
             .unwrap();
         }
 
+        // The work limit is what cuts each pass short here, so the time
+        // limits stay out of the way: the check's own budgets are wide, and the
+        // first search waits for the borrowed index to finish loading on its
+        // background thread. Without that wait a slow runner answers the first
+        // search from a degraded empty index, which never runs the disk check.
         let pass = || {
-            with_budgets_for_test(Duration::from_secs(5), Duration::from_secs(5), || {
-                with_work_limit_for_test(2, || {
-                    let before = reindexes_for_test();
-                    let response = prose_search(&ctx, &root);
-                    (response, reindexes_for_test() - before)
-                })
-            })
+            super::super::with_first_search_index_load_wait_budget_for_test(
+                Duration::from_secs(60),
+                || {
+                    with_budgets_for_test(Duration::from_secs(60), Duration::from_secs(60), || {
+                        with_work_limit_for_test(2, || {
+                            let before = reindexes_for_test();
+                            let response = prose_search(&ctx, &root);
+                            (response, reindexes_for_test() - before)
+                        })
+                    })
+                },
+            )
         };
         let (first, first_reads) = pass();
         let (second, second_reads) = pass();
 
-        assert_eq!(first_reads, 2);
+        assert_eq!(first_reads, 2, "{first:#?}");
         assert_eq!(first["complete"], false, "{first:#?}");
         assert_eq!(first["saved_index_check"]["added"], 4);
         assert_eq!(first["saved_index_check"]["reread"], 2);
@@ -1041,7 +1052,7 @@ mod tests {
 
         assert_eq!(
             second_reads, 2,
-            "the second pass reads only what the first left"
+            "the second pass reads only what the first left: {second:#?}"
         );
         assert_eq!(second["saved_index_check"]["complete"], true, "{second:#?}");
         assert_eq!(second["saved_index_check"]["reused"], false);

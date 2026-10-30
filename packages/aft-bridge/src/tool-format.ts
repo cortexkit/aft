@@ -68,8 +68,8 @@ export function formatBridgeErrorMessage(
       const target = symbol ? `multiple symbols named "${symbol}"` : message.replace(/[.!?]+$/, "");
       const action =
         code === "ambiguous_target"
-          ? "Pass toFile to disambiguate"
-          : "Try one of these files for toFile";
+          ? "Pass toPath to disambiguate"
+          : "Try one of these files for toPath";
       return `${command}: ${code} — ${target}. ${action}:\n${candidates
         .map((candidate) => `  - ${candidate}`)
         .join("\n")}`;

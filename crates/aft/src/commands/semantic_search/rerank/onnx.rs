@@ -232,6 +232,7 @@ pub(crate) struct OnnxReranker {
     fingerprint: RerankFingerprint,
     shared: Arc<Shared>,
     loader: ScorerLoader,
+    keep_alive: std::sync::Weak<OnnxReranker>,
 }
 
 impl OnnxReranker {
@@ -243,14 +244,28 @@ impl OnnxReranker {
                 busy: AtomicBool::new(false),
             }),
             loader,
+            keep_alive: std::sync::Weak::new(),
         }
     }
 
-    fn for_model(model: &'static AllowedModel) -> Self {
+    fn for_model(
+        model: &'static AllowedModel,
+        cache_dir: Option<PathBuf>,
+        lease: Option<std::sync::Weak<crate::root_cache::CacheLease>>,
+    ) -> Self {
         Self::with_loader(
             fingerprint_for(model),
             Arc::new(move || {
-                let files = provision_model_files(model)?;
+                let _lease = match lease.as_ref() {
+                    Some(lease) => Some(lease.upgrade().ok_or_else(|| {
+                        "cache_dir_unavailable: cache context retired".to_string()
+                    })?),
+                    None => None,
+                };
+                let files = match cache_dir.as_deref() {
+                    Some(path) => provision_model_files_in(model, path)?,
+                    None => provision_model_files(model)?,
+                };
                 let scorer = OnnxPairScorer::load(model.name, &files, rerank_intra_threads())?;
                 Ok(Box::new(scorer) as Box<dyn PairScorer>)
             }),
@@ -298,9 +313,10 @@ impl OnnxReranker {
         drop(state);
         let shared = self.shared.clone();
         let loader = self.loader.clone();
+        let keep_alive = self.keep_alive.upgrade();
         let spawned = std::thread::Builder::new()
             .name("aft-rerank-onnx".to_string())
-            .spawn(move || worker_main(shared, loader));
+            .spawn(move || worker_main(shared, loader, keep_alive));
         if let Err(error) = spawned {
             let reason = format!("worker not started: {error}");
             *self
@@ -317,7 +333,7 @@ impl OnnxReranker {
     }
 }
 
-fn worker_main(shared: Arc<Shared>, loader: ScorerLoader) {
+fn worker_main(shared: Arc<Shared>, loader: ScorerLoader, keep_alive: Option<Arc<OnnxReranker>>) {
     let mut scorer = match loader() {
         Ok(scorer) => scorer,
         Err(reason) => {
@@ -337,7 +353,14 @@ fn worker_main(shared: Arc<Shared>, loader: ScorerLoader) {
         .state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = WorkerState::Ready(sender);
+    let weak = Arc::downgrade(&shared);
+    drop(keep_alive);
+    drop(loader);
+    drop(shared);
     for job in receiver {
+        let Some(shared) = weak.upgrade() else {
+            break;
+        };
         // A request whose caller has already given up is dropped, not computed.
         let result = if Instant::now() >= job.deadline {
             Err(RerankError::Timeout)
@@ -428,22 +451,60 @@ pub(crate) fn fingerprint_for(model: &AllowedModel) -> RerankFingerprint {
     }
 }
 
-/// The process-wide ONNX backend for a configured model name (default when
-/// absent). Cheap and free of I/O: it neither reads, downloads nor loads
-/// anything; the worker does that on first use or on `ensure_loaded`.
+#[cfg(test)]
 pub(crate) fn shared_onnx_reranker(model: Option<&str>) -> Result<Arc<OnnxReranker>, String> {
-    static BACKENDS: OnceLock<Mutex<HashMap<&'static str, Arc<OnnxReranker>>>> = OnceLock::new();
+    shared_onnx_reranker_in(model, None, None)
+}
+
+/// Keep the legacy process-wide model when no cache location is configured.
+/// Configured namespaces share only with the same path and directory identity;
+/// weak entries let their workers retire after the last context stops using them.
+pub(crate) fn shared_onnx_reranker_in(
+    model: Option<&str>,
+    cache_dir: Option<PathBuf>,
+    lease: Option<std::sync::Weak<crate::root_cache::CacheLease>>,
+) -> Result<Arc<OnnxReranker>, String> {
+    static DEFAULT_BACKENDS: OnceLock<Mutex<HashMap<&'static str, Arc<OnnxReranker>>>> =
+        OnceLock::new();
+    type ScopedKey = (&'static str, PathBuf, Option<(u64, u64)>);
+    static SCOPED_BACKENDS: OnceLock<Mutex<HashMap<ScopedKey, std::sync::Weak<OnnxReranker>>>> =
+        OnceLock::new();
     let requested = model.unwrap_or(DEFAULT_MODEL);
     let allowed = find_allowed_model(requested)
         .ok_or_else(|| format!("unsupported rerank model {requested:?}"))?;
-    let mut backends = BACKENDS
+    let make = |cache_dir, lease| {
+        Arc::new_cyclic(|weak| {
+            let mut backend = OnnxReranker::for_model(allowed, cache_dir, lease);
+            backend.keep_alive = weak.clone();
+            backend
+        })
+    };
+    let Some(path) = cache_dir else {
+        let mut backends = DEFAULT_BACKENDS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        return Ok(backends
+            .entry(allowed.name)
+            .or_insert_with(|| make(None, None))
+            .clone());
+    };
+    let identity = lease
+        .as_ref()
+        .and_then(std::sync::Weak::upgrade)
+        .map(|lease| lease.root_key());
+    let mut backends = SCOPED_BACKENDS
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    Ok(backends
-        .entry(allowed.name)
-        .or_insert_with(|| Arc::new(OnnxReranker::for_model(allowed)))
-        .clone())
+    backends.retain(|_, backend| backend.strong_count() > 0);
+    let key = (allowed.name, path.clone(), identity);
+    if let Some(backend) = backends.get(&key).and_then(std::sync::Weak::upgrade) {
+        return Ok(backend);
+    }
+    let backend = make(Some(path), lease);
+    backends.insert(key, Arc::downgrade(&backend));
+    Ok(backend)
 }
 
 /// Local paths of one model's files.
@@ -468,6 +529,18 @@ pub(crate) fn provision_model_files_in(
     model: &AllowedModel,
     cache_dir: &Path,
 ) -> Result<ModelFiles, String> {
+    #[cfg(test)]
+    if let Some((name, observed)) = PROVISION_PROBE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+    {
+        if *name == model.name {
+            observed.lock().unwrap().push(cache_dir.to_path_buf());
+            return Err("provision path observed".into());
+        }
+    }
     super::note_io();
     let snapshot = pinned_snapshot_dir(cache_dir, model);
     let local = files_in_snapshot(&snapshot, model);
@@ -483,6 +556,12 @@ pub(crate) fn provision_model_files_in(
     }
 
     use hf_hub::api::sync::ApiBuilder;
+    // The context's cache lease only proves the cache context is alive, not
+    // that `cache_dir` still names its enrolled root. hf-hub creates missing
+    // folders with a recursive mkdir, so re-prove the root right before the
+    // hand-off; a vanished cache volume refuses instead of downloading onto
+    // the main disk.
+    crate::root_cache::prepare_third_party_cache_dir(cache_dir)?;
     crate::slog_info!(
         "downloading rerank model {} ({}@{}) to {}",
         model.name,
@@ -506,6 +585,37 @@ pub(crate) fn provision_model_files_in(
     }
     verify_pinned_files(&snapshot, model)?;
     Ok(local)
+}
+
+#[cfg(test)]
+type ProvisionProbe = (&'static str, Arc<Mutex<Vec<PathBuf>>>);
+#[cfg(test)]
+static PROVISION_PROBE: OnceLock<Mutex<Option<ProvisionProbe>>> = OnceLock::new();
+#[cfg(test)]
+pub(super) fn with_provision_probe<T>(
+    model: &'static str,
+    work: impl FnOnce() -> T,
+) -> (T, Vec<PathBuf>) {
+    struct Reset(Option<ProvisionProbe>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            *PROVISION_PROBE
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = self.0.take();
+        }
+    }
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let _reset = Reset(
+        PROVISION_PROBE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace((model, Arc::clone(&observed))),
+    );
+    let result = work();
+    let paths = observed.lock().unwrap().clone();
+    (result, paths)
 }
 
 fn pinned_files(model: &AllowedModel) -> Vec<PinnedFile> {

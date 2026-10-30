@@ -979,7 +979,7 @@ fn spawn_cached_path_refresh() {
         state.cache_path.clone()
     };
 
-    let Ok(executable) = std::env::current_exe() else {
+    let Ok(executable) = crate::pinned_executable::path() else {
         return;
     };
     let mut command = Command::new(executable);

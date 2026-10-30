@@ -38,6 +38,34 @@ env:
   AFT_COST_GATE_RESULTS_DIR: ${{ github.workspace }}/cost-gate-results
 
 jobs:
+  stress-tests:
+    name: Full-volume test workloads (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      AFT_STRESS: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: nightly-stress
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Run original stress volumes
+        shell: bash
+        run: >-
+          cargo test -p agent-file-tools --lib --
+          views_incremental_random_sequences_equal_full_rebuild
+          tool_result_fixtures_release_descriptors
+          bash_changed_files_flush_native_no_false_complete_during_50k_activity
+          views_shared_checkout_presence_reads_no_payloads
+          repeated_worktree_edits_with_periodic_backend_failures_never_repeat_stored_texts
+          repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admission
+
   cost-gate:
     name: OSS index cost gate
     runs-on: ubuntu-latest

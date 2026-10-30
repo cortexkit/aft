@@ -23,6 +23,12 @@ const MAX_NAMED_CHECKPOINTS_PER_SESSION: usize = 20;
 const NAMED_CHECKPOINT_RETENTION_DAYS: u64 = 14;
 const NAMED_CHECKPOINT_RETENTION_SECS: u64 = NAMED_CHECKPOINT_RETENTION_DAYS * 24 * 60 * 60;
 const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+const IMPORTED_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+#[cfg(test)]
+#[path = "agent_data/ordinary_checkpoint_format_tests.rs"]
+mod ordinary_format_tests;
+#[path = "agent_data/checkpoint.rs"]
+mod portable;
 const UNBOUND_HARNESS_SEGMENT: &str = "unbound";
 
 static CHECKPOINT_MAINTENANCE_KEYS: LazyLock<Mutex<HashSet<(PathBuf, String)>>> =
@@ -84,6 +90,7 @@ pub struct CheckpointPurge {
 /// A stored checkpoint: a snapshot of multiple file contents and metadata.
 #[derive(Debug, Clone)]
 struct Checkpoint {
+    imported_guards: HashMap<PathBuf, crate::agent_data::ImportedGuard>,
     name: String,
     file_contents: HashMap<PathBuf, CheckpointFile>,
     pending_purge: Vec<DiskCheckpointFileMeta>,
@@ -111,6 +118,8 @@ struct CheckpointFile {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct DiskCheckpointMeta {
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    imported_guards: HashMap<PathBuf, crate::agent_data::ImportedGuard>,
     schema_version: u32,
     session_id: String,
     name: String,
@@ -291,6 +300,7 @@ fn checkpoint_mode(_metadata: &fs::Metadata) -> Option<u32> {
 /// change that depends on them.
 #[derive(Debug)]
 pub struct CheckpointStore {
+    portable_registry: Option<Arc<dyn crate::agent_data::ProjectRegistry>>,
     /// session -> name -> checkpoint, derived from the durable disk tree.
     checkpoints: HashMap<String, HashMap<String, Checkpoint>>,
     hydrated_checkpoints: Mutex<HashMap<PathBuf, CachedCheckpoint>>,
@@ -482,6 +492,7 @@ impl CheckpointStore {
 
     fn with_lock_path(lock_path: PathBuf, lock_timeout: Duration) -> Self {
         CheckpointStore {
+            portable_registry: None,
             checkpoints: HashMap::new(),
             hydrated_checkpoints: Mutex::new(HashMap::new()),
             lock_path,
@@ -541,6 +552,7 @@ impl CheckpointStore {
     /// If `files` is empty, snapshots all tracked files for **that session**
     /// from the BackupStore (other sessions' tracked files are not visible).
     /// Overwrites any existing checkpoint with the same name in this session.
+    /// Incomplete tracked-file discovery fails before replacing that checkpoint.
     ///
     /// Unreadable paths (e.g. deleted since their last edit) are skipped with
     /// a warning instead of failing the whole checkpoint. The paths and their
@@ -596,7 +608,7 @@ impl CheckpointStore {
         self.hydrate_session_locked(session)?;
         let explicit_request = !files.is_empty();
         let file_list = match backup_store {
-            Some(backup_store) if files.is_empty() => backup_store.tracked_files(session),
+            Some(backup_store) if files.is_empty() => backup_store.try_tracked_files(session)?,
             _ => files,
         };
 
@@ -655,6 +667,7 @@ impl CheckpointStore {
         captured_paths.sort();
         let checkpoint = Checkpoint {
             pending_purge: Vec::new(),
+            imported_guards: HashMap::new(),
             name: name.to_string(),
             file_contents,
             created_at,
@@ -703,6 +716,9 @@ impl CheckpointStore {
         let mut paths = checkpoint.file_contents.keys().cloned().collect::<Vec<_>>();
         paths.sort();
 
+        for (path, guard) in &checkpoint.imported_guards {
+            guard.check(path, self.portable_registry.as_deref())?;
+        }
         let unchanged = restore_paths_atomically(checkpoint, &paths)?;
         crate::slog_info!("checkpoint restored: {}", name);
 
@@ -738,6 +754,17 @@ impl CheckpointStore {
                 .ok_or_else(|| AftError::FileNotFound {
                     path: path.display().to_string(),
                 })?;
+        }
+        if !checkpoint.imported_guards.is_empty()
+            && validated_paths.len() != checkpoint.file_contents.len()
+        {
+            return Err(AftError::IoError {
+                path: name.to_string(),
+                message: "imported checkpoint must restore as a complete group".into(),
+            });
+        }
+        for (path, guard) in &checkpoint.imported_guards {
+            guard.check(path, self.portable_registry.as_deref())?;
         }
         let unchanged = restore_paths_atomically(checkpoint, validated_paths)?;
         crate::slog_info!("checkpoint restored: {}", name);
@@ -1351,7 +1378,12 @@ impl CheckpointStore {
         }
 
         let meta = DiskCheckpointMeta {
-            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            schema_version: if checkpoint.imported_guards.is_empty() {
+                CHECKPOINT_SCHEMA_VERSION
+            } else {
+                IMPORTED_CHECKPOINT_SCHEMA_VERSION
+            },
+            imported_guards: checkpoint.imported_guards.clone(),
             session_id: session.to_string(),
             name: checkpoint.name.clone(),
             created_at: checkpoint.created_at,
@@ -1734,7 +1766,10 @@ fn read_checkpoint_from_disk(
             message: format!("failed to parse durable checkpoint metadata: {error}"),
         }
     })?;
-    if meta.schema_version != CHECKPOINT_SCHEMA_VERSION {
+    if !matches!(
+        meta.schema_version,
+        CHECKPOINT_SCHEMA_VERSION | IMPORTED_CHECKPOINT_SCHEMA_VERSION
+    ) {
         return Err(AftError::IoError {
             path: meta_path.display().to_string(),
             message: format!(
@@ -1839,6 +1874,7 @@ fn read_checkpoint_from_disk(
 
     let checkpoint = Checkpoint {
         name: meta.name,
+        imported_guards: meta.imported_guards,
         file_contents,
         pending_purge: meta.pending_purge,
         created_at: meta.created_at,
@@ -1982,12 +2018,16 @@ fn sweep_expired_durable_checkpoints(checkpoints_dir: &Path, now: u64) {
     // A vanished mounted child can make ReadDir::drop panic after closedir
     // returns ENXIO, aborting the daemon. This background sweep must not open
     // checkpoint directories on a different filesystem.
-    let Ok(boundary) = crate::walk_boundary::DeviceBoundary::for_root(checkpoints_dir) else {
-        crate::slog_warn!(
-            "cannot establish filesystem boundary for checkpoint sweep {}",
-            checkpoints_dir.display()
-        );
-        return;
+    let boundary = match crate::walk_boundary::DeviceBoundary::for_root(checkpoints_dir) {
+        Ok(boundary) => boundary,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(_) => {
+            crate::slog_warn!(
+                "cannot establish filesystem boundary for checkpoint sweep {}",
+                checkpoints_dir.display()
+            );
+            return;
+        }
     };
     let mut skipped_foreign_mounts = 0usize;
     let Ok(session_entries) = fs::read_dir(checkpoints_dir) else {
@@ -2908,6 +2948,7 @@ mod tests {
         // process exiting after persistence but before retention eviction.
         let checkpoint = Checkpoint {
             pending_purge: Vec::new(),
+            imported_guards: HashMap::new(),
             name: "checkpoint-20".to_string(),
             file_contents: HashMap::from([(path, checkpoint_file("newest"))]),
             created_at: current_timestamp(),
@@ -2959,6 +3000,33 @@ mod tests {
         assert!(
             victim.exists(),
             "cleanup must not sweep empty dirs outside a `checkpoints` root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_sweep_boundary_missing_root_is_quiet_but_other_errors_warn() {
+        let storage = tempfile::tempdir().unwrap();
+        let missing = storage.path().join("checkpoints");
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            sweep_expired_durable_checkpoints(&missing, 0);
+        });
+        assert!(lines.is_empty(), "{lines:?}");
+
+        let loop_path = storage.path().join("loop");
+        std::os::unix::fs::symlink(&loop_path, &loop_path).unwrap();
+        let error = fs::metadata(&loop_path).unwrap_err();
+        assert_ne!(error.kind(), io::ErrorKind::NotFound);
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            sweep_expired_durable_checkpoints(&loop_path, 0);
+        });
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(
+            lines[0],
+            format!(
+                "WARN cannot establish filesystem boundary for checkpoint sweep {}",
+                loop_path.display()
+            )
         );
     }
 
@@ -3383,6 +3451,7 @@ mod tests {
                 "old".to_string(),
                 Checkpoint {
                     pending_purge: Vec::new(),
+                    imported_guards: HashMap::new(),
                     name: "old".to_string(),
                     file_contents: HashMap::new(),
                     created_at: 1000, // far in the past
@@ -3567,6 +3636,86 @@ mod tests {
         fs::write(&path, "modified").unwrap();
         store.restore(DEFAULT_SESSION_ID, "from_tracked").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "tracked_content");
+    }
+
+    fn assert_incomplete_backup_discovery_preserves_checkpoint(expired: bool) {
+        let storage = tempfile::tempdir().unwrap();
+        let path = storage.path().join("tracked.txt");
+        fs::write(&path, b"restore me").unwrap();
+        let mut backup = BackupStore::new();
+        backup.set_storage_dir(storage.path().join("backup"), 72);
+        backup
+            .snapshot(DEFAULT_SESSION_ID, &path, "before edit")
+            .unwrap();
+        let checkpoint_storage = storage.path().join("checkpoints");
+        let mut checkpoints = fresh_checkpoint_store(&checkpoint_storage);
+        checkpoints
+            .create(DEFAULT_SESSION_ID, "useful", vec![path.clone()], &backup)
+            .unwrap();
+        fs::write(&path, b"changed").unwrap();
+        backup.release_memory();
+        if expired {
+            backup.expire_discovery_for_tests();
+        } else {
+            backup.set_discovery_entry_limit_for_tests(0);
+        }
+        let error = checkpoints
+            .create(DEFAULT_SESSION_ID, "useful", vec![], &backup)
+            .unwrap_err();
+        assert!(matches!(error, AftError::IoError { .. }), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains(if expired { "deadline" } else { "entry limit" }),
+            "{error}"
+        );
+        drop(checkpoints);
+        let mut restarted = fresh_checkpoint_store(&checkpoint_storage);
+        let restored = restarted.restore(DEFAULT_SESSION_ID, "useful").unwrap();
+        assert_eq!(restored.file_count, 1);
+        assert_eq!(fs::read(&path).unwrap(), b"restore me");
+    }
+
+    #[test]
+    fn backup_checkpoint_discovery_cap_preserves_existing_checkpoint() {
+        assert_incomplete_backup_discovery_preserves_checkpoint(false);
+    }
+
+    #[test]
+    fn backup_checkpoint_discovery_deadline_preserves_existing_checkpoint() {
+        assert_incomplete_backup_discovery_preserves_checkpoint(true);
+    }
+
+    #[test]
+    fn backup_memory_checkpoints_find_released_and_restarted_backup_paths() {
+        let storage = tempfile::tempdir().unwrap();
+        let path = storage.path().join("binary.bin");
+        let bytes = [0, 255, 128, b'\r', b'\n'];
+        for restart in [false, true] {
+            fs::write(&path, bytes).unwrap();
+            let backup_storage = storage.path().join("backup");
+            let mut backup = BackupStore::new();
+            backup.set_storage_dir(backup_storage.clone(), 72);
+            backup
+                .snapshot(DEFAULT_SESSION_ID, &path, "tracked")
+                .unwrap();
+            backup.release_memory();
+            if restart {
+                backup = BackupStore::new();
+                backup.set_storage_dir(backup_storage, 72);
+            }
+            let checkpoint_storage = storage.path().join(format!("checkpoint-{restart}"));
+            let mut checkpoints = fresh_checkpoint_store(&checkpoint_storage);
+            let info = checkpoints
+                .create(DEFAULT_SESSION_ID, "tracked", vec![], &backup)
+                .unwrap();
+            assert_eq!(info.file_count, 1);
+            fs::write(&path, b"changed").unwrap();
+            drop(checkpoints);
+            let mut restarted = fresh_checkpoint_store(&checkpoint_storage);
+            restarted.restore(DEFAULT_SESSION_ID, "tracked").unwrap();
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
     }
 
     #[test]
@@ -3769,8 +3918,11 @@ mod tests {
             panic!("regular capture must create a regular checkpoint");
         };
         assert_eq!(bytes.as_ref(), b"original bytes");
-        assert_eq!(history[0].content_bytes.as_ref(), b"original bytes");
-        assert!(Arc::ptr_eq(&bytes, &history[0].content_bytes));
+        assert_eq!(
+            history[0].content_bytes().unwrap().as_ref(),
+            b"original bytes"
+        );
+        assert!(Arc::ptr_eq(&bytes, &history[0].content_bytes().unwrap()));
         assert_eq!(crate::backup::capture_read_count(&path), 1);
     }
 
@@ -3798,8 +3950,11 @@ mod tests {
             panic!("regular capture must create a regular checkpoint");
         };
         assert_eq!(bytes.as_ref(), b"fresh disk truth");
-        assert_eq!(history[0].content_bytes.as_ref(), b"fresh disk truth");
-        assert!(Arc::ptr_eq(&bytes, &history[0].content_bytes));
+        assert_eq!(
+            history[0].content_bytes().unwrap().as_ref(),
+            b"fresh disk truth"
+        );
+        assert!(Arc::ptr_eq(&bytes, &history[0].content_bytes().unwrap()));
         assert_eq!(crate::backup::capture_read_count(&path), 2);
     }
 
@@ -3820,6 +3975,7 @@ mod tests {
 
         let checkpoint = Checkpoint {
             pending_purge: Vec::new(),
+            imported_guards: HashMap::new(),
             name: "dir-cleanup".to_string(),
             file_contents: HashMap::from([
                 (path_a.clone(), checkpoint_file("checkpoint-a")),

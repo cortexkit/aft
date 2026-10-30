@@ -1,0 +1,9 @@
+{
+  "harnesses": {
+    "future": {
+      "storage": {
+        "cachedir": "/aft-cache"
+      }
+    }
+  }
+}

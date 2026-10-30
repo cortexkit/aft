@@ -1,0 +1,12 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/semantic_index.rs"
+  ],
+  "note": "audit u21b part 2: summary budget migration; ranking rows unchanged Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}

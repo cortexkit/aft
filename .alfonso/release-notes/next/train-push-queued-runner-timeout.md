@@ -1,1 +1,0 @@
-- Pushes report queued CI jobs without runners and their labels after the 10-minute limit once active jobs finish (reported by CKTUI).

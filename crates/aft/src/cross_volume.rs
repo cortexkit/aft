@@ -48,6 +48,9 @@ fn cross_device_error() -> io::Error {
 /// When the filesystem lacks no-replace support, directories and files without
 /// hard-link support use a non-atomic existence check and rename. Each fallback
 /// reason produces one process-wide warning.
+// Cache retirement now uses directory-handle-relative renames. Keep this
+// pathname helper for the cross-volume fallback fixtures and other move users.
+#[allow(dead_code)]
 pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
     if let Some(error) = publish_no_replace(from, to)? {
         Moved::PublishedWithWarning(error).warn_if_incomplete(from, to);

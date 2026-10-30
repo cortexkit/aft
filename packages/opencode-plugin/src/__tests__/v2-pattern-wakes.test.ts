@@ -1,4 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { BashPatternMatchFrame } from "@cortexkit/aft-bridge";
 import { Effect, Exit, PubSub, Scope, Stream } from "effect";
 
@@ -37,6 +39,9 @@ async function rig(parentID?: string) {
   let failAdmission = false;
   let failAck = false;
   let ignoreAck = false;
+  let loseAck = false;
+  let beforeDrain: (() => Promise<void>) | undefined;
+  let beforeAdmission: (() => Promise<void>) | undefined;
   const host = {
     location: { directory: process.cwd() },
     event: { subscribe: () => Stream.fromPubSub(bus) },
@@ -50,10 +55,13 @@ async function rig(parentID?: string) {
             failAdmission = false;
             return Effect.fail(new Error("host unavailable"));
           }
-          return Effect.sync(() => {
+          const record = Effect.sync(() => {
             statusAtWake.push(task.status);
             return synthetic.push(input);
           });
+          const hook = beforeAdmission;
+          beforeAdmission = undefined;
+          return hook ? Effect.andThen(Effect.promise(hook), record) : record;
         }),
     },
   };
@@ -69,7 +77,10 @@ async function rig(parentID?: string) {
         watch = params;
         return { success: true, watch_id: "watch-ready" };
       }
-      if (command === "bash_drain_completions")
+      if (command === "bash_drain_completions") {
+        const hook = beforeDrain;
+        beforeDrain = undefined;
+        if (hook) await hook();
         return {
           success: true,
           pending_matches: pending ? [pending] : [],
@@ -86,6 +97,7 @@ async function rig(parentID?: string) {
                 ]
               : [],
         };
+      }
       if (command === "bash_ack_completions") {
         if (ignoreAck) {
           ignoreAck = false;
@@ -95,11 +107,30 @@ async function rig(parentID?: string) {
           failAck = false;
           return { success: false, message: "ack unavailable" };
         }
-        if (pending?.once) watch = undefined;
-        pending = undefined;
+        const matches = (
+          (params.matches ?? []) as Array<{
+            task_id: string;
+            watch_id: string;
+            match_offset: number;
+          }>
+        ).filter(
+          (match) =>
+            pending &&
+            match.task_id === pending.task_id &&
+            match.watch_id === pending.watch_id &&
+            match.match_offset === pending.match_offset,
+        );
+        if (matches.length > 0 || ((params.task_ids ?? []) as string[]).includes(task.id)) {
+          if (pending?.once) watch = undefined;
+          pending = undefined;
+        }
+        if (loseAck) {
+          loseAck = false;
+          return { success: false, message: "ack response lost" };
+        }
         return {
           success: true,
-          acked_matches: params.matches ?? [],
+          acked_matches: matches,
           acked_task_ids: params.task_ids ?? [],
         };
       }
@@ -134,6 +165,17 @@ async function rig(parentID?: string) {
     sends,
     bridge,
     pending: () => pending,
+    setPending: (frame: BashPatternMatchFrame) => {
+      pending = frame;
+    },
+    holdNextDrain: (hook: () => Promise<void>) => {
+      beforeDrain = hook;
+    },
+    holdNextAdmission: (hook: () => Promise<void>) => {
+      beforeAdmission = hook;
+    },
+    push: (frame: BashPatternMatchFrame) =>
+      consumer.bridgeOptions.onBashPatternMatch?.(frame, bridge as never),
     watching: () => watch !== undefined,
     revert: (value: boolean) => {
       reverted = value;
@@ -146,6 +188,9 @@ async function rig(parentID?: string) {
     },
     ignoreAck: () => {
       ignoreAck = true;
+    },
+    loseAck: () => {
+      loseAck = true;
     },
     async stop() {
       await Effect.runPromise(
@@ -160,10 +205,10 @@ async function rig(parentID?: string) {
       consumer.dispose();
       await Effect.runPromise(Scope.close(scope, Exit.succeed(undefined)));
     },
-    async register(once = true) {
+    async register(once = true, deliver?: "each_line") {
       await Effect.runPromise(
         tool.execute(
-          { taskId: "bash-running", background: true, pattern: "READY", once },
+          { taskId: "bash-running", background: true, pattern: "READY", once, deliver },
           { sessionID: "session-v2", progress: () => Effect.void },
         ),
       );
@@ -204,6 +249,9 @@ test("V2 async bash_watch wakes on matching output before task completion", asyn
     });
     expect(r.synthetic[0]?.text).toContain("[BG BASH NOTIFY]");
     expect(r.synthetic[0]?.text).toContain("READY: server is listening");
+    expect(r.synthetic[0]?.text).toBe(
+      '<system-reminder>\n[BG BASH NOTIFY]\n- task bash-running matched "READY" (offset 0):\n      > READY: server is listening\n</system-reminder>',
+    );
     expect(r.synthetic[0]).not.toHaveProperty("resume");
     expect(r.sends.filter((send) => send.command === "bash_ack_completions")).toEqual([
       {
@@ -555,5 +603,233 @@ test("V2 erased watch delivers its live-only failure notice without a durable ma
     );
   } finally {
     await r.close();
+  }
+});
+
+function eachLineFrame(offset: number, text: string): BashPatternMatchFrame {
+  return {
+    type: "bash_pattern_match",
+    session_id: "session-v2",
+    task_id: "bash-running",
+    watch_id: "watch-ready",
+    match_text: "matching lines",
+    match_offset: offset,
+    context: "unused: the batch is the rendered source",
+    once: false,
+    reason: "pattern_match",
+    batch: {
+      lines: [
+        {
+          stream: "stdout",
+          offset,
+          end_offset: offset + Buffer.byteLength(text) + 1,
+          text,
+          count: 1,
+        },
+      ],
+      dropped_lines: 0,
+      first_dropped_offset: null,
+      first_dropped_stream: null,
+      skipped_long_lines: 0,
+    },
+  };
+}
+
+function eachLineSnapshot(id: string, ...frames: BashPatternMatchFrame[]): BashPatternMatchFrame {
+  const last = frames.at(-1)!;
+  const batch = {
+    ...last.batch!,
+    pending_id: id,
+    snapshot: true,
+    lines: frames.flatMap((frame) => frame.batch!.lines.map((line) => ({ ...line }))),
+  };
+  return { ...last, batch };
+}
+
+function latch() {
+  let release!: () => void;
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { promise, release };
+}
+
+function nativeTerminalFrame(): BashPatternMatchFrame {
+  // Checked-in native emitter output (see each-line-terminal-frame.json).
+  // Spawning cargo from a host test hangs offline builders; the Rust suite
+  // asserts the live frame equals this pinned file.
+  return JSON.parse(
+    readFileSync(join(import.meta.dir, "fixtures/each-line-terminal-frame.json"), "utf8"),
+  ) as BashPatternMatchFrame;
+}
+
+test("V2 each_line terminal cap summary survives the durable version fence", async () => {
+  const native = nativeTerminalFrame();
+  const r = await rig();
+  try {
+    await r.register(false, "each_line");
+    const pending = eachLineSnapshot("terminal-pending", eachLineFrame(0, "READY first"));
+    pending.match_offset = 123;
+    pending.batch!.dropped_lines = 7;
+    pending.batch!.first_dropped_offset = 123;
+    pending.batch!.first_dropped_stream = "stderr";
+    r.setPending(pending);
+    await r.push(native);
+    expect(r.synthetic).toHaveLength(1);
+    expect(r.synthetic[0]?.text).toContain(
+      '7 matching lines dropped. Read them with bash_status({ taskId: "bash-running", stderrOffset: 123 }).',
+    );
+    expect(r.synthetic[0]?.text).toContain("stdout byte 0: READY first");
+    expect(
+      r.sends.filter((send) => send.command === "bash_ack_completions").at(-1)?.params,
+    ).toEqual({
+      session_id: "session-v2",
+      matches: [{ task_id: "bash-running", watch_id: "watch-ready", match_offset: 123 }],
+    });
+    expect(r.pending()).toBeUndefined();
+  } finally {
+    await r.close();
+  }
+});
+
+test("V2 each_line superseded push delivers every durable line once", async () => {
+  const r = await rig();
+  const entered = latch();
+  const resume = latch();
+  let firstPush: Promise<void> | void;
+  try {
+    await r.register(false, "each_line");
+    const first = eachLineFrame(0, "READY first");
+    const second = eachLineFrame(12, "READY second");
+    const third = eachLineFrame(25, "READY third");
+    r.setPending(eachLineSnapshot("pending-a", first));
+    r.holdNextDrain(async () => {
+      entered.release();
+      await resume.promise;
+    });
+    firstPush = r.push(first);
+    await entered.promise;
+    r.setPending(eachLineSnapshot("pending-a", first, second));
+    await r.push(second);
+    r.setPending(eachLineSnapshot("pending-a", first, second, third));
+    await r.push(third);
+    resume.release();
+    await firstPush;
+    expect(r.synthetic).toHaveLength(1);
+    expect(r.synthetic[0]?.text.split("\n").filter((line) => line.includes("stdout byte"))).toEqual(
+      [
+        "      > stdout byte 0: READY first",
+        "      > stdout byte 12: READY second",
+        "      > stdout byte 25: READY third",
+      ],
+    );
+    expect(
+      r.sends.filter((send) => send.command === "bash_ack_completions").map((send) => send.params),
+    ).toEqual([
+      {
+        session_id: "session-v2",
+        matches: [{ task_id: "bash-running", watch_id: "watch-ready", match_offset: 25 }],
+      },
+    ]);
+    expect(r.pending()).toBeUndefined();
+  } finally {
+    resume.release();
+    await firstPush;
+    await r.close();
+  }
+});
+
+test("V2 each_line concurrent admission dedups folded rows until exact ack", async () => {
+  const r = await rig();
+  const entered = latch();
+  const resume = latch();
+  let firstPush: Promise<void> | void;
+  try {
+    await r.register(false, "each_line");
+    const first = eachLineFrame(0, "READY first");
+    const second = eachLineFrame(12, "READY first");
+    r.setPending(eachLineSnapshot("pending-a", first));
+    r.holdNextAdmission(async () => {
+      entered.release();
+      await resume.promise;
+    });
+    firstPush = r.push(first);
+    await entered.promise;
+    const folded = eachLineSnapshot("pending-a", first);
+    folded.match_offset = second.match_offset;
+    folded.batch!.lines[0].count = 2;
+    r.setPending(folded);
+    await r.push(second);
+    resume.release();
+    await firstPush;
+    expect(r.synthetic).toHaveLength(2);
+    expect(r.synthetic[0]?.text).toContain("stdout byte 0: READY first");
+    expect(r.synthetic[1]?.text).toContain("stdout byte 12: READY first");
+    expect(r.synthetic[1]?.text).not.toContain("stdout byte 0");
+    expect(r.synthetic[1]?.text).not.toContain("×2");
+    expect(r.pending()).toBeUndefined();
+  } finally {
+    resume.release();
+    await firstPush;
+    await r.close();
+  }
+});
+
+test("V2 each_line new pending generation resets admitted drop counters", async () => {
+  const r = await rig();
+  try {
+    await r.register(false, "each_line");
+    const first = eachLineFrame(0, "READY first");
+    first.batch!.dropped_lines = 7;
+    first.batch!.first_dropped_offset = 12;
+    first.batch!.first_dropped_stream = "stdout";
+    r.setPending(eachLineSnapshot("pending-a", first));
+    r.failAck();
+    await r.push(first);
+    const second = eachLineFrame(24, "READY second");
+    second.batch!.dropped_lines = 10;
+    second.batch!.first_dropped_offset = 37;
+    second.batch!.first_dropped_stream = "stdout";
+    r.setPending(eachLineSnapshot("pending-b", second));
+    await r.push(second);
+    expect(r.synthetic).toHaveLength(2);
+    expect(r.synthetic[0]?.text).toContain("7 matching lines dropped.");
+    expect(r.synthetic[1]?.text).toContain("10 matching lines dropped.");
+    expect(r.synthetic[1]?.text).not.toContain("3 matching lines dropped.");
+  } finally {
+    await r.close();
+  }
+});
+
+test("V2 each_line lost ack redelivery preserves drop totals without duplicate delivery", async () => {
+  for (const committed of [false, true]) {
+    const r = await rig();
+    try {
+      await r.register(false, "each_line");
+      const first = eachLineFrame(0, "READY first");
+      first.batch!.dropped_lines = 7;
+      first.batch!.first_dropped_offset = 12;
+      first.batch!.first_dropped_stream = "stdout";
+      r.setPending(eachLineSnapshot("pending-a", first));
+      if (committed) r.loseAck();
+      else r.failAck();
+      await r.push(first);
+      await r.push(first);
+      expect(r.synthetic).toHaveLength(1);
+      expect(r.synthetic[0]?.text).toContain("7 matching lines dropped.");
+      const next = eachLineFrame(24, "READY second");
+      next.batch!.dropped_lines = 10;
+      next.batch!.first_dropped_offset = 37;
+      next.batch!.first_dropped_stream = "stdout";
+      r.setPending(eachLineSnapshot("pending-b", next));
+      await r.push(next);
+      expect(r.synthetic).toHaveLength(2);
+      expect(r.synthetic[1]?.text).toContain("10 matching lines dropped.");
+      expect(r.synthetic[1]?.text).not.toContain("READY first");
+      expect(r.synthetic[1]?.text).not.toContain("3 matching lines dropped.");
+      expect(r.pending()).toBeUndefined();
+    } finally {
+      await r.close();
+    }
   }
 });

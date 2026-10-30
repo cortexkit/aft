@@ -44,6 +44,7 @@ impl Tasks {
                 self.dir.path().into(),
                 HashMap::new(),
                 HardKill::After(Duration::from_secs(30)),
+                None,
                 self.dir.path().into(),
                 if background {
                     crate::bash_background::TaskSlot::Background { max: 10 }
@@ -94,15 +95,8 @@ fn bash_kill_scope_kills_promoted_background_and_grandchildren() {
     );
     let foreground = tasks.start(&stamp, "foreground", "sleep 30", false);
     assert!(tasks.registry.promote(&foreground, "foreground").unwrap());
-    wait_for(|| pid_file.exists());
-    let pid: i32 = std::fs::read_to_string(&pid_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    assert!(crate::bash_background::process::is_process_alive(
-        pid as u32
-    ));
+    let pid = read_pid(&pid_file);
+    assert!(crate::bash_background::process::is_process_alive(pid));
     let reply = tasks.cancel(&stamp);
     assert!(reply.success, "{reply:?}");
     let killed = reply.data["killed"].as_array().unwrap();
@@ -131,7 +125,7 @@ fn bash_kill_scope_kills_promoted_background_and_grandchildren() {
             .take_cancelled_call_notices(session)
             .is_empty());
     }
-    wait_for(|| !crate::bash_background::process::is_process_alive(pid as u32));
+    wait_for(|| !crate::bash_background::process::is_process_alive(pid));
 }
 
 #[test]
@@ -294,7 +288,7 @@ fn bash_kill_scope_completion_is_an_expected_owner_stop() {
 }
 
 #[test]
-fn bash_kill_scope_next_bash_family_reply_names_cancellation_once() {
+fn bash_kill_scope_next_agent_reply_names_cancellation_once() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = crate::config::Config::default();
     config.project_root = Some(dir.path().into());
@@ -307,23 +301,13 @@ fn bash_kill_scope_next_bash_family_reply_names_cancellation_once() {
     let task = tasks.start(&stamp, "session", "sleep 30", true);
     assert!(tasks.cancel(&stamp).success);
     let mut response = Response::success("next", json!({}));
-    let mut unrelated = String::new();
-    crate::response_finalize::finalize_tool_response(
-        &mut response,
-        &mut unrelated,
-        &ctx,
-        "session",
-        "read",
-        false,
-    );
-    assert!(!unrelated.contains("cancelled by owner"));
     let mut next = String::new();
     crate::response_finalize::finalize_tool_response(
         &mut response,
         &mut next,
         &ctx,
         "session",
-        "bash_status",
+        "read",
         false,
     );
     assert!(
@@ -342,12 +326,27 @@ fn bash_kill_scope_next_bash_family_reply_names_cancellation_once() {
     assert!(!again.contains("cancelled by owner"));
 }
 
+/// Waits for a pid file written by `echo $! > file` and returns the pid.
+///
+/// The shell creates the file before `echo` writes into it, so the file can
+/// exist while still empty or partly written. Only a newline-terminated line
+/// that parses counts as complete; the bound is generous for slow runners.
 fn read_pid(path: &std::path::Path) -> u32 {
-    std::fs::read_to_string(path)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap()
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let contents = std::fs::read_to_string(path).unwrap_or_default();
+        if contents.ends_with('\n') {
+            if let Ok(pid) = contents.trim().parse() {
+                return pid;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pid file {} never held a complete pid: {contents:?}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// A module restart leaves a project's saved tasks out of every live registry
@@ -373,6 +372,7 @@ fn bash_kill_scope_stops_saved_task_before_its_project_binds() {
                 project.path().into(),
                 HashMap::new(),
                 HardKill::After(Duration::from_secs(30)),
+                None,
                 harness_dir.clone(),
                 crate::bash_background::TaskSlot::Background { max: 10 },
                 true,
@@ -388,7 +388,6 @@ fn bash_kill_scope_stops_saved_task_before_its_project_binds() {
     let other_pid_file = project.path().join("other");
     let task = start(&stamp, "session", &paused_pid_file);
     let other_task = start(&other, "other-session", &other_pid_file);
-    wait_for(|| paused_pid_file.exists() && other_pid_file.exists());
     let paused_pid = read_pid(&paused_pid_file);
     let other_pid = read_pid(&other_pid_file);
     // The module exits: its registry lets go of the tasks without stopping
@@ -440,4 +439,93 @@ fn bash_kill_scope_stops_saved_task_before_its_project_binds() {
     );
     assert_eq!(other_reply.data["killed"][0]["task_id"], other_task);
     wait_for(|| !crate::bash_background::process::is_process_alive(other_pid));
+}
+
+#[test]
+fn recovered_harness_scope_cancel_records_revoked_in_the_module_database() {
+    use crate::gh_shim_speech::model::{AuthorityRecord, ExecutionSeal, LaunchAuthority};
+    let storage = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let harness_dir = storage.path().join("opencode");
+    let db_path = storage.path().join("aft.db");
+    crate::db::open(&db_path).unwrap();
+    let mut stamp = scope("recovered-head");
+    stamp.kind = subc_protocol::scope::ScopeKind::Head;
+    stamp.owner_authorized = true;
+    stamp.attributes = subc_protocol::scope::ScopeAttributes::new()
+        .with_agent_id(Some("agent-a".into()))
+        .with_delegates(true);
+    let previous = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+    let pid_file = project.path().join("child-pid");
+    let task = with_scope_spawn(Some(stamp.clone()), || {
+        previous.spawn_with_shell_in_slot(
+            SpawnPlan::Unsandboxed,
+            &format!("sh -c 'sleep 30 & echo $! > {}; wait'", pid_file.display()),
+            crate::bash_background::BashShell::Bash,
+            crate::bash_background::registry::resolve_posix_shell(),
+            "session".into(),
+            project.path().into(),
+            HashMap::new(),
+            HardKill::After(Duration::from_secs(30)),
+            None,
+            harness_dir.clone(),
+            crate::bash_background::TaskSlot::Background { max: 10 },
+            true,
+            false,
+            Some(project.path().into()),
+        )
+    })
+    .unwrap();
+    wait_for(|| pid_file.exists());
+    let pid = read_pid(&pid_file);
+    let store = crate::db::gh_speech::Store::new(&db_path);
+    store
+        .capture(&AuthorityRecord {
+            incarnation: "recovered-main-store".into(),
+            minting_run: "old-forwarder".into(),
+            harness: "opencode".into(),
+            session_id: "session".into(),
+            task_id: task.clone(),
+            project_root: project.path().display().to_string(),
+            launch: LaunchAuthority::classic(stamp.clone(), None).unwrap(),
+            policy: None,
+            bindings: std::collections::BTreeMap::new(),
+            seal: None,
+            ineligible_reason: None,
+        })
+        .unwrap();
+    previous.detach();
+    assert!(!harness_dir.join("aft.db").exists());
+    let reply = handle_bash_kill_scope_with_saved_tasks(
+        json!({"scope":stamp}),
+        Some(&stamp.owner),
+        &[],
+        Some(storage.path()),
+    );
+    assert!(reply.success, "{reply:?}");
+    assert_eq!(reply.data["killed"][0]["task_id"], task);
+    wait_for(|| !crate::bash_background::process::is_process_alive(pid));
+    let restarted = crate::db::gh_speech::Store::new(&db_path);
+    assert_eq!(
+        restarted
+            .seal(
+                "recovered-main-store",
+                &ExecutionSeal {
+                    child_pid: 123,
+                    child_start_time_ms: 456,
+                    birth_identity: "birth".into()
+                }
+            )
+            .unwrap_err()
+            .reason,
+        "revoked"
+    );
+    assert_eq!(
+        restarted.get("recovered-main-store").unwrap_err().reason,
+        "revoked"
+    );
+    assert!(
+        !harness_dir.join("aft.db").exists(),
+        "recovery must not invent a harness-local authority database"
+    );
 }

@@ -711,18 +711,39 @@ fn unreadable_git_bind_serves_tools_without_saving_an_identity_and_retries() {
     assert!(!degraded_reasons(&mut aft)
         .join("; ")
         .contains("git_identity_unavailable"));
-    assert_eq!(wait_for_single_built_family(storage.path()), "git");
+    assert_eq!(
+        wait_for_single_built_family(&mut aft, storage.path()),
+        "git"
+    );
     assert!(aft.shutdown().success());
 }
 
 /// After a finalizing bind, wait until exactly one artifact family is owned
-/// and built for the root, and return its saved identity kind.
+/// and built for the root, and return its saved identity kind. A views-off
+/// root builds its trigram index under `index/<family>`; with views on the
+/// legacy index is never written and the checkout's lexical view builds the
+/// family's trigram plane under `blobs/v3/<family>` instead. That view is
+/// built by the first lexical query, not during configure maintenance of the
+/// stdin/stdout process these tests spawn, so each wait round sends a grep.
 #[cfg(unix)]
-fn wait_for_single_built_family(storage: &Path) -> String {
+fn wait_for_single_built_family(aft: &mut AftProcess, storage: &Path) -> String {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         let owners = entry_names(storage, "artifact-owners");
-        let built = entry_names(storage, "index");
+        let mut built = entry_names(storage, "index");
+        built.extend(
+            entry_names(storage, "blobs/v3")
+                .into_iter()
+                .filter(|family| {
+                    storage
+                        .join("blobs/v3")
+                        .join(family)
+                        .join("trigram.sqlite")
+                        .is_file()
+                }),
+        );
+        built.sort();
+        built.dedup();
         if owners.len() == 1 && built.contains(&owners[0]) {
             assert_eq!(built, owners, "one folder must build one index family");
             let saved = saved_root_identities(storage);
@@ -737,6 +758,9 @@ fn wait_for_single_built_family(storage: &Path) -> String {
             std::time::Instant::now() < deadline,
             "no index was built after the finalizing bind: owners={owners:?} index={built:?}"
         );
+        let grep = aft
+            .send(&json!({"id": "build-lexical", "command": "grep", "pattern": "fn"}).to_string());
+        assert_eq!(grep["success"], true, "{grep}");
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
@@ -784,7 +808,7 @@ fn provisional_bind_then_finalize(path_pin: bool) -> String {
         !degraded_reasons(&mut aft).contains(&PROVISIONAL_REASON.to_string()),
         "a finalizing bind clears the provisional reason"
     );
-    let kind = wait_for_single_built_family(storage);
+    let kind = wait_for_single_built_family(&mut aft, storage);
     assert!(aft.shutdown().success());
     kind
 }
@@ -831,7 +855,7 @@ fn provisional_identity_settles_without_a_second_bind_once_aft_db_frees() {
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    assert_eq!(wait_for_single_built_family(storage), "git");
+    assert_eq!(wait_for_single_built_family(&mut aft, storage), "git");
     assert!(aft.shutdown().success());
 }
 

@@ -1,1 +1,0 @@
-- Undo after an upgrade no longer reports "no undo history" while another AFT process is moving older history into the new layout; it waits briefly or says why it couldn't.

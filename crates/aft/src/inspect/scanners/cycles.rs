@@ -570,17 +570,22 @@ impl CycleGraph {
     }
 
     fn finish_order(&self, start: &str, visited: &mut BTreeSet<String>, order: &mut Vec<String>) {
-        visited.insert(start.to_string());
         let mut stack = vec![(start.to_string(), false)];
         while let Some((node, exiting)) = stack.pop() {
             if exiting {
                 order.push(node);
                 continue;
             }
+            // A queued sibling can also be reached through a node currently
+            // being visited. Mark nodes on first processing, not when queued,
+            // so each exit is recorded after its unvisited descendants finish.
+            if !visited.insert(node.clone()) {
+                continue;
+            }
             stack.push((node.clone(), true));
             if let Some(neighbors) = self.adjacency.get(&node) {
                 for neighbor in neighbors.iter().rev() {
-                    if visited.insert(neighbor.clone()) {
+                    if !visited.contains(neighbor) {
                         stack.push((neighbor.clone(), false));
                     }
                 }
@@ -832,5 +837,31 @@ fn language_name(language: LangId) -> &'static str {
         LangId::Groovy => "groovy",
         LangId::ObjC => "objc",
         LangId::Toml => "toml",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit05_scc_sibling_cross_edge_preserves_cycle() {
+        let mut graph = CycleGraph::default();
+        for (from, to) in [("a", "b"), ("a", "c"), ("b", "c"), ("c", "d"), ("d", "c")] {
+            graph.add_edge(
+                from,
+                CycleEdgeContribution {
+                    to: to.to_string(),
+                    specifier: to.to_string(),
+                    kind: "import".to_string(),
+                    line: 1,
+                    edge_kind: "value".to_string(),
+                },
+            );
+        }
+        let mut components = graph.strongly_connected_components();
+        components.sort();
+        assert_eq!(components, vec![vec!["a"], vec!["b"], vec!["c", "d"]]);
+        assert_eq!(graph.cycles().len(), 1);
     }
 }

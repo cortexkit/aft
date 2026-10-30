@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread::ThreadId;
 
@@ -29,6 +30,7 @@ impl EmbedCounts {
 #[derive(Clone, Debug)]
 struct EmbedAttribution {
     request_id: String,
+    identity: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -48,8 +50,8 @@ fn active_attributions() -> &'static Mutex<HashMap<ExecutionId, Vec<EmbedAttribu
     ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn observations() -> &'static Mutex<HashMap<String, EmbedCounts>> {
-    static OBSERVATIONS: OnceLock<Mutex<HashMap<String, EmbedCounts>>> = OnceLock::new();
+fn observations() -> &'static Mutex<HashMap<(String, u64), EmbedCounts>> {
+    static OBSERVATIONS: OnceLock<Mutex<HashMap<(String, u64), EmbedCounts>>> = OnceLock::new();
     OBSERVATIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -61,6 +63,7 @@ fn observations() -> &'static Mutex<HashMap<String, EmbedCounts>> {
 pub struct Guard {
     execution: ExecutionId,
     request_id: String,
+    identity: u64,
     _not_send: PhantomData<Rc<()>>,
 }
 
@@ -68,10 +71,12 @@ pub struct Guard {
 pub fn install(request_id: impl Into<String>) -> Guard {
     let request_id = request_id.into();
     let execution = current_execution();
+    static NEXT_IDENTITY: AtomicU64 = AtomicU64::new(0);
+    let identity = NEXT_IDENTITY.fetch_add(1, Ordering::Relaxed);
     observations()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(request_id.clone(), EmbedCounts::default());
+        .insert((request_id.clone(), identity), EmbedCounts::default());
     active_attributions()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -79,10 +84,12 @@ pub fn install(request_id: impl Into<String>) -> Guard {
         .or_default()
         .push(EmbedAttribution {
             request_id: request_id.clone(),
+            identity,
         });
     Guard {
         execution,
         request_id,
+        identity,
         _not_send: PhantomData,
     }
 }
@@ -95,7 +102,7 @@ pub fn record(counts: EmbedCounts) {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&execution)
         .and_then(|attributions| attributions.last())
-        .map(|current| current.request_id.clone());
+        .map(|current| (current.request_id.clone(), current.identity));
     let Some(request_id) = request_id else {
         return;
     };
@@ -108,12 +115,27 @@ pub fn record(counts: EmbedCounts) {
         .add_assign(counts);
 }
 
-/// Returns the observations accumulated for `request_id`.
+/// Returns observations for the innermost matching request in this execution.
+/// Reused request IDs in other tasks must not reset or share these counts.
 pub fn read(request_id: &str) -> EmbedCounts {
+    let identity = active_attributions()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&current_execution())
+        .and_then(|attributions| {
+            attributions
+                .iter()
+                .rev()
+                .find(|a| a.request_id == request_id)
+        })
+        .map(|a| a.identity);
+    let Some(identity) = identity else {
+        return EmbedCounts::default();
+    };
     observations()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(request_id)
+        .get(&(request_id.to_string(), identity))
         .copied()
         .unwrap_or_default()
 }
@@ -123,36 +145,72 @@ impl Drop for Guard {
         let mut active = active_attributions()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut remove_execution = false;
         if let Some(attributions) = active.get_mut(&self.execution) {
-            let popped = attributions.pop();
-            debug_assert_eq!(
-                popped.as_ref().map(|current| current.request_id.as_str()),
-                Some(self.request_id.as_str())
-            );
-            remove_execution = attributions.is_empty();
+            attributions.retain(|attribution| attribution.identity != self.identity);
+            if attributions.is_empty() {
+                active.remove(&self.execution);
+            }
         }
-        if remove_execution {
-            active.remove(&self.execution);
-        }
-        let still_attributed = active.values().any(|attributions| {
-            attributions
-                .iter()
-                .any(|attribution| attribution.request_id == self.request_id)
-        });
         drop(active);
-        if !still_attributed {
-            observations()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&self.request_id);
-        }
+        observations()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(self.request_id.clone(), self.identity));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit10_nested_same_id_counts_are_isolated() {
+        let request_id = "counter-reused-id";
+        let outer = install(request_id);
+        record(EmbedCounts {
+            requested: 7,
+            ..EmbedCounts::default()
+        });
+        {
+            let _inner = install(request_id);
+            assert_eq!(read(request_id).requested, 0);
+            record(EmbedCounts {
+                requested: 2,
+                ..EmbedCounts::default()
+            });
+            assert_eq!(read(request_id).requested, 2);
+        }
+        assert_eq!(read(request_id).requested, 7);
+        drop(outer);
+        assert_eq!(read(request_id), EmbedCounts::default());
+    }
+
+    #[test]
+    fn audit10_concurrent_same_id_counts_are_isolated() {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let first = barrier.clone();
+        let worker = std::thread::spawn(move || {
+            let _guard = install("counter-overlap");
+            record(EmbedCounts {
+                requested: 7,
+                ..EmbedCounts::default()
+            });
+            first.wait();
+            first.wait();
+            assert_eq!(read("counter-overlap").requested, 7);
+        });
+        barrier.wait();
+        {
+            let _guard = install("counter-overlap");
+            record(EmbedCounts {
+                requested: 2,
+                ..EmbedCounts::default()
+            });
+            assert_eq!(read("counter-overlap").requested, 2);
+        }
+        barrier.wait();
+        worker.join().unwrap();
+    }
 
     #[test]
     fn sums_observations_and_ignores_unattributed_work() {
@@ -230,7 +288,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .keys()
-            .filter(|request_id| request_id.starts_with(&prefix))
+            .filter(|(request_id, _)| request_id.starts_with(&prefix))
             .count();
         assert_eq!(
             retained, 0,

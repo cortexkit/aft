@@ -785,7 +785,7 @@ const OUTBOUND_CALLS_SQL: &str = "SELECT r.caller_file,
             COALESCE(r.target_file, e.target_file),
             COALESCE(tn.name, r.target_symbol, e.target_symbol),
             r.line,
-            CASE WHEN r.kind = 'value_ref' THEN 'value_ref'
+            CASE WHEN r.kind IN ('value_ref', 'callback_ref') THEN 'value_ref'
                  ELSE COALESCE(e.provenance, r.provenance) END,
             r.byte_start,
             r.byte_end,
@@ -794,7 +794,7 @@ const OUTBOUND_CALLS_SQL: &str = "SELECT r.caller_file,
      LEFT JOIN nodes n ON n.id = r.caller_node
      LEFT JOIN edges e ON e.ref_id = r.ref_id AND e.kind = r.kind
      LEFT JOIN nodes tn ON tn.id = e.target_node
-     WHERE r.kind IN ('call', 'value_ref', 'macro_body_call')";
+     WHERE r.kind IN ('call', 'construction', 'callback_ref', 'value_ref', 'macro_body_call')";
 
 fn outbound_calls_from_store(
     conn: &Connection,
@@ -885,7 +885,14 @@ fn outbound_calls_query(
         if stale_caller_node {
             stale_caller_nodes += 1;
         }
-        let short_name = if unresolved_value_path {
+        // Keep module identity when an ordinary Rust call cannot be bound;
+        // the scanner can still resolve the qualified path from source facts.
+        let unresolved_call_path = !matches!(row.status.as_str(), "resolved" | "resolved_local")
+            && row
+                .full_ref
+                .as_deref()
+                .is_some_and(|full_ref| full_ref.contains("::"));
+        let short_name = if unresolved_value_path || unresolved_call_path {
             row.full_ref.as_deref().unwrap_or_default()
         } else {
             row.short_name
@@ -1485,6 +1492,20 @@ export function alpha() { third(); }
                 ("zed", "first"),
             ]
         );
+    }
+
+    #[test]
+    fn unresolved_rust_calls_keep_full_module_paths_in_the_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        fs::create_dir_all(root.join("src")).unwrap();
+        let source = root.join("src/lib.rs");
+        fs::write(&source, "pub fn run() { missing::nested::target(); }").unwrap();
+        let store = CallGraphStore::open(dir.path().join("store"), root).unwrap();
+        store.cold_build(&[source]).unwrap();
+        let snapshot = project_dead_code_snapshot(store.sqlite_path()).unwrap();
+        assert_eq!(snapshot.outbound_calls.len(), 1);
+        assert_eq!(snapshot.outbound_calls[0].target, "missing::nested::target");
     }
 
     #[test]

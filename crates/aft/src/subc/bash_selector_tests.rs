@@ -25,6 +25,7 @@ async fn exec_remote_v1_bash_runs_through_real_route_without_invalid_selector() 
         trust: BindTrust::FirstParty,
         spawn_principal: AuthenticatedPrincipal::FirstParty,
         consumer_elicitation_capable: false,
+        tool_result_body: false,
         disabled_tools: Arc::new(vec![]),
         run_scope: OnceLock::new(),
         call_mode: subc_protocol::call_mode::CallMode::Classic,
@@ -140,6 +141,31 @@ async fn route_bash(
     corr: u64,
     arguments: Value,
 ) {
+    route_cancel_test_tool(
+        executor,
+        root,
+        connection_cancel,
+        bash_tx,
+        corr,
+        "bash",
+        arguments,
+        false,
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+async fn route_cancel_test_tool(
+    executor: &Arc<Executor>,
+    root: &ProjectRootId,
+    connection_cancel: &PersistentCancelSignal,
+    bash_tx: &mpsc::Sender<bash::BashDeferredCompletion>,
+    corr: u64,
+    name: &str,
+    arguments: Value,
+    preview: bool,
+) -> mpsc::Receiver<wire::WriterFrame> {
     let identity = RouteIdentity(Arc::new(RouteIdentityData {
         root: root.clone(),
         project_root: root.as_path().into(),
@@ -149,6 +175,7 @@ async fn route_bash(
         trust: BindTrust::FirstParty,
         spawn_principal: AuthenticatedPrincipal::FirstParty,
         consumer_elicitation_capable: false,
+        tool_result_body: false,
         disabled_tools: Arc::new(vec![]),
         run_scope: OnceLock::new(),
         call_mode: subc_protocol::call_mode::CallMode::Classic,
@@ -163,10 +190,11 @@ async fn route_bash(
         41,
         1,
         corr,
-        serde_json::to_vec(&json!({"name": "bash", "arguments": arguments})).unwrap(),
+        serde_json::to_vec(&json!({"name": name, "arguments": arguments, "preview": preview}))
+            .unwrap(),
     )
     .unwrap();
-    let (writer, _replies) = mpsc::channel(8);
+    let (writer, replies) = mpsc::channel(8);
     let (touch_tx, _touch_rx) = mpsc::channel(8);
     let (deferred_tx, _deferred_rx) = mpsc::unbounded_channel();
     let deferred_tx = super::DeferredResponseSender {
@@ -198,7 +226,12 @@ async fn route_bash(
         &mut HashMap::new(),
         &mut HashMap::new(),
         &mut HashMap::new(),
-        |request, ctx| crate::commands::bash::handle(&request, ctx),
+        |request, ctx| match request.command.as_str() {
+            "bash" => crate::commands::bash::handle(&request, ctx),
+            "bash_status" => crate::commands::bash_status::handle(&request, ctx),
+            "read" => crate::commands::read::handle_read(&request, ctx),
+            other => panic!("unexpected cancelled-call test command: {other}"),
+        },
         &deferred_tx,
         false,
         1024 * 1024,
@@ -207,6 +240,7 @@ async fn route_bash(
     )
     .await
     .unwrap();
+    replies
 }
 
 /// The text and response data of the next bash call answered on `bash_rx`.
@@ -220,6 +254,213 @@ async fn next_bash_reply(
         .expect("bash reply");
     let text = done.text_for_test().expect("bash result").to_string();
     (text, done.response_for_test().data.clone())
+}
+
+#[cfg(unix)]
+async fn next_cancel_test_tool_reply(replies: &mut mpsc::Receiver<wire::WriterFrame>) -> String {
+    let mut reply = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+        .await
+        .expect("tool call settles")
+        .expect("tool call reply");
+    reply.project_tool_result().unwrap();
+    let body: Value = serde_json::from_slice(reply.body()).unwrap();
+    body["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("tool reply has no text: {body}"))
+        .to_string()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelled_call_notice_appears_on_read_once() {
+    cancelled_call_notice_read_case(NoticeInterveningCall::None, false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelled_call_notice_survives_native_status_and_appears_on_read_once() {
+    cancelled_call_notice_read_case(NoticeInterveningCall::NativeStatus, false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelled_call_notice_appears_on_standalone_read_once() {
+    cancelled_call_notice_read_case(NoticeInterveningCall::None, true).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelled_call_notice_survives_argument_refusal_and_appears_on_read_once() {
+    cancelled_call_notice_read_case(NoticeInterveningCall::ArgumentRefusal, false).await;
+}
+
+#[cfg(unix)]
+enum NoticeInterveningCall {
+    None,
+    NativeStatus,
+    ArgumentRefusal,
+}
+
+#[cfg(unix)]
+async fn cancelled_call_notice_read_case(intervening: NoticeInterveningCall, standalone: bool) {
+    struct Shutdown(Arc<AppContext>);
+    impl Drop for Shutdown {
+        fn drop(&mut self) {
+            self.0.bash_background().shutdown();
+        }
+    }
+    let (dir, root) = test_support::test_root("cancelled-call-read");
+    let ctx = cancel_test_context(&root, &dir.path().join("storage"));
+    let _shutdown = Shutdown(Arc::clone(&ctx));
+    let executor = Arc::new(Executor::new());
+    assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+    let (bash_tx, _bash_rx) = mpsc::channel(8);
+    let connection = PersistentCancelSignal::new();
+    let task_id = ctx
+        .bash_background()
+        .spawn_with_shell_in_slot(
+            crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+            "sleep 60",
+            crate::bash_background::BashShell::Bash,
+            crate::bash_background::registry::resolve_posix_shell(),
+            CANCEL_SESSION.into(),
+            root.as_path().into(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(60)),
+            None,
+            dir.path().join("storage"),
+            crate::bash_background::TaskSlot::Background { max: 10 },
+            true,
+            false,
+            Some(root.as_path().into()),
+        )
+        .unwrap();
+    ctx.bash_background()
+        .note_cancelled_call(&task_id, CANCEL_SESSION);
+    let notice = format!("task {task_id} from your cancelled call is still running; check it with bash_status or stop it with bash_kill");
+
+    let arguments = match intervening {
+        NoticeInterveningCall::None => None,
+        NoticeInterveningCall::NativeStatus => Some(("bash_status", json!({"task_id": task_id}))),
+        NoticeInterveningCall::ArgumentRefusal => Some(("read", json!([]))),
+    };
+    if let Some((name, arguments)) = arguments {
+        let mut plumbing = route_cancel_test_tool(
+            &executor,
+            &root,
+            &connection,
+            &bash_tx,
+            2,
+            name,
+            arguments,
+            false,
+        )
+        .await;
+        let text = next_cancel_test_tool_reply(&mut plumbing).await;
+        assert!(!text.contains("cancelled call"), "{text}");
+        if name == "read" {
+            assert!(text.contains("tool arguments must be an object"), "{text}");
+        }
+    }
+
+    let path = root.as_path().join("notice.txt");
+    std::fs::write(&path, "file contents").unwrap();
+    let mut held = Response::error("held", crate::access_policy::ACCESS_ASK_REQUIRED, "ask");
+    let mut text = String::new();
+    crate::response_finalize::finalize_tool_response(
+        &mut held,
+        &mut text,
+        &ctx,
+        CANCEL_SESSION,
+        "read",
+        false,
+    );
+    assert!(!text.contains("cancelled call"), "{text}");
+
+    let mut preview = route_cancel_test_tool(
+        &executor,
+        &root,
+        &connection,
+        &bash_tx,
+        6,
+        "read",
+        json!({"path": path}),
+        true,
+    )
+    .await;
+    let text = next_cancel_test_tool_reply(&mut preview).await;
+    assert!(!text.contains("cancelled call"), "{text}");
+
+    let text = if standalone {
+        let mut request = RawRequest {
+            id: "standalone".into(),
+            command: "tool_call".into(),
+            params: json!({"name": "read", "arguments": {"path": path}, "preview": true}),
+            session_id: Some(CANCEL_SESSION.into()),
+            lsp_hints: None,
+        };
+        let dispatch = |request: RawRequest, ctx: &AppContext| {
+            crate::commands::read::handle_read(&request, ctx)
+        };
+        let preview = crate::commands::tool_call::handle_with_dispatch(&request, &ctx, &dispatch);
+        assert!(!preview.data["text"]
+            .as_str()
+            .unwrap()
+            .contains("cancelled call"));
+        request.params["preview"] = json!(false);
+        let read = crate::commands::tool_call::handle_with_dispatch(&request, &ctx, &dispatch);
+        read.data["text"].as_str().unwrap().to_string()
+    } else {
+        let mut read = route_cancel_test_tool(
+            &executor,
+            &root,
+            &connection,
+            &bash_tx,
+            3,
+            "read",
+            json!({"path": path}),
+            false,
+        )
+        .await;
+        next_cancel_test_tool_reply(&mut read).await
+    };
+    assert!(text.contains("file contents"), "{text}");
+    assert_eq!(text.matches(&notice).count(), 1, "{text}");
+
+    let mut status = route_cancel_test_tool(
+        &executor,
+        &root,
+        &connection,
+        &bash_tx,
+        4,
+        "bash_status",
+        json!({"taskId": task_id}),
+        false,
+    )
+    .await;
+    let text = next_cancel_test_tool_reply(&mut status).await;
+    assert!(!text.contains("cancelled call"), "{text}");
+
+    // The agent's taskId spelling must receive notices; the plugin's task_id poll must not.
+    ctx.bash_background()
+        .note_cancelled_call(&task_id, CANCEL_SESSION);
+    let mut status = route_cancel_test_tool(
+        &executor,
+        &root,
+        &connection,
+        &bash_tx,
+        5,
+        "bash_status",
+        json!({"taskId": task_id}),
+        false,
+    )
+    .await;
+    let text = next_cancel_test_tool_reply(&mut status).await;
+    assert_eq!(text.matches(&notice).count(), 1, "{text}");
+    assert!(ctx
+        .bash_background()
+        .take_cancelled_call_notices(CANCEL_SESSION)
+        .is_empty());
 }
 
 /// A `wait: true` call whose transport is lost while the command still runs
@@ -392,6 +633,7 @@ async fn v1_bash_wait_limit_case(worker: bool) {
         trust: BindTrust::FirstParty,
         spawn_principal: AuthenticatedPrincipal::FirstParty,
         consumer_elicitation_capable: false,
+        tool_result_body: false,
         disabled_tools: Arc::new(vec![]),
         run_scope: OnceLock::new(),
         call_mode: subc_protocol::call_mode::CallMode::Classic,

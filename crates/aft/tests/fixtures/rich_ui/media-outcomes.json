@@ -1,0 +1,47 @@
+[
+  {
+    "operation": "read",
+    "kind": "image",
+    "code": "unsupported_media"
+  },
+  {
+    "operation": "read",
+    "kind": "pdf",
+    "code": "unsupported_media"
+  },
+  {
+    "operation": "read",
+    "kind": "binary",
+    "code": "unsupported_media"
+  },
+  {
+    "operation": "outline",
+    "kind": "image",
+    "code": "unsupported_media"
+  },
+  {
+    "operation": "outline",
+    "kind": "pdf",
+    "code": "unsupported_media"
+  },
+  {
+    "operation": "outline",
+    "kind": "binary",
+    "code": "unsupported_media"
+  },
+  {
+    "operation": "zoom",
+    "kind": "image",
+    "code": "unsupported_media"
+  },
+  {
+    "operation": "zoom",
+    "kind": "pdf",
+    "code": "unsupported_media"
+  },
+  {
+    "operation": "zoom",
+    "kind": "binary",
+    "code": "unsupported_media"
+  }
+]

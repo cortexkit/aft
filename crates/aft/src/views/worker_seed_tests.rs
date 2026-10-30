@@ -251,6 +251,12 @@ fn worker_first_publication_clones_main_with_cold_query_parity() {
         "a new linked checkout must clone its main checkout's compatible derived database"
     );
     assert_eq!(prepared.profile.seed_source, "sibling");
+    // A settled published donor has an empty WAL, so macOS copies it
+    // copy-on-write instead of rewriting every page.
+    #[cfg(target_os = "macos")]
+    assert_eq!(prepared.profile.clone_mechanism, "clonefile");
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(prepared.profile.clone_mechanism, "sqlite_backup");
     let report = prepared.commit().unwrap();
     assert_eq!(report.blob_puts, 3);
     assert_cold_parity(&worker, &report);
@@ -326,6 +332,342 @@ fn worker_seed_uses_freshest_ready_sibling_and_repairs_unusable_own_base() {
     assert_eq!(repaired.profile.cold_build_reason, "none");
     let report = repaired.commit().unwrap();
     assert_cold_parity(&main, &report);
+}
+
+/// A separate clone of `main`'s repository: the same family, but not one of
+/// its Git worktrees, so the worktree census never offers `main` as a donor.
+fn separate_clone(main: &AssemblyRequest) -> (tempfile::TempDir, AssemblyRequest) {
+    let clone = tempfile::tempdir().unwrap();
+    assert!(std::process::Command::new("git")
+        .args(["-c", "core.autocrlf=false", "clone", "--quiet"])
+        .arg(&main.project_root)
+        .arg(clone.path())
+        .status()
+        .unwrap()
+        .success());
+    let mut request = main.clone();
+    request.project_root = clone.path().to_path_buf();
+    request.scope = crate::path_identity::project_scope_key(clone.path());
+    request.family = crate::search_index::artifact_cache_key(clone.path());
+    assert_eq!(request.family, main.family, "a clone stays in its family");
+    request.desired_head = head_tree_fingerprint(&head_tree_entries(clone.path()).unwrap());
+    (clone, request)
+}
+
+fn index_of(request: &AssemblyRequest) -> PathBuf {
+    let blobs = BlobStore::open(&request.storage, &request.family, BlobPlane::Callgraph).unwrap();
+    derived_index::index_path(blobs.path())
+}
+
+#[test]
+fn identical_scope_outside_the_worktree_census_reuses_the_indexed_graph() {
+    let (_dirs, main, _worker) = checkouts(24);
+    let published = publish_checkout(&main).unwrap();
+    assert_eq!(
+        derived_index::recorded_identity(&index_of(&main), &main.scope),
+        Some(derived_index::identity(
+            &main.family,
+            published.manifest.as_ref().unwrap()
+        )),
+        "a published ready derived database must be indexed"
+    );
+    let (_clone, clone) = separate_clone(&main);
+
+    let mut prepared = prepare_checkout(&clone, &mut |_| Ok(())).unwrap();
+
+    assert_eq!(prepared.profile.seed_source, "sibling");
+    assert_eq!(prepared.profile.seed_lookup, "index_exact");
+    assert_eq!(prepared.profile.cold_build_reason, "none");
+    assert!(prepared.profile.derived_cloned);
+    let report = prepared.commit().unwrap();
+    assert_eq!(report.blob_puts, 0);
+    assert_cold_parity(&clone, &report);
+}
+
+#[test]
+fn seeding_prefers_an_identical_donor_over_a_newer_divergent_one() {
+    let (_dirs, main, mut worker) = checkouts(128);
+    publish_checkout(&main).unwrap();
+    // The newest publication in the family diverges past the incremental
+    // cutoff, which the worktree census would offer first.
+    for i in 0..128 {
+        fs::write(
+            worker.project_root.join(format!("file_{i}.ts")),
+            format!("export function replaced_{i}() {{}} "),
+        )
+        .unwrap();
+        worker
+            .changed_paths
+            .insert(format!("file_{i}.ts").into_bytes());
+    }
+    publish_checkout(&worker).unwrap();
+    let third = tempfile::tempdir().unwrap();
+    git(
+        &main.project_root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            third.path().to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let mut third_request = main.clone();
+    third_request.project_root = third.path().to_path_buf();
+    third_request.scope = crate::path_identity::project_scope_key(third.path());
+
+    let mut prepared = prepare_checkout(&third_request, &mut |_| Ok(())).unwrap();
+
+    assert_eq!(prepared.profile.seed_source, "sibling");
+    assert_eq!(prepared.profile.seed_lookup, "index_exact");
+    assert_eq!(prepared.profile.cold_build_reason, "none");
+    let report = prepared.commit().unwrap();
+    assert_cold_parity(&third_request, &report);
+}
+
+#[test]
+fn near_identical_scope_patches_the_nearest_indexed_donor() {
+    let (_dirs, main, _worker) = checkouts(24);
+    publish_checkout(&main).unwrap();
+    let (_clone, mut clone) = separate_clone(&main);
+    fs::write(
+        clone.project_root.join("file_0.ts"),
+        "export function target_0() { return 5; }",
+    )
+    .unwrap();
+    clone.changed_paths.insert(b"file_0.ts".to_vec());
+
+    let mut prepared = prepare_checkout(&clone, &mut |_| Ok(())).unwrap();
+
+    assert_eq!(prepared.profile.seed_source, "sibling");
+    assert_eq!(prepared.profile.seed_lookup, "index_nearest");
+    assert!(prepared.profile.derived_cloned);
+    let report = prepared.commit().unwrap();
+    assert_eq!(report.blob_puts, 1);
+    assert_cold_parity(&clone, &report);
+}
+
+#[test]
+fn indexed_donor_from_an_older_build_output_is_forgotten_not_reused() {
+    let (_dirs, main, _worker) = checkouts(24);
+    let published = publish_checkout(&main).unwrap();
+    let main_view = ViewStore::open(&main.storage, &main.scope).unwrap();
+    crate::views::generation::wait_for_derived_checkpoint_for_test(main_view.view_dir());
+    let derived = main_view
+        .derived_path(published.generation.as_deref().unwrap())
+        .unwrap();
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    while crate::db::file_identity::open_connections(&derived) != 0 {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // What a donor published by an older binary looks like to this one: the
+    // same manifest, but another build-output fingerprint.
+    Connection::open(&derived)
+        .unwrap()
+        .execute(
+            "UPDATE meta SET v = 'older-build' WHERE k = 'fingerprint'",
+            [],
+        )
+        .unwrap();
+    let (_clone, clone) = separate_clone(&main);
+
+    let mut prepared = prepare_checkout(&clone, &mut |_| Ok(())).unwrap();
+
+    assert_eq!(prepared.profile.seed_source, "cold");
+    assert_eq!(prepared.profile.seed_lookup, "none");
+    assert_eq!(
+        derived_index::recorded_identity(&index_of(&main), &main.scope),
+        None,
+        "a donor that fails readiness must leave the index"
+    );
+    let report = prepared.commit().unwrap();
+    assert_cold_parity(&clone, &report);
+}
+
+#[test]
+fn deferred_derived_index_write_is_counted_in_the_publication_io() {
+    let (_dirs, main, _worker) = checkouts(24);
+    let view_dir = ViewStore::open(&main.storage, &main.scope)
+        .unwrap()
+        .view_dir()
+        .to_owned();
+    let root_id = main.project_root.display().to_string();
+    let mut prepared = prepare_checkout(&main, &mut |_| Ok(())).unwrap();
+    prepared.commit().unwrap();
+    let field = |fields: &str, name: &str| -> Option<u64> {
+        fields
+            .split(' ')
+            .find_map(|field| field.strip_prefix(name)?.strip_prefix('='))?
+            .parse()
+            .ok()
+    };
+    let before = prepared.profile.io.fields();
+    let ledger_before =
+        crate::write_ledger::pending_for_test(crate::write_ledger::Domain::ViewsDerived, &root_id);
+
+    // The row is written here, after `commit` closed the publication's phases.
+    prepared.settle_status();
+
+    assert_eq!(index_writes_for_test(&view_dir), vec![IndexWrite::Recorded]);
+    let after = prepared.profile.io.fields();
+    assert!(
+        publication_profile_line(&prepared.profile).contains("derived_index_ms="),
+        "the publication line must report the deferred write's time"
+    );
+    if cfg!(any(target_os = "macos", target_os = "linux")) {
+        let written = field(&after, "derived_index_logical_bytes_written").unwrap();
+        assert_eq!(
+            field(&before, "derived_index_logical_bytes_written"),
+            Some(0)
+        );
+        assert!(
+            written > 0,
+            "the deferred SQLite write must reach the publication's I/O: {after}"
+        );
+        for total in [
+            "derived_logical_bytes_written",
+            "total_logical_bytes_written",
+        ] {
+            assert_eq!(
+                field(&after, total).unwrap() - field(&before, total).unwrap(),
+                written,
+                "{total} must include the deferred write"
+            );
+        }
+        let ledger_after = crate::write_ledger::pending_for_test(
+            crate::write_ledger::Domain::ViewsDerived,
+            &root_id,
+        );
+        assert_eq!(
+            ledger_after.0 - ledger_before.0,
+            written,
+            "the views_derived ledger must be credited with the deferred write"
+        );
+    }
+}
+
+#[test]
+fn publication_writes_a_reference_sidecar_matching_its_manifest() {
+    let (_dirs, main, _worker) = checkouts(4);
+    publish_checkout(&main).unwrap();
+    let view = ViewStore::open(&main.storage, &main.scope).unwrap();
+    let generation = view.current_generation_read_only().unwrap().unwrap();
+    let json = fs::read(view.manifest_path(&generation).unwrap()).unwrap();
+    let expected: Vec<[u8; 32]> =
+        crate::views::generation::decode_reference_keys_for_test(&generation, &json)
+            .unwrap()
+            .into_iter()
+            .collect();
+    assert!(!expected.is_empty());
+    // A policy with a long settle window still trusts the publisher's sidecar.
+    let sidecars = crate::views::reference_sidecar::ReferenceSidecars::new(
+        std::time::Duration::from_secs(3600),
+    );
+    let mut seen = Vec::new();
+    // Room is not under test here.
+    let mut unlimited = usize::MAX;
+    let source = sidecars
+        .visit(
+            view.view_dir(),
+            &generation,
+            |_| panic!("the publisher's sidecar should make decoding unnecessary"),
+            &mut |keys| {
+                seen = vec![[0_u8; 32]; keys.len()];
+                keys.read(0, &mut seen)
+            },
+            &mut unlimited,
+        )
+        .unwrap();
+    assert_eq!(source, crate::views::reference_sidecar::KeySource::Sidecar);
+    assert_eq!(seen, expected);
+}
+
+#[test]
+fn derived_index_row_of_a_superseded_publication_is_never_written() {
+    let (_dirs, mut main, _worker) = checkouts(24);
+    publish_checkout(&main).unwrap();
+    let view_dir = ViewStore::open(&main.storage, &main.scope)
+        .unwrap()
+        .view_dir()
+        .to_owned();
+    let edit = |request: &mut AssemblyRequest, body: &str| {
+        fs::write(
+            request.project_root.join("file_0.ts"),
+            format!("export function target_0() {{ return {body}; }}"),
+        )
+        .unwrap();
+        request.changed_paths.insert(b"file_0.ts".to_vec());
+    };
+    edit(&mut main, "1");
+    let mut older = prepare_checkout(&main, &mut |_| Ok(())).unwrap();
+    let older_generation = older.commit().unwrap().generation.unwrap();
+    // A newer publication is committed and settled before the older one's
+    // deferred index write runs.
+    edit(&mut main, "2");
+    let newer = publish_checkout(&main).unwrap();
+    older.settle_status();
+
+    assert_eq!(
+        index_writes_for_test(&view_dir),
+        vec![
+            IndexWrite::Recorded,
+            IndexWrite::Recorded,
+            IndexWrite::Superseded
+        ]
+    );
+    let rows = derived_index::candidates(&index_of(&main), &[0; 32], "some-other-scope").unwrap();
+    let row = rows.iter().find(|row| row.scope == main.scope).unwrap();
+    assert_eq!(Some(&row.generation), newer.generation.as_ref());
+    assert_ne!(row.generation, older_generation);
+}
+
+#[test]
+fn worker_seed_copy_that_fails_readiness_is_rebuilt_cold_not_served() {
+    // A copy that is well-formed SQLite but whose build never finished, and a
+    // torn copy cut off partway through. Neither may be patched into the
+    // worker's generation.
+    type Damage = fn(&Path);
+    let unfinished: Damage = |derived| {
+        Connection::open(derived)
+            .unwrap()
+            .execute("UPDATE meta SET v = '0' WHERE k = 'ready'", [])
+            .unwrap();
+    };
+    let torn: Damage = |derived| {
+        let file = fs::OpenOptions::new().write(true).open(derived).unwrap();
+        let len = file.metadata().unwrap().len();
+        file.set_len(len / 2).unwrap();
+    };
+    for (label, damage, expected) in [
+        ("unfinished", unfinished, &["base_not_ready"][..]),
+        ("torn", torn, &["base_not_ready", "base_unreadable"][..]),
+    ] {
+        let (_dirs, main, mut worker) = checkouts(24);
+        publish_checkout(&main).unwrap();
+        crate::views::generation::wait_for_derived_checkpoint_for_test(
+            ViewStore::open(&main.storage, &main.scope)
+                .unwrap()
+                .view_dir(),
+        );
+        fs::write(
+            worker.project_root.join("file_0.ts"),
+            "export function target_0() { return 7; }",
+        )
+        .unwrap();
+        worker.changed_paths.insert(b"file_0.ts".to_vec());
+        super::after_derived_clone_for_test(damage);
+        let mut prepared = prepare_checkout(&worker, &mut |_| Ok(())).unwrap();
+        assert_eq!(prepared.profile.seed_source, "cold", "{label}");
+        assert!(
+            expected.contains(&prepared.profile.cold_build_reason),
+            "{label}: {}",
+            prepared.profile.cold_build_reason
+        );
+        let report = prepared.commit().unwrap();
+        assert_cold_parity(&worker, &report);
+    }
 }
 
 #[test]
@@ -464,4 +806,137 @@ fn bench_repository_cold_materialization() {
             .unwrap();
         println!("repository table={name} allocated_bytes={bytes}");
     }
+}
+
+/// Bytes written by a sibling-seeded worker publication, with the donor copied
+/// by SQLite backup (the previous behavior) and copy-on-write (macOS).
+///
+/// Set `AFT_IO_PROBE_DIR` to an empty directory and `AFT_IO_PROBE_ROOT` to a
+/// Git checkout. The driver clones that checkout into the probe directory,
+/// adds two linked worktrees with the same one-file edit, publishes the clone
+/// cold, then publishes each worktree seeded from it. It prints `IO_PROBE`
+/// JSON lines like the other view I/O drivers.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "builds a real checkout's views twice; run single-threaded with isolated HOME/XDG"]
+fn io_amplification_sibling_seed_probe() {
+    use crate::process_io::Bytes;
+    use crate::write_ledger::{pending_for_test, Domain};
+    use std::sync::atomic::Ordering;
+
+    let base =
+        PathBuf::from(std::env::var_os("AFT_IO_PROBE_DIR").expect("set isolated probe directory"));
+    let source = PathBuf::from(std::env::var_os("AFT_IO_PROBE_ROOT").expect("set checkout root"));
+    fs::create_dir_all(&base).unwrap();
+    let base = base.canonicalize().unwrap();
+    let main_root = base.join("main");
+    assert!(!main_root.exists(), "use an empty directory for a cold run");
+    assert!(std::process::Command::new("git")
+        .args(["clone", "--quiet", "--local"])
+        .arg(&source)
+        .arg(&main_root)
+        .status()
+        .unwrap()
+        .success());
+    let workers = ["worker-backup", "worker-clonefile"].map(|name| base.join(name));
+    for worker in &workers {
+        git(
+            &main_root,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                worker.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+    }
+    let storage = base.join("store");
+    let request = |root: &Path| AssemblyRequest {
+        storage: storage.clone(),
+        project_root: root.to_path_buf(),
+        family: crate::search_index::artifact_cache_key(root),
+        scope: crate::path_identity::project_scope_key(root),
+        desired_head: head_tree_fingerprint(&head_tree_entries(root).unwrap()),
+        changed_paths: Default::default(),
+        semantic_keys: Default::default(),
+        require_semantic: false,
+        allow_blob_put: true,
+        callgraph: true,
+    };
+    let measure = |label: &str, request: &AssemblyRequest| {
+        let root_id = request.project_root.display().to_string();
+        let domains = [
+            Domain::ViewsBlob,
+            Domain::ViewsDerived,
+            Domain::ViewsClosure,
+        ];
+        let before_domains = domains.map(|domain| pending_for_test(domain, &root_id));
+        let before = Bytes::capture().unwrap();
+        let started = Instant::now();
+        let mut prepared = prepare_checkout(request, &mut |_| Ok(())).unwrap();
+        let seed_source = prepared.profile.seed_source;
+        let cold_build_reason = prepared.profile.cold_build_reason;
+        let clone_mechanism = prepared.profile.clone_mechanism;
+        let clone_ms = prepared.profile.derived_clone_ms;
+        let report = prepared.commit().unwrap();
+        let io = Bytes::capture().unwrap().delta(before).unwrap();
+        let elapsed_ms = started.elapsed().as_millis();
+        for (domain, baseline) in domains.into_iter().zip(before_domains) {
+            let after = pending_for_test(domain, &root_id);
+            eprintln!(
+                "IO_PROBE {}",
+                serde_json::json!({
+                    "kind": "domain", "label": label, "domain": domain.as_str(),
+                    "logical_bytes": after.0 - baseline.0,
+                    "physical_bytes": after.1 - baseline.1,
+                })
+            );
+        }
+        eprintln!(
+            "IO_PROBE {}",
+            serde_json::json!({
+                "kind": "publication", "label": label, "io": io,
+                "elapsed_ms": elapsed_ms, "clone_ms": clone_ms,
+                "seed_source": seed_source, "cold_build_reason": cold_build_reason,
+                "clone_mechanism": clone_mechanism, "blob_puts": report.blob_puts,
+            })
+        );
+        let view = ViewStore::open(&request.storage, &request.scope).unwrap();
+        crate::views::generation::wait_for_derived_checkpoint_for_test(view.view_dir());
+        (seed_source, clone_mechanism)
+    };
+    measure("main_cold", &request(&main_root));
+    // The same small edit in both worktrees, so both patches do the same work.
+    let edited = "crates/aft/src/views/profile.rs";
+    for (worker, force_backup) in workers.iter().zip([true, false]) {
+        let path = worker.join(edited);
+        let mut text = fs::read_to_string(&path).unwrap();
+        text.push_str("\n// sibling seed probe edit\n");
+        fs::write(&path, text).unwrap();
+        let mut worker_request = request(worker);
+        worker_request
+            .changed_paths
+            .insert(edited.as_bytes().to_vec());
+        crate::views::generation::FORCE_BACKUP_CLONE_FOR_TEST
+            .store(force_backup, Ordering::Relaxed);
+        let label = if force_backup {
+            "worker_sqlite_backup"
+        } else {
+            "worker_clonefile"
+        };
+        let (seed_source, mechanism) = measure(label, &worker_request);
+        assert_eq!(seed_source, "sibling", "{label}");
+        assert_eq!(
+            mechanism,
+            if force_backup {
+                "sqlite_backup"
+            } else {
+                "clonefile"
+            },
+            "{label}"
+        );
+    }
+    crate::views::generation::FORCE_BACKUP_CLONE_FOR_TEST.store(false, Ordering::Relaxed);
 }

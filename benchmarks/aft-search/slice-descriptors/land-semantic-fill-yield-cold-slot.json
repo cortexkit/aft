@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "semantic-fill-yield-cold-slot"
+  ],
+  "note": "Views semantic fills yield cold-build slots during embedding-backend and shared-work waits; scheduling only, no ranking or stored-vector change. No changed path matches RANKING_FENCE_PREFIXES."
+}

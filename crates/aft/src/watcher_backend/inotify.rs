@@ -30,9 +30,13 @@ pub(crate) struct ProjectWatcher {
     shutdown: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
     watched_directory_count: Arc<AtomicUsize>,
+    initial_coverage: super::InitialCoverage,
 }
 
 impl ProjectWatcher {
+    pub(crate) fn initial_coverage(&self) -> super::InitialCoverage {
+        self.initial_coverage.clone()
+    }
     pub(crate) fn create(
         root: PathBuf,
         extra_watch_paths: Vec<PathBuf>,
@@ -114,36 +118,76 @@ impl ProjectWatcher {
 
         let (backend_tx, backend_rx) = mpsc::channel();
         let mut watcher = notify::recommended_watcher(backend_tx)?;
-        let walked_directories = exclusion_state
-            .boundary()
-            .map_or_else(BTreeMap::new, |boundary| {
-                collect_watch_directories(boundary, &matcher, &exclusion_paths)
-            });
         counters.set_backend_exclusions(
             observed_generation.unwrap_or(0),
             exclusion_paths.clone(),
             watcher_exclusion_paths(&plan.dropped),
         );
-        let mut installed = BTreeSet::new();
-        for directory in desired_watch_directories(
-            walked_directories,
-            &BTreeSet::new(),
-            &matcher,
-            &exclusion_paths,
-            &root,
-        ) {
-            if watch_directory(&mut watcher, &directory, &mut watch, &counters)? {
-                installed.insert(directory.clone());
-            } else if directory == root {
-                return Err(notify::Error::path_not_found().add_path(root));
-            }
-        }
+        let boundary = exclusion_state
+            .boundary()
+            .ok_or_else(|| notify::Error::path_not_found().add_path(root.clone()))?;
+        let InitialRegistration {
+            watched: installed,
+            mut gaps,
+        } = register_initial_tree(boundary, &matcher, &exclusion_paths, &mut |directory| {
+            watch_directory(&mut watcher, directory, &mut watch, &counters)
+        })?;
         let mut watched_directories = installed;
+        let git_directory = root.join(".git");
+        let mut git_watched = watched_directories.contains(&git_directory);
         for path in extra_watch_paths {
-            if path.exists() {
-                let _ = watch_directory(&mut watcher, &path, &mut watch, &counters)?;
+            let exists = match path.try_exists() {
+                Ok(exists) => exists,
+                Err(error) => {
+                    gaps.push(super::CoverageGap {
+                        path: path.clone(),
+                        kind: super::CoverageGapKind::MetadataFailed(error.kind()),
+                    });
+                    if path == git_directory {
+                        git_watched = false;
+                    }
+                    continue;
+                }
+            };
+            if exists {
+                let watched = match watch_directory(&mut watcher, &path, &mut watch, &counters) {
+                    Ok(watched) => watched,
+                    Err(error) if fatal_watch_error(&error) => return Err(error),
+                    Err(error) => {
+                        let kind = match &error.kind {
+                            ErrorKind::Io(error) => error.kind(),
+                            _ => std::io::ErrorKind::Other,
+                        };
+                        gaps.push(super::CoverageGap {
+                            path: path.clone(),
+                            kind: super::CoverageGapKind::WatchFailed(kind),
+                        });
+                        if path == git_directory {
+                            git_watched = false;
+                        }
+                        continue;
+                    }
+                };
+                if !watched {
+                    gaps.push(super::CoverageGap {
+                        path: path.clone(),
+                        kind: super::CoverageGapKind::WatchLost,
+                    });
+                }
+                if path == git_directory {
+                    git_watched = watched;
+                }
             }
         }
+        counters.bash_flush.set_marker_directory(
+            if git_watched
+                && std::fs::symlink_metadata(&git_directory).is_ok_and(|metadata| metadata.is_dir())
+            {
+                git_directory
+            } else {
+                root.clone()
+            },
+        );
 
         let watched_directory_count = Arc::new(AtomicUsize::new(watched_directories.len()));
         let thread_count = Arc::clone(&watched_directory_count);
@@ -321,6 +365,19 @@ impl ProjectWatcher {
 
                     match backend_rx.recv_timeout(BACKEND_POLL_INTERVAL) {
                         Ok(Ok(event)) => {
+                            if event.paths.iter().any(|path| {
+                                super::cookie::is_cookie_path(path)
+                                    || (counters.bash_changes.get().is_some()
+                                        && super::flush::is_marker_path(path))
+                            }) {
+                                // New-directory recovery waits briefly for duplicate kernel
+                                // events. Publish its files before the ordered marker too.
+                                if !new_directory_files.files.is_empty()
+                                    && tx.send(Ok(new_directory_files.take_event())).is_err()
+                                {
+                                    return;
+                                }
+                            }
                             let changed_paths = exclusion_state.refresh_event(&event);
                             if !changed_paths.is_empty() {
                                 exclusion_paths = exclusion_state.paths();
@@ -437,6 +494,11 @@ impl ProjectWatcher {
             shutdown,
             join: Some(join),
             watched_directory_count,
+            initial_coverage: if gaps.is_empty() {
+                super::InitialCoverage::Complete
+            } else {
+                super::InitialCoverage::Incomplete(gaps)
+            },
         })
     }
 
@@ -479,6 +541,11 @@ impl Drop for ProjectWatcher {
 // A removed directory cannot contain live files to invalidate. A move out
 // produces a rename event for its old path; a move into the root is scanned
 // on Rename(To), including any files already present in its subtree.
+fn fatal_watch_error(error: &notify::Error) -> bool {
+    matches!(error.kind, ErrorKind::MaxFilesWatch)
+        || matches!(&error.kind, ErrorKind::Io(io) if matches!(io.raw_os_error(), Some(libc::ENOSPC | libc::EMFILE | libc::ENFILE)))
+}
+
 fn watch_directory<F>(
     watcher: &mut notify::RecommendedWatcher,
     path: &Path,
@@ -493,8 +560,7 @@ where
         Err(error) => {
             // Limits and resource exhaustion are failures of the watcher, even
             // if the directory happens to disappear before the recheck.
-            let fatal = matches!(error.kind, ErrorKind::MaxFilesWatch)
-                || matches!(&error.kind, ErrorKind::Io(io) if matches!(io.raw_os_error(), Some(libc::ENOSPC | libc::EMFILE | libc::ENFILE)));
+            let fatal = fatal_watch_error(&error);
             if !fatal
                 && (matches!(error.kind, ErrorKind::PathNotFound)
                     || matches!(&error.kind, ErrorKind::Io(io) if io.kind() == std::io::ErrorKind::NotFound)
@@ -707,6 +773,121 @@ impl DirectoryIdentity {
     }
 }
 
+struct InitialRegistration {
+    watched: BTreeSet<PathBuf>,
+    gaps: Vec<super::CoverageGap>,
+}
+
+/// Arm each parent before listing it. Keep covered directories running when a
+/// descendant fails, but retain every gap so indexing cannot trust full coverage.
+fn register_initial_tree(
+    boundary: &crate::watcher_filter::WatcherWalkBoundary,
+    matcher: &SharedGitignore,
+    exclusions: &[PathBuf],
+    watch: &mut dyn FnMut(&Path) -> notify::Result<bool>,
+) -> notify::Result<InitialRegistration> {
+    let root = boundary.root();
+    let mut stack = vec![root.to_path_buf()];
+    let mut installed = BTreeSet::new();
+    let mut gaps = Vec::new();
+    while let Some(directory) = stack.pop() {
+        if exclusions
+            .iter()
+            .any(|excluded| directory.starts_with(excluded))
+            || watcher_directory_is_ignored_by_matcher(matcher, &directory, root)
+        {
+            continue;
+        }
+        match std::fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                gaps.push(super::CoverageGap {
+                    path: directory,
+                    kind: super::CoverageGapKind::WatchLost,
+                });
+                continue;
+            }
+            Err(error) if directory == root => {
+                return Err(notify::Error::io(error).add_path(directory))
+            }
+            Err(error) => {
+                gaps.push(super::CoverageGap {
+                    path: directory,
+                    kind: super::CoverageGapKind::MetadataFailed(error.kind()),
+                });
+                continue;
+            }
+        }
+        if !boundary.allows_directory(&directory) {
+            continue;
+        }
+        match watch(&directory) {
+            Ok(true) => {}
+            Ok(false) => {
+                gaps.push(super::CoverageGap {
+                    path: directory,
+                    kind: super::CoverageGapKind::WatchLost,
+                });
+                continue;
+            }
+            Err(error) if directory == root || fatal_watch_error(&error) => return Err(error),
+            Err(error) => {
+                let kind = match &error.kind {
+                    ErrorKind::Io(error) => error.kind(),
+                    _ => std::io::ErrorKind::Other,
+                };
+                gaps.push(super::CoverageGap {
+                    path: directory,
+                    kind: super::CoverageGapKind::WatchFailed(kind),
+                });
+                continue;
+            }
+        }
+        installed.insert(directory.clone());
+        #[cfg(test)]
+        tests::block_watch_walk(&directory);
+        #[cfg(test)]
+        let entries = if tests::initial_listing_denied(&directory) {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        } else {
+            crate::watcher_filter::exclusion_read_dir(&directory)
+        };
+        #[cfg(not(test))]
+        let entries = crate::watcher_filter::exclusion_read_dir(&directory);
+        match entries {
+            Ok(entries) => {
+                for entry in entries {
+                    match entry {
+                        Ok(entry) => match entry.file_type() {
+                            Ok(kind) if kind.is_dir() => stack.push(entry.path()),
+                            Ok(_) => {}
+                            Err(error) => gaps.push(super::CoverageGap {
+                                path: entry.path(),
+                                kind: super::CoverageGapKind::MetadataFailed(error.kind()),
+                            }),
+                        },
+                        Err(error) => gaps.push(super::CoverageGap {
+                            path: directory.clone(),
+                            kind: super::CoverageGapKind::ListingFailed(error.kind()),
+                        }),
+                    }
+                }
+            }
+            Err(error) => gaps.push(super::CoverageGap {
+                path: directory,
+                kind: super::CoverageGapKind::ListingFailed(error.kind()),
+            }),
+        }
+    }
+    if !installed.contains(root) {
+        return Err(notify::Error::path_not_found().add_path(root.to_path_buf()));
+    }
+    Ok(InitialRegistration {
+        watched: installed,
+        gaps,
+    })
+}
+
 fn collect_watch_directories(
     boundary: &crate::watcher_filter::WatcherWalkBoundary,
     matcher: &SharedGitignore,
@@ -785,6 +966,224 @@ fn desired_watch_directories(
 
 #[cfg(test)]
 pub(super) mod tests {
+    thread_local! {
+        static INITIAL_LISTING_DENIED: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    }
+    pub(super) fn initial_listing_denied(path: &Path) -> bool {
+        INITIAL_LISTING_DENIED.with(|denied| denied.borrow().as_deref() == Some(path))
+    }
+    struct InitialListingDenial(Option<PathBuf>);
+    impl Drop for InitialListingDenial {
+        fn drop(&mut self) {
+            INITIAL_LISTING_DENIED.with(|denied| *denied.borrow_mut() = self.0.take());
+        }
+    }
+    fn deny_initial_listing(path: PathBuf) -> InitialListingDenial {
+        InitialListingDenial(INITIAL_LISTING_DENIED.with(|denied| denied.replace(Some(path))))
+    }
+
+    #[test]
+    fn initial_subscription_arms_parent_before_listing_new_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let boundary = crate::watcher_filter::WatcherWalkBoundary::for_root(&root).unwrap();
+        let mut order = Vec::new();
+        let installed = register_initial_tree(
+            &boundary,
+            &Arc::new(RwLock::new(None)),
+            &[],
+            &mut |directory| {
+                order.push(directory.to_path_buf());
+                if directory == root {
+                    std::fs::create_dir(root.join("during")).unwrap();
+                }
+                if directory == root.join("during") {
+                    std::fs::create_dir(directory.join("nested")).unwrap();
+                }
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            order,
+            vec![
+                root.clone(),
+                root.join("during"),
+                root.join("during/nested")
+            ]
+        );
+        assert_eq!(installed.watched.len(), 3);
+        assert!(installed.gaps.is_empty());
+    }
+
+    #[test]
+    fn initial_subscription_reports_partial_watches_and_incomplete_listings() {
+        for remove_after_watch in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            std::fs::create_dir(root.join("child")).unwrap();
+            let boundary = crate::watcher_filter::WatcherWalkBoundary::for_root(&root).unwrap();
+            let result = register_initial_tree(
+                &boundary,
+                &Arc::new(RwLock::new(None)),
+                &[],
+                &mut |directory| {
+                    if directory == root {
+                        return Ok(true);
+                    }
+                    if remove_after_watch {
+                        std::fs::remove_dir(directory).unwrap();
+                        Ok(true)
+                    } else {
+                        Ok(false)
+                    }
+                },
+            );
+            let registration = result.unwrap();
+            assert!(registration.watched.contains(&root));
+            assert!(registration
+                .gaps
+                .iter()
+                .any(|gap| gap.path == root.join("child")));
+        }
+    }
+
+    #[test]
+    fn initial_subscription_cannot_certify_a_root_lost_before_registration() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let boundary = crate::watcher_filter::WatcherWalkBoundary::for_root(&root).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        let result =
+            register_initial_tree(&boundary, &Arc::new(RwLock::new(None)), &[], &mut |_| {
+                Ok(true)
+            });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn partial_initial_coverage_keeps_shared_watching_but_never_grants_v3_trust() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("readable")).unwrap();
+        std::fs::create_dir_all(root.join("unreadable/nested")).unwrap();
+        std::fs::write(root.join("unreadable/nested/file.rs"), b"fn hidden() {}\n").unwrap();
+        let _denied = deny_initial_listing(root.join("unreadable"));
+        let (tx, rx) = mpsc::channel();
+        let watcher = ProjectWatcher::create(
+            root.clone(),
+            vec![],
+            tx,
+            Arc::new(RwLock::new(None)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .unwrap();
+        let coverage = super::super::initial_coverage_of(&watcher);
+        let super::super::InitialCoverage::Incomplete(gaps) = &coverage else {
+            panic!("partial registration must name its gap")
+        };
+        assert!(gaps.iter().any(|gap| gap.path == root.join("unreadable")
+            && gap.kind
+                == super::super::CoverageGapKind::ListingFailed(
+                    std::io::ErrorKind::PermissionDenied
+                )));
+        let changed = root.join("readable/still-watched.rs");
+        std::fs::write(&changed, b"fn visible() {}\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let event = rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap()
+                .unwrap();
+            if event.paths.contains(&changed) {
+                break;
+            }
+        }
+        let _subscription = super::super::subscription::start(&root, coverage.clone());
+        assert_eq!(
+            super::super::subscription::status(&root).unwrap().coverage,
+            coverage
+        );
+        assert!(super::super::subscription::current(&root).is_none());
+        let policy = crate::blob_store::v2::TrigramPolicy {
+            max_file_size: 1 << 20,
+        };
+        let driver = crate::views::first_load::CheckoutDriver::new_v3(
+            storage.path(),
+            "family",
+            "worker",
+            &root,
+            crate::views::manifest_v2::Producers {
+                trigram: policy.fingerprint_hex(),
+                semantic: None,
+                callgraph: "unregistered".into(),
+            },
+            Arc::new(crate::views::first_load::ConfiguredMembershipWalker),
+            vec![Arc::new(crate::views::first_load::TrigramBridge::new(
+                storage.path().to_owned(),
+                policy,
+            ))],
+        )
+        .unwrap();
+        let access = driver.access();
+        let (snapshot, revision) = driver
+            .verified_bind(&access, driver.installed_snapshot().generation().clone())
+            .unwrap();
+        assert!(snapshot
+            .generation()
+            .published()
+            .unwrap()
+            .verified_frontier
+            .is_none());
+        assert!(driver.take_reconcile_work().walks > 0);
+        use crate::views::first_load::FirstLoadDriver;
+        driver.install(&access, &snapshot, revision).unwrap();
+        assert!(driver.installed_snapshot().needs_reconcile());
+    }
+
+    #[test]
+    fn watcher_cookie_inotify_recovery_precedes_root_cookie_without_command_tracking() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let tree = staging.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        std::fs::write(tree.join("source.rs"), b"already populated").unwrap();
+        let counters = crate::context::watcher_counters_for_root(&root);
+        assert!(counters.bash_changes.get().is_none());
+        let (tx, rx) = mpsc::channel();
+        let _watcher = ProjectWatcher::create(
+            root.clone(),
+            vec![],
+            tx,
+            Arc::new(RwLock::new(None)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .unwrap();
+        std::fs::rename(&tree, root.join("tree")).unwrap();
+        let cookie = root.join(".aft-cookie-123-nonce");
+        std::fs::write(&cookie, b"").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut recovered = false;
+        loop {
+            let event = rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap()
+                .unwrap();
+            assert!(!event.need_rescan());
+            recovered |= event.paths.contains(&root.join("tree/source.rs"));
+            if event.paths.contains(&cookie) {
+                assert!(
+                    recovered,
+                    "cookie overtook recovered new-directory membership"
+                );
+                break;
+            }
+        }
+    }
+
     use std::sync::{Condvar, Mutex, OnceLock, RwLock};
     use std::time::{Duration, Instant};
 

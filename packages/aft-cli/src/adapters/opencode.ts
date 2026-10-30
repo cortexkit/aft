@@ -527,6 +527,7 @@ export class OpenCodeAdapter implements HarnessAdapter {
       .find(isAftNpmEntry);
     const path = join(getOpenCodeCacheDir(), "packages", configuredEntry ?? PLUGIN_ENTRY);
     let cached: string | undefined;
+    let readError: string | undefined;
     try {
       const installedPkgPath = join(
         path,
@@ -535,16 +536,17 @@ export class OpenCodeAdapter implements HarnessAdapter {
         "aft-opencode",
         "package.json",
       );
-      if (existsSync(installedPkgPath)) {
-        const pkg = JSON.parse(readFileSync(installedPkgPath, "utf-8")) as { version?: unknown };
-        cached = typeof pkg.version === "string" ? pkg.version : undefined;
+      const pkg = JSON.parse(readFileSync(installedPkgPath, "utf-8")) as { version?: unknown };
+      cached = typeof pkg.version === "string" ? pkg.version : undefined;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        readError = error instanceof Error ? error.message : String(error);
       }
-    } catch {
-      cached = undefined;
     }
     return {
       path,
       cached,
+      readError,
       latest: getSelfVersion(),
       exists: existsSync(path),
       configuredEntry,

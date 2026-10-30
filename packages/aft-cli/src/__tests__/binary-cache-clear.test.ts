@@ -4,9 +4,9 @@
  * Tests for `clearOldBinaries`.
  *
  * The user-facing contract: `aft doctor --clear` (with the binary-cache
- * option selected) deletes every cached `aft` binary version EXCEPT the
- * one matching the running CLI. Keeping the active version protects a
- * live OpenCode/Pi process that's currently executing from that binary.
+ * option selected) retains the running CLI's binary and versions installed or
+ * pinned by harness plugins. Keeping those versions avoids breaking live or
+ * offline OpenCode/Pi sessions.
  *
  * Tests use AFT_CACHE_DIR to redirect `getAftBinaryCacheDir()` away from
  * `~/.cache/aft/`, so we don't disturb the user's real cache.
@@ -26,6 +26,68 @@ let releaseEnv: (() => void) | undefined;
 beforeEach(async () => {
   workDir = mkdtempSync(join(tmpdir(), "aft-binary-cache-clear-"));
   releaseEnv = await acquireEnv({ AFT_CACHE_DIR: workDir });
+});
+
+describe("binary prune safety", () => {
+  test("unknown CLI version leaves every cached binary untouched", () => {
+    seedBinary("v0.1.0");
+    seedBinary("v0.2.0");
+    const result = clearOldBinaries("unknown", []);
+    expect(result.cleared).toBe(0);
+    expect(result.keptVersion).toBeNull();
+    expect(existsSync(join(workDir, "bin", "v0.1.0"))).toBe(true);
+    expect(existsSync(join(workDir, "bin", "v0.2.0"))).toBe(true);
+  });
+
+  test("unreadable plugin registration leaves every cached binary untouched", () => {
+    seedBinary("v0.1.0");
+    const result = clearOldBinaries(getSelfVersion(), [
+      {
+        pluginPackageName: "@cortexkit/aft-pi",
+        getPluginCacheInfo: () => {
+          throw new Error("unreadable registration");
+        },
+      },
+    ]);
+    expect(result.cleared).toBe(0);
+    expect(existsSync(join(workDir, "bin", "v0.1.0"))).toBe(true);
+  });
+});
+
+describe("plugin binary retention", () => {
+  test("installed and exact configured plugin versions survive binary pruning", () => {
+    for (const version of ["v0.1.0", "v0.2.0", "v0.3.0"]) seedBinary(version);
+    const result = clearOldBinaries(getSelfVersion(), [
+      {
+        pluginPackageName: "@cortexkit/aft-pi",
+        getPluginCacheInfo: () => ({
+          path: workDir,
+          exists: true,
+          cached: "0.1.0",
+          configuredEntry: "npm:@cortexkit/aft-pi@0.2.0",
+        }),
+      },
+    ]);
+    expect(result.cleared).toBe(1);
+    expect(existsSync(join(workDir, "bin", "v0.1.0"))).toBe(true);
+    expect(existsSync(join(workDir, "bin", "v0.2.0"))).toBe(true);
+    expect(existsSync(join(workDir, "bin", "v0.3.0"))).toBe(false);
+  });
+
+  test("a configured exact pin survives before the plugin is installed", () => {
+    seedBinary("v0.1.0");
+    seedBinary("v0.2.0");
+    const result = clearOldBinaries(getSelfVersion(), [
+      {
+        pluginPackageName: "@cortexkit/aft-pi",
+        getPluginCacheInfo: () => ({ path: workDir, exists: false }),
+        getConfiguredPluginEntry: () => "npm:@cortexkit/aft-pi@0.1.0",
+      },
+    ]);
+    expect(result.cleared).toBe(1);
+    expect(existsSync(join(workDir, "bin", "v0.1.0"))).toBe(true);
+    expect(existsSync(join(workDir, "bin", "v0.2.0"))).toBe(false);
+  });
 });
 
 afterEach(() => {

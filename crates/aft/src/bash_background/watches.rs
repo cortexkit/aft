@@ -1,6 +1,9 @@
 use regex::{Regex, RegexBuilder};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
+
+use super::watch_lines::{LineBatch, LineDelivery};
 
 const MAX_WATCHES_PER_TASK: usize = 8;
 const CONTEXT_BEFORE: usize = 100;
@@ -65,10 +68,28 @@ pub struct PatternMatch {
     pub match_offset: u64,
     pub context: String,
     pub once: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch: Option<LineBatch>,
+    /// The watch is a substring watch, so `match_text` is the pattern exactly
+    /// as the agent supplied it rather than text taken from the output.
+    /// Presentation masking must leave it as it is.
+    #[serde(skip)]
+    pub literal_pattern: bool,
+}
+
+impl PatternMatch {
+    pub(super) fn copy_delivery_identity(&mut self, persisted: &Self) {
+        if let (Some(live), Some(saved)) = (self.batch.as_mut(), persisted.batch.as_ref()) {
+            self.match_offset = persisted.match_offset;
+            live.pending_id = saved.pending_id.clone();
+            live.version = saved.version;
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 pub struct WatchRegistry {
+    line_delivery: HashMap<String, LineDelivery>,
     watches: HashMap<String, Vec<WatchSpec>>,
     scan_cursors: HashMap<String, u64>,
     scan_overlaps: HashMap<String, Vec<u8>>,
@@ -81,6 +102,68 @@ pub struct WatchRegistry {
 }
 
 impl WatchRegistry {
+    pub fn enable_each_line(&mut self, watch_id: &str) {
+        self.line_delivery.entry(watch_id.to_string()).or_default();
+    }
+
+    pub fn is_each_line(&self, watch_id: &str) -> bool {
+        self.line_delivery.contains_key(watch_id)
+    }
+
+    pub fn replay_cursor(&self, task_id: &str, stream: &str, cursor: u64) -> u64 {
+        self.watch_ids(task_id)
+            .iter()
+            .filter_map(|id| self.line_delivery.get(id))
+            .fold(cursor, |cursor, delivery| {
+                delivery.replay_cursor(stream, cursor)
+            })
+    }
+
+    pub fn take_line_batches(&mut self, task_id: &str, terminal: bool) -> Vec<PatternMatch> {
+        self.take_line_batches_at(task_id, terminal, Instant::now())
+    }
+
+    fn take_line_batches_at(
+        &mut self,
+        task_id: &str,
+        terminal: bool,
+        now: Instant,
+    ) -> Vec<PatternMatch> {
+        let mut found = Vec::new();
+        for watch in self.watch_specs(task_id) {
+            let Some(delivery) = self.line_delivery.get_mut(&watch.watch_id) else {
+                continue;
+            };
+            let Some(batch) = delivery.take(now, terminal, &watch.pattern) else {
+                continue;
+            };
+            let matched = batch.has_matches();
+            let offset = batch
+                .lines
+                .first()
+                .map(|line| line.offset)
+                .or(batch.first_dropped_offset)
+                .unwrap_or(0);
+            if matched {
+                self.matched_tasks.insert(task_id.to_string());
+            }
+            found.push(PatternMatch {
+                watch_id: watch.watch_id.clone(),
+                task_id: task_id.to_string(),
+                match_text: "matching lines".to_string(),
+                match_offset: offset,
+                context: String::new(),
+                once: watch.once && matched,
+                batch: Some(batch),
+                // A batch's rows are rendered from the output separately.
+                literal_pattern: false,
+            });
+            if watch.once && matched {
+                self.unregister(task_id, &watch.watch_id);
+            }
+        }
+        found
+    }
     pub fn register(
         &mut self,
         task_id: String,
@@ -149,6 +232,7 @@ impl WatchRegistry {
     }
 
     pub fn unregister(&mut self, task_id: &str, watch_id: &str) {
+        self.line_delivery.remove(watch_id);
         if let Some(watches) = self.watches.get_mut(task_id) {
             watches.retain(|watch| watch.watch_id != watch_id);
             if watches.is_empty() {
@@ -183,6 +267,11 @@ impl WatchRegistry {
         keep: &HashSet<String>,
         has_pending_match: bool,
     ) {
+        for watch_id in self.watch_ids(task_id) {
+            if !keep.contains(&watch_id) {
+                self.line_delivery.remove(&watch_id);
+            }
+        }
         let watches_empty = if let Some(watches) = self.watches.get_mut(task_id) {
             watches.retain(|watch| keep.contains(&watch.watch_id));
             watches.is_empty()
@@ -199,6 +288,9 @@ impl WatchRegistry {
     }
 
     pub fn clear_task(&mut self, task_id: &str) {
+        for watch_id in self.watch_ids(task_id) {
+            self.line_delivery.remove(&watch_id);
+        }
         self.watches.remove(task_id);
         self.controlled_tasks.remove(task_id);
         self.matched_tasks.remove(task_id);
@@ -309,17 +401,29 @@ impl WatchRegistry {
         let mut matches = Vec::new();
         let mut remove_once = Vec::new();
         for watch in watches {
+            if let Some(delivery) = self.line_delivery.get_mut(&watch.watch_id) {
+                let stream = cursor_key.rsplit(':').next().unwrap_or("stdout");
+                delivery.scan(stream, bytes, base_offset, &watch.pattern);
+                continue;
+            }
             if let Some((text_start, text_end, source_start, source_end)) =
                 find_match(&watch.pattern, &text, &scan_bytes, prefix_len)
             {
                 self.matched_tasks.insert(task_id.to_string());
-                let (match_text, context) = render(
+                let (rendered_match, context) = render(
                     &text,
                     text_start,
                     text_end,
                     scan_base_offset.saturating_add(source_start as u64),
                     scan_base_offset.saturating_add(source_end as u64),
                 );
+                // A substring watch matches exactly the text the agent gave it,
+                // which the agent already has, so it is shown as given. Only a
+                // regex match is text taken from the output and may be masked.
+                let (match_text, literal_pattern) = match &watch.pattern {
+                    WatchPattern::Substring(needle) => (needle.clone(), true),
+                    WatchPattern::Regex(_) => (rendered_match, false),
+                };
                 matches.push(PatternMatch {
                     watch_id: watch.watch_id.clone(),
                     task_id: watch.task_id.clone(),
@@ -327,6 +431,8 @@ impl WatchRegistry {
                     match_offset: scan_base_offset.saturating_add(source_start as u64),
                     context,
                     once: watch.once,
+                    batch: None,
+                    literal_pattern,
                 });
                 if watch.once {
                     remove_once.push(watch.watch_id);
@@ -430,6 +536,40 @@ pub(super) fn context_range(text: &str, start: usize, end: usize) -> std::ops::R
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn each_line_default_frame_is_unchanged() {
+        let mut registry = super::WatchRegistry::default();
+        registry
+            .register(
+                "task".into(),
+                super::WatchPattern::Substring("ERROR".into()),
+                false,
+            )
+            .unwrap();
+        let found = registry.scan_new_bytes("task", b"ERROR a\nERROR b\n");
+        assert_eq!(
+            serde_json::to_string(&found).unwrap(),
+            r#"[{"watch_id":"watch-00000001","task_id":"task","match_text":"ERROR","match_offset":0,"context":"ERROR a\nERROR b\n","once":false}]"#
+        );
+    }
+
+    #[test]
+    fn each_line_registry_batches_across_pages() {
+        let mut registry = super::WatchRegistry::default();
+        let id = registry
+            .register(
+                "task".into(),
+                super::WatchPattern::Substring("ERROR".into()),
+                false,
+            )
+            .unwrap();
+        registry.enable_each_line(&id);
+        registry.scan_new_bytes("task", b"ERROR a\nER");
+        registry.scan_new_bytes("task", b"ROR b\n");
+        let found = registry.take_line_batches("task", false);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].batch.as_ref().unwrap().lines.len(), 2);
+    }
     use super::*;
 
     #[test]

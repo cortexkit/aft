@@ -105,6 +105,10 @@ impl SandboxDataPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxProfile {
+    /// Deny task-port access for a launch whose proxy holds vault material.
+    /// This only tightens the OS profile; it never enables secret resolution.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub secret_proxy: bool,
     pub v: u32,
     #[serde(default)]
     pub mode: crate::config::SandboxMode,
@@ -152,6 +156,19 @@ pub struct SandboxProfile {
     pub worker_gh_fence: Option<WorkerGhFence>,
 }
 
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+#[cfg(test)]
+#[test]
+fn secret_bash_ordinary_profile_retains_legacy_bytes() {
+    let legacy = r#"{"v":7,"mode":"strict","worker_jail":false,"deny_prefixes":[],"data_policy":{"deny":[],"read_allow":[],"write_allow":[]},"writable_roots":[],"write_deny":[],"write_deny_nested":[],"read_allow":[],"read_allow_listed":[],"read_deny":[],"socket_deny":[],"cache_roots":[],"temp_dir":"/policy"}"#;
+    let profile: SandboxProfile = serde_json::from_str(legacy).unwrap();
+    assert!(!profile.secret_proxy);
+    assert_eq!(serde_json::to_string(&profile).unwrap(), legacy);
+}
+
 /// How a worker-jail profile fences the gh shim off the operator's gh.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -186,6 +203,7 @@ impl SandboxProfile {
         // symlinks and formerly missing paths may change between spawns.
         let mut deny_paths = HashMap::new();
         Ok(Self {
+            secret_proxy: false,
             v: SANDBOX_PROFILE_VERSION,
             mode: crate::config::SandboxMode::Strict,
             worker_jail: false,
@@ -231,6 +249,7 @@ impl SandboxProfile {
         let (read_allow, read_allow_listed) =
             canonicalize_read_grants(self.read_allow, self.read_allow_listed, &writable_files)?;
         Ok(Self {
+            secret_proxy: self.secret_proxy,
             v: self.v,
             mode: self.mode,
             worker_jail: self.worker_jail,
@@ -1016,6 +1035,7 @@ mod tests {
     #[cfg(unix)]
     fn dangling_deny_profile(root: &Path, deny: &Path) -> SandboxProfile {
         SandboxProfile {
+            secret_proxy: false,
             write_deny: vec![deny.to_path_buf()],
             write_deny_nested: vec![deny.to_path_buf()],
             read_deny: vec![deny.to_path_buf()],
@@ -1398,6 +1418,7 @@ mod tests {
         let root = tempfile::tempdir().expect("temp root");
         let root = root.path().canonicalize().expect("canonical root");
         let profile = SandboxProfile {
+            secret_proxy: false,
             v: SANDBOX_PROFILE_VERSION,
             mode: crate::config::SandboxMode::Strict,
             worker_jail: false,

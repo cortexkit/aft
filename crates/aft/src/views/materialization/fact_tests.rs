@@ -299,7 +299,14 @@ fn unattributed_binding_forces_counted_full_fallback() {
         [serde_json::to_string(&bindings["a.ts"]).unwrap()],
     )
     .unwrap();
-    let stats = apply_manifest_diff(&copy, &f.base, &f.next, &f.blobs).unwrap();
+    let started = std::time::Instant::now();
+    let (stats, work) = crate::callgraph_store::join::extraction_work::measure(|| {
+        apply_manifest_diff(&copy, &f.base, &f.next, &f.blobs).unwrap()
+    });
+    eprintln!(
+        "unattributed_fallback elapsed_us={} parses={} receiver_calls={} receiver_index_passes={} stats={stats:?}",
+        started.elapsed().as_micros(), work.whole_file_parses, work.receiver_type_calls, work.receiver_index_passes,
+    );
     assert!(stats.full_resolution);
     assert_eq!(stats.unattributed_callers, 1);
     let cold = f.dir.path().join("fallback-cold.sqlite");

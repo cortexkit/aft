@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "stderr-exit-hold-test"
+  ],
+  "note": "Test-only hook (debug builds) that holds the stderr mirror until the exit fence starts, so the slow-writer exit test proves the fence delivers the terminal marker to stderr. No search, ranking or routing code changes."
+}

@@ -117,6 +117,15 @@ fn inject_worker_test_threads_with(
     }
 }
 
+/// Whether `name` is one of the worker test-thread budget names AFT fills in.
+/// A configured `bash.env` value for either must not reach this budget, and
+/// the config loader refuses both, so a caller that merges configuration into
+/// a launch environment drops them first.
+pub(crate) fn is_worker_test_thread_env_name(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    name == NEXT_TEST_THREADS_ENV || name == RUST_TEST_THREADS_ENV
+}
+
 fn has_test_thread_override(environment: &HashMap<String, String>, name: &str) -> bool {
     #[cfg(windows)]
     {
@@ -633,7 +642,7 @@ fn managed_git_hook_contents(hook_name: &str) -> String {
 /// configure and is also cheap enough to repair a stale entry immediately
 /// before a child spawn.
 pub fn maintain(config: &Config, storage_root: &Path) -> Result<(), String> {
-    let shims_dir = storage_root.join(SHIMS_DIR_NAME);
+    let shims_dir = crate::pinned_executable::shims_dir(storage_root);
     if config.github.shim {
         let binary = shim_binary(config)?;
         match reject_self_referential_pin(&binary, &shims_dir)
@@ -892,7 +901,7 @@ pub fn inject(
     maintain(config, storage_root)?;
 
     if gh_enabled {
-        let shims_dir = storage_root.join(SHIMS_DIR_NAME);
+        let shims_dir = crate::pinned_executable::shims_dir(storage_root);
         let inherited = environment
             .get("PATH")
             .map(OsString::from)
@@ -925,7 +934,7 @@ pub fn inject(
 pub fn shim_binary(config: &Config) -> Result<PathBuf, String> {
     let binary = match config.gh_shim.binary_path.as_ref() {
         Some(path) => path.clone(),
-        None => std::env::current_exe()
+        None => crate::pinned_executable::path()
             .map_err(|error| format!("failed to resolve the running AFT binary: {error}"))?,
     };
     if !binary.is_absolute() {

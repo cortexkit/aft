@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use super::persistence::{
-    open_task_artifact, replace_artifact_with_tail, TaskArtifact, TaskPaths, ValidatedArtifact,
+    open_task_artifact_once, replace_artifact_with_tail, retry_artifact_read, TaskArtifact,
+    TaskPaths, ValidatedArtifact,
 };
 
 #[cfg(test)]
@@ -86,6 +87,10 @@ pub(crate) enum ArtifactSource {
 
 impl ArtifactSource {
     fn open(&self) -> io::Result<ValidatedArtifact> {
+        retry_artifact_read(|| self.open_once())
+    }
+
+    fn open_once(&self) -> io::Result<ValidatedArtifact> {
         #[cfg(feature = "test-timing-hooks")]
         if matches!(
             self,
@@ -108,7 +113,7 @@ impl ArtifactSource {
             );
         }
         let result = match self {
-            Self::Registered { paths, artifact } => open_task_artifact(paths, *artifact),
+            Self::Registered { paths, artifact } => open_task_artifact_once(paths, *artifact),
             #[cfg(test)]
             Self::Exact(path) => super::persistence::open_unregistered_artifact(path),
         };
@@ -152,8 +157,11 @@ impl ArtifactSource {
     }
 
     fn sampled(&self) -> io::Result<(ValidatedArtifact, u64)> {
-        let file = self.open()?;
-        let len = self.len(&file)?;
+        let (file, len) = retry_artifact_read(|| {
+            let file = self.open_once()?;
+            let len = self.len(&file)?;
+            Ok((file, len))
+        })?;
         #[cfg(test)]
         GROW_AFTER_STAT.with(|hook| {
             if let Some(bytes) = hook.borrow_mut().take() {
@@ -309,7 +317,7 @@ impl BgBuffer {
 
     pub fn stream_len(&self, stream: StreamKind) -> u64 {
         self.source(stream)
-            .and_then(|source| source.open().and_then(|file| source.len(&file)).ok())
+            .and_then(|source| source.sampled().ok().map(|(_, len)| len))
             .unwrap_or(0)
     }
 
@@ -431,14 +439,15 @@ pub fn combine_streams(stdout: &str, stderr: &str) -> String {
 }
 
 fn read_source_tail(source: &ArtifactSource, max_bytes: usize) -> io::Result<(Vec<u8>, bool)> {
-    let mut file = source.open()?;
-    if max_bytes == 0 {
-        return Ok((Vec::new(), source.len(&file)? > 0));
-    }
-    let (mut bytes, truncated) =
+    let (mut bytes, truncated) = retry_artifact_read(|| {
+        let mut file = source.open_once()?;
+        if max_bytes == 0 {
+            return Ok((Vec::new(), source.len(&file)? > 0));
+        }
         source.record_result("read_tail", file.tail(max_bytes), |(bytes, _)| {
             Some(bytes.len() as u64)
-        })?;
+        })
+    })?;
     if truncated {
         bytes = align_start_to_utf8(bytes);
     }

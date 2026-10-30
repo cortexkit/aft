@@ -142,7 +142,10 @@ fn real_success_and_unsupported_targets_never_hint() {
         "sqlite3 *.db 'SELECT missing'",
         "printf 'no such column: missing'",
     ] {
-        assert!(detect(command, dir.path()).is_none(), "{command}");
+        assert!(
+            detect(command, dir.path(), &HashMap::new()).is_none(),
+            "{command}"
+        );
     }
 }
 
@@ -220,6 +223,7 @@ fn real_probe_uses_same_launcher_and_no_user_flags() {
     let record = dir.path().join("probe-argv");
     crate::executable_cache::write_executable(&launcher, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n# Real launchers report unenforceable rules on stderr; that must not cost the hint.\necho 'sandbox-launch: unenforced=[socket_deny]' >&2\n[ \"$1\" = sandbox-launch ] || exit 1\nshift 3\n[ \"$1\" = -- ] || exit 1\nshift\nexec \"$@\"\n", record.display()).as_bytes()).unwrap();
     let profile = SandboxProfile {
+        secret_proxy: false,
         data_policy: Default::default(),
         v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
         mode: crate::config::SandboxMode::Strict,
@@ -274,6 +278,107 @@ fn real_readonly_uri_and_startup_connection_changes() {
         "sqlite3 -init init.sql store.db 'SELECT missing'",
         "sqlite3 store.db '.open other.db'",
     ] {
-        assert!(detect(command, dir.path()).is_none(), "{command}");
+        assert!(
+            detect(command, dir.path(), &HashMap::new()).is_none(),
+            "{command}"
+        );
     }
+}
+
+#[test]
+fn real_assignment_var_and_cd_uri_shapes() {
+    let dir = database("CREATE TABLE tasks(id TEXT, kind TEXT);");
+    // Shaped like production case #3: `DB=...; sqlite3 -readonly "$DB" ...`.
+    let db = dir.path().join("store.db");
+    let command = format!(
+        "DB='{}'; sqlite3 -readonly \"$DB\" 'SELECT substrate FROM tasks'",
+        db.display()
+    );
+    let hint = failure(dir.path(), &command, true).unwrap();
+    assert!(hint.contains("tasks: id TEXT, kind TEXT"), "{hint}");
+    // Shaped like production case #1 without tilde: cd plus a relative
+    // `file:...?mode=ro` URI and `-readonly`.
+    let parent = dir.path().parent().unwrap();
+    let basename = dir.path().file_name().unwrap().to_str().unwrap();
+    let command = format!(
+        "cd '{basename}' && sqlite3 -readonly 'file:store.db?mode=ro' 'SELECT substrate FROM tasks'"
+    );
+    let hint = failure(parent, &command, true).unwrap();
+    assert!(hint.contains("tasks: id TEXT, kind TEXT"), "{hint}");
+}
+
+#[test]
+fn real_tilde_cd_and_var_assignment_shapes() {
+    let dir = database("CREATE TABLE tasks(id TEXT, kind TEXT);");
+    let parent = dir.path().parent().unwrap().to_path_buf();
+    let basename = dir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let home = HashMap::from([("HOME".to_string(), parent.to_string_lossy().to_string())]);
+    let run = |command: &str, cwd: &Path| {
+        let result = Command::new("/bin/sh")
+            .args(["-c", command])
+            .current_dir(cwd)
+            .env("HOME", &parent)
+            .output()
+            .unwrap();
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        )
+    };
+    // `cd ~/...` plus a relative read-only URI (production case #1).
+    let command =
+        format!("cd ~/{basename} && sqlite3 -readonly 'file:store.db?mode=ro' 'SELECT substrate FROM tasks'");
+    let output = run(&command, &parent);
+    assert!(output.contains("no such column"), "{output}");
+    let hint = HintJob::new(&command, &parent, &home, &SpawnPlan::Unsandboxed, true)
+        .finish(&output, Some(1))
+        .unwrap()
+        .to_string();
+    assert!(hint.contains("tasks: id TEXT, kind TEXT"), "{hint}");
+    // `DB=~/...; sqlite3 "$DB"` plus a header pipeline (cases #2 and #3).
+    let command = format!(
+        "DB=~/{basename}/store.db; sqlite3 -readonly -header \"$DB\" 'SELECT substrate FROM tasks' | cat"
+    );
+    let output = run(&command, &parent);
+    assert!(output.contains("no such column"), "{output}");
+    let hint = HintJob::new(&command, &parent, &home, &SpawnPlan::Unsandboxed, true)
+        .finish(&output, Some(0))
+        .unwrap()
+        .to_string();
+    assert!(hint.contains("tasks: id TEXT, kind TEXT"), "{hint}");
+}
+
+#[test]
+fn real_unsupported_shell_forms_stay_unhinted() {
+    let dir = database("CREATE TABLE tasks(id TEXT);");
+    // Bare variables without an in-command assignment, command substitution,
+    // tilde-user, multiple SQLite invocations, and non-SQLite statements
+    // cannot establish a stable probe target.
+    for command in [
+        "sqlite3 \"$DB\" 'SELECT missing'",
+        "DB=store.db; T=$(mktemp -d); sqlite3 \"$DB\" 'SELECT missing'",
+        "sqlite3 ~otheruser/store.db 'SELECT missing'",
+        "sqlite3 store.db 'SELECT missing' && sqlite3 store.db 'SELECT missing'",
+        "sqlite3 store.db 'SELECT missing'; sqlite3 store.db 'SELECT missing'",
+        "S=stage; cp $S/store.db copy.db; sqlite3 copy.db 'SELECT missing'",
+    ] {
+        assert!(
+            detect(command, dir.path(), &HashMap::new()).is_none(),
+            "{command}"
+        );
+    }
+    // A single-quoted variable is literal text, not an expansion.
+    assert!(detect(
+        "DB=store.db; sqlite3 '$DB' 'SELECT missing'",
+        dir.path(),
+        &HashMap::new()
+    )
+    .is_none());
 }

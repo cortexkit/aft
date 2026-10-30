@@ -102,12 +102,14 @@ export function pushNotification(
       }
     }
     const mustKeep = new Set(newestPerSession.values());
-    const byNewest = [...queue].sort((a, b) => b.id - a.id);
     const kept: RpcNotification[] = [];
-    for (const notification of byNewest) {
+    // Push assigns monotonic ids and pruning preserves order, so walking backwards is newest-first.
+    for (let index = queue.length - 1; index >= 0; index--) {
+      const notification = queue[index];
+      if (!notification) continue;
       if (kept.length < 50 || mustKeep.has(notification.id)) kept.push(notification);
     }
-    queue = kept.sort((a, b) => a.id - b.id);
+    queue = kept.reverse();
   }
 }
 

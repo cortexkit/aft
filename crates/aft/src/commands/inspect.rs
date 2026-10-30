@@ -383,8 +383,11 @@ fn verify_final_root_stats(
 }
 
 pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
+    if let Some(reason) = ctx.cache_unavailable_reason() {
+        return Response::error(&req.id, crate::root_cache::CACHE_DIR_UNAVAILABLE, reason);
+    }
     if req.worker_session() {
-        ctx.lsp().disable_rust_cargo_for_worker();
+        ctx.disable_rust_cargo_for_worker();
     }
     handle_inspect_payload(
         req,
@@ -539,8 +542,11 @@ pub fn handle_inspect_warm_for_test(req: &RawRequest, ctx: &AppContext) -> Respo
 }
 
 pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response {
+    if let Some(reason) = ctx.cache_unavailable_reason() {
+        return Response::error(&req.id, crate::root_cache::CACHE_DIR_UNAVAILABLE, reason);
+    }
     if req.worker_session() {
-        ctx.lsp().disable_rust_cargo_for_worker();
+        ctx.disable_rust_cargo_for_worker();
     }
     let phase_log = InspectPhaseLog::for_request(req.id.clone());
     let deadline = InspectRequestDeadline::from_config(&ctx.config());
@@ -702,12 +708,34 @@ fn handle_inspect_payload(
         .iter()
         .any(|category| category.is_tier2() && snapshot.config.inspect.category_enabled(*category));
     start_on_demand_callgraph_for_inspect(ctx, &snapshot.config);
-    let routed_store = if tier2_enabled && ctx.checkout_query_runtime_active() {
+    // With views on, the graph-backed categories read the checkout's v3 view,
+    // pinned once for this request; an unavailable view is reported, never
+    // replaced by the legacy scanner's store.
+    let v3_routed = tier2_enabled && ctx.callgraph_views_enabled();
+    let routed_store = if tier2_enabled && (ctx.checkout_query_runtime_active() || v3_routed) {
         ctx.callgraph_store_for_ops()
     } else {
         crate::context::CallgraphStoreAccess::Unavailable
     };
-    let checkout_routed = ctx.checkout_query_outcome().is_some();
+    let checkout_routed = ctx.checkout_query_outcome().is_some() || v3_routed;
+    // Why the v3 view could not serve, observed once from the access this
+    // request already holds: a SQLite lock is contention (pending, retry),
+    // anything else is unavailability.
+    let routed_observation = v3_routed.then(|| match &routed_store {
+        crate::context::CallgraphStoreAccess::Error(error)
+            if error.is_transient_lock_contention() =>
+        {
+            (crate::feature_status::IndexObservation::building(), true)
+        }
+        crate::context::CallgraphStoreAccess::Error(error) => (
+            crate::feature_status::IndexObservation::unavailable(error.to_string()),
+            false,
+        ),
+        access => (
+            crate::feature_status::callgraph_access_observation(ctx, access),
+            false,
+        ),
+    });
     let checkout_store = if checkout_routed {
         match routed_store {
             crate::context::CallgraphStoreAccess::Ready(store) => Some(store),
@@ -752,12 +780,17 @@ fn handle_inspect_payload(
         && checkout_store.is_none()
     {
         Some(crate::feature_status::observe_callgraph_query_with_contention(ctx))
+    } else if checkout_store.is_none() {
+        routed_observation
     } else {
         None
     };
-    let use_checkout_view = needs_ephemeral_view
+    // A v3-routed request scans only with a reader in hand; without one its
+    // graph-backed categories report the gap below rather than running the
+    // legacy reuse scanner.
+    let use_checkout_view = (needs_ephemeral_view || v3_routed)
         && snapshot.config.views.enabled
-        && (checkout_routed || checkout_store.is_some());
+        && (checkout_store.is_some() || (checkout_routed && !v3_routed));
     let checkout_view_unavailability = (needs_ephemeral_view
         && snapshot.config.views.enabled
         && !checkout_routed
@@ -824,7 +857,7 @@ fn handle_inspect_payload(
         if outcomes.contains_key(&category) {
             continue;
         }
-        if (scope_was_provided || !ctx.inspect_writer()) && !use_checkout_view {
+        if (scope_was_provided || !ctx.inspect_writer() || v3_routed) && !use_checkout_view {
             continue;
         }
         if request_deadline.is_some_and(|deadline| !deadline.has_work_budget()) {
@@ -1313,7 +1346,7 @@ pub(crate) fn handle_inspect_deferred_with_reply_deadline(
     reply_deadline: Option<Instant>,
 ) -> DispatchOutcome {
     if req.worker_session() {
-        ctx.lsp().disable_rust_cargo_for_worker();
+        ctx.disable_rust_cargo_for_worker();
     }
     let watcher_pending = crate::response_finalize::watcher_query_pending(&ctx, "inspect");
     let request_id = req.id.clone();
@@ -1411,52 +1444,56 @@ pub(crate) fn handle_inspect_deferred_with_reply_deadline(
     let grant_scope = crate::access_policy::current_scope();
     let ask_route = crate::access_policy::current_ask_route();
     let io_budget = crate::bounded_io::current().map(|budget| budget.capped(deadline.terminal_at));
-    std::thread::spawn(move || {
-        let _io = crate::bounded_io::enter(io_budget);
-        let _ask_route = crate::access_policy::ask_route_guard(Some(ask_route));
-        let _grant_scope = crate::access_policy::scope_guard(grant_scope);
-        let _config_pin = ctx.pin_config_to(admitted_config);
-        let _cancellation = crate::executor::install_job_cancellation(worker_cancellation);
-        let _force_restrict = force_restrict.then(|| ctx.force_restrict_guard(&request.id));
-        if ctx.checkout_query_runtime_active() {
-            // Pin the one final wait outcome even when diagnostics terminate
-            // before Tier-2 submission. Finalization below uses this same guard.
-            let _ = ctx.callgraph_store_for_ops();
-        }
-        // Queueing instead of sharing a response keeps request-specific scopes,
-        // phase logs, and terminals independent while bounding expensive work to
-        // one detached inspect body per root.
-        let mut response = match DeferredInspectRootPermit::acquire(root, deadline) {
-            Some(_permit) => run_blocking_inspect_body(
-                &request,
-                &ctx,
-                applicability,
-                reports_diagnostics,
-                phase_log,
-                deadline,
-            ),
-            None if inspect_cancellation_requested() => {
-                build_inspect_terminal(&request.id, &phase_log, InspectTerminal::Interrupted)
+    std::thread::Builder::new()
+        .name("aft-inspect-request".into())
+        .spawn(move || {
+            let _io = crate::bounded_io::enter(io_budget);
+            let _ask_route = crate::access_policy::ask_route_guard(Some(ask_route));
+            let _grant_scope = crate::access_policy::scope_guard(grant_scope);
+            let _config_pin = ctx.pin_config_to(admitted_config);
+            let _cancellation = crate::executor::install_job_cancellation(worker_cancellation);
+            let _force_restrict = force_restrict.then(|| ctx.force_restrict_guard(&request.id));
+            if ctx.checkout_query_runtime_active() {
+                // Resolve call-graph availability before diagnostics can end the
+                // request. Response finalization must report the same outcome
+                // even if no background scan is submitted.
+                let _ = ctx.callgraph_store_for_ops();
             }
-            None => build_inspect_terminal(
-                &request.id,
-                &phase_log,
-                request_deadline_terminal(next_phase(&applicability), deadline),
-            ),
-        };
-        crate::response_finalize::attach_checkout_query_gaps(&mut response, &ctx);
-        if response.success {
-            if let Some(payload) = response.data.as_object_mut() {
-                let sections = parse_sections(request.params.get("sections"))
-                    .expect("inspect sections were validated during preflight");
-                set_inspect_completion(payload, &sections);
+            // Queueing instead of sharing a response keeps request-specific scopes,
+            // phase logs, and terminals independent while bounding expensive work to
+            // one detached inspect body per root.
+            let mut response = match DeferredInspectRootPermit::acquire(root, deadline) {
+                Some(_permit) => run_blocking_inspect_body(
+                    &request,
+                    &ctx,
+                    applicability,
+                    reports_diagnostics,
+                    phase_log,
+                    deadline,
+                ),
+                None if inspect_cancellation_requested() => {
+                    build_inspect_terminal(&request.id, &phase_log, InspectTerminal::Interrupted)
+                }
+                None => build_inspect_terminal(
+                    &request.id,
+                    &phase_log,
+                    request_deadline_terminal(next_phase(&applicability), deadline),
+                ),
+            };
+            crate::response_finalize::attach_checkout_query_gaps(&mut response, &ctx);
+            if response.success {
+                if let Some(payload) = response.data.as_object_mut() {
+                    let sections = parse_sections(request.params.get("sections"))
+                        .expect("inspect sections were validated during preflight");
+                    set_inspect_completion(payload, &sections);
+                }
             }
-        }
-        // After the completion verdict, so a watcher backlog still marks the
-        // result incomplete.
-        crate::response_finalize::attach_watcher_query_gap(&mut response, watcher_pending);
-        let _ = tx.send(crate::bounded_io::finish_response(response));
-    });
+            // After the completion verdict, so a watcher backlog still marks the
+            // result incomplete.
+            crate::response_finalize::attach_watcher_query_gap(&mut response, watcher_pending);
+            let _ = tx.send(crate::bounded_io::finish_response(response));
+        })
+        .expect("spawn inspect request worker");
     DispatchOutcome::Deferred(
         PendingResponse::from_receiver(
             completion_request_id,
@@ -5299,7 +5336,7 @@ mod runtime_note_tests {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let ctx = context();
-        let mut client = LspClient::spawn(
+        let mut client = LspClient::spawn_with_reclaim_root(
             ServerKind::TypeScript,
             root.clone(),
             Path::new("/bin/sh"),
@@ -5307,6 +5344,8 @@ mod runtime_note_tests {
             &std::collections::HashMap::new(),
             ctx.lsp().event_sender_for_test(),
             LspChildRegistry::new(),
+            None,
+            false,
         )
         .unwrap();
         client.runtime_note = note.map(str::to_owned);
@@ -7910,6 +7949,24 @@ mod deferred_terminal_tests {
     }
 
     #[test]
+    #[ignore = "opt-in CPU measurement on the checkout containing the crate"]
+    fn live_cpu_root_stats_checkout_cost() {
+        let root =
+            std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+        INSPECT_STAT_CALLS.with(|count| count.set(0));
+        crate::callgraph::PROJECT_WALK_ENTRIES.with(|count| count.set(0));
+        let started = Instant::now();
+        let initial = capture_inspect_root_stats_until(&root, None).unwrap();
+        let first = started.elapsed();
+        let started = Instant::now();
+        let final_stats = capture_inspect_root_stats_until(&root, None).unwrap();
+        let second = started.elapsed();
+        assert_eq!(initial, final_stats);
+        println!("inspect root stats (unchanged algorithm): files={} first={first:?} second={second:?} per_inspect={:?} stat_calls={} walk_entries={}",
+            initial.0.len(), first + second, INSPECT_STAT_CALLS.with(std::cell::Cell::get), crate::callgraph::PROJECT_WALK_ENTRIES.with(std::cell::Cell::get));
+    }
+
+    #[test]
     fn inspect_test_delay_holds_until_elapsed() {
         let started = Instant::now();
         wait_inspect_test_delay(
@@ -8141,8 +8198,10 @@ mod deferred_terminal_tests {
             DispatchOutcome::Deferred(pending) => pending,
             DispatchOutcome::Immediate(_) => panic!("inspect must defer"),
         };
+        // The detached inspect blocks at the gate until released, so a slow
+        // (loaded) runner can only make it arrive late; 30 s still bounds a hang.
         started_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(30))
             .expect("detached inspect reaches body gate");
 
         let mut registry = crate::response_finalize::PendingResponses::default();
@@ -8702,7 +8761,11 @@ mod checkout_deferred_tests {
             let registry =
                 crate::views::registry::FamilyRegistry::open(storage.path(), "inspect-test")
                     .unwrap();
-            let access = ViewAccess::Owner(registry.register_view("scope", root.path()).unwrap());
+            let access = ViewAccess::Owner(
+                registry
+                    .register_view_with_storage(registry.storage(), "scope", root.path())
+                    .unwrap(),
+            );
             ctx.install_checkout_query_runtime(Arc::new(
                 crate::views::query_wait::CheckoutQueryRuntime {
                     access,

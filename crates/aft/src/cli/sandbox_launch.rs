@@ -407,6 +407,10 @@ fn emit_linux_warning(profile: &SandboxProfile, applied: landlock_backend::Appli
     let signal_scope = signal_scope_label(applied.signal_scope_enforced);
     if profile.worker_jail {
         eprintln!("sandbox-launch: signal_scope={signal_scope}");
+        // Landlock scopes kill(pid, 0) too and has no per-signal exception, so
+        // a worker's existence probe of a process outside its own command
+        // fails with EPERM on Linux. docs/config.md states this limit; real
+        // signals stay confined.
     }
     // Landlock's filesystem rights do not mediate AF_UNIX connect. Removing the
     // address from the environment does not hide predictable session-bus paths.
