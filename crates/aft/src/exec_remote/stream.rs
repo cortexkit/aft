@@ -51,9 +51,7 @@ impl ResumePoint {
 /// and replay it from ResumePoint. Terminal proof must be durable before success.
 pub trait OutputSink {
     /// Display-only pre-acceptance status, with no durable cursor or timer effect.
-    fn admission_progress(&mut self, _progress: &types::Progress) -> io::Result<()> {
-        Ok(())
-    }
+    fn admission_progress(&mut self, _progress: &types::Progress) {}
     fn accepted(&mut self, accepted: &Accepted) -> io::Result<()>;
     fn started(&mut self, started: &Started) -> io::Result<()> {
         self.unknown_output(started.seq, &[])
@@ -195,7 +193,7 @@ impl StreamConsumer {
     ) -> Result<(), super::Error> {
         if let StreamRecord::Progress(progress) = record {
             if !self.accepted && self.point.is_none() && self.terminal.is_none() {
-                sink.admission_progress(&progress)?;
+                sink.admission_progress(&progress);
             }
             return Ok(());
         }

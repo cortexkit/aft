@@ -371,9 +371,10 @@ impl RemoteStream {
         self.received_frame
     }
 
-    /// Read one record into a durable sink. Outside output-gap recovery, a known
-    /// terminal followed by clean StreamEnd is required to complete a run;
-    /// loss/decode errors require status/attach. During output-gap recovery, the
+    /// Read one record into a sink; admission progress is display-only. Outside
+    /// output-gap recovery, a known terminal followed by clean StreamEnd is
+    /// required to complete a run; loss/decode errors require status/attach.
+    /// During output-gap recovery, the
     /// saved executor terminal still supplies the outcome even if a later attach
     /// closes with an error or does not repeat that terminal.
     /// There is no response deadline here: request timeout bounds remote run

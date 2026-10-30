@@ -1663,12 +1663,10 @@ pub(super) fn persist_terminal_artifacts(paths: &TaskPaths, metadata: &mut Persi
 
 #[cfg(unix)]
 impl OutputSink for TaskSink {
-    fn admission_progress(&mut self, progress: &exec::types::Progress) -> io::Result<()> {
-        let mut state = self
-            .task
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("task lock poisoned"))?;
+    fn admission_progress(&mut self, progress: &exec::types::Progress) {
+        let Ok(mut state) = self.task.state.lock() else {
+            return;
+        };
         if !state.metadata.is_terminal()
             && state.metadata.remote.as_ref().is_some_and(|r| !r.accepted)
         {
@@ -1677,7 +1675,6 @@ impl OutputSink for TaskSink {
             state.remote_admission_note = Some(admission_progress_line(progress));
             self.task.publish_runon_launch_state(&state);
         }
-        Ok(())
     }
     fn accepted(&mut self, accepted: &Accepted) -> io::Result<()> {
         // Measure receipt before local persistence adds its own latency. An

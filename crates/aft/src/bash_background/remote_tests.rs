@@ -137,8 +137,7 @@ async fn remote_admission_progress_is_latest_only_ephemeral_and_changes_no_timer
         .unwrap()
         .contains("so far"));
     // A sink reused by an attach also refuses late display updates.
-    sink.admission_progress(&Progress::new(ProgressPhase::Connect, 3_000, None).unwrap())
-        .unwrap();
+    sink.admission_progress(&Progress::new(ProgressPhase::Connect, 3_000, None).unwrap());
     assert!(task.state.lock().unwrap().remote_admission_note.is_none());
 }
 

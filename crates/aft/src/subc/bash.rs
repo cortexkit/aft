@@ -1366,7 +1366,8 @@ pub(super) const REMOTE_ADMISSION_PENDING_NOTE: &str = "The remote job is queued
 /// accepted it. Foreground calls reach this at the end of their wait window;
 /// explicit background calls reach it as soon as the task is registered and
 /// keep background launch wording rather than claiming a foreground wait. Both
-/// retain the admission-pending note. Every other reply passes through unchanged:
+/// show the latest admission progress, or the admission-pending note if none
+/// arrived. Every other reply passes through unchanged:
 /// a finished or refused task, an accepted job, or a reply returned early because
 /// AFT is restarting.
 fn foreground_runon_reply(
