@@ -1161,7 +1161,7 @@ class ReleaseRetryTests(PRFixture):
         self.git("checkout", "-q", "main")
         notes = self.repo / ".alfonso/release-notes/v1.0.0.md"
         notes.parent.mkdir(parents=True)
-        notes.write_text("# Approved release\n\nOriginal approved notes.\n")
+        notes.write_text("# v1.0.0\n\nOriginal approved notes for 1.0.0.\n")
         workflows = self.repo / ".github/workflows"
         workflows.mkdir()
         (workflows / "tests.yml").write_text('on:\n  push:\n    branches:\n      - main\n      - "release/**"\n')
@@ -1209,7 +1209,7 @@ class ReleaseRetryTests(PRFixture):
         for pick, original in zip(self.git("rev-list", "--reverse", f"{self.failed}..{released}").splitlines(), fixes):
             self.assertIn(f"(cherry picked from commit {original})", self.git("show", "-s", "--format=%B", pick))
         self.assertEqual(self.git("show", f"{released}:.alfonso/release-notes/v1.0.1.md"),
-                         "# Approved release\n\nOriginal approved notes.\n\n" +
+                         "# v1.0.1\n\nOriginal approved notes for 1.0.1.\n\n" +
                          "\n".join(f"- {name} ({fix[:12]})" for name, fix in zip(("fix-one", "fix-two"), fixes)))
         self.assert_caller_unchanged(head)
         again = self.retry(fixes)

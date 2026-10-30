@@ -157,7 +157,7 @@ def run_isolated(arguments: list[str]) -> int:
               "       scripts/release.sh --retry-from vX.Y.Z X.Y.(Z+1) --fix COMMIT [--fix COMMIT ...]\n"
               "Retry fixes must already be on origin/main. Work happens in a disposable worktree;\n"
               "release/X.Y is pushed directly, checked by Tests, and tagged only when green.\n"
-              "Notes reuse the failed tag's approved notes plus each fix commit's subject.")
+              "Notes reuse the failed tag's approved notes, renamed to the new version, plus each fix's subject.")
         return 0 if arguments else 2
     version = arguments[0]
     if not state_path(version).exists() and git("branch", "--show-current") != "main":
