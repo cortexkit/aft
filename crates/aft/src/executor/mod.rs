@@ -496,8 +496,8 @@ pub struct MutatingLaneSnapshot {
 }
 
 /// Scheduler occupants of one root, including jobs still waiting to enter
-/// their callback. Token identity distinguishes a call from an older job that
-/// reused the same transport request ID.
+/// their callback. Each call has a unique cancellation token, which distinguishes
+/// it from an older job that reused the same transport request ID.
 #[derive(Debug, Clone)]
 pub(crate) struct RootJobSnapshot {
     pub(crate) job_id: u64,
