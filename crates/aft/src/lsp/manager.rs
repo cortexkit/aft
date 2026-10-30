@@ -2213,7 +2213,7 @@ impl LspManager {
         key: &ServerKey,
         path: &Path,
     ) -> Result<i32, LspError> {
-        self.diagnostics.mark_stale_for_server_file(key, path);
+        self.invalidate_diagnostic_content(key, path);
         let reservation = self
             .starting
             .get_mut(key)
@@ -2637,6 +2637,7 @@ impl LspManager {
                 .is_some_and(|store| store.is_open(&canonical_path));
 
             if !already_open {
+                self.invalidate_diagnostic_content(key, &canonical_path);
                 let version = self
                     .documents
                     .get(key)
@@ -2698,8 +2699,7 @@ impl LspManager {
                 .get(key)
                 .is_some_and(|store| store.is_stale_against(&canonical_path, &disk));
             if drifted {
-                self.diagnostics
-                    .mark_stale_for_server_file(key, &canonical_path);
+                self.invalidate_diagnostic_content(key, &canonical_path);
                 if drift_content.is_none() {
                     match std::fs::read_to_string(&canonical_path) {
                         Ok(content) => drift_content = Some(content),
@@ -2868,8 +2868,7 @@ impl LspManager {
                 continue;
             }
             // Both pushed and pulled reports lose authority before text sync.
-            self.diagnostics
-                .mark_stale_for_server_file(&key, &canonical_path);
+            self.invalidate_diagnostic_content(&key, &canonical_path);
             let current_version = self
                 .documents
                 .get(&key)
@@ -2981,8 +2980,7 @@ impl LspManager {
         // (`mark_diagnostics_stale_for_file`). A push server publishes again
         // after the change below; a pull server is asked again.
         for key in &drifted {
-            self.diagnostics
-                .mark_stale_for_server_file(key, &canonical_path);
+            self.invalidate_diagnostic_content(key, &canonical_path);
         }
         std::fs::read_to_string(&canonical_path)
             .map_err(LspError::Io)
@@ -3699,6 +3697,7 @@ impl LspManager {
         let content = std::fs::read_to_string(&canonical_path).map_err(LspError::Io)?;
         let mut opened = Vec::with_capacity(targets.len());
         for key in targets {
+            self.invalidate_diagnostic_content(&key, &canonical_path);
             let version = self
                 .documents
                 .get(&key)
@@ -3892,6 +3891,10 @@ impl LspManager {
             .certify_content(server_key, &lookup_path, content_hash);
         self.diagnostics
             .mark_document_pull(server_key, &lookup_path);
+        if content_hash.is_none() {
+            self.diagnostics
+                .mark_stale_for_server_file(server_key, &lookup_path);
+        }
     }
 
     /// Whether a document is open in this server's document store.
@@ -6112,13 +6115,31 @@ impl LspManager {
                 .is_none_or(|version| entry.version == Some(version))
     }
 
-    fn certify_report_content(&mut self, key: &ServerKey, file: &Path, version: Option<i32>) {
-        let hash = self
-            .documents
+    fn invalidate_diagnostic_content(&mut self, key: &ServerKey, file: &Path) {
+        self.diagnostics.mark_stale_for_server_file(key, file);
+        // A later pull must not lend its content proof to cached rows from
+        // before the change when Rust's pushed and pulled results are merged.
+        self.latest_pull_for_rust
+            .remove(&(key.clone(), file.to_path_buf()));
+        self.latest_push_for_pull_servers
+            .remove(&(key.clone(), file.to_path_buf()));
+    }
+
+    fn confirmed_document_hash(
+        &self,
+        key: &ServerKey,
+        file: &Path,
+        version: Option<i32>,
+    ) -> Option<[u8; 32]> {
+        self.documents
             .get(key)
             .and_then(|store| store.entry(file))
             .filter(|document| Some(document.version) == version)
-            .and_then(|document| document.content_hash);
+            .and_then(|document| document.content_hash)
+    }
+
+    fn certify_report_content(&mut self, key: &ServerKey, file: &Path, version: Option<i32>) {
+        let hash = self.confirmed_document_hash(key, file, version);
         self.diagnostics.certify_content(key, file, hash);
         if hash.is_none() {
             self.diagnostics.mark_stale_for_server_file(key, file);
@@ -6813,7 +6834,10 @@ impl LspManager {
             // An empty push is kept as no entry: a missing entry already
             // reads as "no pushed diagnostics", and storing empty lists kept
             // one entry for every file rust-analyzer ever published.
-            if stored.is_empty() {
+            // Compiler-check results are stored separately. An unversioned push
+            // does not identify the document state it analyzed, so it cannot
+            // borrow a later document pull's content proof.
+            if stored.is_empty() || self.confirmed_document_hash(&key, &file, version).is_none() {
                 self.latest_push_for_pull_servers
                     .remove(&(key.clone(), file.clone()));
             } else {
@@ -11779,6 +11803,56 @@ mod current_content_diagnostics_tests {
         assert_eq!(manager.authoritative_diagnostic_reports().count(), 0);
         publish(&mut manager, &key, &file, Some(1));
         assert_eq!(manager.authoritative_diagnostic_reports().count(), 1);
+    }
+
+    #[test]
+    fn diagnostics_text_sync_cannot_recertify_earlier_push_or_pull_rows() {
+        let (_temp, mut manager, previous, file) = fixture();
+        let key = ServerKey {
+            kind: ServerKind::Rust,
+            root: previous.root,
+        };
+        manager.sync_document_version_for_test(&key, &file, 0);
+        let old = vec![StoredDiagnostic {
+            file: file.clone(),
+            line: 1,
+            column: 1,
+            end_line: 1,
+            end_column: 2,
+            severity: crate::lsp::diagnostics::DiagnosticSeverity::Error,
+            message: "earlier analysis".into(),
+            code: None,
+            source: None,
+        }];
+        manager
+            .latest_push_for_pull_servers
+            .insert((key.clone(), file.clone()), old.clone());
+        manager
+            .latest_pull_for_rust
+            .insert((key.clone(), file.clone()), old);
+        std::fs::write(&file, "fixed!\n").unwrap();
+        manager
+            .notify_file_changed_for_server_keys(file.clone(), "fixed!\n", vec![key.clone()])
+            .unwrap();
+        assert!(!manager
+            .latest_push_for_pull_servers
+            .contains_key(&(key.clone(), file.clone())));
+        assert!(!manager
+            .latest_pull_for_rust
+            .contains_key(&(key.clone(), file.clone())));
+        manager.ingest_document_report(
+            &key,
+            &file,
+            Some(1),
+            None,
+            serde_json::from_value(json!({"kind":"full", "items":[]})).unwrap(),
+        );
+        manager.store_pull_push_union(&key, &file, Vec::new());
+        assert!(manager.has_authoritative_report_for_file(&file));
+        assert!(manager
+            .server_file_diagnostics(&key, &file)
+            .unwrap()
+            .is_empty());
     }
 }
 
