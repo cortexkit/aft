@@ -616,9 +616,19 @@ pub(super) struct DispatchPathMetrics {
     /// Routes bound with a daemon scope stamp that made at least one tool
     /// call, each counted once.
     scoped_routes_with_tool_calls: AtomicU64,
+    pub(super) scope_descriptions: StdMutex<super::route_census::ScopeDescriptions>,
 }
 
 impl DispatchPathMetrics {
+    pub(super) fn in_flight_route_requests(&self) -> Vec<(RouteChannel, u64)> {
+        self.unanswered_tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .copied()
+            .collect()
+    }
+
     pub(super) fn new() -> Self {
         Self {
             watch_delivery: Arc::default(),
@@ -662,6 +672,7 @@ impl DispatchPathMetrics {
             bind_acks: StdMutex::new(BindAckLatencies::default()),
             presetless_tool_calls: StdMutex::new(BTreeMap::new()),
             scoped_routes_with_tool_calls: AtomicU64::new(0),
+            scope_descriptions: StdMutex::new(super::route_census::ScopeDescriptions::default()),
         }
     }
 
@@ -4020,6 +4031,13 @@ pub(super) fn build_health_report(
         crate::cold_build_limiter::progress::snapshot,
         crate::gc::family::sweep_stats(),
     )
+}
+
+pub(super) fn with_route_ownership_summary(report: &mut HealthReport, summary: Value) {
+    if let Some(Value::Object(metrics)) = report.metrics.as_mut() {
+        metrics.insert("route_ownership_summary".into(), summary);
+        budget_health_metrics(metrics);
+    }
 }
 
 fn build_health_report_with_snapshots(
