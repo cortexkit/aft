@@ -14948,6 +14948,22 @@ impl AppContext {
         let Some(mut refresh_worker) = self.semantic_refresh_worker.try_lock() else {
             return false;
         };
+        // A views-routed root's lexical and call-graph views hold installed
+        // snapshots, the call graph's open reader and v3 member protection.
+        // Releasing them here, as evict_idle_artifacts does, lets storage
+        // retention evict an idle root's views for disk budget.
+        let Some(mut lexical_view) = self.lexical_view.try_lock() else {
+            return false;
+        };
+        let Some(mut callgraph_view) = self.callgraph_view.try_lock() else {
+            return false;
+        };
+        let Some(mut lexical_retry) = self.lexical_load_retry.try_lock() else {
+            return false;
+        };
+        let Some(mut callgraph_retry) = self.callgraph_construction_retry.try_lock() else {
+            return false;
+        };
         // Publication memoization can be discarded independently of resident
         // artifact handles, including when the semantic lane remains busy.
         if !self.try_release_view_publication_cache() {
@@ -14962,11 +14978,17 @@ impl AppContext {
         semantic_index.take();
         borrowed_index_cache.clear();
         backup.release_memory();
+        *lexical_retry = Default::default();
+        *callgraph_retry = Default::default();
         let released = (
             embedding_model.take(),
             refresh_events.take(),
             refresh_requests.take(),
             refresh_worker.take(),
+            // Dropping a view can close its reader and unbind its generation,
+            // so the views drop on the release thread too.
+            lexical_view.take(),
+            callgraph_view.take(),
         );
         self.semantic_refresh_epoch.fetch_add(1, Ordering::SeqCst);
         self.semantic_refresh_build_epoch.store(0, Ordering::SeqCst);
@@ -14976,6 +14998,10 @@ impl AppContext {
             refresh_events,
             refresh_requests,
             refresh_worker,
+            lexical_view,
+            callgraph_view,
+            lexical_retry,
+            callgraph_retry,
         ));
         // Native session destruction can wait for ORT. Keep it, and worker
         // channel teardown, off the daemon's frame loop.
