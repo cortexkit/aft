@@ -232,6 +232,7 @@ mod idle_reap_frame_loop_tests;
 #[cfg(test)]
 mod idle_root_retention_tests;
 mod perf_sweep;
+mod route_census;
 mod secret_consent;
 #[cfg(all(test, unix))]
 pub(crate) use secret_consent::with_secret_bound_identity_for_test;
@@ -1476,6 +1477,9 @@ struct RootMeta {
     maintenance_last_submitted: Option<Instant>,
     maintenance_poisoned: bool,
     last_touched: Instant,
+    /// Diagnostic demand clocks; unlike last_touched, polling and teardown do not reset them.
+    last_tool_call: Option<Instant>,
+    route_activity: HashMap<RouteChannel, route_census::RouteActivity>,
     diagnostics_on_edit: bool,
     active_bash_waits: usize,
     idle_artifacts_evicted: bool,
@@ -1798,6 +1802,8 @@ impl RootMeta {
             maintenance_last_submitted: None,
             maintenance_poisoned: false,
             last_touched: now,
+            last_tool_call: None,
+            route_activity: HashMap::new(),
             diagnostics_on_edit: false,
             active_bash_waits: 0,
             idle_artifacts_evicted: false,
@@ -4117,6 +4123,7 @@ async fn teardown_installed_route(
             );
         }
         if let Some(meta) = live_roots.get_mut(&identity.root) {
+            meta.route_activity.remove(&channel);
             let idle_for = meta.last_touched.elapsed();
             meta.note_activity();
             log::debug!(
@@ -6176,6 +6183,7 @@ where
                                 &live_roots,
                                 &root_channels,
                                 &routes,
+                                &active_tool_calls,
                                 &health_rollup_cache,
                                 &dispatch_path_metrics,
                                 management_routes.get(&route).and_then(|identity| identity.principal.as_ref()),
@@ -7785,6 +7793,8 @@ async fn handle_route_bind_completion(
         })
         .or_insert_with(|| RootMeta::new(Instant::now()));
     if let Some(meta) = live_roots.get_mut(&completion.bind_root_id) {
+        meta.route_activity
+            .insert(route_id, route_census::RouteActivity::new(Instant::now()));
         meta.diagnostics_on_edit = completion.diagnostics_on_edit;
         meta.maintenance_poisoned = false;
     }
@@ -7962,14 +7972,16 @@ async fn send_cached_health_response(
     pending_binds: &HashMap<RouteChannel, PendingBind>,
     metrics: &DispatchPathMetrics,
     health_rollup_cache: &HealthRollupCache,
+    ownership_summary: Value,
 ) -> Result<(), SubcError> {
-    let report = build_health_report(
+    let mut report = build_health_report(
         health_rollup_cache,
         executor,
         pending_binds,
         metrics,
         shared_app,
     );
+    health::with_route_ownership_summary(&mut report, ownership_summary);
     let body = serde_json::to_vec(&ModuleControlResponse::from(report)).map_err(SubcError::Json)?;
     let response = Frame::build_with_version(
         frame.header.ver,
@@ -8823,6 +8835,16 @@ async fn handle_control_request(
                 pending_binds,
                 metrics,
                 health_rollup_cache,
+                route_census::snapshot(
+                    live_roots,
+                    root_channels,
+                    routes,
+                    active_tool_calls,
+                    executor,
+                    metrics,
+                    Instant::now(),
+                )
+                .summary(),
             )
             .await
         }
@@ -8838,6 +8860,7 @@ async fn handle_management_request(
     live_roots: &HashMap<ProjectRootId, RootMeta>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
     routes: &HashMap<RouteChannel, RouteIdentity>,
+    active_tool_calls: &ActiveToolCalls,
     health_rollup_cache: &Arc<HealthRollupCache>,
     metrics: &Arc<DispatchPathMetrics>,
     principal: Option<&Principal>,
@@ -8898,6 +8921,15 @@ async fn handle_management_request(
                 shared_app,
                 executor,
                 census_route_rows(live_roots, root_channels),
+                route_census::snapshot(
+                    live_roots,
+                    root_channels,
+                    routes,
+                    active_tool_calls,
+                    executor,
+                    metrics,
+                    Instant::now(),
+                ),
                 health_rollup_cache,
                 metrics,
             );
@@ -9091,6 +9123,7 @@ fn spawn_memory_census(
     shared_app: &Arc<App>,
     executor: &Arc<Executor>,
     route_rows: Vec<CensusRouteRow>,
+    ownership: route_census::Snapshot,
     health_rollup_cache: &Arc<HealthRollupCache>,
     metrics: &Arc<DispatchPathMetrics>,
 ) {
@@ -9104,7 +9137,8 @@ fn spawn_memory_census(
     tokio::spawn(async move {
         let _response_task = ResponseTaskGuard::new(&metrics);
         let census = health::fresh_memory_census(&cache, deadline).await;
-        let census = with_census_route_rows(census, &shared_app, &executor, &route_rows);
+        let mut census = with_census_route_rows(census, &shared_app, &executor, &route_rows);
+        census["route_ownership"] = ownership.render(&executor);
         if let Err(error) = send_management_response(
             &tx,
             &frame,
@@ -11273,6 +11307,12 @@ async fn handle_tool_call_with_capabilities(
             tool_response_body_limit,
         )?;
         return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
+    }
+
+    if is_subc_agent_core_tool(&bare_name) || is_subc_native_plumbing_tool(&bare_name) {
+        if let Some(meta) = live_roots.get_mut(&identity.root) {
+            route_census::note_tool_call(meta, route_id, Instant::now());
+        }
     }
 
     if matches!(bare_name.as_str(), "bash" | "powershell") {
@@ -15677,6 +15717,7 @@ mod tests {
                 &HashMap::new(),
                 &metrics,
                 &health_rollup_cache,
+                json!({}),
             ));
             done_tx.send(result).expect("report health result");
         });
