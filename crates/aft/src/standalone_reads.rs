@@ -444,6 +444,10 @@ mod tests {
             panic!("full lane must refuse without queuing")
         };
         assert_eq!(busy.data["code"], "busy");
+        assert_eq!(
+            busy.data["message"],
+            "standalone read lane is full; retry after outstanding calls finish"
+        );
         assert_eq!(busy.data["retryable"], true);
         // The read lane has its own budget, even when the heavy queue is full.
         register(
