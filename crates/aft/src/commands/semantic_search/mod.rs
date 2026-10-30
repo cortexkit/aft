@@ -978,7 +978,11 @@ fn handle_semantic_search_with_disk_fallback(
     let extensions = crate::search_b2::install_defaults();
     if external_root.is_none() {
         if let Some(Err(error)) = ctx.lexical_view_snapshot("aft_search") {
-            return Response::error(&req.id, "internal_error", error);
+            return Response::error(
+                &req.id,
+                "internal_error",
+                crate::context::view_load_failure_message(error),
+            );
         }
     }
     if let Some((pattern_text, compiled)) = pattern {
@@ -4102,7 +4106,11 @@ fn regex_route_collection(
     let snapshot = if let Some(snapshot) = ctx.lexical_view_snapshot("aft_search") {
         match snapshot {
             Ok(snapshot) => snapshot,
-            Err(error) => return Some(Err(std::io::Error::other(error))),
+            Err(error) => {
+                return Some(Err(std::io::Error::other(
+                    crate::context::view_load_failure_message(error),
+                )))
+            }
         }
     } else {
         #[cfg(test)]
@@ -4947,7 +4955,9 @@ fn run_engine_ranking(
         }
     }
     let view_snapshot = if borrowed_index.is_none() {
-        ctx.lexical_view_snapshot("aft_search").transpose()?
+        ctx.lexical_view_snapshot("aft_search")
+            .transpose()
+            .map_err(crate::context::view_load_failure_message)?
     } else {
         None
     };

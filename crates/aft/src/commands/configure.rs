@@ -14333,6 +14333,7 @@ mod tests {
 
     #[test]
     fn lexical_view_load_failure_counts_and_degrades_until_recovery() {
+        let reporting_suffix = "\nThis is an AFT bug: tell the user to report it with `npx @cortexkit/aft doctor --issue`; don't run it yourself.";
         // Holds the process environment lock for the whole test, like the
         // other lexical views tests above.
         let _git_env = crate::test_env::hermetic_git_env_guard();
@@ -14383,9 +14384,9 @@ mod tests {
         let grep = crate::commands::grep::handle_grep(&grep_request("needle"), &ctx);
         assert!(
             !grep.success
-                && grep.data["message"]
-                    .as_str()
-                    .is_some_and(|message| message.contains(&load_error)),
+                && grep.data["message"].as_str().is_some_and(|message| {
+                    message.contains(&load_error) && message.ends_with(reporting_suffix)
+                }),
             "{:?}",
             grep.data
         );
@@ -14395,9 +14396,9 @@ mod tests {
         );
         assert!(
             !search.success
-                && search.data["message"]
-                    .as_str()
-                    .is_some_and(|message| message.contains(&load_error)),
+                && search.data["message"].as_str().is_some_and(|message| {
+                    message.contains(&load_error) && message.ends_with(reporting_suffix)
+                }),
             "{:?}",
             search.data
         );
@@ -14413,12 +14414,29 @@ mod tests {
         );
         assert!(
             !glob.success
-                && glob.data["message"]
-                    .as_str()
-                    .is_some_and(|message| message.contains(&load_error)),
+                && glob.data["message"].as_str().is_some_and(|message| {
+                    message.contains(&load_error) && message.ends_with(reporting_suffix)
+                }),
             "{:?}",
             glob.data
         );
+
+        let missing_path = crate::commands::glob::handle_glob(
+            &RawRequest {
+                id: "lexical-refused-glob-missing-path".into(),
+                command: "glob".into(),
+                lsp_hints: None,
+                session_id: None,
+                params: json!({"pattern":"**/*.ts", "path":root.join("missing")}),
+            },
+            &ctx,
+        );
+        assert!(!missing_path.success, "{:?}", missing_path.data);
+        assert_eq!(missing_path.data["code"], "path_not_found");
+        assert!(!missing_path.data["message"]
+            .as_str()
+            .unwrap()
+            .contains(reporting_suffix.trim_start_matches('\n')));
 
         // Outline parses the file itself and never loads the view.
         let outline = crate::commands::outline::handle_outline(
@@ -14937,6 +14955,7 @@ mod tests {
 
     #[test]
     fn callgraph_view_load_failure_fails_every_graph_op_and_counts() {
+        let reporting_suffix = "\nThis is an AFT bug: tell the user to report it with `npx @cortexkit/aft doctor --issue`; don't run it yourself.";
         // Holds the process environment lock for the whole test, like the
         // other callgraph views tests above.
         let _git_env = crate::test_env::hermetic_git_env_guard();
@@ -15024,9 +15043,9 @@ mod tests {
             let answer = handle(&request, &ctx);
             assert!(
                 !answer.success
-                    && answer.data["message"]
-                        .as_str()
-                        .is_some_and(|message| message.contains(&load_error)),
+                    && answer.data["message"].as_str().is_some_and(|message| {
+                        message.contains(&load_error) && message.ends_with(reporting_suffix)
+                    }),
                 "{command}: {:?}",
                 answer.data
             );
@@ -15052,7 +15071,7 @@ mod tests {
         );
         assert_eq!(
             zoom_with_graph.data["callgraph"]["index"]["reason"],
-            format!("callgraph store unavailable: callgraph view unavailable: {load_error}")
+            format!("callgraph store unavailable: callgraph view unavailable: {load_error}{reporting_suffix}")
         );
         let zoom_local = crate::commands::zoom::handle_zoom(
             &serde_json::from_value(json!({

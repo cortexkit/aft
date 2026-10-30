@@ -1128,6 +1128,12 @@ pub struct ViewHealthSnapshot {
 /// Rendered as-is by status surfaces, like the other degraded reasons.
 pub(crate) const VIEW_LOAD_DEGRADED_REASON: &str = "view_load_failed";
 
+/// Add reporting guidance only when a view-load failure becomes an agent reply.
+/// Health and logs retain the loader's raw error.
+pub(crate) fn view_load_failure_message(error: impl std::fmt::Display) -> String {
+    format!("{error}\nThis is an AFT bug: tell the user to report it with `npx @cortexkit/aft doctor --issue`; don't run it yourself.")
+}
+
 /// Error-level log throttle: one line per project and plane per minute.
 /// Repeats inside the window are counted and reported on the next emission.
 const VIEW_LOAD_LOG_INTERVAL: Duration = Duration::from_secs(60);
@@ -5068,7 +5074,8 @@ pub(crate) fn checkout_view_callgraph_access(
             CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(error.reason))
         }
         Some(Err(error)) => CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(format!(
-            "callgraph view unavailable: {error}"
+            "callgraph view unavailable: {}",
+            view_load_failure_message(error)
         ))),
         None => CallgraphStoreAccess::Unavailable,
     }
