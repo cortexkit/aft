@@ -1,19 +1,21 @@
 import type { BashAckTarget } from "./bash-pattern-ack.js";
 import type { BashWatchLineBatch } from "./bridge.js";
 
-type Stream = "stdout" | "stderr" | "pty";
+type Stream = "stdout" | "stderr" | "pty" | "output";
 
 function knownStream(stream: string): stream is Stream {
-  return stream === "stdout" || stream === "stderr" || stream === "pty";
+  return stream === "stdout" || stream === "stderr" || stream === "pty" || stream === "output";
 }
 
 /** Admission watermarks for one pending watch generation; no line text is retained. */
 export class WatchBatchProgress {
   private pendingID: string | undefined;
   private version: number | undefined;
-  private ends: Record<Stream, number> = { stdout: 0, stderr: 0, pty: 0 };
+  private ends: Record<Stream, number> = { stdout: 0, stderr: 0, pty: 0, output: 0 };
   private dropped = 0;
   private skipped = 0;
+  private gapNotices = 0;
+  private gapOccurrences = 0;
 
   get admittedVersion(): number | undefined {
     return this.version;
@@ -50,6 +52,20 @@ export class WatchBatchProgress {
       skipped_long_lines: obsolete
         ? 0
         : Math.max(0, batch.skipped_long_lines - (same && batch.snapshot ? this.skipped : 0)),
+      retry_gap: batch.retry_gap
+        ? {
+            ...batch.retry_gap,
+            dropped_notifications: obsolete
+              ? 0
+              : Math.max(0, batch.retry_gap.dropped_notifications - (same ? this.gapNotices : 0)),
+            known_missing_occurrences: obsolete
+              ? 0
+              : Math.max(
+                  0,
+                  batch.retry_gap.known_missing_occurrences - (same ? this.gapOccurrences : 0),
+                ),
+          }
+        : undefined,
     };
   }
 
@@ -58,9 +74,11 @@ export class WatchBatchProgress {
     if (this.pendingID !== pendingID) {
       this.pendingID = pendingID;
       this.version = undefined;
-      this.ends = { stdout: 0, stderr: 0, pty: 0 };
+      this.ends = { stdout: 0, stderr: 0, pty: 0, output: 0 };
       this.dropped = 0;
       this.skipped = 0;
+      this.gapNotices = 0;
+      this.gapOccurrences = 0;
     }
     if (
       !batch.snapshot &&
@@ -81,13 +99,23 @@ export class WatchBatchProgress {
     this.skipped = batch.snapshot
       ? Math.max(this.skipped, batch.skipped_long_lines)
       : this.skipped + batch.skipped_long_lines;
+    this.gapNotices = Math.max(this.gapNotices, batch.retry_gap?.dropped_notifications ?? 0);
+    this.gapOccurrences = Math.max(
+      this.gapOccurrences,
+      batch.retry_gap?.known_missing_occurrences ?? 0,
+    );
     if (batch.version !== undefined)
       this.version = Math.max(this.version ?? batch.version, batch.version);
   }
 }
 
 export function watchBatchHasContent(batch: BashWatchLineBatch): boolean {
-  return batch.lines.length > 0 || batch.dropped_lines > 0 || batch.skipped_long_lines > 0;
+  return (
+    batch.lines.length > 0 ||
+    batch.dropped_lines > 0 ||
+    batch.skipped_long_lines > 0 ||
+    (batch.retry_gap?.dropped_notifications ?? 0) > 0
+  );
 }
 
 type BatchMatch = {

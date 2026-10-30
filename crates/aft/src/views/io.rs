@@ -4,6 +4,48 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+/// Keep the error kind and native source available to retry/absence checks
+/// while naming the I/O that failed. OS errors alone do not include its path.
+pub(crate) fn at(
+    operation: &str,
+    path: &std::path::Path,
+    source: std::io::Error,
+) -> std::io::Error {
+    std::io::Error::new(
+        source.kind(),
+        PathIoError {
+            operation: operation.to_owned(),
+            path: path.to_path_buf(),
+            source,
+        },
+    )
+}
+
+#[derive(Debug)]
+struct PathIoError {
+    operation: String,
+    path: std::path::PathBuf,
+    source: std::io::Error,
+}
+
+impl std::fmt::Display for PathIoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {}: {}",
+            self.operation,
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for PathIoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Lifetime totals for measured work sites, shared by every root in this process.
 /// Relaxed loads are intentionally not a transactional snapshot; difference them
 /// only within one daemon lifetime, never sum overlapping per-root intervals.
@@ -315,6 +357,43 @@ impl Drop for Event {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn path_context_preserves_absence_and_retry_kinds() {
+        for kind in [std::io::ErrorKind::NotFound, std::io::ErrorKind::WouldBlock] {
+            let error = super::at(
+                "reading",
+                std::path::Path::new("missing-input"),
+                std::io::Error::new(kind, "original failure"),
+            );
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), "reading missing-input: original failure");
+        }
+    }
+
+    #[test]
+    fn path_context_preserves_native_error_sources() {
+        let error = super::at(
+            "opening",
+            std::path::Path::new("busy-database"),
+            std::io::Error::from_raw_os_error(32),
+        );
+        let context = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<super::PathIoError>()
+            .unwrap();
+        assert_eq!(context.source.raw_os_error(), Some(32));
+        assert_eq!(
+            std::error::Error::source(context)
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(32)
+        );
+        assert!(error.to_string().starts_with("opening busy-database: "));
+    }
+
     use super::*;
     #[test]
     fn performance_work_counts_real_source_operations() {

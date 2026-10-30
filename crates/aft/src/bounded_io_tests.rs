@@ -87,6 +87,7 @@ fn wait_at_gate(path: &Path, gates: &Mutex<HashMap<PathBuf, HelperGate>>) {
 }
 
 pub(super) fn before_directory_probe(path: &Path) -> io::Result<()> {
+    wait_at_gate(path, &RUNNING_GATES);
     if let Some(fired) = BLOCKED_DIRECTORIES.lock().unwrap().get(path) {
         fired.fetch_add(1, Ordering::Relaxed);
         return Err(failure(
@@ -96,6 +97,31 @@ pub(super) fn before_directory_probe(path: &Path) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn walk_filter_stall_names_directory_being_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let child = dir.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    let stall = stall_running_helper(&child);
+    let budget =
+        Budget::after(Duration::from_secs(5)).with_access_budget(Duration::from_millis(200));
+    let child_in_walk = child.clone();
+    let error = with_budget(Some(budget), || {
+        run(dir.path(), None, move |_| {
+            probe_directory(&child_in_walk, None)
+        })
+    })
+    .unwrap_err();
+    stall.reached.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("read_blocked: {}:", child.display())),
+        "{error}"
+    );
 }
 
 struct BlockDirectory(PathBuf, Arc<AtomicUsize>);
@@ -115,6 +141,63 @@ impl Drop for BlockDirectory {
     fn drop(&mut self) {
         BLOCKED_DIRECTORIES.lock().unwrap().remove(&self.0);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn walk_read_block_and_time_budget_report_both_gaps() {
+    let dir = tempfile::tempdir().unwrap();
+    let keep = dir.path().join("keep.rs");
+    let child = dir.path().join("child");
+    std::fs::write(&keep, "fn keep() {}\n").unwrap();
+    std::fs::create_dir(&child).unwrap();
+    let blocked = BlockDirectory::new(&child);
+    let after_error = dir.path().join("after-directory-error");
+    let stall = stall_running_helper(&after_error);
+    let kept = keep.clone();
+    let blocked_child = child.clone();
+    let budget = Budget::after(Duration::from_secs(5)).with_access_budget(Duration::from_secs(2));
+    let response = with_budget(Some(budget), || {
+        let (files, completion) = run_walk(
+            dir.path(),
+            Some(Instant::now() + Duration::from_millis(300)),
+            Vec::<PathBuf>::new(),
+            move |_, progress| {
+                progress.update(|files| files.push(kept.clone()));
+                let error = probe_directory(&blocked_child, None).unwrap_err();
+                assert!(error.to_string().contains("read_blocked"));
+                // Keep the same walk alive after its injected directory failure
+                // until the caller's walk deadline expires.
+                after_helper_start(&after_error);
+                Ok(vec![kept])
+            },
+        );
+        assert!(completion.incomplete);
+        assert!(completion.time_limit);
+        finish_response(Response::success(
+            "walk-both-gaps",
+            serde_json::json!({
+                "complete": true, "files": files,
+            }),
+        ))
+    });
+    stall.reached.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(blocked.1.load(Ordering::Relaxed), 1);
+    assert!(response.success, "{:?}", response.data);
+    assert_eq!(response.data["complete"], false);
+    assert_eq!(response.data["files"], serde_json::json!([keep]));
+    let gaps = response.data["gaps"].as_array().unwrap();
+    assert_eq!(gaps.len(), 2);
+    assert_eq!(
+        gaps[0],
+        "Directory walk reached its time budget; only examined entries are reported."
+    );
+    let named_gap = format!("read_blocked: {}:", child.display());
+    assert!(gaps[1].as_str().unwrap().starts_with(&named_gap));
+    let text = response.data["text"].as_str().unwrap();
+    assert!(text.lines().any(|line| line
+        == "Directory walk reached its time budget; only examined entries are reported."));
+    assert!(text.contains(&named_gap));
 }
 
 #[test]
@@ -196,6 +279,28 @@ fn reused_helper_starts_each_job_with_clean_counters_and_hooks() {
     assert!(second.9, "canonicalization collector leaked");
     assert!(second.10, "grep I/O probe leaked");
     assert_eq!(second.11, None, "grep cancellation clock leaked");
+}
+
+#[test]
+fn walk_directory_probes_reuse_the_owned_helper() {
+    let dir = tempfile::tempdir().unwrap();
+    let child = dir.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    let budget =
+        Budget::after(Duration::from_secs(5)).with_access_budget(Duration::from_millis(200));
+    with_budget(Some(budget.clone()), || {
+        let (_, completion) = run_walk(dir.path(), None, 0usize, move |_, progress| {
+            probe_directory(&child, None)?;
+            progress.update(|count| *count += 1);
+            Ok(1)
+        });
+        assert!(!completion.incomplete);
+    });
+    assert_eq!(
+        budget.measurements().0,
+        1,
+        "a walk must not queue a nested helper"
+    );
 }
 
 #[test]
@@ -607,13 +712,13 @@ fn queued_time_does_not_consume_running_access_budget() {
     let caller = std::thread::spawn(move || {
         result_tx
             .send(with_budget(
-                Some(Budget::after(Duration::from_secs(5))),
+                Some(Budget::after(Duration::from_secs(30))),
                 || {
                     run_with_timeout(
                         &path,
                         None,
                         Limiter::new(1),
-                        Duration::from_secs(1),
+                        Duration::from_secs(6),
                         None,
                         move |_| {
                             started_tx.send(()).unwrap();
@@ -626,16 +731,19 @@ fn queued_time_does_not_consume_running_access_budget() {
             .unwrap();
     });
     gate.reached.recv_timeout(IO_BUDGET).unwrap();
-    // Model a loaded runner that schedules the helper late, then a healthy
-    // operation taking less than its own access budget, but not the leftover.
-    assert!(result_rx.recv_timeout(Duration::from_millis(750)).is_err());
+    // A three-second queue leaves ample scheduling margin. Four seconds of
+    // running work fit the six-second access cap, but not a cap begun at enqueue.
+    assert!(result_rx.recv_timeout(Duration::from_secs(3)).is_err());
     drop(gate);
     let started = started_rx.recv_timeout(IO_BUDGET);
-    let early = result_rx.recv_timeout(Duration::from_millis(500));
+    let early = result_rx.recv_timeout(Duration::from_secs(4));
     let _ = release_tx.send(());
     caller.join().unwrap();
-    started.expect("the filesystem operation must actually start");
     let result = early.unwrap_or_else(|_| result_rx.recv_timeout(IO_BUDGET).unwrap());
+    assert!(
+        started.is_ok(),
+        "the filesystem operation must actually start: {started:?}; run_with_timeout returned {result:?}"
+    );
     assert_eq!(
         result.unwrap(),
         42,

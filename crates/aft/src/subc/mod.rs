@@ -221,6 +221,7 @@ mod consent;
 pub(crate) use consent::directory_scope;
 #[cfg(all(test, unix))]
 mod deleted_root_reclaim_tests;
+mod diagnostics_findings;
 // The secret vault seam and its consent adapter. They read ragged route
 // fields, so they live under `subc` rather than the public `secret` types.
 mod drain;
@@ -231,6 +232,7 @@ mod idle_reap_frame_loop_tests;
 #[cfg(test)]
 mod idle_root_retention_tests;
 mod perf_sweep;
+mod route_census;
 mod secret_consent;
 #[cfg(all(test, unix))]
 pub(crate) use secret_consent::with_secret_bound_identity_for_test;
@@ -248,11 +250,13 @@ mod persistence;
 #[cfg(test)]
 mod prepared_bind_tests;
 mod push;
+mod queued_call;
 mod readiness;
 mod remote_policy;
 pub(crate) mod result_body;
 mod retained_result;
 mod rich_ui;
+pub(crate) mod watch_delivery;
 // Drives the chunk queries and Occipital's route shapes through the real
 // frame loop, so it lives beside the chunk module but runs as a child of this
 // module to reach the loop and its test fixtures.
@@ -261,6 +265,8 @@ mod rich_ui;
 mod rich_ui_chunk_route_tests;
 mod run_scope;
 mod scope_describe;
+#[cfg(test)]
+mod stack_budget_tests;
 #[cfg(all(test, unix))]
 pub(crate) use scope_describe::confirm_secret_rebind_for_test;
 #[cfg(test)]
@@ -559,6 +565,7 @@ enum RouteDetachPolicy {
 struct RequestFrameMeta {
     ver: u8,
     flags: Flags,
+    deadline: Option<queued_call::Deadline>,
 }
 
 #[derive(Clone)]
@@ -578,6 +585,7 @@ impl AdmissionWait {
             meta: RequestFrameMeta {
                 ver: decoded.frame.header.ver,
                 flags: decoded.frame.header.flags,
+                deadline: None,
             },
             bare_name: bare_name.to_owned(),
             held_since: decoded.phase_trace.received_at(),
@@ -979,25 +987,32 @@ fn submit_active_tool_call(
     request: RequestFrameMeta,
     job: crate::executor::ExecutorJob,
 ) -> oneshot::Receiver<Response> {
+    let job = queued_call::guard(request.deadline, tool, request_id.clone(), job);
     let job = push::routed_progress_job(route, corr, &request_id, job);
-    let (rx, cancellation) =
-        executor.submit_tool_call_cancellable_async(root_id.clone(), lane, request_id, tool, job);
-    active
+    let cancellation = JobCancellation::new();
+    let mut calls = active
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            (route, corr),
-            ActiveToolCall {
-                root_id,
-                cancellation,
-                detach_policy,
-                tool: tool.to_string(),
-                started_at: Instant::now(),
-                request,
-                answering: false,
-            },
-        );
-    rx
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    calls.insert(
+        (route, corr),
+        ActiveToolCall {
+            root_id: root_id.clone(),
+            cancellation: cancellation.clone(),
+            detach_policy,
+            tool: tool.to_string(),
+            started_at: Instant::now(),
+            request,
+            answering: false,
+        },
+    );
+    executor.submit_tool_call_with_cancellation_async(
+        root_id,
+        lane,
+        request_id,
+        tool,
+        job,
+        cancellation,
+    )
 }
 
 /// Run a tracked call's job again (after a consent answer) as that call's
@@ -1016,25 +1031,24 @@ fn resubmit_active_tool_call(
     tool: &str,
     job: crate::executor::ExecutorJob,
 ) -> oneshot::Receiver<Response> {
+    let mut calls = active
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(call) = calls.get_mut(&(route, corr)).filter(|call| !call.answering) else {
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(Response::error(
+            request_id,
+            "route_released",
+            "call ended before resubmission",
+        ));
+        return rx;
+    };
+    let job = queued_call::guard(call.request.deadline, tool, request_id.clone(), job);
     let job = push::routed_progress_job(route, corr, &request_id, job);
     let (rx, cancellation) =
         executor.submit_tool_call_cancellable_async(root_id.clone(), lane, request_id, tool, job);
-    let registered = {
-        let mut calls = active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match calls.get_mut(&(route, corr)) {
-            Some(call) if !call.answering => {
-                call.cancellation = cancellation.clone();
-                call.root_id = root_id.clone();
-                true
-            }
-            _ => false,
-        }
-    };
-    if !registered {
-        executor.cancel_job(&root_id, &cancellation);
-    }
+    call.cancellation = cancellation;
+    call.root_id = root_id;
     rx
 }
 
@@ -1463,6 +1477,9 @@ struct RootMeta {
     maintenance_last_submitted: Option<Instant>,
     maintenance_poisoned: bool,
     last_touched: Instant,
+    /// Diagnostic demand clocks; unlike last_touched, polling and teardown do not reset them.
+    last_tool_call: Option<Instant>,
+    route_activity: HashMap<RouteChannel, route_census::RouteActivity>,
     diagnostics_on_edit: bool,
     active_bash_waits: usize,
     idle_artifacts_evicted: bool,
@@ -1538,6 +1555,20 @@ struct RouteBindCompletion {
 
 #[derive(Debug, Clone)]
 struct RouteIdentity(Arc<RouteIdentityData>);
+
+#[derive(Default)]
+struct ManagementIdentity {
+    principal: Option<Principal>,
+    scope: Option<subc_protocol::scope::ScopeStamp>,
+    admission: ManagementAdmission,
+}
+
+#[derive(Default, PartialEq, Eq)]
+enum ManagementAdmission {
+    #[default]
+    FirstParty,
+    FlowOnly,
+}
 
 impl RouteIdentity {
     fn reply_policy(&self) -> wire::ToolResponsePolicy {
@@ -1779,6 +1810,8 @@ impl RootMeta {
             maintenance_last_submitted: None,
             maintenance_poisoned: false,
             last_touched: now,
+            last_tool_call: None,
+            route_activity: HashMap::new(),
             diagnostics_on_edit: false,
             active_bash_waits: 0,
             idle_artifacts_evicted: false,
@@ -2226,7 +2259,7 @@ fn quiesce_connection_roots(
             quiesce_unbound_root_with(&root_id, live_roots, executor, lsp);
         } else if let Some(ctx) = executor.actor_context(&root_id) {
             ctx.mark_subc_unbound();
-            executor.cancel_queued_maintenance(&root_id);
+            executor.cancel_queued_root_maintenance(&root_id);
             crate::commands::configure::cancel_deferred_configure_maintenance(&ctx);
         }
     }
@@ -2871,13 +2904,12 @@ fn note_reap_lock_contended(
     }
 }
 
-/// Shut down language servers for roots that have had no request for the
-/// configured LSP idle window. This is independent of artifact eviction and
-/// runs even while the root is still bound.
+/// Shut down individually idle language servers, independently of artifact
+/// eviction and even while their root is bound and serving other packages.
 ///
 /// `meta.last_touched` moves on every inbound tool call for a bound root
 /// (`reactivate_bound` in the route-request handler) and on response delivery,
-/// so an active harness does not look idle.
+/// so whole-root idle shutdown does not mistake an active harness for idle.
 fn reap_idle_lsp_servers(
     now: Instant,
     live_roots: &HashMap<ProjectRootId, RootMeta>,
@@ -3931,7 +3963,7 @@ async fn teardown_installed_route(
     replacement_root: Option<&ProjectRootId>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
-    management_routes: &mut HashMap<RouteChannel, Option<Principal>>,
+    management_routes: &mut HashMap<RouteChannel, ManagementIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
@@ -3948,6 +3980,25 @@ async fn teardown_installed_route(
     tool_response_body_limit: usize,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
+    // A replacement project route keeps replayable calls, even those still
+    // waiting in the executor. Release queued calls only when no project route
+    // replaces the old handle; already-running mutations keep their result.
+    if replacement_root.is_none() {
+        let queued =
+            queued_call::release_route(active_tool_calls, executor, channel, pending_responses);
+        for (corr, request) in queued {
+            let terminal = build_error_frame(
+                request.ver,
+                channel.channel,
+                channel.epoch,
+                corr,
+                request.flags,
+                "route_released",
+                "route released before execution; the tool did not run",
+            )?;
+            send_reliable_writer_frame(tx, metrics, terminal, "released queued call").await?;
+        }
+    }
     // Only the consumer's own close withdraws held permission asks. A
     // higher-epoch allocation is a new daemon route/client handle. AFT retains
     // scoped permission work by its call identity, not by that old route handle.
@@ -4035,7 +4086,8 @@ async fn teardown_installed_route(
             channel.channel
         );
     }
-    let migrated = push::migrate_retry_buffer_to_push_buffer(retry_buffer, channel, push_buffer);
+    let migrated =
+        push::migrate_retry_buffer_to_push_buffer(metrics, retry_buffer, channel, push_buffer);
     if let Some(identity) = routes.get(&channel) {
         let has_pending_bind = pending_binds
             .values()
@@ -4079,6 +4131,7 @@ async fn teardown_installed_route(
             );
         }
         if let Some(meta) = live_roots.get_mut(&identity.root) {
+            meta.route_activity.remove(&channel);
             let idle_for = meta.last_touched.elapsed();
             meta.note_activity();
             log::debug!(
@@ -4195,7 +4248,8 @@ enum ModuleLoopExit {
 }
 
 /// Entry point for `aft --subc <connection-file>`. Synchronous on the outside;
-/// owns an isolated current-thread tokio runtime for the async transport.
+/// owns an isolated current-thread tokio runtime on a dedicated, explicitly
+/// sized stack for the async transport. The caller joins that thread.
 /// Returns `Err` (fail-loud) on any connect/auth/protocol failure — we never
 /// fall back to the standalone loop, to avoid split-brain index state.
 pub fn run_subc_mode(
@@ -4273,7 +4327,52 @@ fn run_subc_mode_with_probe(
     )
 }
 
+// A current-thread runtime polls its root future on the thread calling
+// block_on. Windows gives the process main thread only a 1 MiB stack; the
+// module loop and its callees need headroom even with their futures boxed.
+const MODULE_RUNTIME_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+fn with_module_runtime_stack<T: Send>(run: impl FnOnce() -> T + Send) -> io::Result<T> {
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name("aft-subc-runtime".to_string())
+            .stack_size(MODULE_RUNTIME_STACK_BYTES)
+            .spawn_scoped(scope, run)?;
+        match worker.join() {
+            Ok(result) => Ok(result),
+            // Keep the original panic payload and unwind the caller, rather
+            // than turning a module panic into a clean stop or a new panic.
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+}
+
 fn run_subc_mode_inner(
+    connection_file_path: &Path,
+    ctx: Arc<AppContext>,
+    executor: Arc<Executor>,
+    dispatch: DispatchFn,
+    user_config_path: Option<PathBuf>,
+    allow_native_passthrough: bool,
+    tool_response_body_limit: usize,
+    lifecycle_probe: Option<SubcTestLifecycleProbe>,
+) -> Result<(), SubcError> {
+    with_module_runtime_stack(move || {
+        run_subc_mode_on_runtime_thread(
+            connection_file_path,
+            ctx,
+            executor,
+            dispatch,
+            user_config_path,
+            allow_native_passthrough,
+            tool_response_body_limit,
+            lifecycle_probe,
+        )
+    })
+    .map_err(SubcError::RuntimeThread)?
+}
+
+fn run_subc_mode_on_runtime_thread(
     connection_file_path: &Path,
     ctx: Arc<AppContext>,
     executor: Arc<Executor>,
@@ -4920,7 +5019,7 @@ async fn process_route_bind_completion(
     writer_tx: &WriterSender,
     completion: ControlCompletion,
     a0: &A0Egress,
-    management_routes: &mut HashMap<RouteChannel, Option<Principal>>,
+    management_routes: &mut HashMap<RouteChannel, ManagementIdentity>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
@@ -4952,11 +5051,11 @@ async fn process_route_bind_completion(
             _ => return Err(SubcError::WriterClosed),
         },
         ControlCompletion::ManagementAckWritten {
-            route, principal, ..
+            route, identity, ..
         } => {
             a0.retire(route);
             if installed_route_epochs.get(&route.channel) == Some(&route.epoch) {
-                management_routes.insert(route, principal);
+                management_routes.insert(route, identity);
             }
             return Ok(());
         }
@@ -4992,7 +5091,7 @@ async fn drain_pending_route_bind_completions(
     control_completion_rx: &mut mpsc::Receiver<ControlCompletion>,
     configure_completion_rx: &mut mpsc::Receiver<ControlCompletion>,
     a0: &A0Egress,
-    management_routes: &mut HashMap<RouteChannel, Option<Principal>>,
+    management_routes: &mut HashMap<RouteChannel, ManagementIdentity>,
     writer_tx: &WriterSender,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
@@ -5078,6 +5177,9 @@ where
     // startup, see `crate::launch_nonce`) so a reserved module_id's HELLO is
     // accepted; absent for non-reserved/self-connect.
     let launch_nonce = crate::launch_nonce::current();
+    // Compile immutable call validators before HELLO makes this module available.
+    // Discovery only needs catalog entries and must not pay this first-use cost.
+    tool_provider::prepare_admission();
     let mut manifest = build_manifest_without(&catalog_disabled);
     manifest::declare_provenance(&mut manifest, crate::launch_nonce::provenance());
     let rich_ui_proofs = rich_ui::session::ProofCapabilities::from_manifest(&manifest);
@@ -5121,6 +5223,7 @@ where
     };
 
     let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
+    dispatch_path_metrics.watch_delivery.install(&executor);
     if let Some(probe) = lifecycle_probe.clone() {
         *dispatch_path_metrics
             .lifecycle_probe
@@ -5294,7 +5397,7 @@ where
     let connection_cancel = PersistentCancelSignal::new();
     let mut installed_route_epochs: HashMap<u16, u32> = HashMap::new();
     let mut routes: HashMap<RouteChannel, RouteIdentity> = HashMap::new();
-    let mut management_routes: HashMap<RouteChannel, Option<Principal>> = HashMap::new();
+    let mut management_routes: HashMap<RouteChannel, ManagementIdentity> = HashMap::new();
     let mut bg_subs: HashMap<RouteChannel, BgSub> = HashMap::new();
     let mut bg_sub_by_session: BgSubsBySession = HashMap::new();
     let mut bg_wake_pending = BgWakePending::new();
@@ -5490,6 +5593,7 @@ where
                 &routes,
                 &mut retry_buffer,
             );
+            dispatch_path_metrics.watch_delivery.kick();
             if retried > 0 {
                 log::debug!(
                     "subc attach: retried {retried} reliable Push frame(s) after writer backpressure"
@@ -5829,7 +5933,9 @@ where
                         }
                     }
                     FrameType::Request if frame.header.channel == 0 => {
-                        if let Err(error) = handle_control_request(
+                        // Keep the control future on the heap so it does not enlarge
+                        // the loop's poll stack frame, including for tool requests.
+                        if let Err(error) = heap_module_future(|| handle_control_request(
                             &a0.writer,
                             &writer_tx,
                             &a0,
@@ -5863,7 +5969,7 @@ where
                             tool_response_body_limit,
                             Some(&run_scopes),
                             storage_dir,
-                        )
+                        ))
                         .await
                         {
                             break Err(error);
@@ -5872,6 +5978,18 @@ where
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
                         let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore, codemode_policies };
+                        // Bind admission, not request-supplied scope data, limits
+                        // flow management routes to the manifest's flow operations
+                        // before any store, provider, or general tool dispatch.
+                        // Tool routes retain their separate call-mode contract.
+                        if let Some(identity) = management_routes.get(&route) {
+                            if let Err(error) = admit_management_flow_request(identity, decoded.body().ok()) {
+                                if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await {
+                                    break Err(error);
+                                }
+                                continue;
+                            }
+                        }
                         if let (Some(identity), Ok(body)) = (routes.get(&route), decoded.body()) {
                             // Rich-UI chunk queries are provider reads that name no
                             // session or tool, so they are answered here, before the
@@ -5879,6 +5997,15 @@ where
                             if let Some((operation, query)) = chunk_query(body) {
                                 let db = shared_app.db();
                                 if let Err(error) = answer_chunk_query(&writer_tx, &dispatch_path_metrics, &decoded.frame, identity, operation, &query, db.as_deref()).await {
+                                    break Err(error);
+                                }
+                                continue;
+                            }
+                            if diagnostics_findings::is_request(body) {
+                                if let Err(error) = diagnostics_findings::dispatch(
+                                    &writer_tx, &dispatch_path_metrics, &decoded.frame,
+                                    identity.scope.as_ref(), body, &health_rollup_cache, &executor,
+                                ).await {
                                     break Err(error);
                                 }
                                 continue;
@@ -5891,6 +6018,17 @@ where
                             }
                             if let Err(error) = carrier_read_only::admit(identity, body) {
                                 if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await {
+                                    break Err(error);
+                                }
+                                continue;
+                            }
+                        }
+                        if let (Some(identity), Ok(body)) = (management_routes.get(&route), decoded.body()) {
+                            if diagnostics_findings::is_request(body) {
+                                if let Err(error) = diagnostics_findings::dispatch(
+                                    &writer_tx, &dispatch_path_metrics, &decoded.frame,
+                                    identity.scope.as_ref(), body, &health_rollup_cache, &executor,
+                                ).await {
                                     break Err(error);
                                 }
                                 continue;
@@ -6024,9 +6162,8 @@ where
                         let result = if management_routes.contains_key(&route)
                             && gh_relay_operation(&frame).is_some()
                         {
-                            // Management routes are bound only for first-party
-                            // principals (see the RouteBind arm), so the route
-                            // being here is the admission fact passed on.
+                            // Flow-only management routes were refused above;
+                            // reaching the relay requires first-party admission.
                             spawn_gh_relay(
                                 &writer_tx,
                                 &frame,
@@ -6045,17 +6182,17 @@ where
                                 &live_roots,
                                 &root_channels,
                                 &routes,
+                                &active_tool_calls,
                                 &health_rollup_cache,
                                 &dispatch_path_metrics,
-                                management_routes.get(&route).and_then(Option::as_ref),
+                                management_routes.get(&route).and_then(|identity| identity.principal.as_ref()),
                                 storage_dir,
                             )
                             .await
                         } else {
-                            // The tool-call future is polled on this loop's
-                            // thread, so it is boxed to keep its own frame on
-                            // the heap instead of widening this loop's frame.
-                            Box::pin(handle_tool_call_with_capabilities(
+                            // Keep construction of the large tool-call future out
+                            // of the loop's poll stack as well as its stored state.
+                            heap_module_future(|| handle_tool_call_with_capabilities(
                                 &writer_tx,
                                 &frame,
                                 parsed_body,
@@ -6144,6 +6281,7 @@ where
                         let cancelled_deferred = pending_responses.cancel_request(channel, corr);
                         if cancelled_call.is_some() || cancelled_deferred {
                             let request = cancelled_call.unwrap_or(RequestFrameMeta {
+                                deadline: None,
                                 ver: frame.header.ver,
                                 flags: frame.header.flags,
                             });
@@ -7654,6 +7792,8 @@ async fn handle_route_bind_completion(
         })
         .or_insert_with(|| RootMeta::new(Instant::now()));
     if let Some(meta) = live_roots.get_mut(&completion.bind_root_id) {
+        meta.route_activity
+            .insert(route_id, route_census::RouteActivity::new(Instant::now()));
         meta.diagnostics_on_edit = completion.diagnostics_on_edit;
         meta.maintenance_poisoned = false;
     }
@@ -7831,14 +7971,16 @@ async fn send_cached_health_response(
     pending_binds: &HashMap<RouteChannel, PendingBind>,
     metrics: &DispatchPathMetrics,
     health_rollup_cache: &HealthRollupCache,
+    ownership_summary: Value,
 ) -> Result<(), SubcError> {
-    let report = build_health_report(
+    let mut report = build_health_report(
         health_rollup_cache,
         executor,
         pending_binds,
         metrics,
         shared_app,
     );
+    health::with_route_ownership_summary(&mut report, ownership_summary);
     let body = serde_json::to_vec(&ModuleControlResponse::from(report)).map_err(SubcError::Json)?;
     let response = Frame::build_with_version(
         frame.header.ver,
@@ -8092,7 +8234,7 @@ async fn handle_control_request(
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
-    management_routes: &mut HashMap<RouteChannel, Option<Principal>>,
+    management_routes: &mut HashMap<RouteChannel, ManagementIdentity>,
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
@@ -8215,7 +8357,9 @@ async fn handle_control_request(
                     )
                     .await;
                 }
-                if !matches!(bind_trust, BindTrust::FirstParty) {
+                if !matches!(bind_trust, BindTrust::FirstParty)
+                    && diagnostics_findings::admit_flow(scope.as_ref()).is_err()
+                {
                     return send_route_bind_error(
                         tx,
                         frame,
@@ -8225,6 +8369,14 @@ async fn handle_control_request(
                     )
                     .await;
                 }
+                let admission = if scope
+                    .as_ref()
+                    .is_some_and(diagnostics_findings::is_flow_scope)
+                {
+                    ManagementAdmission::FlowOnly
+                } else {
+                    ManagementAdmission::FirstParty
+                };
                 if let Some(installed_epoch) = installed_route_epochs.get(&route_channel).copied() {
                     if installed_epoch >= epoch {
                         return send_route_bind_error(
@@ -8286,7 +8438,11 @@ async fn handle_control_request(
                         ack,
                         ControlCompletion::ManagementAckWritten {
                             route: route_id,
-                            principal,
+                            identity: ManagementIdentity {
+                                principal,
+                                scope,
+                                admission,
+                            },
                             corr: frame.header.corr,
                         },
                         metrics,
@@ -8692,6 +8848,16 @@ async fn handle_control_request(
                 pending_binds,
                 metrics,
                 health_rollup_cache,
+                route_census::snapshot(
+                    live_roots,
+                    root_channels,
+                    routes,
+                    active_tool_calls,
+                    executor,
+                    metrics,
+                    Instant::now(),
+                )
+                .summary(),
             )
             .await
         }
@@ -8707,6 +8873,7 @@ async fn handle_management_request(
     live_roots: &HashMap<ProjectRootId, RootMeta>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
     routes: &HashMap<RouteChannel, RouteIdentity>,
+    active_tool_calls: &ActiveToolCalls,
     health_rollup_cache: &Arc<HealthRollupCache>,
     metrics: &Arc<DispatchPathMetrics>,
     principal: Option<&Principal>,
@@ -8767,6 +8934,15 @@ async fn handle_management_request(
                 shared_app,
                 executor,
                 census_route_rows(live_roots, root_channels),
+                route_census::snapshot(
+                    live_roots,
+                    root_channels,
+                    routes,
+                    active_tool_calls,
+                    executor,
+                    metrics,
+                    Instant::now(),
+                ),
                 health_rollup_cache,
                 metrics,
             );
@@ -8960,6 +9136,7 @@ fn spawn_memory_census(
     shared_app: &Arc<App>,
     executor: &Arc<Executor>,
     route_rows: Vec<CensusRouteRow>,
+    ownership: route_census::Snapshot,
     health_rollup_cache: &Arc<HealthRollupCache>,
     metrics: &Arc<DispatchPathMetrics>,
 ) {
@@ -8973,7 +9150,8 @@ fn spawn_memory_census(
     tokio::spawn(async move {
         let _response_task = ResponseTaskGuard::new(&metrics);
         let census = health::fresh_memory_census(&cache, deadline).await;
-        let census = with_census_route_rows(census, &shared_app, &executor, &route_rows);
+        let mut census = with_census_route_rows(census, &shared_app, &executor, &route_rows);
+        census["route_ownership"] = ownership.render(&executor);
         if let Err(error) = send_management_response(
             &tx,
             &frame,
@@ -9632,6 +9810,25 @@ fn occipital_carrier_route(identity: &RouteIdentity) -> bool {
         })
 }
 
+fn admit_management_flow_request(
+    identity: &ManagementIdentity,
+    body: Option<&Value>,
+) -> Result<(), ErrorBody> {
+    if identity.admission != ManagementAdmission::FlowOnly {
+        return Ok(());
+    }
+    let operation = body
+        .and_then(|body| body.get("method").or_else(|| body.get("op")))
+        .and_then(Value::as_str);
+    if !operation.is_some_and(|operation| manifest::FLOW_OPERATIONS.contains(&operation)) {
+        return Err(ErrorBody::new(
+            "flow_scope_not_supported",
+            "a flow may call only diagnostics.findings on an AFT management route",
+        ));
+    }
+    diagnostics_findings::admit_flow(identity.scope.as_ref())
+}
+
 /// Whether a route request is a tool call: either `op: "tool.call"`, or the
 /// bare form with no `op` whose `name` is not a provider operation.
 fn route_request_is_tool_call(envelope: &Value) -> bool {
@@ -9740,6 +9937,7 @@ async fn submit_provider_read(
     operation: &str,
     body: Value,
     mut phase_trace: PhaseTrace,
+    request: RequestFrameMeta,
 ) -> Result<(), SubcError> {
     let route = route_key(frame.header.channel, frame.header.epoch);
     let corr = frame.header.corr;
@@ -9752,50 +9950,38 @@ async fn submit_provider_read(
     let project_root = identity.project_root.clone();
     let request_id = format!("subc-{}-{}", route.channel, corr);
     let job_id = request_id.clone();
-    // Worker catalogs can materialize persisted launch params even on a
-    // parameterless refetch. Serialize them with grant revocation before replying.
-    let freeze_policy = operation.starts_with("grants.")
-        || remote_policy::key(&identity, body.get("preset").and_then(Value::as_str)).is_some()
-        || body
-            .get("params")
-            .and_then(Value::as_object)
-            .is_some_and(|p| p.contains_key("allow_paths"));
+    let provider_root = identity.root.clone();
+    let received_at = phase_trace.received_at();
+    let admission_deadline = request
+        .deadline
+        .map_or(received_at + Duration::from_secs(2), |deadline| {
+            deadline.at().min(received_at + Duration::from_secs(2))
+        });
     phase_trace.mark_executor_submitted();
     let (trace_tx, trace_rx) = oneshot::channel();
-    let rx = submit_active_tool_call(
+    let mut rx = submit_active_tool_call(
         executor,
         active,
         route,
         corr,
         identity.root.clone(),
-        if freeze_policy {
-            Lane::Mutating
-        } else {
-            Lane::PureRead
-        },
+        Lane::ProviderMetadata,
         request_id.clone(),
-        RouteDetachPolicy::CancelOnDetach,
+        RouteDetachPolicy::RetainForReplay,
         &operation,
-        RequestFrameMeta { ver, flags },
+        request,
         Box::new(move |ctx| {
             phase_trace.mark_job_admitted();
             let result = if job_operation == "role.describe" {
                 Ok(tool_provider::describe())
+            } else if job_operation.starts_with("grants.") && ctx.database_runtime_initializing() {
+                Err(subc_protocol::ErrorBody::new(
+                    "grants_unavailable",
+                    "scope persistence unavailable",
+                ))
             } else if job_operation.starts_with("grants.") {
-                crate::database_open::run_staged_open(
-                    ctx,
-                    crate::database_open::DatabaseOpenRunner::ConfigureTail,
-                    true,
-                );
                 access_grants::operation(body, &job_operation, &identity, ctx)
             } else {
-                if freeze_policy {
-                    crate::database_open::run_staged_open(
-                        ctx,
-                        crate::database_open::DatabaseOpenRunner::ConfigureTail,
-                        true,
-                    );
-                }
                 remote_policy::catalog(body, &identity, ctx)
             };
             if job_operation == "tool.catalog" {
@@ -9832,9 +10018,61 @@ async fn submit_provider_read(
     let tx = tx.clone();
     let metrics = metrics.clone();
     let active = active.clone();
+    let provider_executor = executor.clone();
+    let cancellation = active
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(route, corr))
+        .expect("provider call registered before submission")
+        .cancellation
+        .clone();
     tokio::spawn(async move {
-        let response = await_executor_response(rx, request_id).await;
-        let phase_trace = trace_rx.await.ok();
+        let (response, phase_trace) = match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(admission_deadline),
+            &mut rx,
+        )
+        .await
+        {
+            Ok(response) => (
+                response.unwrap_or_else(|_| {
+                    Response::error(request_id, "internal_error", "executor dropped")
+                }),
+                trace_rx.await.ok(),
+            ),
+            Err(_) => {
+                match provider_executor.cancel_job_before_execution(&provider_root, &cancellation) {
+                    PreExecutionCancelOutcome::AlreadyStarted => (
+                        await_executor_response(rx, request_id).await,
+                        trace_rx.await.ok(),
+                    ),
+                    PreExecutionCancelOutcome::QueuedRemoved
+                    | PreExecutionCancelOutcome::DispatchedCancelled => {
+                        if let Some(deadline) = request.deadline {
+                            deadline.log_drop(&operation, "provider_admission_timeout");
+                        } else {
+                            log::warn!("queued tool_call dropped name={operation:?} reason=provider_admission_timeout queue_ms={} deadline_ms=none admission_budget_ms=2000",
+                            received_at.elapsed().as_millis());
+                        }
+                        let code = if request
+                            .deadline
+                            .is_some_and(|deadline| deadline.at() <= Instant::now())
+                        {
+                            "deadline_exceeded"
+                        } else {
+                            "provider_busy"
+                        };
+                        (
+                            Response::error(
+                                request_id,
+                                code,
+                                "provider admission deadline exceeded; no operation ran",
+                            ),
+                            None,
+                        )
+                    }
+                }
+            }
+        };
         if !claim_active_tool_call(&active, route, corr) {
             if operation == "tool.catalog" {
                 log::warn!(
@@ -9851,6 +10089,8 @@ async fn submit_provider_read(
             (FrameType::Error, error.clone())
         } else if let Some(answer) = response.data.get("answer") {
             (FrameType::Response, answer.clone())
+        } else if !response.success {
+            (FrameType::Error, response.data.clone())
         } else {
             (
                 FrameType::Error,
@@ -10484,6 +10724,11 @@ async fn handle_tool_call_with_capabilities(
         phase_trace.received_at(),
         &envelope,
     );
+    let request_meta = RequestFrameMeta {
+        ver: frame.header.ver,
+        flags: frame.header.flags,
+        deadline: queued_call::Deadline::from_envelope(phase_trace.received_at(), &envelope),
+    };
     if let Some(error) = occipital_session_refusal(&identity, &envelope) {
         return send_provider_error(tx, metrics, frame, error).await;
     }
@@ -10576,6 +10821,7 @@ async fn handle_tool_call_with_capabilities(
                 operation,
                 body,
                 phase_trace,
+                request_meta,
             )
             .await;
         }
@@ -10640,6 +10886,8 @@ async fn handle_tool_call_with_capabilities(
                     operation,
                     dispatch,
                     rich_ui_proofs,
+                    request_meta,
+                    reply_budget,
                 )
                 .await;
             }
@@ -11074,6 +11322,12 @@ async fn handle_tool_call_with_capabilities(
             tool_response_body_limit,
         )?;
         return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
+    }
+
+    if is_subc_agent_core_tool(&bare_name) || is_subc_native_plumbing_tool(&bare_name) {
+        if let Some(meta) = live_roots.get_mut(&identity.root) {
+            route_census::note_tool_call(meta, route_id, Instant::now());
+        }
     }
 
     if matches!(bare_name.as_str(), "bash" | "powershell") {
@@ -11590,10 +11844,7 @@ async fn handle_tool_call_with_capabilities(
             request_id.clone(),
             RouteDetachPolicy::CancelOnDetach,
             &bare_name,
-            RequestFrameMeta {
-                ver: frame.header.ver,
-                flags: frame.header.flags,
-            },
+            request_meta,
             job,
         );
 
@@ -11800,10 +12051,7 @@ async fn handle_tool_call_with_capabilities(
         request_id.clone(),
         RouteDetachPolicy::RetainForReplay,
         &bare_name_for_frame,
-        RequestFrameMeta {
-            ver: frame.header.ver,
-            flags: frame.header.flags,
-        },
+        request_meta,
         job,
     );
     let completion_tx = tx.clone();
@@ -12624,6 +12872,7 @@ pub(crate) mod test_support {
         RequestFrameMeta {
             ver: PROTOCOL_VERSION,
             flags: Flags::new(false, Priority::Interactive, false),
+            deadline: None,
         }
     }
 
@@ -15483,6 +15732,7 @@ mod tests {
                 &HashMap::new(),
                 &metrics,
                 &health_rollup_cache,
+                json!({}),
             ));
             done_tx.send(result).expect("report health result");
         });
@@ -16763,6 +17013,7 @@ mod tests {
                     request: RequestFrameMeta {
                         ver: PROTOCOL_VERSION,
                         flags: control_flags(),
+                        deadline: None,
                     },
                     answering: false,
                 },
@@ -17514,6 +17765,23 @@ mod tests {
     }
 
     #[test]
+    fn idle_lsp_sweep_reaps_one_package_while_bound_root_is_busy() {
+        let fixture = crate::lsp::manager::regression_tests::IdleLspFixture::new();
+        let root = ProjectRootId::from_path(fixture.config.project_root.as_ref().unwrap()).unwrap();
+        fixture.ctx.mark_subc_bound();
+        let executor = Executor::new();
+        assert!(executor.register_actor(root.clone(), Arc::clone(&fixture.ctx)));
+        let mut roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+        for _ in 0..3 {
+            fixture.hover(&fixture.busy);
+            let now = Instant::now();
+            roots.get_mut(&root).unwrap().last_touched = now;
+            reap_idle_lsp_servers(now, &roots, &executor);
+        }
+        fixture.assert_only_busy();
+    }
+
+    #[test]
     fn quiesced_root_refuses_preserved_inspect_spawn_and_rebind_is_safe() {
         use crate::lsp::manager::ServerAttemptResult;
         use crate::lsp::registry::ServerKind;
@@ -17762,14 +18030,17 @@ mod tests {
             ctx.lsp_child_registry(),
         );
         assert_eq!(outcome.graceful + outcome.forced, 1, "{outcome:?}");
-        assert_eq!(outcome.unreaped, 0, "{outcome:?}");
-        // The forced kill does not wait; its worker thread reaps the child
-        // right after. Hang guard only.
+        // The shared budget bounds the caller, not its detached reapers. A slow
+        // Windows force-kill can leave the completion report pending at that
+        // deadline. Require eventual process exit and registry cleanup instead;
+        // neither a live leaked server nor a stale registry entry may remain.
         let deadline = Instant::now() + Duration::from_secs(30);
-        while crate::bash_background::process::is_process_alive(pid) {
+        while crate::bash_background::process::is_process_alive(pid)
+            || ctx.lsp_child_registry().pids().contains(&pid)
+        {
             assert!(
                 Instant::now() < deadline,
-                "exit sweep left server {pid} running"
+                "exit sweep did not reap server {pid}: {outcome:?}"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -21844,6 +22115,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fresh_root_catalog_and_role_describe_do_not_wait_for_view_load_or_index_work() {
+        let mut fixture = HeldConfigureTail::start("view_load");
+        let (started, running) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let index = fixture.executor.submit_async(
+            fixture.root.clone(),
+            Lane::HeavyInit,
+            "held-index".into(),
+            Box::new(move |_| {
+                let _ = started.send(());
+                let _ = held.recv();
+                Response::success("index", json!({}))
+            }),
+        );
+        running.recv_timeout(Duration::from_secs(3)).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime.block_on(async {
+            for (operation, body) in [
+                ("role.describe", json!({})),
+                ("tool.catalog", json!({"preset":"head"})),
+                ("tool.catalog", json!({"preset":"worker"})),
+            ] {
+                let (writer, mut replies) = mpsc::channel(8);
+                let frame =
+                    Frame::build(FrameType::Request, control_flags(), 41, 1, 7, vec![]).unwrap();
+                submit_provider_read(
+                    &writer,
+                    &frame,
+                    route_identity(&fixture.root, "preflight"),
+                    &fixture.executor,
+                    &Arc::default(),
+                    &Arc::new(DispatchPathMetrics::new()),
+                    operation,
+                    body,
+                    PhaseTrace::new(Instant::now()),
+                    test_support::test_request_meta(),
+                )
+                .await
+                .unwrap();
+                let reply = tokio::time::timeout(Duration::from_millis(500), replies.recv()).await;
+                if !matches!(&reply, Ok(Some(frame)) if frame.header.ty == FrameType::Response) {
+                    return false;
+                }
+            }
+            true
+        });
+        release.send(()).unwrap();
+        assert!(index.blocking_recv().unwrap().success);
+        fixture.release_tail();
+        assert!(
+            result,
+            "preflight must answer while real view-load and index work are held"
+        );
+    }
+
     /// After a daemon restart every session of a root rebinds at once, while
     /// that root's first configure tail runs one long unit that cannot step
     /// aside (a view or artifact load on a large root). The herd rebinds with
@@ -22877,8 +23204,9 @@ mod tests {
         assert!(queued_a.is_some(), "root A's pi bind waits in the queue");
         assert!(queued_b.is_some(), "root B's pi bind waits in the queue");
         assert_eq!(
-            idle_with_pi_binds_waiting, 2,
-            "both reserved bind workers are free while the pi binds wait"
+            idle_with_pi_binds_waiting,
+            2 + executor.provider_reserve_for_test(),
+            "both bind workers and the unused metadata reservation are free while pi binds wait"
         );
     }
 

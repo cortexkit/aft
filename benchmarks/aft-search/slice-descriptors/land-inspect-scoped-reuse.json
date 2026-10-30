@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "inspect-scoped-reuse"
+  ],
+  "note": "Scoped aft_inspect dead-code completions reuse the shared scan's revision-checked call-graph projection and rollup instead of re-projecting the whole graph per waiter. No changed path matches RANKING_FENCE_PREFIXES."
+}

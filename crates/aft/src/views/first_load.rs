@@ -4,6 +4,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+#[cfg(test)]
+#[path = "first_load_memory.rs"]
+mod memory;
+
 use crate::blob_store::v2::FamilyPlane;
 pub use crate::watcher_backend::cookie::{CookieObservation, CookieTicket};
 
@@ -1665,6 +1669,35 @@ pub struct CheckoutDriver {
     work: std::sync::Mutex<ReconcileWork>,
 }
 
+/// A bind owns only its synchronous base work. Deferred planes acquire their
+/// own claims. Release the base claim on error or unwind so another driver can
+/// finish the base without waiting for this process to exit.
+struct BaseCompletionClaim<'a>(&'a std::sync::Mutex<Option<super::base_builder::BuildClaim>>);
+
+impl BaseCompletionClaim<'_> {
+    fn release(&self) -> Result<(), PlaneError> {
+        if let Some(claim) = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            claim
+                .release()
+                .map_err(|e| SiblingLoader::error(e.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BaseCompletionClaim<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.release() {
+            crate::slog_warn!("releasing failed bind's base completion claim: {}", error);
+        }
+    }
+}
+
 #[derive(Default)]
 struct DeliveryState {
     seq: u64,
@@ -1889,6 +1922,7 @@ impl CheckoutDriver {
         base: Arc<ComposedGeneration>,
     ) -> Result<(Snapshot, u64), PlaneError> {
         self.check_owner(access)?;
+        let completion_claim = BaseCompletionClaim(&self.base_claim);
         if !self.owner.registry().is_v3_only() {
             return Err(SiblingLoader::error(
                 "verified_bind requires a v3-only registration",
@@ -1936,24 +1970,8 @@ impl CheckoutDriver {
             return Ok((snapshot, revision));
         }
         let own = self.build_own_generation(access, &snapshot, DERIVED_CALLGRAPH_SEEDING);
-        // Every plane of a fresh bootstrap has completed its base entries by
-        // now (lexical in the build, others in `bootstrap_v3_base`).
-        if self
-            .planes
-            .iter()
-            .all(|plane| plane.plane() == FamilyPlane::Trigram || plane.completes_fresh_base())
-        {
-            if let Some(claim) = self
-                .base_claim
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-            {
-                claim
-                    .release()
-                    .map_err(|e| SiblingLoader::error(e.to_string()))?;
-            }
-        }
+        // Synchronous completion is done; deferred planes take their own claim.
+        completion_claim.release()?;
         let own = own?;
         let mut delta = LiveDelta::from_snapshot(&snapshot);
         let draft = super::snapshot::derive_successor(
@@ -2139,9 +2157,11 @@ impl CheckoutDriver {
                     }
                 }
                 outcome => {
+                    let reason =
+                        format!("v3 base plane completion is owned elsewhere: {outcome:?}");
                     return Err(SiblingLoader::error(format!(
-                        "v3 base plane completion is owned elsewhere: {outcome:?}"
-                    )))
+                        "{reason} (base_scope={scope})"
+                    )));
                 }
             }
         }
@@ -2514,6 +2534,22 @@ impl FirstLoadDriver for CheckoutDriver {
             None
         };
         let mut v3_readers = V3PlaneReaders::new(&route);
+        let v2_graph_reader = if !v3
+            && self
+                .planes
+                .iter()
+                .any(|p| p.plane() == FamilyPlane::Callgraph)
+        {
+            crate::blob_store::v2::FamilyStoreReader::open_existing(
+                self.owner.registry().storage(),
+                self.owner.family(),
+                FamilyPlane::Callgraph,
+            )
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
         let persisted = durable
             .as_ref()
             .and_then(|generation| {
@@ -2653,6 +2689,17 @@ impl FirstLoadDriver for CheckoutDriver {
                     let keys_present = old.attachments.values().all(|a| {
                         a.downcast_ref::<CachedAttachment>()
                             .is_none_or(|cached| v3_readers.contains(&cached.0))
+                            && a.downcast_ref::<super::callgraph::CallgraphAttachment>()
+                                .is_none_or(|attachment| {
+                                    attachment.payload().is_some()
+                                        || if v3 {
+                                            v3_readers.contains(&attachment.key)
+                                        } else {
+                                            v2_graph_reader.as_ref().is_some_and(|reader| {
+                                                reader.contains(&attachment.key).unwrap_or(false)
+                                            })
+                                        }
+                                })
                     });
                     if cached.reusable(current)
                         && delivered <= cached.delivery_seq
@@ -2803,6 +2850,8 @@ impl FirstLoadDriver for CheckoutDriver {
             guard: guard.clone(),
             subscription,
         };
+        #[cfg(test)]
+        crate::test_allocations::heap_marker("first_load", "reconcile");
         let mut cut = installed.install_cut().cloned();
         if let Some(cut) = &mut cut {
             cut.verification = guard;
@@ -2960,6 +3009,7 @@ impl FirstLoadDriver for CheckoutDriver {
                         progress = PublicationProgress::Published;
                         unpublished.complete();
                         published = true;
+                        super::callgraph::retire_attachments(&observed, &generation);
                         self.owner.registry().note_publish(self.owner.scope()).map_err(|error| SiblingLoader::error(error.to_string()))?;
                         for adapter in &self.adapters {
                             adapter.generation_published(access, &generation, &|| self.installed_cut().0)?;
@@ -3268,6 +3318,7 @@ impl CheckoutDriver {
                         },
                     );
                 drop(retired);
+                super::callgraph::retire_attachments(&observed, &composed);
                 Ok(composed)
             }
             Ok(super::base_refs::WorkerOutcome::Lost {
@@ -4688,13 +4739,9 @@ impl CompositePlane for CallgraphBridge {
                 attachment.downcast_ref::<super::callgraph::CallgraphAttachment>()
             {
                 keys.push((path.clone(), attachment.key));
-                payloads.push((
-                    attachment.key,
-                    attachment
-                        .blob
-                        .to_bytes()
-                        .map_err(|e| error(e.to_string()))?,
-                ));
+                if let Some(payload) = attachment.payload() {
+                    payloads.push((attachment.key, payload));
+                }
             } else {
                 return Err(error(format!("{path:?}: callgraph attachment missing")));
             }
@@ -4719,7 +4766,7 @@ impl CompositePlane for CallgraphBridge {
                 }
                 Ok(())
             })
-            .map_err(|e| error(e.to_string()))?;
+            .map_err(super::callgraph::v3_error)?;
         }
         for (_, key) in &keys {
             if !v3_readers.contains(key) {
@@ -4728,6 +4775,21 @@ impl CompositePlane for CallgraphBridge {
                 ));
             }
         }
+        for (path, key) in &keys {
+            if let Some(attachment) = observed
+                .get(path)
+                .and_then(|entry| entry.attachments.get(&FamilyPlane::Callgraph))
+                .and_then(|a| a.downcast_ref::<super::callgraph::CallgraphAttachment>())
+                .filter(|a| a.key == *key)
+            {
+                attachment.retire();
+            }
+        }
+        drop(payloads);
+        // Successor publication builds the derived graph before returning. The
+        // protected blob rows, not reconciliation buffers, are its inputs.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        crate::memory::relieve_allocator_pressure();
         super::base_builder::publish_successor(
             claim,
             |manifest| {
@@ -4851,13 +4913,20 @@ impl CompositePlane for CallgraphBridge {
             .collect();
         live.protect(&keys).map_err(|e| error(e.to_string()))?;
         for (path, attachment) in attachments {
-            let bytes = attachment
-                .blob
-                .to_bytes()
-                .map_err(|e| error(e.to_string()))?;
+            let bytes = match attachment.payload() {
+                Some(bytes) => bytes,
+                None => store
+                    .get(&attachment.key)
+                    .map_err(|e| error(e.to_string()))?
+                    .ok_or_else(|| error(format!("{CHECKOUT_CHANGED_BEFORE_INSTALL}: retired callgraph payload missing from store; revalidate")))?
+                    .into(),
+            };
             store
                 .put_or_touch(&attachment.key, &bytes)
                 .map_err(|e| error(e.to_string()))?;
+            // The live pin protects the durable row through graph construction.
+            // Retries can read it under a new pin; a missing row forces revalidation.
+            attachment.retire();
             if let Some(super::manifest_v2::EntryV2::Regular {
                 planes,
                 resolution_input,
@@ -4868,6 +4937,9 @@ impl CompositePlane for CallgraphBridge {
                 *resolution_input = super::assembly::is_resolution_input(path.as_bytes());
             }
         }
+        // Return freed extraction buffers before the resolver grows its indices.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        crate::memory::relieve_allocator_pressure();
         // Joining uses only protected immutable blobs and the projected manifest,
         // not a source root or a sibling's derived database.
         let reader = super::callgraph::BlobReader(
@@ -4921,7 +4993,13 @@ impl CompositePlane for CallgraphBridge {
                 });
             }
             crate::db::file_identity::guard_replacement(&staging_path, "first-load derived rename");
-            std::fs::rename(&staging_path, &published_path).map_err(|e| error(e.into()))?;
+            std::fs::rename(&staging_path, &published_path).map_err(|e| {
+                error(super::ViewError::io_at(
+                    "renaming derived database to",
+                    &published_path,
+                    super::io::at("from", &staging_path, e),
+                ))
+            })?;
         }
         super::sync_directory(owner.view_dir()).map_err(|e| error(e.into()))?;
         Ok(())
@@ -4989,14 +5067,20 @@ impl CompositePlane for CallgraphBridge {
             .map_err(|e| error(e.to_string()))?;
         let mut payloads = Vec::new();
         for (path, attachment) in &attachments {
-            payloads.push((
-                path.clone(),
-                attachment.key,
-                attachment
-                    .blob
-                    .to_bytes()
-                    .map_err(|e| error(e.to_string()))?,
-            ));
+            let bytes = match attachment.payload() {
+                Some(bytes) => bytes,
+                None => crate::blob_store::v3::PlaneReader::open_existing(
+                    &route.storage,
+                    &route.family,
+                    FamilyPlane::Callgraph,
+                )
+                .map_err(super::callgraph::v3_error)?
+                .get(&attachment.key)
+                .map_err(super::callgraph::v3_error)?
+                .ok_or_else(|| error(format!("{CHECKOUT_CHANGED_BEFORE_INSTALL}: retired callgraph payload missing from store; revalidate")))?
+                .into(),
+            };
+            payloads.push((path.clone(), attachment.key, bytes));
         }
         if !payloads.is_empty() {
             let request = payloads
@@ -5012,7 +5096,7 @@ impl CompositePlane for CallgraphBridge {
                 }
                 Ok(())
             })
-            .map_err(|e| error(e.to_string()))?;
+            .map_err(super::callgraph::v3_error)?;
         }
         for (path, key, _) in &payloads {
             if let Some(super::manifest_v2::EntryV2::Regular {
@@ -5025,6 +5109,13 @@ impl CompositePlane for CallgraphBridge {
                 *resolution_input = super::assembly::is_resolution_input(path.as_bytes());
             }
         }
+        for (_, attachment) in &attachments {
+            attachment.retire();
+        }
+        drop((payloads, attachments));
+        // Serialization and parsing buffers no longer belong to this phase.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        crate::memory::relieve_allocator_pressure();
         // The derived graph covers the composed generation. While the base's
         // graph is still pending the projection refuses, and the worker's
         // graph stays building until a later publication; nothing is copied.
@@ -5033,13 +5124,13 @@ impl CompositePlane for CallgraphBridge {
         if super::callgraph::project_manifest(&composed).is_err() {
             return Ok(());
         }
-        let reader = super::callgraph::V3BlobReader(
+        let reader = super::callgraph::V3BlobReader::new(
             crate::blob_store::v3::PlaneReader::open_existing(
                 &route.storage,
                 &route.family,
                 FamilyPlane::Callgraph,
             )
-            .map_err(|e| error(e.to_string()))?,
+            .map_err(super::callgraph::v3_error)?,
         );
         let dir = route.member_dir();
         // Open (and so initialize and recover) the member's view store before
@@ -5126,7 +5217,13 @@ impl CompositePlane for CallgraphBridge {
                 });
             }
             crate::db::file_identity::guard_replacement(&staging_path, "v3 derived rename");
-            std::fs::rename(&staging_path, &published_path).map_err(|e| error(e.into()))?;
+            std::fs::rename(&staging_path, &published_path).map_err(|e| {
+                error(super::ViewError::io_at(
+                    "renaming derived database to",
+                    &published_path,
+                    super::io::at("from", &staging_path, e),
+                ))
+            })?;
         }
         super::sync_directory(&dir).map_err(|e| error(e.into()))?;
         Ok(())
@@ -5137,6 +5234,64 @@ impl CompositePlane for CallgraphBridge {
 mod callgraph_bridge_tests {
     use super::super::contracts::{PlaneAdapter, PlaneLoader};
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn retired_v2_attachment_reuses_present_key_and_reextracts_a_missing_row() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("file.rs"),
+            b"fn target() {} fn caller() { target(); }",
+        )
+        .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.path().join("file.rs"))
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(60)),
+            )
+            .unwrap();
+        let bridge = Arc::new(CallgraphBridge::default());
+        let (driver, access) = graph_driver(root.path(), storage.path(), &bridge, bridge.clone());
+        SiblingLoader::new(driver.clone(), vec![bridge.adapter.clone()])
+            .load(&access)
+            .unwrap();
+        let count = bridge.extraction_count();
+        let observed = driver.observed.lock().unwrap().clone();
+        let attachment = observed.entries[&RelPath::new(b"file.rs".to_vec()).unwrap()].attachments
+            [&FamilyPlane::Callgraph]
+            .downcast_ref::<super::super::callgraph::CallgraphAttachment>()
+            .unwrap();
+        assert!(attachment.payload().is_none());
+        driver.reconcile(&access).unwrap();
+        assert_eq!(
+            bridge.extraction_count(),
+            count,
+            "a durable key replaces the consumed payload"
+        );
+        let store = driver.owner.open_store(FamilyPlane::Callgraph).unwrap();
+        let deleted = rusqlite::Connection::open(store.path())
+            .unwrap()
+            .execute(
+                "DELETE FROM blob_payloads WHERE full_key=?1",
+                rusqlite::params![attachment.key.as_bytes().as_slice()],
+            )
+            .unwrap();
+        assert_eq!(deleted, 1);
+        let next = driver.reconcile(&access).unwrap();
+        assert_eq!(bridge.extraction_count(), count + 1);
+        assert!(
+            next.entries[&RelPath::new(b"file.rs".to_vec()).unwrap()].attachments
+                [&FamilyPlane::Callgraph]
+                .downcast_ref::<super::super::callgraph::CallgraphAttachment>()
+                .unwrap()
+                .payload()
+                .is_some()
+        );
+    }
 
     struct Walker;
     impl MembershipWalker for Walker {
@@ -6053,7 +6208,9 @@ impl CheckoutDriver {
             }
             Ok(_) => Ok(None),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(SiblingLoader::error(error.to_string())),
+            Err(error) => Err(SiblingLoader::error(
+                super::io::at("reading checkout metadata", path, error).to_string(),
+            )),
         }
     }
 
@@ -6576,6 +6733,213 @@ mod v3_bootstrap_tests {
     }
 
     #[test]
+    fn failed_or_panicked_post_bootstrap_reconciliation_releases_live_claim() {
+        struct FailSecondWalk {
+            calls: std::sync::atomic::AtomicUsize,
+            panic: bool,
+        }
+        impl MembershipWalker for FailSecondWalk {
+            fn files(&self, root: &std::path::Path) -> Result<Vec<std::path::PathBuf>, PlaneError> {
+                if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                    assert!(!self.panic, "injected post-bootstrap panic");
+                    return Err(SiblingLoader::error("injected post-bootstrap failure"));
+                }
+                ConfiguredMembershipWalker.files(root)
+            }
+        }
+
+        let _serial = crate::blob_store::v3::serial_for_test();
+        for panic in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("checkout");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("a.ts"), "export function target() {}\n").unwrap();
+            let storage = temp.path().join("storage");
+            let mut driver = trigram_driver(&root, &storage);
+            driver.walker = Arc::new(FailSecondWalk {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                panic,
+            });
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                driver.verified_bind(
+                    &driver.access(),
+                    driver.installed_snapshot().generation().clone(),
+                )
+            }));
+            if panic {
+                assert!(result.is_err());
+            } else {
+                assert!(result
+                    .unwrap()
+                    .unwrap_err()
+                    .reason
+                    .contains("injected post-bootstrap failure"));
+            }
+            assert!(driver
+                .base_claim
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn checkout_driver_regular_policy_read_error_names_operation_and_path() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let _attributes = super::super::verification::known_attribute_sources_for_test(root.path());
+        let policy_path = root.path().join("nested").join(".gitignore");
+        std::fs::create_dir_all(policy_path.parent().unwrap()).unwrap();
+        std::fs::write(&policy_path, b"ignored.rs\n").unwrap();
+        let policy_path = std::fs::canonicalize(policy_path).unwrap();
+        let _failure = super::super::verification::fail_policy_read_for_test(&policy_path);
+        let driver = trigram_driver(root.path(), storage.path());
+        let error = match driver.reconcile(&driver.access()) {
+            Ok(_) => panic!("regular policy file read failure must not be accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("view loader [driver]"), "{error}");
+        assert!(error.contains("reading policy input"), "{error}");
+        assert!(
+            error.contains(&policy_path.display().to_string()),
+            "{error}"
+        );
+        assert!(error.contains("injected policy read failure"), "{error}");
+        assert!(policy_path.is_file());
+    }
+
+    fn policy_git(root: &std::path::Path, args: &[&str]) -> std::process::Output {
+        let mut command = std::process::Command::new("git");
+        command.current_dir(root).args(args);
+        crate::test_env::apply_hermetic_git_env(&mut command);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    #[test]
+    fn checkout_driver_verifies_tracked_policy_named_directories_and_keeps_ignore_rules() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let _attributes = super::super::verification::known_attribute_sources_for_test(root.path());
+        policy_git(root.path(), &["init", "-q"]);
+        for name in [".ignore", ".gitignore"] {
+            let directory = root.path().join("fixtures").join(name);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("keep.rs"), b"fn keep() {}\n").unwrap();
+        }
+        for name in ["by-git.rs", "by-ignore.rs", "by-aft.rs", "keep.rs"] {
+            std::fs::write(root.path().join(name), b"fn sample() {}\n").unwrap();
+        }
+        std::fs::write(root.path().join(".gitignore"), b"by-git.rs\n").unwrap();
+        std::fs::write(root.path().join(".ignore"), b"by-ignore.rs\n").unwrap();
+        std::fs::write(root.path().join(".aftignore"), b"by-aft.rs\n").unwrap();
+        policy_git(root.path(), &["add", "."]);
+        let tracked = policy_git(root.path(), &["ls-files", "-z"]);
+        for name in [
+            b"fixtures/.ignore/keep.rs".as_slice(),
+            b"fixtures/.gitignore/keep.rs",
+        ] {
+            assert!(tracked.stdout.split(|b| *b == 0).any(|path| path == name));
+        }
+        let driver = trigram_driver(root.path(), storage.path());
+        let access = driver.access();
+        let (snapshot, revision) = driver
+            .verified_bind(&access, driver.installed_snapshot().generation().clone())
+            .unwrap();
+        driver.install(&access, &snapshot, revision).unwrap();
+        for name in [
+            "fixtures/.ignore/keep.rs",
+            "fixtures/.gitignore/keep.rs",
+            "keep.rs",
+        ] {
+            let path = RelPath::new(name.as_bytes().to_vec()).unwrap();
+            assert!(
+                matches!(
+                    snapshot.disk_state(&path),
+                    super::super::snapshot::DiskState::Present { .. }
+                ),
+                "{name}"
+            );
+        }
+        for name in ["by-git.rs", "by-ignore.rs", "by-aft.rs"] {
+            assert_eq!(
+                snapshot.disk_state(&RelPath::new(name.as_bytes().to_vec()).unwrap()),
+                super::super::snapshot::DiskState::Absent,
+                "{name}"
+            );
+        }
+        let (verified, _) = driver
+            .verified_bind(&access, snapshot.generation().clone())
+            .unwrap();
+        assert_eq!(verified.membership(), snapshot.membership());
+    }
+
+    #[test]
+    fn checkout_driver_reconcile_never_visits_policy_below_an_ignored_parent() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let _attributes = super::super::verification::known_attribute_sources_for_test(root.path());
+        policy_git(root.path(), &["init", "-q"]);
+        std::fs::write(
+            root.path().join(".gitignore"),
+            b"excluded/\n!excluded/keep.rs\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join("excluded/nested")).unwrap();
+        let broken = root.path().join("excluded/nested/.ignore");
+        std::fs::write(&broken, b"*\n").unwrap();
+        std::fs::write(root.path().join("excluded/keep.rs"), b"fn excluded() {}\n").unwrap();
+        std::fs::write(root.path().join("keep.rs"), b"fn keep() {}\n").unwrap();
+        let broken = std::fs::canonicalize(broken).unwrap();
+        let _failure = super::super::verification::fail_policy_read_for_test(&broken);
+        let driver = trigram_driver(root.path(), storage.path());
+        super::super::verification::take_policy_input_visits_for_test();
+        let reconciled = driver.reconcile(&driver.access()).unwrap();
+        let (directories, _) = super::super::verification::take_policy_input_visits_for_test();
+        assert_eq!(directories, 1);
+        assert!(reconciled
+            .entries
+            .contains_key(&RelPath::new(b"keep.rs".to_vec()).unwrap()));
+        assert!(!reconciled
+            .entries
+            .keys()
+            .any(|path| path.as_bytes().starts_with(b"excluded/")));
+    }
+
+    #[test]
+    fn checkout_driver_directory_git_index_error_names_operation_and_path() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let _attributes = super::super::verification::known_attribute_sources_for_test(root.path());
+        let index_path = root.path().join(".git").join("index");
+        std::fs::create_dir_all(&index_path).unwrap();
+        let driver = trigram_driver(root.path(), storage.path());
+        let error = match driver.reconcile(&driver.access()) {
+            Ok(_) => panic!("directory Git index must not be accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("reading Git index"), "{error}");
+        // Windows reports the root in its verbatim `\\?\` spelling, so accept
+        // the canonical form as well as the path the test built.
+        let canonical = std::fs::canonicalize(&index_path).unwrap();
+        assert!(
+            error.contains(&index_path.display().to_string())
+                || error.contains(&canonical.display().to_string()),
+            "{error}"
+        );
+        assert!(index_path.is_dir());
+    }
+
+    #[test]
     fn absolute_changes_match_canonical_roots_for_missing_descendants() {
         let _serial = crate::blob_store::v3::serial_for_test();
         let root = tempfile::tempdir().unwrap();
@@ -6729,7 +7093,7 @@ mod v3_bootstrap_tests {
         assert_eq!(graph.key(&path, content), Some(extracted.key));
         let trigram_key = crate::blob_store::v2::TrigramKey { content, policy }.family_key();
         let trigram = super::super::segment_store::TrigramPayload::extract(bytes, &policy).encode();
-        let graph_payload = extracted.blob.to_bytes().unwrap();
+        let graph_payload = extracted.payload().unwrap();
         crate::blob_store::v3::publish(storage.path(), "family", 1 << 20, None, |p| {
             p.put(
                 &trigram_key,
@@ -6811,7 +7175,7 @@ mod v3_bootstrap_tests {
         crate::blob_store::v3::publish(storage.path(), "family", 1 << 20, None, |p| {
             p.put(
                 &key,
-                &attachment.blob.to_bytes().unwrap(),
+                &attachment.payload().unwrap(),
                 FamilyPlane::Callgraph.payload_schema(),
             )?;
             Ok(())

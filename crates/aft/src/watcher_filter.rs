@@ -5926,6 +5926,8 @@ mod tests {
     /// Feed `burst` through a filter thread followed by an overflow, so the
     /// thread records observed volume the way a live overflow does.
     fn record_overflow_burst(root: &Path, matcher: &SharedGitignore, burst: Vec<PathBuf>) {
+        let burst_len = burst.len();
+        assert!(burst_len > 0 && burst_len <= WATCHER_ATTRIBUTION_RING_CAPACITY);
         let shutdown = Arc::new(AtomicBool::new(false));
         let (dispatch_tx, dispatch_rx) = crossbeam_channel::bounded(1);
         let (raw_tx, raw_rx) = mpsc::channel();
@@ -5936,7 +5938,8 @@ mod tests {
             dispatch_tx,
             Arc::clone(&shutdown),
         );
-        let handle = thread::spawn(move || filter.run(raw_rx));
+        let counters = Arc::clone(&filter.config.counters);
+        // Queue the complete burst and overflow before intake can start.
         for path in burst {
             raw_tx
                 .send(Ok(
@@ -5949,13 +5952,31 @@ mod tests {
                 notify::Event::new(EventKind::Other).set_flag(Flag::Rescan)
             ))
             .unwrap();
-        assert_eq!(
-            dispatch_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            WatcherDispatchEvent::RescanRequired(RescanReason::Unknown)
-        );
+        let timeout = Duration::from_secs(30);
+        let deadline = Instant::now() + timeout;
+        // This fixture tests overflow attribution, not debounce timing. Keep
+        // automatic flushing beyond the receive timeout even if canonicalizing
+        // the queued paths takes longer than the normal 250 ms flush window.
+        filter.flush_deadline = Some(deadline + timeout);
+        let handle = thread::spawn(move || filter.run(raw_rx));
+        let dispatched =
+            dispatch_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
         shutdown.store(true, Ordering::SeqCst);
         drop(raw_tx);
         handle.join().unwrap();
+        assert_eq!(
+            dispatched.unwrap(),
+            WatcherDispatchEvent::RescanRequired(RescanReason::Unknown)
+        );
+        // Diagnostic overflow prefixes count nonignored paths too, so their
+        // total verifies the burst was observed even when the exclusion list
+        // is empty.
+        let prefixes = counters.snapshot().last_overflow_prefixes;
+        assert_eq!(
+            prefixes.iter().map(|prefix| prefix.count).sum::<u64>(),
+            burst_len as u64,
+            "overflow must record the entire burst: {prefixes:?}"
+        );
     }
 
     const AGENT_SCRATCH_SIBLINGS: [&str; 7] = [

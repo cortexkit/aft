@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "health-rollup-idle-cost"
+  ],
+  "note": "The daemon health rollup reuses each resident call-graph store's stale-path census between idle ticks (invalidated on any database change and rechecked against the filesystem every 30 s), and already-reaped orphan task rows are retired under their own harness once. No search, indexing, query routing or ranking code changes."
+}

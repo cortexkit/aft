@@ -11,8 +11,7 @@
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { mkdir, realpath, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { type BinaryBridge, BridgePool } from "@cortexkit/aft-bridge";
-import { withEnv } from "../../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
+import { type BinaryBridge, type BridgeOptions, BridgePool } from "@cortexkit/aft-bridge";
 import { registerBashTool } from "../../tools/bash.js";
 import type { PluginContext } from "../../types.js";
 import {
@@ -71,11 +70,14 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
     return created;
   }
 
-  async function pluginHarness(configOverrides: Record<string, unknown> = {}) {
+  async function pluginHarness(
+    configOverrides: Record<string, unknown> = {},
+    bridgeOptions: BridgeOptions = {},
+  ) {
     const h = await harness();
     const pool = new BridgePool(
       h.binaryPath,
-      { timeoutMs: 60_000 },
+      { timeoutMs: 60_000, ...bridgeOptions },
       configureParamsFromLegacyOverrides({
         project_root: h.tempDir,
         restrict_to_project_root: false,
@@ -239,27 +241,35 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
   });
 
   test("foreground promotion returns server text without client poll/promote calls", async () => {
-    const { h, bash, bridgeCalls } = await pluginHarness({ experimental_bash_background: true });
-
-    const result = await withEnv({ AFT_TEST_FOREGROUND_WAIT_MS: "25" }, async () =>
-      callBash(bash, h, { command: "sleep 0.2 && echo late" }),
+    const { h, bash, bridgeCalls } = await pluginHarness(
+      { experimental_bash_background: true },
+      // The engine reads AFT_TEST_FOREGROUND_WAIT_MS from its own process
+      // environment, not from the bash request arguments.
+      { childEnv: { AFT_TEST_FOREGROUND_WAIT_MS: "25" } },
     );
+
+    // A terminal result wins over promotion even after the deadline. Keep the
+    // command alive long enough for the engine to poll on a loaded runner.
+    const result = await callBash(bash, h, { command: "sleep 5 && echo late" });
 
     expect(result.output).toContain("promoted to background");
+    // Server text rounds 25 ms to 0s, unlike the default wait of several seconds.
+    expect(result.output).toContain("didn't finish within 0s");
     expect(result.details.task_id).toMatch(/^bash-[a-f0-9]{16}$/);
     expect(nonConfigureCommands(bridgeCalls)).toEqual(["bash"]);
-  });
+  }, 30_000);
 
   test("wait true returns a long foreground command directly", async () => {
-    const { h, bash, bridgeCalls } = await pluginHarness({ experimental_bash_background: true });
-
-    const result = await withEnv({ AFT_TEST_FOREGROUND_WAIT_MS: "25" }, async () =>
-      callBash(bash, h, {
-        command: "sleep 0.2 && echo waited",
-        wait: true,
-        timeout: 5_000,
-      }),
+    const { h, bash, bridgeCalls } = await pluginHarness(
+      { experimental_bash_background: true },
+      { childEnv: { AFT_TEST_FOREGROUND_WAIT_MS: "25" } },
     );
+
+    const result = await callBash(bash, h, {
+      command: "sleep 0.2 && echo waited",
+      wait: true,
+      timeout: 5_000,
+    });
 
     expect(result.output).toContain("waited\n");
     expect(result.output).not.toContain("promoted to background");

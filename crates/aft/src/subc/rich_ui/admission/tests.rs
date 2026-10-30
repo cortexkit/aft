@@ -157,6 +157,47 @@ fn operation_arguments_caps_closed_fields_and_remote_targets() {
 }
 
 #[test]
+fn watch_arguments_are_closed_and_timeouts_are_bounded() {
+    let base = json!({"rich_ui_op":"bash_watch@1","task":"key","pattern":"needle"});
+    for (key, value) in [
+        ("background", json!(true)),
+        ("once", json!(true)),
+        ("deliver", json!("each_line")),
+        ("taskId", json!("bash-0123456789abcdef")),
+        ("ref", json!("HEAD")),
+        ("output_offset", json!(0)),
+        ("outputMode", json!("raw")),
+        ("unknown", json!(true)),
+        ("timeoutMs", json!(0)),
+        ("timeoutMs", json!(20_001)),
+        ("timeoutMs", json!(1.5)),
+        ("timeoutMs", json!("1000")),
+        ("pattern", json!("x".repeat(1025))),
+        ("regex", json!("true")),
+    ] {
+        let mut args = base.clone();
+        args[key] = value;
+        assert_eq!(
+            prepare("bash_watch", args).unwrap_err().code,
+            "args_invalid",
+            "{key}"
+        );
+    }
+    for timeout in [1, 20_000] {
+        let mut args = base.clone();
+        args["timeoutMs"] = timeout.into();
+        assert!(prepare("bash_watch", args).is_ok());
+    }
+    let operation = prepare("bash_watch", base).unwrap();
+    assert_eq!(
+        operation
+            .translate_query(Some("bash-0123456789abcdef"), 120_000)
+            .unwrap()["timeoutMs"],
+        20_000
+    );
+}
+
+#[test]
 fn operation_requires_publication_and_non_carrier_rejects_even_null_marker() {
     for name in ["read", "bash_status"] {
         assert_eq!(
@@ -213,4 +254,66 @@ fn operation_query_translation_passes_served_schemas_without_bound_fields() {
         read.translate_query(None, 5000).unwrap(),
         json!({"path":"x"})
     );
+}
+
+#[test]
+fn session_read_union_free_arguments_pass_served_schemas() {
+    for (name, args) in [
+        (
+            "read",
+            json!({"path":"src/lib.rs", "startLine":2, "endLine":8}),
+        ),
+        (
+            "outline",
+            json!({"target":"src/lib.rs", "includeTests":true}),
+        ),
+        ("outline", json!({"target":"src", "files":true})),
+        (
+            "zoom",
+            json!({"batch":[{"target":"src/lib.rs", "symbols":["one", "two"]}], "contextLines":2, "callgraph":true}),
+        ),
+        (
+            "search",
+            json!({"pattern":"one", "path":"src", "topK":3, "offset":0, "includeTests":true}),
+        ),
+        (
+            "grep",
+            json!({"pattern":"one", "path":"src", "include":"*.rs", "offset":0}),
+        ),
+        ("glob", json!({"pattern":"**/*.rs", "path":"src"})),
+        (
+            "callgraph",
+            json!({"op":"trace_to_symbol", "path":"src/lib.rs", "symbol":"one", "toPath":"src/lib.rs", "toSymbol":"two", "depth":2, "includeTests":true, "includeUnresolved":true}),
+        ),
+    ] {
+        let mut input = args.clone();
+        input["rich_ui_op"] = json!(format!("{name}@1"));
+        let operation = prepare(name, input).unwrap();
+        // The manifest's schemas accept these argument forms directly; do not
+        // coerce symbol lists to strings or wrap a target in an array.
+        assert_eq!(
+            operation.translate_query(None, 5000).unwrap(),
+            args,
+            "{name}"
+        );
+    }
+    for args in [
+        json!({"target":["src/lib.rs"]}),
+        json!({"target":"src/lib.rs", "ref":"HEAD"}),
+    ] {
+        let mut args = args;
+        args["rich_ui_op"] = json!("outline@1");
+        assert_eq!(prepare("outline", args).unwrap_err().code, "args_invalid");
+    }
+    for batch in [
+        json!([{"target":"src/lib.rs", "symbols":"one"}]),
+        json!([{"target":"src/lib.rs", "symbols":["one"], "ref":"HEAD"}]),
+    ] {
+        assert_eq!(
+            prepare("zoom", json!({"rich_ui_op":"zoom@1", "batch":batch}))
+                .unwrap_err()
+                .code,
+            "args_invalid"
+        );
+    }
 }

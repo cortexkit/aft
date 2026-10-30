@@ -1113,7 +1113,8 @@ impl ViewRegistration {
         root: &Path,
     ) -> RegistryResult<Self> {
         let registry = FamilyRegistry::open_v3(storage, family)?;
-        let root = std::fs::canonicalize(root)?;
+        let root = std::fs::canonicalize(root)
+            .map_err(|e| super::io::at("resolving checkout root", root, e))?;
         let owner = current_owner();
         let session_id = super::base_refs::fresh_nonce();
         let view_dir = registry.with_barrier(|tx| {

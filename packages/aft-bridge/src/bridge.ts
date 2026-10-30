@@ -501,6 +501,18 @@ export interface BashLongRunningPayload {
 }
 
 export interface BashWatchLineBatch {
+  retry_gap?: {
+    reason: "retry_overflow";
+    dropped_notifications: number;
+    known_missing_occurrences: number;
+    first_offset?: number;
+    last_offset?: number;
+    stream?: string;
+    evicted_through?: number;
+    eviction_epoch?: string;
+    last_match_version?: number;
+  };
+  acknowledged_version?: number;
   pending_id?: string;
   version?: number;
   terminal_summary?: boolean;
@@ -791,6 +803,25 @@ export class BinaryBridge implements AftProjectTransport {
       }
     } else {
       log(message, meta);
+    }
+  }
+
+  private debugVia(message: string, meta?: LogMeta): void {
+    const logger = this.logger ?? getActiveLogger();
+    // A host logger without a debug method, or no logger at all, gets the same
+    // destination as an INFO record, as before DEBUG forwarding existed. Never
+    // fall back to the console: engine DEBUG records can be numerous.
+    if (!logger?.debug) {
+      this.logVia(message, meta);
+      return;
+    }
+    try {
+      logger.debug(message, meta);
+    } catch (err) {
+      console.error(
+        `[aft-bridge] ERROR: logger debug threw: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      console.error(`[aft-bridge] ${message}`);
     }
   }
 
@@ -1883,7 +1914,16 @@ export class BinaryBridge implements AftProjectTransport {
     this.stderrBuffer = "";
     if (!line || !shouldSurfaceStderrLine(line)) return;
     const tagged = tagStderrLine(line);
-    this.logVia(tagged);
+    // Only the engine's own formatter supplies a trustworthy severity prefix.
+    const level =
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z \[aft(?:-lsp)?\] (INFO|WARN|ERROR|DEBUG) /.exec(
+        line,
+      )?.[1];
+    const meta: LogMeta | undefined = level ? { engineRecord: true } : undefined;
+    if (level === "WARN") this.warnVia(tagged, meta);
+    else if (level === "ERROR") this.errorVia(tagged, meta);
+    else if (level === "DEBUG") this.debugVia(tagged, meta);
+    else this.logVia(tagged, meta);
     this.pushStderrLine(tagged);
   }
 

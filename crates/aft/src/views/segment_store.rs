@@ -323,7 +323,9 @@ pub fn build_from_files(
 ) -> SegmentResult<SegmentBytes> {
     let mut inputs = Vec::with_capacity(members.len());
     for rel_path in members {
-        let bytes = fs::read(root.join(rel_path_to_os(rel_path)?))?;
+        let path = root.join(rel_path_to_os(rel_path)?);
+        let bytes =
+            fs::read(&path).map_err(|e| super::io::at("reading segment source", &path, e))?;
         inputs.push((
             SegmentMember {
                 rel_path: rel_path.clone(),
@@ -415,7 +417,8 @@ pub fn write_segment(
     segment: &SegmentBytes,
     observer: Option<&dyn DurabilityObserver>,
 ) -> SegmentResult<PathBuf> {
-    crate::production_storage::refuse_write(storage)?;
+    crate::production_storage::refuse_write(storage)
+        .map_err(|e| super::io::at("writing segment in", storage, e))?;
     if store.plane() != FamilyPlane::Trigram {
         return Err(SegmentError::Malformed(
             "segments are written through the trigram store".to_string(),
@@ -438,11 +441,20 @@ pub fn write_segment(
             let mut file = crate::private_storage::options()
                 .create_new(true)
                 .write(true)
-                .open(&temporary)?;
-            file.write_all(&segment.bytes)?;
-            file.sync_all()?;
+                .open(&temporary)
+                .map_err(|e| super::io::at("creating segment staging file", &temporary, e))?;
+            file.write_all(&segment.bytes)
+                .map_err(|e| super::io::at("writing segment staging file", &temporary, e))?;
+            file.sync_all()
+                .map_err(|e| super::io::at("syncing segment staging file", &temporary, e))?;
             drop(file);
-            crate::fs_lock::rename_over(&temporary, &path)?;
+            crate::fs_lock::rename_over(&temporary, &path).map_err(|e| {
+                super::io::at(
+                    &format!("renaming segment {} to", temporary.display()),
+                    &path,
+                    e,
+                )
+            })?;
             Ok(())
         })();
         if result.is_err() {
@@ -469,7 +481,7 @@ fn segment_u32(value: usize) -> SegmentResult<u32> {
 fn sync_segment_directory(path: &Path) -> SegmentResult<()> {
     super::sync_directory(path).map_err(|error| match error {
         super::ViewError::Io(source) | super::ViewError::IoAt { source, .. } => {
-            SegmentError::Io(source)
+            SegmentError::Io(super::io::at("syncing segment directory", path, source))
         }
         error => SegmentError::Malformed(error.to_string()),
     })
@@ -487,7 +499,7 @@ pub struct SegmentReader {
 
 impl SegmentReader {
     pub fn open(path: &Path) -> SegmentResult<Self> {
-        Self::from_bytes(&fs::read(path)?)
+        Self::from_bytes(&fs::read(path).map_err(|e| super::io::at("reading segment", path, e))?)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> SegmentResult<Self> {
@@ -716,6 +728,17 @@ mod tests {
             cursor.position,
             cursor.position + trigrams * LOOKUP_ENTRY_BYTES,
         )
+    }
+
+    #[test]
+    fn directory_segment_error_names_operation_and_path() {
+        let storage = tempfile::tempdir().unwrap();
+        let path = storage.path().join("trigram.seg");
+        fs::create_dir(&path).unwrap();
+        let error = SegmentReader::open(&path).unwrap_err().to_string();
+        assert!(error.contains("reading segment"), "{error}");
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(path.is_dir());
     }
 
     #[test]

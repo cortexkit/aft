@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "empty-callers-bounded-count"
+  ],
+  "note": "Call graph: empty caller/impact notes count unresolved sites with a capped SQL COUNT instead of reading every row. No changed path matches RANKING_FENCE_PREFIXES."
+}

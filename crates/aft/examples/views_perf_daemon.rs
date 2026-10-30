@@ -2,11 +2,12 @@
 //! frames cross into the AFT child; no indexing or readiness internals are used.
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     fs,
     io::{self, BufRead, Write},
     path::PathBuf,
     process::{Child, Command, Stdio},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use subc_protocol::session::ModuleControlRequest;
 use subc_protocol::{
@@ -19,6 +20,82 @@ use subc_transport::{
     read_frame, write_frame,
 };
 use tokio::net::{TcpListener, TcpStream};
+
+// Blocking stdin on a current-thread runtime also blocks the socket reader.
+// Keep exactly one async reader and writer, and correlate every reply by ID.
+async fn pipeline(stream: TcpStream) {
+    let (mut reader, mut writer) = stream.into_split();
+    let mut replies = tokio::spawn(async move {
+        while let Some(frame) = read_frame(&mut reader).await.expect("broker frame") {
+            if matches!(frame.header.ty, FrameType::Response | FrameType::Error) {
+                let body: Value = serde_json::from_slice(&frame.body).expect("reply JSON");
+                emit(json!({"id":frame.header.corr.to_string(), "body":body,
+                    "transport_error":frame.header.ty == FrameType::Error}));
+            }
+        }
+    });
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    std::thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            if tx.blocking_send(line.expect("stdin line")).is_err() {
+                break;
+            }
+        }
+    });
+    loop {
+        let line = tokio::select! {
+            line = rx.recv() => match line { Some(line) => line, None => break },
+            _ = &mut replies => panic!("subject disconnected"),
+        };
+        let command: Value = serde_json::from_str(&line).expect("command JSON");
+        let corr = command["id"]
+            .as_str()
+            .expect("string request ID")
+            .parse()
+            .expect("numeric ID");
+        let channel = command["channel"].as_u64().unwrap_or(0) as u16;
+        let body = match command["op"].as_str().expect("operation") {
+            "bind" => serde_json::to_value(ModuleControlRequest::RouteBind {
+                route_channel: channel,
+                epoch: 1,
+                target: RouteTarget::ToolProvider {
+                    module_id: "aft".into(),
+                },
+                identity: BindIdentity::new(
+                    PathBuf::from(command["root"].as_str().unwrap()),
+                    "opencode",
+                    format!("views-perf-{channel}"),
+                ),
+                consumer_capabilities: None,
+                principal: Some(Principal::Direct),
+                admission_facts: Default::default(),
+                scope: None,
+                role_versions: None,
+                call_mode: None,
+            })
+            .unwrap(),
+            "tool" => json!({"name":command["name"], "arguments":command["arguments"]}),
+            "health" => serde_json::to_value(ModuleControlRequest::HealthCheck {}).unwrap(),
+            other => panic!("unsupported pipelined operation {other}"),
+        };
+        let route = if command["op"] == "tool" { channel } else { 0 };
+        write_frame(
+            &mut writer,
+            &Frame::build(
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                route,
+                u32::from(route != 0),
+                corr,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+    replies.abort();
+}
 
 struct Subject(Child);
 impl Drop for Subject {
@@ -66,10 +143,9 @@ fn emit(value: Value) {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let args: Vec<_> = std::env::args_os().collect();
-    assert_eq!(
-        args.len(),
-        4,
-        "usage: views_perf_daemon AFT_BINARY RUN_DIR INITIAL_ROOT"
+    assert!(
+        args.len() == 4 || (args.len() == 5 && args[4] == "--pipelined"),
+        "usage: views_perf_daemon AFT_BINARY RUN_DIR INITIAL_ROOT [--pipelined]"
     );
     let binary = fs::canonicalize(&args[1]).unwrap();
     let out = fs::canonicalize(&args[2]).unwrap();
@@ -152,10 +228,50 @@ async fn main() {
     emit(
         json!({"pid":child.0.id(), "registry":out.join("storage"), "wire_version":PROTOCOL_VERSION, "hello":serde_json::from_slice::<Value>(&hello.body).unwrap()}),
     );
+    if args.len() == 5 {
+        pipeline(stream).await;
+        return;
+    }
     let stdin = io::stdin();
     let mut corr = 100;
     for line in stdin.lock().lines() {
         let command: Value = serde_json::from_str(&line.unwrap()).unwrap();
+        if command["op"] == "batch" {
+            let mut pending = HashMap::new();
+            for request in command["requests"].as_array().expect("batch requests") {
+                corr += 1;
+                let channel = request["channel"].as_u64().unwrap_or(1) as u16;
+                let body = json!({"name":request["name"], "arguments":request["arguments"]});
+                pending.insert(corr, (request["id"].clone(), Instant::now()));
+                write_frame(
+                    &mut stream,
+                    &Frame::build(
+                        FrameType::Request,
+                        Flags::new(false, Priority::Interactive, false),
+                        channel,
+                        1,
+                        corr,
+                        serde_json::to_vec(&body).unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(600), async {
+                while !pending.is_empty() {
+                    let frame = read_frame(&mut stream).await.unwrap().expect("subject disconnected");
+                    if matches!(frame.header.ty, FrameType::Response | FrameType::Error) {
+                        if let Some((id, started)) = pending.remove(&frame.header.corr) {
+                            let response: Value = serde_json::from_slice(&frame.body).unwrap();
+                            assert_ne!(frame.header.ty, FrameType::Error, "{response}");
+                            emit(json!({"id":id, "latency_ms":started.elapsed().as_secs_f64() * 1000.0, "response":response}));
+                        }
+                    }
+                }
+            }).await.expect("parallel public request deadline");
+            continue;
+        }
         corr += 1;
         let channel = command["channel"].as_u64().unwrap_or(0) as u16;
         let body = match command["op"].as_str().unwrap() {

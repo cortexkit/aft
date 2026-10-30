@@ -13,7 +13,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -26,9 +26,10 @@ use serde_json::{json, Value};
 
 const DEADLINE: Duration = Duration::from_secs(90);
 const FINGERPRINT_PROBE: &str = "semantic index fingerprint probe";
+const COMPLETION_QUERY: &str = "single-flight-readiness-probe";
 
-/// Deterministic embeddings over HTTP, counting texts other than the
-/// fingerprint probe the model sends once at startup.
+/// Deterministic embeddings over HTTP, counting texts other than the known
+/// fingerprint and readiness-query probes (neither is chunk-vector work).
 struct MockEmbedder {
     base_url: String,
     addr: SocketAddr,
@@ -39,6 +40,10 @@ struct MockEmbedder {
 
 impl MockEmbedder {
     fn start() -> Self {
+        Self::with_gate(None)
+    }
+
+    fn with_gate(gate: Option<Arc<EmbeddingGate>>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let running = Arc::new(AtomicBool::new(true));
@@ -50,8 +55,9 @@ impl MockEmbedder {
                     break;
                 };
                 let texts = Arc::clone(&thread_texts);
+                let gate = gate.clone();
                 thread::spawn(move || {
-                    let _ = serve(&mut stream, &texts);
+                    let _ = serve(&mut stream, &texts, gate.as_deref());
                 });
             }
         });
@@ -66,6 +72,60 @@ impl MockEmbedder {
 
     fn texts(&self) -> usize {
         self.texts.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(Default)]
+struct EmbeddingGate {
+    state: Mutex<(Vec<Vec<String>>, bool)>,
+    changed: Condvar,
+}
+
+impl EmbeddingGate {
+    fn arrive(&self, inputs: &[String]) {
+        if !inputs
+            .iter()
+            .any(|text| text.contains("concurrent_paid_chunk"))
+        {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        state.0.push(inputs.to_vec());
+        self.changed.notify_all();
+        let deadline = Instant::now() + DEADLINE;
+        while !state.1 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "embedding response was not released");
+            state = self.changed.wait_timeout(state, remaining).unwrap().0;
+        }
+    }
+
+    fn wait_for_first(&self) -> Vec<Vec<String>> {
+        let mut state = self.state.lock().unwrap();
+        let deadline = Instant::now() + DEADLINE;
+        while state.0.is_empty() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "only {} processes reached the model",
+                state.0.len()
+            );
+            state = self.changed.wait_timeout(state, remaining).unwrap().0;
+        }
+        state.0.clone()
+    }
+
+    fn release(&self) {
+        self.state.lock().unwrap().1 = true;
+        self.changed.notify_all();
+    }
+}
+
+struct ReleaseEmbeddingGate(Arc<EmbeddingGate>);
+
+impl Drop for ReleaseEmbeddingGate {
+    fn drop(&mut self) {
+        self.0.release();
     }
 }
 
@@ -86,7 +146,11 @@ fn vector(text: &str) -> Vec<f32> {
         .collect()
 }
 
-fn serve(stream: &mut TcpStream, texts: &AtomicUsize) -> std::io::Result<()> {
+fn serve(
+    stream: &mut TcpStream,
+    texts: &AtomicUsize,
+    gate: Option<&EmbeddingGate>,
+) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -130,10 +194,13 @@ fn serve(stream: &mut TcpStream, texts: &AtomicUsize) -> std::io::Result<()> {
     texts.fetch_add(
         inputs
             .iter()
-            .filter(|input| *input != FINGERPRINT_PROBE)
+            .filter(|input| *input != FINGERPRINT_PROBE && !input.contains(COMPLETION_QUERY))
             .count(),
         Ordering::SeqCst,
     );
+    if let Some(gate) = gate {
+        gate.arrive(&inputs);
+    }
     // Vectors depend on the model too, so vectors of one model never rank
     // like another's: a test can tell which model's vectors were scored.
     let model = body["model"].as_str().unwrap_or_default().to_owned();
@@ -253,28 +320,53 @@ fn send_configure(
     model: &str,
 ) {
     let configured = aft::commands::configure::handle_configure(
-        &request(json!({
-            "id": "configure-views-semantic",
-            "command": "configure",
-            "harness": "opencode",
-            "project_root": root,
-            "storage_dir": storage,
-            "config": crate::helpers::user_config(json!({
-                "indexes": { "trigram": true, "semantic": true, "callgraph": false },
-                "views": { "enabled": views },
-                "semantic": {
-                    "backend": "openai_compatible",
-                    "model": model,
-                    "base_url": server.base_url,
-                    "timeout_ms": 5_000,
-                    "max_batch_size": 64,
-                    "max_files": 2_000
-                }
-            }))
-        })),
+        &request(configure_payload(
+            root, storage, server, views, model, 5_000,
+        )),
         ctx,
     );
     assert!(configured.success, "configure failed: {configured:?}");
+    let resolved = ctx.config().storage_dir.clone().expect("resolved storage");
+    eprintln!(
+        "semantic configure: root={} requested={} resolved={}",
+        root.display(),
+        storage.display(),
+        resolved.display()
+    );
+    assert_eq!(
+        crate::helpers::canonicalize_like_product(&resolved),
+        crate::helpers::canonicalize_like_product(storage),
+        "fixture storage was overridden"
+    );
+}
+
+fn configure_payload(
+    root: &Path,
+    storage: &Path,
+    server: &MockEmbedder,
+    views: bool,
+    model: &str,
+    timeout_ms: u64,
+) -> Value {
+    json!({
+        "id": "configure-views-semantic",
+        "command": "configure",
+        "harness": "opencode",
+        "project_root": root,
+        "storage_dir": storage,
+        "config": crate::helpers::user_config(json!({
+            "indexes": { "trigram": true, "semantic": true, "callgraph": false },
+            "views": { "enabled": views },
+            "semantic": {
+                "backend": "openai_compatible",
+                "model": model,
+                "base_url": server.base_url,
+                "timeout_ms": timeout_ms,
+                "max_batch_size": 64,
+                "max_files": 2_000
+            }
+        }))
+    })
 }
 
 fn drain(ctx: &AppContext) {
@@ -367,6 +459,7 @@ fn search(ctx: &AppContext, query: &str) -> Value {
 
 #[test]
 fn prose_watchdog_query_reports_views_coverage_and_keeps_symbol_previews() {
+    let _settings = crate::test_helpers::without_storage_override();
     let _serial = crate::helpers::watcher_serial_lock();
     let _audit = EnvGuard(
         "AFT_SEARCH_RECALL_AUDIT",
@@ -471,6 +564,7 @@ fn unique_chunks(root: &Path) -> usize {
 
 #[test]
 fn views_on_worktrees_and_sessions_embed_each_chunk_once() {
+    let _settings = crate::test_helpers::without_storage_override();
     let server = MockEmbedder::start();
     let repo = repository();
     let storage = tempfile::tempdir().unwrap();
@@ -509,6 +603,174 @@ fn views_on_worktrees_and_sessions_embed_each_chunk_once() {
     );
 }
 
+/// Holds the owner's response until the other process acknowledges contention.
+/// A second provider arrival is a failure, never a condition for releasing it.
+#[test]
+fn views_on_two_processes_single_flight_checkout_chunk() {
+    two_process_single_flight(false, false);
+}
+
+#[test]
+fn views_on_two_processes_single_flight_separate_base_scopes() {
+    two_process_single_flight(true, true);
+}
+
+#[test]
+fn views_on_two_processes_single_flight_inherited_and_checkout_chunk() {
+    two_process_single_flight(true, false);
+}
+
+fn two_process_single_flight(commit_main: bool, commit_linked: bool) {
+    let _settings = crate::test_helpers::without_storage_override();
+    let gate = Arc::new(EmbeddingGate::default());
+    let server = MockEmbedder::with_gate(Some(Arc::clone(&gate)));
+    let repo = repository();
+    let storage = tempfile::tempdir().unwrap();
+    let chunks = unique_chunks(&repo.main);
+    {
+        let warm = configure(&repo.main, storage.path(), &server, true);
+        wait_views_filled(&warm);
+        assert_eq!(server.texts(), chunks);
+    }
+    // Keep the new files uncommitted by default. The scenarios below optionally
+    // commit one or both, testing the same chunk in uncommitted and committed files.
+    for root in [&repo.main, &repo.linked] {
+        write(
+            root,
+            "src/concurrent.rs",
+            "pub fn concurrent_paid_chunk() -> u64 { 424242 }\n",
+        );
+    }
+    if commit_main {
+        git(&repo.main, &["add", "src/concurrent.rs"]);
+        git(&repo.main, &["commit", "-m", "new inherited chunk"]);
+    }
+    if commit_linked {
+        // Different commit trees get independent base-build ownership, but the
+        // new function is identical. Both fills must coordinate on that shared
+        // chunk instead of embedding it twice.
+        write(&repo.linked, ".gitignore", "# distinct base tree\n");
+        git(&repo.linked, &["add", "src/concurrent.rs", ".gitignore"]);
+        git(
+            &repo.linked,
+            &["commit", "-m", "different base with shared chunk"],
+        );
+    }
+    let mut main = crate::helpers::AftProcess::spawn_with_semantic_env(&[(
+        "AFT_STORAGE_DIR",
+        storage.path().as_os_str(),
+    )]);
+    let mut linked = crate::helpers::AftProcess::spawn_with_semantic_env(&[(
+        "AFT_STORAGE_DIR",
+        storage.path().as_os_str(),
+    )]);
+    let _release = ReleaseEmbeddingGate(Arc::clone(&gate));
+    eprintln!(
+        "two-process fill: main_pid={} linked_pid={} storage={}",
+        main.pid(),
+        linked.pid(),
+        storage.path().display()
+    );
+    let configured = main.send(
+        &configure_payload(&repo.main, storage.path(), &server, true, MODEL, 120_000).to_string(),
+    );
+    assert_eq!(configured["success"], true, "{configured:?}");
+    let requests = gate.wait_for_first();
+    assert_eq!(requests[0].len(), 1, "one new function is one chunk");
+    let configured = linked.send(
+        &configure_payload(&repo.linked, storage.path(), &server, true, MODEL, 120_000).to_string(),
+    );
+    assert_eq!(configured["success"], true, "{configured:?}");
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let status = linked.send(r#"{"id":"contention","command":"status"}"#);
+        assert_eq!(
+            server.texts() - chunks,
+            1,
+            "contender duplicated provider work"
+        );
+        // An unusable coordinator is not acknowledgement of a live owner.
+        if status["semantic_index"]["pending_reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty())
+            && status["semantic_index"]["coordination_error"].is_null()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no positive contention acknowledgement: {status}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(gate.state.lock().unwrap().0.len(), 1);
+    // Contention is not a backend outage: completed base vectors still serve,
+    // while the new file remains an explicitly incomplete path.
+    let pending = linked.send(&json!({"id":"pending-query", "command":"semantic_search", "query":COMPLETION_QUERY, "top_k":100}).to_string());
+    assert_eq!(pending["complete"], false, "{pending}");
+    assert!(
+        pending["results"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()),
+        "saved base vectors disappeared during contention: {pending}"
+    );
+    gate.release();
+    for process in [&mut main, &mut linked] {
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let answer = process.send(&json!({"id":"ready-query", "command":"semantic_search", "query":COMPLETION_QUERY, "top_k":100}).to_string());
+            if answer["complete"] == true {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "semantic worker never became ready: {answer}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    drop(main);
+    drop(linked);
+    let reopened_main = configure(&repo.main, storage.path(), &server, true);
+    wait_views_filled(&reopened_main);
+    let reopened_linked = configure(&repo.linked, storage.path(), &server, true);
+    wait_views_filled(&reopened_linked);
+    let query = vector(&format!("{MODEL}\u{0}{}", requests[0][0]));
+    let left = reopened_main
+        .checkout_semantic_runtime()
+        .unwrap()
+        .search(&query, 100, &|_| true)
+        .unwrap();
+    let right = reopened_linked
+        .checkout_semantic_runtime()
+        .unwrap()
+        .search(&query, 100, &|_| true)
+        .unwrap();
+    assert!(left.complete() && right.complete());
+    let rows = |root: &Path, results: Vec<aft::semantic_index::SemanticResult>| {
+        results
+            .into_iter()
+            .map(|row| {
+                (
+                    row.file.strip_prefix(root).unwrap().to_path_buf(),
+                    row.name,
+                    row.start_line,
+                    row.score,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        rows(&repo.main, left.results),
+        rows(&repo.linked, right.results)
+    );
+    assert_eq!(
+        server.texts() - chunks,
+        1,
+        "reopen must reuse durable chunks"
+    );
+}
+
 /// The model fingerprint of the root's served semantic view, if any.
 fn served_model(ctx: &AppContext) -> Option<String> {
     ctx.checkout_semantic_runtime().map(|runtime| {
@@ -543,6 +805,7 @@ fn wait_single_worker(ctx: &AppContext) {
 /// so any vector of the old model would change them).
 #[test]
 fn views_on_model_change_restarts_the_lane_with_the_new_producer() {
+    let _settings = crate::test_helpers::without_storage_override();
     let server = MockEmbedder::start();
     let repo = repository();
     let storage = tempfile::tempdir().unwrap();
@@ -619,6 +882,7 @@ fn views_on_model_change_restarts_the_lane_with_the_new_producer() {
 /// second configure's model; the superseded lane embeds nothing.
 #[test]
 fn views_on_back_to_back_configures_leave_one_worker() {
+    let _settings = crate::test_helpers::without_storage_override();
     let server = MockEmbedder::start();
     let repo = repository();
     let storage = tempfile::tempdir().unwrap();
@@ -663,6 +927,7 @@ fn views_on_back_to_back_configures_leave_one_worker() {
 
 #[test]
 fn views_on_search_ranks_like_views_off_on_the_same_content() {
+    let _settings = crate::test_helpers::without_storage_override();
     let server = MockEmbedder::start();
     let repo = repository();
     let legacy_storage = tempfile::tempdir().unwrap();
@@ -741,6 +1006,7 @@ fn wait_for_row(ctx: &AppContext, name: &str, gone: &str) {
 
 #[test]
 fn views_on_aft_and_outside_edits_reach_the_fill() {
+    let _settings = crate::test_helpers::without_storage_override();
     let _serial = crate::helpers::watcher_serial_lock();
     let _quiet = EnvGuard(
         "AFT_SEMANTIC_QUIET_WINDOW_MS",
@@ -889,6 +1155,7 @@ fn reload_trigram_after_eviction(ctx: &AppContext) {
 /// are ready again.
 #[test]
 fn views_on_search_after_idle_eviction_reports_the_lane_reloading() {
+    let _settings = crate::test_helpers::without_storage_override();
     let server = MockEmbedder::start();
     let repo = repository();
     let storage = tempfile::tempdir().unwrap();
@@ -932,6 +1199,7 @@ fn views_on_search_after_idle_eviction_reports_the_lane_reloading() {
 /// disclosure, not as the ready its evicted index left behind.
 #[test]
 fn views_off_search_after_idle_eviction_reports_the_index_reloading() {
+    let _settings = crate::test_helpers::without_storage_override();
     let server = MockEmbedder::start();
     let repo = repository();
     let storage = tempfile::tempdir().unwrap();

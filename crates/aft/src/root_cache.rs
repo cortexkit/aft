@@ -802,10 +802,19 @@ impl ReadMarker {
         let mut file = match self.generation.repair_read_file(&self.name) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(crate::views::io::at(
+                    "opening reader marker",
+                    &self.path,
+                    error,
+                ))
+            }
         };
         let mut bytes = Vec::new();
-        (&mut file).take(32 * 1024).read_to_end(&mut bytes)?;
+        (&mut file)
+            .take(32 * 1024)
+            .read_to_end(&mut bytes)
+            .map_err(|error| crate::views::io::at("reading reader marker", &self.path, error))?;
         Ok(serde_json::from_slice::<ReadMarkerMetadata>(&bytes)
             .is_ok_and(|stored| stored == self.metadata))
     }
@@ -822,7 +831,9 @@ impl ReadMarker {
             nonce,
         };
         let dir = read_marker_dir(cache_dir, generation_label);
-        crate::private_storage::open_dir(cache_dir, &dir)?;
+        crate::private_storage::open_dir(cache_dir, &dir).map_err(|error| {
+            crate::views::io::at("creating reader marker directory", &dir, error)
+        })?;
         let seq = MARKER_SEQ.fetch_add(1, Ordering::Relaxed);
         let path = dir.join(format!(
             "{}.{}.{}.{}.json",
@@ -831,12 +842,16 @@ impl ReadMarker {
             metadata.created_at_ms,
             seq
         ));
-        let generation = match pin_cache_path(&dir)? {
-            Some(access) => access.directory(false)?,
-            None => crate::bash_background::persistence::PinnedDir::repair_open_path(&dir)?,
-        };
+        let generation = match pin_cache_path(&dir)
+            .map_err(|error| crate::views::io::at("pinning reader marker directory", &dir, error))?
+        {
+            Some(access) => access.directory(false),
+            None => crate::bash_background::persistence::PinnedDir::repair_open_path(&dir),
+        }
+        .map_err(|error| crate::views::io::at("opening reader marker directory", &dir, error))?;
         let name = path.file_name().unwrap().to_os_string();
-        write_marker_file_pinned(&generation, &name, &metadata)?;
+        write_marker_file_pinned(&generation, &name, &metadata)
+            .map_err(|error| crate::views::io::at("writing reader marker", &path, error))?;
         let last_touched_at_ms = AtomicU64::new(metadata.created_at_ms);
         Ok(Self {
             path,
@@ -848,7 +863,8 @@ impl ReadMarker {
     }
 
     pub fn touch(&self) -> io::Result<()> {
-        write_marker_file_pinned(&self.generation, &self.name, &self.metadata)?;
+        write_marker_file_pinned(&self.generation, &self.name, &self.metadata)
+            .map_err(|error| crate::views::io::at("writing reader marker", &self.path, error))?;
         self.last_touched_at_ms.store(now_ms(), Ordering::Relaxed);
         Ok(())
     }
@@ -1601,45 +1617,9 @@ pub fn process_start_time_ms(pid: u32) -> Option<u64> {
         return override_value;
     }
 
-    // `proc_pidinfo(PROC_PIDTBSDINFO)` answers only for the caller's own uid;
-    // for another user's process it returns zero bytes with no errno, which
-    // read as "no start-time source" and left a recycled low PID (a system
-    // daemon after reboot) counted as the live owner of an old log. The
-    // kern.proc.pid sysctl is what `ps` uses and answers for every pid. The
-    // reply is a kinfo_proc whose first member is extern_proc's p_un union,
-    // where p_starttime (a timeval) sits at offset 0; the libc crate does not
-    // declare the struct, so the two fields are read from the raw buffer.
-    let mut mib = [
-        libc::CTL_KERN,
-        libc::KERN_PROC,
-        libc::KERN_PROC_PID,
-        pid as libc::c_int,
-    ];
-    let mut buffer = [0_u8; 1024];
-    let mut size = buffer.len();
-    let rc = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            mib.len() as libc::c_uint,
-            buffer.as_mut_ptr().cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 || size < 16 {
-        return None;
-    }
-    let tv_sec = i64::from_ne_bytes(buffer[0..8].try_into().ok()?);
-    let tv_usec = i32::from_ne_bytes(buffer[8..12].try_into().ok()?);
-    if tv_sec <= 0 {
-        return None;
-    }
-    Some(
-        (tv_sec as u64)
-            .saturating_mul(1_000)
-            .saturating_add(tv_usec.max(0) as u64 / 1_000),
-    )
+    crate::fs_lock::macos_kinfo(pid)?
+        .started_at_us
+        .map(|start| start / 1_000)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

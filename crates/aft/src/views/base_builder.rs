@@ -228,6 +228,39 @@ pub struct BuildClaim {
     attempt: i64,
 }
 
+/// A base builder owns its claim until it hands a published base to its caller.
+/// Admission, publication or reservation cleanup can fail while another writer
+/// changes the namespace; those exits must not leave a live owner blocking retry.
+struct BuildAttempt(Option<BuildClaim>);
+
+impl std::ops::Deref for BuildAttempt {
+    type Target = BuildClaim;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("an unfinished build owns its claim")
+    }
+}
+
+impl BuildAttempt {
+    fn release(mut self) -> Result<()> {
+        self.0.take().unwrap().release()
+    }
+
+    fn finish(mut self) -> BuildClaim {
+        self.0.take().unwrap()
+    }
+}
+
+impl Drop for BuildAttempt {
+    fn drop(&mut self) {
+        if let Some(claim) = self.0.take() {
+            if let Err(error) = claim.release() {
+                crate::slog_warn!("releasing an unfinished base build claim: {}", error);
+            }
+        }
+    }
+}
+
 /// What [`claim_base`] found.
 #[derive(Debug)]
 pub enum ClaimOutcome {
@@ -371,7 +404,8 @@ impl BuildClaim {
                 self.token,
                 super::base_refs::fresh_nonce()
             ));
-        std::fs::create_dir_all(&dir)?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| super::io::at("creating base staging directory", &dir, e))?;
         Ok(dir)
     }
     /// `derived-<generation>-a<attempt>-<owner_token>.sqlite`.
@@ -400,7 +434,7 @@ impl BuildClaim {
         // `derived_name` is `derived-<owner>.sqlite`: the name the
         // reference file below resolves to.
         let database = store.view_dir().join(self.derived_name(generation));
-        let reader = super::callgraph::V3BlobReader(v3::PlaneReader::open_existing(
+        let reader = super::callgraph::V3BlobReader::new(v3::PlaneReader::open_existing(
             &self.storage,
             &self.family,
             FamilyPlane::Callgraph,
@@ -424,11 +458,18 @@ impl BuildClaim {
         let temporary = store
             .view_dir()
             .join(format!(".derived-{generation}.ref.tmp"));
-        std::fs::write(&temporary, owner.as_bytes())?;
+        std::fs::write(&temporary, owner.as_bytes())
+            .map_err(|e| super::io::at("writing derived reference", &temporary, e))?;
         // Windows refuses FlushFileBuffers on a read-only handle, so sync
         // through the views helper, which opens the file for writing there.
         super::sync_file(&temporary)?;
-        std::fs::rename(&temporary, &reference)?;
+        std::fs::rename(&temporary, &reference).map_err(|e| {
+            super::io::at(
+                &format!("renaming derived reference {} to", temporary.display()),
+                &reference,
+                e,
+            )
+        })?;
         super::sync_directory(store.view_dir())?;
         Ok(())
     }
@@ -441,12 +482,16 @@ impl BuildClaim {
         let entries = match std::fs::read_dir(&staging) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                return Err(super::io::at("listing dead base staging", &staging, error).into())
+            }
         };
         for entry in entries {
-            let entry = entry?;
+            let entry =
+                entry.map_err(|e| super::io::at("reading dead base staging entry", &staging, e))?;
             if entry.file_name().to_string_lossy().starts_with(&prefix) {
-                std::fs::remove_dir_all(entry.path())?;
+                std::fs::remove_dir_all(entry.path())
+                    .map_err(|e| super::io::at("removing dead base staging", &entry.path(), e))?;
             }
         }
         Ok(())
@@ -557,18 +602,27 @@ pub fn read_stable(path: &Path) -> std::io::Result<Vec<u8>> {
         )
     }
     for _ in 0..STABLE_READ_ATTEMPTS {
-        let before = std::fs::symlink_metadata(path)?;
+        let before = std::fs::symlink_metadata(path)
+            .map_err(|e| super::io::at("reading base source metadata", path, e))?;
         if !before.is_file() {
-            return Err(std::io::Error::other("not a regular file"));
+            return Err(super::io::at(
+                "reading base source",
+                path,
+                std::io::Error::other("not a regular file"),
+            ));
         }
-        let bytes = std::fs::read(path)?;
-        let after = std::fs::symlink_metadata(path)?;
+        let bytes =
+            std::fs::read(path).map_err(|e| super::io::at("reading base source", path, e))?;
+        let after = std::fs::symlink_metadata(path)
+            .map_err(|e| super::io::at("reading base source metadata", path, e))?;
         if stamp(&before) == stamp(&after) && bytes.len() as u64 == after.len() {
             return Ok(bytes);
         }
     }
-    Err(std::io::Error::other(
-        "file kept changing during strict reads",
+    Err(super::io::at(
+        "reading stable base source",
+        path,
+        std::io::Error::other("file kept changing during strict reads"),
     ))
 }
 
@@ -700,7 +754,7 @@ pub fn build_base(
     }
     let identity = BaseIdentity::of(family, &manifest)?;
     let claim = match claim_base(storage, family, &identity.scope, observer)? {
-        ClaimOutcome::Claimed(claim) => claim,
+        ClaimOutcome::Claimed(claim) => BuildAttempt(Some(claim)),
         ClaimOutcome::Busy { .. } => return Ok(BaseBuild::Busy),
         ClaimOutcome::CapReached { .. } => return Ok(BaseBuild::Strict("live_base_cap".into())),
     };
@@ -754,7 +808,7 @@ pub fn build_base(
     Ok(BaseBuild::Published {
         identity,
         generation,
-        claim,
+        claim: claim.finish(),
     })
 }
 

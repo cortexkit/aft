@@ -8092,6 +8092,8 @@ struct ConfigureMaintenanceContinuation {
     semantic_waits_for_callgraph_start: bool,
     view_load: Option<crossbeam_channel::Receiver<Result<PreparedConfigureView, String>>>,
     replay_retry_at: Option<Instant>,
+    lexical_bind_retry_at: Option<Instant>,
+    lexical_bind_retry_delay: Duration,
     callgraph_upgrade_retry_at: Option<Instant>,
     replay_error_logged: bool,
 }
@@ -8105,13 +8107,23 @@ impl ConfigureMaintenanceContinuation {
             semantic_waits_for_callgraph_start: false,
             view_load: None,
             replay_retry_at: None,
+            lexical_bind_retry_at: None,
+            lexical_bind_retry_delay: Duration::from_secs(1),
             callgraph_upgrade_retry_at: None,
             replay_error_logged: false,
         }
     }
 
     fn retry_at(&self) -> Option<Instant> {
-        self.callgraph_upgrade_retry_at.or(self.replay_retry_at)
+        self.callgraph_upgrade_retry_at
+            .or(self.lexical_bind_retry_at)
+            .or(self.replay_retry_at)
+    }
+
+    fn defer_lexical_bind(&mut self, now: Instant) {
+        self.lexical_bind_retry_at = Some(now + self.lexical_bind_retry_delay);
+        self.lexical_bind_retry_delay =
+            (self.lexical_bind_retry_delay * 2).min(Duration::from_secs(30));
     }
 }
 
@@ -8986,6 +8998,7 @@ fn run_configure_maintenance_unit_inner(
             continuation.stage = ConfigureMaintenanceStage::ViewLoad;
         }
         ConfigureMaintenanceStage::ViewLoad => {
+            let retrying = continuation.lexical_bind_retry_at.take().is_some();
             if crate::views::parent::held_by(ctx, &job.canonical_cache_root) {
                 // A parent folder owns no view; its session reads the children's.
                 ctx.clear_view_runtime();
@@ -9007,6 +9020,18 @@ fn run_configure_maintenance_unit_inner(
                     ctx.clear_view_runtime();
                 }
                 match ctx.lexical_view_snapshot("bind") {
+                    Some(Err(error)) if crate::views::trigram::bind_is_busy(&error) => {
+                        if !retrying {
+                            slog_warn!(
+                                "lexical checkout view busy; configure maintenance will retry: {}",
+                                error
+                            );
+                        }
+                        // A parent only reads child publications; it cannot
+                        // recover a dropped child bind by querying that child.
+                        continuation.defer_lexical_bind(Instant::now());
+                        return ConfigureMaintenanceUnitResult::Continue;
+                    }
                     Some(Err(error)) => {
                         slog_warn!("lexical checkout view unavailable: {}", error);
                     }
@@ -9016,6 +9041,7 @@ fn run_configure_maintenance_unit_inner(
                     }
                     _ => {}
                 }
+                continuation.lexical_bind_retry_delay = Duration::from_secs(1);
             } else {
                 ctx.clear_view_runtime();
             }
@@ -12929,6 +12955,15 @@ mod tests {
     /// only what changed, reusing every stored vector.
     #[test]
     fn semantic_view_pauses_while_unbound_and_resumes_after_rebind() {
+        semantic_view_reconnect_grace(false);
+    }
+
+    #[test]
+    fn semantic_view_retries_transient_backend_failure_inside_reconnect_grace() {
+        semantic_view_reconnect_grace(true);
+    }
+
+    fn semantic_view_reconnect_grace(transient_backend_failure: bool) {
         let _artifact_guard = artifact_owner_test_lock();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
@@ -12964,7 +12999,7 @@ mod tests {
                     .is_ok_and(|answer| answer.complete())
             })
         };
-        assert_eq!(fills.next(), "settled");
+        fills.wait_until_settled(Duration::from_secs(60)).unwrap();
         assert!(complete(&ctx), "the semantic view never filled");
         let stored = server.non_probe_input_count();
         assert!(stored >= 6);
@@ -12974,6 +13009,9 @@ mod tests {
         // a wait after a `lane_paused` refusal uses the immediate-unbind check.
         ctx.set_unbound_build_abandon_grace_for_test(Duration::from_secs(300));
         ctx.mark_subc_unbound();
+        server
+            .fail_summaries
+            .store(transient_backend_failure, Ordering::SeqCst);
         let during_grace = root.join("module_1.rs");
         fs::write(
             &during_grace,
@@ -12982,16 +13020,32 @@ mod tests {
         .unwrap();
         ctx.record_checkout_watcher_change(&during_grace);
         assert_eq!(fills.next(), "wake");
-        assert_eq!(
-            fills.next(),
-            "settled",
-            "healthy view work stopped inside reconnect grace"
-        );
+        if transient_backend_failure {
+            let runtime = ctx.checkout_semantic_runtime().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let reason = loop {
+                if let Some(reason) = runtime.unavailable_reason() {
+                    break reason;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the backend failure was not observed"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert!(reason.contains("503"), "unexpected retry: {reason}");
+            assert!(!complete(&ctx));
+            server.fail_summaries.store(false, Ordering::SeqCst);
+        }
+        // Transient backend or checkout contention can retry without stopping
+        // the lane. Require settlement within one deadline, without rebinding
+        // or sending another wake to rescue work inside reconnect grace.
+        fills.wait_until_settled(Duration::from_secs(60)).unwrap();
         assert!(complete(&ctx));
         assert!(server.non_probe_input_count() > stored);
         ctx.mark_subc_bound();
         assert_eq!(fills.next(), "wake");
-        assert_eq!(fills.next(), "settled");
+        fills.wait_until_settled(Duration::from_secs(60)).unwrap();
         let stored = server.non_probe_input_count();
 
         ctx.set_unbound_build_abandon_grace_for_test(Duration::ZERO);
@@ -13018,7 +13072,7 @@ mod tests {
         // the transient-retry timer, then wait for that fill to finish.
         ctx.mark_subc_bound();
         assert_eq!(fills.next(), "wake");
-        assert_eq!(fills.next(), "settled");
+        fills.wait_until_settled(Duration::from_secs(60)).unwrap();
         let names = |ctx: &AppContext| {
             ctx.checkout_semantic_runtime()
                 .unwrap()
@@ -14285,6 +14339,8 @@ mod tests {
             "{:?}",
             search.data
         );
+        // A refused view fails the call, like grep and aft_search: glob must
+        // not answer from a fallback walk while the checkout view is down.
         let glob = crate::commands::glob::handle_glob(
             &RawRequest {
                 id: "lexical-refused-glob".into(),
@@ -14296,12 +14352,298 @@ mod tests {
             &ctx,
         );
         assert!(
-            glob.success && glob.data["text"].as_str().unwrap().contains("visible.ts"),
+            !glob.success && glob.data.to_string().contains("deliberately refused"),
             "{:?}",
             glob.data
         );
-        assert_eq!(glob.data["fallback"], "filesystem");
         assert_eq!(ctx.lexical_view_route_counts(), [0; 3]);
+    }
+
+    #[test]
+    fn views_busy_measurement_retries_without_bug_guidance_or_failure_counts() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _serial = crate::blob_store::v3::serial_for_test();
+        for callgraph in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("project");
+            init_git_fixture(&root);
+            std::fs::write(
+                root.join("a.ts"),
+                "export function target() { return 'needle'; }\nexport function caller() { return target(); }\n",
+            )
+            .unwrap();
+            let root = std::fs::canonicalize(root).unwrap();
+            let storage = temp.path().join("storage");
+            let ctx = test_context();
+            assert!(
+                handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx,)
+                    .success
+            );
+            // A new file requires publication during the next bind, even if
+            // configure already warmed the lexical member.
+            let added = root.join("added.ts");
+            std::fs::write(&added, "export const extra = 'needle';\n").unwrap();
+            ctx.record_checkout_watcher_change(&added);
+            let family = ctx.memoized_artifact_cache_key(&root);
+            let callers = RawRequest {
+                id: "measurement-busy-callers".into(),
+                command: "callers".into(),
+                lsp_hints: None,
+                session_id: None,
+                params: json!({"file": root.join("a.ts"), "symbol": "target"}),
+            };
+            let request = || {
+                if callgraph {
+                    crate::commands::callers::handle_callers(&callers, &ctx)
+                } else {
+                    crate::commands::grep::handle_grep(&grep_request("needle"), &ctx)
+                }
+            };
+            let ((first, held, first_writes, held_writes), writes) =
+                crate::blob_store::v3::with_changing_namespace_for_test(
+                    &storage,
+                    &family,
+                    |completed| {
+                        let first = request();
+                        let first_writes = completed.load(std::sync::atomic::Ordering::SeqCst);
+                        let held = request();
+                        let held_writes = completed.load(std::sync::atomic::Ordering::SeqCst);
+                        (first, held, first_writes, held_writes)
+                    },
+                );
+            assert!(first_writes >= 8, "the load must exhaust a measurement");
+            assert_eq!(
+                held_writes, first_writes,
+                "backoff must not repeat the measurement"
+            );
+            assert_eq!(writes, first_writes);
+            assert!(!first.success, "{:?}", first.data);
+            assert_eq!(first.data, held.data);
+            let text = if callgraph {
+                crate::subc_format::format_response_with_context(
+                    "callgraph",
+                    &first,
+                    &crate::subc_format::FormatContext {
+                        callgraph_op: Some("callers".into()),
+                        ..Default::default()
+                    },
+                )
+            } else {
+                crate::subc_format::format_response("grep", &first, false)
+            };
+            if callgraph {
+                assert_eq!(first.data["code"], "callgraph_building");
+                assert_eq!(text, "callers: callgraph_building — callers: persisted callgraph store is busy; retry shortly");
+                let cause = ctx.callgraph_view_read_diagnostics().last_error.unwrap();
+                assert!(
+                    cause.contains("reservation_ledger_busy: measure registry"),
+                    "{cause}"
+                );
+                assert!(
+                    cause.contains("namespace size did not stabilize after 8 measurements"),
+                    "{cause}"
+                );
+            } else {
+                assert_eq!(first.data["code"], "busy");
+                assert_eq!(first.data["retryable"], true);
+                let cause = format!(
+                    "view loader [driver]: family registry I/O error: v3 store busy: reservation_ledger_busy: measure registry {}: v3 store busy: namespace size did not stabilize after 8 measurements",
+                    crate::blob_store::v3::family_dir(&storage, &family).unwrap().display(),
+                );
+                assert_eq!(first.data["message"], cause);
+                assert_eq!(text, cause);
+                let search = crate::commands::semantic_search::handle_semantic_search(
+                    &semantic_search_request("needle"),
+                    &ctx,
+                );
+                let glob = crate::commands::glob::handle_glob(
+                    &RawRequest {
+                        id: "measurement-busy-glob".into(),
+                        command: "glob".into(),
+                        lsp_hints: None,
+                        session_id: None,
+                        params: json!({"pattern": "**/*.ts"}),
+                    },
+                    &ctx,
+                );
+                for (name, response) in [("search", search), ("glob", glob)] {
+                    assert_eq!(response.data["code"], "busy");
+                    assert_eq!(response.data["retryable"], true);
+                    let expected = if name == "search" {
+                        format!("semantic_search: busy — {cause}")
+                    } else {
+                        cause.clone()
+                    };
+                    assert_eq!(
+                        crate::subc_format::format_response(name, &response, false),
+                        expected
+                    );
+                }
+            }
+            assert!(!text.contains("This is an AFT bug"), "{text}");
+            let health = ctx.try_health_snapshot(&root);
+            assert!(health.view_load_failures.is_empty(), "{health:?}");
+            assert!(health.view_load_failure_last.is_none());
+            assert!(!ctx
+                .degraded_reasons()
+                .contains(&crate::context::VIEW_LOAD_DEGRADED_REASON.to_string()));
+            // Stopping the writer alone does not bypass the pending timer.
+            assert!(!request().success);
+            ctx.view_load_retry_due_for_test();
+            let recovered = request();
+            assert!(recovered.success, "{:?}", recovered.data);
+            assert!(ctx.try_health_snapshot(&root).view_load_failures.is_empty());
+        }
+    }
+
+    #[test]
+    fn lexical_view_load_failure_counts_and_degrades_until_recovery() {
+        let reporting_suffix = "\nThis is an AFT bug: tell the user to report it with `npx @cortexkit/aft doctor --issue`; don't run it yourself.";
+        // Holds the process environment lock for the whole test, like the
+        // other lexical views tests above.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        struct Refused(String);
+        impl crate::views::trigram::LexicalSnapshotSource for Refused {
+            fn acquire(&self) -> Result<crate::views::snapshot::Snapshot, String> {
+                Err(self.0.clone())
+            }
+            fn record_change(&self, _: &Path) {}
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("visible.ts"),
+            "export function outlined() { return \"needle\"; }\n",
+        )
+        .unwrap();
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(
+                &configure_lexical_views(&root, &temp.path().join("storage")),
+                &ctx
+            )
+            .success
+        );
+        let degraded = || {
+            ctx.degraded_reasons()
+                .contains(&crate::context::VIEW_LOAD_DEGRADED_REASON.to_string())
+        };
+        assert!(!degraded());
+        // Keep the working source: recovery reinstalls it, proving the next
+        // successful load clears the degraded flag.
+        let initialized = ctx
+            .lexical_view_snapshot("bind")
+            .expect("bind loads a snapshot");
+        assert!(initialized.is_ok(), "{:?}", initialized.err());
+        let working = ctx.lexical_source_for_test();
+        let failed_file = root.join("visible.ts");
+        let load_error = format!(
+            "view I/O failed reading {}: Permission denied",
+            failed_file.display()
+        );
+        ctx.install_lexical_source_for_test(Arc::new(Refused(load_error.clone())));
+
+        // Every lexical lane fails with the view error, never an empty
+        // success and never a fallback walk.
+        let grep = crate::commands::grep::handle_grep(&grep_request("needle"), &ctx);
+        assert!(
+            !grep.success
+                && grep.data["message"].as_str().is_some_and(|message| {
+                    message.contains(&load_error) && message.ends_with(reporting_suffix)
+                }),
+            "{:?}",
+            grep.data
+        );
+        let search = crate::commands::semantic_search::handle_semantic_search(
+            &semantic_search_request("needle"),
+            &ctx,
+        );
+        assert!(
+            !search.success
+                && search.data["message"].as_str().is_some_and(|message| {
+                    message.contains(&load_error) && message.ends_with(reporting_suffix)
+                }),
+            "{:?}",
+            search.data
+        );
+        let glob = crate::commands::glob::handle_glob(
+            &RawRequest {
+                id: "lexical-refused-glob-health".into(),
+                command: "glob".into(),
+                lsp_hints: None,
+                session_id: None,
+                params: json!({"pattern":"**/*.ts"}),
+            },
+            &ctx,
+        );
+        assert!(
+            !glob.success
+                && glob.data["message"].as_str().is_some_and(|message| {
+                    message.contains(&load_error) && message.ends_with(reporting_suffix)
+                }),
+            "{:?}",
+            glob.data
+        );
+
+        let missing_path = crate::commands::glob::handle_glob(
+            &RawRequest {
+                id: "lexical-refused-glob-missing-path".into(),
+                command: "glob".into(),
+                lsp_hints: None,
+                session_id: None,
+                params: json!({"pattern":"**/*.ts", "path":root.join("missing")}),
+            },
+            &ctx,
+        );
+        assert!(!missing_path.success, "{:?}", missing_path.data);
+        assert_eq!(missing_path.data["code"], "path_not_found");
+        assert!(!missing_path.data["message"]
+            .as_str()
+            .unwrap()
+            .contains(reporting_suffix.trim_start_matches('\n')));
+
+        // Outline parses the file itself and never loads the view.
+        let outline = crate::commands::outline::handle_outline(
+            &serde_json::from_value(json!({
+                "id": "lexical-refused-outline",
+                "command": "outline",
+                "file": root.join("visible.ts"),
+            }))
+            .unwrap(),
+            &ctx,
+        );
+        assert!(outline.success, "{:?}", outline.data);
+        assert!(
+            outline.data["text"].as_str().unwrap().contains("outlined"),
+            "{:?}",
+            outline.data
+        );
+
+        // Health counts every failed load by plane and cause, keeps the last
+        // error, and marks the project degraded.
+        let health = ctx.try_health_snapshot(&root);
+        assert_eq!(health.view_load_failures.get("trigram:io"), Some(&3));
+        let last = health.view_load_failure_last.expect("last failure kept");
+        assert_eq!(
+            (last.plane.as_str(), last.cause.as_str()),
+            ("trigram", "io")
+        );
+        assert_eq!((last.count, last.total), (3, 3));
+        assert_eq!(last.error, load_error);
+        assert!(degraded());
+
+        // Recovery: the next successful load clears the degraded flag but
+        // keeps the history count.
+        ctx.install_lexical_source_for_test(working);
+        let recovered = crate::commands::grep::handle_grep(&grep_request("needle"), &ctx);
+        assert!(recovered.success, "{:?}", recovered.data);
+        assert!(!degraded());
+        let health = ctx.try_health_snapshot(&root);
+        assert_eq!(health.view_load_failures.get("trigram:io"), Some(&3));
+        assert!(health
+            .view_load_failure_last
+            .is_some_and(|last| last.error == load_error));
     }
 
     #[test]
@@ -14774,6 +15116,157 @@ mod tests {
             "{:?}",
             legacy_answers[0].1.data
         );
+    }
+
+    #[test]
+    fn callgraph_view_load_failure_fails_every_graph_op_and_counts() {
+        let reporting_suffix = "\nThis is an AFT bug: tell the user to report it with `npx @cortexkit/aft doctor --issue`; don't run it yourself.";
+        // Holds the process environment lock for the whole test, like the
+        // other callgraph views tests above.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        struct Refused(String);
+        impl crate::views::callgraph::CallgraphReaderSource for Refused {
+            fn acquire(
+                &self,
+            ) -> Result<
+                Arc<crate::callgraph_store::ReadonlyCallGraphStore>,
+                crate::views::callgraph::CallgraphViewError,
+            > {
+                Err(self.0.clone().into())
+            }
+            fn record_change(&self, _: &Path) {}
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("a.ts"),
+            "export function target() { return 1; }\nexport function caller() { return target(); }\n",
+        )
+        .unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
+                .success
+        );
+        let failed_file = root.join("a.ts");
+        let load_error = format!(
+            "view I/O failed opening {}: Permission denied",
+            failed_file.display()
+        );
+        ctx.install_callgraph_source_for_test(Arc::new(Refused(load_error.clone())));
+
+        // Every graph operation fails with the view error, never an empty
+        // success and never another store's answer.
+        let file = root.join("a.ts").to_string_lossy().into_owned();
+        let ops: Vec<(
+            &str,
+            serde_json::Value,
+            fn(&RawRequest, &AppContext) -> Response,
+        )> = vec![
+            (
+                "callers",
+                json!({"file": file, "symbol": "target", "depth": 1}),
+                crate::commands::callers::handle_callers,
+            ),
+            (
+                "impact",
+                json!({"file": file, "symbol": "target", "depth": 1}),
+                crate::commands::impact::handle_impact,
+            ),
+            (
+                "call_tree",
+                json!({"file": file, "symbol": "target", "depth": 1}),
+                crate::commands::call_tree::handle_call_tree,
+            ),
+            (
+                "trace_to",
+                json!({"file": file, "symbol": "target", "depth": 1}),
+                crate::commands::trace_to::handle_trace_to,
+            ),
+            (
+                "trace_to_symbol",
+                json!({"file": file, "symbol": "target", "toSymbol": "caller"}),
+                crate::commands::trace_to_symbol::handle_trace_to_symbol,
+            ),
+            (
+                "trace_data",
+                json!({"file": file, "symbol": "caller", "expression": "target"}),
+                crate::commands::trace_data::handle_trace_data,
+            ),
+        ];
+        for (command, params, handle) in &ops {
+            let request: RawRequest = serde_json::from_value(json!({
+                "id": format!("callgraph-refused-{command}"),
+                "command": *command,
+            }))
+            .unwrap();
+            let mut request = request;
+            request.params = params.clone();
+            let answer = handle(&request, &ctx);
+            assert!(
+                !answer.success
+                    && answer.data["message"].as_str().is_some_and(|message| {
+                        message.contains(&load_error) && message.ends_with(reporting_suffix)
+                    }),
+                "{command}: {:?}",
+                answer.data
+            );
+        }
+
+        // Zoom keeps its file-local answer but names the view failure in its
+        // explicit callgraph field; without callgraph:true it needs no view.
+        let zoom_with_graph = crate::commands::zoom::handle_zoom(
+            &serde_json::from_value(json!({
+                "id": "callgraph-refused-zoom",
+                "command": "zoom",
+                "file": file,
+                "symbols": ["target"],
+                "callgraph": true,
+            }))
+            .unwrap(),
+            &ctx,
+        );
+        assert!(zoom_with_graph.success, "{:?}", zoom_with_graph.data);
+        assert_eq!(
+            zoom_with_graph.data["callgraph"]["code"],
+            "callgraph_unavailable"
+        );
+        assert_eq!(
+            zoom_with_graph.data["callgraph"]["index"]["reason"],
+            format!("callgraph store unavailable: callgraph view unavailable: {load_error}{reporting_suffix}")
+        );
+        let zoom_local = crate::commands::zoom::handle_zoom(
+            &serde_json::from_value(json!({
+                "id": "callgraph-refused-zoom-local",
+                "command": "zoom",
+                "file": file,
+                "symbols": ["target"],
+            }))
+            .unwrap(),
+            &ctx,
+        );
+        assert!(zoom_local.success, "{:?}", zoom_local.data);
+        assert!(zoom_local.data.get("callgraph").is_none());
+
+        // Health counts every failed load by plane and cause and marks the
+        // project degraded.
+        let health = ctx.try_health_snapshot(&root);
+        assert_eq!(
+            health.view_load_failures.get("callgraph:io"),
+            Some(&(ops.len() as u64 + 1))
+        );
+        let last = health.view_load_failure_last.expect("last failure kept");
+        assert_eq!(
+            (last.plane.as_str(), last.cause.as_str()),
+            ("callgraph", "io")
+        );
+        assert_eq!(last.error, load_error);
+        assert!(ctx
+            .degraded_reasons()
+            .contains(&crate::context::VIEW_LOAD_DEGRADED_REASON.to_string()));
     }
 
     /// What a root's storage holds outside the v3 namespace: content-addressed
@@ -17022,6 +17515,173 @@ mod tests {
         lock.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
             .unwrap();
         lock
+    }
+
+    #[test]
+    fn lexical_bind_busy_markers_do_not_retry_terminal_failures() {
+        for reason in [
+            "family registry I/O error: reservation_ledger_busy: read format: database is locked",
+            "[driver]: v3 store busy: reservation lock timeout",
+            "[driver]: v3 base build busy; retain direct-scan coverage and retry",
+        ] {
+            assert!(crate::views::trigram::bind_is_busy(reason), "{reason}");
+        }
+        for reason in [
+            "reservation_ledger_unreadable: permission denied",
+            "live_sqlite_file_replaced",
+            "a file named busy.rs is unreadable",
+        ] {
+            assert!(!crate::views::trigram::bind_is_busy(reason), "{reason}");
+        }
+    }
+
+    #[test]
+    fn busy_lexical_bind_retries_until_parent_can_read_child_trigram() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(temp.path()).unwrap();
+        let projects = base.join("projects");
+        let root = projects.join("alpha");
+        let storage = base.join("storage");
+        init_git_fixture(&root);
+        let ctx = test_context();
+        let response = super::handle_configure(
+            &configure_request_with_params(json!({
+                "project_root": root,
+                "harness": "opencode",
+                "storage_dir": storage,
+                "config": [user_tier(json!({
+                    "indexes": { "trigram": true, "semantic": false, "callgraph": false },
+                    "views": { "enabled": true },
+                }))],
+            })),
+            &ctx,
+        );
+        assert!(response.success, "{response:?}");
+        assert!(ctx.artifact_identity_provisional_reason().is_none());
+        assert!(ctx.views_route_root());
+        let family = ctx.cached_artifact_cache_key(&root).unwrap();
+        let mut state = super::ConfigureMaintenanceState::default();
+        state.absorb_enqueued(&ctx);
+        while state.jobs.front().unwrap().stage != super::ConfigureMaintenanceStage::ViewLoad {
+            assert!(super::drain_deferred_configure_maintenance_unit(
+                &ctx, &mut state
+            ));
+        }
+
+        let parent = test_context();
+        parent.update_config(|config| {
+            config.project_root = Some(projects.clone());
+            config.views.enabled = true;
+            config.indexes.semantic = false;
+            config.indexes.callgraph = false;
+        });
+        parent.set_canonical_cache_root(projects.clone());
+        let planes = crate::views::parent::RequestedPlanes {
+            trigram: true,
+            semantic: false,
+            callgraph: false,
+        };
+        assert!(crate::views::parent::prepare(&projects, planes));
+        assert!(crate::views::parent::activate(
+            &parent,
+            &projects,
+            &storage,
+            &parent.config().semantic
+        ));
+        let session = crate::views::parent::session_for_root(&projects).unwrap();
+        assert!(session.wait_rounds(1, Duration::from_secs(30)));
+        assert!(!session.children()[0].trigram_ready());
+
+        {
+            let reservation = crate::blob_store::v3::ReservationLock::acquire(&storage).unwrap();
+            crate::blob_store::v3::open_base_refs_registry(&storage, &family, &reservation, None)
+                .unwrap();
+        }
+        let ledger = crate::blob_store::v3::family_dir(&storage, &family)
+            .unwrap()
+            .join("members.sqlite");
+        let blocker = rusqlite::Connection::open(ledger).unwrap();
+        blocker.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; UPDATE accounting SET watermark=watermark+1;").unwrap();
+        // Only the configure tail may publish the child; the parent never binds it.
+        while super::drain_deferred_configure_maintenance_unit(&ctx, &mut state) {}
+        assert!(!session.children()[0].trigram_ready());
+        assert_eq!(
+            state.jobs.len(),
+            1,
+            "busy lexical bind was dropped instead of parked"
+        );
+        assert_eq!(
+            state.jobs[0].stage,
+            super::ConfigureMaintenanceStage::ViewLoad
+        );
+        let retry_at = state.jobs[0]
+            .retry_at()
+            .expect("busy bind needs a retry deadline");
+        assert_eq!(
+            state.jobs[0].lexical_bind_retry_delay,
+            Duration::from_secs(2)
+        );
+        state.replay_retry_cutoff = Some(retry_at - Duration::from_nanos(1));
+        assert!(!state.has_ready_job());
+        // Check every backoff step without spending SQLite's busy timeout on
+        // each attempt. The real locked bind above arms the same continuation.
+        for seconds in [2, 4, 8, 16, 30, 30] {
+            let now = Instant::now();
+            state.jobs[0].defer_lexical_bind(now);
+            let retry_at = state.jobs[0].retry_at().unwrap();
+            assert_eq!(retry_at, now + Duration::from_secs(seconds));
+            state.replay_retry_cutoff = Some(retry_at - Duration::from_nanos(1));
+            assert!(!state.has_ready_job());
+            assert_eq!(
+                state.jobs[0].stage,
+                super::ConfigureMaintenanceStage::ViewLoad
+            );
+        }
+        assert!(session.wait_rounds(session.rounds() + 1, Duration::from_secs(30)));
+        let query: RawRequest = serde_json::from_value(json!({
+            "id": "parent-busy-lexical",
+            "command": "semantic_search",
+            "query": "tracked",
+        }))
+        .unwrap();
+        let pending = crate::views::parent::route(&query, &parent).unwrap();
+        assert_eq!(pending.data["complete"], false, "{pending:?}");
+        let text = pending.data["text"].as_str().unwrap();
+        assert!(
+            text.contains("alpha") && text.contains("busy"),
+            "{pending:?}"
+        );
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+        assert!(session.wait_rounds(session.rounds() + 1, Duration::from_secs(30)));
+        let pending = crate::views::parent::route(&query, &parent).unwrap();
+        assert_eq!(pending.data["complete"], false, "{pending:?}");
+        let text = pending.data["text"].as_str().unwrap();
+        assert!(
+            text.contains("alpha") && text.contains("busy"),
+            "{pending:?}"
+        );
+        state.replay_retry_cutoff = state.jobs[0].retry_at();
+        assert!(state.has_ready_job());
+        assert!(super::drain_deferred_configure_maintenance_unit(
+            &ctx, &mut state
+        ));
+        assert!(state.jobs[0].lexical_bind_retry_at.is_none());
+        assert_eq!(
+            state.jobs[0].lexical_bind_retry_delay,
+            Duration::from_secs(1)
+        );
+        while super::drain_deferred_configure_maintenance_unit(&ctx, &mut state) {}
+        assert!(state.jobs.is_empty());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !session.children()[0].trigram_ready() {
+            assert!(
+                Instant::now() < deadline,
+                "parent never saw the retried lexical publication"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn trigram_bind_request(root: &std::path::Path, storage: &std::path::Path) -> RawRequest {

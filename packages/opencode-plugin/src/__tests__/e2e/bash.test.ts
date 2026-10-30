@@ -4,7 +4,7 @@ import { afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type BinaryBridge, BridgePool } from "@cortexkit/aft-bridge";
+import { type BinaryBridge, type BridgeOptions, BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 import { withEnv } from "../../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { loadAftConfig } from "../../config.js";
@@ -98,11 +98,14 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     return created;
   }
 
-  async function pluginHarness(configOverrides: Record<string, unknown> = {}) {
+  async function pluginHarness(
+    configOverrides: Record<string, unknown> = {},
+    bridgeOptions: BridgeOptions = {},
+  ) {
     const h = await harness();
     const pool = new BridgePool(
       h.binaryPath,
-      { timeoutMs: 20_000 },
+      { timeoutMs: 20_000, ...bridgeOptions },
       configureParamsFromLegacyOverrides({
         restrict_to_project_root: true,
         bash_permissions: false,
@@ -218,7 +221,11 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
   ): Promise<Record<string, unknown>> {
     const launched = await h.bridge.send("bash", args);
     expect(launched.success).toBe(true);
-    expect(launched.status).toBe("running");
+    // A fast command (git init, git status) can finish before the launch
+    // reply is built, so the reply may already say completed. Either way the
+    // task id is there, and bash_status below reads the same final status.
+    expect(["running", "completed"]).toContain(launched.status);
+    expect(typeof launched.task_id).toBe("string");
     const taskId = launched.task_id as string;
     const started = Date.now();
     // A positive wait for a short command to finish. Windows runners start
@@ -284,16 +291,20 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
   );
 
   test("foreground promotion returns server text and does not call bash_status or bash_promote", async () => {
-    const { h, bash, bridgeCalls } = await pluginHarness({ experimental_bash_background: true });
-
-    // The command must still be running when the 25 ms wait window ends. A
-    // 0.2 s command finished first on a loaded runner and came back as a
-    // completed result, which is correct product behaviour, so give it seconds.
-    const result = await withEnv({ AFT_TEST_FOREGROUND_WAIT_MS: "25" }, async () =>
-      callPluginBash(bash, h, { command: "sleep 5 && echo late" }),
+    const { h, bash, bridgeCalls } = await pluginHarness(
+      { experimental_bash_background: true },
+      // The engine reads AFT_TEST_FOREGROUND_WAIT_MS from its own process
+      // environment, not from the bash request arguments.
+      { childEnv: { AFT_TEST_FOREGROUND_WAIT_MS: "25" } },
     );
 
+    // A terminal result wins over promotion even after the deadline. Keep the
+    // command alive long enough for the engine to poll on a loaded runner.
+    const result = await callPluginBash(bash, h, { command: "sleep 5 && echo late" });
+
     expect(result.output).toContain("promoted to background");
+    // Server text rounds 25 ms to 0s, unlike the default wait of several seconds.
+    expect(result.output).toContain("didn't finish within 0s");
     expect(String(result.metadata.taskId)).toMatch(/^bash-[a-f0-9]{16}$/);
     expectNoClientPollOrPromote(bridgeCalls);
     // Explicit budget: spawn + 25ms wait-window + promote crosses several
@@ -302,15 +313,16 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
   }, 30_000);
 
   test("wait true returns a long foreground command directly", async () => {
-    const { h, bash, bridgeCalls } = await pluginHarness({ experimental_bash_background: true });
-
-    const result = await withEnv({ AFT_TEST_FOREGROUND_WAIT_MS: "25" }, async () =>
-      callPluginBash(bash, h, {
-        command: "sleep 0.2 && echo waited",
-        wait: true,
-        timeout: 5_000,
-      }),
+    const { h, bash, bridgeCalls } = await pluginHarness(
+      { experimental_bash_background: true },
+      { childEnv: { AFT_TEST_FOREGROUND_WAIT_MS: "25" } },
     );
+
+    const result = await callPluginBash(bash, h, {
+      command: "sleep 0.2 && echo waited",
+      wait: true,
+      timeout: 5_000,
+    });
 
     expect(eol(result.output)).toContain("waited\n");
     expect(result.output).not.toContain("promoted to background");

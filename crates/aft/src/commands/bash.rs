@@ -77,6 +77,7 @@ fn hard_kill_for(params: &BashParams) -> crate::bash_background::HardKill {
 }
 
 pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
+    let launch_started = std::time::Instant::now();
     let raw_params = req
         .params
         .get("params")
@@ -106,6 +107,8 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             params.shell.is_powershell(),
         )
         .is_some();
+    let _runon_timings =
+        remote_requested.then(|| crate::bash_background::RunonTimingScope::start(launch_started));
     if has_secrets && remote_requested {
         return crate::bash_background::secrets::refusal(
             &req.id,
@@ -147,6 +150,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     // A project's `bash.env` applies only while the project root is trusted at
     // the time of the call, so trusting or untrusting takes effect on the next
     // command without a reload.
+    crate::bash_background::enter_runon_phase("request_environment");
     let project_trusted = project_env_trusted(ctx);
     let remote_env_plan = if remote_requested {
         crate::commands::bash_remote_env::plan(ctx.config().as_ref())
@@ -231,6 +235,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     // `runon` sends the whole line, as written, to the remote runner. Every
     // reason that cannot happen is refused here, before any local work (even
     // resolving a local shell).
+    crate::bash_background::enter_runon_phase("routing_validation");
     let mut remote = match params.runon.as_deref() {
         // Placeholder routing was decided before sandbox checks. A live config
         // change must not turn a locally admitted launch into a remote job.
@@ -326,6 +331,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
+    crate::bash_background::enter_runon_phase("workdir_return_paths");
     let workdir = resolve_workdir(params.workdir.as_deref(), ctx);
     let mut remote = remote;
     if let Err(response) = attach_return_paths(&req.id, ctx, &params, &workdir, &mut remote) {
@@ -337,6 +343,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         .project_root
         .clone()
         .unwrap_or_else(|| default_workdir(ctx));
+    crate::bash_background::enter_runon_phase("permission_preflight");
     let principal = crate::sandbox_spawn::current_authenticated_principal();
     let host_requested = matches!(params.sandbox, Some(BashSandbox::Host));
     if host_requested && !crate::sandbox_spawn::principal_is_first_party(&principal) {

@@ -245,8 +245,13 @@ fn refresh_trigram(session: &ParentSession, child: &Child) {
         Some(&session.storage),
     );
     let Some(artifact) = artifact else {
-        *write(&child.trigram) =
-            Plane::Gap("no trigram index has been built for this repository yet".into());
+        let mut trigram = write(&child.trigram);
+        // Releasing the ledger lock does not itself publish a usable lexical index.
+        // Keep its last busy diagnostic until a usable publication arrives.
+        if matches!(&*trigram, Plane::Gap(reason) if super::super::trigram::bind_is_busy(reason)) {
+            return;
+        }
+        *trigram = Plane::Gap("no trigram index has been built for this repository yet".into());
         return;
     };
     if read(&child.trigram).ready().is_some_and(

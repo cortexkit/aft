@@ -27,6 +27,7 @@ export function mergeWatchLineBatches(
   merged.masking_limit_bytes = next.masking_limit_bytes ?? previous.masking_limit_bytes;
   merged.pending_id = next.pending_id ?? previous.pending_id;
   merged.version = next.version ?? previous.version;
+  if (next.retry_gap) merged.retry_gap = next.retry_gap;
   let retained = merged.lines.reduce((sum, line) => sum + line.count, 0);
   for (const line of next.lines) {
     const keep = Math.min(line.count, MAX_PENDING_WATCH_LINES - retained);
@@ -80,6 +81,21 @@ export function formatWatchLineBatch(
         : "";
     lines.push(
       `${batch.dropped_lines} matching lines dropped.${incomplete} Read them with bash_status({ ${taskKey}: ${JSON.stringify(taskId)}, ${offsetKey}: ${batch.first_dropped_offset ?? 0} }).`,
+    );
+  }
+  if (batch.retry_gap && batch.retry_gap.dropped_notifications > 0) {
+    const gap = batch.retry_gap;
+    const taskKey = camelCase ? "taskId" : "task_id";
+    const cursor = gap.stream === "stderr" ? "stderr" : "output";
+    const offsetKey = camelCase ? `${cursor}Offset` : `${cursor}_offset`;
+    const missing =
+      gap.known_missing_occurrences === 0
+        ? "Some matches may be missing."
+        : gap.known_missing_occurrences === 1
+          ? "At least 1 match is missing."
+          : `At least ${gap.known_missing_occurrences} matches are missing.`;
+    lines.push(
+      `Some watch notices were lost: a stalled connection dropped ${gap.dropped_notifications} of them, and they cannot be recovered. ${missing} Read the task output with bash_status({ ${taskKey}: ${JSON.stringify(taskId)}, ${offsetKey}: ${gap.first_offset ?? 0} }).`,
     );
   }
   return lines.join("\n");

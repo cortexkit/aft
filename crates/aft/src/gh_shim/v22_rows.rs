@@ -332,16 +332,51 @@ fn is_decimal_id(value: &str) -> bool {
 
 /// One payload item of a governed API write, in argv order.
 enum PayloadItem {
-    /// A `name=value` field; `@file` values of typed fields are already read.
-    Field { name: String, text: String },
+    /// A `name=value` field after gh's typed-field conversions.
+    Field { name: String, value: Value },
     /// The JSON document behind `--input`.
     Document(Value),
+}
+
+fn api_field_value<R: Read>(
+    name: &str,
+    text: &str,
+    typed: bool,
+    stdin: &mut R,
+) -> Result<Value, CanonicalizeError> {
+    if !typed {
+        return Ok(Value::String(text.to_string()));
+    }
+    if let Ok(number) = text.parse::<i64>() {
+        return Ok(json!(number));
+    }
+    match text {
+        "true" => return Ok(Value::Bool(true)),
+        "false" => return Ok(Value::Bool(false)),
+        "null" => return Ok(Value::Null),
+        _ => {}
+    }
+    if let Some(source) = text.strip_prefix('@') {
+        return read_body_file_from(Path::new(source), stdin)
+            .map(Value::String)
+            .map_err(CanonicalizeError::unclassified);
+    }
+    if ["{owner}", "{repo}", "{branch}"]
+        .iter()
+        .any(|placeholder| text.contains(placeholder))
+    {
+        return Err(CanonicalizeError::unclassified(format!(
+            "{name} uses gh placeholders in --field; pass a resolved value or use --raw-field"
+        )));
+    }
+    Ok(Value::String(text.to_string()))
 }
 
 /// Read the payload of a governed API write: `-f`/`-F`/`--field`/`--raw-field`
 /// `name=value` pairs, or a JSON document behind `--input` (`-` is standard
 /// input). A typed field (`-F`/`--field`) whose value starts with `@` is read
-/// from that file, as upstream `gh` does. Every other flag is refused by name,
+/// from that file, as upstream `gh` does; booleans, null, and integers retain
+/// their JSON types. Every other flag is refused by name,
 /// and the method and endpoint (already matched during classification) are
 /// skipped; a second positional is refused.
 fn api_payload_items<R: Read>(
@@ -352,6 +387,9 @@ fn api_payload_items<R: Read>(
     let args = api_args(args)
         .ok_or_else(|| CanonicalizeError::unclassified("api endpoint is undeclared"))?;
     let mut items = Vec::new();
+    let mut document_seen = false;
+    let mut field_seen = false;
+    let mut stdin_seen = false;
     let mut endpoint_seen = false;
     let mut index = 1;
     while index < args.len() {
@@ -373,6 +411,13 @@ fn api_payload_items<R: Read>(
             continue;
         }
         if value == "--input" || value.starts_with("--input=") {
+            // With --input, gh puts fields in the URL query, not the body.
+            // The governed wire format cannot represent that combination.
+            if field_seen || std::mem::replace(&mut document_seen, true) {
+                return Err(CanonicalizeError::unclassified(
+                    "--input cannot be repeated or combined with --field/--raw-field on a governed write",
+                ));
+            }
             let (source, consumed) = match value.strip_prefix("--input=") {
                 Some(source) => (source.to_string(), 1),
                 None => (next()?.to_string(), 2),
@@ -406,17 +451,26 @@ fn api_payload_items<R: Read>(
             }
         }
         if let Some((pair, typed, consumed)) = field {
+            if document_seen {
+                return Err(CanonicalizeError::unclassified(
+                    "--input cannot be combined with --field/--raw-field on a governed write",
+                ));
+            }
+            field_seen = true;
             let (name, text) = pair.split_once('=').ok_or_else(|| {
                 CanonicalizeError::unclassified(format!("{value} takes name=value"))
             })?;
-            let text = match text.strip_prefix('@').filter(|_| typed) {
-                Some(source) => read_body_file_from(Path::new(source), stdin)
-                    .map_err(CanonicalizeError::unclassified)?,
-                None => text.to_string(),
-            };
+            // File inputs are saved by path for policy validation. A second
+            // @- would reuse the first stdin contents rather than read stdin
+            // again, which would return EOF in gh.
+            if typed && text == "@-" && std::mem::replace(&mut stdin_seen, true) {
+                return Err(CanonicalizeError::unclassified(format!(
+                    "{name}: --field @- may read stdin only once on a governed write"
+                )));
+            }
             items.push(PayloadItem::Field {
                 name: name.to_string(),
-                text,
+                value: api_field_value(name, text, typed, stdin)?,
             });
             index += consumed;
             continue;
@@ -439,24 +493,26 @@ fn api_payload_items<R: Read>(
 /// The string fields of a governed API write. Each name must be one of
 /// `allowed` and may appear once, whether given as a field or inside the
 /// `--input` object.
-fn api_fields_payload<R: Read>(
+pub(super) fn api_fields_payload<R: Read>(
     args: &[OsString],
     allowed: &[&str],
     row: &str,
     stdin: &mut R,
 ) -> Result<Map<String, Value>, CanonicalizeError> {
     let mut fields = Map::new();
-    let mut insert = |name: &str, text: String| -> Result<(), CanonicalizeError> {
+    let mut insert = |name: &str, value: Value| -> Result<(), CanonicalizeError> {
         if !allowed.contains(&name) {
             return Err(CanonicalizeError::unclassified(format!(
                 "{name} is not declared; {row} admits only {}",
                 allowed.join(", ")
             )));
         }
-        if fields
-            .insert(name.to_string(), Value::String(text))
-            .is_some()
-        {
+        if !value.is_string() {
+            return Err(CanonicalizeError::unclassified(format!(
+                "{row} needs {name} as a string"
+            )));
+        }
+        if fields.insert(name.to_string(), value).is_some() {
             return Err(CanonicalizeError::unclassified(format!(
                 "{row} admits one {name}"
             )));
@@ -465,16 +521,13 @@ fn api_fields_payload<R: Read>(
     };
     for item in api_payload_items(args, row, stdin)? {
         match item {
-            PayloadItem::Field { name, text } => insert(&name, text)?,
+            PayloadItem::Field { name, value } => insert(&name, value)?,
             PayloadItem::Document(document) => {
                 let object = document.as_object().ok_or_else(|| {
                     CanonicalizeError::unclassified(format!("{row} payload must be a JSON object"))
                 })?;
                 for (name, field) in object {
-                    let text = field.as_str().ok_or_else(|| {
-                        CanonicalizeError::unclassified(format!("{row} needs {name} as a string"))
-                    })?;
-                    insert(name, text.to_string())?;
+                    insert(name, field.clone())?;
                 }
             }
         }
@@ -494,7 +547,6 @@ fn stack_pull_requests_payload<R: Read>(
     let number = |value: &Value| -> Option<u64> {
         match value {
             Value::Number(number) => number.as_u64(),
-            Value::String(text) if is_decimal_id(text) => text.parse().ok(),
             _ => None,
         }
         .filter(|number| *number > 0)
@@ -503,9 +555,11 @@ fn stack_pull_requests_payload<R: Read>(
     let mut document_seen = false;
     for item in api_payload_items(args, row, stdin)? {
         match item {
-            PayloadItem::Field { name, text } if name == "pull_requests[]" => {
-                numbers.push(number(&Value::String(text.clone())).ok_or_else(|| {
-                    CanonicalizeError::unclassified(format!("{text} is not a pull request number"))
+            PayloadItem::Field { name, value } if name == "pull_requests[]" => {
+                numbers.push(number(&value).ok_or_else(|| {
+                    CanonicalizeError::unclassified(format!(
+                        "pull_requests[] needs a positive JSON integer, not {value}; use --field for integers"
+                    ))
                 })?);
             }
             PayloadItem::Field { name, .. } => {
@@ -775,6 +829,15 @@ pub(super) fn review_thread_mutation(args: &[OsString]) -> Result<ReviewThreadMu
         {
             return Err(format!(
                 "{key} uses a value gh would rewrite; pass it with -f instead"
+            ));
+        }
+        if typed
+            && !api_field_value(key, text, true, &mut io::empty())
+                .map_err(|error| error.to_string())?
+                .is_string()
+        {
+            return Err(format!(
+                "{key} needs a string; --field converts {text} to a JSON scalar; use --raw-field"
             ));
         }
         if key == "query" {

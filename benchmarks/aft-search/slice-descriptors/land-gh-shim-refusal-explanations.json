@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "gh-shim-refusal-explanations"
+  ],
+  "note": "GitHub shim refusal text only: each Plexus and relay refusal code gets the operator-approved explanation with retry safety; head-only bypass hint. No changed path matches RANKING_FENCE_PREFIXES."
+}

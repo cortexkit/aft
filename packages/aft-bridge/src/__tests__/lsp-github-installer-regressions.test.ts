@@ -1,4 +1,5 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import * as childProcess from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   existsSync,
@@ -74,6 +75,81 @@ async function cacheFixture(
   }
 }
 
+async function withTarPrecheckDiagnostics(operation: () => Promise<void>): Promise<void> {
+  const original = childProcess.execFile;
+  const started = performance.now();
+  const children: Array<{
+    command: string;
+    child: childProcess.ChildProcess;
+    exitObserved: boolean;
+    closeObserved: boolean;
+    stdoutBytesObserved: number;
+    stderrBytesObserved: number;
+  }> = [];
+  const report = (): void => {
+    console.error("Tar precheck child lifecycle:", {
+      bunVersion: Bun.version,
+      elapsedMs: Math.round(performance.now() - started),
+      children: children.map(({ child, ...observed }) => ({
+        ...observed,
+        pid: child.pid,
+        exitCode: child.exitCode,
+        signalCode: child.signalCode,
+        stdinEnded: child.stdin?.writableEnded,
+        stdoutEnded: child.stdout?.readableEnded,
+        stderrEnded: child.stderr?.readableEnded,
+      })),
+    });
+  };
+  const toolMock = spyOn(childProcess, "execFile").mockImplementation(((
+    command: string,
+    args: string[],
+    options: childProcess.ExecFileOptionsWithStringEncoding,
+    callback: (
+      error: childProcess.ExecFileException | null,
+      stdout: string,
+      stderr: string,
+    ) => void,
+  ) => {
+    const child = original(command, args, options, callback);
+    const observed = {
+      command: `${command} ${args[0]}`,
+      child,
+      exitObserved: false,
+      closeObserved: false,
+      stdoutBytesObserved: 0,
+      stderrBytesObserved: 0,
+    };
+    children.push(observed);
+    child.once("exit", () => {
+      observed.exitObserved = true;
+    });
+    child.once("close", () => {
+      observed.closeObserved = true;
+    });
+    child.stdout?.on("data", (chunk: string | Buffer) => {
+      observed.stdoutBytesObserved += Buffer.byteLength(chunk);
+    });
+    child.stderr?.on("data", (chunk: string | Buffer) => {
+      observed.stderrBytesObserved += Buffer.byteLength(chunk);
+    });
+    return child;
+  }) as typeof childProcess.execFile);
+  // Log before Bun's unchanged 30 s deadline, even if the pending test is aborted.
+  // The listeners observe events after execFile returns; exitCode can also expose
+  // a child that exited before those listeners could be attached.
+  const diagnostic = setTimeout(report, 29_000);
+  try {
+    await operation();
+  } catch (error) {
+    report();
+    throw error;
+  } finally {
+    clearTimeout(diagnostic);
+    toolMock.mockRestore();
+  }
+}
+
 const config = { autoInstall: true, graceDays: 7, versions: {}, disabled: new Set<string>() };
 const clangd = findGithubServerById("clangd");
 if (!clangd) throw new Error("clangd fixture missing");
@@ -88,14 +164,16 @@ describe("release platforms", () => {
 
 describe("archive prechecks", () => {
   test("tar size precheck reads sizes rather than numeric filenames", async () => {
-    await cacheFixture(async (root) => {
-      // A file name that parses as a number larger than the extraction cap.
-      const name = "5000000000-payload";
-      writeFileSync(join(root, name), "four");
-      const archive = join(root, "payload.tar");
-      execFileSync("tar", ["-cf", archive, "-C", root, name]);
-      expect(await installerFixture()._precheckTarForTesting(archive, "tar")).toBe(4);
-    });
+    await withTarPrecheckDiagnostics(() =>
+      cacheFixture(async (root) => {
+        // A file name that parses as a number larger than the extraction cap.
+        const name = "5000000000-payload";
+        writeFileSync(join(root, name), "four");
+        const archive = join(root, "payload.tar");
+        execFileSync("tar", ["-cf", archive, "-C", root, name]);
+        expect(await installerFixture()._precheckTarForTesting(archive, "tar")).toBe(4);
+      }),
+    );
     // Spawns tar twice; a loaded CI runner can exceed bun's 5 s default.
   }, 30_000);
 });

@@ -94,7 +94,9 @@ impl LivePin {
             LIVE_SEQ.fetch_add(1, Ordering::Relaxed)
         );
         validate_generation(&label)?;
-        crate::private_storage::create_dir_all(view_dir.join("pins"))?;
+        let pins_dir = view_dir.join("pins");
+        crate::private_storage::create_dir_all(&pins_dir)
+            .map_err(|e| crate::views::io::at("creating live pin directory", &pins_dir, e))?;
         let (metadata_path, keys_path) = pin_paths(view_dir, &label);
         let metadata = PinMetadata {
             family,
@@ -187,9 +189,17 @@ impl LivePin {
             let file = crate::private_storage::options()
                 .write(true)
                 .create_new(true)
-                .open(&temporary)?;
-            write_key_lines(file, self.keys.iter().map(String::as_str))?;
-            fs_lock::rename_over(&temporary, &self.keys_path)?;
+                .open(&temporary)
+                .map_err(|e| crate::views::io::at("creating live pin keys", &temporary, e))?;
+            write_key_lines(file, self.keys.iter().map(String::as_str))
+                .map_err(|e| crate::views::io::at("writing live pin keys", &temporary, e))?;
+            fs_lock::rename_over(&temporary, &self.keys_path).map_err(|e| {
+                crate::views::io::at(
+                    &format!("renaming live pin keys {} to", temporary.display()),
+                    &self.keys_path,
+                    e,
+                )
+            })?;
             Ok(())
         })();
         if result.is_err() {

@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "release-macos-blacksmith"
+  ],
+  "note": "Release macOS builds run on Blacksmith's 24 GB M4 runner instead of GitHub's 7 GB macos-26. Workflow-only; no product code changes."
+}

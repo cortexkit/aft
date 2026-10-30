@@ -7,6 +7,17 @@ use crate::views::eviction::{DiskBudget, V3Refusal, V3_HARD_LIMIT_GAP};
 
 const MIB: u64 = 1 << 20;
 
+#[test]
+fn directory_base_source_error_names_operation_and_path() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("source.rs");
+    std::fs::create_dir(&path).unwrap();
+    let error = read_stable(&path).unwrap_err().to_string();
+    assert!(error.contains("reading base source"), "{error}");
+    assert!(error.contains(&path.display().to_string()), "{error}");
+    assert!(path.is_dir());
+}
+
 fn scope(byte: u8) -> String {
     crate::views::base_refs::base_scope_for(&[byte; 32])
 }

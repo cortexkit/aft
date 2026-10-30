@@ -567,7 +567,10 @@ fn alive(pid: u32) -> bool {
 
 #[cfg(unix)]
 async fn child_pid(path: &Path) -> u32 {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // The background shell writes this file once it is running. A loaded CI
+    // runner can take several seconds to start it (production allows 15 s),
+    // so 5 s failed there; a shell that never starts still fails here.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Ok(text) = std::fs::read_to_string(path) {
             if let Ok(pid) = text.trim().parse() {

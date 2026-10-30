@@ -5,6 +5,59 @@ use crate::subc::rich_ui::{carrier, chunks};
 const MANIFEST: &[u8] = include_bytes!("../../../../tests/fixtures/rich_ui/manifest.jcs.json");
 
 #[tokio::test]
+async fn session_read_targets_keep_frozen_gate_and_step_five_refusals() {
+    let _manifest = chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    let (_dir, root) = test_support::test_root("session-read-targets");
+    let cases: Vec<Value> = serde_json::from_slice(include_bytes!(
+        "../../../../tests/fixtures/rich_ui/target-arguments.json"
+    ))
+    .unwrap();
+    for case in cases {
+        let name = case["operation"].as_str().unwrap();
+        let mut args = match name {
+            "read" => json!({"path":"src/lib.rs"}),
+            "outline" => json!({"target":"src/lib.rs"}),
+            "zoom" => json!({"batch":[{"target":"src/lib.rs", "symbols":["one"]}]}),
+            "search" | "grep" | "glob" => json!({"pattern":"one"}),
+            "callgraph" => json!({"op":"callers", "path":"src/lib.rs", "symbol":"one"}),
+            _ => unreachable!(),
+        };
+        match case["field"].as_str().unwrap() {
+            "target[]" => args["target"] = json!(["src/lib.rs", case["form"]]),
+            "batch[].target" => {
+                args["batch"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"target":case["form"], "symbols":["one"]}));
+            }
+            field => args[field] = case["form"].clone(),
+        }
+        args["rich_ui_op"] = json!(format!("{name}@1"));
+        let reply = exchange_with_actor(
+            json!({"op":"tool.call", "name":name, "arguments":args}),
+            occipital_identity(&root, RouteRole::ToolProviderV1),
+            test_support::test_ctx(),
+            &Arc::new(DispatchPathMetrics::new()),
+            |_, _| panic!("remote and revision targets must not dispatch"),
+        )
+        .await;
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        if case["refused_by"] == "gate" {
+            assert_eq!(reply.header.ty, FrameType::Error, "{case}: {body}");
+            assert_eq!(body["code"], case["code"], "{case}: {body}");
+        } else {
+            assert_eq!(reply.header.ty, FrameType::Response, "{case}: {body}");
+            assert_eq!(
+                body,
+                carrier::error_body(case["code"].as_str().unwrap()),
+                "{case}"
+            );
+            carrier::validate_body(None, &body).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn operation_route_gate_and_admission_precedence() {
     let _manifest = chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     let (_dir, root) = test_support::test_root("operation-route");

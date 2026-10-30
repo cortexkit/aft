@@ -15,7 +15,63 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { shouldSurfaceStderrLine, tagStderrLine } from "../bridge.js";
+import { BinaryBridge, shouldSurfaceStderrLine, tagStderrLine } from "../bridge.js";
+
+describe("engine stderr flush severity", () => {
+  function capture() {
+    const calls: [string, string][] = [];
+    const bridge = new BinaryBridge("/unused/aft", process.cwd(), {
+      logger: {
+        log: (message) => calls.push(["INFO", message]),
+        debug: (message) => calls.push(["DEBUG", message]),
+        warn: (message) => calls.push(["WARN", message]),
+        error: (message) => calls.push(["ERROR", message]),
+      },
+    });
+    return { calls, bridge: bridge as any };
+  }
+
+  for (const level of ["INFO", "WARN", "ERROR", "DEBUG"]) {
+    test(`routes ${level} to its sink without changing the message`, () => {
+      const { calls, bridge } = capture();
+      const line = `2026-10-23T21:26:36.123Z [aft-lsp] ${level} payload  with spaces Ω`;
+      bridge.onStderrData(`${line}\n`);
+      expect(calls).toEqual([[level, `[aft] ${line}`]]);
+      expect(bridge.formatStderrTail()).toContain(`[aft] ${line}`);
+    });
+  }
+
+  test("sends DEBUG to log when the host logger has no debug method", () => {
+    const calls: [string, string][] = [];
+    const bridge = new BinaryBridge("/unused/aft", process.cwd(), {
+      logger: {
+        log: (message) => calls.push(["INFO", message]),
+        warn: (message) => calls.push(["WARN", message]),
+        error: (message) => calls.push(["ERROR", message]),
+      },
+    }) as any;
+    const line = "2026-10-23T21:26:36.123Z [aft] DEBUG detail";
+    bridge.onStderrData(`${line}\n`);
+    expect(calls).toEqual([["INFO", `[aft] ${line}`]]);
+  });
+
+  test("flushes an unterminated record and leaves unrecognized stderr on INFO", () => {
+    const { calls, bridge } = capture();
+    const lines = [
+      "2026-10-23T21:26:36.123Z [aft] WARN pending record",
+      "noise 2026-10-23T21:26:36.123Z [aft] ERROR not an engine prefix",
+      "2026-10-23T21:26:36.123Z [third-party] WARN not an engine tag",
+      "[aft] WARN legacy unstructured text",
+    ];
+    for (const line of lines) {
+      bridge.onStderrData(line);
+      bridge.flushStderrBuffer();
+    }
+    expect(calls).toEqual(
+      lines.map((line, index) => [index === 0 ? "WARN" : "INFO", tagStderrLine(line)]),
+    );
+  });
+});
 
 describe("tagStderrLine — never doubles the [aft] prefix", () => {
   for (const { name, line, expected } of [

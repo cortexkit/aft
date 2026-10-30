@@ -62,16 +62,22 @@ fn identity(root: &Path, kind: &str, id: &str, channel: u16) -> RouteIdentity {
 
 impl Fixture {
     fn new(kind: &str) -> Self {
+        Self::with_config(kind, |_| {})
+    }
+
+    fn with_config(kind: &str, configure: impl FnOnce(&mut crate::config::Config)) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
+        let mut config = crate::config::Config {
+            project_root: Some(root.clone()),
+            restrict_to_project_root: false,
+            storage_dir: Some(root.join("storage")),
+            ..Default::default()
+        };
+        configure(&mut config);
         let ctx = Arc::new(AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),
-            crate::config::Config {
-                project_root: Some(root.clone()),
-                restrict_to_project_root: false,
-                storage_dir: Some(root.join("storage")),
-                ..Default::default()
-            },
+            config,
         ));
         ctx.set_db(Arc::new(std::sync::Mutex::new(
             crate::db::open(&root.join("aft.db")).unwrap(),
@@ -1037,3 +1043,9 @@ async fn unresolved_policy_is_typed_and_database_and_preset_errors_precede_mode(
 
 #[path = "bash_tests.rs"]
 mod bash_tests;
+
+#[path = "read_tests.rs"]
+mod read_tests;
+
+#[path = "samples.rs"]
+mod samples;
