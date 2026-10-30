@@ -995,10 +995,12 @@ impl<Io: ExchangeIo> Exchange<'_, Io> {
             && self.budget == RELAY_BUDGET
             && remaining < MIN_WRITE_DISPATCH_BUDGET
         {
-            return Err(RouteOutcome::GovernanceUnavailableTimedOut {
-                stage: ProbeStage::Request,
-                elapsed_ms: now.saturating_duration_since(self.started).as_millis() as u64,
-            });
+            return Err(SendFailure::Outcome(
+                RouteOutcome::GovernanceUnavailableTimedOut {
+                    stage: ProbeStage::Request,
+                    elapsed_ms: now.saturating_duration_since(self.started).as_millis() as u64,
+                },
+            ));
         }
         if remaining.is_zero() {
             return Err(SendFailure::Outcome(RouteOutcome::Unavailable(format!(
