@@ -3260,7 +3260,7 @@ impl InspectManager {
 
         match waiter_rx.recv() {
             Ok(outcome) => filter_outcome_for_scope_with_contributions(
-                None,
+                Some(self),
                 outcome,
                 &snapshot,
                 category,
@@ -3512,8 +3512,10 @@ impl InspectManager {
         snapshot: &InspectSnapshot,
     ) -> JobOutcome {
         match waiter_rx.recv() {
+            // Scoped completions need the shared scan's revision-checked graph
+            // and contribution-checked rollup, not a full projection per waiter.
             Ok(outcome) => filter_outcome_for_scope_with_contributions(
-                None,
+                Some(self),
                 outcome,
                 snapshot,
                 key.category,
@@ -8022,6 +8024,7 @@ mod guard_tests {
 
     include!("view_projection_tests.rs");
     include!("completion_perf_tests.rs");
+    include!("tier2_refresh_perf_tests.rs");
 
     fn published_projection_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, InspectJob) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -8846,7 +8849,10 @@ mod guard_tests {
             outcome_tx.send(outcome).expect("send inspect outcome");
         });
 
-        let deadline = Instant::now() + Duration::from_secs(3);
+        // The inspect thread opens its cache and checks for a reusable result
+        // before it reaches the seed gate; a loaded Windows runner needed more
+        // than 3 s for that. The gate itself is what the test checks.
+        let deadline = Instant::now() + Duration::from_secs(30);
         while manager.tier2_builder_state(InspectCategory::DeadCode)
             != InspectBuilderState::GatedBySemanticSeed
         {
@@ -8854,7 +8860,7 @@ mod guard_tests {
                 Instant::now() < deadline,
                 "inspect must queue while the active seed owns the slot"
             );
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(5));
         }
         assert!(
             outcome_rx.try_recv().is_err(),

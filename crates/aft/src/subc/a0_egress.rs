@@ -165,7 +165,7 @@ pub(super) enum ControlCompletion {
     AckCancelled(Box<ControlCompletion>),
     ManagementAckWritten {
         route: RouteChannel,
-        principal: Option<Principal>,
+        identity: ManagementIdentity,
         corr: u64,
     },
     BindRetracted {
@@ -578,7 +578,7 @@ mod tests {
                 route_bind_ack_frame(PROTOCOL_VERSION, 891, control_flags()).unwrap(),
                 ControlCompletion::ManagementAckWritten {
                     route: route_key(7, 1),
-                    principal: None,
+                    identity: ManagementIdentity::default(),
                     corr: 891
                 },
                 &Arc::new(DispatchPathMetrics::new())
@@ -654,7 +654,7 @@ mod tests {
                 route_bind_ack_frame(PROTOCOL_VERSION, 891, control_flags()).unwrap(),
                 ControlCompletion::ManagementAckWritten {
                     route: route_key(7, 1),
-                    principal: None,
+                    identity: ManagementIdentity::default(),
                     corr: 891,
                 },
                 &metrics,
@@ -774,7 +774,7 @@ mod tests {
                 route_bind_ack_frame(PROTOCOL_VERSION, 891, control_flags()).unwrap(),
                 ControlCompletion::ManagementAckWritten {
                     route: route_key(7, 1),
-                    principal: None,
+                    identity: ManagementIdentity::default(),
                     corr: 891,
                 },
                 &metrics,
@@ -873,7 +873,7 @@ mod fixup_tests {
         } else {
             ControlCompletion::ManagementAckWritten {
                 route,
-                principal: None,
+                identity: ManagementIdentity::default(),
                 corr: 891,
             }
         };
@@ -952,7 +952,7 @@ mod fixup_tests {
                         route_bind_ack_frame(PROTOCOL_VERSION, 891, control_flags()).unwrap(),
                         ControlCompletion::ManagementAckWritten {
                             route,
-                            principal: None,
+                            identity: ManagementIdentity::default(),
                             corr: 891
                         },
                         &metrics
@@ -1058,7 +1058,7 @@ mod fixup_tests {
                         .unwrap(),
                     ControlCompletion::ManagementAckWritten {
                         route,
-                        principal: None,
+                        identity: ManagementIdentity::default(),
                         corr: channel as u64
                     },
                     &metrics
@@ -1118,7 +1118,7 @@ mod fixup_tests {
                 route_bind_ack_frame(PROTOCOL_VERSION, 891, control_flags()).unwrap(),
                 ControlCompletion::ManagementAckWritten {
                     route,
-                    principal: None,
+                    identity: ManagementIdentity::default(),
                     corr: 891
                 },
                 &metrics

@@ -15,7 +15,8 @@ mod shared_test_env;
 
 #[allow(unused_imports)]
 pub(crate) use shared_test_env::{
-    apply_hermetic_git_env, hermetic_git_env, hermetic_git_env_guard,
+    apply_hermetic_git_env, hermetic_git_env, hermetic_git_env_guard, process_env_lock,
+    process_env_lock_is_available, without_storage_override, ProcessEnvLockGuard,
 };
 
 use std::collections::VecDeque;
@@ -358,6 +359,12 @@ impl AftProcess {
         Self::spawn_inner(envs)
     }
 
+    /// Use a fixture-owned deployment path without changing the test runner's
+    /// global binary override or sacrificing the normal isolated environment.
+    pub fn spawn_binary_with_env(binary: &Path, envs: &[(&str, &std::ffi::OsStr)]) -> Self {
+        Self::spawn_binary_inner(binary, envs, &[], None)
+    }
+
     /// Spawn with stderr piped so tests can read it via `stderr_output()`.
     ///
     /// Stderr is now always piped (the drain thread keeps a rolling tail for
@@ -428,6 +435,15 @@ impl AftProcess {
         cwd: Option<&Path>,
     ) -> Self {
         let binary = aft_binary::aft_binary();
+        Self::spawn_binary_inner(&binary, envs, removed, cwd)
+    }
+
+    fn spawn_binary_inner(
+        binary: &Path,
+        envs: &[(&str, &std::ffi::OsStr)],
+        removed: &[&str],
+        cwd: Option<&Path>,
+    ) -> Self {
         let diag_enabled =
             std::env::var_os("AFT_TEST_DIAG").as_deref() == Some(std::ffi::OsStr::new("1"));
         let cache_dir = tempfile::tempdir().expect("create aft test cache dir");

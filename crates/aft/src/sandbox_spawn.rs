@@ -1863,7 +1863,7 @@ fn build_native_profile(
         let storage = ctx.storage_dir();
         let mut managed_paths = Vec::new();
         if ctx.config().github.shim {
-            managed_paths.push(storage.join(crate::agent_child_env::SHIMS_DIR_NAME));
+            managed_paths.push(crate::pinned_executable::shims_dir(&storage));
             managed_paths.push(crate::agent_child_env::shim_binary(&ctx.config())?);
         }
         if ctx.config().git.co_author != "off" {
@@ -2181,7 +2181,7 @@ fn build_relaxed_profile(
     }
     let storage = ctx.storage_dir();
     for path in [
-        storage.join(crate::agent_child_env::SHIMS_DIR_NAME),
+        crate::pinned_executable::shims_dir(&storage),
         crate::agent_child_env::managed_git_hooks_dir(&storage),
     ] {
         if profile_candidate_exists(&path) {
@@ -5411,7 +5411,7 @@ fn native_launcher_path(ctx: &AppContext) -> std::io::Result<PathBuf> {
         }
     }
     let _ = ctx;
-    std::env::current_exe()
+    crate::pinned_executable::path()
 }
 
 /// Use the real aft executable for an in-process integration fixture. The test

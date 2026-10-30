@@ -403,7 +403,11 @@ impl ExactMemoStore {
         page: &[CandidateResult],
         file_digests: &HashMap<PathBuf, String>,
     ) -> Result<(), PathBuf> {
+        let mut checked = HashSet::new();
         for candidate in page {
+            if !checked.insert(&candidate.path) {
+                continue;
+            }
             let Some(expected_digest) = file_digests.get(&candidate.path) else {
                 continue;
             };
@@ -1044,7 +1048,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_memo_digest_work_still_covers_every_served_candidate() {
+    fn exact_memo_digest_work_covers_every_served_file_once() {
         let temp = tempfile::tempdir().unwrap();
         let paths = (0..200)
             .map(|ordinal| {
@@ -1066,7 +1070,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        for page in [&candidates[100..110], candidates.as_slice()] {
+        for (page, expected_reads) in [(&candidates[100..110], 10), (candidates.as_slice(), 200)] {
             crate::search_hot_path_measurements::reset();
             ExactMemoStore::check_served_page_digests(page, &file_digests).unwrap();
             let reads = crate::search_hot_path_measurements::counts().file_reads;
@@ -1074,7 +1078,7 @@ mod tests {
                 "SEMANTIC_WORK memo_digests: page={} files=200 reads_and_hashes={reads}",
                 page.len()
             );
-            assert_eq!(reads, page.len());
+            assert_eq!(reads, expected_reads);
         }
         fs::write(&paths[0], b"changed").unwrap();
         assert_eq!(

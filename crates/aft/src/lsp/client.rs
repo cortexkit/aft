@@ -987,6 +987,8 @@ pub struct LspClient {
 
     /// Pending request responses, keyed by request ID.
     pending: Arc<Mutex<PendingMap>>,
+    /// Last outbound request or document open/change/save, not server-pushed traffic.
+    last_used_at: Instant,
     /// Next request ID counter.
     next_id: AtomicI64,
     /// Diagnostic capabilities reported by the server in its initialize response.
@@ -1416,6 +1418,7 @@ impl LspClient {
             child_pid,
             writer,
             pending,
+            last_used_at: Instant::now(),
             next_id: AtomicI64::new(1),
             diagnostic_caps: None,
             diagnostic_registrations,
@@ -2294,6 +2297,7 @@ impl LspClient {
             self.remove_pending(&id);
             return Err(err);
         }
+        self.last_used_at = Instant::now();
         Ok(PendingLspRequest {
             id,
             method,
@@ -2324,6 +2328,7 @@ impl LspClient {
         opened: bool,
         saved: Option<(Instant, u64)>,
     ) {
+        self.last_used_at = Instant::now();
         self.note_analysis_document(
             if opened {
                 "textDocument/didOpen"
@@ -2347,6 +2352,12 @@ impl LspClient {
         let params = serde_json::to_value(params)?;
         let notification = Notification::new(N::METHOD, Some(params));
         self.writer.send(serde_json::to_string(&notification)?)?;
+        if matches!(
+            N::METHOD,
+            "textDocument/didOpen" | "textDocument/didChange" | "textDocument/didSave"
+        ) {
+            self.last_used_at = Instant::now();
+        }
         self.note_analysis_document(N::METHOD, notification.params.as_ref().unwrap());
         Ok(())
     }
@@ -2354,7 +2365,24 @@ impl LspClient {
     /// Write an already serialized notification.
     fn send_serialized_notification(&mut self, json: &str) -> Result<(), LspError> {
         self.ensure_can_send()?;
-        self.writer.send(json.to_string())
+        self.writer.send(json.to_string())?;
+        self.last_used_at = Instant::now();
+        Ok(())
+    }
+
+    pub(crate) fn last_used_at(&self) -> Instant {
+        self.last_used_at
+    }
+
+    pub(crate) fn has_pending_requests(&self) -> bool {
+        self.pending
+            .lock()
+            .map_or(true, |pending| !pending.is_empty())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_last_used_at_for_test(&mut self, at: Instant) {
+        self.last_used_at = at;
     }
 
     /// Send `textDocument/didChange` carrying the whole document (see

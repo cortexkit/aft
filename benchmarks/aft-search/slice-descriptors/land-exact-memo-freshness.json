@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "readiness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "exact-memo-freshness"
+  ],
+  "note": "Accepted search-index content changes (watcher updates, AFT's own writes, pre-index fallback updates and replacement-index publication) clear the exact and literal-presence memos, so exact results always reflect the current contents. Ranking and candidate selection are unchanged; unchanged queries still reuse their memo."
+}

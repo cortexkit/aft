@@ -273,6 +273,30 @@ fn candidate_text_is_bounded_relative_and_repeatable() {
 // ---- served path ---------------------------------------------------------
 
 #[test]
+fn candidate_text_reuses_raw_source_without_lossy_matching_or_stale_lines() {
+    let project = tempfile::tempdir().unwrap();
+    let file = project.path().join("raw.rs");
+    let whole = CandidateResult::new_exact(
+        file.clone(),
+        None,
+        super::super::evidence_descriptor::EvidenceDescriptor::for_e1(1, true, false),
+    );
+    std::fs::write(&file, b"// bad: \xff\r\n\r\nfn target_name() {}\r\n").unwrap();
+    assert_eq!(
+        candidate_text(project.path(), &whole, "target_name"),
+        "raw.rs:1\ntarget_name\n// bad: \u{fffd}\nfn target_name() {}"
+    );
+    std::fs::write(&file, "// valid\r\n\r\nfn target_name() {}\r\n").unwrap();
+    assert!(candidate_text(project.path(), &whole, "target_name")
+        .starts_with("raw.rs:3\ntarget_name\n"));
+    std::fs::write(&file, "fn target_name() {}\n").unwrap();
+    assert_eq!(
+        candidate_text(project.path(), &whole, "target_name"),
+        "raw.rs:1\ntarget_name\nfn target_name() {}"
+    );
+}
+
+#[test]
 fn audit01_raw_range_survives_crlf_and_invalid_prefix() {
     let project = tempfile::tempdir().unwrap();
     let file = project.path().join("raw.rs");

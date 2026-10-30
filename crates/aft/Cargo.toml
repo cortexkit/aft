@@ -1,6 +1,6 @@
 [package]
 name = "agent-file-tools"
-version = "0.63.1"
+version = "0.63.3"
 edition = "2021"
 description = "Agent File Tools — tree-sitter powered code analysis for AI agents"
 license = "MIT"
@@ -179,10 +179,10 @@ oxc_str = "0.126"
 rustc-hash = "2"
 rustc-demangle = "0.1"
 rusqlite = { version = "0.32", features = ["bundled", "backup", "trace", "functions"] }
-aft-tokenizer = { path = "../aft-tokenizer", version = "0.63.1" }
+aft-tokenizer = { path = "../aft-tokenizer", version = "0.63.3" }
 # The placeholder grammar, key-location rules and audit record AFT's vault
 # seam speaks. AFT owns the crate; basal links it later.
-secret-rules = { path = "../secret-rules", version = "0.1.0" }
+secret-rules = { path = "../secret-rules", version = "0.63.3", package = "aft-secret-rules" }
 zeroize = "1"
 bytes = "1"
 http-body-util = "0.1"
@@ -197,7 +197,7 @@ rcgen = "0.13"
 # Lives in github.com/cortexkit/commons (product-neutral, used without subc);
 # its CI runs the cfg(windows) verbatim/UNC/drive-case vectors continuously.
 cortexkit-paths = "0.1"
-cortexkit-exec-remote-types = "=0.2.14"
+cortexkit-exec-remote-types = "=0.2.15"
 
 glob = "0.3"
 which = "7"
@@ -246,7 +246,7 @@ cortexkit-role-agent-data = "=0.2.3"
 cortexkit-project-identity = "=0.1.4"
 cortexkit-agent-identity = "=0.1.1"
 jsonschema = { version = "0.33", default-features = false }
-subc-protocol = "=0.33.3"
+subc-protocol = "=0.33.5"
 subc-transport = "=0.14.0"
 subc-client-rs = "=0.32.7"
 # The one reader of the daemon's launch nonce (pipe first, environment copy

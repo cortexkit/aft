@@ -323,7 +323,8 @@ jobs:
       # an npm download cache (about 6.5 GB summed over a run), a Bun cache,
       # the host's node_modules and Node's compile cache. None of it is
       # evidence: they are the same public packages in every scenario, so they
-      # are left out.
+      # are left out. Per-process executable pins are copies of the same AFT
+      # binary, not forensic evidence, and are excluded even after a crash.
       # Everything else stays: forensics (streams, exchanges, failure,
       # readiness and termination records), AFT and plugin logs, the project
       # trees, AFT's index and callgraph stores, and the install metadata files
@@ -351,6 +352,7 @@ jobs:
           fi
           du -sh "$run_dir" || true
           tar -C "$AFT_E2E_ARTIFACT_ROOT" \
+            --exclude='*/run/aft-pinned-*' \
             --exclude='*/xdg-data/cortexkit/aft/semantic/models' \
             --exclude='*/xdg-data/cortexkit/aft/onnxruntime/*/lib' \
             --exclude='*/xdg-data/cortexkit/aft/onnxruntime/*/libonnxruntime*' \

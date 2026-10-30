@@ -1,7 +1,7 @@
 use super::{types::*, *};
 use serde::Serialize;
 use serde_json::json;
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Instant};
 use subc_client_rs::{CallOptions, ConsumerOptions, SubcConsumer, SubscribeOptions, Subscription};
 use subc_protocol::{BindIdentity, RouteTarget};
 
@@ -10,6 +10,61 @@ use subc_protocol::{BindIdentity, RouteTarget};
 pub(crate) const WINDOWS_CAPABILITY: &str = "exec-remote-windows/v1";
 
 pub const CAPABILITY: &str = "exec-remote/v1";
+
+/// Local, monotonic launch timings. Phase labels are static so diagnostics
+/// cannot accidentally include command text, paths, or environment values.
+pub(crate) struct LaunchTimings {
+    started: Instant,
+    entered: Instant,
+    phase: &'static str,
+    phases: Vec<(&'static str, std::time::Duration)>,
+}
+
+impl LaunchTimings {
+    pub(crate) fn new(started: Instant, phase: &'static str) -> Self {
+        Self {
+            started,
+            entered: started,
+            phase,
+            phases: Vec::new(),
+        }
+    }
+
+    pub(crate) fn enter(&mut self, phase: &'static str) {
+        let now = Instant::now();
+        self.phases
+            .push((self.phase, now.duration_since(self.entered)));
+        self.entered = now;
+        self.phase = phase;
+    }
+
+    fn sent(mut self, task_id: &str, session: &str, sent_at: Instant) {
+        use std::fmt::Write as _;
+
+        self.phases
+            .push((self.phase, sent_at.duration_since(self.entered)));
+        let mut phases = String::new();
+        for (name, elapsed) in self.phases {
+            if !phases.is_empty() {
+                phases.push(',');
+            }
+            let _ = write!(phases, "{name}:{}", elapsed.as_millis());
+        }
+        crate::slog_info!(
+            "runon: exec.run sent task_id={} session={} pre_send_ms={} phases={}",
+            task_id,
+            session,
+            sent_at.duration_since(self.started).as_millis(),
+            phases,
+        );
+    }
+}
+
+pub(crate) struct RunDiagnostics<'a> {
+    pub task_id: &'a str,
+    pub session: &'a str,
+    pub timings: LaunchTimings,
+}
 
 /// An authenticated daemon route to the catalog's sole capability provider.
 /// No module ID fallback, SSH transport, snapshotting, or automatic run retry.
@@ -58,26 +113,43 @@ impl ExecRemoteClient {
     }
 
     pub async fn run(&self, request: &RunRequest) -> Result<RemoteStream, Error> {
-        if (request.submission_key().is_some() || request.resume_from_seq().is_some())
-            && !self.supports_submission_key().await?
-        {
-            return Err(Error::Protocol(
-                "executor does not advertise submission keys".into(),
-            ));
+        self.run_with_diagnostics(request, None).await
+    }
+
+    pub(crate) async fn run_with_diagnostics(
+        &self,
+        request: &RunRequest,
+        mut diagnostics: Option<RunDiagnostics<'_>>,
+    ) -> Result<RemoteStream, Error> {
+        if request.submission_key().is_some() || request.resume_from_seq().is_some() {
+            if let Some(diagnostics) = diagnostics.as_mut() {
+                diagnostics.timings.enter("run_supports_submission_key");
+            }
+            if !self.supports_submission_key().await? {
+                return Err(Error::Protocol(
+                    "executor does not advertise submission keys".into(),
+                ));
+            }
         }
-        if request.platform == Some(Platform::Windows)
-            && !self.advertises(WINDOWS_CAPABILITY).await.map_err(|error| {
+        if request.platform == Some(Platform::Windows) {
+            if let Some(diagnostics) = diagnostics.as_mut() {
+                diagnostics.timings.enter("advertises_windows");
+            }
+            if !self.advertises(WINDOWS_CAPABILITY).await.map_err(|error| {
                 Error::Protocol(format!(
                     "runon \"windows\" capability discovery failed before launch: {error}"
                 ))
-            })?
-        {
-            return Err(Error::Protocol(format!("runon \"windows\" is unavailable: the build server doesn't offer Windows jobs yet (missing {WINDOWS_CAPABILITY})")));
+            })? {
+                return Err(Error::Protocol(format!("runon \"windows\" is unavailable: the build server doesn't offer Windows jobs yet (missing {WINDOWS_CAPABILITY})")));
+            }
         }
         // A runner without chunked return would run the command and drop the
         // requested files, so refuse before submitting anything.
-        if !request.return_paths.is_empty()
-            && !self
+        if !request.return_paths.is_empty() {
+            if let Some(diagnostics) = diagnostics.as_mut() {
+                diagnostics.timings.enter("advertises_return_chunked");
+            }
+            if !self
                 .advertises(RETURN_CHUNKED_CAPABILITY)
                 .await
                 .map_err(|error| {
@@ -85,16 +157,23 @@ impl ExecRemoteClient {
                         "return_paths capability discovery failed before launch: {error}"
                     ))
                 })?
-        {
-            return Err(Error::MissingCapability {
-                feature: "return_paths",
-                capability: RETURN_CHUNKED_CAPABILITY,
-            });
+            {
+                return Err(Error::MissingCapability {
+                    feature: "return_paths",
+                    capability: RETURN_CHUNKED_CAPABILITY,
+                });
+            }
         }
+        // Progress is optional display data. Older executors receive no opt-in,
+        // even if a saved request was created against a newer executor.
+        let request = request
+            .clone()
+            .with_progress(self.advertises(PROGRESS_CAPABILITY).await.unwrap_or(false));
         self.stream(
             "exec.run",
-            request,
+            &request,
             StreamConsumer::keyed_run(request.resume_from_seq()),
+            diagnostics,
         )
         .await
     }
@@ -140,7 +219,7 @@ impl ExecRemoteClient {
     /// packet. `from_seq` on the wire is inclusive, so this sends last_seq + 1.
     pub async fn attach(&self, point: ResumePoint) -> Result<RemoteStream, Error> {
         let request = point.attach_request()?;
-        self.stream("exec.attach", &request, StreamConsumer::resume(point))
+        self.stream("exec.attach", &request, StreamConsumer::resume(point), None)
             .await
     }
 
@@ -149,7 +228,11 @@ impl ExecRemoteClient {
         method: &str,
         params: &T,
         consumer: StreamConsumer,
+        mut diagnostics: Option<RunDiagnostics<'_>>,
     ) -> Result<RemoteStream, Error> {
+        if let Some(diagnostics) = diagnostics.as_mut() {
+            diagnostics.timings.enter("send");
+        }
         let subscription = self
             .consumer
             .subscribe_route(
@@ -159,11 +242,18 @@ impl ExecRemoteClient {
             )
             .await
             .map_err(Error::Transport)?;
+        let sent_at = Instant::now();
+        if let Some(diagnostics) = diagnostics {
+            diagnostics
+                .timings
+                .sent(diagnostics.task_id, diagnostics.session, sent_at);
+        }
         Ok(RemoteStream {
             subscription,
             consumer,
             finished: false,
             received_frame: false,
+            sent_at: (method == "exec.run").then_some(sent_at),
         })
     }
 
@@ -249,6 +339,7 @@ fn envelope<T: Serialize>(method: &str, params: &T) -> Result<Vec<u8>, Error> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum StreamProgress {
     Record,
+    AdmissionProgress,
     Complete(Verdict),
 }
 
@@ -259,9 +350,16 @@ pub struct RemoteStream {
     consumer: StreamConsumer,
     finished: bool,
     received_frame: bool,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    sent_at: Option<Instant>,
 }
 
 impl RemoteStream {
+    #[cfg(unix)]
+    pub(crate) fn sent_at(&self) -> Option<Instant> {
+        self.sent_at
+    }
+
     pub fn resume_point(&self) -> Option<ResumePoint> {
         self.consumer.resume_point()
     }
@@ -273,9 +371,10 @@ impl RemoteStream {
         self.received_frame
     }
 
-    /// Read one record into a durable sink. Outside output-gap recovery, a known
-    /// terminal followed by clean StreamEnd is required to complete a run;
-    /// loss/decode errors require status/attach. During output-gap recovery, the
+    /// Read one record into a sink; admission progress is display-only. Outside
+    /// output-gap recovery, a known terminal followed by clean StreamEnd is
+    /// required to complete a run; loss/decode errors require status/attach.
+    /// During output-gap recovery, the
     /// saved executor terminal still supplies the outcome even if a later attach
     /// closes with an error or does not repeat that terminal.
     /// There is no response deadline here: request timeout bounds remote run
@@ -285,9 +384,13 @@ impl RemoteStream {
             return self.consumer.finish().map(StreamProgress::Complete);
         }
         if let Some(bytes) = self.subscription.events().recv().await {
-            self.received_frame = true;
-            if let Err(error) = self.consumer.consume_bytes(&bytes, sink) {
-                return Err(self.consumer.recovery(error.to_string()));
+            match self.consumer.consume_frame(&bytes, sink) {
+                Ok(false) => return Ok(StreamProgress::AdmissionProgress),
+                Ok(true) => self.received_frame = true,
+                Err(error) => {
+                    self.received_frame = true;
+                    return Err(self.consumer.recovery(error.to_string()));
+                }
             }
             return Ok(StreamProgress::Record);
         }
@@ -313,13 +416,18 @@ impl RemoteStream {
 
 #[cfg(test)]
 mod capability_tests {
-    use super::{CAPABILITY, RETURN_CHUNKED_CAPABILITY, WINDOWS_CAPABILITY};
+    use super::{CAPABILITY, PROGRESS_CAPABILITY, RETURN_CHUNKED_CAPABILITY, WINDOWS_CAPABILITY};
 
     /// The daemon refuses a HELLO whose manifest names a capability outside the
     /// `<name>/v<N>` grammar, so AFT must check for names that can exist on the wire.
     #[test]
     fn checked_capabilities_pass_the_daemon_grammar() {
-        for capability in [CAPABILITY, WINDOWS_CAPABILITY, RETURN_CHUNKED_CAPABILITY] {
+        for capability in [
+            CAPABILITY,
+            WINDOWS_CAPABILITY,
+            RETURN_CHUNKED_CAPABILITY,
+            PROGRESS_CAPABILITY,
+        ] {
             assert!(
                 subc_protocol::manifest::is_valid_capability_identifier(capability),
                 "{capability} is not a capability name the daemon admits"

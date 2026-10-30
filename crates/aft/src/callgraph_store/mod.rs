@@ -4452,6 +4452,128 @@ pub struct ReadonlyCallGraphStore {
     inner: CallGraphStore,
     _view_pin: Option<Arc<crate::pins::QueryPin>>,
     _generation_pin: Option<Arc<crate::views::snapshot::OpenGeneration>>,
+    health_stale_census: Mutex<Option<CachedStalePathCensus>>,
+}
+
+#[derive(Debug)]
+struct CachedStalePathCensus {
+    data_version: i64,
+    total_changes: u64,
+    measured_at: Instant,
+    census: StalePathCensus,
+}
+
+pub(crate) struct StalePathHealthCensus {
+    pub census: StalePathCensus,
+    pub measured_age_ms: u64,
+}
+
+// Path existence and permissions can change without a SQLite commit. Recheck
+// them periodically even when the resident database has not changed.
+const HEALTH_STALE_PATH_MAX_AGE: Duration = Duration::from_secs(30);
+
+#[cfg(test)]
+mod health_stale_census_tests {
+    use super::*;
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        PathBuf,
+        CallGraphStore,
+        ReadonlyCallGraphStore,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let files = [root.join("a.ts"), root.join("b.ts")];
+        for file in &files {
+            std::fs::write(file, "export function fixture() {}\n").unwrap();
+        }
+        let store_dir = dir.path().join("store");
+        let writer = CallGraphStore::open(store_dir.clone(), root.clone()).unwrap();
+        writer.cold_build(&files).unwrap();
+        writer.mark_files_stale(&files[..1]).unwrap();
+        let reader = CallGraphStore::open_readonly(store_dir, root.clone())
+            .unwrap()
+            .unwrap();
+        (dir, root, writer, reader)
+    }
+
+    #[test]
+    fn health_stale_census_reuses_paths_with_honest_age_and_rechecks_filesystem() {
+        let (_dir, root, _writer, reader) = fixture();
+        let now = Instant::now();
+        let first = reader
+            .try_stale_path_census_for_health_at(now)
+            .unwrap()
+            .unwrap();
+        assert_eq!((first.census.stale, first.census.absent), (1, 0));
+        let builds = STALE_PATH_CENSUS_BUILDS.with(std::cell::Cell::get);
+        std::fs::remove_file(root.join("a.ts")).unwrap();
+        let reused = reader
+            .try_stale_path_census_for_health_at(now + Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert_eq!(reused.census, first.census);
+        assert_eq!(reused.measured_age_ms, 3_000);
+        assert_eq!(STALE_PATH_CENSUS_BUILDS.with(std::cell::Cell::get), builds);
+        let expired = reader
+            .try_stale_path_census_for_health_at(now + HEALTH_STALE_PATH_MAX_AGE)
+            .unwrap()
+            .unwrap();
+        assert_eq!((expired.census.stale, expired.census.absent), (1, 1));
+        assert_eq!(expired.measured_age_ms, 0);
+        assert_eq!(
+            STALE_PATH_CENSUS_BUILDS.with(std::cell::Cell::get),
+            builds + 1
+        );
+        let _guard = reader.inner.conn.lock().unwrap();
+        assert!(reader.try_stale_path_census_for_health().unwrap().is_none());
+    }
+
+    #[test]
+    fn health_stale_census_invalidates_on_other_connection_commits() {
+        let (_dir, root, writer, reader) = fixture();
+        let first = reader.try_stale_path_census_for_health().unwrap().unwrap();
+        assert_eq!(first.census.stale, 1);
+        let builds = STALE_PATH_CENSUS_BUILDS.with(std::cell::Cell::get);
+        writer.mark_files_stale(&[root.join("b.ts")]).unwrap();
+        let updated = reader.try_stale_path_census_for_health().unwrap().unwrap();
+        assert_eq!(updated.census.stale, 2);
+        assert_eq!(updated.measured_age_ms, 0);
+        assert_eq!(
+            STALE_PATH_CENSUS_BUILDS.with(std::cell::Cell::get),
+            builds + 1
+        );
+    }
+
+    #[test]
+    fn health_stale_census_invalidates_on_same_connection_writes() {
+        let (_dir, _root, writer, _reader) = fixture();
+        let reader = ReadonlyCallGraphStore::from_inner(writer);
+        assert_eq!(
+            reader
+                .try_stale_path_census_for_health()
+                .unwrap()
+                .unwrap()
+                .census
+                .stale,
+            1
+        );
+        reader
+            .inner
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE backend_file_state SET status = ?1 WHERE file_path = 'a.ts'",
+                [BACKEND_STATUS_UNDECODABLE],
+            )
+            .unwrap();
+        let updated = reader.try_stale_path_census_for_health().unwrap().unwrap();
+        assert_eq!((updated.census.stale, updated.census.undecodable), (0, 1));
+        assert_eq!(updated.measured_age_ms, 0);
+    }
 }
 
 /// Bound the work spent counting possible callers for an empty reverse graph.
@@ -5297,6 +5419,10 @@ struct ProjectIndex<'a> {
     /// uses it. Such an index's file set is fixed when it is constructed: a
     /// changed file set means a new `ProjectIndex`, which starts empty.
     crate_scans: std::cell::OnceCell<CrateScanMemo>,
+    /// The lazy index overlays fresh caller extracts on stored rows. Its parent
+    /// map and caller paths belong to that immutable snapshot, not the worker.
+    lazy_module_parents: std::cell::OnceCell<HashMap<String, (String, String)>>,
+    rust_caller_paths: RefCell<HashMap<String, Vec<String>>>,
     go_packages: RefCell<GoPackageMemo>,
     local_symbols: RefCell<CallerSymbolMemo>,
 }
@@ -5443,6 +5569,102 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
+#[cfg(test)]
+mod rust_module_work {
+    use super::*;
+
+    #[derive(Debug, Default)]
+    pub(super) struct Work {
+        pub parent_lookups: usize,
+        pub parent_scans: usize,
+        pub parent_file_visits: usize,
+        pub caller_requests: usize,
+        pub caller_walks: usize,
+        pub parent_time: Duration,
+        pub caller_time: Duration,
+    }
+
+    thread_local! {
+        static ACTIVE: RefCell<Option<Work>> = const { RefCell::new(None) };
+        static DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(super) fn disabled() -> bool {
+        DISABLED.with(std::cell::Cell::get)
+    }
+
+    pub(super) fn note(update: impl FnOnce(&mut Work)) {
+        ACTIVE.with(|active| {
+            if let Some(work) = active.borrow_mut().as_mut() {
+                update(work);
+            }
+        });
+    }
+
+    pub(super) struct Session;
+
+    impl Session {
+        pub fn start(disabled: bool) -> Self {
+            ACTIVE.with(|active| {
+                assert!(active.borrow().is_none(), "nested module profiling session");
+                *active.borrow_mut() = Some(Work::default());
+            });
+            DISABLED.with(|flag| flag.set(disabled));
+            Self
+        }
+
+        pub fn finish(self) -> Work {
+            ACTIVE.with(|active| active.borrow_mut().take().unwrap())
+        }
+    }
+
+    impl Drop for Session {
+        fn drop(&mut self) {
+            ACTIVE.with(|active| active.borrow_mut().take());
+            DISABLED.with(|flag| flag.set(false));
+        }
+    }
+
+    pub(super) struct Timing {
+        started: Option<Instant>,
+        parent: bool,
+    }
+
+    impl Timing {
+        pub fn parent() -> Self {
+            note(|work| work.parent_lookups += 1);
+            Self::start(true)
+        }
+
+        pub fn caller() -> Self {
+            note(|work| work.caller_requests += 1);
+            Self::start(false)
+        }
+
+        fn start(parent: bool) -> Self {
+            Self {
+                started: ACTIVE.with(|active| active.borrow().is_some().then(Instant::now)),
+                parent,
+            }
+        }
+    }
+
+    impl Drop for Timing {
+        fn drop(&mut self) {
+            if let Some(started) = self.started {
+                let elapsed = started.elapsed();
+                note(|work| {
+                    if self.parent {
+                        work.parent_time += elapsed;
+                    } else {
+                        work.caller_time += elapsed;
+                    }
+                });
+            }
+        }
+    }
+}
+
 /// Answers to the two Rust lookups that otherwise scan every indexed file on
 /// each call (`module_parent`, `inline_scoped_target`), precomputed from an
 /// in-memory file set. Lookups return exactly what the scans return.
@@ -5472,26 +5694,30 @@ impl CrateScanMemo {
         rust_files.sort();
         let mut module_parents = HashMap::<String, (String, String)>::new();
         for (file, index) in files {
-            for (module, target) in &index.declared_module_targets {
-                let Some(target) = target else {
-                    continue;
-                };
-                let candidate = (file.clone(), module.clone());
-                match module_parents.entry(target.clone()) {
-                    std::collections::hash_map::Entry::Occupied(mut best) => {
-                        if candidate < *best.get() {
-                            best.insert(candidate);
-                        }
-                    }
-                    std::collections::hash_map::Entry::Vacant(slot) => {
-                        slot.insert(candidate);
-                    }
-                }
-            }
+            Self::note_module_parents(&mut module_parents, file, index);
         }
         Self {
             rust_files,
             module_parents,
+        }
+    }
+
+    fn note_module_parents(
+        parents: &mut HashMap<String, (String, String)>,
+        file: &str,
+        index: &DbFileIndex,
+    ) {
+        for (module, target) in &index.declared_module_targets {
+            let Some(target) = target else {
+                continue;
+            };
+            let candidate = (file.to_string(), module.clone());
+            let best = parents
+                .entry(target.clone())
+                .or_insert_with(|| candidate.clone());
+            if candidate < *best {
+                *best = candidate;
+            }
         }
     }
 }
@@ -5521,6 +5747,9 @@ trait ResolverIndex {
     fn lang_for(&self, file: &str) -> Option<LangId>;
     fn module_target(&self, caller_file: &str, module_path: &str) -> Option<String>;
     fn module_parent(&self, target_file: &str) -> Option<(String, String)>;
+    fn rust_caller_module_segments(&self, caller_file: &str) -> Vec<String> {
+        rust_caller_module_segments_uncached(self, caller_file)
+    }
     fn reexports_for(&self, file: &str) -> Vec<ReexportIndex>;
     fn node_for_symbol(&self, file: &str, symbol: &str) -> Option<String>;
     fn node_is_callable(&self, file: &str, node_id: &str) -> bool;
@@ -5596,10 +5825,34 @@ impl ResolverIndex for ProjectIndex<'_> {
     }
 
     fn module_parent(&self, target_file: &str) -> Option<(String, String)> {
+        #[cfg(test)]
+        let _timing = rust_module_work::Timing::parent();
+        if self.lazy.is_some() {
+            #[cfg(test)]
+            if rust_module_work::disabled() {
+                return self.module_parent_by_scan(target_file);
+            }
+            return self.lazy_module_parents().get(target_file).cloned();
+        }
         match self.crate_scans() {
             Some(memo) => memo.module_parents.get(target_file).cloned(),
             None => self.module_parent_by_scan(target_file),
         }
+    }
+
+    fn rust_caller_module_segments(&self, caller_file: &str) -> Vec<String> {
+        #[cfg(test)]
+        if rust_module_work::disabled() {
+            return rust_caller_module_segments_uncached(self, caller_file);
+        }
+        if let Some(path) = self.rust_caller_paths.borrow().get(caller_file) {
+            return path.clone();
+        }
+        let path = rust_caller_module_segments_uncached(self, caller_file);
+        self.rust_caller_paths
+            .borrow_mut()
+            .insert(caller_file.to_string(), path.clone());
+        path
     }
 
     fn reexports_for(&self, file: &str) -> Vec<ReexportIndex> {
@@ -5689,6 +5942,24 @@ impl ResolverIndex for ProjectIndex<'_> {
 }
 
 impl ProjectIndex<'_> {
+    fn lazy_module_parents(&self) -> &HashMap<String, (String, String)> {
+        self.lazy_module_parents.get_or_init(|| {
+            #[cfg(test)]
+            rust_module_work::note(|work| work.parent_scans += 1);
+            let mut parents = HashMap::new();
+            // scan_paths excludes stored rows replaced by this refresh's
+            // extracts, including declarations that have just been removed.
+            for file in self.scan_paths(LazyDbFileIndexes::module_declaring_files) {
+                #[cfg(test)]
+                rust_module_work::note(|work| work.parent_file_visits += 1);
+                if let Some(index) = self.file_index(&file) {
+                    CrateScanMemo::note_module_parents(&mut parents, &file, &index);
+                }
+            }
+            parents
+        })
+    }
+
     fn go_package(
         &self,
         paths: &FactPaths<'_>,
@@ -5711,9 +5982,9 @@ impl ProjectIndex<'_> {
             |file| self.file_index(file),
         )
     }
-    /// The crate-wide lookup memo, or `None` for an index that loads stored
-    /// files on demand: its file set is not all in memory, so those lookups
-    /// keep scanning.
+    /// The eager crate-wide memo. Lazy indexes build their parent map
+    /// separately; resolving symbols inside inline Rust modules still scans
+    /// stored paths.
     fn crate_scans(&self) -> Option<&CrateScanMemo> {
         #[cfg(test)]
         if SCAN_WITHOUT_CRATE_MEMO.with(std::cell::Cell::get) {
@@ -5732,10 +6003,14 @@ impl ProjectIndex<'_> {
     /// `(declaring file, module name)` pair whose declared target is
     /// `target_file`.
     fn module_parent_by_scan(&self, target_file: &str) -> Option<(String, String)> {
+        #[cfg(test)]
+        rust_module_work::note(|work| work.parent_scans += 1);
         let mut parents = self
             .scan_paths(LazyDbFileIndexes::module_declaring_files)
             .into_iter()
             .filter_map(|file| {
+                #[cfg(test)]
+                rust_module_work::note(|work| work.parent_file_visits += 1);
                 let index = self.file_index(&file)?;
                 let modules = index
                     .declared_module_targets
@@ -6166,6 +6441,8 @@ impl ResolverIndex for DiskProjectIndex<'_> {
     }
 
     fn module_parent(&self, target_file: &str) -> Option<(String, String)> {
+        #[cfg(test)]
+        let _timing = rust_module_work::Timing::parent();
         if self.memoize_resolver_indexes {
             return self.module_parents().get(target_file).cloned();
         }
@@ -9482,6 +9759,7 @@ impl ReadonlyCallGraphStore {
             inner,
             _view_pin: None,
             _generation_pin: None,
+            health_stale_census: Mutex::new(None),
         })
     }
 
@@ -9513,6 +9791,7 @@ impl ReadonlyCallGraphStore {
             inner,
             _view_pin: pin,
             _generation_pin: None,
+            health_stale_census: Mutex::new(None),
         })
     }
 
@@ -9558,6 +9837,7 @@ impl ReadonlyCallGraphStore {
             inner,
             _view_pin: None,
             _generation_pin: None,
+            health_stale_census: Mutex::new(None),
         }
     }
 
@@ -9590,6 +9870,60 @@ impl ReadonlyCallGraphStore {
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
         };
         stale_path_census(&conn, &self.inner.project_root).map(Some)
+    }
+
+    pub(crate) fn try_stale_path_census_for_health(&self) -> Result<Option<StalePathHealthCensus>> {
+        self.try_stale_path_census_for_health_at(Instant::now())
+    }
+
+    fn try_stale_path_census_for_health_at(
+        &self,
+        now: Instant,
+    ) -> Result<Option<StalePathHealthCensus>> {
+        let conn = match self.inner.conn.try_lock() {
+            Ok(conn) => conn,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        let mut cached = match self.health_stale_census.try_lock() {
+            Ok(cached) => cached,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        // data_version observes other connections' commits, while total_changes
+        // also covers writes made on this connection. The memo belongs to this
+        // opened store, so replacing a resident generation cannot reuse it.
+        let data_version: i64 = conn.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        let total_changes = conn.total_changes();
+        if let Some(sample) = cached.as_ref() {
+            let age = now.saturating_duration_since(sample.measured_at);
+            if sample.data_version == data_version
+                && sample.total_changes == total_changes
+                && age < HEALTH_STALE_PATH_MAX_AGE
+            {
+                return Ok(Some(StalePathHealthCensus {
+                    census: sample.census,
+                    measured_age_ms: age.as_millis().min(u128::from(u64::MAX)) as u64,
+                }));
+            }
+        }
+        *cached = None;
+        let census = stale_path_census(&conn, &self.inner.project_root)?;
+        let after_version: i64 = conn.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        // A writer can commit between the census's queries. Do not preserve a
+        // mixed observation as an unchanged-database sample for future ticks.
+        if after_version == data_version {
+            *cached = Some(CachedStalePathCensus {
+                data_version,
+                total_changes,
+                measured_at: now,
+                census,
+            });
+        }
+        Ok(Some(StalePathHealthCensus {
+            census,
+            measured_age_ms: 0,
+        }))
     }
 
     pub(crate) fn projection_generation(&self) -> Option<&str> {
@@ -17217,6 +17551,17 @@ fn rust_resolve_segments_with_index<I: ResolverIndex>(
 }
 
 fn rust_caller_module_segments<I: ResolverIndex>(index: &I, caller_file: &str) -> Vec<String> {
+    #[cfg(test)]
+    let _timing = rust_module_work::Timing::caller();
+    index.rust_caller_module_segments(caller_file)
+}
+
+fn rust_caller_module_segments_uncached<I: ResolverIndex + ?Sized>(
+    index: &I,
+    caller_file: &str,
+) -> Vec<String> {
+    #[cfg(test)]
+    rust_module_work::note(|work| work.caller_walks += 1);
     if index.rust_crate_root_file(caller_file).as_deref() == Some(caller_file) {
         Vec::new()
     } else {
@@ -17318,7 +17663,7 @@ fn rust_resolve_segments_from(
     }
 }
 
-fn rust_registered_module_segments<I: ResolverIndex>(
+fn rust_registered_module_segments<I: ResolverIndex + ?Sized>(
     index: &I,
     caller_file: &str,
 ) -> Option<Vec<String>> {
@@ -17462,6 +17807,8 @@ impl<'a> ProjectIndex<'a> {
             workspace_crate_prefixes,
             rust_crate_roots: callgraph::RustCrateRootMemo::default(),
             crate_scans: std::cell::OnceCell::new(),
+            lazy_module_parents: std::cell::OnceCell::new(),
+            rust_caller_paths: RefCell::default(),
             go_packages: RefCell::default(),
             local_symbols: RefCell::default(),
         }
@@ -21215,7 +21562,14 @@ fn backend_file_paths_with_status(
         .map_err(Into::into)
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static STALE_PATH_CENSUS_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn stale_path_census(conn: &Connection, project_root: &Path) -> Result<StalePathCensus> {
+    #[cfg(test)]
+    STALE_PATH_CENSUS_BUILDS.with(|builds| builds.set(builds.get() + 1));
     let mut census = StalePathCensus {
         undecodable: backend_file_paths_with_status(
             conn,
@@ -31872,6 +32226,7 @@ mod crate_scan_memo_tests {
     //! order, and show that a changed file set (a new index) never reuses an
     //! earlier index's answers.
     use super::*;
+    use std::fs;
 
     fn rust_file(declared: &[(&str, &str)], scoped: &[&str]) -> DbFileIndex {
         let mut index = DbFileIndex::empty(Some(LangId::Rust));
@@ -31938,6 +32293,100 @@ mod crate_scan_memo_tests {
         path.iter().map(|segment| segment.to_string()).collect()
     }
 
+    fn copy_rust_corpus(from: &Path, to: &Path, files: &mut Vec<PathBuf>) {
+        fs::create_dir_all(to).unwrap();
+        let mut entries = fs::read_dir(from)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        entries.sort();
+        for source in entries {
+            let name = source.file_name().unwrap();
+            if source.is_dir() {
+                if name != "target" && name != ".git" {
+                    copy_rust_corpus(&source, &to.join(name), files);
+                }
+            } else if source.extension().is_some_and(|ext| ext == "rs") {
+                let destination = to.join(name);
+                fs::copy(&source, &destination).unwrap();
+                files.push(destination);
+            } else if name == "Cargo.toml" {
+                fs::copy(&source, to.join(name)).unwrap();
+            }
+        }
+    }
+
+    /// Compare identical source inventories and edits, including every stored
+    /// edge column, without changing the checkout being measured.
+    #[test]
+    #[ignore]
+    fn bench_rust_module_paths_whole_crate_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("corpus");
+        let mut files = Vec::new();
+        copy_rust_corpus(Path::new(env!("CARGO_MANIFEST_DIR")), &root, &mut files);
+        assert!(
+            files.len() > 500,
+            "benchmark must cover the whole Rust crate"
+        );
+        eprintln!("RUST_MODULE_PATHS inventory_files={}", files.len());
+        let changed = root.join("src/callgraph_store/mod.rs");
+        let original = fs::read_to_string(&changed).unwrap();
+        let mut baseline = None;
+        for disabled in [true, false] {
+            fs::write(&changed, &original).unwrap();
+            let store = CallGraphStore::open(
+                dir.path().join(if disabled { "baseline" } else { "memo" }),
+                root.clone(),
+            )
+            .unwrap();
+            eprintln!("RUST_MODULE_PATHS disabled={disabled} starting cold build");
+            set_cold_build_phase_observer(Some(Arc::new(move |phase| {
+                eprintln!("RUST_MODULE_PATHS disabled={disabled} cold_phase={phase}");
+            })));
+            let session = rust_module_work::Session::start(disabled);
+            let stats = store.cold_build(&files).unwrap();
+            let cold_work = session.finish();
+            set_cold_build_phase_observer(None);
+            eprintln!("RUST_MODULE_PATHS disabled={disabled} cold_ms={} files={} failed_files={} undecodable_files={}", stats.elapsed_ms, stats.files, stats.failed_files.len(), stats.undecodable_files.len());
+            let cold_edges = cold_build_insert_tests::graph_table_rows(&store, "edges");
+            fs::write(
+                &changed,
+                format!("{original}\npub fn aft_module_path_refresh_probe() {{}}\n"),
+            )
+            .unwrap();
+            eprintln!("RUST_MODULE_PATHS disabled={disabled} starting refresh");
+            let session = rust_module_work::Session::start(disabled);
+            let (refresh, profile) = store
+                .refresh_files_profiled(std::slice::from_ref(&changed))
+                .unwrap();
+            let refresh_work = session.finish();
+            assert!(
+                refresh.refreshed_own_files > 0,
+                "edit must re-resolve references"
+            );
+            let refreshed_edges = cold_build_insert_tests::graph_table_rows(&store, "edges");
+            println!(
+                "RUST_MODULE_PATHS disabled={disabled} files={} refs={} cold_edges={} refreshed_edges={} cold_ms={} cold_work={cold_work:?} refresh_profile={} refresh_work={refresh_work:?}",
+                stats.files, stats.refs, cold_edges.len(), refreshed_edges.len(),
+                stats.elapsed_ms, profile.report(),
+            );
+            if let Some((expected_cold, expected_refresh)) = &baseline {
+                assert!(
+                    &cold_edges == expected_cold,
+                    "whole-crate cold edge rows differ"
+                );
+                assert!(
+                    &refreshed_edges == expected_refresh,
+                    "whole-crate refreshed edge rows differ"
+                );
+                println!("RUST_MODULE_PATHS whole-crate edge rows identical before and after edit");
+            } else {
+                baseline = Some((cold_edges, refreshed_edges));
+            }
+        }
+    }
+
     /// Compares every memo answer with the scan over the same index and
     /// returns the memo answers for further checks.
     fn assert_memo_matches_scan(
@@ -31980,6 +32429,135 @@ mod crate_scan_memo_tests {
 
     fn pair(file: &str, item: &str) -> Option<(String, String)> {
         Some((file.to_string(), item.to_string()))
+    }
+
+    #[test]
+    fn lazy_rust_module_paths_scan_once_and_walk_once_per_caller() {
+        const DEPTH: usize = 48;
+        const CALL_SITES: usize = 200;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        fs::create_dir_all(root.join("src")).unwrap();
+        let mut files = Vec::new();
+        for level in 0..=DEPTH {
+            let file = root.join(if level == 0 {
+                "src/lib.rs".to_string()
+            } else {
+                format!("src/m{level}.rs")
+            });
+            let source = if level < DEPTH {
+                format!("#[path = \"m{}.rs\"] pub mod child;\n", level + 1)
+            } else {
+                "pub fn leaf() {}\n".to_string()
+            };
+            fs::write(&file, source).unwrap();
+            files.push(file);
+        }
+        let store = CallGraphStore::open(dir.path().join("store"), root.clone()).unwrap();
+        store.cold_build(&files).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let callers = HashMap::new();
+        let index = ProjectIndex::from_db_and_callers(
+            &conn,
+            &root,
+            &callers,
+            WorkspaceCratePrefixCache::default(),
+        );
+        let caller = format!("src/m{DEPTH}.rs");
+        let session = rust_module_work::Session::start(false);
+        for _ in 0..CALL_SITES {
+            assert_eq!(
+                rust_caller_module_segments(&index, &caller),
+                vec!["child".to_string(); DEPTH],
+            );
+        }
+        let work = session.finish();
+        assert_eq!(work.caller_requests, CALL_SITES);
+        assert_eq!(work.caller_walks, 1, "one path walk, not one per call site");
+        assert_eq!(work.parent_lookups, DEPTH + 1);
+        assert_eq!(
+            work.parent_scans, 1,
+            "one inventory pass, not one per parent"
+        );
+        assert_eq!(work.parent_file_visits, DEPTH);
+        assert!(index.take_lazy_load_error().is_none());
+    }
+
+    #[test]
+    fn lazy_rust_module_paths_overlay_replaced_declarations_and_reset_per_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        fs::create_dir_all(root.join("src")).unwrap();
+        let lib = root.join("src/lib.rs");
+        let child = root.join("src/physical.rs");
+        let zed = root.join("src/zed.rs");
+        fs::write(&lib, "#[path = \"physical.rs\"] mod old;\n").unwrap();
+        fs::write(&child, "pub fn target() {}\n").unwrap();
+        fs::write(&zed, "#[path = \"physical.rs\"] mod fallback;\n").unwrap();
+        let store = CallGraphStore::open(dir.path().join("store"), root.clone()).unwrap();
+        store.cold_build(&[lib.clone(), child, zed]).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let empty = HashMap::new();
+        let before = ProjectIndex::from_db_and_callers(
+            &conn,
+            &root,
+            &empty,
+            WorkspaceCratePrefixCache::default(),
+        );
+        assert_eq!(
+            rust_caller_module_segments(&before, "src/physical.rs"),
+            segments(&["old"])
+        );
+        for (source, expected) in [
+            ("#[path = \"physical.rs\"] mod new;\n", "new"),
+            ("// declaration removed\n", "fallback"),
+        ] {
+            fs::write(&lib, source).unwrap();
+            let callers = HashMap::from([(
+                "src/lib.rs".to_string(),
+                build_file_extract(&root, &lib).unwrap(),
+            )]);
+            let next = ProjectIndex::from_db_and_callers(
+                &conn,
+                &root,
+                &callers,
+                WorkspaceCratePrefixCache::default(),
+            );
+            assert_eq!(
+                ResolverIndex::module_parent(&next, "src/physical.rs"),
+                next.module_parent_by_scan("src/physical.rs")
+            );
+            assert_eq!(
+                rust_caller_module_segments(&next, "src/physical.rs"),
+                segments(&[expected])
+            );
+            assert_eq!(
+                rust_caller_module_segments(&before, "src/physical.rs"),
+                segments(&["old"])
+            );
+            assert!(next.take_lazy_load_error().is_none());
+        }
+    }
+
+    #[test]
+    fn rust_module_path_memo_preserves_cycles_missing_parents_and_path_fallbacks() {
+        let index = index(vec![
+            ("src/a.rs", rust_file(&[("b", "src/b.rs")], &[])),
+            ("src/b.rs", rust_file(&[("a", "src/a.rs")], &[])),
+            ("src/loose.rs", rust_file(&[], &[])),
+            ("src/lib.rs", rust_file(&[], &[])),
+        ]);
+        for caller in [
+            "src/a.rs",
+            "src/b.rs",
+            "src/loose.rs",
+            "src/lib.rs",
+            "src/missing.rs",
+        ] {
+            let expected = rust_caller_module_segments_uncached(&index, caller);
+            assert_eq!(rust_caller_module_segments(&index, caller), expected);
+            assert_eq!(rust_caller_module_segments(&index, caller), expected);
+        }
     }
 
     #[test]
@@ -32083,6 +32661,8 @@ mod reexport_resolution_tests {
             workspace_crate_prefixes: WorkspaceCratePrefixCache::default(),
             rust_crate_roots: callgraph::RustCrateRootMemo::default(),
             crate_scans: std::cell::OnceCell::new(),
+            lazy_module_parents: std::cell::OnceCell::new(),
+            rust_caller_paths: RefCell::default(),
             go_packages: RefCell::default(),
             local_symbols: RefCell::default(),
         }

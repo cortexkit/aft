@@ -158,6 +158,50 @@ function artifactReadTool(
 }
 
 describe("OpenCode 2 in-process permission assertion", () => {
+  test("route replacement requests a second host assertion before retrying", async () => {
+    const target = "/aft-v2-engine-fixture/narrow/file.ts";
+    const { host, calls, prompts } = fixture({
+      agentRules: [
+        { action: "*", resource: "*", effect: "allow" },
+        { action: "external_directory", resource: "*", effect: "ask" },
+      ],
+    });
+    const sends: Record<string, unknown>[] = [];
+    const definitions = hoistedTools(
+      pluginContext((_name, _preview, args) => {
+        sends.push(structuredClone(args));
+        if (sends.length === 3) return { success: true, text: "freshly approved contents" };
+        return {
+          success: false,
+          code: "permission_required",
+          asks: [
+            {
+              kind: "external_directory",
+              grant_id: sends.length === 1 ? "outside:old-route" : "outside:new-route",
+              path: target,
+              operation: "read",
+              patterns: [target],
+              always: [target],
+              ...(sends.length === 2 ? { reason: "approval_route_replaced" } : {}),
+            },
+          ],
+        };
+      }),
+    );
+    const read = projectV2Tool(
+      "read",
+      definitions.read!,
+      { directory: process.cwd() },
+      hoistedV2ToolConsumers(host),
+    );
+    const result = await executeProjected(read, { path: target });
+    expect(JSON.stringify(result)).toContain("freshly approved contents");
+    expect(sends[1]?.permissions_granted).toEqual(["outside:old-route"]);
+    expect(sends[2]?.permissions_granted).toEqual(["outside:new-route"]);
+    expect(calls.filter((call) => call.action === "external_directory")).toHaveLength(2);
+    expect(prompts.filter((call) => call.action === "external_directory")).toHaveLength(2);
+  });
+
   for (const decision of ["allow", "ask", "deny", "hook-deny"] as const) {
     test(`engine outside asks use host assert with exact patterns: ${decision}`, async () => {
       const target = "/aft-v2-engine-fixture/narrow/file.ts";
