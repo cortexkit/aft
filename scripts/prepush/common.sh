@@ -12,6 +12,7 @@ prepush_init() {
   : > "$lane_log"
   lane_start=$SECONDS
   failures=()
+  ci_only=()
   if git rev-parse --verify HEAD >/dev/null 2>&1; then
     if [[ -n "${PREPUSH_COMMIT:-}" && "$PREPUSH_COMMIT" != "$(git rev-parse HEAD)" ]]; then
       echo 'Printed lane belongs to a different commit; regenerate --print-lanes after committing.'
@@ -53,11 +54,27 @@ prepush_step() {
   fi
 }
 
+# Record a step this runner cannot run at all, so the report names it instead of
+# passing silently. Only for capabilities the runner lacks by design (for example
+# containers inside build-server job VMs); a missing tool that could be installed
+# must stay a prerequisite failure. GitHub CI remains the gate for these steps.
+prepush_ci_only() {
+  local name=$1 reason=$2
+  printf '\n== %s: CI-ONLY: %s\n' "$name" "$reason" >> "$lane_log"
+  printf '%s: ci-only (%s)\n' "$name" "$reason"
+  ci_only+=("$name")
+}
+
 prepush_finish() {
   # This pipe reads the saved log only; test exit codes were collected above.
   # Keep failure reporting usable even when Python itself is the missing tool.
   grep -E 'Summary \[|^test result:|^Ran [0-9]+ tests|^[[:space:]]*[0-9]+ (pass|fail)$|Checked [0-9]+ files' "$lane_log" | tail -n 25 || true
   printf '%s elapsed=%ss log=%s\n' "$lane" "$((SECONDS - lane_start))" "$lane_log"
+  if ((${#ci_only[@]})); then
+    printf 'NOT RUN HERE (GitHub CI only):'
+    printf ' %s' "${ci_only[@]}"
+    printf '\n'
+  fi
   if ((${#failures[@]})); then
     printf 'GATE FAILED: %s' "$lane"
     printf ' %s' "${failures[@]}"

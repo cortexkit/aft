@@ -8,9 +8,14 @@ trap 'prepush_abort $?' EXIT
 prepush_step platform prepush_require_platform linux
 export CI=1
 unset AFT_STORAGE_DIR AFT_CACHE_DIR
-prepush_step prerequisites bash scripts/prepush/require-tools.sh linux bun node cargo npm rg docker timeout gh unzip
+prepush_step prerequisites bash scripts/prepush/require-tools.sh linux bun node cargo npm rg timeout gh unzip
 prepush_step tool-versions bash -c 'set -euo pipefail; bun --version; node --version; cargo --version; rg --version'
-prepush_step docker-daemon bash scripts/prepush/require-tools.sh linux --probe 'Docker daemon' docker version
+# Build-server job VMs deliberately cannot create the namespaces containers
+# need, so the Docker suites run only where a Docker daemon answers.
+have_docker=0
+if command -v docker >/dev/null 2>&1 && docker version >/dev/null 2>&1; then
+  have_docker=1
+fi
 prepush_step dependencies bun install --frozen-lockfile
 prepush_step bridge bun run --cwd packages/aft-bridge build
 prepush_step pi bun run --cwd packages/pi-plugin build
@@ -33,7 +38,12 @@ prepush_step beta-pin bash scripts/prepush/beta-pin.sh || true
 prepush_step stage-binary cargo build --profile stage -p agent-file-tools || true
 export AFT_BINARY_PATH="${CARGO_TARGET_DIR:-$PWD/target}/stage/aft"
 prepush_step pi-rpc bash -c 'set -euo pipefail; cd tests/pi-rpc; bun test' || true
-prepush_step docker-e2e bash scripts/prepush/docker-e2e.sh || true
-prepush_step opencode2-e2e bash scripts/prepush/opencode2-e2e.sh || true
+if ((have_docker)); then
+  prepush_step docker-e2e bash scripts/prepush/docker-e2e.sh || true
+  prepush_step opencode2-e2e bash scripts/prepush/opencode2-e2e.sh || true
+else
+  prepush_ci_only docker-e2e 'no Docker daemon on this runner'
+  prepush_ci_only opencode2-e2e 'no Docker daemon on this runner'
+fi
 trap - EXIT
 prepush_finish
