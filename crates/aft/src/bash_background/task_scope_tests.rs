@@ -62,6 +62,232 @@ impl Drop for StopOnDrop {
     }
 }
 
+struct ModuleScopeGuard {
+    unit: String,
+    root: std::path::PathBuf,
+    child: Option<std::process::Child>,
+}
+
+impl Drop for ModuleScopeGuard {
+    fn drop(&mut self) {
+        if let Ok(id) = std::fs::read_to_string(self.root.join("task-id")) {
+            if let Ok(Some(scope)) = super::super::task_scope::lookup(&id) {
+                let _ = scope.stop();
+            }
+        }
+        let _ = super::super::task_scope::user_manager_command(std::path::Path::new("systemctl"))
+            .args(["--user", "stop", &self.unit])
+            .status();
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.wait();
+        }
+    }
+}
+
+#[test]
+fn task_scope_module_helper() {
+    let Some(root) = std::env::var_os("AFT_TEST_TASK_SCOPE_MODULE_ROOT") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let cap = std::fs::read_to_string(root.join("cap"))
+        .ok()
+        .map(|value| value.parse::<u64>().unwrap());
+    let registry = BgTaskRegistry::default();
+    let id = scope_spawn(
+        &registry,
+        &root,
+        "echo before; while [ ! -e release ]; do sleep .02; done; echo after; exit 7",
+        super::super::HardKill::After(Duration::from_secs(120)),
+        cap,
+    );
+    std::fs::write(root.join("task-id"), id).unwrap();
+    std::fs::write(root.join("module-pid"), std::process::id().to_string()).unwrap();
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+#[test]
+fn task_scope_survives_module_cgroup_kill() {
+    if !manager_available() {
+        return;
+    }
+    for (cap, downtime_exit) in [(None, false), (Some(64), false), (None, true)] {
+        let root = tempfile::tempdir().unwrap();
+        if let Some(cap) = cap {
+            std::fs::write(root.path().join("cap"), cap.to_string()).unwrap();
+        }
+        let mut module = ModuleScopeGuard {
+            unit: format!("aft-test-module-{}.scope", random_slug()),
+            root: root.path().into(),
+            child: None,
+        };
+        module.child = Some(
+            std::process::Command::new("systemd-run")
+                .args(["--user", "--scope", "--collect", "--quiet"])
+                .arg(format!("--unit={}", module.unit))
+                .args([
+                    "--property=RuntimeMaxSec=180s",
+                    "--property=TimeoutStopSec=2s",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "bash_background::registry::task_scope_tests::task_scope_module_helper",
+                    "--nocapture",
+                ])
+                .env("AFT_TEST_TASK_SCOPE_MODULE_ROOT", root.path())
+                .spawn()
+                .unwrap(),
+        );
+        until(|| {
+            std::fs::read_to_string(root.path().join("module-pid"))
+                .ok()
+                .is_some_and(|text| text.parse::<u32>().is_ok())
+        });
+        let id = std::fs::read_to_string(root.path().join("task-id")).unwrap();
+        let pid = std::fs::read_to_string(root.path().join("module-pid"))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        assert_ne!(pid, std::process::id());
+        let module_cgroup = super::super::task_scope::current_cgroup(pid).unwrap();
+        assert_eq!(
+            module_cgroup.file_name().unwrap().to_str().unwrap(),
+            module.unit
+        );
+        let task_scope = super::super::task_scope::lookup(&id)
+            .unwrap()
+            .expect("task scope missing before module kill");
+        assert_eq!(
+            task_scope.cgroup().parent().unwrap().file_name().unwrap(),
+            "aft.slice"
+        );
+        assert!(
+            !task_scope.cgroup().starts_with(&module_cgroup),
+            "task is nested in the module cgroup"
+        );
+        let layout =
+            super::super::persistence::resolve_task(root.path(), "task-scope", &id).unwrap();
+        if cap.is_some() {
+            let policy = read_task_at(&layout).unwrap().memory_policy.unwrap();
+            assert_eq!(policy.cgroup.as_deref(), Some(task_scope.cgroup()));
+            assert!(!policy.cgroup.unwrap().starts_with(&module_cgroup));
+        }
+        until(|| std::fs::read_to_string(&layout.paths.stdout).unwrap_or_default() == "before\n");
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(module_cgroup.join("cgroup.kill"))
+            .unwrap()
+            .write_all(b"1")
+            .unwrap();
+        until(|| module.child.as_mut().unwrap().try_wait().unwrap().is_some());
+        if downtime_exit {
+            std::fs::write(root.path().join("release"), "1").unwrap();
+            until(|| {
+                read_exit_marker(&layout.paths).ok().flatten()
+                    == Some(super::super::persistence::ExitMarker::Code(7))
+            });
+        }
+        let registry = BgTaskRegistry::default();
+        registry.configure_task_scope_runtime(true, Duration::from_secs(86400));
+        registry.replay_session(root.path(), "task-scope").unwrap();
+        if !downtime_exit {
+            assert_eq!(
+                registry
+                    .task(&id)
+                    .unwrap()
+                    .lock_state()
+                    .unwrap()
+                    .metadata
+                    .status,
+                super::super::BgTaskStatus::Running
+            );
+            std::fs::write(root.path().join("release"), "1").unwrap();
+        }
+        until(|| {
+            let task = registry.task(&id).unwrap();
+            registry.poll_task(&task).unwrap();
+            task.is_terminal()
+        });
+        let status = registry
+            .status(&id, "task-scope", None, None, 1024)
+            .unwrap();
+        assert_eq!(status.exit_code, Some(7));
+        assert_ne!(status.info.status, super::super::BgTaskStatus::FateUnknown);
+        assert_eq!(
+            std::fs::read_to_string(&layout.paths.stdout).unwrap(),
+            "before\nafter\n"
+        );
+        assert_eq!(std::fs::read_to_string(&layout.paths.stderr).unwrap(), "");
+        assert_eq!(
+            registry
+                .pending_completions_for_session("task-scope")
+                .iter()
+                .filter(|completion| completion.task_id == id)
+                .count(),
+            1
+        );
+        assert_eq!(
+            registry.ack_completions_for_session(Some("task-scope"), &[id.clone()]),
+            vec![id.clone()]
+        );
+        registry.detach();
+        let third = BgTaskRegistry::default();
+        third.configure_task_scope_runtime(true, Duration::from_secs(86400));
+        third.replay_session(root.path(), "task-scope").unwrap();
+        assert!(third
+            .pending_completions_for_session("task-scope")
+            .iter()
+            .all(|completion| completion.task_id != id));
+    }
+}
+
+#[test]
+fn task_scope_fixed_backstop_works_without_registry() {
+    if !manager_available() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    registry.configure_task_scope_runtime(true, Duration::from_secs(1));
+    let id = registry
+        .spawn_with_shell_in_slot_typed(
+            SpawnPlan::Unsandboxed,
+            "echo alive > alive; sleep 60",
+            super::super::BashShell::Bash,
+            PathBuf::from("/bin/bash"),
+            "task-scope".into(),
+            root.path().into(),
+            HashMap::new(),
+            super::super::HardKill::Default,
+            None,
+            root.path().into(),
+            super::super::TaskSlot::Background { max: 4 },
+            true,
+            false,
+            Some(root.path().into()),
+            true,
+        )
+        .unwrap();
+    let _stop = StopOnDrop(id.clone());
+    let scope = super::super::task_scope::lookup(&id).unwrap().unwrap();
+    until(|| root.path().join("alive").exists());
+    registry.detach();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::fs::read_to_string(scope.cgroup().join("cgroup.events"))
+        .is_ok_and(|text| !text.lines().any(|line| line == "populated 0"))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "fixed scope backstop did not stop the detached task"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn scope_spawn(
     r: &BgTaskRegistry,
     root: &Path,
