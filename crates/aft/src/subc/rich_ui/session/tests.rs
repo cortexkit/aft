@@ -1046,3 +1046,6 @@ mod bash_tests;
 
 #[path = "read_tests.rs"]
 mod read_tests;
+
+#[path = "samples.rs"]
+mod samples;

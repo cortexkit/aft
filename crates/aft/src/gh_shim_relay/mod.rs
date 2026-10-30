@@ -947,8 +947,17 @@ async fn post_captured(
     use crate::gh_shim_speech::partner;
     use crate::gh_shim_speech::{Code, Refusal, ScopeRole};
     let probe_deadline = tokio::time::Instant::now() + Duration::from_millis(9_750);
-    let invalid = || Refusal::new(Code::AuthorityUnavailable, "snapshot_invalid");
-    let launch = redeemed.launch.as_ref().ok_or_else(invalid)?;
+    let invalid = |check| {
+        crate::gh_shim_speech::snapshot_invalid(
+            "gh_shim_relay::post_captured",
+            check,
+            json!({"session_id": redeemed.session_id, "task_id": redeemed.task_id}),
+        )
+    };
+    let launch = redeemed
+        .launch
+        .as_ref()
+        .ok_or_else(|| invalid("launch_missing"))?;
     launch.validate()?;
     let service = routes
         .speech
@@ -966,9 +975,13 @@ async fn post_captured(
     let ticket = params
         .get("ticket")
         .and_then(Value::as_str)
-        .ok_or_else(invalid)?;
+        .ok_or_else(|| invalid("ticket_not_string"))?;
     let warm = crate::gh_shim_ticket::speech_for_ticket(ticket);
-    let stored = if let Some(warm) = &warm {
+    let (stored, foreground) = if let Some(warm) = &warm {
+        let _local = service
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if let Some(error) = warm
             .failure
             .lock()
@@ -984,21 +997,25 @@ async fn post_captured(
             ));
         }
         if warm.prepared.context.service.store.path() != service.store.path() {
-            return Err(invalid());
+            return Err(invalid("store_path_mismatch"));
         }
-        service.store.get(&warm.incarnation)?
+        (
+            service.store.get(&warm.incarnation)?,
+            !warm.background.load(std::sync::atomic::Ordering::SeqCst),
+        )
     } else {
-        service.store.find_digest(
-            &crate::gh_shim_ticket::speech_digest(ticket).ok_or_else(invalid)?,
-            crate::gh_shim_speech::service::run_nonce().unwrap_or_default(),
-        )?
+        (
+            service.store.find_digest(
+                &crate::gh_shim_ticket::speech_digest(ticket)
+                    .ok_or_else(|| invalid("ticket_digest"))?,
+                crate::gh_shim_speech::service::run_nonce().unwrap_or_default(),
+            )?,
+            false,
+        )
     };
     if &stored.record.launch != launch {
-        return Err(invalid());
+        return Err(invalid("launch_mismatch"));
     }
-    let foreground = warm
-        .as_ref()
-        .is_some_and(|warm| !warm.background.load(std::sync::atomic::Ordering::SeqCst));
     if foreground
         && !routes.origin_live(
             launch.origin.as_ref(),
@@ -1033,14 +1050,18 @@ async fn post_captured(
         .register_accepted_policy()?
         .ok_or_else(|| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
     let policy_generation = service.store.advance_policy(&current)?;
-    let invocation: crate::gh_shim_speech::invocation::Invocation =
-        serde_json::from_value(params.get("invocation").cloned().ok_or_else(invalid)?)
-            .map_err(|_| invalid())?;
+    let invocation: crate::gh_shim_speech::invocation::Invocation = serde_json::from_value(
+        params
+            .get("invocation")
+            .cloned()
+            .ok_or_else(|| invalid("invocation_missing"))?,
+    )
+    .map_err(|_| invalid("invocation_decode"))?;
     crate::gh_shim::validate_speech_policy(start, &current, request, &invocation)?;
     let repo = request
         .get("repository")
         .and_then(Value::as_str)
-        .ok_or_else(invalid)?
+        .ok_or_else(|| invalid("repository_not_string"))?
         .to_ascii_lowercase();
     let initial = stored
         .record
@@ -1137,6 +1158,8 @@ async fn post_captured(
         &body.expect_json(),
     )?;
     let dispatch_generation = service.generation();
+    #[cfg(test)]
+    service.test_before_final_gate();
     let queued = {
         let _local = service
             .admission
@@ -1147,6 +1170,12 @@ async fn post_captured(
             launch,
             &redeemed.session_id,
             &redeemed.task_id,
+        )?;
+        let stored = service.store.revalidate_authority(
+            &stored,
+            &crate::gh_shim_ticket::speech_digest(ticket)
+                .ok_or_else(|| invalid("ticket_digest"))?,
+            foreground,
         )?;
         let send = || {
             for (role, scope) in launch.required_scopes() {
@@ -1164,8 +1193,6 @@ async fn post_captured(
             }
             slot.send()
         };
-        #[cfg(test)]
-        service.test_before_final_gate();
         let queued = if foreground {
             service.store.final_foreground_gate(
                 &stored.record.incarnation,

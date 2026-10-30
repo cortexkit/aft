@@ -146,6 +146,11 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
     response
 }
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_SEARCH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let pattern = match req.params.get("pattern").and_then(|value| value.as_str()) {
         Some(pattern) => pattern,
@@ -292,6 +297,12 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         return Response::error(&req.id, "internal_error", result.index_read_gaps.join("; "));
     }
     let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
+    #[cfg(test)]
+    AFTER_SEARCH.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
     let scope_probe_started = std::time::Instant::now();
     let bounded_walk = phases
         .walk_counts
@@ -309,11 +320,18 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             .indexed_scope_has_files
             .or_else(|| {
                 phases.walk_counts.and_then(|counts| {
-                    (!result.walk_truncated && result.skipped_foreign_mounts == 0)
+                    (counts.eligible > 0
+                        || (!result.walk_truncated && result.skipped_foreign_mounts == 0))
                         .then_some(counts.eligible > 0)
                 })
             })
-            .or_else(|| grep_executor::scope_has_files(&scope, &filters))
+            .or_else(|| {
+                // A stopped walk cannot prove absence. Probing again can consume
+                // the reply budget and replace the results it already found.
+                (!result.walk_truncated)
+                    .then(|| grep_executor::scope_has_files(&scope, &filters))
+                    .flatten()
+            })
     };
     let scope_has_files = scope_presence != Some(false);
     let empty_counts = if !scope_has_files {
@@ -387,6 +405,10 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             "filtered": counts.filtered, "bytes_read": counts.bytes_read, "errors": counts.errors,
             "entry_budget": counts.entry_budget, "file_budget": counts.file_budget, "per_root_time_budget_ms": counts.time_budget_ms,
             "per_root_byte_budget": crate::bounded_folder_walk::BYTE_BUDGET});
+    }
+    if let Some(counts) = phases.walk_counts {
+        body["entries_examined"] = serde_json::json!(counts.entries_visited);
+        body["files_examined"] = serde_json::json!(counts.examined);
     }
     if !result.index_read_gaps.is_empty() {
         body["index_read_gap"] = serde_json::json!(result.index_read_gaps);
@@ -1745,6 +1767,44 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[test]
+    fn second_scope_probe_keeps_partial_grep_reply_after_expiry() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.rs", "b.rs"] {
+            std::fs::write(dir.path().join(name), "needle\n").unwrap();
+        }
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            },
+        );
+        let req = serde_json::from_value(serde_json::json!({
+            "id": "walk-partial", "command": "grep", "path": dir.path(), "pattern": "needle",
+        }))
+        .unwrap();
+        let budget = crate::bounded_io::Budget::after(Duration::from_secs(2));
+        let deadline = budget.deadline;
+        AFTER_SEARCH.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            }))
+        });
+        let response = crate::bounded_io::with_budget(Some(budget), || {
+            grep_executor::with_walk_limit(1, || handle_grep(&req, &ctx))
+        });
+        assert!(
+            response.success,
+            "partial reply replaced: {:?}",
+            response.data
+        );
+        assert_eq!(response.data["complete"], false);
+        assert_eq!(response.data["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(response.data["walk_stopped_by"], "file_limit");
+    }
 
     fn grep_match(file: &str, line: u32, line_text: &str) -> GrepMatch {
         GrepMatch {

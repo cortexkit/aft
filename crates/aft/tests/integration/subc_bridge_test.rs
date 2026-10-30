@@ -2678,6 +2678,24 @@ fn subc_bridge_goodbye_cancels_pending_bind() {
 }
 
 #[test]
+fn subc_bridge_higher_epoch_rebind_preserves_queued_read() {
+    run_subc_bridge_test_with_dispatch_and_executor_config(
+        "higher-epoch-rebind-preserves-queued-read",
+        Duration::from_secs(60),
+        drive_higher_epoch_rebind_preserves_queued_read_daemon,
+        |_, _, _| {},
+        bridge_dispatch,
+        ExecutorConfig {
+            pool_size: 2,
+            read_cap: 1,
+            actor_cap: 1,
+            heavy_permits: 1,
+            drr_quantum: 1,
+        },
+    );
+}
+
+#[test]
 fn subc_bridge_goodbye_cancels_queued_read_before_same_root_rebind() {
     run_subc_bridge_test_with_dispatch_and_executor_config(
         "goodbye-cancels-queued-read-before-rebind",
@@ -7999,6 +8017,122 @@ async fn drive_goodbye_cancels_pending_bind_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
+async fn drive_higher_epoch_rebind_preserves_queued_read_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        state,
+        ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+
+    // Hold the only actor slot so the read is admitted but cannot start before
+    // the same session replaces its route with a higher epoch, without Goodbye.
+    let epoch_base = state.begin_epoch_wave();
+    send_tool_call(
+        &mut stream,
+        1,
+        120,
+        "semantic_search",
+        json!({ "query": "hold the only interactive actor slot" }),
+    )
+    .await;
+    state.wait_until("heavy route call started", |inner| inner.heavy_started);
+    send_tool_call(&mut stream, 1, 121, "echo", json!({ "case": "epoch" })).await;
+    send_frame(
+        &mut stream,
+        Frame::build(FrameType::Ping, control_flags(), 0, 0, 122, Vec::new())
+            .expect("queued-read barrier ping"),
+    )
+    .await;
+    let barrier = read_frame_timeout(&mut stream, "queued-read barrier pong").await;
+    assert_eq!(
+        (barrier.header.ty, barrier.header.corr),
+        (FrameType::Pong, 122)
+    );
+    assert_eq!(
+        state.epoch_started_count(),
+        epoch_base,
+        "read must be queued"
+    );
+
+    send_route_bind_epoch(&mut stream, 1, 2, 220, &root1).await;
+    send_frame(
+        &mut stream,
+        Frame::build(FrameType::Ping, control_flags(), 0, 0, 124, Vec::new())
+            .expect("rebind submission barrier ping"),
+    )
+    .await;
+    let mut bind_ack = false;
+    loop {
+        let frame = read_frame_timeout(&mut stream, "rebind barrier").await;
+        match (frame.header.ty, frame.header.channel, frame.header.corr) {
+            (FrameType::Pong, 0, 124) => break,
+            (FrameType::Response, 0, 220) => {
+                assert!(!bind_ack, "duplicate bind ack");
+                let ack: ModuleControlResponse = serde_json::from_slice(&frame.body).unwrap();
+                assert_eq!(ack, ModuleControlResponse::RouteBindAck {});
+                bind_ack = true;
+            }
+            other => {
+                state.release_heavy();
+                state.release_epoch_reads();
+                panic!(
+                    "rebind must retain the queued call, got {other:?}: {:?}",
+                    frame.body
+                );
+            }
+        }
+    }
+    assert_eq!(
+        state.epoch_started_count(),
+        epoch_base,
+        "read must still be queued"
+    );
+    state.release_heavy();
+    state.release_epoch_reads();
+
+    let mut responses = HashSet::new();
+    while !bind_ack || responses.len() < 2 {
+        let frame = read_frame_timeout(&mut stream, "retained call response or bind ack").await;
+        assert_eq!(frame.header.ty, FrameType::Response, "{:?}", frame.body);
+        if frame.header.channel == 0 {
+            assert_eq!(frame.header.corr, 220);
+            assert!(!bind_ack, "duplicate bind ack");
+            let ack: ModuleControlResponse = serde_json::from_slice(&frame.body).unwrap();
+            assert_eq!(ack, ModuleControlResponse::RouteBindAck {});
+            bind_ack = true;
+        } else {
+            assert_eq!((frame.header.channel, frame.header.epoch), (1, 1));
+            assert!([120, 121].contains(&frame.header.corr));
+            assert!(
+                responses.insert(frame.header.corr),
+                "duplicate tool terminal"
+            );
+            assert_eq!(tool_response_json(&frame)["success"], true);
+        }
+    }
+    assert_eq!(
+        state.epoch_started_count(),
+        epoch_base + 1,
+        "queued read must execute once"
+    );
+
+    send_tool_call_epoch(&mut stream, 1, 2, 221, "echo", json!({ "case": "fast" })).await;
+    let successor = read_frame_timeout(&mut stream, "successor route response").await;
+    assert_eq!(successor.header.ty, FrameType::Response);
+    assert_eq!(
+        (
+            successor.header.channel,
+            successor.header.epoch,
+            successor.header.corr
+        ),
+        (1, 2, 221)
+    );
+    assert_eq!(tool_response_json(&successor)["success"], true);
+    send_connection_goodbye(&mut stream).await;
+}
+
 async fn drive_goodbye_cancels_queued_read_before_rebind_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
         mut stream,
@@ -11380,11 +11514,16 @@ async fn drive_bg_events_daemon(input: FakeDaemonInput) {
         }
     }
 
+    // The re-armed nudge follows the product's backoff: 1 s, doubling to a
+    // 30 s cap (BG_WAKE_REARM_*_BACKOFF in subc/push.rs). On a loaded runner
+    // a re-arm may already have landed among the early events above, so the
+    // next one can be several seconds away. Wait past the cap; a wake lane
+    // that never re-arms still fails here.
     let _ = wait_for_bg_event(
         &mut stream,
         provider_channel,
         700,
-        Duration::from_secs(2),
+        Duration::from_secs(40),
         "re-armed bg_events wake before ack",
     )
     .await;
@@ -13525,6 +13664,41 @@ async fn drive_management_surface_daemon(input: FakeDaemonInput) {
     assert!(census_io["available"].is_boolean());
     assert!(census_io["sampled_at_ms"].is_u64());
 
+    let ownership = &census["data"]["route_ownership"];
+    assert_eq!(ownership["summary"]["bound_routes"], 1);
+    assert_eq!(
+        ownership["summary"]["unscoped"],
+        json!({"routes": 1, "roots": 1})
+    );
+    let route = &ownership["roots"][0]["routes"][0];
+    assert_eq!(route["channel"], 1);
+    assert_eq!(route["harness"], "opencode");
+    assert_eq!(route["session_id"], "session-1");
+    assert_eq!(route["principal"], "direct");
+    assert_eq!(route["scope"], "none");
+    assert!(route["last_tool_call_age_ms"].is_null());
+    send_control_request(&mut stream, 330, ModuleControlRequest::HealthCheck {}).await;
+    let health = expect_health_check_report(&mut stream, 330).await;
+    assert_eq!(
+        health.metrics.unwrap()["route_ownership_summary"]["bound_routes"],
+        1
+    );
+    send_management_request(&mut stream, 2, 331, json!({"op":"memory.census"})).await;
+    let polled = read_management_response(&mut stream, 2, 331, "memory.census").await;
+    assert!(
+        polled["data"]["route_ownership"]["roots"][0]["routes"][0]["last_tool_call_age_ms"]
+            .is_null(),
+        "health and census polling must not count as admitted tools"
+    );
+    expect_manifest_tool_success(&mut stream, 332, "glob", json!({"pattern":"*"})).await;
+    send_management_request(&mut stream, 2, 333, json!({"op":"memory.census"})).await;
+    let called = read_management_response(&mut stream, 2, 333, "memory.census").await;
+    assert!(
+        called["data"]["route_ownership"]["roots"][0]["routes"][0]["last_tool_call_age_ms"]
+            .is_u64()
+    );
+    assert!(called["data"]["route_ownership"]["roots"][0]["last_tool_call_age_ms"].is_u64());
+
     send_management_request(
         &mut stream,
         2,
@@ -13606,6 +13780,79 @@ async fn drive_management_surface_daemon(input: FakeDaemonInput) {
     assert_eq!(executor.actor_count(), actor_count);
     assert_eq!(state.configure_count(), configure_count);
     assert_eq!(app.watcher_count(), watcher_count);
+
+    let owner = Principal::Reserved {
+        module_id: "prefrontal-core".into(),
+    };
+    let stamp = subc_protocol::scope::ScopeStamp::new(
+        owner.clone(),
+        "census-scope",
+        7,
+        subc_protocol::scope::ScopeKind::Head,
+    );
+    send_control_request(
+        &mut stream,
+        340,
+        ModuleControlRequest::RouteBind {
+            route_channel: 6,
+            epoch: 1,
+            target: RouteTarget::ToolProvider {
+                module_id: "aft".into(),
+            },
+            identity: BindIdentity::new(root1.clone(), "opencode", "census-scoped"),
+            principal: Some(owner),
+            scope: Some(stamp),
+            consumer_capabilities: None,
+            admission_facts: Default::default(),
+            role_versions: None,
+            call_mode: None,
+        },
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 340).await;
+    send_management_request(&mut stream, 2, 341, json!({"op":"memory.census"})).await;
+    let paired = read_management_response(&mut stream, 2, 341, "memory.census").await;
+    let ownership = &paired["data"]["route_ownership"];
+    assert_eq!(ownership["summary"]["bound_routes"], 2);
+    assert_eq!(ownership["summary"]["bound_roots"], 1);
+    assert_eq!(
+        ownership["summary"]["scoped"],
+        json!({"routes":1,"roots":1})
+    );
+    assert_eq!(
+        ownership["summary"]["unscoped"],
+        json!({"routes":1,"roots":1})
+    );
+    assert_eq!(
+        ownership["roots"][0]["routes"][1]["scope"],
+        json!({"owner":"reserved:prefrontal-core","ref":"census-scope","epoch":7})
+    );
+    assert_eq!(
+        ownership["roots"][0]["routes"][1]["principal"],
+        "reserved:prefrontal-core"
+    );
+    send_route_goodbye(&mut stream, 6, 342).await;
+    send_management_request(&mut stream, 2, 343, json!({"op":"memory.census"})).await;
+    let detached = read_management_response(&mut stream, 2, 343, "memory.census").await;
+    assert_eq!(
+        detached["data"]["route_ownership"]["summary"]["bound_routes"],
+        1
+    );
+    assert_eq!(
+        detached["data"]["route_ownership"]["summary"]["scoped"]["routes"],
+        0
+    );
+    send_route_goodbye(&mut stream, 1, 344).await;
+    send_management_request(&mut stream, 2, 345, json!({"op":"memory.census"})).await;
+    let unbound = read_management_response(&mut stream, 2, 345, "memory.census").await;
+    assert_eq!(
+        unbound["data"]["route_ownership"]["summary"]["bound_roots"],
+        0
+    );
+    assert_eq!(
+        unbound["data"]["route_ownership"]["summary"]["bound_routes"],
+        0
+    );
 
     send_connection_goodbye(&mut stream).await;
 }

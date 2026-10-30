@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "flake-batch-26"
+  ],
+  "note": "Test-only: blob-store first-open failure diagnostics, Windows exit-sweep eventual-reap wait, per-fixture TMPDIR for the TypeScript language-server tests. No changed path matches RANKING_FENCE_PREFIXES."
+}

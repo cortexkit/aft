@@ -232,6 +232,7 @@ mod idle_reap_frame_loop_tests;
 #[cfg(test)]
 mod idle_root_retention_tests;
 mod perf_sweep;
+mod route_census;
 mod secret_consent;
 #[cfg(all(test, unix))]
 pub(crate) use secret_consent::with_secret_bound_identity_for_test;
@@ -1476,6 +1477,9 @@ struct RootMeta {
     maintenance_last_submitted: Option<Instant>,
     maintenance_poisoned: bool,
     last_touched: Instant,
+    /// Diagnostic demand clocks; unlike last_touched, polling and teardown do not reset them.
+    last_tool_call: Option<Instant>,
+    route_activity: HashMap<RouteChannel, route_census::RouteActivity>,
     diagnostics_on_edit: bool,
     active_bash_waits: usize,
     idle_artifacts_evicted: bool,
@@ -1556,6 +1560,14 @@ struct RouteIdentity(Arc<RouteIdentityData>);
 struct ManagementIdentity {
     principal: Option<Principal>,
     scope: Option<subc_protocol::scope::ScopeStamp>,
+    admission: ManagementAdmission,
+}
+
+#[derive(Default, PartialEq, Eq)]
+enum ManagementAdmission {
+    #[default]
+    FirstParty,
+    FlowOnly,
 }
 
 impl RouteIdentity {
@@ -1798,6 +1810,8 @@ impl RootMeta {
             maintenance_last_submitted: None,
             maintenance_poisoned: false,
             last_touched: now,
+            last_tool_call: None,
+            route_activity: HashMap::new(),
             diagnostics_on_edit: false,
             active_bash_waits: 0,
             idle_artifacts_evicted: false,
@@ -2890,13 +2904,12 @@ fn note_reap_lock_contended(
     }
 }
 
-/// Shut down language servers for roots that have had no request for the
-/// configured LSP idle window. This is independent of artifact eviction and
-/// runs even while the root is still bound.
+/// Shut down individually idle language servers, independently of artifact
+/// eviction and even while their root is bound and serving other packages.
 ///
 /// `meta.last_touched` moves on every inbound tool call for a bound root
 /// (`reactivate_bound` in the route-request handler) and on response delivery,
-/// so an active harness does not look idle.
+/// so whole-root idle shutdown does not mistake an active harness for idle.
 fn reap_idle_lsp_servers(
     now: Instant,
     live_roots: &HashMap<ProjectRootId, RootMeta>,
@@ -3967,21 +3980,24 @@ async fn teardown_installed_route(
     tool_response_body_limit: usize,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
-    // A released handle cannot receive queued work. Cancel only before the
-    // executor's start transition; already-running mutations keep their result.
-    let queued =
-        queued_call::release_route(active_tool_calls, executor, channel, pending_responses);
-    for (corr, request) in queued {
-        let terminal = build_error_frame(
-            request.ver,
-            channel.channel,
-            channel.epoch,
-            corr,
-            request.flags,
-            "route_released",
-            "route released before execution; the tool did not run",
-        )?;
-        send_reliable_writer_frame(tx, metrics, terminal, "released queued call").await?;
+    // A replacement project route keeps replayable calls, even those still
+    // waiting in the executor. Release queued calls only when no project route
+    // replaces the old handle; already-running mutations keep their result.
+    if replacement_root.is_none() {
+        let queued =
+            queued_call::release_route(active_tool_calls, executor, channel, pending_responses);
+        for (corr, request) in queued {
+            let terminal = build_error_frame(
+                request.ver,
+                channel.channel,
+                channel.epoch,
+                corr,
+                request.flags,
+                "route_released",
+                "route released before execution; the tool did not run",
+            )?;
+            send_reliable_writer_frame(tx, metrics, terminal, "released queued call").await?;
+        }
     }
     // Only the consumer's own close withdraws held permission asks. A
     // higher-epoch allocation is a new daemon route/client handle. AFT retains
@@ -4115,6 +4131,7 @@ async fn teardown_installed_route(
             );
         }
         if let Some(meta) = live_roots.get_mut(&identity.root) {
+            meta.route_activity.remove(&channel);
             let idle_for = meta.last_touched.elapsed();
             meta.note_activity();
             log::debug!(
@@ -5961,25 +5978,17 @@ where
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
                         let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore, codemode_policies };
-                        // A flow has a non-empty flow_id in its bound scope. On a
-                        // management route it may call only diagnostics.findings;
-                        // refuse every other management op before it can read
-                        // stores. Flow-scoped tool routes are governed by the
-                        // call-mode contract instead (reads served, writes
-                        // refused), so they are not checked here.
-                        let scope = management_routes.get(&route).and_then(|identity| identity.scope.as_ref());
-                        if let Some(error) = flow_scope_refusal(scope) {
-                            let result = match decoded.body() {
-                                Ok(body) if diagnostics_findings::is_request(body) => diagnostics_findings::dispatch(
-                                    &writer_tx, &dispatch_path_metrics, &decoded.frame,
-                                    scope, body, &health_rollup_cache, &executor,
-                                ).await,
-                                _ => send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await,
-                            };
-                            if let Err(error) = result {
-                                break Err(error);
+                        // Bind admission, not request-supplied scope data, limits
+                        // flow management routes to the manifest's flow operations
+                        // before any store, provider, or general tool dispatch.
+                        // Tool routes retain their separate call-mode contract.
+                        if let Some(identity) = management_routes.get(&route) {
+                            if let Err(error) = admit_management_flow_request(identity, decoded.body().ok()) {
+                                if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await {
+                                    break Err(error);
+                                }
+                                continue;
                             }
-                            continue;
                         }
                         if let (Some(identity), Ok(body)) = (routes.get(&route), decoded.body()) {
                             // Rich-UI chunk queries are provider reads that name no
@@ -6153,9 +6162,8 @@ where
                         let result = if management_routes.contains_key(&route)
                             && gh_relay_operation(&frame).is_some()
                         {
-                            // Management routes are bound only for first-party
-                            // principals (see the RouteBind arm), so the route
-                            // being here is the admission fact passed on.
+                            // Flow-only management routes were refused above;
+                            // reaching the relay requires first-party admission.
                             spawn_gh_relay(
                                 &writer_tx,
                                 &frame,
@@ -6174,6 +6182,7 @@ where
                                 &live_roots,
                                 &root_channels,
                                 &routes,
+                                &active_tool_calls,
                                 &health_rollup_cache,
                                 &dispatch_path_metrics,
                                 management_routes.get(&route).and_then(|identity| identity.principal.as_ref()),
@@ -7783,6 +7792,8 @@ async fn handle_route_bind_completion(
         })
         .or_insert_with(|| RootMeta::new(Instant::now()));
     if let Some(meta) = live_roots.get_mut(&completion.bind_root_id) {
+        meta.route_activity
+            .insert(route_id, route_census::RouteActivity::new(Instant::now()));
         meta.diagnostics_on_edit = completion.diagnostics_on_edit;
         meta.maintenance_poisoned = false;
     }
@@ -7960,14 +7971,16 @@ async fn send_cached_health_response(
     pending_binds: &HashMap<RouteChannel, PendingBind>,
     metrics: &DispatchPathMetrics,
     health_rollup_cache: &HealthRollupCache,
+    ownership_summary: Value,
 ) -> Result<(), SubcError> {
-    let report = build_health_report(
+    let mut report = build_health_report(
         health_rollup_cache,
         executor,
         pending_binds,
         metrics,
         shared_app,
     );
+    health::with_route_ownership_summary(&mut report, ownership_summary);
     let body = serde_json::to_vec(&ModuleControlResponse::from(report)).map_err(SubcError::Json)?;
     let response = Frame::build_with_version(
         frame.header.ver,
@@ -8344,7 +8357,9 @@ async fn handle_control_request(
                     )
                     .await;
                 }
-                if !matches!(bind_trust, BindTrust::FirstParty) {
+                if !matches!(bind_trust, BindTrust::FirstParty)
+                    && diagnostics_findings::admit_flow(scope.as_ref()).is_err()
+                {
                     return send_route_bind_error(
                         tx,
                         frame,
@@ -8354,6 +8369,14 @@ async fn handle_control_request(
                     )
                     .await;
                 }
+                let admission = if scope
+                    .as_ref()
+                    .is_some_and(diagnostics_findings::is_flow_scope)
+                {
+                    ManagementAdmission::FlowOnly
+                } else {
+                    ManagementAdmission::FirstParty
+                };
                 if let Some(installed_epoch) = installed_route_epochs.get(&route_channel).copied() {
                     if installed_epoch >= epoch {
                         return send_route_bind_error(
@@ -8415,7 +8438,11 @@ async fn handle_control_request(
                         ack,
                         ControlCompletion::ManagementAckWritten {
                             route: route_id,
-                            identity: ManagementIdentity { principal, scope },
+                            identity: ManagementIdentity {
+                                principal,
+                                scope,
+                                admission,
+                            },
                             corr: frame.header.corr,
                         },
                         metrics,
@@ -8821,6 +8848,16 @@ async fn handle_control_request(
                 pending_binds,
                 metrics,
                 health_rollup_cache,
+                route_census::snapshot(
+                    live_roots,
+                    root_channels,
+                    routes,
+                    active_tool_calls,
+                    executor,
+                    metrics,
+                    Instant::now(),
+                )
+                .summary(),
             )
             .await
         }
@@ -8836,6 +8873,7 @@ async fn handle_management_request(
     live_roots: &HashMap<ProjectRootId, RootMeta>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
     routes: &HashMap<RouteChannel, RouteIdentity>,
+    active_tool_calls: &ActiveToolCalls,
     health_rollup_cache: &Arc<HealthRollupCache>,
     metrics: &Arc<DispatchPathMetrics>,
     principal: Option<&Principal>,
@@ -8896,6 +8934,15 @@ async fn handle_management_request(
                 shared_app,
                 executor,
                 census_route_rows(live_roots, root_channels),
+                route_census::snapshot(
+                    live_roots,
+                    root_channels,
+                    routes,
+                    active_tool_calls,
+                    executor,
+                    metrics,
+                    Instant::now(),
+                ),
                 health_rollup_cache,
                 metrics,
             );
@@ -9089,6 +9136,7 @@ fn spawn_memory_census(
     shared_app: &Arc<App>,
     executor: &Arc<Executor>,
     route_rows: Vec<CensusRouteRow>,
+    ownership: route_census::Snapshot,
     health_rollup_cache: &Arc<HealthRollupCache>,
     metrics: &Arc<DispatchPathMetrics>,
 ) {
@@ -9102,7 +9150,8 @@ fn spawn_memory_census(
     tokio::spawn(async move {
         let _response_task = ResponseTaskGuard::new(&metrics);
         let census = health::fresh_memory_census(&cache, deadline).await;
-        let census = with_census_route_rows(census, &shared_app, &executor, &route_rows);
+        let mut census = with_census_route_rows(census, &shared_app, &executor, &route_rows);
+        census["route_ownership"] = ownership.render(&executor);
         if let Err(error) = send_management_response(
             &tx,
             &frame,
@@ -9761,21 +9810,23 @@ fn occipital_carrier_route(identity: &RouteIdentity) -> bool {
         })
 }
 
-fn flow_scope_refusal(scope: Option<&subc_protocol::scope::ScopeStamp>) -> Option<ErrorBody> {
-    scope
-        .filter(|stamp| {
-            stamp
-                .attributes
-                .flow_id
-                .as_ref()
-                .is_some_and(|id| !id.is_empty())
-        })
-        .map(|_| {
-            ErrorBody::new(
-                "flow_scope_not_supported",
-                "a flow may call only diagnostics.findings on an AFT management route",
-            )
-        })
+fn admit_management_flow_request(
+    identity: &ManagementIdentity,
+    body: Option<&Value>,
+) -> Result<(), ErrorBody> {
+    if identity.admission != ManagementAdmission::FlowOnly {
+        return Ok(());
+    }
+    let operation = body
+        .and_then(|body| body.get("method").or_else(|| body.get("op")))
+        .and_then(Value::as_str);
+    if !operation.is_some_and(|operation| manifest::FLOW_OPERATIONS.contains(&operation)) {
+        return Err(ErrorBody::new(
+            "flow_scope_not_supported",
+            "a flow may call only diagnostics.findings on an AFT management route",
+        ));
+    }
+    diagnostics_findings::admit_flow(identity.scope.as_ref())
 }
 
 /// Whether a route request is a tool call: either `op: "tool.call"`, or the
@@ -11271,6 +11322,12 @@ async fn handle_tool_call_with_capabilities(
             tool_response_body_limit,
         )?;
         return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
+    }
+
+    if is_subc_agent_core_tool(&bare_name) || is_subc_native_plumbing_tool(&bare_name) {
+        if let Some(meta) = live_roots.get_mut(&identity.root) {
+            route_census::note_tool_call(meta, route_id, Instant::now());
+        }
     }
 
     if matches!(bare_name.as_str(), "bash" | "powershell") {
@@ -15675,6 +15732,7 @@ mod tests {
                 &HashMap::new(),
                 &metrics,
                 &health_rollup_cache,
+                json!({}),
             ));
             done_tx.send(result).expect("report health result");
         });
@@ -17707,6 +17765,23 @@ mod tests {
     }
 
     #[test]
+    fn idle_lsp_sweep_reaps_one_package_while_bound_root_is_busy() {
+        let fixture = crate::lsp::manager::regression_tests::IdleLspFixture::new();
+        let root = ProjectRootId::from_path(fixture.config.project_root.as_ref().unwrap()).unwrap();
+        fixture.ctx.mark_subc_bound();
+        let executor = Executor::new();
+        assert!(executor.register_actor(root.clone(), Arc::clone(&fixture.ctx)));
+        let mut roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+        for _ in 0..3 {
+            fixture.hover(&fixture.busy);
+            let now = Instant::now();
+            roots.get_mut(&root).unwrap().last_touched = now;
+            reap_idle_lsp_servers(now, &roots, &executor);
+        }
+        fixture.assert_only_busy();
+    }
+
+    #[test]
     fn quiesced_root_refuses_preserved_inspect_spawn_and_rebind_is_safe() {
         use crate::lsp::manager::ServerAttemptResult;
         use crate::lsp::registry::ServerKind;
@@ -17955,14 +18030,17 @@ mod tests {
             ctx.lsp_child_registry(),
         );
         assert_eq!(outcome.graceful + outcome.forced, 1, "{outcome:?}");
-        assert_eq!(outcome.unreaped, 0, "{outcome:?}");
-        // The forced kill does not wait; its worker thread reaps the child
-        // right after. Hang guard only.
+        // The shared budget bounds the caller, not its detached reapers. A slow
+        // Windows force-kill can leave the completion report pending at that
+        // deadline. Require eventual process exit and registry cleanup instead;
+        // neither a live leaked server nor a stale registry entry may remain.
         let deadline = Instant::now() + Duration::from_secs(30);
-        while crate::bash_background::process::is_process_alive(pid) {
+        while crate::bash_background::process::is_process_alive(pid)
+            || ctx.lsp_child_registry().pids().contains(&pid)
+        {
             assert!(
                 Instant::now() < deadline,
-                "exit sweep left server {pid} running"
+                "exit sweep did not reap server {pid}: {outcome:?}"
             );
             std::thread::sleep(Duration::from_millis(20));
         }

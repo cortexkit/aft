@@ -4,6 +4,58 @@ use crate::context::AppContext;
 use crate::context::SemanticIndexStatus;
 use crate::db::compression_events::CompressionAggregate;
 use crate::protocol::{RawRequest, Response, StatusPayload, DEFAULT_SESSION_ID};
+use crate::views::semantic_runtime::CoordinationState;
+
+// Operator-only copy: never use these lines as fill errors or agent reply reasons.
+const PENDING_REASON: &str =
+    "Waiting for another AFT process that is embedding the same new code; results will follow.";
+const ERROR_REASON: &str = "Can't coordinate embedding with other AFT processes";
+
+fn coordination_detail(detail: &str) -> String {
+    let redacted = crate::log_redact::aft_redactor(detail);
+    let single_line = redacted
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect::<String>();
+    single_line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn project_semantic_coordination(info: &mut serde_json::Value, state: CoordinationState) {
+    match state {
+        CoordinationState::Contended => {
+            info["pending_reason"] = serde_json::json!(PENDING_REASON);
+        }
+        CoordinationState::BaseBusy { owner_pid, attempt } => {
+            info["pending_reason"] = serde_json::json!(PENDING_REASON);
+            info["pending_owner"] = serde_json::json!({
+                "kind": "base_claim", "pid": owner_pid, "attempt": attempt,
+            });
+        }
+        CoordinationState::Error { failure, retry_in } => {
+            let detail = coordination_detail(&failure.detail);
+            let line = match retry_in {
+                Some(wait) => format!(
+                    "{ERROR_REASON}: {detail}. Retrying in {}.",
+                    crate::lsp::manager::format_retry_delay(wait)
+                ),
+                None => format!("{ERROR_REASON}: {detail}. No retry is scheduled."),
+            };
+            info["pending_reason"] = serde_json::json!(line);
+            info["coordination_error"] = serde_json::json!({
+                "state": "error", "kind": failure.kind_label(), "reason": ERROR_REASON,
+                "detail": detail, "retryable": failure.retryable,
+                "retry_scheduled": retry_in.is_some(),
+                "retry_in_ms": retry_in.map(|wait| u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)),
+            });
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct CompressionStats {
@@ -321,7 +373,7 @@ impl AppContext {
         } else {
             search_index_info
         };
-        let semantic_index_info = if let Some(reason) =
+        let mut semantic_index_info = if let Some(reason) =
             crate::folder_admission_runtime::reason(self)
         {
             serde_json::json!({"status": "off", "reason": reason})
@@ -332,6 +384,19 @@ impl AppContext {
         } else {
             semantic_index_info
         };
+
+        if config.views.enabled && config.indexes.semantic {
+            if let Some(Some(crate::views::semantic_runtime::CheckoutSemanticState::Ready(
+                runtime,
+            ))) = self.checkout_semantic().try_state()
+            {
+                if let Some(coordination) = runtime.coordination_state() {
+                    // Existing semantic vectors remain queryable; expose coordination
+                    // diagnostics only in operator status output.
+                    project_semantic_coordination(&mut semantic_index_info, coordination);
+                }
+            }
+        }
 
         // Disk cache sizes — scoped to the **current project** only.
         //
@@ -746,6 +811,113 @@ fn dir_size_recursive(path: &std::path::Path) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    fn coordination_error_status(
+        retryable: bool,
+        retry_in: Option<std::time::Duration>,
+        detail: &str,
+    ) -> serde_json::Value {
+        let mut info = json!({"status": "ready"});
+        super::project_semantic_coordination(
+            &mut info,
+            super::CoordinationState::Error {
+                failure: crate::views::semantic::LeaseError {
+                    kind: crate::views::semantic::LeaseErrorKind::Storage(
+                        std::io::ErrorKind::PermissionDenied,
+                    ),
+                    detail: detail.into(),
+                    retryable,
+                },
+                retry_in,
+            },
+        );
+        info
+    }
+
+    #[test]
+    fn semantic_batch_lease_operator_pending_text_is_exact_for_both_owners() {
+        for state in [
+            super::CoordinationState::Contended,
+            super::CoordinationState::BaseBusy {
+                owner_pid: 42,
+                attempt: 3,
+            },
+        ] {
+            let mut info = json!({"status": "ready"});
+            super::project_semantic_coordination(&mut info, state);
+            assert_eq!(info["pending_reason"], "Waiting for another AFT process that is embedding the same new code; results will follow.");
+            assert_eq!(info["status"], "ready");
+            assert!(info.get("coordination_error").is_none());
+        }
+    }
+
+    #[test]
+    fn semantic_batch_lease_operator_retry_text_and_wait_are_exact() {
+        for (seconds, expected) in [
+            (4, "Can't coordinate embedding with other AFT processes: permission denied. Retrying in 4s."),
+            (80, "Can't coordinate embedding with other AFT processes: permission denied. Retrying in 1m 20s."),
+        ] {
+            let info = coordination_error_status(true, Some(std::time::Duration::from_secs(seconds)), "permission denied");
+            assert_eq!(info["pending_reason"], expected);
+            assert_eq!(info["status"], "ready");
+            assert_eq!(info["coordination_error"]["retry_scheduled"], true);
+            assert_eq!(info["coordination_error"]["retry_in_ms"], seconds * 1_000);
+            assert_eq!(info["coordination_error"]["retryable"], true);
+            assert_eq!(info["coordination_error"]["detail"], "permission denied");
+        }
+    }
+
+    #[test]
+    fn semantic_batch_lease_operator_no_retry_text_is_exact_after_refusal_or_exhaustion() {
+        for retryable in [false, true] {
+            let info = coordination_error_status(retryable, None, "permission denied");
+            assert_eq!(info["pending_reason"], "Can't coordinate embedding with other AFT processes: permission denied. No retry is scheduled.");
+            assert_eq!(info["coordination_error"]["retry_scheduled"], false);
+            assert_eq!(
+                info["coordination_error"]["retry_in_ms"],
+                serde_json::Value::Null
+            );
+            assert_eq!(info["coordination_error"]["retryable"], retryable);
+        }
+    }
+
+    #[test]
+    fn semantic_batch_lease_operator_detail_is_single_line_and_secret_free() {
+        let secret = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let detail = format!(
+            "lease refused\nAuthorization: Bearer {secret}\r\towner unavailable\u{2028}\u{2029}"
+        );
+        let info = coordination_error_status(false, None, &detail);
+        let rendered = info["coordination_error"]["detail"].as_str().unwrap();
+        assert!(!rendered.contains(secret));
+        assert!(!rendered
+            .chars()
+            .any(|ch| ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}')));
+        assert!(!info["pending_reason"].as_str().unwrap().contains(secret));
+    }
+
+    #[test]
+    fn semantic_batch_lease_disabled_status_never_probes_view_slot() {
+        for (views, semantic) in [(false, true), (true, false), (false, false), (true, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = Config::default();
+            config.project_root = Some(dir.path().to_path_buf());
+            config.storage_dir = Some(dir.path().join("storage"));
+            config.views.enabled = views;
+            config.indexes.semantic = semantic;
+            let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+            crate::views::semantic_runtime::TEST_TRY_STATE_READS.with(|reads| reads.set(0));
+            let response = handle_status(&request(), &ctx);
+            let probes =
+                crate::views::semantic_runtime::TEST_TRY_STATE_READS.with(|reads| reads.get());
+            assert!(response.success);
+            if views && semantic {
+                assert!(probes > 0, "enabled status must exercise the probe counter");
+            } else {
+                assert_eq!(probes, 0, "disabled status touched the semantic slot (views={views}, semantic={semantic})");
+            }
+        }
+    }
+
     use super::handle_status;
     use crate::config::Config;
     use crate::context::AppContext;

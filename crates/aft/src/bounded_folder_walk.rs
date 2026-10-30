@@ -1,4 +1,7 @@
 //! Direct query enumeration when root-wide indexes are not admitted.
+//! Like ordinary grep/glob, this uses `bounded_io::run_walk` to stop at the time
+//! budget, retain paths already found when a directory read stalls, and report
+//! the path that stopped making progress.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,7 +27,7 @@ pub(crate) enum Stop {
     IoError,
 }
 
-#[derive(Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub(crate) struct Outcome {
     #[serde(skip)]
     pub files: Vec<PathBuf>,
@@ -130,27 +133,53 @@ pub(crate) fn walk(
     let filters = filters.clone();
     let cancellation = crate::executor::current_job_cancellation();
     let deadline = Instant::now() + budget;
-    crate::bounded_io::run(root, Some(deadline), move |root| {
-        Ok(walk_inner(
-            &filter_root,
-            &root,
-            &filters,
-            max_files,
-            deadline,
-            budget,
-            ignored_target,
-            cancellation.as_ref(),
-        ))
-    })
-    .unwrap_or_else(|_| Outcome {
-        stop: Stop::TimeBudget,
+    let deadline = crate::bounded_io::current().map_or(deadline, |b| {
+        b.deadline
+            .checked_sub(Duration::from_millis(100))
+            .unwrap_or(b.deadline)
+            .min(deadline)
+    });
+    let initial = Outcome {
         entry_budget: max_files.saturating_mul(8).max(1024),
         file_budget: max_files,
         time_budget_ms: budget.as_millis(),
         byte_budget: BYTE_BUDGET,
         ignore_file_byte_budget: 64 * 1024,
         ..Outcome::default()
-    })
+    };
+    let (mut outcome, completion) =
+        crate::bounded_io::run_walk(root, Some(deadline), initial, move |root, progress| {
+            Ok(walk_inner(
+                &filter_root,
+                &root,
+                &filters,
+                max_files,
+                budget,
+                ignored_target,
+                cancellation.as_ref(),
+                &progress,
+            ))
+        });
+    if completion.incomplete {
+        if completion.time_limit {
+            outcome.stop = Stop::TimeBudget;
+        } else if outcome.stop == Stop::Complete {
+            outcome.stop = Stop::IoError;
+        }
+    }
+    outcome
+}
+
+fn publish_counts(progress: &crate::bounded_io::WalkProgress<Outcome>, out: &Outcome) {
+    progress.update(|snapshot| {
+        snapshot.stop = out.stop;
+        snapshot.entries_visited = out.entries_visited;
+        snapshot.files_examined = out.files_examined;
+        snapshot.ignored = out.ignored;
+        snapshot.filtered = out.filtered;
+        snapshot.errors = out.errors;
+        snapshot.bytes_read = out.bytes_read;
+    });
 }
 
 fn walk_inner(
@@ -158,10 +187,10 @@ fn walk_inner(
     root: &Path,
     filters: &PathFilters,
     max_files: usize,
-    deadline: Instant,
     budget: Duration,
     ignored_target: bool,
     cancellation: Option<&crate::executor::JobCancellation>,
+    progress: &crate::bounded_io::WalkProgress<Outcome>,
 ) -> Outcome {
     let mut out = Outcome {
         entry_budget: max_files.saturating_mul(8).max(1024),
@@ -181,12 +210,16 @@ fn walk_inner(
             .collect::<Vec<_>>();
         paths.reverse();
         for path in paths {
-            if Instant::now() >= deadline {
+            if progress.stopped() {
                 out.stop = Stop::TimeBudget;
                 return out;
             }
             if !crate::context::confinement::admits_walk_root(path) {
                 continue;
+            }
+            if !crate::bounded_io::walk_path(path) {
+                out.stop = Stop::TimeBudget;
+                return out;
             }
             match Rules::load(path, ancestors, &mut out.bytes_read) {
                 Ok(rules) => ancestors = Some(rules),
@@ -200,7 +233,7 @@ fn walk_inner(
     }
     let mut pending = vec![(root.to_path_buf(), ancestors)];
     while let Some((directory, parent)) = pending.pop() {
-        if Instant::now() >= deadline {
+        if progress.stopped() {
             out.stop = Stop::TimeBudget;
             break;
         }
@@ -210,6 +243,11 @@ fn walk_inner(
         }
         if !crate::context::confinement::admits_walk_root(&directory) {
             continue;
+        }
+        publish_counts(progress, &out);
+        if !crate::bounded_io::walk_path(&directory) {
+            out.stop = Stop::TimeBudget;
+            break;
         }
         let metadata = if directory == root {
             std::fs::metadata(&directory)
@@ -225,6 +263,8 @@ fn walk_inner(
             out.entries_visited += 1;
             out.files_examined += 1;
             out.files.push(directory);
+            progress.update(|snapshot| snapshot.files.push(out.files.last().unwrap().clone()));
+            publish_counts(progress, &out);
             continue;
         }
         if metadata.file_type().is_symlink() {
@@ -251,7 +291,8 @@ fn walk_inner(
             }
         };
         loop {
-            if Instant::now() >= deadline {
+            publish_counts(progress, &out);
+            if progress.stopped() {
                 out.stop = Stop::TimeBudget;
                 break;
             }
@@ -267,17 +308,22 @@ fn walk_inner(
                 break;
             };
             out.entries_visited += 1;
+            publish_counts(progress, &out);
             let Ok(entry) = entry else {
                 out.errors += 1;
                 out.stop = Stop::IoError;
                 continue;
             };
+            let path = entry.path();
+            if !crate::bounded_io::walk_path(&path) {
+                out.stop = Stop::TimeBudget;
+                break;
+            }
             let Ok(kind) = entry.file_type() else {
                 out.errors += 1;
                 out.stop = Stop::IoError;
                 continue;
             };
-            let path = entry.path();
             // Charge every entry before exclusions or include patterns. A flat
             // directory full of ignored/nonmatching names must still hit a bound.
             if kind.is_symlink()
@@ -310,6 +356,7 @@ fn walk_inner(
                     break;
                 }
                 out.files.push(path);
+                progress.update(|snapshot| snapshot.files.push(out.files.last().unwrap().clone()));
             }
         }
         if matches!(
@@ -323,5 +370,50 @@ fn walk_inner(
             break;
         }
     }
+    publish_counts(progress, &out);
     out
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folder_admission_bounded_walk_retains_prefix_and_names_a_stall() {
+        let root = tempfile::tempdir().unwrap();
+        let found = root.path().join("found.rs");
+        let slow = root.path().join("slow");
+        std::fs::write(&found, "needle\n").unwrap();
+        std::fs::create_dir(&slow).unwrap();
+        let stall = crate::bounded_io::stall_running_helper(&slow);
+        let budget = crate::bounded_io::Budget::after(Duration::from_secs(2))
+            .with_path_access_budget(&slow, Duration::from_millis(100));
+        let response = crate::bounded_io::with_budget(Some(budget), || {
+            let walked = walk(
+                root.path(),
+                root.path(),
+                &PathFilters::default(),
+                100,
+                Duration::from_secs(2),
+                false,
+            );
+            assert_eq!(walked.files, [found.clone()], "{walked:?}");
+            assert_ne!(walked.stop, Stop::Complete);
+            crate::bounded_io::finish_response(crate::protocol::Response::success(
+                "bounded-folder-stall",
+                serde_json::json!({"complete": true, "files": walked.files}),
+            ))
+        });
+        assert!(response.success, "{}", response.data);
+        assert_eq!(response.data["complete"], false);
+        assert!(
+            response.data["text"]
+                .as_str()
+                .unwrap()
+                .contains(slow.to_str().unwrap()),
+            "{}",
+            response.data
+        );
+        drop(stall);
+    }
 }

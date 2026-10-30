@@ -1274,7 +1274,7 @@ impl Drop for ModuleProcess {
     }
 }
 
-async fn accept_module(listener: &TcpListener) -> TcpStream {
+pub(super) async fn accept_module(listener: &TcpListener) -> TcpStream {
     let (mut stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
         .await
         .expect("timed out accepting module connection")
@@ -1320,6 +1320,20 @@ pub(super) async fn bind_route(stream: &mut TcpStream, root: &Path) {
 }
 
 async fn bind_route_as(stream: &mut TcpStream, root: &Path, channel: u16, harness: &str) {
+    bind_route_as_at_epoch(stream, root, channel, harness, 1).await;
+}
+
+pub(super) async fn bind_route_at_epoch(stream: &mut TcpStream, root: &Path, epoch: u32) {
+    bind_route_as_at_epoch(stream, root, ROUTE_CHANNEL, "opencode", epoch).await;
+}
+
+async fn bind_route_as_at_epoch(
+    stream: &mut TcpStream,
+    root: &Path,
+    channel: u16,
+    harness: &str,
+    epoch: u32,
+) {
     let project_cfg = root.join(".cortexkit").join("aft.jsonc");
     std::fs::create_dir_all(project_cfg.parent().expect("project config parent"))
         .expect("create project config dir");
@@ -1334,7 +1348,7 @@ async fn bind_route_as(stream: &mut TcpStream, root: &Path, channel: u16, harnes
 
     let request = ModuleControlRequest::RouteBind {
         route_channel: channel,
-        epoch: 1,
+        epoch,
         target: RouteTarget::ToolProvider {
             module_id: "aft".to_string(),
         },

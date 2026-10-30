@@ -413,6 +413,7 @@ export const AftSidebarPanel = (props: AftSidebarPanelProps) => {
         error: s()?.semantic_index?.error,
         reason: s()?.semantic_index?.reason,
         backend_url: s()?.semantic_index?.backend_url,
+        pending_reason: s()?.semantic_index?.pending_reason,
       }),
     };
   };

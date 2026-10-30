@@ -14,5 +14,5 @@
   "holder_behavior": "replied with the response file bytes",
   "exit_code": 86,
   "stdout": "",
-  "stderr": "gh-shim: gh_shim_seam_refusal: plexus refused the bot write with a code this shim does not know: identity_mismatch; it was not retried\n"
+  "stderr": "gh-shim: gh_shim_seam_refusal: Plexus refused the bot write: identity_mismatch. This shim does not recognize the refusal code. Whether anything reached GitHub is unknown. Check GitHub before rerunning.\n"
 }

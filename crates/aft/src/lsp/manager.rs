@@ -457,6 +457,8 @@ pub struct ApplicableServerStartOutcomes {
 
 pub const START_IN_PROGRESS_STATUS: &str = "start_in_progress";
 pub const START_IN_PROGRESS_REASON: &str = "server startup is in progress; retry shortly";
+
+const FILE_SERVER_RESTART_ATTEMPTS: usize = 3;
 pub const STARTUP_NOTIFICATION_PATH_CAP: usize = 8_192;
 pub const STARTUP_NOTIFICATION_QUEUE_FULL: &str =
     "language-server startup notification queue is full; retry the file change";
@@ -704,8 +706,21 @@ where
     let deadline = timeout.map(|timeout| Instant::now() + timeout);
     // Start any missing server without the lock; the pulls below then only
     // open the document and send the requests under it.
-    start_servers_for_file_unlocked(&lock, file_path, config);
-    let pulls = lock().begin_file_pulls(file_path, config, deadline)?;
+    let mut pulls = None;
+    for _ in 0..FILE_SERVER_RESTART_ATTEMPTS {
+        let opened = ensure_file_open_unlocked(&lock, file_path, config)?;
+        let mut manager = lock();
+        if opened
+            .server_keys
+            .iter()
+            .any(|key| !manager.clients.contains_key(key))
+        {
+            continue;
+        }
+        pulls = Some(manager.begin_file_pulls(file_path, config, deadline)?);
+        break;
+    }
+    let pulls = pulls.ok_or_else(|| LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()))?;
     // All requests are in flight at once; wait for each without the lock.
     let replies = pulls
         .into_iter()
@@ -764,7 +779,8 @@ where
 }
 
 /// Send an interactive request (hover, definition, references, rename) to the
-/// running server that owns `file_path` and wait for its reply.
+/// server that owns `file_path` and wait for its reply, restarting it if idle
+/// reaping detached it after the caller's startup check.
 ///
 /// The manager lock is held only to find the client and write the request.
 /// The wait for the reply, up to eight seconds on a busy server, runs without
@@ -786,6 +802,13 @@ where
 {
     let started = {
         let mut lsp = lock();
+        if lsp.client_for_file(file_path, config).is_none() {
+            drop(lsp);
+            if let Err(err) = ensure_file_open_unlocked(&lock, file_path, config) {
+                return Some(Err(err));
+            }
+            lsp = lock();
+        }
         let client = lsp.client_for_file_mut(file_path, config)?;
         client.start_request::<R>(params)
     };
@@ -1121,6 +1144,7 @@ pub struct LspManager {
     /// notifications are skipped because the capability is absent.
     watched_file_skip_logged: HashSet<ServerKey>,
     pending_watched_changes: HashMap<ServerKey, PendingWatchedChanges>,
+    watched_lifecycle: HashMap<ServerKey, WatchedLifecycleCache>,
     /// rust-analyzer instances with a workspace reload running on a helper
     /// thread because the file watcher saw a Cargo manifest change (see
     /// [`spawn_watcher_rust_workspace_reload`]). The value collects the
@@ -1354,7 +1378,7 @@ fn next_transient_backoff(previous: Option<Duration>) -> Duration {
 
 /// A retry delay in whole seconds, rounded up so a pending retry never reads
 /// as "after 0s": `45s`, `2m`, `4m 30s`.
-fn format_retry_delay(delay: Duration) -> String {
+pub(crate) fn format_retry_delay(delay: Duration) -> String {
     let seconds = delay.as_secs() + u64::from(delay.subsec_nanos() > 0);
     match (seconds / 60, seconds % 60) {
         (0, seconds) => format!("{seconds}s"),
@@ -1402,6 +1426,7 @@ impl LspManager {
             transient_backoff: HashMap::new(),
             watched_file_skip_logged: HashSet::new(),
             pending_watched_changes: HashMap::new(),
+            watched_lifecycle: HashMap::new(),
             watcher_rust_reloads: HashMap::new(),
             #[cfg(windows)]
             last_watched_file_notification_trace: "no watched-file notification attempted"
@@ -2446,11 +2471,10 @@ impl LspManager {
         key: &ServerKey,
         failure: StartFailure,
     ) -> ServerAttemptResult {
-        slog_error!("failed to spawn {}: {}", def.name, failure.error);
+        log_spawn_failure(def, key, &failure.error, self.retry_clock.now());
         let result = classify_spawn_error(&def.binary, &failure.error);
-        // Remember the failure so subsequent file events skip this
-        // (kind, root) pair instead of producing a fresh spawn attempt +
-        // ERROR log per request.
+        // Remember executable failures so subsequent file events skip this
+        // (kind, root) pair. Capacity refusals remain eligible on the next request.
         self.record_failed_spawn(key, result, failure.durability)
     }
 
@@ -3083,6 +3107,7 @@ impl LspManager {
         kind: FileChangeType,
         raw: Option<PathBuf>,
         extra_config_markers: Vec<String>,
+        stamp: Option<WatchedFileStamp>,
     ) -> Result<(), LspError> {
         let pid = self.clients.get(key).map(LspClient::child_pid);
         let pending = self
@@ -3115,6 +3140,7 @@ impl LspManager {
                 kind,
                 raw,
                 extra_config_markers,
+                stamp,
             },
         );
         Ok(())
@@ -3151,21 +3177,28 @@ impl LspManager {
                 continue;
             }
             let mut direct = Vec::new();
+            let mut stamps = WatchedFileStamps::new();
             let mut forwarded: HashMap<Vec<String>, Vec<(PathBuf, FileChangeType)>> =
                 HashMap::new();
             for (path, change) in pending.changes {
                 if let Some(raw) = change.raw {
+                    if let Some(stamp) = change.stamp {
+                        stamps.insert(raw.clone(), stamp);
+                    }
                     forwarded
                         .entry(change.extra_config_markers)
                         .or_default()
                         .push((raw, change.kind));
                 } else {
+                    if let Some(stamp) = change.stamp {
+                        stamps.insert(path.clone(), stamp);
+                    }
                     direct.push((path, change.kind));
                 }
             }
             if !direct.is_empty() {
                 if let Err(error) =
-                    self.notify_files_watched_changed_for_server(&direct, Some(&key))
+                    self.notify_files_watched_changed_for_server(&direct, Some(&key), &stamps)
                 {
                     crate::slog_warn!("queued watched-file sync failed for {key:?}: {error}");
                 }
@@ -3175,6 +3208,7 @@ impl LspManager {
                     &changes,
                     &markers,
                     Some(&key),
+                    &stamps,
                 ));
             }
         }
@@ -3190,13 +3224,22 @@ impl LspManager {
         paths: &[(PathBuf, FileChangeType)],
         _config: &Config,
     ) -> Result<(), LspError> {
-        self.notify_files_watched_changed_for_server(paths, None)
+        self.notify_files_watched_changed_with_stamps(paths, &WatchedFileStamps::new())
+    }
+
+    pub(crate) fn notify_files_watched_changed_with_stamps(
+        &mut self,
+        paths: &[(PathBuf, FileChangeType)],
+        stamps: &WatchedFileStamps,
+    ) -> Result<(), LspError> {
+        self.notify_files_watched_changed_for_server(paths, None, stamps)
     }
 
     fn notify_files_watched_changed_for_server(
         &mut self,
         paths: &[(PathBuf, FileChangeType)],
         only_server: Option<&ServerKey>,
+        stamps: &WatchedFileStamps,
     ) -> Result<(), LspError> {
         if self.is_quiesced() {
             return Err(LspError::ProjectClosed);
@@ -3217,8 +3260,12 @@ impl LspManager {
         }
 
         let mut canonical_events = Vec::with_capacity(paths.len());
+        let mut canonical_stamps = WatchedFileStamps::new();
         for (path, typ) in paths {
             let canonical_path = resolve_for_lsp_uri(path);
+            if let Some(stamp) = stamps.get(path) {
+                canonical_stamps.insert(canonical_path.clone(), *stamp);
+            }
             canonical_events.push((canonical_path, *typ));
         }
         #[cfg(windows)]
@@ -3247,9 +3294,14 @@ impl LspManager {
             {
                 for (path, typ) in &canonical_events {
                     if path.starts_with(&key.root) {
-                        if let Err(error) =
-                            self.queue_watched_change(&key, path.clone(), *typ, None, Vec::new())
-                        {
+                        if let Err(error) = self.queue_watched_change(
+                            &key,
+                            path.clone(),
+                            *typ,
+                            None,
+                            Vec::new(),
+                            canonical_stamps.get(path).copied(),
+                        ) {
                             first_error.get_or_insert(error);
                         }
                     }
@@ -3315,6 +3367,18 @@ impl LspManager {
                 if let Err(error) = send_result {
                     log::warn!("watched-file notification failed for {key:?}: {error}");
                     first_error.get_or_insert(error);
+                } else {
+                    let delivered = self.watched_lifecycle.entry(key.clone()).or_default();
+                    for (path, kind) in &canonical_events {
+                        if path.starts_with(&key.root) && *kind != FileChangeType::CHANGED {
+                            delivered.remember(
+                                path.clone(),
+                                *kind,
+                                canonical_stamps.get(path).copied(),
+                                Instant::now(),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -3362,7 +3426,20 @@ impl LspManager {
         events: &[(PathBuf, FileChangeType)],
         extra_config_markers: &[String],
     ) -> Vec<(ServerKey, Vec<PathBuf>)> {
-        self.forward_watcher_file_events_for_server(events, extra_config_markers, None)
+        self.forward_watcher_file_events_with_stamps(
+            events,
+            extra_config_markers,
+            &WatchedFileStamps::new(),
+        )
+    }
+
+    pub(crate) fn forward_watcher_file_events_with_stamps(
+        &mut self,
+        events: &[(PathBuf, FileChangeType)],
+        extra_config_markers: &[String],
+        stamps: &WatchedFileStamps,
+    ) -> Vec<(ServerKey, Vec<PathBuf>)> {
+        self.forward_watcher_file_events_for_server(events, extra_config_markers, None, stamps)
     }
 
     fn forward_watcher_file_events_for_server(
@@ -3370,6 +3447,7 @@ impl LspManager {
         events: &[(PathBuf, FileChangeType)],
         extra_config_markers: &[String],
         only_server: Option<&ServerKey>,
+        stamps: &WatchedFileStamps,
     ) -> Vec<(ServerKey, Vec<PathBuf>)> {
         let mut rust_manifest_changes = Vec::new();
         if self.is_quiesced() {
@@ -3399,10 +3477,38 @@ impl LspManager {
             .into_iter()
             .collect();
         for key in keys {
+            // A create after a delete, or a delete after a create, clears the
+            // earlier event even when the server subscribed to only one kind.
+            if let Some(previous) = self.watched_lifecycle.get_mut(&key) {
+                for (raw, path, kind) in &events {
+                    if *kind != FileChangeType::CHANGED
+                        && (path.starts_with(&key.root) || raw.starts_with(&key.root))
+                        && previous
+                            .entries
+                            .get(path)
+                            .is_some_and(|last| last.kind != *kind)
+                    {
+                        previous.remove(path);
+                    }
+                }
+            }
             let in_root: Vec<&(&Path, PathBuf, FileChangeType)> = events
                 .iter()
                 .filter(|(raw, resolved, _)| {
                     resolved.starts_with(&key.root) || raw.starts_with(&key.root)
+                })
+                .filter(|(raw, resolved, kind)| {
+                    !self
+                        .watched_lifecycle
+                        .get_mut(&key)
+                        .is_some_and(|previous| {
+                            previous.absorb_echo(
+                                resolved,
+                                *kind,
+                                stamps.get(*raw).copied(),
+                                Instant::now(),
+                            )
+                        })
                 })
                 .collect();
             if in_root.is_empty() {
@@ -3433,6 +3539,7 @@ impl LspManager {
                         *typ,
                         Some(raw.to_path_buf()),
                         extra_config_markers.to_vec(),
+                        stamps.get(*raw).copied(),
                     ) {
                         crate::slog_warn!(
                             "queued watched-file forward failed for {key:?}: {error}"
@@ -3495,11 +3602,25 @@ impl LspManager {
                             )
                         });
                         match sent {
-                            Some(Ok(())) if watchers.is_some() => {
-                                sent_to_registered_watcher = selected
-                                    .iter()
-                                    .map(|(_, resolved, _)| resolved.clone())
-                                    .collect();
+                            Some(Ok(())) => {
+                                let delivered =
+                                    self.watched_lifecycle.entry(key.clone()).or_default();
+                                for (raw, path, kind) in &selected {
+                                    if *kind != FileChangeType::CHANGED {
+                                        delivered.remember(
+                                            path.clone(),
+                                            *kind,
+                                            stamps.get(*raw).copied(),
+                                            Instant::now(),
+                                        );
+                                    }
+                                }
+                                if watchers.is_some() {
+                                    sent_to_registered_watcher = selected
+                                        .iter()
+                                        .map(|(_, resolved, _)| resolved.clone())
+                                        .collect();
+                                }
                             }
                             Some(Err(error)) => {
                                 crate::slog_warn!(
@@ -4170,6 +4291,10 @@ impl LspManager {
         max_events: usize,
         preserve_pull_observations: bool,
     ) -> DrainedLspEvents {
+        let now = Instant::now();
+        for cache in self.watched_lifecycle.values_mut() {
+            cache.expire(now);
+        }
         self.publish_completed_starts();
         let mut events = Vec::new();
         let mut instances = Vec::new();
@@ -5644,6 +5769,54 @@ impl LspManager {
         clients
     }
 
+    /// Detach idle clients while holding the manager lock, before stopping them.
+    /// Requests either reserve a pending response first or find the key absent
+    /// and start a replacement; they cannot acquire a half-stopped client.
+    pub(crate) fn take_idle_clients(
+        &mut self,
+        now: Instant,
+        ttl: Duration,
+        root_idle: bool,
+    ) -> Vec<(ServerKey, LspClient)> {
+        let keys: Vec<_> = self
+            .clients
+            .iter()
+            .filter_map(|(key, client)| {
+                // Startup document replay writes through a cloned writer while
+                // its reservation exists, so it is not idle work to interrupt.
+                if self.starting.contains_key(key) {
+                    return None;
+                }
+                let idle = now.saturating_duration_since(client.last_used_at());
+                ((root_idle || idle >= ttl) && !client.has_pending_requests()).then(|| key.clone())
+            })
+            .collect();
+        let mut clients = Vec::with_capacity(keys.len());
+        for key in keys {
+            let client = self.clients.remove(&key).expect("selected idle client");
+            let idle = now.saturating_duration_since(client.last_used_at());
+            let package = key
+                .root
+                .file_name()
+                .unwrap_or(key.root.as_os_str())
+                .to_string_lossy();
+            slog_info!(
+                "idle lsp reap {} {package}: after {}m (ttl {}m)",
+                key.kind.id_str(),
+                idle.as_secs() / 60,
+                ttl.as_secs() / 60
+            );
+            self.forget_server_state(Some(&key));
+            self.pending_diagnostic_observations
+                .retain(|observation| observation.server_key != key);
+            clients.push((key, client));
+        }
+        if !clients.is_empty() {
+            self.clients_generation = self.clients_generation.wrapping_add(1);
+        }
+        clients
+    }
+
     /// Forget instance-owned state without changing start reservations or
     /// failure backoff. Those have their own generation and retry lifecycles.
     fn forget_server_state(&mut self, key: Option<&ServerKey>) {
@@ -5654,6 +5827,7 @@ impl LspManager {
         self.watched_file_skip_logged.retain(keep);
         self.pending_watched_changes
             .retain(|server, _| keep(server));
+        self.watched_lifecycle.retain(|server, _| keep(server));
         self.latest_push_for_pull_servers
             .retain(|(server, _), _| keep(server));
         self.latest_pull_for_rust
@@ -8515,6 +8689,103 @@ struct PendingWatchedChange {
     kind: FileChangeType,
     raw: Option<PathBuf>,
     extra_config_markers: Vec<String>,
+    stamp: Option<WatchedFileStamp>,
+}
+
+pub(crate) type WatchedFileStamp = (u64, Option<std::time::SystemTime>);
+pub(crate) type WatchedFileStamps = HashMap<PathBuf, WatchedFileStamp>;
+
+/// Capture disk observations before taking the LSP manager lock. Queued changes
+/// carry these observations through delivery and startup replay without new I/O.
+pub(crate) fn capture_watched_file_stamps<'a>(
+    paths: impl IntoIterator<Item = &'a PathBuf>,
+) -> WatchedFileStamps {
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let metadata = std::fs::metadata(path).ok()?;
+            Some((path.clone(), (metadata.len(), metadata.modified().ok())))
+        })
+        .collect()
+}
+
+/// Retain created/deleted file events just beyond the watcher's debounce window.
+const WATCHED_LIFECYCLE_TTL: Duration = Duration::from_secs(10);
+const WATCHED_LIFECYCLE_CAP: usize = 4_096;
+
+struct WatchedLifecycle {
+    kind: FileChangeType,
+    stamp: Option<WatchedFileStamp>,
+    order: (Instant, u64),
+}
+
+/// Keep both indexes bounded: replacing or consuming a path removes its age key.
+#[derive(Default)]
+struct WatchedLifecycleCache {
+    entries: HashMap<PathBuf, WatchedLifecycle>,
+    oldest: std::collections::BTreeMap<(Instant, u64), PathBuf>,
+    sequence: u64,
+}
+
+impl WatchedLifecycleCache {
+    fn remove(&mut self, path: &Path) {
+        if let Some(previous) = self.entries.remove(path) {
+            self.oldest.remove(&previous.order);
+        }
+    }
+
+    fn expire(&mut self, now: Instant) {
+        while self
+            .oldest
+            .first_key_value()
+            .is_some_and(|((at, _), _)| now.saturating_duration_since(*at) >= WATCHED_LIFECYCLE_TTL)
+        {
+            let (_, path) = self.oldest.pop_first().expect("oldest entry exists");
+            self.entries.remove(&path);
+        }
+    }
+
+    fn remember(
+        &mut self,
+        path: PathBuf,
+        kind: FileChangeType,
+        stamp: Option<WatchedFileStamp>,
+        now: Instant,
+    ) {
+        self.expire(now);
+        self.remove(&path);
+        if self.entries.len() >= WATCHED_LIFECYCLE_CAP {
+            if let Some((_, path)) = self.oldest.pop_first() {
+                self.entries.remove(&path);
+            }
+        }
+        self.sequence = self.sequence.wrapping_add(1);
+        let order = (now, self.sequence);
+        self.oldest.insert(order, path.clone());
+        self.entries
+            .insert(path, WatchedLifecycle { kind, stamp, order });
+    }
+
+    fn absorb_echo(
+        &mut self,
+        path: &Path,
+        kind: FileChangeType,
+        stamp: Option<WatchedFileStamp>,
+        now: Instant,
+    ) -> bool {
+        self.expire(now);
+        let echo = self.entries.get(path).is_some_and(|previous| {
+            kind == previous.kind
+                || (kind == FileChangeType::CHANGED
+                    && previous.kind == FileChangeType::CREATED
+                    && stamp.is_some()
+                    && previous.stamp == stamp)
+        });
+        if echo {
+            self.remove(path);
+        }
+        echo
+    }
 }
 
 /// Wait through spawn and replay until a final startup outcome or the deadline.
@@ -8780,17 +9051,28 @@ where
     G: std::ops::DerefMut<Target = LspManager>,
 {
     let canonical_path = canonicalize_for_lsp(file_path)?;
-    let outcomes = ensure_server_for_file_detailed_unlocked(&lock, &canonical_path, config);
-    if outcomes
-        .attempts
-        .iter()
-        .any(|attempt| matches!(attempt.result, ServerAttemptResult::InProgress { .. }))
-    {
-        return Err(LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()));
+    for _ in 0..FILE_SERVER_RESTART_ATTEMPTS {
+        let outcomes = ensure_server_for_file_detailed_unlocked(&lock, &canonical_path, config);
+        if outcomes
+            .attempts
+            .iter()
+            .any(|attempt| matches!(attempt.result, ServerAttemptResult::InProgress { .. }))
+        {
+            return Err(LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()));
+        }
+        let mut manager = lock();
+        // An idle sweep can detach a server after startup resolves. Restart
+        // outside the lock rather than returning an empty document-open result.
+        if outcomes
+            .successful
+            .iter()
+            .any(|key| !manager.clients.contains_key(key))
+        {
+            continue;
+        }
+        return manager.ensure_file_open(&canonical_path, config);
     }
-    // Every server is now running or has a remembered failure, so this
-    // starts nothing under the lock unless a client vanished in between.
-    lock().ensure_file_open(&canonical_path, config)
+    Err(LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()))
 }
 
 /// rust-analyzer's own LSP request (not part of the LSP specification) that
@@ -8906,6 +9188,7 @@ pub type WatcherForwardSlot = Arc<parking_lot::Mutex<Option<WatcherForwardBacklo
 pub struct WatcherForwardBacklog {
     paths: Vec<PathBuf>,
     seen: HashSet<PathBuf>,
+    stamps: WatchedFileStamps,
     /// Paths were dropped, so rust-analyzer must check its manifests itself.
     overflowed: bool,
     /// The watcher lost events; same consequence as `overflowed`.
@@ -8916,17 +9199,38 @@ pub struct WatcherForwardBacklog {
 impl WatcherForwardBacklog {
     /// Add one drain's changes. `extra_config_markers` replaces the previous
     /// value, so the latest configuration decides what counts as config.
+    #[cfg(test)]
     pub(crate) fn merge(
         &mut self,
         paths: &[PathBuf],
         reload_all_rust: bool,
         extra_config_markers: Vec<String>,
     ) {
+        self.merge_with_stamps(
+            paths,
+            reload_all_rust,
+            extra_config_markers,
+            &WatchedFileStamps::new(),
+        );
+    }
+
+    pub(crate) fn merge_with_stamps(
+        &mut self,
+        paths: &[PathBuf],
+        reload_all_rust: bool,
+        extra_config_markers: Vec<String>,
+        stamps: &WatchedFileStamps,
+    ) {
         self.extra_config_markers = extra_config_markers;
         self.reload_all_rust |= reload_all_rust;
         for path in paths {
             if self.overflowed && !self.is_config(path) {
                 continue;
+            }
+            if let Some(stamp) = stamps.get(path) {
+                self.stamps.insert(path.clone(), *stamp);
+            } else {
+                self.stamps.remove(path);
             }
             if !self.seen.insert(path.clone()) {
                 continue;
@@ -8952,6 +9256,7 @@ impl WatcherForwardBacklog {
             self.paths.clear();
         }
         self.seen = self.paths.iter().cloned().collect();
+        self.stamps.retain(|path, _| self.seen.contains(path));
     }
 
     fn is_empty(&self) -> bool {
@@ -8982,7 +9287,11 @@ impl WatcherForwardBacklog {
                 (path, typ)
             })
             .collect();
-        let mut reloads = lsp.forward_watcher_file_events(&events, &self.extra_config_markers);
+        let mut reloads = lsp.forward_watcher_file_events_with_stamps(
+            &events,
+            &self.extra_config_markers,
+            &self.stamps,
+        );
         if self.overflowed || self.reload_all_rust {
             for key in lsp.rust_server_keys() {
                 if !reloads.iter().any(|(known, _)| known == &key) {
@@ -9500,6 +9809,37 @@ fn process_start_durability(error: &LspError) -> FailureDurability {
     }
 }
 
+fn log_spawn_failure(def: &ServerDef, key: &ServerKey, error: &LspError, now: Instant) {
+    let capacity = match error {
+        LspError::Io(io) => io
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<super::client::RustAnalyzerCapacityExhausted>()),
+        _ => None,
+    };
+    if let Some(capacity) = capacity {
+        // Admission is daemon-wide, so separate managers for the same root
+        // must share the log limit. Expire quiet roots instead of retaining
+        // every checkout the daemon has ever seen.
+        static LAST_LOG: std::sync::OnceLock<parking_lot::Mutex<HashMap<PathBuf, Instant>>> =
+            std::sync::OnceLock::new();
+        let mut last_log = LAST_LOG.get_or_init(Default::default).lock();
+        last_log.retain(|_, at| now.saturating_duration_since(*at) < Duration::from_secs(3600));
+        if last_log.contains_key(&key.root) {
+            return;
+        }
+        last_log.insert(key.root.clone(), now);
+        drop(last_log);
+        slog_info!(
+            "rust-analyzer admission deferred root={} cap={} current={}; retry after another worker analyzer stops",
+            key.root.display(),
+            capacity.cap,
+            capacity.current
+        );
+    } else {
+        slog_error!("failed to spawn {}: {}", def.name, error);
+    }
+}
+
 /// Classify a server that died or failed during or after `initialize` from
 /// its failure text and stderr. Only configuration errors AFT recognises are
 /// permanent: typescript-language-server finding no usable TypeScript SDK,
@@ -9542,7 +9882,7 @@ fn env_binary_override_from(
 
 #[cfg(test)]
 #[path = "manager_regression_tests.rs"]
-mod regression_tests;
+pub(crate) mod regression_tests;
 
 #[cfg(all(test, unix))]
 #[path = "startup_regression_tests.rs"]
@@ -9555,6 +9895,10 @@ pub(crate) mod instance_regression_tests;
 #[cfg(test)]
 #[path = "watcher_work_tests.rs"]
 mod watcher_work_tests;
+
+#[cfg(test)]
+#[path = "lifecycle_tests.rs"]
+mod lifecycle_tests;
 
 #[cfg(test)]
 mod env_binary_override_tests {
@@ -10014,6 +10358,68 @@ mod transient_retry_tests {
         assert_eq!(format_retry_delay(Duration::from_secs(45)), "45s");
         assert_eq!(format_retry_delay(Duration::from_secs(120)), "2m");
         assert_eq!(format_retry_delay(Duration::from_secs(270)), "4m 30s");
+    }
+
+    #[test]
+    fn rust_capacity_logs_info_once_per_root_per_hour_across_managers() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = ServerKey {
+            kind: ServerKind::Rust,
+            root: dir.path().join("first"),
+        };
+        let other = ServerKey {
+            root: dir.path().join("second"),
+            ..key.clone()
+        };
+        let def = crate::lsp::registry::builtin_servers()
+            .into_iter()
+            .find(|def| def.kind == ServerKind::Rust)
+            .unwrap();
+        let failure = || {
+            let error = LspError::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                super::super::client::RustAnalyzerCapacityExhausted { cap: 2, current: 3 },
+            ));
+            let durability = process_start_durability(&error);
+            assert_eq!(durability, FailureDurability::Capacity);
+            StartFailure { error, durability }
+        };
+        let (mut first, offset) = manager_with_clock();
+        let mut second = LspManager::new();
+        second.set_retry_clock(first.retry_clock.clone());
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            first.record_file_start_failure(&def, &key, failure());
+            second.record_file_start_failure(&def, &key, failure());
+            offset.store(3_599_999, Ordering::SeqCst);
+            first.record_file_start_failure(&def, &key, failure());
+            second.record_file_start_failure(&def, &other, failure());
+            offset.store(3_600_000, Ordering::SeqCst);
+            second.record_file_start_failure(&def, &key, failure());
+        });
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        for line in &lines {
+            assert!(line.starts_with("INFO "), "{line}");
+            assert!(line.contains("cap=2 current=3"), "{line}");
+        }
+        assert!(lines[0].contains(&key.root.display().to_string()));
+        assert!(lines[1].contains(&other.root.display().to_string()));
+        assert!(lines[2].contains(&key.root.display().to_string()));
+
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            for kind in [std::io::ErrorKind::WouldBlock, std::io::ErrorKind::NotFound] {
+                let error = LspError::Io(std::io::Error::from(kind));
+                let durability = process_start_durability(&error);
+                first.record_file_start_failure(&def, &key, StartFailure { error, durability });
+            }
+        });
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("ERROR "))
+                .count(),
+            2,
+            "real spawn failures must still log ERROR: {lines:?}"
+        );
     }
 
     #[test]

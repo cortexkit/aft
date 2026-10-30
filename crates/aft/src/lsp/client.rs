@@ -46,14 +46,15 @@ const RUST_ANALYZER_WORKER_PROCESS_CAP: usize = 2;
 
 #[derive(Debug)]
 pub(crate) struct RustAnalyzerCapacityExhausted {
-    cap: usize,
+    pub(super) cap: usize,
+    pub(super) current: usize,
 }
 
 impl std::fmt::Display for RustAnalyzerCapacityExhausted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f,
-            "rust_analyzer_capacity_exhausted: daemon-wide worker-policy rust-analyzer process cap={} reached; retry after another worker analyzer stops",
-            self.cap)
+            "rust_analyzer_capacity_exhausted: daemon-wide worker-policy rust-analyzer process cap={} reached (current={}); retry after another worker analyzer stops",
+            self.cap, self.current)
     }
 }
 
@@ -72,7 +73,10 @@ impl RustAnalyzerCapacity {
         if *active >= self.cap {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                RustAnalyzerCapacityExhausted { cap: self.cap },
+                RustAnalyzerCapacityExhausted {
+                    cap: self.cap,
+                    current: *active,
+                },
             ));
         }
         *active += 1;
@@ -987,6 +991,8 @@ pub struct LspClient {
 
     /// Pending request responses, keyed by request ID.
     pending: Arc<Mutex<PendingMap>>,
+    /// Last outbound request or document open/change/save, not server-pushed traffic.
+    last_used_at: Instant,
     /// Next request ID counter.
     next_id: AtomicI64,
     /// Diagnostic capabilities reported by the server in its initialize response.
@@ -1416,6 +1422,7 @@ impl LspClient {
             child_pid,
             writer,
             pending,
+            last_used_at: Instant::now(),
             next_id: AtomicI64::new(1),
             diagnostic_caps: None,
             diagnostic_registrations,
@@ -2294,6 +2301,7 @@ impl LspClient {
             self.remove_pending(&id);
             return Err(err);
         }
+        self.last_used_at = Instant::now();
         Ok(PendingLspRequest {
             id,
             method,
@@ -2324,6 +2332,7 @@ impl LspClient {
         opened: bool,
         saved: Option<(Instant, u64)>,
     ) {
+        self.last_used_at = Instant::now();
         self.note_analysis_document(
             if opened {
                 "textDocument/didOpen"
@@ -2347,6 +2356,12 @@ impl LspClient {
         let params = serde_json::to_value(params)?;
         let notification = Notification::new(N::METHOD, Some(params));
         self.writer.send(serde_json::to_string(&notification)?)?;
+        if matches!(
+            N::METHOD,
+            "textDocument/didOpen" | "textDocument/didChange" | "textDocument/didSave"
+        ) {
+            self.last_used_at = Instant::now();
+        }
         self.note_analysis_document(N::METHOD, notification.params.as_ref().unwrap());
         Ok(())
     }
@@ -2354,7 +2369,24 @@ impl LspClient {
     /// Write an already serialized notification.
     fn send_serialized_notification(&mut self, json: &str) -> Result<(), LspError> {
         self.ensure_can_send()?;
-        self.writer.send(json.to_string())
+        self.writer.send(json.to_string())?;
+        self.last_used_at = Instant::now();
+        Ok(())
+    }
+
+    pub(crate) fn last_used_at(&self) -> Instant {
+        self.last_used_at
+    }
+
+    pub(crate) fn has_pending_requests(&self) -> bool {
+        self.pending
+            .lock()
+            .map_or(true, |pending| !pending.is_empty())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_last_used_at_for_test(&mut self, at: Instant) {
+        self.last_used_at = at;
     }
 
     /// Send `textDocument/didChange` carrying the whole document (see
@@ -3050,6 +3082,26 @@ fn parse_diagnostic_capabilities(value: &Value) -> ServerDiagnosticCapabilities 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_capacity_refusal_reports_cap_and_current_count() {
+        let capacity = Arc::new(RustAnalyzerCapacity {
+            cap: 1,
+            active: Mutex::new(0),
+        });
+        let permit = capacity.acquire().unwrap();
+        let error = capacity.acquire().err().unwrap();
+        let refused = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<RustAnalyzerCapacityExhausted>()
+            .unwrap();
+        assert_eq!(refused.cap, 1);
+        assert_eq!(refused.current, 1);
+        assert!(error.to_string().contains("cap=1 reached (current=1)"));
+        drop(permit);
+        assert!(capacity.acquire().is_ok());
+    }
 
     #[test]
     fn server_instance_allocator_preserves_the_exhaustion_boundary() {
