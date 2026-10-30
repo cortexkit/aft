@@ -270,6 +270,15 @@ fn prepare_snapshot(config: Config, notices: Vec<String>) -> Result<SnapshotPlan
     let report = roots
         .reconcile(&config)
         .map_err(|error| IndexError::validation(error.to_string()))?;
+    for entry in &report.active_entries {
+        let folder = aft::folder_admission_runtime::standalone(&entry.resolved_target, &config)
+            .map_err(|reason| IndexError::validation(format!("folder_not_admitted: {reason}")))?;
+        if folder.classification != aft::folder_admission::FolderClassification::Project {
+            return Err(IndexError::validation(
+                aft::folder_admission_runtime::OFF_TEXT,
+            ));
+        }
+    }
 
     let cache_root = aft::root_cache::cache_root(&config);
     let storage_dir = cache_root.as_path();

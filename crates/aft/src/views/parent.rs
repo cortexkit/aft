@@ -64,17 +64,8 @@ use super::snapshot::{OpenGeneration, Snapshot};
 /// Children past the cap are reported as a named gap, never silently dropped.
 pub const DEFAULT_MAX_CHILD_REPOS: usize = 64;
 
-/// How deep discovery looks for repositories below the parent folder.
-const MAX_DISCOVERY_DEPTH: usize = 3;
-
-/// Upper bound on directory entries discovery examines, so a huge non-project
-/// folder cannot keep the worker walking.
-const MAX_DISCOVERY_ENTRIES: usize = 20_000;
-
-/// Wall-clock budget of the probe configure runs to decide whether a root is
-/// a parent folder. Configure answers a route bind under a deadline, so the
-/// probe stops at the first repository it finds, or when this budget ends.
-const PROBE_BUDGET: Duration = Duration::from_millis(200);
+/// The shared admission probe's default wall-clock budget.
+const PROBE_BUDGET: Duration = Duration::from_millis(100);
 
 /// At most this many paths outside every child are remembered for gap reports.
 const MAX_OUTSIDE_PATHS: usize = 64;
@@ -133,39 +124,6 @@ pub struct Discovery {
     /// Top-level entries of the parent folder that hold files outside every
     /// child (at most [`MAX_OUTSIDE_PATHS`]).
     pub outside: Vec<PathBuf>,
-}
-
-fn is_repository(dir: &Path) -> bool {
-    // A `.git` directory is a primary checkout; a `.git` file is a linked
-    // worktree or submodule checkout. Both own their own indexes.
-    dir.join(".git").exists()
-}
-
-fn home_dir() -> Option<PathBuf> {
-    let home = crate::environment::non_empty_os_var("HOME")
-        .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))?;
-    let home = PathBuf::from(home);
-    Some(std::fs::canonicalize(&home).unwrap_or(home))
-}
-
-/// Per-root pause applied to every directory entry discovery examines, so a
-/// test can make a walk slow without a slow disk.
-fn discovery_delays() -> &'static Mutex<HashMap<PathBuf, Duration>> {
-    static DELAYS: OnceLock<Mutex<HashMap<PathBuf, Duration>>> = OnceLock::new();
-    DELAYS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Slows discovery under `root` by `delay` per examined entry (zero clears
-/// it). Only tests use this.
-#[doc(hidden)]
-pub fn set_discovery_entry_delay(root: &Path, delay: Duration) {
-    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let mut delays = lock(discovery_delays());
-    if delay.is_zero() {
-        delays.remove(&root);
-    } else {
-        delays.insert(root, delay);
-    }
 }
 
 fn discovery_holds() -> &'static Mutex<HashMap<PathBuf, Arc<DiscoveryHoldState>>> {
@@ -230,98 +188,75 @@ fn wait_for_discovery_hold(root: &Path) {
     }
 }
 
-/// Canonical `root` when it may be a parent folder: not inside a git checkout
-/// (which keeps its own indexes) and not the home folder (which indexes
-/// nothing).
-fn candidate_root(root: &Path) -> Option<PathBuf> {
-    let root = std::fs::canonicalize(root).ok()?;
-    if root.ancestors().any(is_repository) {
-        return None;
-    }
-    if home_dir().is_some_and(|home| home == root) {
-        return None;
-    }
-    Some(root)
-}
-
 /// What a walk found, and whether it finished.
 struct Walk {
     repositories: Vec<PathBuf>,
     outside: Vec<PathBuf>,
 }
 
-/// Walks `root` for repositories. `stop` is asked after each entry; when it
-/// answers true the walk ends with what it found so far.
-fn walk(root: &Path, stop: &dyn Fn(&Walk) -> bool) -> Walk {
-    let delay = lock(discovery_delays()).get(root).copied();
+fn discovery_from_admission(
+    root: &Path,
+    admission: &crate::folder_admission::FolderAdmission,
+    cap: usize,
+) -> Discovery {
     let mut found = Walk {
         repositories: Vec::new(),
         outside: Vec::new(),
     };
-    let Some(boundary) = crate::watcher_filter::WatcherWalkBoundary::for_root(root) else {
-        return found;
-    };
-    let mut examined = 0usize;
-    let mut pending = vec![(root.to_path_buf(), 0usize)];
-    while let Some((dir, depth)) = pending.pop() {
-        if !boundary.allows_directory(&dir) {
+    let boundary = crate::watcher_filter::WatcherWalkBoundary::for_root(root);
+    for candidate in &admission.child_roots {
+        let child = std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.clone());
+        if !child.starts_with(root) || crate::project_content::is_excluded(&child) {
             continue;
         }
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+        let hidden = child.strip_prefix(root).ok().is_none_or(|relative| {
+            relative
+                .components()
+                .any(|part| part.as_os_str().to_string_lossy().starts_with('.'))
+        });
+        if hidden {
             continue;
-        };
-        let mut entries = entries.flatten().collect::<Vec<_>>();
-        entries.sort_by_key(|entry| entry.file_name());
-        let mut subdirectories = Vec::new();
-        for entry in entries {
-            examined += 1;
-            if examined > MAX_DISCOVERY_ENTRIES || stop(&found) {
-                return found;
-            }
-            if let Some(delay) = delay {
-                std::thread::sleep(delay);
-            }
-            let name = entry.file_name();
-            let hidden = name.to_str().is_none_or(|name| name.starts_with('.'));
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            // Symlinks are not followed: a link to a repository elsewhere
-            // would make the parent serve a checkout outside its folder.
-            if hidden || kind.is_symlink() {
-                continue;
-            }
-            let path = entry.path();
-            if kind.is_dir() {
-                if !boundary.allows_directory(&path) {
-                    // Another drive or filesystem: never opened, but reported
-                    // as unsearched so results over it don't read as complete.
-                    note_outside(&mut found, root, &path);
-                    continue;
-                }
-                if name
-                    .to_str()
-                    .is_some_and(|name| SKIPPED_DIRECTORY_NAMES.contains(&name))
-                {
-                    continue;
-                }
-                if is_repository(&path) {
-                    found.repositories.push(path);
-                } else if depth + 1 < MAX_DISCOVERY_DEPTH {
-                    subdirectories.push(path);
-                } else {
-                    note_outside(&mut found, root, &path);
-                }
-            } else {
-                note_outside(&mut found, root, &path);
-            }
         }
-        // Depth-first in reverse so directories are visited in name order.
-        for subdirectory in subdirectories.into_iter().rev() {
-            pending.push((subdirectory, depth + 1));
+        if boundary.as_ref().is_none_or(|boundary| {
+            child
+                .ancestors()
+                .take_while(|path| path.starts_with(root))
+                .any(|path| !boundary.allows_directory(path))
+        }) {
+            note_outside(&mut found, root, &child);
+            continue;
+        }
+        found.repositories.push(child);
+    }
+    for path in &admission.outside_paths {
+        note_outside(&mut found, root, path);
+    }
+    if !admission.coverage.complete {
+        for path in &admission.immediate_directories {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            if !name.starts_with('.')
+                && !SKIPPED_DIRECTORY_NAMES.contains(&name)
+                && !found.repositories.iter().any(|child| child == path)
+            {
+                note_outside(&mut found, root, path);
+            }
         }
     }
-    found
+    found.repositories.sort();
+    found.repositories.dedup();
+    let skipped = found
+        .repositories
+        .split_off(found.repositories.len().min(cap));
+    found.outside.sort();
+    Discovery {
+        root: root.to_path_buf(),
+        children: found.repositories,
+        skipped,
+        outside: found.outside,
+    }
 }
 
 /// Records the top-level entry of `root` that holds `path`: gaps name
@@ -338,45 +273,12 @@ fn note_outside(found: &mut Walk, root: &Path, path: &Path) {
     }
 }
 
-/// Finds the child repositories of `root`, keeping at most `cap`.
-///
-/// `None` means `root` is not a parent folder: it is inside a git checkout,
-/// it is the home folder, or it holds no repository within
-/// [`MAX_DISCOVERY_DEPTH`].
+/// Bounded workspace classification and child membership for an explicit probe.
 pub fn discover(root: &Path, cap: usize) -> Option<Discovery> {
-    let root = candidate_root(root)?;
-    let found = walk(&root, &|_| false);
-    if found.repositories.is_empty() {
-        return None;
-    }
-    let mut repositories = found
-        .repositories
-        .into_iter()
-        .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
-        .collect::<Vec<_>>();
-    repositories.sort_by(|left, right| left.as_os_str().cmp(right.as_os_str()));
-    repositories.dedup();
-    let skipped = repositories.split_off(repositories.len().min(cap));
-    let mut outside = found.outside;
-    outside.sort();
-    Some(Discovery {
-        root,
-        children: repositories,
-        skipped,
-        outside,
-    })
-}
-
-/// Configure's decision: does `root` hold a repository? Stops at the first
-/// one found or after `budget`, whichever comes first. A root whose
-/// repositories are not found within the budget keeps its own index.
-fn probe(root: &Path, budget: Duration) -> Option<PathBuf> {
-    let root = candidate_root(root)?;
-    let deadline = Instant::now() + budget;
-    let found = walk(&root, &|found| {
-        !found.repositories.is_empty() || Instant::now() >= deadline
-    });
-    (!found.repositories.is_empty()).then_some(root)
+    let root = std::fs::canonicalize(root).ok()?;
+    let admission = crate::folder_admission::probe(&root, &Default::default(), Default::default());
+    (admission.classification == crate::folder_admission::FolderClassification::Workspace)
+        .then(|| discovery_from_admission(&root, &admission, cap))
 }
 
 // ---------------------------------------------------------------------------
@@ -394,7 +296,14 @@ pub struct RequestedPlanes {
 
 #[derive(Default)]
 struct Registry {
-    prepared: HashMap<PathBuf, RequestedPlanes>,
+    prepared: HashMap<
+        PathBuf,
+        (
+            RequestedPlanes,
+            Discovery,
+            crate::folder_admission::ProjectDetectionConfig,
+        ),
+    >,
     sessions: HashMap<PathBuf, Arc<ParentSession>>,
 }
 
@@ -407,24 +316,62 @@ fn registry() -> &'static Mutex<Registry> {
 /// parent folder and remembers the requested planes for [`activate`]. True
 /// means the root must build no index of its own.
 ///
-/// This runs on the configure path, so it only probes: it returns at the
-/// first repository found or after a short wall-clock budget. The full walk
-/// for every child runs later, on the session worker.
+/// Configure instead passes its deferred admission snapshot to [`prepare_admitted`].
 pub fn prepare(root: &Path, planes: RequestedPlanes) -> bool {
     prepare_with_budget(root, planes, PROBE_BUDGET)
 }
 
 pub fn prepare_with_budget(root: &Path, planes: RequestedPlanes, budget: Duration) -> bool {
-    let Some(root) = probe(root, budget) else {
+    let admission = crate::folder_admission::probe(
+        root,
+        &Default::default(),
+        crate::folder_admission::ProbeBudgets {
+            time: budget,
+            ..Default::default()
+        },
+    );
+    prepare_admitted(root, planes, &admission, &Default::default())
+}
+
+pub(crate) fn prepare_admitted(
+    root: &Path,
+    planes: RequestedPlanes,
+    admission: &crate::folder_admission::FolderAdmission,
+    detection: &crate::folder_admission::ProjectDetectionConfig,
+) -> bool {
+    if admission.classification != crate::folder_admission::FolderClassification::Workspace {
         return false;
-    };
-    lock(registry()).prepared.insert(root, planes);
+    }
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let discovery = discovery_from_admission(&root, admission, DEFAULT_MAX_CHILD_REPOS);
+    lock(registry())
+        .prepared
+        .insert(root, (planes, discovery, detection.clone()));
     true
+}
+
+pub(crate) fn prepared_matches_active(ctx: &crate::context::AppContext, root: &Path) -> bool {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let registry = lock(registry());
+    registry
+        .prepared
+        .get(&root)
+        .zip(registry.sessions.get(&root))
+        .is_some_and(|((planes, discovery, detection), session)| {
+            !session.stopped()
+                && session.planes == *planes
+                && session.classified == *discovery
+                && session.project_detection == *detection
+                && lock(&session.holders)
+                    .iter()
+                    .any(|holder| holder.id == context_id(ctx) && holder.holds())
+        })
 }
 
 /// Who holds a session: one bound context, tracked without a reference that
 /// would keep it alive.
 struct Holder {
+    workspace_allowed: Arc<AtomicBool>,
     /// The context's address, unique while the context lives.
     id: usize,
     /// Upgradeable while the context lives: the context owns the only
@@ -436,6 +383,7 @@ struct Holder {
 impl Holder {
     fn of(ctx: &crate::context::AppContext) -> Self {
         Self {
+            workspace_allowed: ctx.folder_admission().workspace_gate(),
             id: context_id(ctx),
             alive: Arc::downgrade(&ctx.configure_generation_flag()),
             lifecycle: ctx.subc_lifecycle_admission(),
@@ -445,7 +393,9 @@ impl Holder {
     /// True while the context lives and its routes have not all been closed
     /// past the unbind grace period.
     fn holds(&self) -> bool {
-        self.alive.strong_count() > 0 && !self.lifecycle.unbound_past_grace()
+        self.workspace_allowed.load(Ordering::Acquire)
+            && self.alive.strong_count() > 0
+            && !self.lifecycle.unbound_past_grace()
     }
 }
 
@@ -470,7 +420,7 @@ pub fn activate(
     let trigram_policy = crate::blob_store::v2::TrigramPolicy {
         max_file_size: ctx.config().search_index_max_file_size,
     };
-    let Some(planes) = registry.prepared.remove(&root) else {
+    let Some((planes, discovery, detection)) = registry.prepared.remove(&root) else {
         if let Some(session) = registry.sessions.get(&root) {
             session.release(context_id(ctx));
         }
@@ -483,16 +433,25 @@ pub fn activate(
             && existing.planes == planes
             && existing.storage == storage
             && existing.trigram_policy == trigram_policy
+            && existing.classified == discovery
+            && existing.project_detection == detection
         {
+            ctx.folder_admission().allow_workspace();
             existing.hold(Holder::of(ctx));
             return true;
         }
     }
+    if let Some(existing) = registry.sessions.get(&root) {
+        existing.stop();
+    }
+    ctx.folder_admission().allow_workspace();
     let session = ParentSession::start(
         root.clone(),
+        discovery,
         planes,
         storage.to_path_buf(),
         semantic.clone(),
+        detection,
         trigram_policy,
         Holder::of(ctx),
     );
@@ -505,8 +464,11 @@ pub fn activate(
 /// True when `ctx` holds the running parent session for `root`.
 pub fn held_by(ctx: &crate::context::AppContext, root: &Path) -> bool {
     let id = context_id(ctx);
-    session_for_root(root)
-        .is_some_and(|session| lock(&session.holders).iter().any(|holder| holder.id == id))
+    session_for_root(root).is_some_and(|session| {
+        lock(&session.holders)
+            .iter()
+            .any(|holder| holder.id == id && holder.holds())
+    })
 }
 
 /// Called whenever `ctx` binds a root: `ctx` stops holding every parent
@@ -542,6 +504,11 @@ pub(crate) fn release_context(ctx: &crate::context::AppContext) -> bool {
         true
     });
     released
+}
+
+pub(crate) fn forget_prepared(root: &Path) {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    lock(registry()).prepared.remove(&root);
 }
 
 /// Drops the parent session for `root`, if any: its worker stops and every
@@ -586,7 +553,12 @@ pub fn session_for(ctx: &crate::context::AppContext) -> Option<Arc<ParentSession
     if !config.views.enabled {
         return None;
     }
-    session_for_root(config.project_root.as_deref()?)
+    let root = config.project_root.as_deref()?;
+    let session = session_for_root(root)?;
+    let held = lock(&session.holders)
+        .iter()
+        .any(|holder| holder.id == context_id(ctx) && holder.holds());
+    held.then_some(session)
 }
 
 /// Routes changed paths from a file watcher to the parent sessions whose
@@ -822,10 +794,16 @@ impl Child {
     }
 
     /// The child's artifact family, the same key its own sessions use.
-    fn family(&self, storage: &Path) -> Result<&str, String> {
+    fn family(&self, session: &ParentSession) -> Result<&str, String> {
+        crate::folder_admission_runtime::admit_borrowed(
+            &self.root,
+            &session.storage,
+            &session.project_detection,
+        )?;
         if self.family.get().is_none() {
-            let key = crate::search_index::artifact_cache_key_read_only(&self.root, storage)
-                .map_err(|error| error.to_string())?;
+            let key =
+                crate::search_index::artifact_cache_key_read_only(&self.root, &session.storage)
+                    .map_err(|error| error.to_string())?;
             let _ = self.family.set(key);
         }
         Ok(self.family.get().expect("resolved child family"))
@@ -892,6 +870,8 @@ pub(crate) struct ParentSemantic {
 
 /// A parent folder's session state, shared by every context bound to it.
 pub struct ParentSession {
+    classified: Discovery,
+    project_detection: crate::folder_admission::ProjectDetectionConfig,
     root: PathBuf,
     pub(crate) planes: RequestedPlanes,
     storage: PathBuf,
@@ -920,14 +900,18 @@ pub struct ParentSession {
 impl ParentSession {
     fn start(
         root: PathBuf,
+        classified: Discovery,
         planes: RequestedPlanes,
         storage: PathBuf,
         semantic_config: crate::config::SemanticBackendConfig,
+        project_detection: crate::folder_admission::ProjectDetectionConfig,
         trigram_policy: crate::blob_store::v2::TrigramPolicy,
         holder: Holder,
     ) -> Arc<Self> {
         let root_for_backstop = root.clone();
         let session = Arc::new(Self {
+            classified,
+            project_detection,
             root,
             planes,
             storage,
@@ -1009,7 +993,7 @@ impl ParentSession {
     /// True once the session stopped: no context holds it any more, or it was
     /// replaced or deactivated.
     pub fn stopped(&self) -> bool {
-        self.stop.load(Ordering::SeqCst)
+        self.stop.load(Ordering::SeqCst) || !self.held()
     }
 
     /// Holds (or releases) the worker's rounds. Queries keep being answered

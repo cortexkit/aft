@@ -1511,7 +1511,7 @@ fn dispatch_command(req: RawRequest, ctx: &AppContext) -> Response {
     aft::commands::tool_call::register_dispatch(dispatch);
     // A parent folder session answers index-backed commands from its child
     // repositories' own indexes (grep and glob fan out inside their handlers).
-    if let Some(response) = aft::views::parent::route(&req, ctx) {
+    if let Some(response) = aft::folder_admission_runtime::route_index_command(&req, ctx) {
         return response;
     }
     match req.command.as_str() {
@@ -1841,6 +1841,9 @@ fn dispatch_outcome(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
 }
 
 fn dispatch_outcome_on_route(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
+    if let Some(response) = aft::folder_admission_runtime::route_refusal(&req, ctx) {
+        return DispatchOutcome::Immediate(response);
+    }
     if req.worker_session() {
         ctx.disable_rust_cargo_for_worker();
     }

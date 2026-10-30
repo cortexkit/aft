@@ -806,6 +806,9 @@ fn cancelled_search_response_from_id(request_id: &str) -> Response {
 }
 
 pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
+    if let Some(response) = crate::folder_admission_runtime::route_index_command(req, ctx) {
+        return response;
+    }
     let mut response = handle_semantic_search_with_disk_fallback(req, ctx, false);
     if let Some(reason) = ctx.cache_unavailable_reason() {
         let code = crate::root_cache::cache_status_code(&reason);

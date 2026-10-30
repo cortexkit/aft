@@ -50,7 +50,7 @@ pub(crate) fn fallback_walks_for_test() -> usize {
     FALLBACK_WALKS.with(std::cell::Cell::get)
 }
 
-fn fallback_walk_limit() -> usize {
+pub(crate) fn fallback_walk_limit() -> usize {
     #[cfg(test)]
     {
         WALK_LIMIT.with(|limit| limit.get())
@@ -76,7 +76,7 @@ pub(crate) fn with_walk_limit<R>(limit: usize, run: impl FnOnce() -> R) -> R {
 pub(crate) const FALLBACK_WALK_BUDGET: Duration = Duration::from_secs(10);
 const FALLBACK_WALK_RETURN_MARGIN: Duration = Duration::from_millis(100);
 
-fn fallback_walk_budget() -> Duration {
+pub(crate) fn fallback_walk_budget() -> Duration {
     #[cfg(test)]
     {
         return WALK_BUDGET.with(std::cell::Cell::get);
@@ -174,6 +174,12 @@ pub(crate) struct ScopeFileCounts {
     pub filtered: usize,
     pub eligible: usize,
     pub entries_visited: usize,
+    pub bounded_walk_stop: Option<crate::bounded_folder_walk::Stop>,
+    pub bytes_read: usize,
+    pub errors: usize,
+    pub entry_budget: usize,
+    pub file_budget: usize,
+    pub time_budget_ms: u128,
 }
 
 impl ScopeFileCounts {
@@ -183,6 +189,17 @@ impl ScopeFileCounts {
         self.filtered += other.filtered;
         self.eligible += other.eligible;
         self.entries_visited += other.entries_visited;
+        self.bytes_read += other.bytes_read;
+        self.errors += other.errors;
+        self.entry_budget += other.entry_budget;
+        self.file_budget += other.file_budget;
+        self.time_budget_ms = self.time_budget_ms.max(other.time_budget_ms);
+        if self
+            .bounded_walk_stop
+            .is_none_or(|stop| stop == crate::bounded_folder_walk::Stop::Complete)
+        {
+            self.bounded_walk_stop = other.bounded_walk_stop.or(self.bounded_walk_stop);
+        }
     }
 
     pub(crate) fn empty_note(&self, include_only: bool) -> String {
@@ -785,6 +802,24 @@ fn execute_root_profiled(
         return (
             empty_grep_result(IndexStatus::Fallback, false),
             GrepExecutionPhaseTimings::default(),
+        );
+    }
+    if crate::folder_admission_runtime::bounded_query(ctx) {
+        let (result, counts) = unadmitted_grep(
+            pattern,
+            root,
+            filters,
+            params,
+            max_results,
+            project_root,
+            order,
+        );
+        return (
+            result,
+            GrepExecutionPhaseTimings {
+                walk_counts: Some(counts),
+                ..Default::default()
+            },
         );
     }
     // Explicit single-file scope: search the named file directly, bypassing the
@@ -2329,7 +2364,37 @@ fn fallback_search_file(
             return Vec::new();
         }
     };
-    if crate::search_index::is_binary_bytes(&bytes) {
+    fallback_search_bytes(
+        file,
+        &bytes,
+        pattern,
+        max_results,
+        stop_after,
+        total_matches,
+        files_searched,
+        files_with_matches,
+        truncated,
+        engine_capped,
+        job_cancellation,
+        deadline,
+    )
+}
+
+fn fallback_search_bytes(
+    file: &PathBuf,
+    bytes: &[u8],
+    pattern: &CompiledPattern,
+    max_results: usize,
+    stop_after: usize,
+    total_matches: &AtomicUsize,
+    files_searched: &AtomicUsize,
+    files_with_matches: &AtomicUsize,
+    truncated: &AtomicBool,
+    engine_capped: &AtomicBool,
+    job_cancellation: Option<&crate::executor::JobCancellation>,
+    deadline: Option<Instant>,
+) -> Vec<GrepMatch> {
+    if crate::search_index::is_binary_bytes(bytes) {
         return Vec::new();
     }
     let content = bytes;
@@ -2419,6 +2484,122 @@ fn fallback_search_file(
     }
 
     matches
+}
+
+fn unadmitted_grep(
+    pattern: &CompiledPattern,
+    root: &ResolvedRoot,
+    filters: &PathFilters,
+    params: &GrepParams,
+    max_results: usize,
+    project_root: &Path,
+    order: GrepScanOrder,
+) -> (GrepResult, ScopeFileCounts) {
+    use crate::bounded_folder_walk::{Stop, BYTE_BUDGET};
+    let deadline = Instant::now() + fallback_walk_budget();
+    let mut walk = crate::bounded_folder_walk::walk(
+        &root.filter_root,
+        &root.search_root,
+        filters,
+        fallback_walk_limit(),
+        fallback_walk_budget(),
+        root.ignored_target,
+    );
+    if order == GrepScanOrder::Path {
+        walk.files.sort();
+    }
+    let total = AtomicUsize::new(0);
+    let searched = AtomicUsize::new(0);
+    let matched = AtomicUsize::new(0);
+    let truncated = AtomicBool::new(false);
+    let capped = AtomicBool::new(false);
+    let cancellation = crate::executor::current_job_cancellation();
+    let mut result = empty_grep_result(IndexStatus::Fallback, false);
+    for file in &walk.files {
+        if Instant::now() >= deadline {
+            walk.stop = Stop::TimeBudget;
+            break;
+        }
+        if cancellation
+            .as_ref()
+            .is_some_and(|c| c.cancel_requested_before_commit())
+        {
+            walk.stop = Stop::Cancelled;
+            break;
+        }
+        if params
+            .path_exclusion
+            .is_some_and(|exclude| exclude(file, project_root))
+        {
+            continue;
+        }
+        let remaining = BYTE_BUDGET.saturating_sub(walk.bytes_read);
+        if remaining <= 1 {
+            walk.stop = Stop::ByteBudget;
+            break;
+        }
+        match crate::project_content::read_limited(
+            file,
+            Some(deadline),
+            remaining - 1,
+            root.authorized_task_artifact,
+        ) {
+            Ok((bytes, cut)) => {
+                walk.bytes_read += bytes.len() + usize::from(cut);
+                result.matches.extend(fallback_search_bytes(
+                    file,
+                    &bytes,
+                    pattern,
+                    max_results,
+                    max_results.saturating_mul(2),
+                    &total,
+                    &searched,
+                    &matched,
+                    &truncated,
+                    &capped,
+                    cancellation.as_ref(),
+                    Some(deadline),
+                ));
+                if cut {
+                    walk.stop = Stop::ByteBudget;
+                    break;
+                }
+            }
+            Err(error) => {
+                walk.errors += 1;
+                walk.stop = if error.kind() == std::io::ErrorKind::TimedOut {
+                    Stop::TimeBudget
+                } else {
+                    Stop::IoError
+                };
+            }
+        }
+        if truncated.load(Ordering::Relaxed) {
+            break;
+        }
+    }
+    let counts = ScopeFileCounts {
+        examined: walk.files_examined,
+        ignored: walk.ignored,
+        filtered: walk.filtered,
+        eligible: walk.files.len(),
+        entries_visited: walk.entries_visited,
+        bounded_walk_stop: Some(walk.stop),
+        bytes_read: walk.bytes_read,
+        errors: walk.errors,
+        entry_budget: walk.entry_budget,
+        file_budget: walk.file_budget,
+        time_budget_ms: walk.time_budget_ms,
+    };
+    result.total_matches = total.load(Ordering::Relaxed);
+    result.files_searched = searched.load(Ordering::Relaxed);
+    result.files_read_directly = result.files_searched;
+    result.files_with_matches = matched.load(Ordering::Relaxed);
+    result.truncated = truncated.load(Ordering::Relaxed);
+    result.engine_capped = capped.load(Ordering::Relaxed);
+    result.walk_truncated = walk.stop != Stop::Complete;
+    result.scan_deadline_reached = walk.stop == Stop::TimeBudget;
+    (result, counts)
 }
 
 fn fallback_line_details_bytes<'a>(

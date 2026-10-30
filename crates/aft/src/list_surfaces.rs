@@ -355,6 +355,36 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "folder_admission_runtime.rs",
+        enclosing_item: "load_raw, persist",
+        location_or_primitive: "CACHE_BYTES, take",
+        reason: "Private admission-metadata input/output bound, not an agent result list; an oversized or invalid record is discarded before any index is loaded.",
+    },
+    ExclusionEntry {
+        file: "bounded_io.rs",
+        enclosing_item: "regular_read_with_limit",
+        location_or_primitive: "take, truncate",
+        reason: "Physical source-read byte budget with a counted look-ahead and explicit cut flag; grep reports that cut through its query coverage and list envelope.",
+    },
+    ExclusionEntry {
+        file: "bounded_folder_walk.rs",
+        enclosing_item: "walk_inner, load",
+        location_or_primitive: "entry_budget, file_budget, BYTE_BUDGET, deadline",
+        reason: "Shared query enumeration bound, surfaced by the registered grep/glob envelopes; Outcome carries stop reason and pre-filter observed counts, never a complete empty claim after a cut.",
+    },
+    ExclusionEntry {
+        file: "views/parent.rs",
+        enclosing_item: "discovery_from_admission, note_outside",
+        location_or_primitive: "split_off, MAX_OUTSIDE_PATHS",
+        reason: "Bounded workspace fan-out and named outside-scope gaps, not an index file cap. Omitted child roots remain in Discovery.skipped and query gaps; admission coverage retains sample incompleteness.",
+    },
+    ExclusionEntry {
+        file: "grep_executor.rs",
+        enclosing_item: "unadmitted_grep",
+        location_or_primitive: "BYTE_BUDGET",
+        reason: "Aggregate filesystem-read bound for an unindexed query; query_walk exposes its byte_budget stop and counts, and the grep envelope marks the answer incomplete.",
+    },
+    ExclusionEntry {
         file: "folder_admission.rs",
         enclosing_item: "probe_with_read_dir, walk, time_left, validated_git_worktree",
         location_or_primitive: "ProbeBudgets entries, time, depth, per_directory",

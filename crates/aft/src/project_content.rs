@@ -408,6 +408,28 @@ pub(crate) fn read_bounded(
     crate::bounded_io::read(path, deadline)
 }
 
+pub(crate) fn read_limited(
+    path: &Path,
+    deadline: Option<std::time::Instant>,
+    limit: usize,
+    authorized_task_artifact: bool,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    if authorized_task_artifact {
+        if is_sqlite_or_metadata(path) || std::fs::symlink_metadata(path)?.file_type().is_symlink()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "SQLite files and aliases are not readable task content",
+            ));
+        }
+    } else {
+        admit(path, None)?;
+    }
+    #[cfg(test)]
+    record_open(path);
+    crate::bounded_io::read_limited(path, deadline, limit)
+}
+
 /// Guard direct source reads as well as enumeration. Watcher deltas and queued
 /// view work can hold paths admitted before storage was configured.
 pub(crate) fn read(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {

@@ -135,11 +135,15 @@ pub(crate) mod work_probe {
 pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
     let config = ctx.config();
     let _pin = config.views.enabled.then(|| ctx.pin_config_to(config));
-    ctx.with_read_policy_snapshot(&req.id, || {
+    let mut response = ctx.with_read_policy_snapshot(&req.id, || {
         crate::context::confinement::with_floor_disclosure(|| {
             crate::bounded_io::command(req, ctx, handle_grep_inner)
         })
-    })
+    });
+    if response.success {
+        crate::folder_admission_runtime::decorate(ctx, &mut response, false, req.session());
+    }
+    response
 }
 
 fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -268,6 +272,7 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // Child indexes intentionally omit ignored targets, just like the local
     // index. An explicitly named ignored root must use the direct walk instead.
     let parent_answer = if crate::context::confinement::active()
+        || !crate::folder_admission_runtime::workspace_current(ctx)
         || scope.roots.iter().any(|root| root.ignored_target)
     {
         None
@@ -288,18 +293,31 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     }
     let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
     let scope_probe_started = std::time::Instant::now();
-    let scope_presence = phases
-        .indexed_scope_has_files
-        .or_else(|| {
-            phases.walk_counts.and_then(|counts| {
-                (!result.walk_truncated && result.skipped_foreign_mounts == 0)
-                    .then_some(counts.eligible > 0)
+    let bounded_walk = phases
+        .walk_counts
+        .filter(|counts| counts.bounded_walk_stop.is_some());
+    let scope_presence = if let Some(counts) = bounded_walk {
+        if counts.eligible > 0 {
+            Some(true)
+        } else if result.walk_truncated {
+            None
+        } else {
+            Some(false)
+        }
+    } else {
+        phases
+            .indexed_scope_has_files
+            .or_else(|| {
+                phases.walk_counts.and_then(|counts| {
+                    (!result.walk_truncated && result.skipped_foreign_mounts == 0)
+                        .then_some(counts.eligible > 0)
+                })
             })
-        })
-        .or_else(|| grep_executor::scope_has_files(&scope, &filters));
+            .or_else(|| grep_executor::scope_has_files(&scope, &filters))
+    };
     let scope_has_files = scope_presence != Some(false);
     let empty_counts = if !scope_has_files {
-        grep_executor::scope_file_counts(&scope, &filters)
+        bounded_walk.or_else(|| grep_executor::scope_file_counts(&scope, &filters))
     } else {
         None
     };
@@ -334,6 +352,7 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut body = serde_json::json!({
         "text": text,
         "complete": scope_presence.is_some() && !result.walk_truncated
+            && !(bounded_walk.is_some() && (result.truncated || result.engine_capped))
             && (scope_has_files || empty_counts.is_some())
             && !result.scan_deadline_reached
             && result.skipped_foreign_mounts == 0
@@ -362,6 +381,13 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         "truncated": result.truncated,
         "search_ms": (search_ms * 1000.0).round() / 1000.0,
     });
+    if let Some(counts) = bounded_walk {
+        body["query_walk"] = serde_json::json!({"stop": counts.bounded_walk_stop, "entries_visited": counts.entries_visited,
+            "files_examined": counts.examined, "eligible_files": counts.eligible, "ignored": counts.ignored,
+            "filtered": counts.filtered, "bytes_read": counts.bytes_read, "errors": counts.errors,
+            "entry_budget": counts.entry_budget, "file_budget": counts.file_budget, "per_root_time_budget_ms": counts.time_budget_ms,
+            "per_root_byte_budget": crate::bounded_folder_walk::BYTE_BUDGET});
+    }
     if !result.index_read_gaps.is_empty() {
         body["index_read_gap"] = serde_json::json!(result.index_read_gaps);
         if let Some(text) = body["text"].as_str() {
@@ -379,12 +405,15 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             .to_string(),
         );
     }
-    if result.walk_truncated {
+    if result.walk_truncated && bounded_walk.is_none() {
         body["walk_truncated"] = serde_json::Value::Bool(true);
         let note = walk_coverage_note(&result).unwrap_or_else(|| {
             "(Fallback directory walk stopped early: file-count or time budget reached; results may be incomplete.)".to_string()
         });
         body["text"] = serde_json::Value::String(format!("{}\n\n{}", text, note));
+    }
+    if result.walk_truncated {
+        body["walk_truncated"] = serde_json::Value::Bool(true);
     }
     if result.scan_deadline_reached {
         // The scan ran out of time with candidate files still unread, so a

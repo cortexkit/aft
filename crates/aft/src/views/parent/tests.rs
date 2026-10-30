@@ -2,6 +2,26 @@
 
 use super::*;
 
+fn isolated<R>(root: &Path, body: impl FnOnce() -> R) -> R {
+    crate::git_probe::with_child_env_for_test(
+        &[(
+            "GIT_CEILING_DIRECTORIES",
+            root.parent().unwrap().as_os_str(),
+        )],
+        body,
+    )
+}
+
+fn discover(root: &Path, cap: usize) -> Option<Discovery> {
+    isolated(root, || super::discover(root, cap))
+}
+fn prepare(root: &Path, planes: RequestedPlanes) -> bool {
+    isolated(root, || super::prepare(root, planes))
+}
+fn prepare_with_budget(root: &Path, planes: RequestedPlanes, budget: Duration) -> bool {
+    isolated(root, || super::prepare_with_budget(root, planes, budget))
+}
+
 #[cfg(unix)]
 #[test]
 fn discovery_skips_repositories_on_different_devices() {
@@ -11,15 +31,17 @@ fn discovery_skips_repositories_on_different_devices() {
     git_init(&root.join("mounted").join("external"));
     crate::watcher_filter::EXCLUSION_TEST_DEVICE
         .with(|device| *device.borrow_mut() = Some(root.join("mounted")));
-    let found = walk(&root, &|_| false);
+    let found = discover(&root, DEFAULT_MAX_CHILD_REPOS).unwrap();
     crate::watcher_filter::EXCLUSION_TEST_DEVICE.with(|device| *device.borrow_mut() = None);
-    assert_eq!(found.repositories, vec![root.join("local")]);
+    assert_eq!(found.children, vec![root.join("local")]);
+    assert!(found.outside.contains(&root.join("mounted")));
 }
 
 fn git_init(dir: &Path) {
     std::fs::create_dir_all(dir).unwrap();
-    // Discovery only looks for the `.git` marker, so an empty one suffices.
-    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    let mut command = std::process::Command::new("git");
+    crate::test_env::apply_hermetic_git_env(command.current_dir(dir));
+    assert!(command.args(["init", "-q"]).status().unwrap().success());
 }
 
 #[test]
@@ -50,6 +72,8 @@ fn discovery_refuses_checkouts_and_folders_without_repositories() {
     let root = std::fs::canonicalize(temp.path()).unwrap();
     assert!(discover(&root, DEFAULT_MAX_CHILD_REPOS).is_none());
     git_init(&root.join("child"));
+    assert!(discover(&root, DEFAULT_MAX_CHILD_REPOS).is_none());
+    git_init(&root.join("second"));
     assert!(discover(&root, DEFAULT_MAX_CHILD_REPOS).is_some());
     // A subfolder of a checkout keeps the checkout's own indexes.
     assert!(discover(&root.join("child"), DEFAULT_MAX_CHILD_REPOS).is_none());
@@ -178,6 +202,7 @@ fn activate_requires_prepare_and_deactivate_stops_the_session() {
     let temp = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(temp.path()).unwrap();
     git_init(&root.join("child"));
+    git_init(&root.join("second"));
     let storage = tempfile::tempdir().unwrap();
     let semantic = crate::config::SemanticBackendConfig::default();
     let ctx = context();
@@ -219,6 +244,7 @@ fn session_stops_when_its_only_context_binds_another_root() {
     let temp = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(temp.path()).unwrap();
     git_init(&root.join("child"));
+    git_init(&root.join("second"));
     let storage = tempfile::tempdir().unwrap();
     let semantic = crate::config::SemanticBackendConfig::default();
     let first = context();
@@ -245,6 +271,7 @@ fn session_stops_when_its_context_is_dropped() {
     let temp = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(temp.path()).unwrap();
     git_init(&root.join("child"));
+    git_init(&root.join("second"));
     let storage = tempfile::tempdir().unwrap();
     let semantic = crate::config::SemanticBackendConfig::default();
     let ctx = context();
@@ -260,21 +287,12 @@ fn session_stops_when_its_context_is_dropped() {
 fn configure_probe_is_bounded_by_wall_clock_time() {
     let temp = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(temp.path()).unwrap();
-    for index in 0..20 {
-        std::fs::create_dir_all(root.join(format!("plain-{index:02}"))).unwrap();
-    }
-    git_init(&root.join("zz-repo"));
-    set_discovery_entry_delay(&root, Duration::from_millis(50));
+    git_init(&root.join("one"));
+    git_init(&root.join("two"));
     let started = Instant::now();
-    // The only repository sorts last, past the budget: the probe gives up
-    // and the root keeps its own index rather than stalling configure.
-    assert!(!prepare_with_budget(
-        &root,
-        PLANES,
-        Duration::from_millis(200)
-    ));
+    // An injected zero deadline rejects evidence without relying on disk speed.
+    assert!(!prepare_with_budget(&root, PLANES, Duration::ZERO));
     assert!(started.elapsed() < Duration::from_millis(600));
-    set_discovery_entry_delay(&root, Duration::ZERO);
     assert!(prepare_with_budget(
         &root,
         PLANES,

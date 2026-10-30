@@ -124,7 +124,7 @@ function buildSchema(): Record<string, unknown> {
         type: "object",
         additionalProperties: false,
         description:
-          "User-only folder admission policy, also allowed in user harness overrides. Reserved for the folder-admission lifecycle; not yet connected to indexing startup.",
+          "User-only folder admission policy, also allowed in user harness overrides. Auto uses bounded project evidence before recursive startup or saved-index loads; project forces admission, workspace serves separate children without a combined index, and off disables indexing. Project-tier values are ignored.",
         properties: {
           mode: {
             type: "string",

@@ -837,6 +837,9 @@ pub fn reload_log_line(
 /// Call the setters that copy a changed live key into a component that keeps
 /// its own copy.
 fn push_live_setters(ctx: &AppContext, before: &Config, after: &Config) {
+    if before.project_detection != after.project_detection {
+        crate::folder_admission_runtime::policy_changed(ctx, after);
+    }
     if before.formatter != after.formatter || before.checker != after.checker {
         crate::format::clear_tool_cache_for_root(after.project_root.as_deref());
     }
@@ -935,7 +938,7 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     later!("indexes.semantic", indexes.semantic);
     later!("indexes.callgraph", indexes.callgraph);
     later!("index.roots", index.roots);
-    later!("project_detection", project_detection);
+    live!("project_detection", project_detection);
     later!("views.enabled", views.enabled);
     live!("callgraph_chunk_size", callgraph_chunk_size);
     // Inspect.

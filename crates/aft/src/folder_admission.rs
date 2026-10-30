@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 pub const POLICY_VERSION: u32 = 1;
 
-const MARKERS: &[&str] = &[
+pub(crate) const MARKERS: &[&str] = &[
     "Cargo.toml",
     "package.json",
     "go.mod",
@@ -40,7 +40,7 @@ const MARKERS: &[&str] = &[
     "pubspec.yaml",
     "flake.nix",
 ];
-const PERSONAL: &[&str] = &[
+pub(crate) const PERSONAL: &[&str] = &[
     "Desktop",
     "Downloads",
     "Documents",
@@ -191,6 +191,7 @@ pub struct ProbeCoverage {
     /// Counts are exact only for a complete walk under the stated policy.
     /// Otherwise all observed counts are lower bounds, not population estimates.
     pub complete: bool,
+    pub count_kind: CountKind,
     pub root_listing_complete: bool,
     pub stop: ProbeStop,
     pub entry_budget: usize,
@@ -200,6 +201,13 @@ pub struct ProbeCoverage {
     pub directory_cuts: usize,
     pub depth_cuts: usize,
     pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CountKind {
+    Exact,
+    LowerBound,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +225,12 @@ pub struct FolderAdmission {
     pub tracked: Option<TrackedCount>,
     /// Actual shallow project roots, not their grouping directories.
     pub child_roots: Vec<PathBuf>,
+    pub immediate_directories: Vec<PathBuf>,
+    pub observed_directories: Vec<PathBuf>,
+    pub immediate_entries: Vec<PathBuf>,
+    pub evidence_markers: Vec<PathBuf>,
+    pub git_controls: Vec<PathBuf>,
+    pub outside_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,6 +245,8 @@ struct Probe {
     budgets: ProbeBudgets,
     root_io_error: bool,
     child_groups: BTreeSet<PathBuf>,
+    workspace_override: bool,
+    outside_candidates: Vec<PathBuf>,
 }
 
 impl Probe {
@@ -271,12 +287,39 @@ impl Probe {
             };
         }
         coverage.complete = coverage.stop == ProbeStop::Complete;
+        coverage.count_kind = if coverage.complete {
+            CountKind::Exact
+        } else {
+            CountKind::LowerBound
+        };
         coverage.elapsed_ms = millis(self.start.elapsed());
         self.result.observed.child_projects = self.child_groups.len();
         self.result.observed.root_markers.sort();
         self.result.observed.root_markers.dedup();
         self.result.child_roots.sort();
         self.result.child_roots.dedup();
+        if let Some(root) = self.result.canonical_root.as_ref() {
+            self.result.outside_paths = self
+                .outside_candidates
+                .iter()
+                .filter(|path| {
+                    !self
+                        .result
+                        .child_roots
+                        .iter()
+                        .any(|child| path.starts_with(child))
+                })
+                .filter_map(|path| {
+                    path.strip_prefix(root)
+                        .ok()?
+                        .components()
+                        .next()
+                        .map(|part| root.join(part))
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+        }
         self.result
     }
 }
@@ -324,6 +367,7 @@ fn probe_with_read_dir(
             observed: Observed::default(),
             coverage: ProbeCoverage {
                 complete: false,
+                count_kind: CountKind::LowerBound,
                 root_listing_complete: false,
                 stop: ProbeStop::Complete,
                 entry_budget: budgets.entries,
@@ -337,11 +381,19 @@ fn probe_with_read_dir(
             override_mode: DetectionMode::Auto,
             tracked: None,
             child_roots: Vec::new(),
+            immediate_directories: Vec::new(),
+            observed_directories: Vec::new(),
+            immediate_entries: Vec::new(),
+            evidence_markers: Vec::new(),
+            git_controls: Vec::new(),
+            outside_paths: Vec::new(),
         },
         start,
         budgets,
         root_io_error: false,
         child_groups: BTreeSet::new(),
+        workspace_override: false,
+        outside_candidates: Vec::new(),
     };
     let root = probe
         .result
@@ -355,6 +407,21 @@ fn probe_with_read_dir(
         return probe.finish();
     }
     probe.result.override_mode = policy.mode_for_root(&root);
+    if probe.result.override_mode != DetectionMode::Off && probe.time_left() {
+        if read_dir(&root).is_err() {
+            probe.result.observed.errors += 1;
+            probe.result.reason = AdmissionReason::ProbeIoError;
+            probe.result.coverage.stop = ProbeStop::IoError;
+            return probe.finish();
+        }
+    }
+    if probe.result.override_mode == DetectionMode::Workspace {
+        probe.workspace_override = true;
+        probe.walk(&root, read_dir);
+        probe.result.classification = FolderClassification::Workspace;
+        probe.result.reason = AdmissionReason::UserOverride;
+        return probe.finish();
+    }
     if probe.result.override_mode != DetectionMode::Auto {
         probe.result.classification = match probe.result.override_mode {
             DetectionMode::Project => FolderClassification::Project,
@@ -375,6 +442,11 @@ fn probe_with_read_dir(
             probe.result.observed.personal_groups += 1;
         }
     }
+    if probe.result.observed.errors > 0 {
+        probe.result.reason = AdmissionReason::ProbeIoError;
+        probe.result.coverage.stop = ProbeStop::IoError;
+        return probe.finish();
+    }
     if probe.result.observed.personal_groups >= 3 {
         probe.result.reason = AdmissionReason::MixedPersonalTree;
         probe.result.coverage.stop = ProbeStop::StrongEvidence;
@@ -388,7 +460,18 @@ fn probe_with_read_dir(
             probe.result.observed.root_markers.push((*name).to_owned());
         }
     }
-    if probe.time_left() && validated_git_worktree(&root, start, budgets.time) {
+    if let Some(head) = probe
+        .time_left()
+        .then(|| validated_git_worktree(&root, start, budgets.time))
+        .flatten()
+    {
+        probe.result.git_controls.push(head.clone());
+        if let Some(directory) = head.parent() {
+            probe.result.git_controls.push(directory.to_path_buf());
+            for name in ["index", "config", "commondir", "objects"] {
+                probe.result.git_controls.push(directory.join(name));
+            }
+        }
         probe.result.classification = FolderClassification::Project;
         probe.result.reason = AdmissionReason::GitCheckout;
         probe.result.coverage.stop = ProbeStop::StrongEvidence;
@@ -432,14 +515,97 @@ fn probe_with_read_dir(
 }
 
 impl Probe {
+    fn child_markers(&mut self, directory: &Path, group: &Path) -> bool {
+        if self
+            .result
+            .child_roots
+            .iter()
+            .any(|project| directory.starts_with(project))
+        {
+            return true;
+        }
+        let git = directory.join(".git");
+        let git_marker = self
+            .metadata(&git)
+            .is_some_and(|m| m.is_dir() || m.is_file())
+            && child_git_evidence(directory, &git, self.start, self.budgets.time);
+        let found = if git_marker {
+            Some(git)
+        } else {
+            MARKERS.iter().find_map(|name| {
+                let path = directory.join(name);
+                self.metadata(&path)
+                    .is_some_and(|m| m.is_file())
+                    .then_some(path)
+            })
+        };
+        if let Some(marker) = found {
+            self.child_groups.insert(group.to_path_buf());
+            self.result.child_roots.push(directory.to_path_buf());
+            self.result.evidence_markers.push(marker);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn enough_workspace_evidence(&self) -> bool {
+        self.result.coverage.root_listing_complete
+            && self.child_groups.len() >= 2
+            && self.child_groups.len() * 2 >= self.result.observed.non_bulk_root_directories
+    }
+
     fn walk(&mut self, root: &Path, read_dir: impl Fn(&Path) -> std::io::Result<std::fs::ReadDir>) {
         let mut pending = VecDeque::from([(root.to_path_buf(), 0, false, PathBuf::new())]);
-        while let Some((directory, level, bulk, top)) = pending.pop_front() {
+        let mut deferred = VecDeque::new();
+        let mut diagnostics = false;
+        loop {
+            if pending.is_empty() {
+                if !diagnostics && self.enough_workspace_evidence() {
+                    self.result.coverage.stop = ProbeStop::StrongEvidence;
+                    return;
+                }
+                if deferred.is_empty() {
+                    break;
+                }
+                pending.append(&mut deferred);
+                diagnostics = true;
+            }
+            let Some((directory, level, bulk, top)) = pending.pop_front() else {
+                break;
+            };
             if !self.time_left() || self.result.observed.entries >= self.budgets.entries {
                 if self.result.coverage.stop != ProbeStop::Time {
                     self.result.coverage.stop = ProbeStop::Entries;
                 }
                 break;
+            }
+            if !diagnostics && level > 2 {
+                if self.enough_workspace_evidence() {
+                    self.result.coverage.stop = ProbeStop::StrongEvidence;
+                    return;
+                }
+                pending.append(&mut deferred);
+                diagnostics = true;
+            }
+            let owned = self
+                .result
+                .child_roots
+                .iter()
+                .any(|project| directory.starts_with(project));
+            if level > 0 && level <= 2 && !bulk && !owned {
+                self.child_markers(&directory, &top);
+            }
+            if !diagnostics
+                && level > 0
+                && self
+                    .result
+                    .child_roots
+                    .iter()
+                    .any(|project| project == &directory)
+            {
+                deferred.push_back((directory, level, bulk, top));
+                continue;
             }
             let entries = match read_dir(&directory) {
                 Ok(entries) => entries,
@@ -487,6 +653,9 @@ impl Probe {
                     continue;
                 }
                 let path = entry.path();
+                if level == 0 {
+                    self.result.immediate_entries.push(path.clone());
+                }
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 let group = if level == 0 {
@@ -501,11 +670,13 @@ impl Probe {
                     if level > 0
                         && level <= 2
                         && !bulk
+                        && !owned
                         && (kind.is_dir() || kind.is_file())
-                        && validated_git_worktree(&directory, self.start, self.budgets.time)
+                        && child_git_evidence(&directory, &path, self.start, self.budgets.time)
                     {
                         self.child_groups.insert(group);
                         self.result.child_roots.push(directory.clone());
+                        self.result.evidence_markers.push(path.clone());
                     }
                     continue;
                 }
@@ -514,17 +685,24 @@ impl Probe {
                 {
                     if level == 0 {
                         self.result.observed.root_markers.push(name.to_string());
-                        self.result.classification = FolderClassification::Project;
-                        self.result.reason = AdmissionReason::RootMarker;
-                        self.result.coverage.stop = ProbeStop::StrongEvidence;
-                        return;
-                    } else if level <= 2 && !bulk {
+                        if !self.workspace_override {
+                            self.result.classification = FolderClassification::Project;
+                            self.result.reason = AdmissionReason::RootMarker;
+                            self.result.coverage.stop = ProbeStop::StrongEvidence;
+                            return;
+                        }
+                    } else if level <= 2 && !bulk && !owned {
                         self.child_groups.insert(group.clone());
                         self.result.child_roots.push(directory.clone());
+                        self.result.evidence_markers.push(path.clone());
                     }
                 }
                 if kind.is_dir() {
                     self.result.observed.directories += 1;
+                    self.result.observed_directories.push(path.clone());
+                    if level == 0 {
+                        self.result.immediate_directories.push(path.clone());
+                    }
                     let next_bulk = bulk || BULK.contains(&name.as_ref());
                     if level == 0 && !next_bulk {
                         self.result.observed.non_bulk_root_directories += 1;
@@ -535,6 +713,13 @@ impl Probe {
                         self.result.coverage.depth_cuts += 1;
                     }
                 } else if kind.is_file() {
+                    if !bulk
+                        && !group
+                            .file_name()
+                            .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+                    {
+                        self.outside_candidates.push(path.clone());
+                    }
                     self.result.observed.files += 1;
                     let source = path
                         .extension()
@@ -547,6 +732,19 @@ impl Probe {
             }
             if level == 0 {
                 self.result.coverage.root_listing_complete = listing_complete;
+                // Inspect every immediate candidate's fixed markers before
+                // spending the shared budget on one project's source files.
+                let candidates = pending
+                    .iter()
+                    .filter(|(_, level, bulk, _)| *level == 1 && !*bulk)
+                    .map(|(directory, _, _, top)| (directory.clone(), top.clone()))
+                    .collect::<Vec<_>>();
+                for (directory, top) in candidates {
+                    if !self.time_left() {
+                        break;
+                    }
+                    self.child_markers(&directory, &top);
+                }
             }
             if matches!(
                 self.result.coverage.stop,
@@ -561,15 +759,61 @@ impl Probe {
 /// Git's read-only plumbing accepts empty repositories, subdirectories and
 /// linked worktrees, but not bare databases or a stray directory named `.git`.
 /// Never parse the index or walk the worktree just to establish this evidence.
-fn validated_git_worktree(root: &Path, start: Instant, budget: Duration) -> bool {
+fn validated_git_worktree(root: &Path, start: Instant, budget: Duration) -> Option<PathBuf> {
+    let bytes = git_output(
+        root,
+        start,
+        budget,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "HEAD",
+            "--is-inside-work-tree",
+        ],
+    )?;
+    let head = bytes
+        .strip_suffix(b"\ntrue\n")
+        .or_else(|| bytes.strip_suffix(b"\r\ntrue\r\n"))?;
+    let path = crate::git_probe::git_output_path(head)?;
+    Some(if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    })
+}
+
+fn child_git_evidence(root: &Path, marker: &Path, start: Instant, budget: Duration) -> bool {
+    // Directory control metadata is enough for a workspace candidate, not an
+    // admission to build that child's index. Opening the child validates its own
+    // working tree. Gitfiles and unusual layouts use bounded Git validation.
+    if std::fs::symlink_metadata(marker).is_ok_and(|m| m.is_dir())
+        && std::fs::symlink_metadata(marker.join("HEAD")).is_ok_and(|m| m.is_file())
+        && std::fs::symlink_metadata(marker.join("objects")).is_ok_and(|m| m.is_dir())
+        && std::fs::symlink_metadata(marker.join("refs")).is_ok_and(|m| m.is_dir())
+    {
+        return true;
+    }
+    git_output(root, start, budget, &["rev-parse", "--show-toplevel"])
+        .and_then(|bytes| crate::git_probe::git_output_path(&bytes))
+        .and_then(|path| crate::path_identity::ProjectRootId::from_path(&path).ok())
+        .is_some_and(|git_root| {
+            crate::path_identity::ProjectRootId::from_path(root)
+                .ok()
+                .as_ref()
+                == Some(&git_root)
+        })
+}
+
+fn git_output(root: &Path, start: Instant, budget: Duration, args: &[&str]) -> Option<Vec<u8>> {
     if start.elapsed() >= budget || !crate::developer_tools::git_usable() {
-        return false;
+        return None;
     }
     let mut command = crate::git_probe::command();
     command
         .args(["-c", "core.fsmonitor=false", "-C"])
         .arg(root)
-        .args(["rev-parse", "--is-inside-work-tree"])
+        .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
@@ -577,15 +821,16 @@ fn validated_git_worktree(root: &Path, start: Instant, budget: Duration) -> bool
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     let Ok(mut child) = command.spawn() else {
-        return false;
+        return None;
     };
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                return status.success()
-                    && child.wait_with_output().is_ok_and(|output| {
-                        output.stdout == b"true\n" || output.stdout == b"true\r\n"
-                    });
+                return if status.success() {
+                    child.wait_with_output().ok().map(|output| output.stdout)
+                } else {
+                    None
+                };
             }
             Ok(None) if start.elapsed() < budget => {
                 std::thread::sleep(Duration::from_millis(1));
@@ -593,7 +838,7 @@ fn validated_git_worktree(root: &Path, start: Instant, budget: Duration) -> bool
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return false;
+                return None;
             }
         }
     }
@@ -1006,17 +1251,16 @@ mod tests {
         assert!(result.tracked.is_none());
     }
 
-    #[test]
-    fn million_name_scratch_is_rejected_with_bounded_observations() {
+    fn scratch_is_rejected_with_bounded_observations(shards: usize, runs: usize, names: usize) {
         let root = tempfile::tempdir().unwrap();
-        for shard in 0..21 {
+        for shard in 0..shards {
             let shard = root.path().join(shard.to_string());
             std::fs::create_dir(&shard).unwrap();
-            for run in 0..100 {
+            for run in 0..runs {
                 let leaf = shard.join(run.to_string());
                 std::fs::create_dir(&leaf).unwrap();
                 file(&leaf, "seed.dat");
-                for name in 1..1000 {
+                for name in 1..names {
                     std::fs::hard_link(leaf.join("seed.dat"), leaf.join(format!("{name}.dat")))
                         .unwrap();
                 }
@@ -1030,5 +1274,18 @@ mod tests {
         let wire = serde_json::to_value(result).unwrap();
         assert_eq!(wire["coverage"]["entry_budget"], 4096);
         assert_eq!(wire["classification"], "not_project");
+    }
+
+    #[test]
+    fn scratch_is_rejected_at_the_entry_budget() {
+        scratch_is_rejected_with_bounded_observations(5, 20, 500);
+    }
+
+    // Fifty thousand names already exceed the evidence budget. The full test
+    // performs millions of filesystem operations, so reserve it for manual runs.
+    #[test]
+    #[ignore]
+    fn million_name_scratch_is_rejected_with_bounded_observations() {
+        scratch_is_rejected_with_bounded_observations(21, 100, 1000);
     }
 }

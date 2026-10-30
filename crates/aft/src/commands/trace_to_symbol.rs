@@ -11,6 +11,9 @@ use crate::protocol::{RawRequest, Response};
 
 /// Handle a `trace_to_symbol` request.
 pub fn handle_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
+    if let Some(response) = crate::folder_admission_runtime::route_index_command(req, ctx) {
+        return response;
+    }
     let mut response = answer_trace_to_symbol(req, ctx);
     disclose_borrowed_answer(
         ctx,

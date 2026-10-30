@@ -1181,6 +1181,8 @@ pub struct SuspendedDomainHealthSnapshot {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RootHealthSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub folder: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_unavailable_reason: Option<&'static str>,
     pub project_root: String,
     pub actor_count: usize,
@@ -1209,6 +1211,7 @@ pub struct RootHealthSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RootHealthSummary {
+    folder: Option<serde_json::Value>,
     cache_unavailable: Option<&'static str>,
     state: RootHealthState,
     search_index_status: Option<&'static str>,
@@ -1228,6 +1231,7 @@ pub(crate) struct RootHealthSummary {
 impl RootHealthSummary {
     fn busy() -> Self {
         Self {
+            folder: None,
             state: RootHealthState::Busy,
             cache_unavailable: None,
             search_index_status: None,
@@ -1269,7 +1273,9 @@ impl RootHealthSummary {
 
     pub(crate) fn into_snapshot(self, project_root: &Path) -> RootHealthSnapshot {
         if self.is_busy() {
-            return RootHealthSnapshot::busy(project_root);
+            let mut snapshot = RootHealthSnapshot::busy(project_root);
+            snapshot.folder = self.folder;
+            return snapshot;
         }
         // Health snapshots may be assembled by the maintenance refresh, but the
         // public snapshot helper also has latency-sensitive callers. Never derive
@@ -1290,6 +1296,7 @@ impl RootHealthSummary {
                 _ => (None, None),
             };
         RootHealthSnapshot {
+            folder: self.folder,
             cache_unavailable_reason: self.cache_unavailable,
             project_root: project_root.display().to_string(),
             actor_count: 1,
@@ -1322,6 +1329,7 @@ impl RootHealthSummary {
 impl RootHealthSnapshot {
     fn busy(project_root: &Path) -> Self {
         Self {
+            folder: None,
             cache_unavailable_reason: None,
             project_root: project_root.display().to_string(),
             actor_count: 1,
@@ -4552,6 +4560,7 @@ pub struct AppContext {
     /// Standalone NDJSON requests may borrow a finite CLI snapshot after the
     /// writer has exited; daemon-bound routes keep their live freshness owner.
     daemonless_query_mode: AtomicBool,
+    parent_query_only: AtomicBool,
     /// The search reranker backend, rebuilt off the search path whenever the
     /// published config or the daemon mode changes.
     rerank_slot: crate::commands::semantic_search::rerank::slot::BackendSlot,
@@ -4797,6 +4806,7 @@ pub struct AppContext {
     /// The background identity retry armed when aft.db was busy at this
     /// root's bind. See [`crate::provisional_identity_retry`].
     provisional_identity_retry: crate::provisional_identity_retry::RetrySlot,
+    folder_admission: crate::folder_admission_runtime::State,
     artifact_cache_keys: parking_lot::Mutex<BTreeMap<PathBuf, String>>,
     /// Only successful configure binds may populate this memo. Build-derived
     /// keys remain observable by status but cannot skip identity verification.
@@ -5426,7 +5436,9 @@ impl AppContext {
             .downcast_ref::<TreeSitterProvider>()
             .map(|provider| provider.symbol_cache())
             .unwrap_or_else(|| Arc::new(std::sync::RwLock::new(SymbolCache::new())));
+        let folder_admission = crate::folder_admission_runtime::State::default();
         let mut lsp_manager = LspManager::new();
+        lsp_manager.set_folder_work_gate(folder_admission.work_gate());
         lsp_manager.set_child_registry(app.lsp_child_registry());
         lsp_manager.set_search_paths(config.lsp_paths_extra.clone());
         // Apply the configured diagnostic LRU cap (default 5000, 0 = unbounded)
@@ -5472,6 +5484,7 @@ impl AppContext {
             linked_main_root: parking_lot::Mutex::new(None),
             shared_artifacts_read_only: AtomicBool::new(false),
             daemonless_query_mode: AtomicBool::new(false),
+            parent_query_only: AtomicBool::new(false),
             rerank_slot: Default::default(),
             callgraph_writer: AtomicBool::new(true),
             inspect_writer: AtomicBool::new(true),
@@ -5610,6 +5623,7 @@ impl AppContext {
             database_open_idle: parking_lot::Condvar::new(),
             parked_configure_tail: parking_lot::Mutex::new(None),
             provisional_identity_retry: Default::default(),
+            folder_admission,
             artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
             configure_artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
             readonly_artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
@@ -5821,6 +5835,29 @@ impl AppContext {
         &self,
         cache_dir: Option<&Path>,
     ) -> RootHealthSummary {
+        let mut summary = self.try_health_summary_inner(cache_dir);
+        summary.folder = crate::folder_admission_runtime::try_snapshot(self);
+        if crate::folder_admission_runtime::blocked(self) {
+            summary.search_index_status = Some("disabled");
+            summary.callgraph_store_status = Some("disabled");
+            summary.tier2_status = Some("disabled");
+            summary.semantic_index = Some(SemanticHealthComponentSnapshot {
+                status: "disabled",
+                reason: crate::folder_admission_runtime::reason(self),
+                since_ms: None,
+                next_retry_ms: None,
+                paused_until_ms: None,
+                stage: None,
+                embedded_chunks: None,
+                total_chunks: None,
+                current_batch: None,
+                total_batches: None,
+            });
+        }
+        summary
+    }
+
+    fn try_health_summary_inner(&self, cache_dir: Option<&Path>) -> RootHealthSummary {
         // Read lifecycle state before taking artifact locks. Worker admission takes
         // the lifecycle lock first and then installs artifact receivers, so the
         // reverse order here would deadlock a health poll against worker startup.
@@ -6129,6 +6166,7 @@ impl AppContext {
         };
 
         RootHealthSummary {
+            folder: None,
             cache_unavailable: cache_unavailable_reason,
             state: RootHealthState::Ready,
             search_index_status: Some(search_index_status),
@@ -7351,7 +7389,7 @@ impl AppContext {
                 .try_lock()
                 .is_none_or(|tail| tail.as_ref().is_some_and(|state| state.has_ready_job()))
             || !self.configure_warnings_rx.is_empty()
-            || self.provisional_identity_retry.is_due()
+            || crate::provisional_identity_retry::due(self)
     }
 
     /// No configure-tail work is queued or parked. The background identity
@@ -7369,6 +7407,10 @@ impl AppContext {
         &self,
     ) -> &crate::provisional_identity_retry::RetrySlot {
         &self.provisional_identity_retry
+    }
+
+    pub(crate) fn folder_admission(&self) -> &crate::folder_admission_runtime::State {
+        &self.folder_admission
     }
 
     /// Hold the lock behind one maintenance probe for the duration of
@@ -9543,6 +9585,16 @@ impl AppContext {
         self.reconcile_rerank_backend(&self.config_unpinned());
     }
 
+    pub(crate) fn set_parent_query_only(&self) {
+        self.parent_query_only.store(true, Ordering::SeqCst);
+        self.folder_admission.close();
+        self.set_heavy_root_work_allowed(false);
+    }
+
+    pub(crate) fn parent_query_only(&self) -> bool {
+        self.parent_query_only.load(Ordering::SeqCst)
+    }
+
     /// The search reranker's backend slot.
     pub(crate) fn rerank_slot(
         &self,
@@ -9658,10 +9710,12 @@ impl AppContext {
     }
 
     pub fn root_too_broad(&self) -> bool {
-        self.degraded_reasons
-            .lock()
-            .iter()
-            .any(|reason| reason == "root_too_broad")
+        crate::folder_admission_runtime::blocked(self)
+            || self
+                .degraded_reasons
+                .lock()
+                .iter()
+                .any(|reason| reason == "root_too_broad")
     }
 
     /// The bound root's artifact identity was provisional at its last bind

@@ -568,9 +568,10 @@ Hashline mode needs both the `read` and `edit` tools. If `disabled_tools` remove
 
 The user config at `~/.config/cortexkit/aft.jsonc` accepts this policy, including
 inside `harnesses.<name>`. Project config cannot set it: the resolver drops the
-entire project-tier block, including a project harness override. The policy and
-bounded classifier are available to the core, but are not yet connected to
-configure or indexing startup.
+entire project-tier block, including a project harness override. AFT checks the
+canonical root before recursive startup or loading saved indexes. While the
+bounded check is pending, indexes remain off; explicit-file outline/zoom and
+bounded grep/glob remain available.
 
 ```jsonc
 {
@@ -599,6 +600,24 @@ override wins. An `auto` override opts that exact root back into detection even
 when the global mode is forced. A user harness override replaces the entire
 `project_detection` block rather than appending to its override list. Counts
 from an incomplete probe are lower bounds, not estimates of the unseen tree.
+
+Workspace roots have no combined index. With views enabled, the parent reads
+already-published child indexes; a child's own indexes start only when that
+child is opened. With views disabled, grep/glob use bounded walks. An unadmitted
+root keeps every index plane off and uses no old index artifact after restart.
+Index-dependent tools return `folder_not_admitted` with the classification,
+reason, observed counts and coverage. Health retains the same decision. Counts
+describe the timestamped probe snapshot, not a new census on every tool call.
+
+Admission metadata is cached and checked against root/marker identities and
+the effective override. Root and sampled immediate-child marker changes request
+a recheck without a recursive watcher. Automatic probes are spaced by at least
+60 seconds; explicit configure refresh (`refresh: true`) and user policy changes
+can request fresh evidence. A rebind rechecks a negative decision after its
+60-second lifetime. A late result from an older root/configuration generation
+is ignored. Deep changes outside the sampled marker scope can require a refresh
+or opening the child directly. Project admission does not remove the semantic
+20,000-file limit or bypass file-access permissions.
 
 ## Search reranking
 

@@ -192,6 +192,12 @@ pub fn unobserved_index_status(enabled: bool) -> IndexObservation {
 /// runtime holds that state, otherwise `unavailable` with a named cause
 /// (`runtime_not_observed` when nothing has been observed yet).
 pub fn observed_index_status(ctx: &AppContext, plane: IndexPlane) -> IndexObservation {
+    if let Some(reason) = crate::folder_admission_runtime::reason(ctx) {
+        return IndexObservation {
+            effective: IndexEffective::Off,
+            unavailable_reason: Some(reason),
+        };
+    }
     if ctx.root_too_broad() {
         return IndexObservation {
             effective: IndexEffective::Off,

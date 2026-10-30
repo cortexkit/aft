@@ -85,6 +85,11 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
     {
+        if let Some(response) =
+            crate::folder_admission_runtime::refusal(ctx, &req.id, req.session())
+        {
+            return response;
+        }
         return handle_outline_files_mode(req, ctx, MAX_OUTPUT_BYTES);
     }
 
@@ -106,6 +111,11 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
 
+        if let Some(response) =
+            crate::folder_admission_runtime::refusal(ctx, &req.id, req.session())
+        {
+            return response;
+        }
         let discovery = discover_outline_files(&dir_path);
         let project_root = ctx.config().project_root.clone();
         let include_tests = include_tests_param(req);

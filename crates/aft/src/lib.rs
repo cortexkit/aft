@@ -66,6 +66,7 @@ pub(crate) mod bash_env;
 pub mod bash_permissions;
 pub mod bash_rewrite;
 pub mod blob_store;
+pub(crate) mod bounded_folder_walk;
 pub(crate) mod bounded_io;
 pub mod build_breaker;
 pub mod cache_freshness;
@@ -105,6 +106,8 @@ pub(crate) mod file_identity;
 pub mod file_kind;
 pub mod fleet_status;
 pub mod folder_admission;
+#[doc(hidden)]
+pub mod folder_admission_runtime;
 pub mod format;
 pub mod fs_lock;
 pub mod fuzzy_match;

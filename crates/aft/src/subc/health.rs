@@ -9975,6 +9975,7 @@ fn standing_root_health_value(
 
 fn unhosted_standing_health_snapshot(entry: &StandingHealthEntry) -> RootHealthSnapshot {
     RootHealthSnapshot {
+        folder: None,
         cache_unavailable_reason: None,
         project_root: entry.root_id.as_ref().map_or_else(
             || entry.literal_path.clone(),

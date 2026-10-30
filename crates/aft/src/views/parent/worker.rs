@@ -14,8 +14,8 @@ use super::super::manifest_v2::Producers;
 use super::super::semantic::SemanticProducer;
 use super::super::snapshot::LiveDelta;
 use super::{
-    lock, read, write, CallgraphChild, Child, Discovery, ParentSemantic, ParentSession, Plane,
-    PublishedChild, SemanticChild, TrigramChild, TrigramSource, DEFAULT_MAX_CHILD_REPOS,
+    lock, read, write, CallgraphChild, Child, ParentSemantic, ParentSession, Plane, PublishedChild,
+    SemanticChild, TrigramChild, TrigramSource,
 };
 
 /// Longest the worker sleeps between two checks of its stop flag, holders
@@ -44,6 +44,8 @@ pub(super) fn run(weak: Weak<ParentSession>) {
         return;
     };
     if !discover(&first) {
+        first.stop();
+        super::unregister(&first);
         return;
     }
     initial_load(&first);
@@ -61,6 +63,8 @@ pub(super) fn run(weak: Weak<ParentSession>) {
             return;
         };
         if session.stopped() {
+            session.stop();
+            super::unregister(&session);
             return;
         }
         if !session.held() {
@@ -75,7 +79,7 @@ pub(super) fn run(weak: Weak<ParentSession>) {
         let paused = session.paused.load(Ordering::SeqCst);
         if !paused {
             for child in session.children() {
-                apply_pending(&child);
+                apply_pending(&session, &child);
             }
             let now = Instant::now();
             if now >= next_backstop {
@@ -83,7 +87,7 @@ pub(super) fn run(weak: Weak<ParentSession>) {
                     if session.stopped() {
                         return;
                     }
-                    backstop(&child);
+                    backstop(&session, &child);
                 }
                 next_backstop = Instant::now() + session.backstop_interval;
             }
@@ -110,12 +114,7 @@ pub(super) fn run(weak: Weak<ParentSession>) {
 fn discover(session: &Arc<ParentSession>) -> bool {
     super::wait_for_discovery_hold(session.root());
     let started = Instant::now();
-    let discovery = super::discover(session.root(), DEFAULT_MAX_CHILD_REPOS).unwrap_or(Discovery {
-        root: session.root().to_path_buf(),
-        children: Vec::new(),
-        skipped: Vec::new(),
-        outside: Vec::new(),
-    });
+    let discovery = session.classified.clone();
     if session.stopped() {
         return false;
     }
@@ -218,9 +217,26 @@ fn install_trigram(session: &ParentSession, child: &Child, trigram: TrigramChild
     super::engine::sync(session, child);
 }
 
+pub(super) fn admit_child(session: &ParentSession, child: &Child) -> bool {
+    if let Err(reason) = crate::folder_admission_runtime::admit_borrowed(
+        &child.root,
+        &session.storage,
+        &session.project_detection,
+    ) {
+        *write(&child.trigram) = Plane::Gap(reason.clone());
+        *write(&child.semantic) = Plane::Gap(reason.clone());
+        *write(&child.callgraph) = Plane::Gap(reason);
+        *write(&child.inspect) = None;
+        *lock(&child.engine) = None;
+        lock(&child.pending).clear();
+        return false;
+    }
+    true
+}
+
 fn refresh_trigram(session: &ParentSession, child: &Child) {
     let keep_going = || !session.stopped();
-    let family = match child.family(&session.storage) {
+    let family = match child.family(session) {
         Ok(family) => family,
         Err(error) => {
             *write(&child.trigram) = Plane::Gap(error);
@@ -366,7 +382,10 @@ fn install_view_trigram(
 }
 
 /// Applies the watcher paths queued for `child`.
-fn apply_pending(child: &Arc<Child>) {
+fn apply_pending(session: &ParentSession, child: &Arc<Child>) {
+    if !lock(&child.pending).is_empty() && !admit_child(session, child) {
+        return;
+    }
     let paths = std::mem::take(&mut *lock(&child.pending));
     if paths.is_empty() {
         return;
@@ -422,7 +441,10 @@ fn apply_paths(child: &Arc<Child>, paths: BTreeSet<PathBuf>) {
 /// Compares every file of `child` with its trigram snapshot and applies the
 /// differences. It walks and stats only; the snapshot is copied only when a
 /// difference exists.
-fn backstop(child: &Arc<Child>) {
+fn backstop(session: &ParentSession, child: &Arc<Child>) {
+    if !admit_child(session, child) {
+        return;
+    }
     let Some(current) = read(&child.trigram).ready().cloned() else {
         return;
     };
@@ -561,7 +583,7 @@ fn belongs_to_child(child: &Child, path: &Path) -> bool {
 /// that publication and holds its read marker; a child whose sessions never
 /// published one is a named gap.
 fn refresh_callgraph(session: &ParentSession, child: &Child) {
-    let family = match child.family(&session.storage) {
+    let family = match child.family(session) {
         Ok(family) => family,
         Err(error) => {
             *write(&child.callgraph) = Plane::Gap(error);
@@ -627,6 +649,15 @@ fn refresh_callgraph(session: &ParentSession, child: &Child) {
 }
 
 fn refresh_inspect(session: &ParentSession, child: &Child) {
+    if crate::folder_admission_runtime::admit_borrowed(
+        &child.root,
+        &session.storage,
+        &session.project_detection,
+    )
+    .is_err()
+    {
+        return;
+    }
     if read(&child.inspect).is_some() {
         return;
     }
@@ -675,7 +706,7 @@ fn refresh_semantic(session: &ParentSession, child: &Child) {
     // The child's semantic view is its v3 member `<scope>.semantic`. Opening
     // it pins the member's published generation and the base it composes
     // with read markers; the answers are as of that publication.
-    let family = match child.family(&session.storage) {
+    let family = match child.family(session) {
         Ok(family) => family,
         Err(error) => {
             *write(&child.semantic) = Plane::Gap(error);
