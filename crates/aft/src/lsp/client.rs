@@ -46,14 +46,15 @@ const RUST_ANALYZER_WORKER_PROCESS_CAP: usize = 2;
 
 #[derive(Debug)]
 pub(crate) struct RustAnalyzerCapacityExhausted {
-    cap: usize,
+    pub(super) cap: usize,
+    pub(super) current: usize,
 }
 
 impl std::fmt::Display for RustAnalyzerCapacityExhausted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f,
-            "rust_analyzer_capacity_exhausted: daemon-wide worker-policy rust-analyzer process cap={} reached; retry after another worker analyzer stops",
-            self.cap)
+            "rust_analyzer_capacity_exhausted: daemon-wide worker-policy rust-analyzer process cap={} reached (current={}); retry after another worker analyzer stops",
+            self.cap, self.current)
     }
 }
 
@@ -72,7 +73,10 @@ impl RustAnalyzerCapacity {
         if *active >= self.cap {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                RustAnalyzerCapacityExhausted { cap: self.cap },
+                RustAnalyzerCapacityExhausted {
+                    cap: self.cap,
+                    current: *active,
+                },
             ));
         }
         *active += 1;
@@ -3050,6 +3054,26 @@ fn parse_diagnostic_capabilities(value: &Value) -> ServerDiagnosticCapabilities 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_capacity_refusal_reports_cap_and_current_count() {
+        let capacity = Arc::new(RustAnalyzerCapacity {
+            cap: 1,
+            active: Mutex::new(0),
+        });
+        let permit = capacity.acquire().unwrap();
+        let error = capacity.acquire().err().unwrap();
+        let refused = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<RustAnalyzerCapacityExhausted>()
+            .unwrap();
+        assert_eq!(refused.cap, 1);
+        assert_eq!(refused.current, 1);
+        assert!(error.to_string().contains("cap=1 reached (current=1)"));
+        drop(permit);
+        assert!(capacity.acquire().is_ok());
+    }
 
     #[test]
     fn server_instance_allocator_preserves_the_exhaustion_boundary() {
