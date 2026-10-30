@@ -74,6 +74,147 @@ where
     panic!("timed out waiting for {label}; last response: {last_response:?}");
 }
 
+fn exact_memo_watcher_content_changes(views: bool) {
+    let _watcher_guard = crate::helpers::watcher_serial_lock();
+    let project = tempfile::tempdir().expect("create project dir");
+    let seed = project.path().join("seed.rs");
+    let edited = project.path().join("edited.rs");
+    let created = project.path().join("created.rs");
+    // Quoted stopwords still match the exact phrase, but have no lexical
+    // content tokens that could rescue a file missing from the exact memo.
+    let phrase = "the and";
+    fs::write(&seed, format!("// {phrase}\n")).unwrap();
+    fs::write(&edited, "// unrelated initial content\n").unwrap();
+
+    let mut aft = AftProcess::spawn_with_real_watcher_env(&[]);
+    let configured = send(
+        &mut aft,
+        json!({
+            "id": "cfg-exact-memo-watcher",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project.path(),
+            "config": user_config(json!({
+                "indexes": { "trigram": true, "semantic": false },
+                "views": { "enabled": views },
+            })),
+        }),
+    );
+    assert_eq!(configured["success"], true, "{configured}");
+    wait_for_ready_grep(&mut aft, "initial exact corpus", phrase, |r| {
+        r["total_matches"] == 1
+    });
+
+    let search = |aft: &mut AftProcess, label: &str| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let response = send(
+                aft,
+                json!({
+                    "id": "search-exact-memo-watcher",
+                    "command": "semantic_search",
+                    "query": format!("\"{phrase}\""),
+                    "hint": "literal",
+                    "top_k": 10,
+                    "include_tests": false,
+                }),
+            );
+            assert_eq!(response["success"], true, "{label}: {response}");
+            let pending = response["gaps"]
+                .as_array()
+                .is_some_and(|gaps| gaps.iter().any(|gap| gap["kind"] == "watcher_pending"));
+            if !pending {
+                eprintln!(
+                    "exact memo watcher views={views} {label}: {}",
+                    json!({
+                        "results": response["results"],
+                        "complete": response["complete"],
+                        "total": response["results_list_envelope"]["total"],
+                        "generation": response["structuredContent"]["plan"]["snapshot_generation"],
+                        "stability_void": response["structuredContent"]["plan"]["stability_void"],
+                    })
+                );
+                assert_eq!(response["engine_capped"], false, "{response}");
+                assert_eq!(response["more_available"], false, "{response}");
+                return response;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "watcher did not settle: {response}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let files = |response: &Value| -> Vec<String> {
+        let mut files = response["results"]
+            .as_array()
+            .expect("search results")
+            .iter()
+            .map(|row| {
+                assert_eq!(row["exact"], true, "{row}");
+                Path::new(row["file"].as_str().expect("result file"))
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        files.sort();
+        files
+    };
+    let initial = search(&mut aft, "initial");
+    assert_eq!(files(&initial), ["seed.rs"]);
+    let warm = search(&mut aft, "warm");
+    assert_eq!(files(&warm), ["seed.rs"]);
+
+    // Direct writes exercise OS notifications rather than refreshes triggered
+    // by writes performed by AFT itself. The marker checks confirm the index
+    // accepted each change before search.
+    fs::write(&edited, format!("// {phrase} edited_watcher_marker\n")).unwrap();
+    wait_for_ready_grep(&mut aft, "in-place update", "edited_watcher_marker", |r| {
+        r["total_matches"] == 1
+    });
+    let after_edit = search(&mut aft, "newly matching in-place edit");
+
+    fs::write(&created, format!("// {phrase} created_watcher_marker\n")).unwrap();
+    wait_for_ready_grep(&mut aft, "new file", "created_watcher_marker", |r| {
+        r["total_matches"] == 1
+    });
+    let after_create = search(&mut aft, "newly created match");
+
+    fs::write(&seed, "// retired_watcher_marker\n").unwrap();
+    wait_for_ready_grep(&mut aft, "retired match", "retired_watcher_marker", |r| {
+        r["total_matches"] == 1
+    });
+    let after_retire = search(&mut aft, "file stops matching");
+
+    // Check all three transitions together so a failing reproduction still
+    // records how additions and disappearing matches behave independently.
+    assert_eq!(
+        [
+            files(&after_edit),
+            files(&after_create),
+            files(&after_retire)
+        ],
+        [
+            vec!["edited.rs", "seed.rs"],
+            vec!["created.rs", "edited.rs", "seed.rs"],
+            vec!["created.rs", "edited.rs"],
+        ],
+        "exact memo must follow accepted watcher changes (views={views})"
+    );
+}
+
+#[test]
+fn exact_memo_real_watcher_views_off_content_changes() {
+    exact_memo_watcher_content_changes(false);
+}
+
+#[test]
+fn exact_memo_real_watcher_views_on_content_changes() {
+    exact_memo_watcher_content_changes(true);
+}
+
 #[cfg(debug_assertions)]
 #[test]
 fn search_pending_replay_skips_file_that_becomes_ignored() {

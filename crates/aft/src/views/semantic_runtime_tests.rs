@@ -2596,6 +2596,8 @@ fn semantic_fill_waiter_yields_cold_slot(shared_content: bool) {
     let (entered_tx, entered_rx) = crossbeam_channel::unbounded();
     let (release_tx, release_rx) = crossbeam_channel::bounded(1);
     let (done_tx, done_rx) = crossbeam_channel::unbounded();
+    let models: Vec<_> = (0..2).map(|_| Arc::new(Model::default())).collect();
+    let requests: Vec<_> = (0..2).map(|_| Arc::new(AtomicUsize::new(0))).collect();
     let mut lanes = Vec::new();
     for (i, root) in roots.iter().enumerate() {
         for file in 0..33 {
@@ -2628,6 +2630,8 @@ fn semantic_fill_waiter_yields_cold_slot(shared_content: bool) {
         let entered = entered_tx.clone();
         let release = release_rx.clone();
         let done = done_tx.clone();
+        let model = Arc::clone(&models[i]);
+        let requests = Arc::clone(&requests[i]);
         workers.push(std::thread::spawn(move || {
             let outcome = catch_up_with_limiters(
                 &weak,
@@ -2636,11 +2640,12 @@ fn semantic_fill_waiter_yields_cold_slot(shared_content: bool) {
                 &schedule,
                 FillBudget::default(),
                 &mut |texts| {
+                    requests.fetch_add(1, Ordering::SeqCst);
                     entered.send(i).unwrap();
                     if i == 0 {
                         release.recv().unwrap();
                     }
-                    Model::default().embed(texts)
+                    model.embed(texts)
                 },
                 &preparation,
                 &inflight,
@@ -2662,9 +2667,35 @@ fn semantic_fill_waiter_yields_cold_slot(shared_content: bool) {
         std::thread::sleep(Duration::from_millis(5));
     };
     let both_waiting = done_rx.is_empty();
+    let diagnostics = || {
+        eprintln!("cold slots: {:#?}", cold.census());
+        eprintln!("cold admissions: {:#?}", cold.admission_events());
+        for (i, (slot, _, _, runtime)) in lanes.iter().enumerate() {
+            eprintln!(
+                "lane {i}: state={} refresh_attempts={} backend_requests={} backend_completed={} backend_texts={} progress={:#?}",
+                slot.describe(),
+                runtime.refresh_attempts(),
+                requests[i].load(Ordering::SeqCst),
+                models[i].calls(),
+                models[i].texts(),
+                crate::cold_build_limiter::progress::snapshot_for_root(roots[i].path(), 0),
+            );
+        }
+    };
+    if !yielded || !both_waiting {
+        diagnostics();
+    }
     release_tx.send(()).unwrap();
     let first_done = done_rx.recv_timeout(Duration::from_secs(10));
+    if first_done.is_err() {
+        eprintln!("first fill completion: {first_done:?}");
+        diagnostics();
+    }
     let second_done = done_rx.recv_timeout(Duration::from_secs(10));
+    if second_done.is_err() {
+        eprintln!("second fill completion: {second_done:?}");
+        diagnostics();
+    }
     if first_done.is_err() || second_done.is_err() {
         for (slot, _, _, _) in &lanes {
             slot.clear();

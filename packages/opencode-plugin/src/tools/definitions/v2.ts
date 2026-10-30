@@ -1,6 +1,7 @@
 import type { ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { Effect } from "effect";
+import type { ZodType } from "zod";
 
 import { PermissionStepAbort } from "../../permissions/v2.js";
 import { renameV2ToolReferences, v2HostToolName } from "../../v2-host-tool-names.js";
@@ -89,7 +90,7 @@ export type V2Provider = "openai" | "anthropic" | "gemini";
 export interface V2ProviderTool {
   name: string;
   description: string;
-  input: ReturnType<typeof tool.schema.object>;
+  input: ReturnType<typeof tool.schema.object> & Pick<ZodType, "~standard">;
   options: Readonly<Record<string, unknown>> & {
     codemode: false;
   };
@@ -358,7 +359,28 @@ export function projectV2Tool(
   const currentInput = () => {
     const input = tool.schema.object(projectArguments(name, definition));
     assertV2Contract(hostName, input);
-    return input;
+    const toJSONSchema = (
+      io: "input" | "output",
+      { target }: Parameters<ZodType["~standard"]["jsonSchema"]["input"]>[0],
+    ) => {
+      // Normalized argument overrides emit 2020-12; reject other dialects
+      // rather than mixing their root declaration with 2020-12 properties.
+      if (target !== "draft-2020-12") {
+        throw new Error(`Unsupported JSON Schema target: ${target}`);
+      }
+      return tool.schema.toJSONSchema(input, { io, target: "draft-2020-12" });
+    };
+    // Let the host use our converter rather than traversing argument internals
+    // with a different Zod version. Keep the root schema and its validator intact.
+    return Object.assign(input, {
+      "~standard": {
+        ...input["~standard"],
+        jsonSchema: {
+          input: (options) => toJSONSchema("input", options),
+          output: (options) => toJSONSchema("output", options),
+        } satisfies ZodType["~standard"]["jsonSchema"],
+      },
+    });
   };
   currentInput();
   const sharedOptions = (definition as ToolDefinition & { options?: Record<string, unknown> })

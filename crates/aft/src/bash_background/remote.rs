@@ -1186,6 +1186,7 @@ struct TaskSink {
     // metadata until the files are synced. Cancellation also saves that metadata.
     output_progress: OutputProgress,
     last_progress_persist: Instant,
+    sent_at: Option<Instant>,
     #[cfg(test)]
     progress_clock: Option<Arc<dyn Fn() -> Instant + Send + Sync>>,
     /// Runs between the checkpoint snapshot and its file write, so a test can
@@ -1306,6 +1307,7 @@ impl TaskSink {
                 ..OutputProgress::of(&remote)
             },
             last_progress_persist: Instant::now(),
+            sent_at: None,
             #[cfg(test)]
             progress_clock: None,
             #[cfg(test)]
@@ -1648,6 +1650,12 @@ pub(super) fn persist_terminal_artifacts(paths: &TaskPaths, metadata: &mut Persi
 #[cfg(unix)]
 impl OutputSink for TaskSink {
     fn accepted(&mut self, accepted: &Accepted) -> io::Result<()> {
+        // Measure receipt before local persistence adds its own latency. An
+        // attach after restart has no in-process exec.run send timestamp.
+        let capture_ms = self
+            .sent_at
+            .map(|sent_at| sent_at.elapsed().as_millis().to_string())
+            .unwrap_or_else(|| "unknown".into());
         // A resubmitted job returns its files afresh.
         if let Some(returns) = self.returns.as_mut() {
             returns.reset();
@@ -1688,10 +1696,11 @@ impl OutputSink for TaskSink {
             *existing = note + &suffix;
         }
         crate::slog_info!(
-            "runon: remote task accepted task_id={} session={} job_id={}",
+            "runon: remote task accepted task_id={} session={} job_id={} capture_ms={}",
             self.task.task_id,
             state.metadata.session_id,
             accepted.job_id,
+            capture_ms,
         );
         self.registry
             .persist_task_locked(&self.task, &state.metadata, &mut db)?;
@@ -2289,6 +2298,8 @@ impl BgTaskRegistry {
         compressed: bool,
         root: Option<PathBuf>,
     ) -> Result<String, RegistryError> {
+        let mut timings = super::super::take_runon_timings();
+        timings.enter("task_setup");
         let canonical_project_root = canonicalized_path(root.as_deref().unwrap_or(&workdir));
         let _admission = self.background_admission_guard(slot);
         self.check_background_slot_typed(slot, &session_id)?;
@@ -2297,6 +2308,7 @@ impl BgTaskRegistry {
             None => allocate_task_layout(&storage_dir, &session_id).map_err(|e| e.to_string())?,
         };
         let layout_cleanup = UncommittedLayout::new(&layout);
+        timings.enter("sandbox_payload");
         if plan.prepared_task().is_none() {
             let environment =
                 crate::sandbox_spawn::approved_payload_environment(&env, &std::env::temp_dir());
@@ -2312,6 +2324,7 @@ impl BgTaskRegistry {
             plan = plan.with_prepared_task(prepared);
         }
         let task_id = layout.paths.task_id.clone();
+        timings.enter("task_metadata");
         let requested_vcpus = launch.requested_vcpus;
         let mut metadata = PersistedTask::starting(
             task_id.clone(),
@@ -2374,6 +2387,7 @@ impl BgTaskRegistry {
             &shell_path,
         );
         attach_sandbox_metadata(&mut metadata, &plan);
+        timings.enter("fallback_snapshot");
         let digest = crate::sandbox_spawn::save_local_launch(
             &plan,
             root.as_deref().unwrap_or(&workdir),
@@ -2385,6 +2399,7 @@ impl BgTaskRegistry {
             memory_limit_mib,
         )?;
         metadata.remote.as_mut().unwrap().fallback_digest = Some(digest);
+        timings.enter("task_registration");
         let handles =
             TaskIoHandles::create(&layout, BgMode::Pipes, true).map_err(|e| e.to_string())?;
         write_task_at(&layout, &metadata).map_err(|e| e.to_string())?;
@@ -2413,6 +2428,7 @@ impl BgTaskRegistry {
             .map_err(|_| "task lock poisoned")?
             .io_handles = Some(handles);
         let request_root = root.as_deref().unwrap_or(&workdir);
+        timings.enter("remote_environment");
         let linux_scope = env
             .remove("AFT_INTERNAL_LINUX_SCOPE")
             .is_some_and(|v| v == "1");
@@ -2472,6 +2488,7 @@ impl BgTaskRegistry {
                 .map_err(|e| e.to_string())?;
         }
         let explicit_runon = launch.explicit_runon;
+        timings.enter("workdir_repository_git");
         let request = environment.and_then(|environment| {
             *task
                 .completion_secrets
@@ -2502,6 +2519,7 @@ impl BgTaskRegistry {
                 },
             )
         });
+        timings.enter("cd_snapshot_git");
         let request = request
             .map_err(RemoteRequestError::Build)
             .and_then(|request| {
@@ -2522,13 +2540,14 @@ impl BgTaskRegistry {
             env,
             capture_pipeline,
         };
-        self.start_remote_worker(task, Some((request, fallback)))?;
+        timings.enter("worker_dispatch");
+        self.start_remote_worker(task, Some((request, fallback)), Some(timings))?;
         self.start_watchdog();
         Ok(task_id)
     }
 
     pub(super) fn resume_remote_task(&self, task_id: &str) -> Result<(), String> {
-        self.start_remote_worker(self.task(task_id).ok_or("remote task missing")?, None)
+        self.start_remote_worker(self.task(task_id).ok_or("remote task missing")?, None, None)
     }
 
     async fn key_fresh_request(
@@ -2536,11 +2555,14 @@ impl BgTaskRegistry {
         client: &ExecRemoteClient,
         task: &Arc<BgTask>,
         request: RunRequest,
+        timings: &mut exec::LaunchTimings,
     ) -> Result<RunRequest, String> {
+        timings.enter("supports_submission_key");
         let supported = client
             .supports_submission_key()
             .await
             .map_err(|e| e.to_string())?;
+        timings.enter("submission_persistence");
         let previous = task
             .state
             .lock()
@@ -2599,6 +2621,7 @@ impl BgTaskRegistry {
     ) -> Result<Option<exec::RemoteStream>, String> {
         sink.checkpoint_progress().map_err(|e| e.to_string())?;
         loop {
+            let mut timings = exec::LaunchTimings::new(Instant::now(), "submission_recovery");
             let metadata = sink
                 .task
                 .state
@@ -2669,10 +2692,11 @@ impl BgTaskRegistry {
                 return Ok(None);
             }
             let submit = async {
+                timings.enter("supports_submission_key");
                 if !client.supports_submission_key().await? {
                     return Ok(None);
                 }
-                let result = client.run(&request).await;
+                let result = run_diagnosed(client, &sink.task, &request, timings).await;
                 #[cfg(test)]
                 let result = if result.is_ok() && tests::lose_submission_replies(root) {
                     // A round trip confirms dispatch reached the fake executor
@@ -2715,6 +2739,7 @@ impl BgTaskRegistry {
         &self,
         task: Arc<BgTask>,
         initial: Option<(Result<RunRequest, RemoteRequestError>, LocalFallback)>,
+        timings: Option<exec::LaunchTimings>,
     ) -> Result<(), String> {
         {
             // A finished task whose owed runner cancel the startup pass
@@ -2776,11 +2801,19 @@ impl BgTaskRegistry {
         std::thread::Builder::new()
             .name(format!("aft-remote-{}", task.task_id))
             .spawn(move || {
-                let result = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| e.to_string())
-                    .and_then(|rt| rt.block_on(registry.run_remote_task(task.clone(), initial)));
+                let run = || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| e.to_string())
+                        .and_then(|rt| {
+                            rt.block_on(registry.run_remote_task(task.clone(), initial, timings))
+                        })
+                };
+                #[cfg(test)]
+                let result = tests::capture_remote_launch_logs(&task, run);
+                #[cfg(not(test))]
+                let result = run();
                 if let Err(error) = result {
                     if registry.finish_owner_pause_cancel(&task, Err(error.clone())) {
                         task.remote_launch_ready.store(true, Ordering::Release);
@@ -2835,7 +2868,10 @@ impl BgTaskRegistry {
         &self,
         task: Arc<BgTask>,
         mut initial: Option<(Result<RunRequest, RemoteRequestError>, LocalFallback)>,
+        timings: Option<exec::LaunchTimings>,
     ) -> Result<(), String> {
+        let mut timings =
+            timings.unwrap_or_else(|| exec::LaunchTimings::new(Instant::now(), "recovery_setup"));
         let remote = task
             .state
             .lock()
@@ -2852,6 +2888,7 @@ impl BgTaskRegistry {
             .project_root
             .clone()
             .unwrap_or_else(|| PathBuf::from("/"));
+        timings.enter("worker_setup");
         let mut sink = TaskSink::new(self, task.clone()).map_err(|e| e.to_string())?;
         let mut recovery = ReattachBudget::new(
             &root,
@@ -2944,6 +2981,7 @@ impl BgTaskRegistry {
             );
             return Ok(());
         }
+        timings.enter("connect_route");
         let connection = remote
             .connection_file
             .as_ref()
@@ -3027,6 +3065,7 @@ impl BgTaskRegistry {
                 }
             }
         };
+        timings.enter("retry_preparation");
         let mut fallback = None;
         let mut hinted: Option<HintedRetry> = None;
         if remote.accepted && !platform_acknowledged(&remote) {
@@ -3134,7 +3173,9 @@ impl BgTaskRegistry {
                 .map_err(|e| e.to_string())?;
                 hinted = Some(HintedRetry::start(&root, request.clone()));
             }
-            let request = self.key_fresh_request(&client, &task, request).await?;
+            let request = self
+                .key_fresh_request(&client, &task, request, &mut timings)
+                .await?;
             if task
                 .state
                 .lock()
@@ -3149,7 +3190,7 @@ impl BgTaskRegistry {
                 }
                 return Ok(());
             }
-            match client.run(&request).await {
+            match run_diagnosed(&client, &task, &request, timings).await {
                 Ok(stream) => stream,
                 Err(error) if proves_no_start(&error) => {
                     return if remote.explicit_runon {
@@ -3229,6 +3270,7 @@ impl BgTaskRegistry {
                     return Err(PRE_ACCEPTANCE_CANCELLED.into());
                 }
             }
+            sink.sent_at = stream.sent_at();
             let result = tokio::select! {
                 result=stream.next(&mut sink)=>result,
                 _=tokio::time::sleep(Duration::from_millis(50))=>{
@@ -3519,6 +3561,7 @@ impl BgTaskRegistry {
         task: &Arc<BgTask>,
         root: &Path,
     ) -> Result<Option<(exec::RemoteStream, HintedRetry)>, String> {
+        let mut timings = exec::LaunchTimings::new(Instant::now(), "draining_retry");
         // Recheck after connecting: reconnect time also consumes the retry budget.
         let Some(request) = self.wait_draining_retry(task, root).await? else {
             return Ok(None);
@@ -3526,7 +3569,7 @@ impl BgTaskRegistry {
         #[cfg(test)]
         tests::draining_gate(root, tests::DrainingGate::BeforeResubmit).await;
         let keyed_request = self
-            .key_fresh_request(client, task, request.clone())
+            .key_fresh_request(client, task, request.clone(), &mut timings)
             .await?;
         {
             let mut db = DeferredDbWrites::new(self, task);
@@ -3563,7 +3606,7 @@ impl BgTaskRegistry {
         }
         // A fresh submission gets its own signer-retry allowance, counted from now.
         let hinted = HintedRetry::start(root, request);
-        match resubmit(client, &keyed_request, root).await {
+        match resubmit(client, task, &keyed_request, root, timings).await {
             Ok(stream) => Ok(Some((stream, hinted))),
             Err(error) if proves_no_start(&error) => {
                 #[cfg(test)]
@@ -3593,6 +3636,7 @@ impl BgTaskRegistry {
         root: &Path,
         retry: &mut HintedRetry,
     ) -> Result<HintedRetryStep, String> {
+        let mut timings = exec::LaunchTimings::new(Instant::now(), "hinted_retry");
         let (terminal, started) = {
             let state = task.state.lock().map_err(|_| "task lock poisoned")?;
             let remote = state
@@ -3668,7 +3712,7 @@ impl BgTaskRegistry {
         #[cfg(test)]
         tests::draining_gate(root, tests::DrainingGate::BeforeHintedResubmit).await;
         let request = self
-            .key_fresh_request(client, task, retry.request.clone())
+            .key_fresh_request(client, task, retry.request.clone(), &mut timings)
             .await?;
         {
             let mut db = DeferredDbWrites::new(self, task);
@@ -3703,7 +3747,7 @@ impl BgTaskRegistry {
                 .map_err(|e| e.to_string())?;
         }
         retry.resubmits += 1;
-        match resubmit(client, &request, root).await {
+        match resubmit(client, task, &request, root, timings).await {
             Ok(stream) => Ok(HintedRetryStep::Resubmitted(stream)),
             Err(error) if proves_no_start(&error) => {
                 #[cfg(test)]
@@ -5531,8 +5575,10 @@ fn append_executor_environment_disclosure(metadata: &mut PersistedTask) {
 #[cfg(unix)]
 async fn resubmit(
     client: &ExecRemoteClient,
+    task: &Arc<BgTask>,
     request: &RunRequest,
     _root: &Path,
+    timings: exec::LaunchTimings,
 ) -> Result<exec::RemoteStream, exec::Error> {
     #[cfg(test)]
     if tests::refuse_resubmission(_root) {
@@ -5540,7 +5586,26 @@ async fn resubmit(
             "test: resubmission failed before it was sent".into(),
         ));
     }
-    client.run(request).await
+    run_diagnosed(client, task, request, timings).await
+}
+
+#[cfg(unix)]
+async fn run_diagnosed(
+    client: &ExecRemoteClient,
+    task: &Arc<BgTask>,
+    request: &RunRequest,
+    timings: exec::LaunchTimings,
+) -> Result<exec::RemoteStream, exec::Error> {
+    client
+        .run_with_diagnostics(
+            request,
+            Some(exec::RunDiagnostics {
+                task_id: &task.task_id,
+                session: &task.session_id,
+                timings,
+            }),
+        )
+        .await
 }
 
 #[cfg(unix)]

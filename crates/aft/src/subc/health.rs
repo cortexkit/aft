@@ -3460,7 +3460,8 @@ fn build_health_diagnostic_rollup_from_actors(
         // This field deliberately covers only already-open resident stores. A
         // standing report is necessary because stale rows block projection by
         // making dead-code findings disappear rather than raising an error.
-        resident_callgraph_stale_backend_rows: Option<crate::callgraph_store::StalePathCensus>,
+        resident_callgraph_stale_backend_rows:
+            Option<crate::callgraph_store::StalePathHealthCensus>,
         watcher: Option<crate::context::WatcherCountersSnapshot>,
         disclaim_privacy: Option<bool>,
         standing: Option<StandingHealthEntry>,
@@ -3584,7 +3585,7 @@ fn build_health_diagnostic_rollup_from_actors(
             ctx.callgraph_store().try_read().ok().and_then(|store| {
                 store
                     .as_ref()
-                    .and_then(|store| store.try_stale_path_census().ok().flatten())
+                    .and_then(|store| store.try_stale_path_census_for_health().ok().flatten())
             });
         let backend = ctx.semantic_backend_health_snapshot();
         if !backend.available {
@@ -3756,7 +3757,12 @@ fn build_health_diagnostic_rollup_from_actors(
                         );
                     }
                 }
-                if let Some(census) = candidate.resident_callgraph_stale_backend_rows {
+                if let Some(sample) = candidate.resident_callgraph_stale_backend_rows {
+                    let census = sample.census;
+                    object.insert(
+                        "resident_callgraph_stale_backend_rows_age_ms".to_string(),
+                        json!(sample.measured_age_ms),
+                    );
                     object.insert(
                         "resident_callgraph_stale_backend_rows".to_string(),
                         json!(census.stale),
@@ -6066,6 +6072,32 @@ mod tests {
         *ctx.callgraph_store()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(reader));
+    }
+
+    #[test]
+    fn idle_rollup_reuses_resident_stale_path_censuses() {
+        let executor = Executor::new();
+        let app = crate::context::App::default_shared();
+        let mut dirs = Vec::new();
+        for index in 0..111 {
+            let (dir, root) = test_root(&format!("idle-stale-{index}"));
+            let ctx = test_ctx();
+            install_resident_stale_callgraph(&ctx, &root, "src/stale.ts", false);
+            assert!(executor.register_actor(root, ctx));
+            dirs.push(dir);
+        }
+        let cache = HealthRollupCache::new();
+        cache.refresh_for_test(&executor, &app);
+        let before = crate::callgraph_store::STALE_PATH_CENSUS_BUILDS.with(std::cell::Cell::get);
+        for _ in 0..5 {
+            cache.refresh_for_test(&executor, &app);
+        }
+        assert_eq!(
+            crate::callgraph_store::STALE_PATH_CENSUS_BUILDS.with(std::cell::Cell::get) - before,
+            0,
+            "idle ticks must not query stale rows and probe their paths again"
+        );
+        assert_eq!(cache.snapshot().0.metrics["root_count"], 111);
     }
 
     #[test]

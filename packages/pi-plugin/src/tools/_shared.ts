@@ -418,6 +418,9 @@ export async function withOutsidePermissions<T extends Record<string, unknown>>(
   // Re-asks the engine marked `approval_expired`, per operation and path:
   // the user said yes after the token expired, so asking again is progress.
   const expiredReasks = new Map<string, number>();
+  // A reconnect can replace the route while its prompt is open. Offer one
+  // fresh approval, but do not loop through repeated reconnects in one call.
+  const replacedRouteReasks = new Set<string>();
   for (let round = 0; ; round++) {
     // Before every send, including an approved retry: a call cancelled
     // while it waited for an answer must not run.
@@ -468,12 +471,21 @@ export async function withOutsidePermissions<T extends Record<string, unknown>>(
       const key = askKey(ask);
       if (!approvedThisCall.has(key)) continue;
       const where = ask.path ?? "an outside path";
-      // An approval the engine refuses for any other reason cannot finish.
-      if (ask.reason !== "approval_expired")
+      const replacedRoute = ask.reason === "approval_route_replaced";
+      // A fresh route needs fresh approval; no token crosses the route boundary.
+      // Any other refusal, or a second replacement, cannot finish this call.
+      if (
+        (ask.reason !== "approval_expired" && !replacedRoute) ||
+        (replacedRoute && replacedRouteReasks.has(key))
+      )
         throw new BridgeError(
           `outside access to ${where} was refused again after it was approved`,
           "outside_permission_stalled",
         );
+      if (replacedRoute) {
+        replacedRouteReasks.add(key);
+        continue;
+      }
       const reasked = expiredReasks.get(key) ?? 0;
       if (reasked >= MAX_EXPIRED_REASKS_PER_PATH)
         throw new BridgeError(
