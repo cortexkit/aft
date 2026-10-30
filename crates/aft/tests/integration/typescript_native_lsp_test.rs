@@ -96,7 +96,13 @@ fn typescript_package(dir: &Path, modules: &Path) {
 }
 
 fn spawn_configured(root: &Path, lsp_paths_extra: &[PathBuf]) -> AftProcess {
-    let mut aft = AftProcess::spawn();
+    // On macOS typescript-language-server probes case sensitivity in a shared
+    // typescript-language-server<uid> temp directory using existsSync + mkdirSync.
+    // Concurrent first starts can race to create it, so isolate each fixture's
+    // server temp files as well as its workspace and HOME.
+    let server_tmp = root.join(".typescript-server-tmp");
+    fs::create_dir_all(&server_tmp).unwrap();
+    let mut aft = AftProcess::spawn_with_env(&[("TMPDIR", server_tmp.as_os_str())]);
     let configure = aft.send(
         &json!({
             "id": "cfg",
@@ -160,6 +166,41 @@ fn runtime_notes(aft: &mut AftProcess, file: &Path) -> Vec<String> {
         aft.send(&json!({"id": "inspect-lsp", "command": "lsp_inspect", "file": file}).to_string());
     assert_eq!(response["success"], true, "lsp_inspect: {response}");
     serde_json::from_value(response["lsp_runtime_notes"].clone()).unwrap()
+}
+
+#[test]
+fn typescript_server_temp_directories_are_isolated() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().canonicalize().unwrap();
+    let bin = parent.join("bin");
+    let server = bin.join("typescript-language-server");
+    write(
+        &server,
+        "#!/bin/sh\nprintf 'server TMPDIR=%s\\n' \"$TMPDIR\" >&2\nexit 1\n",
+    );
+    fs::set_permissions(&server, fs::Permissions::from_mode(0o755)).unwrap();
+
+    for name in ["first", "second"] {
+        let root = parent.join(name);
+        let file = root.join("src/main.ts");
+        write(&root.join("tsconfig.json"), "{}");
+        write(&file, "export const value = 1;\n");
+        let mut aft = spawn_configured(&root, std::slice::from_ref(&bin));
+        let _ = aft.send(
+            &json!({"id": "probe", "command": "inspect", "scope": file, "sections": ["diagnostics"]})
+                .to_string(),
+        );
+        let (_, stderr) = aft.stderr_output();
+        assert!(
+            stderr.contains(&format!(
+                "server TMPDIR={}",
+                root.join(".typescript-server-tmp").display()
+            )),
+            "server did not inherit its fixture's private temp directory: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -242,15 +283,24 @@ fn typescript_5_inspect_outside_project_root_uses_external_workspace() {
         })
         .to_string(),
     );
-    assert_eq!(response["success"], true, "{response}");
-    assert_eq!(response["scope_files"], 1, "{response}");
+    // The response only quotes the first stderr line on a startup crash. Drain
+    // AFT's exit logs too so a failed assertion includes the Node error and path.
+    let (_, stderr) = aft.stderr_output();
+    assert_eq!(
+        response["success"], true,
+        "{response}\nAFT stderr:\n{stderr}"
+    );
+    assert_eq!(
+        response["scope_files"], 1,
+        "{response}\nAFT stderr:\n{stderr}"
+    );
     assert_eq!(
         response["summary"]["diagnostics"]["errors"], 1,
-        "{response}"
+        "{response}\nAFT stderr:\n{stderr}"
     );
     assert_eq!(
         response["summary"]["diagnostics"]["by_producer"]["typescript"]["errors"], 1,
-        "{response}"
+        "{response}\nAFT stderr:\n{stderr}"
     );
     assert!(
         response["details"]["diagnostics"]
@@ -261,7 +311,7 @@ fn typescript_5_inspect_outside_project_root_uses_external_workspace() {
                 && row["message"].as_str().is_some_and(
                     |message| message.contains("2322") || message.contains("not assignable")
                 )),
-        "{response}"
+        "{response}\nAFT stderr:\n{stderr}"
     );
 }
 
