@@ -655,7 +655,6 @@ fn materialize_reading(
     let mut loaded_paths = BTreeSet::new();
     let mut owned_files = Vec::new();
     let mut owned_nodes = Vec::new();
-    let mut dispatch_inputs = dispatch::DecodedFiles::default();
     let mut cold_module_facts = HashMap::new();
     for (path, entry) in manifest.entries() {
         if changed
@@ -688,7 +687,6 @@ fn materialize_reading(
             CallGraphStoreError::Unavailable("non-UTF-8 manifest callgraph path".to_string())
         })?;
         loaded_paths.insert(path.clone());
-        dispatch_inputs.insert(path.clone(), parse)?;
         if changed.is_none() && path.ends_with(".rs") {
             if let Some(facts) = module_digest::RustParseFacts::of(parse) {
                 cold_module_facts.insert(path.clone(), facts);
@@ -1328,7 +1326,7 @@ fn materialize_reading(
         });
     }
     drop(load_refs);
-    drop((parsed, nodes, loaded_paths));
+    drop((nodes, loaded_paths));
     #[cfg(test)]
     drop(control_lookup);
     let edges_deleted = profile.measure(WritePhase::Edges, &transaction, || {
@@ -1492,6 +1490,15 @@ fn materialize_reading(
         .map(|row| row.caller_file.clone())
         .collect::<BTreeSet<_>>();
     drop((pending_refs, pending_edges, ref_deletes, existing));
+    let mut dispatch_inputs = dispatch::DecodedFiles::default();
+    for (path, emission) in &parsed {
+        if !dispatch_reuse || changed_strings.contains(path) {
+            if let Some(parse) = emission.blob.parse() {
+                dispatch_inputs.insert(path.clone(), parse)?;
+            }
+        }
+    }
+    drop(parsed);
     #[cfg(test)]
     crate::test_allocations::heap_marker("materialization", "dispatch_inputs_only");
     let dispatch_work = dispatch::emit_from_decoded(

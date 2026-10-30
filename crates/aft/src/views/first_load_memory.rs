@@ -97,6 +97,7 @@ fn first_load_fixed_fixture_peak_rss() {
         .env("AFT_VIEW_MEMORY_CORPUS", root.path())
         .env("AFT_VIEW_MEMORY_OUTPUT", storage.path())
         .env("AFT_VIEW_MEMORY_LIMIT_MIB", "384")
+        .env("AFT_VIEW_PROFILE", "1")
         .output()
         .unwrap();
     assert!(

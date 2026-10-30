@@ -2518,6 +2518,22 @@ impl FirstLoadDriver for CheckoutDriver {
             None
         };
         let mut v3_readers = V3PlaneReaders::new(&route);
+        let v2_graph_reader = if !v3
+            && self
+                .planes
+                .iter()
+                .any(|p| p.plane() == FamilyPlane::Callgraph)
+        {
+            crate::blob_store::v2::FamilyStoreReader::open_existing(
+                self.owner.registry().storage(),
+                self.owner.family(),
+                FamilyPlane::Callgraph,
+            )
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
         let persisted = durable
             .as_ref()
             .and_then(|generation| {
@@ -2658,7 +2674,16 @@ impl FirstLoadDriver for CheckoutDriver {
                         a.downcast_ref::<CachedAttachment>()
                             .is_none_or(|cached| v3_readers.contains(&cached.0))
                             && a.downcast_ref::<super::callgraph::CallgraphAttachment>()
-                                .is_none_or(|attachment| attachment.payload().is_some())
+                                .is_none_or(|attachment| {
+                                    attachment.payload().is_some()
+                                        || if v3 {
+                                            v3_readers.contains(&attachment.key)
+                                        } else {
+                                            v2_graph_reader.as_ref().is_some_and(|reader| {
+                                                reader.contains(&attachment.key).unwrap_or(false)
+                                            })
+                                        }
+                                })
                     });
                     if cached.reusable(current)
                         && delivered <= cached.delivery_seq
@@ -4875,12 +4900,15 @@ impl CompositePlane for CallgraphBridge {
                 None => store
                     .get(&attachment.key)
                     .map_err(|e| error(e.to_string()))?
-                    .ok_or_else(|| error("retired callgraph payload missing from store".into()))?
+                    .ok_or_else(|| error(format!("{CHECKOUT_CHANGED_BEFORE_INSTALL}: retired callgraph payload missing from store; revalidate")))?
                     .into(),
             };
             store
                 .put_or_touch(&attachment.key, &bytes)
                 .map_err(|e| error(e.to_string()))?;
+            // The live pin protects the durable row through graph construction.
+            // Retries can read it under a new pin; a missing row forces revalidation.
+            attachment.retire();
             if let Some(super::manifest_v2::EntryV2::Regular {
                 planes,
                 resolution_input,
@@ -4891,6 +4919,9 @@ impl CompositePlane for CallgraphBridge {
                 *resolution_input = super::assembly::is_resolution_input(path.as_bytes());
             }
         }
+        // Return freed extraction buffers before the resolver grows its indices.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        crate::memory::relieve_allocator_pressure();
         // Joining uses only protected immutable blobs and the projected manifest,
         // not a source root or a sibling's derived database.
         let reader = super::callgraph::BlobReader(
@@ -5028,7 +5059,7 @@ impl CompositePlane for CallgraphBridge {
                 .map_err(super::callgraph::v3_error)?
                 .get(&attachment.key)
                 .map_err(super::callgraph::v3_error)?
-                .ok_or_else(|| error("retired callgraph payload missing from store".into()))?
+                .ok_or_else(|| error(format!("{CHECKOUT_CHANGED_BEFORE_INSTALL}: retired callgraph payload missing from store; revalidate")))?
                 .into(),
             };
             payloads.push((path.clone(), attachment.key, bytes));
@@ -5060,6 +5091,13 @@ impl CompositePlane for CallgraphBridge {
                 *resolution_input = super::assembly::is_resolution_input(path.as_bytes());
             }
         }
+        for (_, attachment) in &attachments {
+            attachment.retire();
+        }
+        drop((payloads, attachments));
+        // Serialization and parsing buffers no longer belong to this phase.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        crate::memory::relieve_allocator_pressure();
         // The derived graph covers the composed generation. While the base's
         // graph is still pending the projection refuses, and the worker's
         // graph stays building until a later publication; nothing is copied.
@@ -5178,6 +5216,50 @@ impl CompositePlane for CallgraphBridge {
 mod callgraph_bridge_tests {
     use super::super::contracts::{PlaneAdapter, PlaneLoader};
     use super::*;
+
+    #[test]
+    fn retired_v2_attachment_reuses_present_key_and_reextracts_a_missing_row() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("file.rs"),
+            b"fn target() {} fn caller() { target(); }",
+        )
+        .unwrap();
+        let bridge = Arc::new(CallgraphBridge::default());
+        let (driver, access) = graph_driver(root.path(), storage.path(), &bridge, bridge.clone());
+        SiblingLoader::new(driver.clone(), vec![bridge.adapter.clone()])
+            .load(&access)
+            .unwrap();
+        let count = bridge.extraction_count();
+        let observed = driver.observed.lock().unwrap().clone();
+        let attachment = observed.entries[&RelPath::new(b"file.rs".to_vec()).unwrap()].attachments
+            [&FamilyPlane::Callgraph]
+            .downcast_ref::<super::super::callgraph::CallgraphAttachment>()
+            .unwrap();
+        assert!(attachment.payload().is_none());
+        driver.reconcile(&access).unwrap();
+        assert_eq!(
+            bridge.extraction_count(),
+            count,
+            "a durable key replaces the consumed payload"
+        );
+        let store = driver.owner.open_store(FamilyPlane::Callgraph).unwrap();
+        rusqlite::Connection::open(store.path())
+            .unwrap()
+            .execute("DELETE FROM blob_membership", [])
+            .unwrap();
+        let next = driver.reconcile(&access).unwrap();
+        assert_eq!(bridge.extraction_count(), count + 1);
+        assert!(
+            next.entries[&RelPath::new(b"file.rs".to_vec()).unwrap()].attachments
+                [&FamilyPlane::Callgraph]
+                .downcast_ref::<super::super::callgraph::CallgraphAttachment>()
+                .unwrap()
+                .payload()
+                .is_some()
+        );
+    }
 
     struct Walker;
     impl MembershipWalker for Walker {

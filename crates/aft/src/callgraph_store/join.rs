@@ -2268,10 +2268,23 @@ fn join_manifest_with_surfaces(
         loaded.borrow_mut().insert(key.clone(), bytes.clone());
         Ok(bytes)
     };
+    // Standalone selective joins have no emission owner to keep changed
+    // caller blobs alive across surface replay. Cold materialization already
+    // shares those objects through its emission reader.
+    let selective_decoded = std::cell::RefCell::new(HashMap::<BlobKey, Arc<CallgraphBlob>>::new());
     let decode = |key: &BlobKey| -> Result<Arc<CallgraphBlob>, ManifestJoinError> {
-        blobs
+        if let Some(blob) = selective_decoded.borrow().get(key) {
+            return Ok(blob.clone());
+        }
+        let blob = blobs
             .read_callgraph_blob_decoded(key)?
-            .ok_or_else(|| ManifestJoinError::MissingBlob(key.clone()))
+            .ok_or_else(|| ManifestJoinError::MissingBlob(key.clone()))?;
+        if selected.is_some() {
+            selective_decoded
+                .borrow_mut()
+                .insert(key.clone(), blob.clone());
+        }
+        Ok(blob)
     };
     let read_error = std::cell::RefCell::new(None);
     let reader = |key: &BlobKey| match load(key) {
