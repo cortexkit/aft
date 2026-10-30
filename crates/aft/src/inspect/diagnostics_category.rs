@@ -35,8 +35,9 @@ pub(crate) const EXPLICIT_CHECK_UNVERIFIED_REASON: &str = "cargo check for aft_i
 
 const EXPLICIT_CHECK_RUNNING_REASON: &str = "cargo check running for aft_inspect; retry";
 
-/// PROPOSED AGENT-VISIBLE WORDING — approval is required before merge.
-/// Used for named file gaps, not as a checked-clean fallback.
+/// Reason for a file whose diagnostics don't yet match its current content.
+/// It names a coverage gap and is never used as a checked-clean fallback.
+/// Agents see this text, so changing it needs product approval.
 pub(crate) const CURRENT_CONTENT_UNVERIFIED_REASON: &str =
     "no diagnostics for the current file content arrived in time; retry aft_inspect";
 
