@@ -1586,6 +1586,13 @@ mod production {
             "{during:#}"
         );
         assert_ne!(during["complete"], true, "{during:#}");
+        assert!(
+            !during.to_string().contains("This is an AFT bug"),
+            "{during:#}"
+        );
+        let health = ctx.try_health_snapshot(&root);
+        assert!(health.view_load_failures.is_empty(), "{health:?}");
+        assert!(health.view_load_failure_last.is_none(), "{health:?}");
         // The views-on lane imports into the family's v3 planes through the
         // v3 ledger (the family is the legacy key).
         let ledger = V3Ledger::new(&storage, &key).unwrap();

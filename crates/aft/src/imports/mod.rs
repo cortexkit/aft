@@ -2428,6 +2428,17 @@ fn parse_py_imports(source: &str, tree: &Tree) -> ImportBlock {
     }
 }
 
+/// Parse one Python import without imposing the import editor's top-level boundary.
+pub(crate) fn parse_py_import_node(source: &str, node: &Node) -> Option<ImportStatement> {
+    match node.kind() {
+        "import_statement" => parse_py_import_statement(source, node),
+        "import_from_statement" | "future_import_statement" => {
+            parse_py_import_from_statement(source, node)
+        }
+        _ => None,
+    }
+}
+
 /// Parse `import X` or `import X.Y` Python statements.
 fn parse_py_import_statement(source: &str, node: &Node) -> Option<ImportStatement> {
     let raw_text = source[node.byte_range()].to_string();

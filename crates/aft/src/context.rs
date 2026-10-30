@@ -318,7 +318,7 @@ thread_local! {
 thread_local! {
     static CHECKOUT_QUERY_OUTCOMES: std::cell::RefCell<Vec<(usize, Option<crate::views::contracts::WaitOutcome>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
-    static LEXICAL_QUERY_SNAPSHOTS: std::cell::RefCell<Vec<(usize, Result<crate::search_index::SearchIndexSnapshot, String>)>> =
+    static LEXICAL_QUERY_SNAPSHOTS: std::cell::RefCell<Vec<(usize, Result<crate::views::trigram::LexicalViewSnapshot, String>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// The call-graph reader each pinned request acquired from its checkout
     /// view, so every graph read in one request answers from one generation.
@@ -12430,7 +12430,7 @@ impl AppContext {
     pub(crate) fn lexical_view_snapshot(
         &self,
         tool: &str,
-    ) -> Option<Result<crate::search_index::SearchIndexSnapshot, String>> {
+    ) -> Option<Result<crate::views::trigram::LexicalViewSnapshot, String>> {
         if !self.lexical_views_enabled() {
             return None;
         }
@@ -12465,8 +12465,13 @@ impl AppContext {
                             .as_ref()
                             .is_some_and(|view| view.matches(&root, &storage, &family, policy))
                         {
-                            match crate::views::trigram::LexicalView::new(
-                                root, storage, family, policy,
+                            match crate::views::trigram::LexicalView::new_with_import(
+                                root,
+                                storage,
+                                family,
+                                policy,
+                                self.views_import_control(),
+                                self.cold_build_limiter(),
                             ) {
                                 Ok(view) => *slot = Some(Arc::new(view)),
                                 Err(error) => return Err(error),
@@ -12486,7 +12491,7 @@ impl AppContext {
                     .push((self.config_pin_key(), result.clone()))
             });
         }
-        if result.is_ok() && tool != "bind" {
+        if result.as_ref().is_ok_and(|snapshot| snapshot.is_ready()) && tool != "bind" {
             let index = match tool {
                 "grep" => 0,
                 "glob" => 1,
@@ -12495,7 +12500,10 @@ impl AppContext {
             self.lexical_routes[index].fetch_add(1, Ordering::Relaxed);
         }
         match &result {
-            Ok(_) => self.note_view_load_success(),
+            Ok(crate::views::trigram::LexicalViewSnapshot::Ready(_)) => {
+                self.note_view_load_success()
+            }
+            Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding) => {}
             Err(error) => self.note_view_load_failure("trigram", error),
         }
         Some(result)
@@ -12517,7 +12525,8 @@ impl AppContext {
     /// (lexical, call graph and semantic) rather than the content-addressed
     /// v1 view or the legacy stores. Such a root runs none of the legacy
     /// views-on writers: no v1 view publication or import, no v1 blob puts
-    /// and no legacy semantic import. An explicitly installed checkout query
+    /// and no import into the old semantic runtime. Compatible pre-view caches
+    /// may still be imported into v3 on background workers. A checkout query
     /// runtime keeps the older route.
     pub(crate) fn views_route_root(&self) -> bool {
         let config = self.config();
@@ -12526,6 +12535,13 @@ impl AppContext {
             && self.heavy_root_work_allowed()
             && self.cache_unavailable_reason().is_none()
             && !self.checkout_query_runtime_active()
+    }
+
+    pub(crate) fn views_import_control(&self) -> crate::migration::v3_ledger::ImportControl {
+        let lifecycle = self.subc_lifecycle_admission();
+        let generation = self.configure_generation_flag();
+        let expected = generation.load(Ordering::Acquire);
+        Arc::new(move || lifecycle.is_bound() && generation.load(Ordering::Acquire) == expected)
     }
 
     pub(crate) fn callgraph_view_is_ready(&self) -> bool {
@@ -12608,7 +12624,16 @@ impl AppContext {
                 match self.callgraph_construction_retry.lock().run(
                     Instant::now,
                     |error| error.busy,
-                    || crate::views::callgraph::CallgraphView::new(root, storage, family, policy),
+                    || {
+                        crate::views::callgraph::CallgraphView::new_with_import(
+                            root,
+                            storage,
+                            family,
+                            policy,
+                            self.views_import_control(),
+                            self.cold_build_limiter(),
+                        )
+                    },
                 ) {
                     Ok(view) => *slot = Some(Arc::new(view)),
                     Err(error) => {
@@ -22201,6 +22226,9 @@ mod status_emitter_tests {
 
     #[test]
     fn status_counts_do_not_acquire_a_held_lsp_manager() {
+        let fixture = tempfile::tempdir().unwrap();
+        let file = fixture.path().join("main.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
         let ctx = Arc::new(AppContext::new(
             Box::new(TreeSitterProvider::new()),
             Config {
@@ -22215,9 +22243,10 @@ mod status_emitter_tests {
                 kind: crate::lsp::registry::ServerKind::Rust,
                 root: PathBuf::from("/proj"),
             },
-            PathBuf::from("/proj/main.rs"),
+            file.clone(),
             vec![],
         );
+        ctx.lsp().certify_diagnostic_content_for_test(&file);
         let (client, mut fleet_rx) = crate::fleet_status::FleetStatusClient::dial_channel(2);
         ctx.install_fleet_status_client(Some(client));
         let mut first = String::from("first");
@@ -23067,14 +23096,18 @@ mod status_bar_tests {
 
     #[test]
     fn diagnostics_counts_are_unknown_until_project_applicability_exists() {
+        let fixture = tempfile::tempdir().unwrap();
+        let file = fixture.path().join("main.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
         ctx.lsp()
             .diagnostics_store_mut_for_test()
             .publish_with_kind(
                 crate::lsp::registry::ServerKind::Rust,
-                PathBuf::from("/fixture/main.rs"),
+                file.clone(),
                 Vec::new(),
             );
+        ctx.lsp().certify_diagnostic_content_for_test(&file);
         assert_eq!(
             (
                 ctx.status_bar_count_values().errors,
@@ -23280,7 +23313,9 @@ mod status_bar_tests {
         let ctx = ctx();
         ctx.update_status_bar_tier2(Some(0), Some(0), Some(0), Some(0), false); // populate so the bar surfaces
 
-        let file = std::path::PathBuf::from("/proj/gone.ts");
+        let fixture = tempfile::tempdir().unwrap();
+        let file = fixture.path().join("gone.ts");
+        std::fs::write(&file, "const value = 1;\n").unwrap();
         {
             let mut lsp = ctx.lsp();
             lsp.diagnostics_store_mut_for_test().publish(
@@ -23301,6 +23336,7 @@ mod status_bar_tests {
                     source: None,
                 }],
             );
+            lsp.certify_diagnostic_content_for_test(&file);
         }
 
         // Bar reflects the live warm-set error.
@@ -23320,8 +23356,11 @@ mod status_bar_tests {
 
         let ctx = ctx();
         ctx.update_status_bar_tier2(Some(0), Some(0), Some(0), Some(0), false);
-        let root = std::path::PathBuf::from("/proj");
+        let fixture = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(fixture.path());
         let file = root.join("src/main.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "fn main() {}\n").unwrap();
         let key = ServerKey {
             kind: ServerKind::Rust,
             root,
@@ -23345,6 +23384,7 @@ mod status_bar_tests {
                 file.clone(),
                 vec![diagnostic(DiagnosticSeverity::Error, "settled error")],
             );
+            lsp.certify_diagnostic_content_for_test(&file);
         }
         let counts = ctx.status_bar_counts().expect("populated");
         assert_eq!((counts.errors, counts.warnings), (1, 0));
@@ -23363,6 +23403,7 @@ mod status_bar_tests {
                     None,
                     true,
                 );
+            lsp.certify_diagnostic_content_for_test(&file);
         }
         let counts = ctx.status_bar_counts().expect("populated");
         assert_eq!(
@@ -23392,15 +23433,13 @@ mod status_bar_tests {
         use crate::lsp::roots::ServerKey;
 
         let ctx = ctx();
-        let root = if cfg!(windows) {
-            std::path::PathBuf::from(r"C:\proj")
-        } else {
-            std::path::PathBuf::from("/proj")
-        };
+        let fixture = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(fixture.path());
         ctx.set_canonical_cache_root(root.clone());
         ctx.update_status_bar_tier2(Some(0), Some(0), Some(0), Some(0), false);
 
         let file = root.join("aft.jsonc");
+        std::fs::write(&file, "{}\n").unwrap();
         let key = ServerKey {
             kind: ServerKind::TypeScript,
             root: root.clone(),
@@ -23423,6 +23462,7 @@ mod status_bar_tests {
             let mut lsp = ctx.lsp();
             lsp.diagnostics_store_mut_for_test()
                 .publish(key.clone(), file.clone(), vec![env]);
+            lsp.certify_diagnostic_content_for_test(&file);
         }
         assert_eq!(
             ctx.status_bar_count_values().errors,
@@ -23433,7 +23473,8 @@ mod status_bar_tests {
         {
             let mut lsp = ctx.lsp();
             lsp.diagnostics_store_mut_for_test()
-                .publish(key, file, vec![]);
+                .publish(key, file.clone(), vec![]);
+            lsp.certify_diagnostic_content_for_test(&file);
         }
         assert_eq!(
             ctx.status_bar_count_values().errors,

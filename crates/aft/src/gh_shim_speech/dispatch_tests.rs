@@ -319,6 +319,7 @@ struct LaunchOptions {
     repository: Option<String>,
     agent: Option<String>,
     handle: Option<String>,
+    initial_binding_outages: usize,
     pause: Option<(
         std::sync::mpsc::Sender<String>,
         std::sync::mpsc::Receiver<()>,
@@ -489,13 +490,28 @@ impl Fixture {
         let runtime = service.runtime_guard();
         let read = plex.clone();
         let reserve = plex.clone();
+        let binding_outages = Mutex::new(options.initial_binding_outages);
         if !options.sdk_daemon {
             service.install_test_partners(Arc::new(TestPartners {
                 seal_failure: options.seal_failure.clone(),
                 expect_placed: Some("fake-atomic-expect"),
                 run_placed: Some("fake-atomic-run"),
                 reserved_send_placed: true,
-                bindings: Arc::new(move |_, _| Ok(read.bindings())),
+                bindings: Arc::new(move |_, _| {
+                    let mut left = binding_outages.lock().unwrap();
+                    if *left > 0 {
+                        *left -= 1;
+                        let mut error = crate::gh_shim_speech::service::binding_refusal(
+                            Code::AuthorityUnavailable,
+                            "binding_unverifiable",
+                            "connection refused",
+                        );
+                        error.retry_before_send = true;
+                        Err(error)
+                    } else {
+                        Ok(read.bindings())
+                    }
+                }),
                 reserve: Arc::new(move |_, _, scope, body| reserve.reserve(scope, body)),
                 before_final_gate: None,
             }));
@@ -1284,4 +1300,159 @@ async fn captured_dispatch_survives_unscoped_head_reconnect_via_sdk_without_test
     assert_eq!(refused.data["refusal_code"], "task_gh_scope_unknown");
     assert_eq!(refused.data["reason"], "not_synced");
     assert_eq!(fixture.plex.state.lock().unwrap().posts.len(), 1);
+}
+
+#[tokio::test]
+async fn captured_dispatch_retries_unreachable_bindings_once_but_not_missing_rows() {
+    let _lock = crate::test_env::process_env_lock();
+    for recover in [true, false] {
+        let fixture = Fixture::new(false).await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts = calls.clone();
+        let expected = {
+            let mut error = crate::gh_shim_speech::service::binding_refusal(
+                Code::AuthorityUnavailable,
+                "binding_unverifiable",
+                "binding_read_transport: Unavailable(\"connection refused\")",
+            );
+            error.retry_before_send = true;
+            error
+        };
+        fixture.partners(|partners| {
+            let read = partners.bindings.clone();
+            let error = expected.clone();
+            partners.bindings = Arc::new(move |project, session| {
+                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if recover && attempt == 1 {
+                    read(project, session)
+                } else {
+                    Err(error.clone())
+                }
+            });
+        });
+        let reply = fixture.post(true, "binding-outage-once").await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        if recover {
+            assert!(reply.ok, "{:?}", reply.data);
+            assert_eq!(fixture.plex.state.lock().unwrap().sends, 1);
+        } else {
+            assert_eq!(
+                reply.data,
+                expected.wire_data(),
+                "outage refusal code and text stay unchanged"
+            );
+            assert_eq!(fixture.plex.state.lock().unwrap().sends, 0);
+        }
+    }
+    let fixture = Fixture::new(false).await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempts = calls.clone();
+    fixture.partners(|partners| {
+        partners.bindings = Arc::new(move |_, _| {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(json!({"result":{"repo_binding_generation":4,"bindings":[]}}))
+        });
+    });
+    let reply = fixture.post(true, "missing-row").await;
+    assert_eq!(reply.data["refusal_code"], "task_gh_authority_unavailable");
+    assert_eq!(reply.data["reason"], "binding_unverifiable");
+    assert!(reply.data["detail"]
+        .as_str()
+        .unwrap()
+        .contains("no_binding_row"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(fixture.plex.state.lock().unwrap().sends, 0);
+}
+
+#[tokio::test]
+async fn captured_dispatch_retries_unreachable_reservation_before_sending_once() {
+    let _lock = crate::test_env::process_env_lock();
+    let fixture = Fixture::new(false).await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempts = calls.clone();
+    fixture.partners(|partners| {
+        let reserve = partners.reserve.clone();
+        partners.reserve = Arc::new(move |project, session, scope, body| {
+            if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                let mut error = Refusal::new(Code::AuthorityUnavailable, "module_warming");
+                error.retry_before_send = true;
+                Err(error)
+            } else {
+                reserve(project, session, scope, body)
+            }
+        });
+    });
+    let reply = fixture.post(true, "reservation-outage-once").await;
+    assert!(reply.ok, "{:?}", reply.data);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(fixture.plex.state.lock().unwrap().sends, 1);
+}
+
+#[tokio::test]
+async fn captured_dispatch_scope_end_interrupts_a_long_post_send_wait() {
+    let _lock = crate::test_env::process_env_lock();
+    let fixture = Fixture::new(false).await;
+    let sent = Arc::new(tokio::sync::Notify::new());
+    let waiting = sent.clone();
+    fixture.partners(|partners| {
+        let reserve = partners.reserve.clone();
+        partners.reserve = Arc::new(move |project, session, scope, body| {
+            let slot = reserve(project, session, scope, body)?;
+            let sent = sent.clone();
+            Ok(ReservedBotRequest::for_test(move || {
+                let _queued = slot.send()?;
+                Ok(QueuedBotResponse::new(async move {
+                    sent.notify_one();
+                    std::future::pending().await
+                }))
+            }))
+        });
+    });
+    let end = async {
+        waiting.notified().await;
+        let selector = subc_client_rs::ScopeSelector::new(
+            fixture.head.owner.clone(),
+            fixture.head.scope_ref.clone(),
+            Some(fixture.head.scope_epoch),
+        );
+        fixture
+            .service
+            .record_rpc_end(
+                &fixture.head,
+                crate::gh_shim_speech::ScopeRole::Authority,
+                &selector,
+                &fixture.service.generation(),
+                crate::gh_shim_speech::scope::ScopedRpcEndSource::Provider,
+            )
+            .unwrap();
+    };
+    let (reply, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(fixture.post(true, "end-while-waiting"), end)
+    })
+    .await
+    .expect("scope end must not wait for the 160 s reply budget");
+    assert_eq!(reply.data["refusal_code"], "task_gh_scope_ended");
+    assert_eq!(reply.data["scope_role"], "authority");
+    assert_eq!(fixture.plex.state.lock().unwrap().sends, 1);
+}
+
+#[tokio::test]
+async fn captured_launch_retries_an_unreachable_initial_binding_read_before_sealing() {
+    let _lock = crate::test_env::process_env_lock();
+    let fixture = Fixture::new_with_options(
+        false,
+        LaunchOptions {
+            initial_binding_outages: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        fixture.startup_error.is_none(),
+        "{:?}",
+        fixture.startup_error
+    );
+    let reply = fixture.post(true, "startup-outage-once").await;
+    assert!(reply.ok, "{:?}", reply.data);
+    assert_eq!(fixture.plex.state.lock().unwrap().sends, 1);
 }

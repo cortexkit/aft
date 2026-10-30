@@ -56,6 +56,7 @@ fn is_zero(value: &usize) -> bool {
 
 pub(crate) const CALLBACK_REFERENCE_LABEL: &str = " (callback reference)";
 pub(crate) const UNRESOLVED_CALLERS_NOTE: &str = "Incomplete: {count} call site{plural} in the analyzed {language} code could not be resolved, so a dynamic or indirect call may still reach `{symbol}`.";
+const UNRESOLVED_NAMED_CALLERS_NOTE: &str = "Incomplete: {count} call site{plural} named `{symbol}` in the analyzed {language} code could not be resolved; additional callers may be missing.";
 const TEST_FILTER_NOTE: &str = "Test filtering incomplete: AFT could not tell whether {count} caller site{plural} {verb} test code, so {subject} still shown.";
 
 #[derive(Debug, Clone, Serialize)]
@@ -112,6 +113,7 @@ pub struct StoreIncompleteNote {
     pub incomplete_reason: String,
 }
 
+#[cfg(test)]
 fn empty_receiver_note(
     store: &impl CallGraphRead,
     target: &StoreNode,
@@ -121,7 +123,26 @@ fn empty_receiver_note(
     if count != 0 {
         return Ok(None);
     }
-    let unresolved_call_sites = store.unresolved_call_site_count(target.lang, include_tests)?;
+    receiver_note(store, target, count, include_tests)
+}
+
+fn receiver_note(
+    store: &impl CallGraphRead,
+    target: &StoreNode,
+    count: usize,
+    include_tests: bool,
+) -> StoreAdapterResult<Option<StoreIncompleteNote>> {
+    let (unresolved_call_sites, template) = if count == 0 {
+        (
+            store.unresolved_call_site_count(target.lang, include_tests)?,
+            UNRESOLVED_CALLERS_NOTE,
+        )
+    } else {
+        (
+            store.unresolved_call_site_count_named(&target.name, target.lang, include_tests)?,
+            UNRESOLVED_NAMED_CALLERS_NOTE,
+        )
+    };
     let count_text = if unresolved_call_sites == UNRESOLVED_CALL_SITE_COUNT_LIMIT {
         format!("at least {unresolved_call_sites}")
     } else {
@@ -130,7 +151,7 @@ fn empty_receiver_note(
     Ok((unresolved_call_sites > 0).then(|| StoreIncompleteNote {
         complete: false,
         unresolved_call_sites,
-        incomplete_reason: UNRESOLVED_CALLERS_NOTE
+        incomplete_reason: template
             .replace("{count}", &count_text)
             .replace(
                 "{plural}",
@@ -724,7 +745,7 @@ pub fn callers_result(
         callback_dependencies,
         callback_reference_label: (callback_dependencies > 0).then_some(CALLBACK_REFERENCE_LABEL),
         test_filter_note,
-        incomplete: empty_receiver_note(
+        incomplete: receiver_note(
             store,
             &target.representative,
             post_filter_count + via_count,
@@ -1094,7 +1115,7 @@ pub fn impact_result(
         callback_dependencies,
         callback_reference_label: (callback_dependencies > 0).then_some(CALLBACK_REFERENCE_LABEL),
         test_filter_note,
-        incomplete: empty_receiver_note(
+        incomplete: receiver_note(
             store,
             &target.representative,
             post_filter_count,

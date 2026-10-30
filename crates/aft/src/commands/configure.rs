@@ -7600,6 +7600,7 @@ fn start_checkout_semantic_lane(
     };
     let lifecycle = ctx.subc_lifecycle_admission();
     let strict_lifecycle = lifecycle.clone();
+    let import_generation = ctx.configure_generation_flag();
     let config = crate::views::semantic_runtime::WorkerConfig {
         root: root.to_path_buf(),
         storage: ctx.storage_paths(),
@@ -7637,11 +7638,29 @@ fn start_checkout_semantic_lane(
                 // this background thread, into the family's v3 planes only, so
                 // the lane's fills find its vectors stored rather than
                 // embedding every file again.
-                let current = {
-                    let slot = weak_slot.clone();
-                    move || slot.upgrade().is_some_and(|slot| slot.is_current(epoch))
-                };
-                import_legacy_set_into_v3(&config, &current);
+                finish_legacy_import_before_fill(
+                    || {
+                        weak_slot
+                            .upgrade()
+                            .is_some_and(|slot| slot.is_current(epoch))
+                    },
+                    || {
+                        let slot = weak_slot.clone();
+                        let generation = import_generation.clone();
+                        let expected = generation.load(Ordering::Acquire);
+                        let lifecycle = strict_lifecycle.clone();
+                        let current: crate::migration::v3_ledger::ImportControl =
+                            Arc::new(move || {
+                                lifecycle.is_bound()
+                                    && generation.load(Ordering::Acquire) == expected
+                                    && slot.upgrade().is_some_and(|slot| slot.is_current(epoch))
+                            });
+                        if !current() {
+                            return false;
+                        }
+                        import_legacy_set_into_v3(&config, current.clone()) && current()
+                    },
+                );
                 let _pause_currency = crate::semantic_index::PauseRetryScope::new(
                     config.schedule.retry_initial,
                     config.schedule.retry_max,
@@ -7661,20 +7680,43 @@ fn start_checkout_semantic_lane(
     start_tx
 }
 
+/// A checkout's semantic worker may outlive a configure change or the brief
+/// disconnect of its last session. Resume cancelled imports before vector fills,
+/// so vectors still in semantic.bin are reused rather than recomputed. An expired
+/// worker epoch must not start another import attempt.
+/// An attempt returns true when it can hand off to fills; false means retry.
+fn finish_legacy_import_before_fill(
+    lane_current: impl Fn() -> bool,
+    mut attempt_is_complete: impl FnMut() -> bool,
+) {
+    while lane_current() {
+        if attempt_is_complete() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Imports a root's legacy (pre-view) set into the family's v3 planes before
 /// its views-on semantic lane fills, through the v3 import ledger. Nothing is
 /// written to the v2 view registry or the v2 stores. A root with no legacy
-/// artifact, or whose v3 import already finished, returns at once; another
-/// process importing the same set is not waited for.
+/// artifact, or whose v3 import already finished, returns at once. A busy
+/// import is observed on this worker until it finishes or the binding ends,
+/// so a concurrent importer does not cause duplicate cold extraction.
+/// Returns false on cancellation so a retained lane retries before filling.
 fn import_legacy_set_into_v3(
     config: &crate::views::semantic_runtime::WorkerConfig,
-    keep_going: &dyn Fn() -> bool,
-) {
+    keep_going: crate::migration::v3_ledger::ImportControl,
+) -> bool {
     let (storage, key) = (&config.storage.artifacts, &config.family);
-    if !crate::migration::per_checkout::has_importable_legacy_artifact(storage, key)
-        || !keep_going()
+    if !crate::root_cache::ArtifactAccess::for_root(&config.root)
+        .allows_write(key, &storage.join("blobs/v3").join(key))
+        || !crate::migration::per_checkout::has_importable_legacy_artifact(storage, key)
     {
-        return;
+        return true;
+    }
+    if !keep_going() {
+        return false;
     }
     *config
         .status
@@ -7689,9 +7731,9 @@ fn import_legacy_set_into_v3(
         &config.schedule.limiter,
         "legacy_import",
         &config.root,
-        keep_going,
+        || keep_going(),
     ) else {
-        return;
+        return false;
     };
     let request = crate::migration::v3_ledger::V3ImportRequest::full_plane(
         storage.clone(),
@@ -7702,21 +7744,37 @@ fn import_legacy_set_into_v3(
         crate::migration::per_checkout::legacy_semantic_producer(storage, key, &config.semantic),
     );
     let started = Instant::now();
-    match crate::migration::v3_ledger::run_v3_import(&request, None) {
-        Ok(report) => slog_info!(
-            "legacy v3 import root={} key={} outcomes={:?} elapsed_ms={}",
-            config.root.display(),
-            key,
-            report.outcomes,
-            started.elapsed().as_millis()
-        ),
-        Err(error) => slog_warn!(
-            "legacy v3 import root={} key={} failed: {}",
-            config.root.display(),
-            key,
-            error
-        ),
+    while keep_going() {
+        match crate::migration::v3_ledger::run_v3_import_while(&request, None, keep_going.clone()) {
+            Ok(report)
+                if report.outcomes.values().any(|outcome| {
+                    matches!(
+                        outcome,
+                        crate::migration::v3_ledger::ArtifactOutcome::Busy { .. }
+                    )
+                }) =>
+            {
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            Err(crate::migration::v3_import::V3ImportError::Cancelled) => return false,
+            Ok(report) => slog_info!(
+                "legacy v3 import root={} key={} outcomes={:?} elapsed_ms={}",
+                config.root.display(),
+                key,
+                report.outcomes,
+                started.elapsed().as_millis()
+            ),
+            Err(error) => slog_warn!(
+                "legacy v3 import root={} key={} failed: {}",
+                config.root.display(),
+                key,
+                error
+            ),
+        }
+        return true;
     }
+    false
 }
 
 /// Account for a finished artifact load at its hand-off to the receiver.
@@ -9035,8 +9093,14 @@ fn run_configure_maintenance_unit_inner(
                     Some(Err(error)) => {
                         slog_warn!("lexical checkout view unavailable: {}", error);
                     }
+                    Some(Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding)) => {
+                        continuation.defer_lexical_bind(Instant::now());
+                        return ConfigureMaintenanceUnitResult::Continue;
+                    }
                     // The symbol prewarm follows the files the view verified.
-                    Some(Ok(snapshot)) if ctx.views_route_root() => {
+                    Some(Ok(crate::views::trigram::LexicalViewSnapshot::Ready(snapshot)))
+                        if ctx.views_route_root() =>
+                    {
                         spawn_symbol_view_prewarm(ctx, &snapshot);
                     }
                     _ => {}
@@ -10002,6 +10066,10 @@ fn callgraph_store_upgrade_required(ctx: &AppContext) -> bool {
             })
     })
 }
+
+#[cfg(test)]
+#[path = "configure/views_import_tests.rs"]
+mod views_import_tests;
 
 #[cfg(test)]
 mod tests {
@@ -14049,6 +14117,19 @@ mod tests {
     }
 
     fn lexical_views_assert_public_parity(ctx: &AppContext, root: &Path) {
+        // Exact text parity compares ready indexes. During a legacy import,
+        // grep appends a disclosure that its index is unavailable; separate
+        // import tests verify that incomplete response.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match ctx.lexical_view_snapshot("bind") {
+                Some(Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding)) => {
+                    assert!(Instant::now() < deadline, "legacy import did not finish");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => break,
+            }
+        }
         let oracle = lexical_views_oracle(root);
         for (command, params, field) in [
             (
@@ -15500,7 +15581,12 @@ mod tests {
 
         // A fresh cache over the same files reuses the stored rows: nothing
         // is parsed or stored again.
-        let snapshot = ctx.lexical_view_snapshot("bind").unwrap().unwrap();
+        let snapshot = ctx
+            .lexical_view_snapshot("bind")
+            .unwrap()
+            .unwrap()
+            .into_ready()
+            .unwrap();
         let fresh: crate::parser::SharedSymbolCache =
             Arc::new(std::sync::RwLock::new(crate::parser::SymbolCache::new()));
         let report = super::prewarm_symbol_cache_from_view(

@@ -460,7 +460,7 @@ fn refusal_explanation_maybe_sent() {
 }
 
 #[test]
-fn refusal_explanation_retryable_true_from_module_error() {
+fn refusal_explanation_retry_safe_module_error_does_not_authorize_automatic_retry() {
     let reply = json!({"error": {
         "code": "request_deadline_exceeded", "retry_same_nonce": true, "transmission": "not_sent",
     }});
@@ -479,11 +479,14 @@ fn refusal_explanation_retryable_true_from_module_error() {
     ]));
     assert_eq!(
         dispatch_comment(&harness, live.value(), "hello"),
-        (0, false)
+        (REFUSAL_EXIT_STATUS, false)
     );
     let sent = nonces(&harness);
-    assert_eq!(sent.len(), 2);
-    assert_eq!(sent[0], sent[1]);
+    assert_eq!(
+        sent.len(),
+        1,
+        "not_sent is safety metadata, not a retry policy"
+    );
     let terminal = self::harness(ticket_gated(vec![
         json!({
             "op": BOT_REQUEST_OPERATION, "status": "ok", "data": {"error": {
@@ -912,7 +915,7 @@ fn daemon_and_plexus_refusals_decode_with_their_stage() {
 #[test]
 fn vendored_reply_contract_decodes_every_native_plexus_outcome() {
     let vectors = super::super::plexus_contract_judge::load_reply_vectors();
-    assert_eq!(vectors.len(), 17);
+    assert_eq!(vectors.len(), 27);
     for vector in vectors {
         let name = vector["name"].as_str().unwrap();
         let reply = &vector["reply"];
@@ -2063,6 +2066,156 @@ fn outcome_unknown_is_never_resent_and_exits_87() {
 }
 
 #[test]
+fn not_sent_pre_reads_retry_only_transient_reasons_once_with_the_same_nonce_and_deadline() {
+    struct ReadRelay {
+        now: std::cell::Cell<Instant>,
+        attempts: std::cell::RefCell<Vec<(Instant, Duration, Value)>>,
+        sleeps: std::cell::RefCell<Vec<Duration>>,
+        reply: Value,
+        recover: bool,
+    }
+    impl ExchangeIo for ReadRelay {
+        fn now(&self) -> Instant {
+            self.now.get()
+        }
+        async fn sleep(&self, delay: Duration) {
+            self.sleeps.borrow_mut().push(delay);
+            self.now.set(self.now() + delay);
+        }
+        async fn request(
+            &self,
+            bytes: Vec<u8>,
+            options: CallOptions,
+        ) -> Result<Vec<u8>, CallError> {
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            if body["op"] == BINDINGS_READ_OPERATION {
+                return Ok(serde_json::to_vec(&bindings_ok()).unwrap());
+            }
+            self.attempts
+                .borrow_mut()
+                .push((self.now(), options.timeout, body));
+            self.now.set(self.now() + Duration::from_millis(100));
+            let reply = if self.recover && self.attempts.borrow().len() == 2 {
+                plexus_completed()
+            } else {
+                self.reply.clone()
+            };
+            Ok(serde_json::to_vec(&reply).unwrap())
+        }
+    }
+    let mut cases = Vec::new();
+    for reason in ["transport_unknown", "lease_expired"] {
+        for (recover, budget_ms, attempts) in [(false, 2000, 2), (true, 2000, 2), (false, 700, 1)] {
+            cases.push((
+                format!("pre_dispatch_read_incomplete{{reason: {reason}}}"),
+                true,
+                true,
+                recover,
+                budget_ms,
+                attempts,
+                false,
+            ));
+        }
+    }
+    for code in [
+        "vendor_rejected{status: 404}",
+        "vendor_rejected{status: 422}",
+        "handle_credential_rejected",
+        "pre_dispatch_read_incomplete{reason: invalid_response}",
+        "pre_dispatch_read_incomplete{reason: page_bound}",
+        "pre_dispatch_read_incomplete{reason: future_reason}",
+        "pre_dispatch_read_incomplete",
+        "store_failure",
+        "outcome_unknown",
+    ] {
+        cases.push((code.into(), true, true, false, 2000, 1, false));
+    }
+    cases.push((
+        "pre_dispatch_read_incomplete{reason: transport_unknown}".into(),
+        true,
+        false,
+        false,
+        2000,
+        1,
+        false,
+    ));
+    // A write with outcome_unknown remains indeterminate and never authorizes a resend.
+    cases.push(("outcome_unknown".into(), false, false, false, 2000, 1, true));
+    for (code, not_sent, retry_safe, recover, budget_ms, expected_attempts, unknown) in cases {
+        let mut reply = plexus_refused(&code);
+        if not_sent {
+            reply["data"]["result"]["transmission"] = json!("not_sent");
+            reply["data"]["result"]["retry_same_nonce"] = json!(retry_safe);
+        } else {
+            reply["data"]["result"] = json!({"status": "outcome_unknown"});
+        }
+        let started = Instant::now();
+        let io = ReadRelay {
+            now: std::cell::Cell::new(started),
+            attempts: Default::default(),
+            sleeps: Default::default(),
+            reply,
+            recover,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(temp.path().join("state"));
+        let manifest = v12_manifest();
+        let binding = AgentBinding {
+            repo: "cortexkit/aft".into(),
+            agent_id: "alfonso-aft".into(),
+        };
+        let stage = Mutex::new(ProbeStage::Request);
+        let timing = Exchange {
+            io: &io,
+            ticket: "test-ticket",
+            stage: &stage,
+            started,
+            budget: Duration::from_millis(budget_ms),
+        };
+        let body =
+            json!({"op": BOT_REQUEST_OPERATION, "params": {"request_nonce": "read-retry-nonce"}});
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(exchange(
+                &timing,
+                &paths,
+                &binding,
+                &manifest,
+                &body,
+                [Duration::from_millis(600); 2],
+            ));
+        match outcome {
+            RouteOutcome::Result(_) if recover => {}
+            RouteOutcome::OutcomeUndetermined(text) if unknown => {
+                assert!(text.contains("the bot write may have executed; check before retrying"));
+            }
+            RouteOutcome::RelayRefusal { code: actual, text } if !recover && !unknown => {
+                assert_eq!(actual, code);
+                assert!(text.contains("Nothing reached GitHub."), "{text}");
+                assert!(!text.contains("outcome unknown"), "{text}");
+                if code.contains("transport_unknown") || code.contains("lease_expired") {
+                    assert!(text.contains("The GitHub read did not finish."), "{text}");
+                }
+            }
+            other => panic!("{code}: unexpected {other:?}"),
+        }
+        let attempts = io.attempts.borrow();
+        assert_eq!(
+            attempts.len(),
+            expected_attempts,
+            "{code}: recover={recover}, budget={budget_ms}"
+        );
+        assert_eq!(io.sleeps.borrow().len(), expected_attempts - 1, "{code}");
+        for (at, timeout, sent) in attempts.iter() {
+            assert_eq!(*at + *timeout, timing.deadline(), "{code}: reset deadline");
+            assert_eq!(sent, &body, "{code}: changed request or nonce");
+        }
+        assert!(io.now() <= timing.deadline());
+    }
+}
+
+#[test]
 fn terminal_setup_and_unknown_codes_are_not_retried() {
     let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-terminal", "call-x", "/p");
     for code in [
@@ -2149,11 +2302,58 @@ fn a_changed_binding_generation_triggers_a_new_check() {
 }
 
 #[test]
-fn production_relay_budget_is_thirty_seconds() {
-    assert_eq!(RELAY_BUDGET, Duration::from_secs(30));
+fn production_governed_relay_budget_covers_the_post_send_wait() {
+    assert_eq!(RELAY_BUDGET, Duration::from_secs(210));
+    assert_eq!(MIN_WRITE_DISPATCH_BUDGET, Duration::from_secs(175));
+    assert_eq!(READ_RELAY_BUDGET, Duration::from_secs(30));
     if std::env::var_os(REQUEST_TIMEOUT_TEST_ENV).is_none() {
         assert_eq!(RelayContext::from_process().relay_budget, RELAY_BUDGET);
     }
+}
+
+#[tokio::test]
+async fn write_exchange_allows_the_long_reply_but_binding_reads_remain_short() {
+    struct RecordingIo {
+        now: Instant,
+        timeouts: Mutex<Vec<Duration>>,
+    }
+    impl ExchangeIo for RecordingIo {
+        fn now(&self) -> Instant {
+            self.now
+        }
+        async fn sleep(&self, _: Duration) {
+            unreachable!()
+        }
+        async fn request(&self, _: Vec<u8>, options: CallOptions) -> Result<Vec<u8>, CallError> {
+            self.timeouts.lock().unwrap().push(options.timeout);
+            Ok(Vec::new())
+        }
+    }
+    let started = Instant::now();
+    let io = RecordingIo {
+        now: started + Duration::from_secs(10),
+        timeouts: Mutex::new(Vec::new()),
+    };
+    let stage = Mutex::new(ProbeStage::Request);
+    let exchange = Exchange {
+        io: &io,
+        ticket: "ticket",
+        stage: &stage,
+        started,
+        budget: RELAY_BUDGET,
+    };
+    exchange
+        .send(&json!({"op": BINDINGS_READ_OPERATION}))
+        .await
+        .unwrap();
+    exchange
+        .send(&json!({"op": BOT_REQUEST_OPERATION}))
+        .await
+        .unwrap();
+    assert_eq!(
+        *io.timeouts.lock().unwrap(),
+        vec![Duration::from_secs(30), Duration::from_secs(200)]
+    );
 }
 
 /// A write that gets no reply within the relay budget is an unknown
@@ -2475,9 +2675,13 @@ fn explicit_retries_reuse_nonce_until_only_the_budget_stops_them() {
     let RouteOutcome::OutcomeUndetermined(text) = outcome else {
         panic!("expected final module refusal");
     };
-    assert_eq!(text, "Plexus refused the bot write: request_deadline_exceeded. The request deadline expired before dispatch. GitHub received a request. Already-sent write steps: comment. The relay's 30000 ms budget cannot fit another retry. Check GitHub before rerunning; a rerun may repeat the steps that were sent.");
+    assert_eq!(text, "Plexus refused the bot write: request_deadline_exceeded. The request deadline expired before dispatch. GitHub received a request. Already-sent write steps: comment. Check GitHub before rerunning; a rerun may repeat the steps that were sent.");
     let attempts = module_io.attempts.borrow();
-    assert_eq!(attempts.len(), 4);
+    assert_eq!(
+        attempts.len(),
+        2,
+        "a not_sent deadline refusal is not retried"
+    );
     assert!(attempts.iter().all(|(_, sent)| sent == &body));
 }
 
@@ -2686,4 +2890,73 @@ fn a_github_head_refusal_is_relayed_verbatim_and_never_retried() {
             .code,
         "pr_head_cross_repository"
     );
+}
+
+#[test]
+fn a_late_known_refusal_declines_retry_before_dispatch_with_the_approved_not_run_line() {
+    struct LateRefusal {
+        now: std::cell::Cell<Instant>,
+        sent: std::cell::RefCell<Vec<Value>>,
+    }
+    impl ExchangeIo for LateRefusal {
+        fn now(&self) -> Instant {
+            self.now.get()
+        }
+        async fn sleep(&self, delay: Duration) {
+            self.now.set(self.now() + delay);
+        }
+        async fn request(&self, bytes: Vec<u8>, _: CallOptions) -> Result<Vec<u8>, CallError> {
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            if body["op"] == BINDINGS_READ_OPERATION {
+                return Ok(serde_json::to_vec(&bindings_ok()).unwrap());
+            }
+            self.sent.borrow_mut().push(body);
+            self.now.set(self.now() + Duration::from_secs(40));
+            Ok(serde_json::to_vec(&plexus_refused("store_failure")).unwrap())
+        }
+    }
+    let started = Instant::now();
+    let io = LateRefusal {
+        now: std::cell::Cell::new(started),
+        sent: Default::default(),
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::from_root(temp.path().join("state"));
+    let manifest = v12_manifest();
+    let binding = AgentBinding {
+        repo: "cortexkit/aft".into(),
+        agent_id: "alfonso-aft".into(),
+    };
+    let stage = Mutex::new(ProbeStage::Request);
+    let timing = Exchange {
+        io: &io,
+        ticket: "test-ticket",
+        stage: &stage,
+        started,
+        budget: RELAY_BUDGET,
+    };
+    let body = json!({"op":BOT_REQUEST_OPERATION,"params":{"request_nonce":"same-nonce"}});
+    let outcome = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(exchange(
+            &timing,
+            &paths,
+            &binding,
+            &manifest,
+            &body,
+            TRANSIENT_RETRY_DELAYS,
+        ));
+    let RouteOutcome::GovernanceUnavailableTimedOut { stage, elapsed_ms } = outcome else {
+        panic!("expected a proven not-sent timeout, not outcome_unknown: {outcome:?}");
+    };
+    assert_eq!(stage, ProbeStage::Request);
+    assert_eq!(elapsed_ms, 45_000);
+    assert_eq!(
+        io.sent.borrow().as_slice(),
+        &[body],
+        "only the known-refused attempt reached the wire"
+    );
+    assert_eq!(super::super::governance_probe_timeout_text(elapsed_ms, stage),
+        "governance probe timed out after 45000 ms at request (daemon may be busy; host load?) - this repository's actions are identity-governed, so the command was not run; retry");
 }

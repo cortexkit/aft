@@ -582,7 +582,7 @@ fn g7_v3_writer_child() {
             thread::park();
         }
     }
-    v3::set_free_space_for_test(u64::MAX, u64::MAX / 2);
+    let _space = v3::set_free_space_for_test(&storage, u64::MAX, u64::MAX / 2);
     let missing_root = storage.join("g7-missing-checkout");
     v3::publish(&storage, &family, 1 << 20, None, |publication| {
         publication
@@ -643,6 +643,12 @@ fn g7_v3_writer_child() {
     loop {
         thread::park();
     }
+}
+
+#[test]
+fn a_v3_seed_publishes_using_its_storage_scoped_override() {
+    let fixture = Fixture::new();
+    seed_v3(&fixture, "0123456789abcdef");
 }
 
 /// A seed whose writer never gets ready fails, and the failure still kills

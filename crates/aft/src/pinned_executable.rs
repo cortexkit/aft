@@ -6,14 +6,28 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 struct PinnedExecutable {
     executable: PathBuf,
     directory: PathBuf,
+    state: Mutex<PinState>,
+}
+
+struct PinState {
+    owner: Option<std::fs::File>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    source: std::fs::File,
 }
 
 static PINNED: OnceLock<PinnedExecutable> = OnceLock::new();
+
+thread_local! {
+    static TASK_IMAGE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+const OWNER_LOCK: &str = "owner.lock";
+const TASK_IMAGE_DIR: &str = "startup-image";
 
 #[cfg(target_os = "macos")]
 struct StartupSource {
@@ -93,6 +107,7 @@ fn prepare(storage: &Path) -> io::Result<PinnedExecutable> {
     crate::private_storage::create_dir(&directory)?;
 
     let result = (|| {
+        let owner = owner_lock(&directory)?;
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let executable = {
             let destination = directory.join("aft");
@@ -107,6 +122,11 @@ fn prepare(storage: &Path) -> io::Result<PinnedExecutable> {
         Ok(PinnedExecutable {
             executable,
             directory: directory.clone(),
+            state: Mutex::new(PinState {
+                owner: Some(owner),
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                source: source_file,
+            }),
         })
     })();
     if result.is_err() {
@@ -131,10 +151,160 @@ fn cleanup(run: &Path) -> io::Result<()> {
             None => crate::fs_lock::process_alive(pid),
         };
         if !alive {
+            // The kernel lease is authoritative even if another PID namespace
+            // or a changed boot-clock conversion reports a different owner.
+            let lease_path = entry.path().join(OWNER_LOCK);
+            let lease = if lease_path.try_exists()? {
+                let mut options = crate::private_storage::options();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.custom_flags(libc::O_NOFOLLOW);
+                }
+                let Ok(file) = options.read(true).write(true).open(&lease_path) else {
+                    continue;
+                };
+                if file.try_lock().is_err() {
+                    continue;
+                }
+                Some(file)
+            } else {
+                None
+            };
+            // Windows cannot unlink an open lock file. The owner is already
+            // dead and pin names are never reused, so release before removal.
+            drop(lease);
             std::fs::remove_dir_all(entry.path())?;
         }
     }
     Ok(())
+}
+
+fn owner_lock(directory: &Path) -> io::Result<std::fs::File> {
+    let file = crate::private_storage::options()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(directory.join(OWNER_LOCK))?;
+    file.lock_shared()?;
+    Ok(file)
+}
+
+impl PinnedExecutable {
+    fn path(&self) -> io::Result<PathBuf> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if self.executable.is_file() && self.directory.is_dir() {
+            return Ok(self.executable.clone());
+        }
+        crate::slog_warn!(
+            "startup executable pin missing; restoring {}",
+            self.executable.display()
+        );
+        crate::private_storage::create_dir_all(&self.directory)?;
+        if !self.directory.join(OWNER_LOCK).try_exists()? {
+            state.owner = Some(owner_lock(&self.directory)?);
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let temporary = self.directory.join("aft.repin");
+            let _ = std::fs::remove_file(&temporary);
+            // The deployment pathname may now contain a different build. Only
+            // the held startup image is a valid source for repair.
+            materialize(&self.executable, &mut state.source, &temporary, |_, _| {
+                Err(io::Error::other("repair from held startup image"))
+            })?;
+            std::fs::rename(temporary, &self.executable)?;
+        }
+        std::fs::metadata(&self.executable)?;
+        Ok(self.executable.clone())
+    }
+
+    fn cleanup_at_exit(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.owner.take();
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+
+    #[cfg(unix)]
+    fn task_image(&self, task_io: &Path) -> io::Result<PathBuf> {
+        let executable = self.path()?;
+        let directory = task_io.join(TASK_IMAGE_DIR);
+        crate::private_storage::create_dir(&directory)?;
+        let destination = directory.join("aft");
+        let mut source = std::fs::File::open(&executable)?;
+        materialize(&executable, &mut source, &destination, |from, to| {
+            std::fs::hard_link(from, to)
+        })?;
+        let shims = self.directory.join("shims");
+        if shims.join("gh").is_symlink() {
+            let target = std::fs::read_link(shims.join("gh"))?;
+            let target = if target == self.executable {
+                destination
+            } else {
+                target
+            };
+            crate::private_storage::create_dir(&directory.join("shims"))?;
+            std::os::unix::fs::symlink(target, directory.join("shims/gh"))?;
+        }
+        Ok(directory)
+    }
+}
+
+/// Freeze the launcher and shim into the task's own artifact lifetime before
+/// constructing either backend's profile. Detached tasks can outlive a module
+/// restart, including while sandbox-launch is still applying its rules.
+#[cfg(unix)]
+pub(crate) fn with_task_image<R>(task_io: &Path, run: impl FnOnce() -> R) -> io::Result<R> {
+    let Some(pin) = PINNED.get() else {
+        return Ok(run());
+    };
+    let directory = pin.task_image(task_io)?;
+    struct Scope(Option<PathBuf>);
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            TASK_IMAGE.with(|slot| {
+                slot.replace(self.0.take());
+            });
+        }
+    }
+    let _scope = Scope(TASK_IMAGE.with(|slot| slot.replace(Some(directory))));
+    Ok(run())
+}
+
+pub(crate) fn task_environment(
+    launcher: &Path,
+    environment: &mut std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+) {
+    let Some(pin) = PINNED.get() else {
+        return;
+    };
+    let Some(directory) = launcher
+        .parent()
+        .filter(|path| path.file_name() == Some(std::ffi::OsStr::new(TASK_IMAGE_DIR)))
+    else {
+        return;
+    };
+    let redirect = |path: &Path| {
+        path.strip_prefix(&pin.directory)
+            .map(|suffix| directory.join(suffix))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    for key in [
+        crate::agent_child_env::GH_SHIMS_DIR_ENV,
+        crate::agent_child_env::GH_SHIM_BINARY_ENV,
+    ] {
+        if let Some(value) = environment.get_mut(std::ffi::OsStr::new(key)) {
+            *value = redirect(Path::new(value)).into_os_string();
+        }
+    }
+    if let Some(value) = environment.get_mut(std::ffi::OsStr::new("PATH")) {
+        let entries = std::env::split_paths(value)
+            .map(|path| redirect(&path))
+            .collect::<Vec<_>>();
+        if let Ok(path) = std::env::join_paths(entries) {
+            *value = path;
+        }
+    }
 }
 
 fn owner(name: &str) -> Option<(u32, u64)> {
@@ -171,7 +341,7 @@ fn link_image(source: &Path, destination: &Path) -> io::Result<()> {
     std::fs::hard_link(source, destination)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", all(test, unix)))]
+#[cfg(unix)]
 fn materialize(
     source_path: &Path,
     source: &mut std::fs::File,
@@ -196,7 +366,23 @@ fn materialize(
                 .write(true)
                 .create_new(true)
                 .open(destination)?;
-            io::copy(source, &mut output)?;
+            // Cloned startup handles share a cursor. Positional reads let
+            // concurrent task copies and later repairs read the complete image.
+            use std::io::Write;
+            use std::os::unix::fs::FileExt;
+            let mut offset = 0;
+            let mut buffer = [0; 64 * 1024];
+            loop {
+                let count = match source.read_at(&mut buffer, offset) {
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    result => result?,
+                };
+                if count == 0 {
+                    break;
+                }
+                output.write_all(&buffer[..count])?;
+                offset += count as u64;
+            }
             output.sync_all()?;
             output.set_permissions(std::fs::Permissions::from_mode(0o500))?;
         }
@@ -208,20 +394,26 @@ fn materialize(
 /// Startup cleanup handles crashes and any best-effort removal failures.
 pub fn cleanup_at_exit() {
     if let Some(pin) = PINNED.get() {
-        let _ = std::fs::remove_dir_all(&pin.directory);
+        pin.cleanup_at_exit();
     }
 }
 
 /// Return the daemon's startup pin, or normal executable discovery for standalone
 /// and library-only hosts that have not initialized a pin.
 pub fn path() -> io::Result<PathBuf> {
+    if let Some(directory) = TASK_IMAGE.with(|slot| slot.borrow().clone()) {
+        return Ok(directory.join("aft"));
+    }
     if let Some(pin) = PINNED.get() {
-        return Ok(pin.executable.clone());
+        return pin.path();
     }
     std::env::current_exe()
 }
 
 pub(crate) fn shims_dir(storage: &Path) -> PathBuf {
+    if let Some(directory) = TASK_IMAGE.with(|slot| slot.borrow().clone()) {
+        return directory.join("shims");
+    }
     match PINNED.get() {
         // A shared, mutable `shims/gh` could be retargeted by a second daemon
         // running a different build. Keep each server's PATH entry immutable.
@@ -287,6 +479,102 @@ mod tests {
         assert!(live.join("aft").exists());
         assert!(!reused.exists(), "a reused PID must not retain an old pin");
         assert!(unrelated.join("aft").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_executable_cleanup_preserves_another_live_process() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let pid = child.id();
+        let start = crate::root_cache::process_start_time_ms(pid).unwrap();
+        let directory = storage.path().join(format!("aft-pinned-{pid}-{start}"));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("aft"), b"live image").unwrap();
+        let result = cleanup(storage.path());
+        let retained = directory.join("aft").exists();
+        let alive = child.try_wait().unwrap().is_none();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        result.unwrap();
+        assert!(
+            alive && retained,
+            "cleanup removed a live process's executable"
+        );
+        cleanup(storage.path()).unwrap();
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn pinned_executable_cleanup_lease_overrides_mismatched_process_clock() {
+        let storage = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        let start = crate::root_cache::process_start_time_ms(pid).unwrap();
+        let directory = storage
+            .path()
+            .join(format!("aft-pinned-{pid}-{}", start - 1));
+        std::fs::create_dir(&directory).unwrap();
+        let lease = owner_lock(&directory).unwrap();
+        cleanup(storage.path()).unwrap();
+        assert!(
+            directory.exists(),
+            "a held lease must override an apparent PID reuse"
+        );
+        drop(lease);
+        cleanup(storage.path()).unwrap();
+        assert!(!directory.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_executable_task_image_and_shim_outlive_daemon_pin() {
+        let storage = tempfile::tempdir().unwrap();
+        let task = tempfile::tempdir().unwrap();
+        let pin = prepare(storage.path()).unwrap();
+        std::fs::create_dir(pin.directory.join("shims")).unwrap();
+        std::os::unix::fs::symlink(&pin.executable, pin.directory.join("shims/gh")).unwrap();
+        let image = pin.task_image(task.path()).unwrap();
+        pin.cleanup_at_exit();
+        assert!(!pin.directory.exists());
+        assert_eq!(
+            std::fs::read_link(image.join("shims/gh")).unwrap(),
+            image.join("aft")
+        );
+        let output = std::process::Command::new(image.join("shims/gh"))
+            .args(["--list", "pinned_executable_cleanup_preserves_live_owner"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 test"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_executable_missing_pin_is_repaired_from_complete_held_image() {
+        use sha2::{Digest, Sha256};
+        use std::io::Seek;
+        let storage = tempfile::tempdir().unwrap();
+        let pin = prepare(storage.path()).unwrap();
+        let digest = |path: &Path| {
+            let mut hash = Sha256::new();
+            io::copy(&mut std::fs::File::open(path).unwrap(), &mut hash).unwrap();
+            hash.finalize()
+        };
+        let original = digest(&pin.executable);
+        pin.state
+            .lock()
+            .unwrap()
+            .source
+            .seek(io::SeekFrom::End(0))
+            .unwrap();
+        std::fs::remove_dir_all(&pin.directory).unwrap();
+        assert_eq!(pin.path().unwrap(), pin.executable);
+        assert_eq!(original, digest(&pin.executable));
+        assert!(pin.directory.join(OWNER_LOCK).exists());
+        pin.cleanup_at_exit();
     }
 
     #[cfg(unix)]

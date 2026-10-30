@@ -5422,6 +5422,7 @@ where
     let mut next_bash_ask_corr: u64 = 1;
     let mut route_bash_cancels: HashMap<RouteChannel, bash::RouteBashCancel> = HashMap::new();
     let active_tool_calls: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
+    let gh_relay_requests = gh_relay_wait::Requests::default();
     let pending_deferred_setups = Arc::new(PendingDeferredSetups::default());
     let mut pending_responses = PendingSubcResponses::default();
     let mut database_waits = persistence::DatabaseWaits::default();
@@ -6171,6 +6172,8 @@ where
                                 &dispatch_path_metrics,
                                 true,
                                 gh_relay_route_scopes(&routes,&speech),
+                                &gh_relay_requests,
+                                module_drain.is_active(),
                             );
                             Ok(())
                         } else if management_routes.contains_key(&route) {
@@ -6264,6 +6267,9 @@ where
                     FrameType::Cancel => {
                         let channel = route_key(frame.header.channel, frame.header.epoch);
                         let corr = frame.header.corr;
+                        if gh_relay_requests.cancel(channel, corr) {
+                            continue;
+                        }
                         if ledger_edge.cancel(channel, corr) {
                             continue;
                         }
@@ -6382,6 +6388,7 @@ where
                                 // bash waits: each checks it on its next poll.
                                  scope_describe_task.abort();
                                  module_drain.begin(until);
+                                 gh_relay_requests.drain();
                                 drain_progress = Some(drain::DrainProgress {
                                     until,
                                     quiesced_reported: false,
@@ -9268,9 +9275,11 @@ fn gh_relay_route_scopes(
     scopes
 }
 
-/// Run a gh shim relay request on its own task. The relay makes up to two
-/// network calls (prefrontal, then plexus); running them here keeps the subc frame
-/// loop free, and the relay holds no lock across them.
+mod gh_relay_wait;
+
+/// Run the relay off-loop, retaining ownership of its terminal frame even when
+/// cancellation or drain interrupts the provider wait.
+#[allow(clippy::too_many_arguments)]
 fn spawn_gh_relay(
     tx: &WriterSender,
     frame: &Frame,
@@ -9278,7 +9287,10 @@ fn spawn_gh_relay(
     metrics: &Arc<DispatchPathMetrics>,
     first_party: bool,
     route_scopes: crate::gh_shim_relay::RouteScopes,
+    requests: &gh_relay_wait::Requests,
+    draining: bool,
 ) {
+    let mut wait = requests.register(frame, draining);
     let tx = tx.clone();
     let frame = frame.clone();
     let relay = Arc::clone(relay);
@@ -9296,7 +9308,8 @@ fn spawn_gh_relay(
             .unwrap_or_default()
             .to_string();
         let params = decoded.get("params").cloned().unwrap_or_else(|| json!({}));
-        let reply = crate::gh_shim_relay::relay(
+        let relay_log = |line: &str| log::info!("{line}");
+        let relay_call = crate::gh_shim_relay::relay(
             &relay.transport,
             crate::gh_shim_relay::RelayCall {
                 operation: &operation,
@@ -9304,26 +9317,10 @@ fn spawn_gh_relay(
                 first_party,
                 route_scopes: &route_scopes,
             },
-            &|line| log::info!("{line}"),
-        )
-        .await;
-        let body = json!({
-            "op": operation,
-            "status": if reply.ok { "ok" } else { "error" },
-            "data": reply.data,
-        });
-        let Ok(body) = serde_json::to_vec(&body) else {
-            return;
-        };
-        let Ok(response) = Frame::build_with_version(
-            frame.header.ver,
-            FrameType::Response,
-            frame.header.flags,
-            frame.header.channel,
-            frame.header.epoch,
-            frame.header.corr,
-            body,
-        ) else {
+            &relay_log,
+        );
+        let response = gh_relay_wait::terminal(&frame, &operation, &mut wait, relay_call).await;
+        let Ok(response) = response else {
             return;
         };
         if let Err(error) =
@@ -22799,6 +22796,93 @@ mod tests {
         format!("Opens:\n{}", lines.join("\n"))
     }
 
+    /// Capture waits without taking the locks an open or a worker may be stuck
+    /// holding. Other roots' unfinished opens matter because the dedicated
+    /// database-open thread serves them in order.
+    fn rebind_wait_diagnostics(executor: &Executor, fixture: &ConfiguredRoot) -> String {
+        let (slot, _) = fixture.ctx.database_open_slot();
+        let database = match slot.try_lock() {
+            Some(slot) => format!(
+                "epoch={} committed_age_ms={} running={} pending={:?} ready_for={:?}",
+                slot.epoch,
+                slot.committed_at.elapsed().as_millis(),
+                slot.running,
+                slot.pending.as_ref().map(|request| (
+                    request.epoch,
+                    request.dispatched_at.map(|at| at.elapsed().as_millis()),
+                    &request.storage_root,
+                )),
+                slot.ready_for,
+            ),
+            None => "database-open slot locked (attach/publication may be in progress)".into(),
+        };
+        let opens = crate::database_open::recorded_opens_for_test()
+            .into_iter()
+            .filter(|open| open.root == fixture.canonical_root || open.finished_at.is_none())
+            .map(|open| {
+                format!(
+                    "root={} lane={:?} age_ms={} queued_ms={:?} finished={} floor_ms={} open_ms={} outcome={:?}",
+                    open.root.display(), open.runner, open.started_at.elapsed().as_millis(),
+                    open.dispatched_at.map(|at| open.started_at.saturating_duration_since(at).as_millis()),
+                    open.finished_at.is_some(), open.floor_check.as_millis(), open.open.as_millis(), open.outcome,
+                )
+            })
+            .collect::<Vec<_>>();
+        format!(
+            "database: {database}; opens: {opens:?}; root jobs (None means scheduler locked): {:?}; barriers: {:?}; dispatch: {:?}",
+            executor.try_root_job_snapshots(&fixture.root, None),
+            executor.try_bind_blocker_snapshot(&fixture.root, "subc-41-7"),
+            executor.try_dispatch_liveness_snapshot(),
+        )
+    }
+
+    struct RebindWaitDiagnostics<'a>(&'a Executor, &'a ConfiguredRoot);
+
+    impl Drop for RebindWaitDiagnostics<'_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                eprintln!(
+                    "rebind wait failure: {}",
+                    rebind_wait_diagnostics(self.0, self.1)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rebind_wait_diagnostics_name_active_job_without_waiting_on_database_slot() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let executor = Executor::new();
+        let fixture = ConfiguredRoot::unconfigured(&executor);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = executor.submit_async(
+            fixture.root.clone(),
+            Lane::Mutating,
+            "held-rebind-writer".into(),
+            Box::new(move |_| {
+                entered_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                Response::success("held-rebind-writer", json!({}))
+            }),
+        );
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (slot, _) = fixture.ctx.database_open_slot();
+        let locked = slot.lock();
+        let diagnostic = rebind_wait_diagnostics(&executor, &fixture);
+        drop(locked);
+        release_tx.send(()).unwrap();
+        assert!(writer.blocking_recv().unwrap().success);
+        for expected in [
+            "database-open slot locked",
+            "held-rebind-writer",
+            "lane: Mutating",
+            "started_age_ms:",
+        ] {
+            assert!(diagnostic.contains(expected), "{diagnostic}");
+        }
+    }
+
     /// A rebind can put a working root back into "initializing": here the
     /// rebind points the root at a different storage directory, and neither
     /// the post-reply dispatch nor the configure tail runs (the tail stands in
@@ -22811,6 +22895,9 @@ mod tests {
         let executor = Arc::new(Executor::new());
         let fixture = ConfiguredRoot::new(&executor);
         let _reap = ReapContextChildren(Arc::clone(&fixture.ctx));
+        // Diagnose panics inside database_wire_tool as well as failed response
+        // assertions. Run before child cleanup on unwind.
+        let _diagnostics = RebindWaitDiagnostics(&executor, &fixture);
         fixture.ctx.mark_subc_bound();
         start_post_ack_database_open(&executor, &fixture.root);
         assert!(
@@ -22858,6 +22945,11 @@ mod tests {
         );
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(other_storage.path().join("aft.db").is_file());
+        eprintln!(
+            "rebind bash completed in {}ms; {}",
+            started.elapsed().as_millis(),
+            rebind_wait_diagnostics(&executor, &fixture),
+        );
     }
 
     #[test]

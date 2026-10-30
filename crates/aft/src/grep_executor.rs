@@ -846,12 +846,17 @@ fn execute_root_profiled(
     let snapshot_started = Instant::now();
     let ignored_target = root.ignored_target;
     let mut snapshot_timed_out = false;
+    let mut import_building = false;
     let view_snapshot = (root.use_index && !ignored_target)
         .then(|| ctx.lexical_view_snapshot("grep"))
         .flatten();
     let indexed_snapshot = if let Some(snapshot) = view_snapshot {
         match snapshot {
-            Ok(snapshot) => Some(snapshot),
+            Ok(crate::views::trigram::LexicalViewSnapshot::Ready(snapshot)) => Some(snapshot),
+            Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding) => {
+                import_building = true;
+                None
+            }
             Err(error) => {
                 return (
                     failed_index_grep(std::io::Error::other(
@@ -928,13 +933,15 @@ fn execute_root_profiled(
         index_lacks_scope = true;
     }
 
-    if root.use_index && !index_lacks_scope {
+    if root.use_index && !index_lacks_scope && !import_building {
         crate::commands::configure::trigger_search_index_reload_if_evicted(ctx);
     }
     // A walk that replaces a ready index reports `Fallback`, so the response
     // discloses that these results came from the filesystem, not the index.
     let index_status = if root.use_index && !index_lacks_scope {
-        if snapshot_timed_out {
+        if import_building {
+            IndexStatus::Building
+        } else if snapshot_timed_out {
             IndexStatus::Fallback
         } else {
             current_index_status(ctx)
@@ -943,7 +950,7 @@ fn execute_root_profiled(
         IndexStatus::Fallback
     };
     let mut counts = ScopeFileCounts::default();
-    let result = fallback_grep_counted(
+    let mut result = fallback_grep_counted(
         project_root,
         &root.search_root,
         &root.filter_root,
@@ -956,6 +963,11 @@ fn execute_root_profiled(
         ignored_target,
         order,
     );
+    if import_building {
+        result
+            .index_read_gaps
+            .push("legacy text and symbol import building".into());
+    }
     (
         result,
         GrepExecutionPhaseTimings {

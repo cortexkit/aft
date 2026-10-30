@@ -1026,7 +1026,14 @@ fn watchdog_cost_status_poll_preserves_session_completion_delivery() {
                 .insert_rehydrated_task(metadata.clone(), paths.clone(), true)
                 .unwrap();
             if queued_before_poll {
-                registry.enqueue_completion_from_parts(&metadata, None, Some(&paths), false, None);
+                registry.enqueue_completion_from_parts(
+                    &metadata,
+                    None,
+                    Some(&paths),
+                    false,
+                    None,
+                    CompletionTokenPolicy::Count,
+                );
             }
             let data = serde_json::json!({"task_id": paths.task_id, "status": "completed", "exit_code": 0, "output_preview": "done"});
             let mut status = crate::protocol::Response::success("status", data.clone());
@@ -1061,7 +1068,14 @@ fn watchdog_cost_status_poll_preserves_session_completion_delivery() {
             assert!(paths.json.exists(), "cleanup removed an undelivered result");
             // Terminal rendering can enqueue after a status snapshot is returned.
             if !queued_before_poll {
-                registry.enqueue_completion_from_parts(&metadata, None, Some(&paths), false, None);
+                registry.enqueue_completion_from_parts(
+                    &metadata,
+                    None,
+                    Some(&paths),
+                    false,
+                    None,
+                    CompletionTokenPolicy::Count,
+                );
             }
             let mut foreign = crate::protocol::Response::success("foreign", serde_json::json!({}));
             crate::response_finalize::finalize_response_with_bg_completions(
@@ -1436,7 +1450,14 @@ fn watchdog_cost_terminal_reply_ack_fences_a_late_completion_snapshot() {
     registry.ack_terminal_result_for_session(&paths.task_id, "session");
     // Rendering may finish after the caller has already received a terminal
     // watch reply. Its pre-ack snapshot must not restore a notification afterward.
-    registry.enqueue_completion_from_parts(&snapshot, None, Some(&paths), false, None);
+    registry.enqueue_completion_from_parts(
+        &snapshot,
+        None,
+        Some(&paths),
+        false,
+        None,
+        CompletionTokenPolicy::Count,
+    );
     assert!(
         registry.drain_completions().is_empty(),
         "a late completion snapshot undid the reply acknowledgment"

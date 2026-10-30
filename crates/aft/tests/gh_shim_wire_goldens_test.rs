@@ -372,6 +372,7 @@ fn leak(value: String) -> &'static str {
 /// pinning exactly those bytes.
 #[derive(Clone, Debug)]
 struct CapturedFrame {
+    request_nonce: Option<Value>,
     on_route: bool,
     body: Vec<u8>,
 }
@@ -640,6 +641,10 @@ async fn serve_connection(
                     .lock()
                     .expect("captured frames lock")
                     .push(CapturedFrame {
+                        request_nonce: decoded
+                            .as_ref()
+                            .filter(|_| bot_write)
+                            .map(|value| value["params"]["request_nonce"].clone()),
                         on_route: bot_write,
                         body,
                     });
@@ -1912,6 +1917,7 @@ struct V22Run {
     stderr: String,
     upstream_invocations: Option<String>,
     routed_request: Option<Value>,
+    request_nonces: Vec<Value>,
 }
 
 /// Run one row through the real shim with the given signed manifest bytes,
@@ -1938,6 +1944,18 @@ fn run_v22_row_with_input(
     agent_id: &str,
     reply: Vec<u8>,
     input: &str,
+) -> V22Run {
+    run_v22_row_with_timing(row, manifest_bytes, agent_id, reply, input, 5000, 1)
+}
+
+fn run_v22_row_with_timing(
+    row: &V22Row,
+    manifest_bytes: &[u8],
+    agent_id: &str,
+    reply: Vec<u8>,
+    input: &str,
+    timeout_ms: u64,
+    expected_max_requests: usize,
 ) -> V22Run {
     let bindings = serde_json::to_vec(&json!({
         "op": "gh_shim.bindings_read",
@@ -1980,7 +1998,7 @@ fn run_v22_row_with_input(
         .env("PATH", path)
         .env("GH_SHIM_TEST_RECORD", &recorder)
         .env("AFT_GH_SHIM_TICKET", TEST_GH_SHIM_TICKET)
-        .env("AFT_GH_SHIM_RELAY_TIMEOUT_MS", "5000")
+        .env("AFT_GH_SHIM_RELAY_TIMEOUT_MS", timeout_ms.to_string())
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_ENTERPRISE_TOKEN")
@@ -2000,14 +2018,18 @@ fn run_v22_row_with_input(
         .write_all(input.as_bytes())
         .expect("write shim stdin");
     let output = child.wait_with_output().expect("wait for gh shim");
-    let routed = holder
-        .captured()
+    let captured = holder.captured();
+    let request_nonces = captured
+        .iter()
+        .filter_map(|frame| frame.request_nonce.clone())
+        .collect();
+    let routed = captured
         .into_iter()
         .filter(|frame| frame.on_route)
         .map(|frame| serde_json::from_slice::<Value>(&frame.body).expect("routed request is JSON"))
         .collect::<Vec<_>>();
     assert!(
-        routed.len() <= 1,
+        routed.len() <= expected_max_requests,
         "{}: the shim sent {} governed requests",
         row.name,
         routed.len()
@@ -2017,6 +2039,7 @@ fn run_v22_row_with_input(
         stdout: String::from_utf8(output.stdout).expect("stdout is UTF-8"),
         stderr: String::from_utf8(output.stderr).expect("stderr is UTF-8"),
         upstream_invocations: fs::read_to_string(&recorder).ok(),
+        request_nonces,
         routed_request: routed.into_iter().next(),
     }
 }
@@ -2147,6 +2170,17 @@ fn reply_contract_row(vector: &Value) -> V22Row {
             "--title".into(),
             text(&request["body"]["title"]),
         ],
+        "api:PATCH:/repos/*/*/issues/comments/*" => vec![
+            "api".into(),
+            "-X".into(),
+            "PATCH".into(),
+            format!(
+                "repos/{REPOSITORY}/issues/comments/{}",
+                text(&request["target"]["comment_id"])
+            ),
+            "-f".into(),
+            format!("body={}", text(&request["body"]["body"])),
+        ],
         "graphql resolvereviewthread" | "graphql unresolvereviewthread" => {
             let mutation = if action == "graphql resolvereviewthread" {
                 "resolveReviewThread"
@@ -2187,11 +2221,22 @@ fn reply_contract_row(vector: &Value) -> V22Row {
 }
 
 #[test]
-fn every_plexus_reply_vector_round_trips_through_the_real_shim() {
+fn every_supported_plexus_reply_vector_round_trips_through_the_real_shim() {
     let vectors = plexus_contract_judge::load_reply_vectors();
-    assert_eq!(vectors.len(), 17);
+    assert_eq!(vectors.len(), 27);
+    for name in plexus_contract_judge::UNSUPPORTED_REAL_SHIM_REPLY_VECTORS {
+        assert!(
+            vectors.iter().any(|vector| vector["name"] == *name),
+            "missing unsupported vector {name}"
+        );
+    }
     let manifest = synthetic_v22_manifest(unix_seconds());
     for vector in vectors {
+        if plexus_contract_judge::UNSUPPORTED_REAL_SHIM_REPLY_VECTORS
+            .contains(&vector["name"].as_str().unwrap())
+        {
+            continue;
+        }
         let row = reply_contract_row(&vector);
         let native = serde_json::to_vec(&vector["reply"]).unwrap();
         let wrapped: Value = serde_json::from_slice(
@@ -2199,15 +2244,49 @@ fn every_plexus_reply_vector_round_trips_through_the_real_shim() {
         )
         .unwrap();
         assert_eq!(wrapped["data"], vector["reply"], "{}", row.name);
-        let run = run_v22_row_with_reply(&row, &manifest, "alfonso-aft", native);
+        let retry = row.name == "comment-edit-pre-read-unknown";
+        let run = run_v22_row_with_timing(
+            &row,
+            &manifest,
+            "alfonso-aft",
+            native,
+            "",
+            if retry { 15000 } else { 5000 },
+            if retry { 2 } else { 1 },
+        );
         assert!(
             run.upstream_invocations.is_none(),
             "{} delegated to gh",
             row.name
         );
-        let mut routed = run.routed_request.expect("one request, with no retries");
+        assert_eq!(
+            run.request_nonces.len(),
+            if retry { 2 } else { 1 },
+            "{}",
+            row.name
+        );
+        assert!(
+            run.request_nonces[0]
+                .as_str()
+                .is_some_and(|nonce| !nonce.is_empty()),
+            "{}",
+            row.name
+        );
+        assert!(
+            run.request_nonces
+                .iter()
+                .all(|nonce| nonce == &run.request_nonces[0]),
+            "{}: retry changed nonce",
+            row.name
+        );
+        let mut routed = run.routed_request.expect("at least one routed request");
         let mut expected = vector["request"].clone();
         expected["repository"] = json!(REPOSITORY);
+        if row.name == "comment-edit-pre-read-unknown" {
+            // Plexus accepts comment edits without author_scope, but the signed
+            // shim manifest requires own-comment targeting and stamps it explicitly.
+            expected["author_scope"] = json!("own");
+        }
         for request in [&mut routed, &mut expected] {
             request
                 .as_object_mut()
@@ -2231,6 +2310,21 @@ fn every_plexus_reply_vector_round_trips_through_the_real_shim() {
                 row.name
             );
             assert!(!run.stderr.contains("outcome unknown"), "{}", row.name);
+            if matches!(
+                row.name,
+                "comment-edit-pre-read-unknown"
+                    | "pr-edit-pull-request-not-found"
+                    | "pr-ready-pull-request-read-incomplete"
+                    | "resolve-thread-graphql-errors"
+                    | "stack-unstack-stack-read-incomplete"
+            ) {
+                let sentence = match row.name {
+                    "comment-edit-pre-read-unknown" => "The GitHub read did not finish. Nothing reached GitHub. Rerunning the command is safe.",
+                    "pr-ready-pull-request-read-incomplete" | "stack-unstack-stack-read-incomplete" => "The GitHub read response could not be used. Nothing reached GitHub. Rerunning the command is safe.",
+                    _ => "GitHub rejected the request. Nothing reached GitHub. The agent must change the request.",
+                };
+                assert_eq!(run.stderr, format!("gh-shim: gh_shim_seam_refusal: Plexus refused the bot write: {}. {sentence}\n", result["refusal_code"].as_str().unwrap()), "{}", row.name);
+            }
             if row.name == "resolve-thread-not-own" {
                 assert_eq!(run.stderr, "gh-shim: gh_shim_seam_refusal: Plexus refused the bot write: review_thread_not_own. 'resolveReviewThread' works only on pull requests this repository's bot opened (app-fixture[bot]); #7 was opened by octocat. Reply to the finding as the bot, then resolve the thread as the operator. Nothing reached GitHub. The agent must change the request.\n");
             }
