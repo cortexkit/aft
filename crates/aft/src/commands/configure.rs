@@ -9093,8 +9093,14 @@ fn run_configure_maintenance_unit_inner(
                     Some(Err(error)) => {
                         slog_warn!("lexical checkout view unavailable: {}", error);
                     }
+                    Some(Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding)) => {
+                        continuation.defer_lexical_bind(Instant::now());
+                        return ConfigureMaintenanceUnitResult::Continue;
+                    }
                     // The symbol prewarm follows the files the view verified.
-                    Some(Ok(snapshot)) if ctx.views_route_root() => {
+                    Some(Ok(crate::views::trigram::LexicalViewSnapshot::Ready(snapshot)))
+                        if ctx.views_route_root() =>
+                    {
                         spawn_symbol_view_prewarm(ctx, &snapshot);
                     }
                     _ => {}
@@ -14111,6 +14117,19 @@ mod tests {
     }
 
     fn lexical_views_assert_public_parity(ctx: &AppContext, root: &Path) {
+        // Exact text parity compares ready indexes. During a legacy import,
+        // grep appends a disclosure that its index is unavailable; separate
+        // import tests verify that incomplete response.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match ctx.lexical_view_snapshot("bind") {
+                Some(Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding)) => {
+                    assert!(Instant::now() < deadline, "legacy import did not finish");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => break,
+            }
+        }
         let oracle = lexical_views_oracle(root);
         for (command, params, field) in [
             (
@@ -15425,7 +15444,12 @@ mod tests {
 
         // A fresh cache over the same files reuses the stored rows: nothing
         // is parsed or stored again.
-        let snapshot = ctx.lexical_view_snapshot("bind").unwrap().unwrap();
+        let snapshot = ctx
+            .lexical_view_snapshot("bind")
+            .unwrap()
+            .unwrap()
+            .into_ready()
+            .unwrap();
         let fresh: crate::parser::SharedSymbolCache =
             Arc::new(std::sync::RwLock::new(crate::parser::SymbolCache::new()));
         let report = super::prewarm_symbol_cache_from_view(

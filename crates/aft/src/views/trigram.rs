@@ -54,6 +54,25 @@ pub(crate) fn bind_is_busy(reason: &str) -> bool {
         || reason.contains("v3 base build busy; retain direct-scan coverage and retry")
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum LexicalViewSnapshot {
+    Ready(crate::search_index::SearchIndexSnapshot),
+    ImportBuilding,
+}
+
+impl LexicalViewSnapshot {
+    pub(crate) fn into_ready(self) -> Option<crate::search_index::SearchIndexSnapshot> {
+        match self {
+            Self::Ready(snapshot) => Some(snapshot),
+            Self::ImportBuilding => None,
+        }
+    }
+
+    pub(crate) fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+}
+
 /// Checkout-local lexical authority, independent of the semantic worker's
 /// lifetime and model availability. Queries serialize reconciliation so an
 /// installed membership and its payloads always come from the same snapshot.
@@ -284,7 +303,7 @@ impl LexicalView {
         self.source.acquire()
     }
 
-    pub(crate) fn snapshot(&self) -> Result<crate::search_index::SearchIndexSnapshot, String> {
+    pub(crate) fn snapshot(&self) -> Result<LexicalViewSnapshot, String> {
         if !(self.current)() {
             return Err(format!(
                 "{}checkout is no longer bound to this generation",
@@ -296,15 +315,15 @@ impl LexicalView {
             .as_ref()
             .is_some_and(|job| job.is_building())
         {
-            return Err(format!(
-                "{}legacy text and symbol import building",
-                crate::blob_store::v3::BUSY_PREFIX
-            ));
+            // The legacy import has not published a snapshot yet. This is
+            // expected progress, not a failed load; queries can scan files
+            // directly and report that the index is still importing.
+            return Ok(LexicalViewSnapshot::ImportBuilding);
         }
         let result = self.project();
         self.ready
             .store(result.is_ok(), std::sync::atomic::Ordering::Release);
-        result
+        result.map(LexicalViewSnapshot::Ready)
     }
 
     /// A watcher event or an AFT write can land between a bind's install and
@@ -1813,7 +1832,7 @@ mod tests {
             },
         )
         .unwrap();
-        let first = view.snapshot().unwrap();
+        let first = view.snapshot().unwrap().into_ready().unwrap();
         assert_eq!(
             first
                 .grep("first_needle", true, &[], &[], &root, 10)
@@ -1825,7 +1844,7 @@ mod tests {
         assert!(view.is_ready());
         // No event is recorded for this edit: only the strict bind sees it.
         fs::write(root.join("b.rs"), "fn second_needle() {}\n").unwrap();
-        let second = view.snapshot().unwrap();
+        let second = view.snapshot().unwrap().into_ready().unwrap();
         assert_eq!(
             second
                 .grep("second_needle", true, &[], &[], &root, 10)
@@ -1863,7 +1882,7 @@ mod tests {
             policy,
             source.clone(),
         );
-        let projected = view.snapshot().unwrap();
+        let projected = view.snapshot().unwrap().into_ready().unwrap();
         let legacy =
             crate::search_index::SearchIndex::build_with_limit_serial(&root, policy.max_file_size)
                 .snapshot();

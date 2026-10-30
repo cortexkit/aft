@@ -52,7 +52,11 @@ fn lexical_snapshot(root: &Path, storage: &Path) -> crate::search_index::SearchI
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match view.snapshot() {
-            Ok(snapshot) => return snapshot,
+            Ok(crate::views::trigram::LexicalViewSnapshot::Ready(snapshot)) => return snapshot,
+            Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding) => {
+                assert!(Instant::now() < deadline, "legacy import did not finish");
+                thread::sleep(Duration::from_millis(10))
+            }
             Err(error)
                 if crate::views::trigram::bind_is_busy(&error) && Instant::now() < deadline =>
             {
@@ -184,6 +188,97 @@ fn query_context(root: &Path, storage: &Path) -> AppContext {
 }
 
 #[test]
+fn views_import_building_serves_lexical_results_without_load_failures() {
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let (_checkout, storage, root) = warm_fixture();
+    let ctx = query_context(&root, storage.path());
+    ctx.mark_subc_bound();
+    let family = ctx.memoized_artifact_cache_key(&root);
+    crate::root_cache::configure_artifact_access(&root, &family, false);
+    let destination = storage.path().join("index").join(&family);
+    std::fs::create_dir_all(&destination).unwrap();
+    std::fs::copy(
+        storage.path().join("index").join(KEY).join("cache.bin"),
+        destination.join("cache.bin"),
+    )
+    .unwrap();
+    ctx.isolate_cold_build_limiter_for_test(1);
+    let slot = ctx.take_cold_build_slot_for_test().unwrap();
+
+    assert!(matches!(
+        ctx.lexical_view_snapshot("grep"),
+        Some(Ok(
+            crate::views::trigram::LexicalViewSnapshot::ImportBuilding
+        ))
+    ));
+    let request = |command: &str, params| RawRequest {
+        id: format!("import-building-{command}"),
+        command: command.into(),
+        lsp_hints: None,
+        session_id: None,
+        params,
+    };
+    let grep = crate::commands::grep::handle_grep(
+        &request(
+            "grep",
+            serde_json::json!({"pattern": "alpha", "include": "**/*.rs"}),
+        ),
+        &ctx,
+    );
+    assert!(grep.success, "{:?}", grep.data);
+    assert_eq!(grep.data["complete"], false, "{:?}", grep.data);
+    assert!(
+        grep.data["index_read_gap"]
+            .as_array()
+            .is_some_and(|gaps| gaps
+                .iter()
+                .any(|gap| gap == "legacy text and symbol import building")),
+        "{:?}",
+        grep.data
+    );
+    assert_eq!(grep.data["matches"].as_array().map(Vec::len), Some(1));
+    assert!(grep.data.to_string().contains("lib.rs"), "{:?}", grep.data);
+    let glob = crate::commands::glob::handle_glob(
+        &request("glob", serde_json::json!({"pattern": "**/*.rs"})),
+        &ctx,
+    );
+    assert!(glob.success, "{:?}", glob.data);
+    assert_eq!(glob.data["files"].as_array().map(Vec::len), Some(2));
+    assert!(glob.data.to_string().contains("lib.rs"), "{:?}", glob.data);
+    let search = crate::commands::semantic_search::handle_semantic_search(
+        &request("semantic_search", serde_json::json!({"query": "alpha"})),
+        &ctx,
+    );
+    assert!(search.success, "{:?}", search.data);
+    assert_eq!(search.data["complete"], false, "{:?}", search.data);
+    assert!(
+        search
+            .data
+            .to_string()
+            .contains("legacy text and symbol import building"),
+        "{:?}",
+        search.data
+    );
+    assert!(
+        search.data["results"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()),
+        "{:?}",
+        search.data
+    );
+    for response in [&grep, &glob, &search] {
+        assert!(!response.data.to_string().contains("This is an AFT bug"));
+    }
+    let health = ctx.try_health_snapshot(&root);
+    assert!(health.view_load_failures.is_empty(), "{health:?}");
+    assert!(health.view_load_failure_last.is_none(), "{health:?}");
+    assert!(!ctx
+        .degraded_reasons()
+        .contains(&crate::context::VIEW_LOAD_DEGRADED_REASON.to_string()));
+    drop(slot);
+}
+
+#[test]
 fn views_import_currency_is_revoked_on_unbind_and_not_revived_by_rebind() {
     let (_checkout, storage, root) = warm_fixture();
     let context = query_context(&root, storage.path());
@@ -303,9 +398,13 @@ fn views_import_public_grep_search_outline_zoom_match_fresh_builds() {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             match ctx.lexical_view_snapshot("bind").expect("views must route") {
-                Ok(snapshot) => {
+                Ok(crate::views::trigram::LexicalViewSnapshot::Ready(snapshot)) => {
                     spawn_symbol_view_prewarm(ctx, &snapshot);
                     break;
+                }
+                Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding) => {
+                    assert!(Instant::now() < deadline, "legacy import did not finish");
+                    thread::sleep(Duration::from_millis(10))
                 }
                 Err(error)
                     if crate::views::trigram::bind_is_busy(&error) && Instant::now() < deadline =>
@@ -438,7 +537,10 @@ fn views_import_benchmark_measure() {
                 crate::views::trigram::LexicalView::new(root, paths, key.into(), policy).unwrap();
             loop {
                 match view.snapshot() {
-                    Ok(_snapshot) => break,
+                    Ok(crate::views::trigram::LexicalViewSnapshot::Ready(_)) => break,
+                    Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding) => {
+                        thread::sleep(Duration::from_millis(10))
+                    }
                     Err(error) if crate::views::trigram::bind_is_busy(&error) => {
                         thread::sleep(Duration::from_millis(10))
                     }

@@ -318,7 +318,7 @@ thread_local! {
 thread_local! {
     static CHECKOUT_QUERY_OUTCOMES: std::cell::RefCell<Vec<(usize, Option<crate::views::contracts::WaitOutcome>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
-    static LEXICAL_QUERY_SNAPSHOTS: std::cell::RefCell<Vec<(usize, Result<crate::search_index::SearchIndexSnapshot, String>)>> =
+    static LEXICAL_QUERY_SNAPSHOTS: std::cell::RefCell<Vec<(usize, Result<crate::views::trigram::LexicalViewSnapshot, String>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// The call-graph reader each pinned request acquired from its checkout
     /// view, so every graph read in one request answers from one generation.
@@ -12398,7 +12398,7 @@ impl AppContext {
     pub(crate) fn lexical_view_snapshot(
         &self,
         tool: &str,
-    ) -> Option<Result<crate::search_index::SearchIndexSnapshot, String>> {
+    ) -> Option<Result<crate::views::trigram::LexicalViewSnapshot, String>> {
         if !self.lexical_views_enabled() {
             return None;
         }
@@ -12464,7 +12464,7 @@ impl AppContext {
                     .push((self.config_pin_key(), result.clone()))
             });
         }
-        if result.is_ok() && tool != "bind" {
+        if result.as_ref().is_ok_and(|snapshot| snapshot.is_ready()) && tool != "bind" {
             let index = match tool {
                 "grep" => 0,
                 "glob" => 1,
@@ -12473,7 +12473,10 @@ impl AppContext {
             self.lexical_routes[index].fetch_add(1, Ordering::Relaxed);
         }
         match &result {
-            Ok(_) => self.note_view_load_success(),
+            Ok(crate::views::trigram::LexicalViewSnapshot::Ready(_)) => {
+                self.note_view_load_success()
+            }
+            Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding) => {}
             Err(error) => self.note_view_load_failure("trigram", error),
         }
         Some(result)
