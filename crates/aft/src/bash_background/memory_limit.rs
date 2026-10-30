@@ -645,15 +645,10 @@ mod linux {
 
         #[test]
         fn task_scope_memory_monitor_borrows_and_detects_oom() {
-            use std::os::unix::fs::PermissionsExt;
             for initial in ["1", "0"] {
                 let dir = tempfile::tempdir().unwrap();
                 let group = dir.path().join("memory.oom.group");
                 std::fs::write(&group, initial).unwrap();
-                if initial == "1" {
-                    std::fs::set_permissions(&group, std::fs::Permissions::from_mode(0o400))
-                        .unwrap();
-                }
                 std::fs::write(dir.path().join("memory.events"), "oom_kill 1\n").unwrap();
                 let scope = crate::bash_background::task_scope::handle_for_test(
                     "bash-0123456789abcdef",
@@ -674,17 +669,15 @@ mod linux {
 
         #[test]
         fn task_scope_memory_monitor_refuses_denied_group_write() {
-            use std::os::unix::fs::PermissionsExt;
             let dir = tempfile::tempdir().unwrap();
             let group = dir.path().join("memory.oom.group");
-            std::fs::write(&group, "0").unwrap();
-            std::fs::set_permissions(&group, std::fs::Permissions::from_mode(0o400)).unwrap();
+            std::fs::create_dir(&group).unwrap();
             let scope = crate::bash_background::task_scope::handle_for_test(
                 "bash-0123456789abcdef",
                 dir.path().into(),
             );
             assert!(super::super::Monitor::from_task_scope(64, &scope).is_err());
-            assert_eq!(std::fs::read_to_string(group).unwrap(), "0");
+            assert!(group.is_dir());
         }
 
         #[test]

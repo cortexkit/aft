@@ -265,7 +265,7 @@ fn task_scope_standalone_never_starts_systemd_run() {
         );
         r.configure_task_scope_runtime(true, Duration::from_secs(86400));
         let id = r
-            .spawn_with_shell(
+            .spawn_with_shell_in_slot_typed(
                 SpawnPlan::Unsandboxed,
                 "printf config-opt-out",
                 super::super::BashShell::Bash,
@@ -276,10 +276,11 @@ fn task_scope_standalone_never_starts_systemd_run() {
                 super::super::HardKill::Default,
                 None,
                 root.clone(),
-                8,
+                super::super::TaskSlot::Background { max: 8 },
                 false,
                 false,
-                None,
+                Some(root.clone()),
+                false,
             )
             .unwrap();
         wait_done(&r, &id);
@@ -306,8 +307,15 @@ fn task_scope_standalone_never_starts_systemd_run() {
     ))
     .unwrap();
     let out = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "bash_background::registry::spawn_tests::task_scope_standalone_never_starts_systemd_run", "--nocapture"])
-        .env(ROOT, root.path()).env("PATH", path).output().unwrap();
+        .args([
+            "--exact",
+            "bash_background::registry::spawn_tests::task_scope_standalone_never_starts_systemd_run",
+            "--nocapture",
+        ])
+        .env(ROOT, root.path())
+        .env("PATH", path)
+        .output()
+        .unwrap();
     assert!(
         out.status.success(),
         "{}{}",

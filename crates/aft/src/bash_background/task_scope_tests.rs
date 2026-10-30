@@ -109,10 +109,9 @@ fn task_scope_module_helper() {
 }
 
 #[test]
+#[ignore = "requires a systemd user manager"]
 fn task_scope_survives_module_cgroup_kill() {
-    if !manager_available() {
-        return;
-    }
+    require_manager();
     for (cap, downtime_exit) in [(None, false), (Some(64), false), (None, true)] {
         let root = tempfile::tempdir().unwrap();
         if let Some(cap) = cap {
@@ -252,10 +251,9 @@ fn task_scope_survives_module_cgroup_kill() {
 }
 
 #[test]
+#[ignore = "requires a systemd user manager"]
 fn task_scope_fixed_backstop_works_without_registry() {
-    if !manager_available() {
-        return;
-    }
+    require_manager();
     let root = tempfile::tempdir().unwrap();
     let registry = BgTaskRegistry::default();
     registry.configure_task_scope_runtime(true, Duration::from_secs(1));
@@ -297,9 +295,7 @@ fn task_scope_fixed_backstop_works_without_registry() {
     );
     registry.detach();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while std::fs::read_to_string(scope.cgroup().join("cgroup.events"))
-        .is_ok_and(|text| !text.lines().any(|line| line == "populated 0"))
-    {
+    while !scope_stopped(&scope.cgroup().join("cgroup.events")) {
         assert!(
             Instant::now() < deadline,
             "fixed scope backstop did not stop the detached task"
@@ -336,14 +332,29 @@ fn scope_spawn(
     .unwrap()
 }
 
-fn manager_available() -> bool {
-    match super::super::task_scope::probe_user_manager(Duration::from_secs(1)) {
-        Ok(()) => true,
-        Err(e) => {
-            eprintln!("SKIP task scopes: user manager probe failed: {e}");
-            false
-        }
+fn require_manager() {
+    super::super::task_scope::probe_user_manager(Duration::from_secs(1))
+        .expect("requires a systemd user manager");
+}
+
+fn scope_stopped(events: &Path) -> bool {
+    match std::fs::read_to_string(events) {
+        Ok(text) => text.lines().any(|line| line == "populated 0"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => panic!("cannot read cgroup.events: {error}"),
     }
+}
+
+#[test]
+fn task_scope_stopped_requires_empty_or_missing_events() {
+    let root = tempfile::tempdir().unwrap();
+    let events = root.path().join("cgroup.events");
+    assert!(scope_stopped(&events));
+    std::fs::write(&events, "populated 1\n").unwrap();
+    assert!(!scope_stopped(&events));
+    std::fs::write(&events, "populated 0\n").unwrap();
+    assert!(scope_stopped(&events));
+    assert!(std::panic::catch_unwind(|| scope_stopped(root.path())).is_err());
 }
 
 fn until(mut condition: impl FnMut() -> bool) {
@@ -355,10 +366,9 @@ fn until(mut condition: impl FnMut() -> bool) {
 }
 
 #[test]
+#[ignore = "requires a systemd user manager"]
 fn task_scope_spawn_has_named_membership() {
-    if !manager_available() {
-        return;
-    }
+    require_manager();
     let root = tempfile::tempdir().unwrap();
     let r = BgTaskRegistry::default();
     let id = scope_spawn(
@@ -378,10 +388,9 @@ fn task_scope_spawn_has_named_membership() {
 }
 
 #[test]
+#[ignore = "requires a systemd user manager"]
 fn task_scope_memory_uses_the_task_scope() {
-    if !manager_available() {
-        return;
-    }
+    require_manager();
     let root = tempfile::tempdir().unwrap();
     let r = BgTaskRegistry::default();
     let id = scope_spawn(
@@ -415,10 +424,9 @@ fn task_scope_memory_uses_the_task_scope() {
 }
 
 #[test]
+#[ignore = "requires a systemd user manager"]
 fn task_scope_memory_denied_setup_keeps_payload_gate_closed() {
-    if !manager_available() {
-        return;
-    }
+    require_manager();
     let root = tempfile::tempdir().unwrap();
     let r = BgTaskRegistry::default();
     r.configure_task_scope_runtime(true, Duration::from_secs(86400));
@@ -449,10 +457,9 @@ fn task_scope_memory_denied_setup_keeps_payload_gate_closed() {
 }
 
 #[test]
+#[ignore = "requires a systemd user manager"]
 fn task_scope_kill_reaches_setsid_descendant() {
-    if !manager_available() {
-        return;
-    }
+    require_manager();
     let root = tempfile::tempdir().unwrap();
     let r = BgTaskRegistry::default();
     let command = "setsid /bin/sh -c 'trap \"\" TERM; echo $$ > escaped; while :; do sleep 1; done' & while [ ! -s escaped ]; do sleep .02; done; sleep 60";
@@ -467,12 +474,7 @@ fn task_scope_kill_reaches_setsid_descendant() {
     until(|| root.path().join("escaped").exists());
     let scope = super::super::task_scope::lookup(&id).unwrap().unwrap();
     r.kill(&id, "task-scope").unwrap();
-    until(
-        || match std::fs::read_to_string(scope.cgroup().join("cgroup.events")) {
-            Ok(text) => text.lines().any(|line| line == "populated 0"),
-            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
-        },
-    );
+    until(|| scope_stopped(&scope.cgroup().join("cgroup.events")));
 }
 
 #[test]
@@ -530,12 +532,10 @@ fn task_scope_kill_follows_group_signal_order() {
 
 #[test]
 fn task_scope_kill_reports_live_controller_permission_failure() {
-    use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
     let id = random_slug();
     let control = root.path().join("cgroup.kill");
-    std::fs::write(&control, "0").unwrap();
-    std::fs::set_permissions(&control, std::fs::Permissions::from_mode(0o400)).unwrap();
+    std::fs::create_dir(&control).unwrap();
     let r = BgTaskRegistry::default();
     r.inner
         .task_scopes
@@ -546,7 +546,7 @@ fn task_scope_kill_reports_live_controller_permission_failure() {
     assert!(r.kill_task_scope(&id).unwrap_err().contains(&format!(
         "task scope aft-task-{id}.scope could not be killed"
     )));
-    std::fs::remove_file(&control).unwrap();
+    std::fs::remove_dir(&control).unwrap();
     assert!(
         r.kill_task_scope(&id).is_err(),
         "live cgroup without its controller was accepted"
@@ -559,10 +559,9 @@ fn task_scope_kill_reports_live_controller_permission_failure() {
 }
 
 #[test]
+#[ignore = "requires a systemd user manager"]
 fn task_scope_replay_adopts_and_keeps_output() {
-    if !manager_available() {
-        return;
-    }
+    require_manager();
     let root = tempfile::tempdir().unwrap();
     let first = BgTaskRegistry::default();
     let id = scope_spawn(
@@ -617,10 +616,9 @@ fn task_scope_replay_adopts_and_keeps_output() {
 }
 
 #[test]
+#[ignore = "requires a systemd user manager"]
 fn task_scope_replay_identity_refusal_does_not_block_session() {
-    if !manager_available() {
-        return;
-    }
+    require_manager();
     let root = tempfile::tempdir().unwrap();
     let first = BgTaskRegistry::default();
     first.inner.shutdown.store(true, Ordering::SeqCst);
@@ -677,10 +675,9 @@ fn task_scope_replay_identity_refusal_does_not_block_session() {
 }
 
 #[test]
+#[ignore = "requires a systemd user manager"]
 fn task_scope_kill_without_handle_uses_exact_identity() {
-    if !manager_available() {
-        return;
-    }
+    require_manager();
     let root = tempfile::tempdir().unwrap();
     let first = BgTaskRegistry::default();
     let id = scope_spawn(&first, root.path(), "setsid /bin/sh -c 'trap \"\" TERM; echo $$ > escaped; while :; do sleep 1; done' & sleep 60", super::super::HardKill::Default, None);
@@ -698,17 +695,13 @@ fn task_scope_kill_without_handle_uses_exact_identity() {
         .unwrap();
     assert!(second.inner.task_scopes.get(&id).is_none());
     second.kill(&id, "task-scope").unwrap();
-    until(|| {
-        std::fs::read_to_string(scope.cgroup().join("cgroup.events"))
-            .map_or(true, |text| text.lines().any(|line| line == "populated 0"))
-    });
+    until(|| scope_stopped(&scope.cgroup().join("cgroup.events")));
 }
 
 #[test]
+#[ignore = "requires a systemd user manager"]
 fn task_scope_kill_without_handle_does_not_need_pid_identity() {
-    if !manager_available() {
-        return;
-    }
+    require_manager();
     let root = tempfile::tempdir().unwrap();
     let first = BgTaskRegistry::default();
     let id = scope_spawn(
@@ -730,19 +723,13 @@ fn task_scope_kill_without_handle_does_not_need_pid_identity() {
     let scope = super::super::task_scope::lookup(&id).unwrap().unwrap();
     second.kill_task_scope(&id).unwrap();
     assert!(second.inner.task_scopes.get(&id).is_none());
-    until(|| {
-        !std::fs::read_to_string(scope.cgroup().join("cgroup.events"))
-            .unwrap_or_default()
-            .lines()
-            .any(|line| line == "populated 1")
-    });
+    until(|| scope_stopped(&scope.cgroup().join("cgroup.events")));
 }
 
 #[test]
+#[ignore = "requires a systemd user manager"]
 fn task_scope_kill_distinguishes_absent_present_and_failed() {
-    if !manager_available() {
-        return;
-    }
+    require_manager();
     let registry = BgTaskRegistry::default();
     registry.kill_task_scope(&random_slug()).unwrap();
     let root = tempfile::tempdir().unwrap();
@@ -773,6 +760,7 @@ fn task_scope_kill_distinguishes_absent_present_and_failed() {
 }
 
 #[test]
+#[ignore = "requires a systemd user manager"]
 fn task_scope_uncached_kill_does_not_need_user_bus() {
     const ID: &str = "AFT_TEST_LOCAL_SCOPE_KILL_ID";
     if let Ok(id) = std::env::var(ID) {
@@ -781,9 +769,7 @@ fn task_scope_uncached_kill_does_not_need_user_bus() {
             .expect("manager outage prevented local cgroup kill");
         return;
     }
-    if !manager_available() {
-        return;
-    }
+    require_manager();
     let root = tempfile::tempdir().unwrap();
     let registry = BgTaskRegistry::default();
     let id = scope_spawn(
@@ -796,7 +782,7 @@ fn task_scope_uncached_kill_does_not_need_user_bus() {
     let _stop = StopOnDrop(id.clone());
     let scope = super::super::task_scope::lookup(&id).unwrap().unwrap();
     for target in [random_slug(), id] {
-        let output = std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", "bash_background::registry::task_scope_tests::task_scope_uncached_kill_does_not_need_user_bus", "--nocapture"]).env(ID, target).env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent/aft-probe-bus").env("XDG_RUNTIME_DIR", "/nonexistent/aft-probe-runtime").output().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", "bash_background::registry::task_scope_tests::task_scope_uncached_kill_does_not_need_user_bus", "--nocapture", "--include-ignored"]).env(ID, target).env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent/aft-probe-bus").env("XDG_RUNTIME_DIR", "/nonexistent/aft-probe-runtime").output().unwrap();
         assert!(
             output.status.success(),
             "uncached kill required manager: {}{}",
@@ -804,12 +790,7 @@ fn task_scope_uncached_kill_does_not_need_user_bus() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    until(|| {
-        !std::fs::read_to_string(scope.cgroup().join("cgroup.events"))
-            .unwrap_or_default()
-            .lines()
-            .any(|line| line == "populated 1")
-    });
+    until(|| scope_stopped(&scope.cgroup().join("cgroup.events")));
 }
 
 #[test]
@@ -832,6 +813,7 @@ fn task_scope_kill_file_write_failure_is_static() {
 }
 
 #[test]
+#[ignore = "requires a systemd user manager"]
 fn task_scope_replay_keeps_live_identity_without_user_manager() {
     const ROOT: &str = "AFT_TEST_SCOPE_REPLAY_ROOT";
     if let Some(root) = std::env::var_os(ROOT) {
@@ -891,9 +873,7 @@ fn task_scope_replay_keeps_live_identity_without_user_manager() {
         registry.detach();
         return;
     }
-    if !manager_available() {
-        return;
-    }
+    require_manager();
     for cap in [None, Some(64)] {
         let root = tempfile::tempdir().unwrap();
         let registry = BgTaskRegistry::default();
@@ -934,7 +914,7 @@ fn task_scope_replay_keeps_live_identity_without_user_manager() {
                 until(|| crate::root_cache::process_start_time_ms(pid).is_none());
             }
             let mut child = std::process::Command::new(std::env::current_exe().unwrap());
-            child.args(["--exact", "bash_background::registry::task_scope_tests::task_scope_replay_keeps_live_identity_without_user_manager", "--nocapture"]).env(ROOT, root.path());
+            child.args(["--exact", "bash_background::registry::task_scope_tests::task_scope_replay_keeps_live_identity_without_user_manager", "--nocapture", "--include-ignored"]).env(ROOT, root.path());
             if broken {
                 child
                     .env(
@@ -1013,10 +993,9 @@ fn task_scope_monitor_recovery_does_not_write_controls() {
 }
 
 #[test]
+#[ignore = "requires a systemd user manager"]
 fn task_scope_scoped_task_without_marker_is_fate_unknown() {
-    if !manager_available() {
-        return;
-    }
+    require_manager();
     let root = tempfile::tempdir().unwrap();
     let first = BgTaskRegistry::default();
     let id = scope_spawn(
@@ -1058,10 +1037,9 @@ fn task_scope_scoped_task_without_marker_is_fate_unknown() {
 }
 
 #[test]
+#[ignore = "requires a systemd user manager"]
 fn task_scope_cleanup_and_hook_require_readable_owned_records() {
-    if !manager_available() {
-        return;
-    }
+    require_manager();
     let root = tempfile::tempdir().unwrap();
     let foreign_root = tempfile::tempdir().unwrap();
     let r = BgTaskRegistry::default();
@@ -1123,10 +1101,9 @@ fn task_scope_cleanup_and_hook_require_readable_owned_records() {
 }
 
 #[test]
+#[ignore = "requires a systemd user manager"]
 fn task_scope_cleanup_requires_this_storage_description() {
-    if !manager_available() {
-        return;
-    }
+    require_manager();
     let root = tempfile::tempdir().unwrap();
     let other = tempfile::tempdir().unwrap();
     let registry = BgTaskRegistry::default();
@@ -1158,10 +1135,9 @@ fn task_scope_cleanup_requires_this_storage_description() {
 }
 
 #[test]
+#[ignore = "requires a systemd user manager"]
 fn task_scope_cleanup_keeps_harness_store_coverage() {
-    if !manager_available() {
-        return;
-    }
+    require_manager();
     let root = tempfile::tempdir().unwrap();
     let store = root.path().join("pi");
     std::fs::create_dir(&store).unwrap();
@@ -1293,10 +1269,9 @@ fn task_scope_cleanup_retries_unconfirmed_owned_unit() {
 }
 
 #[test]
+#[ignore = "requires a systemd user manager"]
 fn task_scope_actor_created_after_daemon_attach_has_named_membership() {
-    if !manager_available() {
-        return;
-    }
+    require_manager();
     let root = tempfile::tempdir().unwrap();
     let app = crate::context::App::default_shared();
     let first = crate::context::AppContext::from_app(app.clone(), crate::config::Config::default());

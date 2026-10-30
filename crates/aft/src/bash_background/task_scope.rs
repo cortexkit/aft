@@ -1208,11 +1208,11 @@ mod linux {
         }
 
         #[test]
-        fn task_scope_listing_skips_foreign_units() {
+        fn task_scope_listing_keeps_unconfirmed_units_pending() {
             let foreign = "aft-task-bash-0000000000000001.scope";
             let owned = "aft-task-bash-0000000000000002.scope";
             let (_dir, path) = fake(&format!("case \"$2\" in\nlist-units) printf '%s\\n' '{foreign}' '{owned}' ;;\nshow) for unit in \"$@\"; do :; done; case \"$unit\" in\n'{foreign}') printf 'LoadState=loaded\\nControlGroup=/app.slice/{foreign}\\n' ;;\n*) printf 'LoadState=loaded\\nControlGroup=/aft.slice/{owned}\\n' ;;\nesac ;;\nesac"));
-            assert_eq!(list_with(&path).unwrap(), vec![owned.to_string()]);
+            assert!(list_with(&path).is_err());
         }
         #[test]
         fn task_scope_version_capabilities() {
@@ -1222,6 +1222,7 @@ mod linux {
         }
 
         #[test]
+        #[ignore = "requires a systemd user manager"]
         fn task_scope_launcher_ignores_process_path() {
             const INNER: &str = "AFT_TEST_SCOPE_TRUSTED_LAUNCHER";
             if std::env::var_os(INNER).is_some() {
@@ -1236,17 +1237,14 @@ mod linux {
                 );
                 return;
             }
-            if let Err(error) = probe_user_manager(Duration::from_secs(1)) {
-                eprintln!("SKIP task scopes: user manager probe failed: {error}");
-                return;
-            }
+            probe_user_manager(Duration::from_secs(1)).expect("requires a systemd user manager");
             let root = tempfile::tempdir().unwrap();
             crate::executable_cache::write_executable(
                 &root.path().join("systemd-run"),
                 b"#!/bin/sh\nprintf 'systemd 262\\n'\nexit 0\n",
             )
             .unwrap();
-            let status = Command::new(std::env::current_exe().unwrap()).args(["--exact", "bash_background::task_scope::linux::command_tests::task_scope_launcher_ignores_process_path", "--nocapture"]).env(INNER, "1").env("PATH", format!("{}:/usr/bin:/bin", root.path().display())).status().unwrap();
+            let status = Command::new(std::env::current_exe().unwrap()).args(["--exact", "bash_background::task_scope::linux::command_tests::task_scope_launcher_ignores_process_path", "--nocapture", "--include-ignored"]).env(INNER, "1").env("PATH", format!("{}:/usr/bin:/bin", root.path().display())).status().unwrap();
             assert!(status.success(), "trusted launcher subprocess failed");
         }
 
