@@ -50,6 +50,7 @@ pub(crate) struct Counts {
     pub project_walk_entries: usize,
     pub project_walk_files: usize,
     pub exact_passes: usize,
+    pub exact_preparations: usize,
     pub exact_pass_candidates: usize,
     pub exact_pass_reads: usize,
     pub exact_pass_micros: usize,

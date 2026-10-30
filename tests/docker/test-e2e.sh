@@ -54,6 +54,14 @@ fi
 # lines (the durable log persists across runs on non-container hosts).
 mkdir -p "$(dirname "$PLUGIN_LOG")"
 : > "$PLUGIN_LOG"
+# The engine writes its own aft-<pid>.log beside the plugin log; the plugin
+# does not copy engine lines into its own log. Engine-side checks read both.
+ENGINE_LOG_DIR="$(dirname "$PLUGIN_LOG")"
+rm -f "$ENGINE_LOG_DIR"/aft-[0-9]*.log "$ENGINE_LOG_DIR"/aft-[0-9]*.log.[0-9]*
+# Always succeeds, so a missing engine log can never flip a negated check.
+aft_logs() {
+    cat "$PLUGIN_LOG" "$ENGINE_LOG_DIR"/aft-[0-9]*.log 2>/dev/null || true
+}
 AIMOCK_PID=""
 
 # Platform-specific paths for the broken-ONNX scenario.
@@ -392,16 +400,16 @@ check "bridge spawned" "grep -q 'Spawning binary\|started, pid' '$PLUGIN_LOG' 2>
 check "no bridge crash" "! grep -qi 'Binary crashed\|SIGABRT' '$PLUGIN_LOG' 2>/dev/null"
 
 # Search index
-check "search index started" "grep -qi 'watcher started\|search.*index\|index.*build' '$PLUGIN_LOG' 2>/dev/null"
+check "search index started" "aft_logs | grep -qi 'watcher started\|search.*index\|index.*build'"
 
 # ONNX — no crash is mandatory, download success is best-effort in Docker (QEMU limitations)
-check "no ONNX crash" "! grep -qi 'SIGABRT\|panicked.*ort\|thread.*panicked' '$PLUGIN_LOG' 2>/dev/null"
+check "no ONNX crash" "! aft_logs | grep -qi 'SIGABRT\|panicked.*ort\|thread.*panicked'"
 # Note: ONNX download may fail under QEMU emulation due to curl/fetch timing issues.
 # These are informational checks — not release-blocking.
 if grep -qi 'ONNX Runtime.*installed to\|ONNX Runtime found at' "$PLUGIN_LOG" 2>/dev/null; then
     echo -e "  ${GREEN}PASS${NC} [ONNX downloaded]"
     PASS=$((PASS + 1))
-    if grep -qi 'built semantic index\|semantic index persisted' "$PLUGIN_LOG" 2>/dev/null; then
+    if aft_logs | grep -qi 'built semantic index\|semantic index persisted'; then
         echo -e "  ${GREEN}PASS${NC} [semantic index built]"
         PASS=$((PASS + 1))
     else

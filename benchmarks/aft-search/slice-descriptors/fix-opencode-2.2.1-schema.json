@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "opencode-2-2-1-tool-schemas"
+  ],
+  "note": "OpenCode 2 plugin tool definitions expose Standard JSON Schema conversion so OpenCode 2.2.1's Zod accepts AFT tools. TypeScript plugin only; no engine or ranking code changes."
+}

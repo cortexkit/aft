@@ -1,13 +1,19 @@
 [package]
-name = "secret-rules"
-version = "0.1.0"
+# Published to crates.io next to agent-file-tools, which depends on it:
+# crates.io refuses a crate whose dependencies it can't resolve. The version
+# moves in lockstep with AFT's (scripts/version-sync.mjs).
+name = "aft-secret-rules"
+version = "0.63.3"
 edition = "2021"
 description = "Placeholder grammar, key location rules, host/path matching and response scrubbing for agent secret use"
 license = "MIT"
 # Standalone on purpose: AFT links this crate today, basal will link it later,
 # so it must not depend on any other workspace crate.
 rust-version.workspace = true
-publish = false
+
+# Keep the Rust crate name `secret_rules`, so code and tests are unchanged.
+[lib]
+name = "secret_rules"
 
 [dependencies]
 idna = "1"

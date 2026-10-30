@@ -735,7 +735,7 @@ fn acquire_with_deadline(
         if availability == LockAvailability::Stale {
             match reclaim_lock_file(path, &metadata)? {
                 ReclaimResult::Removed => {
-                    slog_warn!(
+                    slog_info!(
                         "removing filesystem lock at {} from dead or recycled PID {}",
                         path.display(),
                         metadata.pid
@@ -3728,8 +3728,22 @@ mod tests {
         let metadata = synthetic_metadata(999_999_999, current_hostname(), now_ms());
         write_synthetic_lock(&path, &metadata);
 
-        let guard = acquire_with_config(&path, Some(Duration::from_secs(1)), test_config())
-            .expect("reclaim dead pid lock");
+        let (guard, lines) = crate::logging::capture_log_lines(|| {
+            acquire_with_config(&path, Some(Duration::from_secs(1)), test_config())
+                .expect("reclaim dead pid lock")
+        });
+        let reclaim_lines: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains("removing filesystem lock"))
+            .collect();
+        assert_eq!(
+            reclaim_lines,
+            vec![&format!(
+                "INFO removing filesystem lock at {} from dead or recycled PID {}",
+                path.display(),
+                metadata.pid
+            )]
+        );
         let metadata = read_lock_metadata(&path).expect("read reclaimed lock");
         assert_eq!(metadata.pid, std::process::id());
         drop(guard);

@@ -1029,6 +1029,8 @@ pub struct LspShutdownAllOutcome {
     pub elapsed: Duration,
 }
 
+type ShutdownResult = (Option<ServerKey>, u32, Result<(), LspError>);
+
 pub struct LspManager {
     #[cfg(test)]
     spawn_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -5702,7 +5704,29 @@ impl LspManager {
         budget: Duration,
         include_registered: bool,
     ) -> LspShutdownAllOutcome {
-        let started = Instant::now();
+        Self::shutdown_all_clients_with_wait(
+            clients,
+            child_registry,
+            budget,
+            include_registered,
+            Instant::now(),
+            |rx, until| rx.recv_deadline(until),
+        )
+    }
+
+    // Keep deadline selection shared with deterministic tests. Only receiving
+    // reports is replaceable; spawning, killing, dropping and reporting are real.
+    pub(super) fn shutdown_all_clients_with_wait(
+        clients: Vec<(ServerKey, LspClient)>,
+        child_registry: LspChildRegistry,
+        budget: Duration,
+        include_registered: bool,
+        started: Instant,
+        mut receive: impl FnMut(
+            &Receiver<ShutdownResult>,
+            Instant,
+        ) -> Result<ShutdownResult, RecvTimeoutError>,
+    ) -> LspShutdownAllOutcome {
         let mut pending_pids = clients
             .iter()
             .map(|(_, client)| client.child_pid())
@@ -5753,8 +5777,9 @@ impl LspManager {
         let force_at = deadline - LSP_FORCED_TERMINATION_RESERVE.min(budget / 2);
         let mut outcome = LspShutdownAllOutcome::default();
         while !pending_pids.is_empty() {
-            let remaining = force_at.saturating_duration_since(Instant::now());
-            match result_rx.recv_timeout(remaining) {
+            // Pass the absolute cutoff through to the channel: descheduling
+            // before a receive must not restart a relative timeout later.
+            match receive(&result_rx, force_at) {
                 Ok((key, pid, result)) => {
                     if !pending_pids.remove(&pid) {
                         continue;
@@ -5788,10 +5813,9 @@ impl LspManager {
             });
             let mut unreaped = pids.into_iter().collect::<HashSet<_>>();
             while !unreaped.is_empty() {
-                // A zero timeout still takes a report that is already queued,
+                // An expired deadline still takes a report that is already queued,
                 // so a late wake-up counts every server reaped in the meantime.
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                match result_rx.recv_timeout(remaining) {
+                match receive(&result_rx, deadline) {
                     Ok((_, pid, _)) => {
                         unreaped.remove(&pid);
                     }

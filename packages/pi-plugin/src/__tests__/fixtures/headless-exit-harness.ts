@@ -20,7 +20,7 @@
  * factory returns, as Pi and OMP do as soon as a session exists.
  *
  * Environment (set by the parent test):
- *   HARNESS_NPM_MARKER  file the fake `npm` writes its pid to once it starts
+ *   HARNESS_NPM_MARKER  file the fake `npm install` writes its pid to once it starts
  *   HARNESS_PLUGIN      absolute path of the plugin entry (src/index.ts)
  *   HARNESS_MODE        "sigterm": skip session_shutdown, add a second SIGTERM
  *                       listener that never exits, and wait for the parent to
@@ -151,6 +151,12 @@ Bun.plugin({
       loader: "object",
       exports: {
         ...realBridge,
+        terminateNpmProcessTree: async (
+          ...args: Parameters<typeof realBridge.terminateNpmProcessTree>
+        ) => {
+          await realBridge.terminateNpmProcessTree(...args);
+          emit("npm-stopped", String(args[0].pid));
+        },
         findBinarySync: () => "/fake/aft",
         findBinary: async () => "/fake/aft",
         ensureBinary: async () => "/fake/aft",

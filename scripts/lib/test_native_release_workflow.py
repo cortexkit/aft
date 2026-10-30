@@ -3,6 +3,7 @@
 
 import importlib.util
 from pathlib import Path
+import tomllib
 import unittest
 
 
@@ -116,6 +117,49 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
                     expected_destination = f"packages/npm/{platform}/bin/aft" if publish == "publish-npm" else f"release-assets/aft-{platform}"
                     self.assertIn(expected_destination, verification["run"])
                     self.assertNotIn("cargo build", commands(job))
+
+    def test_every_path_dependency_of_a_published_crate_is_published_first(self):
+        # crates.io refuses a crate whose dependencies it can't resolve, and it
+        # does so only at release time, after every build has passed: 0.63.2
+        # failed this way when a path dependency was marked `publish = false`.
+        run = next(
+            step["run"] for step in self.workflow("release.yml")["jobs"]["publish-crates"]["steps"]
+            if "cargo publish --package agent-file-tools" in step.get("run", "")
+        )
+        sync = (ROOT / "scripts/version-sync.mjs").read_text()
+
+        def path_dependencies(manifest_dir):
+            manifest = tomllib.loads((manifest_dir / "Cargo.toml").read_text())
+            tables = [manifest.get("dependencies", {}), manifest.get("build-dependencies", {})]
+            tables += [t.get("dependencies", {}) for t in manifest.get("target", {}).values()]
+            tables += [t.get("build-dependencies", {}) for t in manifest.get("target", {}).values()]
+            for table in tables:
+                for key, spec in table.items():
+                    if isinstance(spec, dict) and "path" in spec:
+                        yield key, spec, (manifest_dir / spec["path"]).resolve()
+
+        published_before = run.index("cargo publish --package agent-file-tools")
+        pending, seen = [ROOT / "crates/aft"], set()
+        while pending:
+            for key, spec, dep_dir in path_dependencies(pending.pop()):
+                if dep_dir in seen:
+                    continue
+                seen.add(dep_dir)
+                pending.append(dep_dir)
+                package = tomllib.loads((dep_dir / "Cargo.toml").read_text())["package"]
+                name = package["name"]
+                with self.subTest(dependency=key, package=name):
+                    self.assertNotEqual(package.get("publish"), False, f"{name} must be publishable")
+                    self.assertIn("version", spec, f"{key} needs a version pin to publish")
+                    publish = f"cargo publish --package {name} "
+                    self.assertIn(publish, run, f"release.yml must publish {name}")
+                    self.assertLess(run.index(publish), published_before, f"{name} must publish before agent-file-tools")
+                    relative = dep_dir.relative_to(ROOT).parts
+                    self.assertIn(
+                        ", ".join(f'"{part}"' for part in relative), sync,
+                        f"version-sync.mjs must keep {name}'s version in lockstep",
+                    )
+        self.assertTrue(seen, "agent-file-tools has no path dependencies; the check found nothing")
 
 
 if __name__ == "__main__":

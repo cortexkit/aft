@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "release-notes-0.63.2"
+  ],
+  "note": "Release notes only: the unpublished 0.63.1 notes become 0.63.2 with seven pending fragments folded in. No code changes."
+}

@@ -323,8 +323,8 @@ fn apply_comment_match(
             &req.id,
             "match_not_found",
             format!(
-                "edit_match: '{}' not found in {}{}",
-                match_text,
+                "edit_match: {} not found in {}{}",
+                crate::fuzzy_match::describe_searched_text(match_text),
                 resource,
                 crate::fuzzy_match::render_nearest_miss_detail(source, match_text)
             ),
@@ -634,6 +634,56 @@ mod tests {
     use crate::context::default_language_provider_factory;
     use crate::harness::Harness;
     use serde_json::json;
+
+    #[test]
+    fn comment_match_miss_bounds_a_large_needle() {
+        let req: RawRequest = serde_json::from_value(json!({
+            "id": "comment-miss", "command": "edit_match", "params": {}
+        }))
+        .unwrap();
+        let needle = (0..400)
+            .map(|index| format!("    let absent_{index} = {index};\n"))
+            .collect::<String>();
+        let response = apply_comment_match(
+            &req,
+            "issue://759/comments/2",
+            "unrelated comment body\n",
+            &needle,
+            "replacement",
+        )
+        .unwrap_err();
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "match_not_found");
+        let message = response.data["message"].as_str().unwrap();
+        assert!(message.starts_with(
+            "edit_match: '    let absent_0 = 0;…' (400 lines, 10180 bytes) not found in issue://759/comments/2"
+        ), "{message}");
+        assert!(message.len() < 4096);
+        assert!(!message.contains(&needle));
+    }
+
+    #[test]
+    fn comment_match_miss_keeps_short_needle_text() {
+        let req: RawRequest = serde_json::from_value(json!({
+            "id": "comment-miss", "command": "edit_match", "params": {}
+        }))
+        .unwrap();
+        let response = apply_comment_match(
+            &req,
+            "issue://759/comments/2",
+            "",
+            "ABSENT_TOKEN",
+            "replacement",
+        )
+        .unwrap_err();
+        assert_eq!(response.data["code"], "match_not_found");
+        assert_eq!(
+            response.data["message"].as_str(),
+            Some(
+                "edit_match: 'ABSENT_TOKEN' not found in issue://759/comments/2 (file has 0 lines)"
+            )
+        );
+    }
 
     #[cfg(unix)]
     #[test]
