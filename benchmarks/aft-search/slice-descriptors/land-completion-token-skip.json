@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "completion-token-skip"
+  ],
+  "note": "Background-task kill, timeout and reclaim publication skips output token counting (existing skipped-metrics state); ordinary completions keep exact counts. Adds tokenizer timing guards. No changed path matches RANKING_FENCE_PREFIXES."
+}
