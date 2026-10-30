@@ -4,8 +4,10 @@ on:
   push:
     tags:
       - "v*"
-  # Branch validation runs the gate and the build fleet but leaves every
-  # publishing job skipped. Tag pushes retain the production release DAG.
+  # GitHub schedules run on the default branch (main). Rehearsals share the
+  # dispatch build/E2E path; only tag pushes may publish to external services.
+  schedule:
+    - cron: "17 2 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -30,7 +32,10 @@ jobs:
   # fat-LTO binaries before any publication. There is no CI-gate bypass.
   gate:
     name: CI gate (tests.yml green on this commit)
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    # v0.62.0/v0.63.3/v0.63.4: 0.3-0.5 min; allow 5 min for API delays.
+    timeout-minutes: 5
     permissions:
       contents: read
       actions: read
@@ -53,6 +58,8 @@ jobs:
   build-js-packages:
     name: Build JS packages
     runs-on: ubuntu-latest
+    # v0.62.0/v0.63.3/v0.63.4: 0.4-0.5 min; 5 min includes cold setup.
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
 
@@ -73,10 +80,61 @@ jobs:
           bun run --cwd packages/aft-bridge build
           bun run --filter '*' build
 
+  # No needs: waiting for the build fleet would delay cancellation until its
+  # slowest job finished. Poll the current attempt so timeouts are caught too.
+  # Rehearsals deliberately keep all builds running to report every failure.
+  cancel-failed-tag-builds:
+    name: Cancel tag run on first build failure
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # Windows ARM64 peaked at 100.5 min in v0.62.0 (84.8/50.2 in v0.63.3/4).
+    # Outlive its 210-minute build budget, with 10 minutes for polling/setup.
+    timeout-minutes: 220
+    permissions:
+      actions: write
+    steps:
+      - name: Watch builds and cancel on failure
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import time
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          run_id = os.environ["GITHUB_RUN_ID"]
+          attempt = os.environ["GITHUB_RUN_ATTEMPT"]
+          build_names = {
+              "Build JS packages", "Build macOS ARM64", "Build macOS x64",
+              "Build Linux ARM64", "Build Linux x64",
+              "Build Windows ARM64", "Build Windows x64",
+          }
+          while True:
+              pages = json.loads(subprocess.check_output([
+                  "gh", "api", "--paginate", "--slurp",
+                  f"repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100",
+              ], text=True))
+              builds = [job for page in pages for job in page["jobs"] if job["name"] in build_names]
+              failed = [job for job in builds if job["status"] == "completed" and job["conclusion"] != "success"]
+              if failed:
+                  print(f"::error::{failed[0]['name']}: {failed[0]['conclusion']}; cancelling remaining jobs", flush=True)
+                  subprocess.run(["gh", "run", "cancel", run_id, "--repo", repo], check=True)
+                  break
+              if {job["name"] for job in builds if job["status"] == "completed"} == build_names:
+                  print("All release builds succeeded")
+                  break
+              time.sleep(30)
+          PY
+
   publish-crates:
     name: Publish to crates.io
-    if: github.event_name != 'workflow_dispatch'
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    # v0.62.0: 4 min; v0.63.3 reached crates.io's size refusal at 6.1 min.
+    # Allow over twice the latter duration for packaging and upload.
+    timeout-minutes: 15
     needs:
       - gate
       - build-js-packages
@@ -155,8 +213,8 @@ jobs:
   # Linux x64 hand their shipped binaries to release-only E2E, then publication
   # verifies those same bytes. The three cross-built targets retain build-only
   # coverage. No publication can start until all three E2E jobs succeed.
-  # Shipped-profile builds get 120 minutes: cold fat LTO already exceeds the
-  # 45-minute landing budget on macOS; rare releases can afford that headroom.
+  # Budgets below use recent release durations on the current runner types,
+  # rather than the slower macOS GitHub-hosted runners used for v0.62.0.
   # ---------------------------------------------------------------------------
   build-darwin-arm64:
     name: Build macOS ARM64
@@ -164,10 +222,8 @@ jobs:
     # peaks near 12 GB and swaps for hours on GitHub's 7 GB macos-26 runner.
     # Temporary until the self-hosted release runner on our own Mac is live.
     runs-on: blacksmith-6vcpu-macos-26
-    # The shipped-profile library codegen alone took 87 minutes for v0.63.0
-    # and ran past 120 for v0.63.1, so 120 cancelled the release. The x64 build
-    # on the same runner type already gets the 360-minute job default.
-    timeout-minutes: 240
+    # v0.63.3/v0.63.4 on Blacksmith: 15.5/16.4 min; over twice the latter.
+    timeout-minutes: 45
     outputs:
       rust_version: ${{ steps.bundle.outputs.rust_version }}
     permissions:
@@ -236,6 +292,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: shipped-darwin-arm64-${{ github.sha }}
+          retention-days: ${{ github.event_name == 'schedule' && 2 || 90 }}
           path: ${{ runner.temp }}/release.tar
           compression-level: 1
           if-no-files-found: error
@@ -244,6 +301,8 @@ jobs:
     name: Build macOS x64
     # Same runner as the ARM64 build; see the note there.
     runs-on: blacksmith-6vcpu-macos-26
+    # v0.63.3/v0.63.4 on Blacksmith: 15.7/18.3 min; over twice the latter.
+    timeout-minutes: 45
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -305,18 +364,22 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: darwin-x64
+          retention-days: ${{ github.event_name == 'schedule' && 2 || 90 }}
           path: target/x86_64-apple-darwin/release/aft
           if-no-files-found: error
 
       - uses: actions/upload-artifact@v4
         with:
           name: darwin-x64-dsym
+          retention-days: ${{ github.event_name == 'schedule' && 2 || 90 }}
           path: release-dsym/aft-darwin-x64-dsym.zip
           if-no-files-found: error
 
   build-linux-arm64:
     name: Build Linux ARM64
     runs-on: ubuntu-latest
+    # v0.62.0/v0.63.3/v0.63.4: 19.9/19.9/27.2 min; over twice the peak.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
 
@@ -353,13 +416,15 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: linux-arm64
+          retention-days: ${{ github.event_name == 'schedule' && 2 || 90 }}
           path: target/aarch64-unknown-linux-gnu/release/aft
           if-no-files-found: error
 
   build-linux-x64:
     name: Build Linux x64
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # v0.62.0/v0.63.3/v0.63.4: 16.0/25.4/22.1 min; over twice the peak.
+    timeout-minutes: 60
     outputs:
       rust_version: ${{ steps.bundle.outputs.rust_version }}
     steps:
@@ -397,6 +462,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: shipped-linux-x64-${{ github.sha }}
+          retention-days: ${{ github.event_name == 'schedule' && 2 || 90 }}
           path: ${{ runner.temp }}/release.tar
           compression-level: 1
           if-no-files-found: error
@@ -407,6 +473,8 @@ jobs:
     # cross-compiles to aarch64-pc-windows-msvc via the MSVC ARM64 cross
     # toolchain bundled in the Visual Studio Build Tools on the runner.
     runs-on: windows-latest
+    # v0.62.0/v0.63.3/v0.63.4: 100.5/84.8/50.2 min; twice the peak + margin.
+    timeout-minutes: 210
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -445,13 +513,15 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: win32-arm64
+          retention-days: ${{ github.event_name == 'schedule' && 2 || 90 }}
           path: target/aarch64-pc-windows-msvc/release/aft.exe
           if-no-files-found: error
 
   build-win32-x64:
     name: Build Windows x64
     runs-on: windows-2022
-    timeout-minutes: 120
+    # v0.62.0/v0.63.3/v0.63.4: 34.8/48.1/48.7 min; twice the peak + margin.
+    timeout-minutes: 100
     outputs:
       rust_version: ${{ steps.bundle.outputs.rust_version }}
     permissions:
@@ -504,6 +574,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: shipped-win32-x64-${{ github.sha }}
+          retention-days: ${{ github.event_name == 'schedule' && 2 || 90 }}
           path: ${{ runner.temp }}/release.tar
           compression-level: 1
           if-no-files-found: error
@@ -515,7 +586,8 @@ jobs:
     name: Shipped E2E (macOS ARM64)
     needs: build-darwin-arm64
     runs-on: macos-26
-    timeout-minutes: 45
+    # v0.62.0/v0.63.3/v0.63.4: 2.4/3.0/3.4 min; 10 min covers cold setup.
+    timeout-minutes: 10
     env:
       CARGO_INCREMENTAL: "0"
     steps:
@@ -554,6 +626,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: tested-darwin-arm64-${{ github.sha }}
+          retention-days: ${{ github.event_name == 'schedule' && 2 || 90 }}
           path: ${{ runner.temp }}/shipped-darwin-arm64/release.tar
           compression-level: 1
           if-no-files-found: error
@@ -562,6 +635,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: shipped-e2e-macos-log-${{ github.run_attempt }}
+          retention-days: ${{ github.event_name == 'schedule' && 2 || 90 }}
           path: ${{ runner.temp }}/aft-e2e-data/cortexkit/aft/logs/aft-plugin.log
           if-no-files-found: warn
 
@@ -569,7 +643,8 @@ jobs:
     name: Shipped E2E (Windows x64)
     needs: build-win32-x64
     runs-on: windows-2022
-    timeout-minutes: 45
+    # v0.62.0/v0.63.3/v0.63.4: 4.8/4.6/4.6 min; twice the peak + margin.
+    timeout-minutes: 10
     env:
       CARGO_INCREMENTAL: "0"
     steps:
@@ -609,6 +684,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: tested-win32-x64-${{ github.sha }}
+          retention-days: ${{ github.event_name == 'schedule' && 2 || 90 }}
           path: ${{ runner.temp }}/shipped-win32-x64/release.tar
           compression-level: 1
           if-no-files-found: error
@@ -625,6 +701,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: shipped-e2e-windows-log-${{ github.run_attempt }}
+          retention-days: ${{ github.event_name == 'schedule' && 2 || 90 }}
           path: ${{ runner.temp }}/aft-plugin.log
           if-no-files-found: warn
 
@@ -632,7 +709,8 @@ jobs:
     name: Shipped E2E (Linux x64 Docker)
     needs: build-linux-x64
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # v0.62.0/v0.63.3/v0.63.4: 2.5/2.7/2.6 min; 10 min covers cold Docker.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -677,6 +755,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: tested-linux-x64-${{ github.sha }}
+          retention-days: ${{ github.event_name == 'schedule' && 2 || 90 }}
           path: ${{ runner.temp }}/shipped-linux-x64/release.tar
           compression-level: 1
           if-no-files-found: error
@@ -685,16 +764,177 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: shipped-e2e-linux-log-${{ github.run_attempt }}
+          retention-days: ${{ github.event_name == 'schedule' && 2 || 90 }}
           path: e2e-artifacts/linux/aft-plugin.log
           if-no-files-found: warn
+
+  # Consume the same built/tested bytes as npm publishing, but never use registry
+  # credentials or upload externally. The main-CI gate is only for tag releases.
+  rehearse-publish:
+    name: Rehearse crates.io and npm packaging
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # No rehearsal timing yet: v0.63.4 Linux builds peaked at 27.2 min and
+    # v0.62.0 npm took 5.8. Allow over twice their sum for package verification.
+    timeout-minutes: 75
+    permissions:
+      contents: read
+      actions: read
+    needs:
+      - build-js-packages
+      - build-darwin-arm64
+      - build-darwin-x64
+      - build-linux-arm64
+      - build-linux-x64
+      - build-win32-arm64
+      - build-win32-x64
+      - e2e-darwin-arm64
+      - e2e-win32-x64
+      - e2e-linux-x64
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # A released main version would make Cargo reject the dry run as already
+      # published. Relabel only this checkout, not the built/tested binaries.
+      - name: Set an unpublished rehearsal version
+        run: |
+          version=$(node -p 'const [major, minor, patch] = require("./packages/aft-bridge/package.json").version.split("-")[0].split(".").map(Number); `${major}.${minor}.${patch + 1}-rehearsal.${process.env.GITHUB_RUN_NUMBER}.${process.env.GITHUB_RUN_ATTEMPT}`')
+          node scripts/version-sync.mjs "$version"
+          # A fresh runner has no registry index for offline lockfile refresh.
+          cargo update -w
+
+      # One multi-package invocation verifies siblings in dependency order using
+      # Cargo's local registry overlay, without needing unpublished siblings on
+      # crates.io. Stable Cargo >=1.90 supports this selection mode.
+      - name: Rehearse crates.io publishing
+        run: cargo publish --dry-run --locked --allow-dirty -p aft-tokenizer -p aft-secret-rules -p agent-file-tools
+
+      # Mirrors the inline 10 MiB check in scripts/release.sh (crates.io package
+      # sizes). A publish dry run does not enforce the registry's upload limit.
+      - name: Check packaged crate sizes
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import subprocess
+
+          metadata = json.loads(subprocess.check_output([
+              "cargo", "metadata", "--format-version", "1", "--no-deps",
+          ], text=True))
+          crate_dir = Path(metadata["target_directory"]) / "package"
+          crates = sorted(crate_dir.glob("*.crate"))
+          expected = {"aft-tokenizer", "aft-secret-rules", "agent-file-tools"}
+          for package in metadata["packages"]:
+              if package["name"] in expected:
+                  assert crate_dir / f"{package['name']}-{package['version']}.crate" in crates, package["name"]
+          assert len(crates) >= len(expected), "missing packaged crates"
+          limit = 10 * 1024 * 1024
+          for crate in crates:
+              size = crate.stat().st_size
+              print(f"{crate.name}: {size} bytes ({size / limit:.1%} of 10 MiB)")
+              if size >= limit:
+                  raise SystemExit(f"::error::{crate.name} must be under {limit} bytes")
+          PY
+
+      - name: Download darwin-arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: tested-darwin-arm64-${{ github.sha }}
+          path: ${{ runner.temp }}/tested-darwin-arm64
+      - name: Download darwin-x64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: darwin-x64
+          path: packages/npm/darwin-x64/bin
+      - name: Download linux-arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-arm64
+          path: packages/npm/linux-arm64/bin
+      - name: Download linux-x64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: tested-linux-x64-${{ github.sha }}
+          path: ${{ runner.temp }}/tested-linux-x64
+      - name: Download win32-x64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: tested-win32-x64-${{ github.sha }}
+          path: ${{ runner.temp }}/tested-win32-x64
+      - name: Download win32-arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: win32-arm64
+          path: packages/npm/win32-arm64/bin
+      - name: Verify tested macOS binary for npm
+        run: python3 scripts/native-release-artifact.py unpack-published --target aarch64-apple-darwin --archive "$RUNNER_TEMP/tested-darwin-arm64/release.tar" --binary packages/npm/darwin-arm64/bin/aft
+      - name: Verify tested Windows binary for npm
+        run: python3 scripts/native-release-artifact.py unpack-published --target x86_64-pc-windows-msvc --archive "$RUNNER_TEMP/tested-win32-x64/release.tar" --binary packages/npm/win32-x64/bin/aft.exe
+      - name: Verify tested Linux binary for npm
+        run: python3 scripts/native-release-artifact.py unpack-published --target x86_64-unknown-linux-gnu --archive "$RUNNER_TEMP/tested-linux-x64/release.tar" --binary packages/npm/linux-x64/bin/aft
+
+      # Both binaries came from the tag path's cross@0.2.5 release builds.
+      # readelf is architecture-independent; do not execute ARM64 on this host.
+      - name: Audit Linux glibc floor
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import subprocess
+
+          floor = (2, 23)
+          for platform in ("linux-x64", "linux-arm64"):
+              binary = Path("packages/npm") / platform / "bin/aft"
+              symbols = subprocess.check_output(["readelf", "--dyn-syms", "--wide", str(binary)], text=True)
+              required = set(re.findall(r"@GLIBC_([\w.]+)", "\n".join(line for line in symbols.splitlines() if " UND " in line)))
+              if not required:
+                  raise SystemExit(f"::error::{platform}: no required GLIBC versions found")
+              for version in sorted(required):
+                  if not re.fullmatch(r"\d+(?:\.\d+)+", version) or tuple(map(int, version.split("."))) > floor:
+                      raise SystemExit(f"::error::{platform} requires GLIBC_{version}, above the glibc 2.23 floor")
+              print(f"{platform}: required GLIBC versions {', '.join(sorted(required))}; floor 2.23 passed")
+          PY
+
+      - name: Prepare npm packages
+        run: |
+          chmod +x packages/npm/{darwin-arm64,darwin-x64,linux-arm64,linux-x64}/bin/aft
+          node scripts/validate-packages.mjs
+          bun install
+          bun run --cwd packages/aft-bridge build
+          bun run --filter '*' build
+
+      - name: Rehearse every npm package
+        run: |
+          for platform in darwin-arm64 darwin-x64 linux-arm64 linux-x64 win32-arm64 win32-x64; do
+            npm pack --dry-run "./packages/npm/$platform"
+          done
+          for package in aft-bridge opencode-plugin pi-plugin aft-cli; do
+            npm pack --dry-run "./packages/$package"
+          done
+
+      - name: Prepare publication records from the rehearsal candidate
+        run: node scripts/release-gate-v049.mjs --prepare --snapshot-dir "${{ runner.temp }}/governed-publication" --candidate
+      - name: Verify rehearsal publication gates
+        run: node scripts/release-gate-v049.mjs --snapshot-dir "${{ runner.temp }}/governed-publication" --candidate --require-platform-artifacts
 
   # npm publish runs AFTER github-release so that checksums.sha256 is already
   # available on the GitHub release page when ensureBinary() runs during
   # @cortexkit/aft-opencode@latest install.
   publish-npm:
     name: Publish to npm
-    if: github.event_name != 'workflow_dispatch'
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    # v0.62.0: 5.8 min; v0.63.3/v0.63.4 never reached npm. Over twice 5.8.
+    timeout-minutes: 15
     needs:
       - gate
       - build-darwin-arm64
@@ -915,8 +1155,10 @@ jobs:
   # isn't available yet.
   github-release:
     name: Create GitHub Release
-    if: github.event_name != 'workflow_dispatch'
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    # v0.62.0: 2.1 min; allow 10 min for sequential asset-upload retries.
+    timeout-minutes: 10
     needs:
       - gate
       - build-darwin-arm64
@@ -1113,6 +1355,8 @@ jobs:
   discord-announce:
     name: Announce on Discord
     runs-on: ubuntu-latest
+    # v0.62.0: 0.2 min; a 5-minute minimum leaves room for webhook delays.
+    timeout-minutes: 5
     # MUST wait for BOTH github-release AND publish-npm. Without `publish-npm`
     # the announcement can fire while npm packages are still uploading,
     # leaving users who click the release link unable to install the
@@ -1121,7 +1365,7 @@ jobs:
       - gate
       - github-release
       - publish-npm
-    if: success() && github.event_name != 'workflow_dispatch'
+    if: success() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     continue-on-error: true
     steps:
       - uses: actions/checkout@v5
