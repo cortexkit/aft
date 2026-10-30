@@ -87,6 +87,17 @@ unsafe extern "C" fn open(
             return ffi::SQLITE_CANTOPEN;
         };
         let rc = unsafe { open(base, name, file, flags, out) };
+        if rc != ffi::SQLITE_OK {
+            let path = if name.is_null() {
+                "<temporary>".into()
+            } else {
+                unsafe { CStr::from_ptr(name) }.to_string_lossy()
+            };
+            eprintln!(
+                "dirty-page VFS open failed: path={path:?} flags={flags:#x} extended_code={rc} os_error={}",
+                std::io::Error::last_os_error()
+            );
+        }
         if rc != ffi::SQLITE_OK || name.is_null() {
             return rc;
         }
@@ -283,7 +294,10 @@ fn session_keeps_default_and_wal_probe_isolated() {
             }
             match write_row(&connection) {
                 Ok(()) => default_writes += 1,
-                Err(error) => errors.push(format!("default write: {error}")),
+                Err(error) => errors.push(format!(
+                    "default write: path={:?}: {error:?}",
+                    other_root.join("default.sqlite")
+                )),
             }
             let credit = crate::db::wal_credit_probe::open_counted(
                 &other_root.join("credit.sqlite"),
@@ -291,7 +305,10 @@ fn session_keeps_default_and_wal_probe_isolated() {
             );
             match write_row(&credit) {
                 Ok(()) => credit_writes += 1,
-                Err(error) => errors.push(format!("WAL credit write: {error}")),
+                Err(error) => errors.push(format!(
+                    "WAL credit write: path={:?}: {error:?}",
+                    other_root.join("credit.sqlite")
+                )),
             }
             if crate::db::wal_credit_probe::main_io_counts(&credit).0 == 0 {
                 errors.push("WAL credit probe missed its main-file writes".to_string());
@@ -349,7 +366,9 @@ fn session_keeps_default_and_wal_probe_isolated() {
         }
         match result {
             Ok(()) => measured_writes += 1,
-            Err(error) => errors.push(format!("measured write: {error}")),
+            Err(error) => errors.push(format!(
+                "measured write: iteration={iteration} path={measured:?}: {error:?}"
+            )),
         }
     }
     let (other_errors, default_writes, credit_writes) = other.join().unwrap();
