@@ -135,6 +135,8 @@ pub(crate) struct Budget {
     failure: Arc<Mutex<Option<Failure>>>,
     failed: Arc<AtomicBool>,
     walk_partial: Arc<AtomicBool>,
+    /// A read stall alone does not mean the walk reached its own deadline.
+    walk_time_limit_reached: Arc<AtomicBool>,
     walk_gap: Arc<Mutex<Option<String>>>,
     directories: Arc<Mutex<HashMap<PathBuf, Arc<Probe>>>>,
     traversable: Arc<Mutex<HashSet<PathBuf>>>,
@@ -161,6 +163,7 @@ impl Budget {
             failure: Arc::new(Mutex::new(None)),
             failed: Arc::new(AtomicBool::new(false)),
             walk_partial: Arc::new(AtomicBool::new(false)),
+            walk_time_limit_reached: Arc::new(AtomicBool::new(false)),
             walk_gap: Arc::new(Mutex::new(None)),
             directories: Arc::new(Mutex::new(HashMap::new())),
             traversable: Arc::new(Mutex::new(HashSet::new())),
@@ -345,7 +348,10 @@ pub(crate) fn finish_response(mut response: Response) -> Response {
                     .clone()
             })
         });
-        let mut gaps = vec![WALK_PARTIAL_GAP.to_string()];
+        let mut gaps = Vec::new();
+        if current().is_some_and(|b| b.walk_time_limit_reached.load(Ordering::Acquire)) {
+            gaps.push(WALK_PARTIAL_GAP.to_string());
+        }
         if let Some(gap) = named_gap {
             if gap != WALK_PARTIAL_GAP {
                 gaps.push(gap);
@@ -700,16 +706,32 @@ pub(crate) fn run_walk<T: Clone + Send + 'static>(
     });
     stopped.store(true, Ordering::Release);
     let failed = failure.is_some();
-    let partial = result.is_err() || failed || Instant::now() >= deadline;
+    let time_limit = Instant::now() >= deadline;
+    let partial = result.is_err() || failed || time_limit;
+    let named_gap = failure
+        .as_ref()
+        .map(|failure| failure.message.clone())
+        .or_else(|| {
+            result
+                .as_ref()
+                .err()
+                .filter(|_| !time_limit)
+                .map(ToString::to_string)
+        });
     if partial && (published.load(Ordering::Acquire) || !failed) {
         if let Some(budget) = &parent {
             budget.walk_partial.store(true, Ordering::Release);
-            if let Some(failure) = failure {
+            if time_limit {
+                budget
+                    .walk_time_limit_reached
+                    .store(true, Ordering::Release);
+            }
+            if let Some(gap) = named_gap {
                 budget
                     .walk_gap
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .get_or_insert(failure.message);
+                    .get_or_insert(gap);
             }
         }
     } else if let (Some(budget), Some(failure)) = (parent, failure) {
@@ -724,7 +746,7 @@ pub(crate) fn run_walk<T: Clone + Send + 'static>(
         result.unwrap_or_else(|_| snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone()),
         WalkCompletion {
             incomplete: partial,
-            time_limit: partial && !failed,
+            time_limit,
         },
     )
 }
