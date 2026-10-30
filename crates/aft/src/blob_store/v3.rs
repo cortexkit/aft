@@ -386,10 +386,12 @@ pub fn allocated_bytes_until(path: &Path, deadline: Option<Instant>) -> Result<O
                 hook(&path);
             }
         });
-        // SQLite can remove sidecars while the namespace is being measured,
-        // even under the publication lock. A vanished entry occupies no bytes;
-        // other stat errors still leave accounting unknown and must refuse it.
-        let meta = match fs::symlink_metadata(&path) {
+        // Windows directory entries already contain size and type. Reopening a
+        // name here can fail with access denied while it is being deleted; use
+        // the listed size as a conservative charge until the next measurement.
+        // On Unix this still stats without following symlinks. Vanished entries
+        // occupy no bytes; other errors must leave accounting unknown.
+        let meta = match entry.metadata() {
             Ok(meta) => meta,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
@@ -2201,3 +2203,5 @@ mod replay_tests;
 mod source_guard;
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, windows))]
+pub(crate) use tests::deny_read_for_test;

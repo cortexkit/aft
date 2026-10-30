@@ -115,6 +115,32 @@ fn publication_survives_a_sidecar_disappearing_during_accounting() {
     assert_eq!(reader.get(&run).unwrap().unwrap(), b"run");
 }
 #[cfg(windows)]
+pub(crate) fn deny_read_for_test(path: &Path) -> impl Drop {
+    fn icacls(path: &Path, action: &str, rights: &str) {
+        let output = std::process::Command::new("icacls")
+            .arg(path)
+            .args([action, rights])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "icacls: {output:?}");
+    }
+    struct Restore(PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            icacls(&self.0, "/remove:d", "*S-1-1-0");
+        }
+    }
+    // Everyone's read-data right is also the directory-listing right. A SID
+    // avoids depending on the localized account name on the Windows runner.
+    icacls(path, "/deny", "*S-1-1-0:(RD)");
+    Restore(path.to_path_buf())
+}
+
+/// A deletion can make the initial metadata open fail with error 5, then remove
+/// the name before std's FindFirstFileExW fallback, which returns the original
+/// error 5. Denying parent listing after enumeration makes that fallback fail
+/// deterministically while a legacy delete-pending handle keeps the file alive.
+#[cfg(windows)]
 #[test]
 fn accounting_uses_listed_metadata_for_a_delete_pending_file() {
     use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
@@ -138,6 +164,8 @@ fn accounting_uses_listed_metadata_for_a_delete_pending_file() {
     let pending_handle = std::rc::Rc::clone(&handle);
     let removed = std::rc::Rc::new(std::cell::Cell::new(false));
     let observed = std::rc::Rc::clone(&removed);
+    let denied = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let hook_denied = std::rc::Rc::clone(&denied);
     WALK_BEFORE_STAT.with(|hook| {
         *hook.borrow_mut() = Some(Box::new(move |path| {
             if path == pending && !observed.replace(true) {
@@ -157,6 +185,7 @@ fn accounting_uses_listed_metadata_for_a_delete_pending_file() {
                     "{}",
                     std::io::Error::last_os_error()
                 );
+                *hook_denied.borrow_mut() = Some(deny_read_for_test(path.parent().unwrap()));
                 assert_eq!(
                     fs::symlink_metadata(path).unwrap_err().raw_os_error(),
                     Some(5)
@@ -166,11 +195,43 @@ fn accounting_uses_listed_metadata_for_a_delete_pending_file() {
     });
     let result = allocated_bytes_until(&dir, None);
     WALK_BEFORE_STAT.with(|hook| *hook.borrow_mut() = None);
+    denied.borrow_mut().take();
 
     assert!(removed.get(), "the walk did not reach the pending file");
     // The listing's length is a conservative charge until a later measurement.
     assert_eq!(result.unwrap(), Some(payload.len() as u64));
     drop(handle);
+}
+
+#[cfg(windows)]
+#[test]
+fn accounting_counts_unreadable_files_but_refuses_unreadable_directories() {
+    let root = tempdir().unwrap();
+    let dir = family_dir(root.path(), A).unwrap();
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("unreadable");
+    let payload = b"still charged from the directory listing";
+    fs::write(&file, payload).unwrap();
+
+    let denied = deny_read_for_test(&file);
+    let read = fs::read(&file);
+    let measured = allocated_bytes_until(&dir, None);
+    drop(denied);
+    assert_eq!(
+        read.unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    // File content access is unnecessary for accounting, but its bytes must
+    // never be silently discarded just because the content is unreadable.
+    assert_eq!(measured.unwrap(), Some(payload.len() as u64));
+
+    let denied = deny_read_for_test(&dir);
+    let measured = allocated_bytes_until(&dir, None);
+    drop(denied);
+    let Error::Io(error) = measured.unwrap_err() else {
+        panic!("unreadable directory must report an I/O error");
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
 }
 
 #[cfg(unix)]
