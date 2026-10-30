@@ -270,15 +270,69 @@ pub fn view_dir(storage: &Path, family: &str, scope: &str) -> Result<PathBuf> {
     Ok(family_dir(storage, family)?.join("views").join(scope))
 }
 
-thread_local! {
-    static FREE_SPACE: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+struct FreeSpaceOverrides {
+    storage: std::collections::BTreeMap<PathBuf, (u64, u64)>,
+    unlimited: usize,
 }
-/// Overrides the free-space probe only on the calling thread. Production never calls it.
-/// Other test threads must keep probing their own storage volume, even while a
-/// reservation-refusal test simulates a full device.
+static FREE_SPACE: Mutex<FreeSpaceOverrides> = Mutex::new(FreeSpaceOverrides {
+    storage: std::collections::BTreeMap::new(),
+    unlimited: 0,
+});
+
+/// Restores a storage root's previous test probe when dropped, including on unwind.
 #[doc(hidden)]
-pub fn set_free_space_for_test(free: u64, capacity: u64) {
-    FREE_SPACE.set(Some((free, capacity)));
+#[must_use]
+pub struct FreeSpaceTestGuard {
+    storage: PathBuf,
+    previous: Option<(u64, u64)>,
+}
+impl Drop for FreeSpaceTestGuard {
+    fn drop(&mut self) {
+        let mut overrides = FREE_SPACE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(previous) = self.previous {
+            overrides.storage.insert(self.storage.clone(), previous);
+        } else {
+            overrides.storage.remove(&self.storage);
+        }
+    }
+}
+
+/// Overrides probes under `storage` on every thread until the guard drops.
+/// The most specific matching root wins. Production never calls this setter.
+#[doc(hidden)]
+pub fn set_free_space_for_test(storage: &Path, free: u64, capacity: u64) -> FreeSpaceTestGuard {
+    let storage = storage.to_path_buf();
+    let previous = FREE_SPACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .storage
+        .insert(storage.clone(), (free, capacity));
+    FreeSpaceTestGuard { storage, previous }
+}
+
+#[cfg(test)]
+pub(crate) struct UnlimitedFreeSpaceForTestProcess;
+#[cfg(test)]
+impl Drop for UnlimitedFreeSpaceForTestProcess {
+    fn drop(&mut self) {
+        FREE_SPACE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unlimited -= 1;
+    }
+}
+/// Existing shared fixtures acquire their guard before creating one or more
+/// storage roots. Their fallback can only allow admission; refusal simulations
+/// must name a storage root and always take precedence over this fallback.
+#[cfg(test)]
+fn unlimited_free_space_for_test_process() -> UnlimitedFreeSpaceForTestProcess {
+    FREE_SPACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unlimited += 1;
+    UnlimitedFreeSpaceForTestProcess
 }
 /// The platform probe itself, bypassing the test override.
 #[cfg(test)]
@@ -286,7 +340,19 @@ pub(crate) fn probe_free_space_for_test(path: &Path) -> Option<(u64, u64)> {
     probe_free_space(path)
 }
 fn free_space(path: &Path) -> Option<(u64, u64)> {
-    if let Some(value) = FREE_SPACE.get() {
+    let value = {
+        let overrides = FREE_SPACE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        overrides
+            .storage
+            .iter()
+            .filter(|(root, _)| path.starts_with(root))
+            .max_by_key(|(root, _)| root.components().count())
+            .map(|(_, value)| *value)
+            .or_else(|| (overrides.unlimited > 0).then_some((u64::MAX, u64::MAX / 2)))
+    };
+    if let Some(value) = value {
         return Some(value);
     }
     probe_free_space(path)
@@ -2186,10 +2252,10 @@ impl PlaneReader {
     }
 }
 
-/// Retains the shared v3 test lock and installs unlimited space on the calling
-/// thread. Dropping the guard restores the previous probe, including on panic.
+/// Retains the shared v3 test lock and an unlimited process fallback. Explicit
+/// storage-scoped probes take precedence, even on a different thread.
 #[cfg(test)]
-pub(crate) fn serial_for_test() -> tests::FreeSpaceTestGuard {
+pub(crate) fn serial_for_test() -> tests::SerialTestGuard {
     tests::serial()
 }
 

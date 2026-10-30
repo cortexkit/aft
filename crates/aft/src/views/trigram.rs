@@ -1661,17 +1661,20 @@ mod tests {
         let (release, wait) = std::sync::mpsc::channel::<()>();
         let worker = std::thread::spawn(move || {
             let _guard = crate::blob_store::v3::serial_for_test();
-            crate::blob_store::v3::set_free_space_for_test(1 << 20, 1 << 40);
-            let refusal =
+            let _space =
+                crate::blob_store::v3::set_free_space_for_test(&other_storage, 1 << 20, 1 << 40);
+            let refusal = || {
                 crate::blob_store::v3::publish(&other_storage, "full-device", 1, None, |_| Ok(()))
                     .unwrap_err()
-                    .to_string();
-            installed.send(refusal).unwrap();
+                    .to_string()
+            };
+            installed.send(refusal()).unwrap();
             let _ = wait.recv();
+            assert_eq!(refusal(), "device_free_space_floor");
         });
         let refusal = ready.recv().unwrap();
         // Keep the refusing probe installed until the independent checkout has
-        // finished binding; scheduling cannot hide a cross-thread override.
+        // finished binding; scheduling cannot hide a cross-storage override.
         let snapshot = source.acquire();
         drop(release);
         worker.join().unwrap();
