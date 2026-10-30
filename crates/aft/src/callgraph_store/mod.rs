@@ -4617,7 +4617,7 @@ mod health_stale_census_tests {
     }
 }
 
-/// Bound the work spent counting possible callers for an empty reverse graph.
+/// Bound the work spent counting unresolved possible callers.
 pub const UNRESOLVED_CALL_SITE_COUNT_LIMIT: usize = 1_000;
 
 const UNRESOLVED_CALL_SITE_COUNT_SQL: &str = "
@@ -4629,26 +4629,56 @@ const UNRESOLVED_CALL_SITE_COUNT_SQL: &str = "
         WHERE r.status = 'unresolved'
           AND r.kind IN ('call', 'construction')
           AND f.lang = ?1
+          AND (?4 IS NULL OR r.short_name = ?4)
           AND (?2 OR (COALESCE(n.is_test, 0) = 0 AND NOT aft_is_test_file(r.caller_file)))
           AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.ref_id = r.ref_id AND e.kind = 'call')
         LIMIT ?3
     )";
 
+const UNRESOLVED_NAMED_CALL_SITE_COUNT_SQL: &str = "
+    SELECT COUNT(*) FROM (
+        SELECT DISTINCT r.caller_file, r.byte_start, r.byte_end
+        FROM refs r
+        JOIN files f ON f.path = r.caller_file
+        LEFT JOIN nodes n ON n.id = r.caller_node
+        WHERE r.status = 'unresolved'
+          AND r.kind IN ('call', 'construction')
+          AND f.lang = ?1
+          AND r.short_name = ?4
+          AND (?2 OR (COALESCE(n.is_test, 0) = 0 AND NOT aft_is_test_file(r.caller_file)))
+          AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.ref_id = r.ref_id AND e.kind = 'call')
+        LIMIT ?3
+    )";
+
+#[cfg(test)]
 fn unresolved_call_site_count(
     conn: &Connection,
     language: LangId,
     include_tests: bool,
 ) -> Result<usize> {
-    Ok(conn
-        .prepare_cached(UNRESOLVED_CALL_SITE_COUNT_SQL)?
-        .query_row(
-            params![
-                lang_label(language),
-                include_tests,
-                UNRESOLVED_CALL_SITE_COUNT_LIMIT as i64
-            ],
-            |row| row.get(0),
-        )?)
+    unresolved_call_site_count_filtered(conn, language, include_tests, None)
+}
+
+fn unresolved_call_site_count_filtered(
+    conn: &Connection,
+    language: LangId,
+    include_tests: bool,
+    name: Option<&str>,
+) -> Result<usize> {
+    let sql = if name.is_some() {
+        UNRESOLVED_NAMED_CALL_SITE_COUNT_SQL
+    } else {
+        UNRESOLVED_CALL_SITE_COUNT_SQL
+    };
+    Ok(conn.prepare_cached(sql)?.query_row(
+        params![
+            lang_label(language),
+            include_tests,
+            UNRESOLVED_CALL_SITE_COUNT_LIMIT as i64,
+            name
+        ],
+        |row| row.get(0),
+    )?)
 }
 
 #[cfg(test)]
@@ -4659,7 +4689,7 @@ mod callgraph_unresolved_count_tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE files(path TEXT PRIMARY KEY, lang TEXT);
             CREATE TABLE nodes(id TEXT PRIMARY KEY, is_test INTEGER);
-            CREATE TABLE refs(ref_id TEXT, caller_file TEXT, caller_node TEXT, byte_start INTEGER, byte_end INTEGER, status TEXT, kind TEXT);
+            CREATE TABLE refs(ref_id TEXT, caller_file TEXT, caller_node TEXT, byte_start INTEGER, byte_end INTEGER, status TEXT, kind TEXT, short_name TEXT DEFAULT 'target');
             CREATE TABLE edges(ref_id TEXT, kind TEXT);
             INSERT INTO files VALUES ('lib.rs', 'rust');").unwrap();
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4682,7 +4712,7 @@ mod callgraph_unresolved_count_tests {
         let (conn, reads) = fixture();
         for i in 0..(UNRESOLVED_CALL_SITE_COUNT_LIMIT * 3) {
             conn.execute(
-                "INSERT INTO refs VALUES (?1, 'lib.rs', NULL, ?2, ?2+1, 'unresolved', 'call')",
+                "INSERT INTO refs(ref_id, caller_file, caller_node, byte_start, byte_end, status, kind) VALUES (?1, 'lib.rs', NULL, ?2, ?2+1, 'unresolved', 'call')",
                 params![i.to_string(), i as i64],
             )
             .unwrap();
@@ -4699,12 +4729,39 @@ mod callgraph_unresolved_count_tests {
     }
 
     #[test]
+    fn callgraph_named_unresolved_count_filters_before_the_sql_cap() {
+        let (conn, reads) = fixture();
+        for (name, offset) in [("other", 0), ("target", 10_000)] {
+            for i in 0..(UNRESOLVED_CALL_SITE_COUNT_LIMIT * 3) {
+                conn.execute(
+                    "INSERT INTO refs VALUES (?1, 'lib.rs', NULL, ?2, ?2+1, 'unresolved', 'call', ?3)",
+                    params![format!("{name}_{i}"), (offset + i) as i64, name],
+                ).unwrap();
+            }
+        }
+        assert_eq!(
+            unresolved_call_site_count_filtered(&conn, LangId::Rust, false, Some("target"))
+                .unwrap(),
+            1_000
+        );
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            1_000,
+            "unrelated names must not consume the cap, and matching rows must stop in SQL"
+        );
+        assert_eq!(
+            unresolved_call_site_count_filtered(&conn, LangId::Rust, true, Some("absent")).unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn callgraph_unresolved_count_preserves_site_identity_and_exclusions() {
         let (conn, _) = fixture();
         conn.execute_batch(
             "INSERT INTO files VALUES ('other.ts', 'typescript');
             INSERT INTO nodes VALUES ('test_node', 1);
-            INSERT INTO refs VALUES
+            INSERT INTO refs(ref_id, caller_file, caller_node, byte_start, byte_end, status, kind) VALUES
                 ('a', 'lib.rs', NULL, 1, 2, 'unresolved', 'call'),
                 ('duplicate', 'lib.rs', NULL, 1, 2, 'unresolved', 'construction'),
                 ('b', 'lib.rs', NULL, 2, 3, 'unresolved', 'construction'),
@@ -4722,6 +4779,15 @@ mod callgraph_unresolved_count_tests {
         );
         assert_eq!(
             unresolved_call_site_count(&conn, LangId::Rust, true).unwrap(),
+            3
+        );
+        assert_eq!(
+            unresolved_call_site_count_filtered(&conn, LangId::Rust, false, Some("target"))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            unresolved_call_site_count_filtered(&conn, LangId::Rust, true, Some("target")).unwrap(),
             3
         );
         // Paths without enclosing nodes still use the shared test-file classifier.
@@ -4751,7 +4817,7 @@ mod callgraph_unresolved_count_tests {
             conn.execute("INSERT INTO files VALUES (?1, 'rust')", [path])
                 .unwrap();
             conn.execute(
-                "INSERT INTO refs VALUES (?1, ?2, NULL, 0, 1, 'unresolved', 'call')",
+                "INSERT INTO refs(ref_id, caller_file, caller_node, byte_start, byte_end, status, kind) VALUES (?1, ?2, NULL, 0, 1, 'unresolved', 'call')",
                 params![format!("test_{i}"), path],
             )
             .unwrap();
@@ -4762,6 +4828,15 @@ mod callgraph_unresolved_count_tests {
         );
         assert_eq!(
             unresolved_call_site_count(&conn, LangId::Rust, true).unwrap(),
+            21
+        );
+        assert_eq!(
+            unresolved_call_site_count_filtered(&conn, LangId::Rust, false, Some("target"))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            unresolved_call_site_count_filtered(&conn, LangId::Rust, true, Some("target")).unwrap(),
             21
         );
     }
@@ -4844,6 +4919,18 @@ pub trait CallGraphRead {
     /// A count at the limit is a lower bound, not an exact total.
     fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
         let _ = (language, include_tests);
+        Ok(0)
+    }
+    /// Count distinct (caller file, byte start, byte end) spans with this short
+    /// name, including bare imported calls. The test filter and SQL count limit
+    /// match the unnamed count.
+    fn unresolved_call_site_count_named(
+        &self,
+        name: &str,
+        language: LangId,
+        include_tests: bool,
+    ) -> Result<usize> {
+        let _ = (name, language, include_tests);
         Ok(0)
     }
     fn call_tree(
@@ -9562,6 +9649,24 @@ impl CallGraphStore {
     }
 
     fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
+        self.unresolved_call_site_count_matching(language, include_tests, None)
+    }
+
+    fn unresolved_call_site_count_named(
+        &self,
+        name: &str,
+        language: LangId,
+        include_tests: bool,
+    ) -> Result<usize> {
+        self.unresolved_call_site_count_matching(language, include_tests, Some(name))
+    }
+
+    fn unresolved_call_site_count_matching(
+        &self,
+        language: LangId,
+        include_tests: bool,
+        name: Option<&str>,
+    ) -> Result<usize> {
         self.refresh_read_marker()?;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         self.ensure_ready(&conn)?;
@@ -9574,7 +9679,7 @@ impl CallGraphStore {
                 | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
             |ctx| Ok(crate::inspect::job::is_test_file(&ctx.get::<String>(0)?)),
         )?;
-        unresolved_call_site_count(&conn, language, include_tests)
+        unresolved_call_site_count_filtered(&conn, language, include_tests, name)
     }
 
     pub fn call_tree(
@@ -10359,6 +10464,14 @@ impl CallGraphRead for CallGraphStore {
     fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
         CallGraphStore::unresolved_call_site_count(self, language, include_tests)
     }
+    fn unresolved_call_site_count_named(
+        &self,
+        name: &str,
+        language: LangId,
+        include_tests: bool,
+    ) -> Result<usize> {
+        CallGraphStore::unresolved_call_site_count_named(self, name, language, include_tests)
+    }
     fn call_tree(
         &self,
         file_rel: &Path,
@@ -10482,6 +10595,14 @@ impl<T: CallGraphRead + ?Sized> CallGraphRead for Arc<T> {
     }
     fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
         (**self).unresolved_call_site_count(language, include_tests)
+    }
+    fn unresolved_call_site_count_named(
+        &self,
+        name: &str,
+        language: LangId,
+        include_tests: bool,
+    ) -> Result<usize> {
+        (**self).unresolved_call_site_count_named(name, language, include_tests)
     }
     fn call_tree(
         &self,
@@ -10607,6 +10728,15 @@ impl CallGraphRead for ReadonlyCallGraphStore {
     fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
         self.inner
             .unresolved_call_site_count(language, include_tests)
+    }
+    fn unresolved_call_site_count_named(
+        &self,
+        name: &str,
+        language: LangId,
+        include_tests: bool,
+    ) -> Result<usize> {
+        self.inner
+            .unresolved_call_site_count_named(name, language, include_tests)
     }
     fn call_tree(
         &self,
@@ -13238,7 +13368,7 @@ fn ensure_database_ready(conn: &Connection) -> Result<()> {
 ///   completion does not duplicate documented methods.
 /// - v13: known interface contracts and their implementation fan-out retain
 ///   exact/dispatch provenance; a concrete trait call has only its actual target.
-const BUILD_OUTPUT_VERSION: &str = "v21-rust-module-paths-and-function-references";
+const BUILD_OUTPUT_VERSION: &str = "v22-python-import-bindings";
 
 fn staging_file_name(project_key: &str) -> String {
     format!("{project_key}.{BUILD_OUTPUT_VERSION}.staging.sqlite.tmp.resume")
@@ -15017,6 +15147,7 @@ fn resolution_caller_data(data: &FileCallData) -> FileCallData {
         symbol_metadata: data.symbol_metadata.clone(),
         default_export_symbol: data.default_export_symbol.clone(),
         import_block: data.import_block.clone(),
+        python_bindings: data.python_bindings.clone(),
         lang: data.lang,
     }
 }
@@ -15056,7 +15187,18 @@ fn resolution_caller_data_weight(rel_path: &str, data: &FileCallData) -> usize {
         .chain(data.exported_symbols.iter())
         .map(|name| ENTRY + name.len())
         .sum::<usize>();
-    ENTRY * 4 + rel_path.len() + imports + metadata + names
+    let python = data
+        .python_bindings
+        .iter()
+        .map(|binding| {
+            ENTRY
+                + binding
+                    .target
+                    .as_ref()
+                    .map_or(0, |(module, symbol)| module.len() + symbol.len())
+        })
+        .sum::<usize>();
+    ENTRY * 4 + rel_path.len() + imports + metadata + names + python
 }
 
 fn collect_source_freshness(path: &Path, source: &str) -> std::io::Result<FileFreshness> {
@@ -16517,6 +16659,9 @@ fn resolve_ref<I: ResolverIndex>(raw: RawRef, index: &I) -> Result<ResolvedRef> 
         Some(LangId::Go) => {
             resolve_go_target(index, &caller_file, full_ref, short_name, caller_data)
         }
+        Some(LangId::Python) => {
+            resolve_python_target(index, &caller_file, full_ref, short_name, caller_data, &raw)
+        }
         Some(LangId::TypeScript | LangId::Tsx | LangId::JavaScript) => {
             resolve_js_ts_target(index, &caller_file, full_ref, short_name, caller_data)
         }
@@ -16926,6 +17071,37 @@ fn resolve_go_target<I: ResolverIndex>(
     };
     let target = index.go_symbol_target(caller_file, module, short_name)?;
     Some(("resolved".to_string(), target, short_name.to_string()))
+}
+
+fn resolve_python_target<I: ResolverIndex>(
+    index: &I,
+    caller_file: &str,
+    full_ref: &str,
+    short_name: &str,
+    caller_data: &FileCallData,
+    raw: &RawRef,
+) -> Option<(String, String, String)> {
+    if let Ok(binding_index) = caller_data
+        .python_bindings
+        .binary_search_by_key(&(raw.byte_start, raw.byte_end), |binding| {
+            (binding.byte_start, binding.byte_end)
+        })
+    {
+        let binding = &caller_data.python_bindings[binding_index];
+        let (module, symbol) = binding.target.as_ref()?;
+        let target_file = index.module_target(caller_file, module)?;
+        // An import names one module, never every same-named symbol in the project.
+        let node = index.node_for_symbol(&target_file, symbol)?;
+        // Bare-name lookup also finds methods; `from mod import f` requires
+        // the module-level function, not a class's same-named method.
+        if node != node_id(&target_file, "function", symbol) {
+            return None;
+        }
+        return index
+            .node_is_callable(&target_file, &node)
+            .then(|| ("resolved".to_string(), target_file, symbol.clone()));
+    }
+    resolve_local_target(index, caller_file, full_ref, short_name, caller_data)
 }
 
 fn resolve_js_ts_target<I: ResolverIndex>(
@@ -23561,6 +23737,13 @@ fn module_ref_target(
         return rust_declared_module_target(project_root, caller_file, module_path, memo, facts);
     }
     let caller_path = project_root.join(caller_file);
+    if caller_path.extension().and_then(|ext| ext.to_str()) == Some("py") {
+        return python_module_candidates(project_root, &caller_path, module_path)
+            .into_iter()
+            .find(|candidate| facts.is_file(candidate))
+            .map(|path| relative_path(project_root, &path))
+            .filter(|path| is_indexed(path));
+    }
     if Path::new(caller_file)
         .extension()
         .and_then(|ext| ext.to_str())
@@ -23777,6 +23960,13 @@ fn module_dependencies_with_memo(
     memo: &callgraph::ModuleResolutionMemo,
     facts: &FactPaths<'_>,
 ) -> BTreeSet<String> {
+    if abs_path.extension().and_then(|ext| ext.to_str()) == Some("py") {
+        // Keep missing candidates too, so creating a module rebinds its importers.
+        return python_module_candidates(project_root, abs_path, module_path)
+            .into_iter()
+            .map(|path| relative_path(project_root, &path))
+            .collect();
+    }
     let mut deps = rust_module_dependencies(project_root, abs_path, module_path, memo, facts);
     let caller_dir = abs_path.parent().unwrap_or(project_root);
     if let Some(resolved) =
@@ -23791,6 +23981,43 @@ fn module_dependencies_with_memo(
         }
     }
     deps
+}
+
+/// Absolute Python imports start at the analyzed project root. Relative dots
+/// walk package directories; neither form searches arbitrary same-named files
+/// or guesses runtime changes to sys.path.
+fn python_module_candidates(project_root: &Path, caller: &Path, module: &str) -> Vec<PathBuf> {
+    let dots = module.bytes().take_while(|byte| *byte == b'.').count();
+    let mut base = if dots == 0 {
+        project_root.to_path_buf()
+    } else {
+        let Some(parent) = caller.parent() else {
+            return Vec::new();
+        };
+        parent.to_path_buf()
+    };
+    for _ in 1..dots {
+        let Some(parent) = base.parent() else {
+            return Vec::new();
+        };
+        base = parent.to_path_buf();
+    }
+    if !base.starts_with(project_root) || (dots > 0 && base == project_root) {
+        return Vec::new();
+    }
+    let rest = &module[dots..];
+    if !rest.is_empty() {
+        for segment in rest.split('.') {
+            if segment.is_empty() || !segment.chars().all(|c| c == '_' || c.is_alphanumeric()) {
+                return Vec::new();
+            }
+            base.push(segment);
+        }
+    } else if dots == 0 {
+        return Vec::new();
+    }
+    // A regular package takes precedence over a sibling module, as in Python.
+    vec![base.join("__init__.py"), base.with_extension("py")]
 }
 
 fn rust_module_dependencies(
@@ -24555,6 +24782,7 @@ mod refresh_worker_tests {
             symbol_metadata: HashMap::new(),
             default_export_symbol: None,
             import_block: crate::imports::ImportBlock::empty(),
+            python_bindings: Vec::new(),
             lang: LangId::TypeScript,
         };
         let index = DiskProjectIndex {
@@ -28192,8 +28420,9 @@ mod cold_build_insert_tests {
         assert_eq!(result.total_callers, CALLER_COUNT);
         assert_eq!(caller_queries, 1);
         assert_eq!(boundary_queries, 3);
-        // Includes one readiness SELECT, which reads all readiness metadata at once.
-        assert_eq!(total_selects, 7);
+        // Readiness metadata and matching unresolved names each use one SELECT;
+        // the total stays constant as the number of callers grows.
+        assert_eq!(total_selects, 8);
     }
 
     #[test]
@@ -30053,6 +30282,7 @@ pub fn run() {
                 symbol_metadata: HashMap::new(),
                 default_export_symbol: None,
                 import_block: ImportBlock::empty(),
+                python_bindings: Vec::new(),
                 lang: LangId::TypeScript,
             },
             nodes: vec![node.clone()],

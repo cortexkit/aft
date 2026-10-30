@@ -663,9 +663,13 @@ pub struct FileCallData {
     pub default_export_symbol: Option<String>,
     /// Parsed import block for cross-file resolution.
     pub import_block: ImportBlock,
+    /// Lexically selected Python import bindings, sorted by call-expression span.
+    pub python_bindings: Vec<python::CallBinding>,
     /// Language of the file.
     pub lang: LangId,
 }
+
+pub(crate) mod python;
 
 impl FileCallData {
     /// Look up metadata for an exported symbol name.
@@ -1747,7 +1751,11 @@ pub(crate) fn build_file_data_from_tree(
     line_index: &SourceLineIndex,
 ) -> Result<FileCallData, AftError> {
     // Parse imports
-    let import_block = imports::parse_imports(&source, &tree, lang);
+    let (import_block, python_bindings) = if lang == LangId::Python {
+        python::extract(source, tree.root_node())
+    } else {
+        (imports::parse_imports(&source, &tree, lang), Vec::new())
+    };
 
     // Get symbols (for call site extraction and export detection)
     let symbols = crate::parser::extract_symbols_from_tree(&source, &tree, lang)?;
@@ -1964,6 +1972,7 @@ pub(crate) fn build_file_data_from_tree(
         symbol_metadata,
         default_export_symbol: default_export.map(|export| export.symbol),
         import_block,
+        python_bindings,
         lang,
     })
 }
@@ -4758,6 +4767,7 @@ def right():
             symbol_metadata,
             default_export_symbol: None,
             import_block: ImportBlock::empty(),
+            python_bindings: Vec::new(),
             lang: LangId::Rust,
         };
 

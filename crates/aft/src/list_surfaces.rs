@@ -818,9 +818,9 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "callgraph_store/mod.rs",
-        enclosing_item: "unresolved_call_site_count",
+        enclosing_item: "unresolved_call_site_count_filtered",
         location_or_primitive: "UNRESOLVED_CALL_SITE_COUNT_LIMIT, SQL LIMIT",
-        reason: "bounded count for the empty-callers and impact incompleteness note, not a list cut; the note says 'at least N' at the limit and the result lists keep their own envelopes",
+        reason: "bounded count for callers and impact incompleteness notes, including nonempty answers with matching unresolved names, not a list cut; the note says 'at least N' at the limit and the callers and impact lists retain their own truncation metadata",
     },
     // The borrowed-graph coverage note on callgraph answers is one summary
     // line: it names the first few files the borrowed graph does not reflect
