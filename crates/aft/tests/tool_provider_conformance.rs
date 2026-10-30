@@ -1467,10 +1467,10 @@ async fn wait_for_route_ready(route: &Route, probe: CallSpec) {
     }
 }
 
-/// Result inventories compare settled tool behavior, not the configure
-/// acknowledgement. A valid search observes admission without relying on the
-/// pinned status fixture or on invalid-argument precedence. All fixture index
-/// lanes are off, so `no_search_lanes_enabled` is the expected ready reply.
+/// Result inventories wait for admission before comparing tool replies. These
+/// tests replace the status reply with a fixed snapshot, so a valid regex search
+/// is used instead. It scans files with the text and semantic indexes off and
+/// does not depend on whether argument errors precede admission refusals.
 async fn wait_for_folder_ready(route: &Route, preset: &str) -> Result<(), HarnessError> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     // Distinct patterns prevent setup retries from triggering repeated-call warnings.
@@ -1485,15 +1485,22 @@ async fn wait_for_folder_ready(route: &Route, preset: &str) -> Result<(), Harnes
         .await
         .map_err(harness_error)?;
         let reply = response_json(&frame);
+        if reply["isError"] == false {
+            return Ok(());
+        }
         let result = reply.get("structuredContent").unwrap_or(&reply);
-        match (result["code"].as_str(), result["reason"].as_str()) {
-            (Some("no_search_lanes_enabled"), _) => return Ok(()),
-            (Some("folder_not_admitted"), Some("folder_admission_pending")) => {}
-            _ => {
-                return Err(HarnessError::new(format!(
-                    "project fixture did not settle: {reply}"
-                )))
-            }
+        let pending = result["code"] == "folder_not_admitted"
+            && result["reason"] == "folder_admission_pending";
+        // Text-only pending refusals still carry the code and reason.
+        let legacy_pending = reply["content"].as_array().is_some_and(|blocks| {
+            blocks
+                .iter()
+                .any(|block| block["text"] == "folder_not_admitted: folder_admission_pending")
+        });
+        if !pending && !legacy_pending {
+            return Err(HarnessError::new(format!(
+                "project fixture did not settle: {reply}"
+            )));
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(HarnessError::new(format!(
