@@ -1,12 +1,12 @@
 {
-  "slice_class": "non_ranking",
+  "slice_class": "engine_unwired",
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
-    "harness-goldens"
+    "crates/aft/src/commands/semantic_search/mod.rs"
   ],
   "slices": [
     "flake-batch-31"
   ],
-  "note": "Test-only deadline change in a views semantic_runtime test helper. No changed path matches RANKING_FENCE_PREFIXES."
+  "note": "Test-only changes. The ranking-fenced semantic_search mod.rs change gives one split-request test's file-count-cap case a 30 s disk-walk budget, so a loaded runner cannot end the walk before it reaches the three files. The other change is a views semantic_runtime test helper's queue wait. Enumeration, lane selection, scores, fusion, ordering and page cuts are unchanged; benchmark rows must remain byte-identical."
 }

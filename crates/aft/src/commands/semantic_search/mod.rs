@@ -16445,9 +16445,18 @@ mod split_request_tests {
             let ctx = external_context(session.path(), storage.path(), false);
             for query in [None, Some("scheduler drains the work queue")] {
                 regex_route::MAX_EXAMINED_FILES_OVERRIDE.with(|limit| limit.set(Some(1)));
-                let capped = search(
-                    &ctx,
-                    serde_json::json!({"query": query, "pattern": "load_config", "path": root}),
+                // This case tests the file-count cap, so the disk walk gets a
+                // generous time budget: on a loaded Windows runner the default
+                // 2 s ran out before the walk reached any of the three files.
+                let capped = external_disk_check::with_budgets_for_test(
+                    Duration::from_secs(30),
+                    Duration::from_secs(30),
+                    || {
+                        search(
+                            &ctx,
+                            serde_json::json!({"query": query, "pattern": "load_config", "path": root}),
+                        )
+                    },
                 );
                 regex_route::MAX_EXAMINED_FILES_OVERRIDE.with(|limit| limit.set(None));
                 assert_eq!(capped["success"], true, "{capped}");
