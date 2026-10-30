@@ -522,8 +522,12 @@ needed). Output is buffered in memory up to 1MB and spills beyond that to AFT's 
 AFT saves background task records and pending notices on disk.
 On Linux, daemon tasks in user scopes can continue to run through an AFT module restart.
 The same systemd user manager must stay active. Standalone and PTY tasks do not get this containment.
-If the exit marker is missing and AFT cannot find the recorded process, it reports an unknown outcome (`FateUnknown`).
+
+If the exit marker is missing and the recorded process has exited, AFT reports an unknown outcome (`FateUnknown`).
+An unreachable user manager does not change a live task's `Running` status.
 See [scope settings and limits](config.md) for the fallback conditions and the operator stop command.
+
+A same-user command can move processes with `systemd-run --user` to a different cgroup, where the memory limit, scope kill, and time limit do not apply.
 
 Once a task has finished for 24 hours and its completion has been delivered, its output files are
 deleted; copy evidence you need into your report or a shared file. With project-root restrictions,

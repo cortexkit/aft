@@ -39,7 +39,9 @@ Use user config to set `bash.linux_scope: false` and disable these scopes. Proje
 
 `bash.linux_scope_max_runtime_secs` is a user-only integer from `1` through `4294967295`. Its default is `86400` (24 hours). With no explicit `timeout`, a new worker wait does not extend the scope ceiling. With an explicit `timeout`, the scope limit is that timeout plus 60 seconds. AFT also applies its usual timeouts.
 
-After replay, AFT uses the wrapper's `io/exit` marker for the command's exit code. If the exit marker is missing and AFT cannot find the recorded process, it reports an unknown outcome (`FateUnknown`). Systemd unit results do not prove a shell exit code. Logout, a host restart, or a user-manager stop can end the tasks.
+A same-user command can move processes with `systemd-run --user` to a different cgroup, where the memory limit, scope kill, and time limit do not apply.
+
+After replay, AFT uses the wrapper's `io/exit` marker for the command's exit code. If the exit marker is missing and the recorded process has exited, AFT reports an unknown outcome (`FateUnknown`). An unreachable user manager does not change a live task's `Running` status. Systemd unit results do not prove a shell exit code. Logout, a host restart, or a user-manager stop can end the tasks.
 
 To stop all task scopes for your user, run `systemctl --user stop aft.slice`. WARNING: This command stops tasks from all AFT instances for that user.
 
