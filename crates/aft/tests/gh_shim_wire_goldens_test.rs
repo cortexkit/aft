@@ -2282,6 +2282,11 @@ fn every_supported_plexus_reply_vector_round_trips_through_the_real_shim() {
         let mut routed = run.routed_request.expect("at least one routed request");
         let mut expected = vector["request"].clone();
         expected["repository"] = json!(REPOSITORY);
+        if row.name == "comment-edit-pre-read-unknown" {
+            // Plexus accepts comment edits without author_scope, but the signed
+            // shim manifest requires own-comment targeting and stamps it explicitly.
+            expected["author_scope"] = json!("own");
+        }
         for request in [&mut routed, &mut expected] {
             request
                 .as_object_mut()
