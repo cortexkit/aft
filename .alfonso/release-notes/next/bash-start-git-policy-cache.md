@@ -1,1 +1,1 @@
-Shell commands start faster in busy sessions: AFT no longer re-runs git to work out sandbox settings on every command.
+Shell commands start faster when a Git hooks or excludes setting points through a symlink, and reaching the language-server limit no longer logs an error.
