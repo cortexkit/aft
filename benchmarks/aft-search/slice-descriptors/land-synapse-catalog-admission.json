@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "synapse-catalog-admission"
+  ],
+  "note": "Synapse embedding backend discovery only: catalog lanes gate on serving_admission instead of certification. No changed path matches RANKING_FENCE_PREFIXES."
+}
