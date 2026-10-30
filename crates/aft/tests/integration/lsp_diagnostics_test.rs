@@ -3524,8 +3524,8 @@ mod mutation_events {
             assert!(handle_write(&req, &ctx).success);
         }
 
-        // Both typed events and the path-only OS watcher can echo the mutation.
-        // Neither may repeat the already delivered membership transition.
+        // A single watcher echo is coalesced, then its bookkeeping is released.
+        // Exercise path-only OS events and a typed create delayed past an edit.
         let final_events = expected
             .iter()
             .copied()
@@ -3543,20 +3543,19 @@ mod mutation_events {
                 )
             })
             .collect::<Vec<_>>();
-        ctx.lsp().forward_watcher_file_events(&echoes, &[]);
-        ctx.lsp_forward_watcher_file_events(
-            &echoes
-                .iter()
-                .map(|(path, _)| path.clone())
-                .collect::<Vec<_>>(),
-        );
-
         if operation == "write" {
             let req: RawRequest = serde_json::from_value(serde_json::json!({"id": "edit-created", "command": "write", "file": after, "content": "export const added = 123456;\n"})).unwrap();
             assert!(handle_write(&req, &ctx).success);
             // An old create event can arrive after a later content edit. It
             // still describes the same creation, not another new module.
             ctx.lsp().forward_watcher_file_events(&echoes, &[]);
+        } else {
+            ctx.lsp_forward_watcher_file_events(
+                &echoes
+                    .iter()
+                    .map(|(path, _)| path.clone())
+                    .collect::<Vec<_>>(),
+            );
         }
 
         // The importer is untouched by the mutation. Its acknowledgement is a

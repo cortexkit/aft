@@ -15043,18 +15043,19 @@ impl AppContext {
     fn lsp_forward_or_queue_watcher_changes(&self, paths: &[PathBuf], reload_all_rust: bool) {
         use crate::lsp::manager::WatcherForwardBacklog;
         let markers = self.custom_lsp_root_markers();
+        let stamps = crate::lsp::manager::capture_watched_file_stamps(paths);
         {
             // A queued backlog goes first, so newer changes join it rather
             // than overtake it on the fast path.
             let mut slot = self.lsp_watcher_forward_slot.lock();
             if let Some(backlog) = slot.as_mut() {
-                backlog.merge(paths, reload_all_rust, markers);
+                backlog.merge_with_stamps(paths, reload_all_rust, markers, &stamps);
                 return;
             }
         }
         if let Some(mut lsp) = self.lsp_manager.try_lock() {
             let mut backlog = WatcherForwardBacklog::default();
-            backlog.merge(paths, reload_all_rust, markers);
+            backlog.merge_with_stamps(paths, reload_all_rust, markers, &stamps);
             let reloads = backlog.apply(&mut lsp);
             drop(lsp);
             crate::lsp::manager::spawn_watcher_rust_workspace_reloads(&self.lsp_manager, reloads);
@@ -15062,11 +15063,11 @@ impl AppContext {
         }
         let mut slot = self.lsp_watcher_forward_slot.lock();
         if let Some(backlog) = slot.as_mut() {
-            backlog.merge(paths, reload_all_rust, markers);
+            backlog.merge_with_stamps(paths, reload_all_rust, markers, &stamps);
             return;
         }
         let mut backlog = WatcherForwardBacklog::default();
-        backlog.merge(paths, reload_all_rust, markers);
+        backlog.merge_with_stamps(paths, reload_all_rust, markers, &stamps);
         *slot = Some(backlog);
         drop(slot);
         let manager = Arc::clone(&self.lsp_manager);
@@ -15494,16 +15495,20 @@ impl AppContext {
         }
 
         let config = self.config();
+        let stamps = crate::lsp::manager::capture_watched_file_stamps(
+            config_paths.iter().map(|(path, _)| path),
+        );
         crate::lsp::pending_changes::send_or_queue_lsp_change(
             &self.lsp_manager,
             &self.lsp_pending_change_slot,
             Arc::clone(&config),
             |lsp| {
-                if let Err(e) = lsp.notify_files_watched_changed(config_paths, &config) {
+                if let Err(e) = lsp.notify_files_watched_changed_with_stamps(config_paths, &stamps)
+                {
                     crate::slog_warn!("watched-file sync error: {}", e);
                 }
             },
-            |pending| pending.queue_watched(config_paths),
+            |pending| pending.queue_watched_with_stamps(config_paths, &stamps),
         );
     }
 
@@ -15515,14 +15520,16 @@ impl AppContext {
         }
         let config = self.config();
         let markers = self.custom_lsp_root_markers();
+        let stamps =
+            crate::lsp::manager::capture_watched_file_stamps(events.iter().map(|(path, _)| path));
         crate::lsp::pending_changes::send_or_queue_lsp_change(
             &self.lsp_manager,
             &self.lsp_pending_change_slot,
             config,
             |lsp| {
-                lsp.forward_watcher_file_events(events, &markers);
+                lsp.forward_watcher_file_events_with_stamps(events, &markers, &stamps);
             },
-            |pending| pending.queue_mutation_watched(events),
+            |pending| pending.queue_mutation_watched(events, &stamps),
         );
     }
 
