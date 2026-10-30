@@ -197,6 +197,12 @@ where
                         .map(|service| service.generation())
                         .unwrap_or_default();
                     let reply = control.describe(&stamp).await;
+                    control
+                        .metrics
+                        .scope_descriptions
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .record(&stamp, reply.as_ref().ok(), Instant::now());
                     if let Some(service) = &speech {
                         service.remember_probe(
                             &stamp,
@@ -570,11 +576,12 @@ mod tests {
             HELLO_CORR + 1,
         ));
         let live = stamp.clone();
+        let census_metrics = control.metrics.clone();
         let (scopes, mut ended, worker) =
             start_with_scope_source(control, executor, Duration::from_secs(60), move || {
                 std::future::ready(vec![live.clone()])
             });
-        scopes.goodbye(stamp);
+        scopes.goodbye(stamp.clone());
         let request = tokio::time::timeout(Duration::from_secs(5), frames.recv())
             .await
             .unwrap()
@@ -602,6 +609,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let described = census_metrics
+            .scope_descriptions
+            .lock()
+            .unwrap()
+            .get(&stamp, Instant::now());
+        assert_eq!(described["status"], "ended");
+        assert_eq!(described["scope_epoch"], 10);
+        assert!(described["age_ms"].is_u64());
         worker.abort();
         let db = ctx.db().unwrap();
         let conn = db.lock().unwrap();

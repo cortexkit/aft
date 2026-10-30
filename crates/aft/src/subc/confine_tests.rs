@@ -675,19 +675,27 @@ fn vector(f: &Fixture, name: &str, value: Value) {
             Value::Array(items) => {
                 Value::Array(items.into_iter().map(|item| stable(item, root)).collect())
             }
-            Value::Object(items) => Value::Object(
-                items
-                    .into_iter()
-                    .map(|(key, value)| {
-                        let value = if key == "search_ms" {
-                            json!(0.0)
-                        } else {
-                            stable(value, root)
-                        };
-                        (key, value)
-                    })
-                    .collect(),
-            ),
+            Value::Object(items) => {
+                // A walk cut short by its limit examines entries in directory
+                // order, which differs between platforms; complete walks count
+                // the same everywhere, so only truncated counts are masked.
+                let truncated_walk = items.get("walk_truncated") == Some(&json!(true));
+                Value::Object(
+                    items
+                        .into_iter()
+                        .map(|(key, value)| {
+                            let value = if key == "search_ms" {
+                                json!(0.0)
+                            } else if truncated_walk && key == "entries_examined" {
+                                json!(0)
+                            } else {
+                                stable(value, root)
+                            };
+                            (key, value)
+                        })
+                        .collect(),
+                )
+            }
             value => value,
         }
     }

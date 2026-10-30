@@ -252,7 +252,7 @@ fn a_v3_worker_graph_is_built_from_v3_blobs_into_its_member_directory() {
             for (_, attachment) in &base_graph {
                 publication.put(
                     &attachment.key,
-                    &attachment.blob.to_bytes().unwrap(),
+                    &attachment.payload().unwrap(),
                     FamilyPlane::Callgraph.payload_schema(),
                 )?;
             }

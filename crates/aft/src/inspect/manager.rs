@@ -860,6 +860,25 @@ fn callgraph_pending_result(job: &InspectJob, duration: Duration) -> InspectResu
     )
 }
 
+fn retry_dead_code_store_read<T>(
+    mut read: impl FnMut() -> Result<T, CallGraphStoreError>,
+) -> Result<T, CallGraphStoreError> {
+    // Even a published WAL generation can briefly reject a read-only open while
+    // another handle closes and cleans up its WAL. Readiness probes fail fast;
+    // give contention the same short grace period as serving-reader queries.
+    let deadline = Instant::now() + Duration::from_millis(100);
+    loop {
+        match read() {
+            Err(error) if error.is_transient_lock_contention() && Instant::now() < deadline => {
+                #[cfg(test)]
+                guard_tests::notify_callgraph_read_retry_for_test();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            result => return result,
+        }
+    }
+}
+
 fn callgraph_store_ready_for_dead_code(
     callgraph_dir: PathBuf,
     project_root: PathBuf,
@@ -877,7 +896,9 @@ fn callgraph_store_ready_for_dead_code(
 
 fn callgraph_store_busy_for_dead_code(inspect_dir: &Path, project_root: &Path) -> bool {
     for dir in callgraph_store_dirs_from_inspect_dir(inspect_dir, project_root) {
-        match callgraph_store_ready_for_dead_code(dir, project_root.to_path_buf()) {
+        match retry_dead_code_store_read(|| {
+            callgraph_store_ready_for_dead_code(dir.clone(), project_root.to_path_buf())
+        }) {
             Ok(true) => return false,
             Err(_) => return true,
             Ok(false) => {}
@@ -6603,9 +6624,10 @@ fn scoped_tier2_rollup_job(
         // contributions. Use a real ready store snapshot when one exists; if no
         // snapshot is available, leave it absent so the rollup reports degraded
         // callgraph_unavailable instead of treating an empty graph as truth.
-        job.callgraph_snapshot =
-            build_tier2_callgraph_snapshot_with_refresh_inner(&job, false, false, &[], manager)?
-                .map(|(snapshot, _, _)| snapshot);
+        job.callgraph_snapshot = retry_dead_code_store_read(|| {
+            build_tier2_callgraph_snapshot_with_refresh_inner(&job, false, false, &[], manager)
+        })?
+        .map(|(snapshot, _, _)| snapshot);
     }
 
     Ok(job)

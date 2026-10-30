@@ -4040,7 +4040,9 @@ fn resolve_git_policy_uncached(
     } else {
         &[]
     } {
-        if let Some((input, path)) = configured_git_path(project_root, key, &mut metadata_allow)? {
+        if let Some((input, path)) =
+            configured_git_path_with_inputs(project_root, key, &mut metadata_allow, &mut inputs)?
+        {
             if let Some(inputs) = &mut inputs {
                 inputs.resolved_paths.push((input, path.clone()));
             }
@@ -4051,9 +4053,6 @@ fn resolve_git_policy_uncached(
     // in hooks/excludes paths cannot leave a deny pointing at the old target.
     if let Some(inputs) = &mut inputs {
         inputs.resolved_paths.push((hooks_input, hooks.clone()));
-    }
-    if !metadata_allow.is_empty() {
-        inputs = None;
     }
     let linked = (git_dir != common_dir).then(|| (git_dir.clone(), common_dir.clone()));
     let read_roots = {
@@ -4157,6 +4156,16 @@ fn configured_git_path(
     key: &str,
     metadata_allow: &mut Vec<PathBuf>,
 ) -> Result<Option<(PathBuf, PathBuf)>, String> {
+    configured_git_path_with_inputs(project_root, key, metadata_allow, &mut None)
+}
+
+#[cfg(unix)]
+fn configured_git_path_with_inputs(
+    project_root: &Path,
+    key: &str,
+    metadata_allow: &mut Vec<PathBuf>,
+    inputs: &mut Option<GitPolicyInputs>,
+) -> Result<Option<(PathBuf, PathBuf)>, String> {
     if !project_root.join(".git").exists() || !crate::developer_tools::git_usable() {
         return Ok(None);
     }
@@ -4193,6 +4202,16 @@ fn configured_git_path(
             } else {
                 project_root.join(path)
             };
+            // Watch the literal path before deriving metadata grants. Canonical
+            // target equality alone cannot detect a symlink replaced by a
+            // directory (or the reverse) that still reaches the same target.
+            // Unprovable identities keep the whole policy uncached.
+            if inputs
+                .as_mut()
+                .is_some_and(|inputs| inputs.watch(&path).is_none())
+            {
+                *inputs = None;
+            }
             for ancestor in path.ancestors() {
                 if std::fs::symlink_metadata(ancestor)
                     .is_ok_and(|metadata| metadata.file_type().is_symlink())
@@ -7858,6 +7877,84 @@ mod git_policy_cache_tests {
     }
 
     #[test]
+    fn git_policy_cache_configured_symlink_paths_hit_and_retarget_safely() {
+        use std::os::unix::fs::symlink;
+
+        for key in [
+            "core.hooksPath",
+            "mason.originalHooksPath",
+            "core.excludesFile",
+        ] {
+            let fixture = Fixture::new();
+            let first = fixture.root.join("first");
+            let second = fixture.root.join("second");
+            for target in [&first, &second] {
+                std::fs::create_dir(target).unwrap();
+                std::fs::write(target.join("policy"), "policy contents").unwrap();
+            }
+            let alias = fixture.root.join("alias");
+            symlink(&first, &alias).unwrap();
+            assert!(
+                git_policy_output(&fixture.root, &["config", key, "alias/policy"])
+                    .unwrap()
+                    .status
+                    .success()
+            );
+            let (original, cold) = fixture.resolve();
+            assert!(cold > 0);
+            assert!(original.metadata_allow.contains(&alias));
+            assert!(original
+                .configured_paths
+                .contains(&(key.into(), first.join("policy"))));
+            assert_eq!(fixture.resolve().1, 0, "{key} must cache symlink grants");
+
+            std::fs::remove_file(&alias).unwrap();
+            symlink(&second, &alias).unwrap();
+            let (changed, calls) = fixture.resolve();
+            assert!(calls > 0, "{key} retarget must invalidate");
+            assert!(changed
+                .configured_paths
+                .contains(&(key.into(), second.join("policy"))));
+            assert!(!changed
+                .configured_paths
+                .contains(&(key.into(), first.join("policy"))));
+            assert_eq!(fixture.resolve().1, 0);
+        }
+    }
+
+    #[test]
+    fn git_policy_cache_metadata_grant_identity_changes_with_same_target_invalidate() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        std::fs::create_dir(fixture.root.join("real")).unwrap();
+        std::fs::create_dir(fixture.root.join("real/hooks")).unwrap();
+        let alias = fixture.root.join("alias");
+        symlink(fixture.root.join("real"), &alias).unwrap();
+        assert!(
+            git_policy_output(&fixture.root, &["config", "core.hooksPath", "alias/hooks"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let (original, _) = fixture.resolve();
+        assert_eq!(fixture.resolve().1, 0);
+        assert!(original.metadata_allow.contains(&alias));
+
+        // Keep the canonical hooks target, but move the metadata grant to a
+        // different component. Reusing the old grant would widen the profile.
+        std::fs::remove_file(&alias).unwrap();
+        std::fs::create_dir(&alias).unwrap();
+        symlink(fixture.root.join("real/hooks"), alias.join("hooks")).unwrap();
+        let (changed, calls) = fixture.resolve();
+        assert!(calls > 0);
+        assert_eq!(changed.hooks, original.hooks);
+        assert!(!changed.metadata_allow.contains(&alias));
+        assert!(changed.metadata_allow.contains(&alias.join("hooks")));
+        assert_eq!(fixture.resolve().1, 0);
+    }
+
+    #[test]
     fn git_policy_cache_review_branch_switch_refreshes_hooks() {
         let fixture = Fixture::new();
         let included = fixture.root.join("branch-config");
@@ -8960,6 +9057,39 @@ mod git_policy_cache_tests {
                         .map(|(_, spawns)| *spawns)
                         .collect::<Vec<_>>()
                 );
+            }
+        }
+    }
+
+    /// Count mandatory cold work across real linked worktrees, then revisit
+    /// every root to distinguish worktree churn from repeated-start misses.
+    #[test]
+    #[ignore = "manual measurement; AFT_GIT_POLICY_BENCH_ROOTS_DIR contains linked worktrees"]
+    fn real_checkout_many_worktrees_git_policy_cost() {
+        crate::effective_path::initialize_process_path();
+        let directory = PathBuf::from(std::env::var_os("AFT_GIT_POLICY_BENCH_ROOTS_DIR").unwrap());
+        let mut roots = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|root| root.join(".git").is_file())
+            .collect::<Vec<_>>();
+        roots.sort();
+        assert!(!roots.is_empty());
+        for label in ["first", "second"] {
+            let before = GIT_POLICY_SPAWNS.load(std::sync::atomic::Ordering::SeqCst);
+            let started = Instant::now();
+            for root in &roots {
+                with_worker_jail(true, || resolve_git_policy(root)).unwrap();
+            }
+            let elapsed = started.elapsed();
+            let spawns = GIT_POLICY_SPAWNS.load(std::sync::atomic::Ordering::SeqCst) - before;
+            eprintln!(
+                "worker=true {label}: roots={} total_ms={:.3} git_spawns={spawns}",
+                roots.len(),
+                elapsed.as_secs_f64() * 1000.0
+            );
+            if label == "second" {
+                assert_eq!(spawns, 0, "revisiting unchanged roots must not spawn git");
             }
         }
     }

@@ -802,104 +802,10 @@ fn macos_process_group_members(pgid: i32) -> Result<GroupListing, LiveDescendant
     }))
 }
 
-/// The fields AFT reads from a macOS `struct kinfo_proc`.
 #[cfg(target_os = "macos")]
-#[derive(Clone)]
-struct MacosKinfo {
-    comm: String,
-    ruid: u32,
-    pgid: i32,
-    /// `kp_proc.p_stat`: running, sleeping, stopped or a zombie (`SZOMB`).
-    state: u8,
-    /// `kp_proc.p_flag`: the kernel's process flags, including `P_WEXIT`.
-    flags: u32,
-}
-
-#[cfg(target_os = "macos")]
-impl MacosKinfo {
-    /// Whether the process has exited or is on its way out, so it can neither
-    /// run nor hold the task's output open. `kill(pid, 0)` and `killpg(pgid, 0)`
-    /// still succeed for such a process, so only this reading tells it apart
-    /// from a survivor.
-    ///
-    /// Exiting takes two steps in the kernel: `exit1` marks the process with
-    /// `P_LEXIT` while it is still running (state `SRUN`), and only later, once
-    /// the last thread has run `proc_exit`, does its state become `SZOMB`.
-    /// `kern.proc.pid` publishes that first step as `P_WEXIT` in
-    /// `kp_proc.p_flag`, which is why neither state alone is enough.
-    fn has_exited(&self) -> bool {
-        self.state == SZOMB || self.flags & P_WEXIT != 0
-    }
-}
-
-/// `kp_proc.p_stat` for a process that has exited and waits to be reaped.
-#[cfg(target_os = "macos")]
-const SZOMB: u8 = 5;
-/// `kp_proc.p_flag` for a process whose exit has started but whose state is not
-/// `SZOMB` yet (`bsd/sys/proc.h`).
-#[cfg(target_os = "macos")]
-const P_WEXIT: u32 = 0x0000_2000;
-
-/// Read `kern.proc.pid.<pid>`. `None` when the process no longer exists or
-/// the answer does not have the expected layout.
-///
-/// The `libc` crate does not declare `struct kinfo_proc` for Apple targets, so
-/// the fields are read at their offsets in `<sys/sysctl.h>`. The layout is the
-/// same on arm64 and x86_64; a size check rejects any other, and a test checks
-/// the offsets against the test process itself.
-#[cfg(target_os = "macos")]
-fn macos_kinfo(pid: u32) -> Option<MacosKinfo> {
-    const KINFO_PROC_SIZE: usize = 648;
-    // kp_proc.p_flag (int) and kp_proc.p_stat (char).
-    const P_FLAG_OFFSET: usize = 32;
-    const P_STAT_OFFSET: usize = 36;
-    // kp_proc.p_comm[MAXCOMLEN + 1]
-    const P_COMM_OFFSET: usize = 243;
-    const P_COMM_LEN: usize = 17;
-    // kp_eproc.e_pcred.p_ruid
-    const P_RUID_OFFSET: usize = 392;
-    // kp_eproc.e_pgid
-    const E_PGID_OFFSET: usize = 564;
-
-    let mut mib = [
-        libc::CTL_KERN,
-        libc::KERN_PROC,
-        libc::KERN_PROC_PID,
-        i32::try_from(pid).ok()?,
-    ];
-    let mut bytes = [0_u8; KINFO_PROC_SIZE];
-    let mut size = bytes.len();
-    // SAFETY: `size` is the buffer's real length, and sysctl writes at most
-    // that many bytes.
-    let status = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            mib.len() as u32,
-            bytes.as_mut_ptr().cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if status != 0 || size != KINFO_PROC_SIZE {
-        return None;
-    }
-    let read_u32 = |offset: usize| {
-        u32::from_ne_bytes(bytes[offset..offset + 4].try_into().expect("four bytes"))
-    };
-    let comm_bytes = &bytes[P_COMM_OFFSET..P_COMM_OFFSET + P_COMM_LEN];
-    let comm_len = comm_bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(P_COMM_LEN);
-    Some(MacosKinfo {
-        comm: String::from_utf8_lossy(&comm_bytes[..comm_len]).into_owned(),
-        ruid: read_u32(P_RUID_OFFSET),
-        pgid: read_u32(E_PGID_OFFSET) as i32,
-        state: bytes[P_STAT_OFFSET],
-        flags: read_u32(P_FLAG_OFFSET),
-    })
-}
+use crate::fs_lock::macos_kinfo;
+#[cfg(all(test, target_os = "macos"))]
+use crate::fs_lock::{MacosKinfo, P_WEXIT, SZOMB};
 
 #[cfg(target_os = "macos")]
 fn macos_argv(pid: u32) -> Option<Vec<String>> {
@@ -1622,6 +1528,11 @@ mod macos_zombie_tests {
         let info = macos_kinfo(child.id()).expect("a zombie is still readable");
         assert_eq!(info.state, SZOMB, "the killed child must read as a zombie");
         assert!(info.has_exited(), "a zombie has exited");
+        assert_eq!(info.exit_state(), crate::fs_lock::MacosExitState::Zombie);
+        assert!(
+            info.started_at_us.is_some(),
+            "the zombie retains its birth time"
+        );
         assert_ne!(
             info.flags & P_WEXIT,
             0,
@@ -1652,12 +1563,21 @@ fn an_exiting_process_counts_as_exited_before_it_is_a_zombie() {
         pgid: 1,
         state: 2, // SRUN
         flags: P_WEXIT,
+        started_at_us: Some(1),
     };
     let running = MacosKinfo {
         state: 2,
         flags: 0,
         ..exiting.clone()
     };
+    assert_eq!(
+        exiting.exit_state(),
+        crate::fs_lock::MacosExitState::Exiting
+    );
+    assert_eq!(
+        running.exit_state(),
+        crate::fs_lock::MacosExitState::NotExiting
+    );
     assert!(
         exiting.has_exited(),
         "a record with P_WEXIT reports the process as gone"

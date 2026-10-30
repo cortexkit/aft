@@ -114,6 +114,216 @@ fn publication_survives_a_sidecar_disappearing_during_accounting() {
     assert_eq!(reader.get(&chunk).unwrap().unwrap(), b"chunk");
     assert_eq!(reader.get(&run).unwrap().unwrap(), b"run");
 }
+#[cfg(windows)]
+fn open_permission_fixture(
+    path: &Path,
+    access: u32,
+) -> std::io::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::{ffi::OsStrExt, io::FromRawHandle};
+    use windows_sys::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        Storage::FileSystem::{
+            CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, OPEN_EXISTING,
+        },
+    };
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // These handles probe rights on dedicated non-SQLite fixtures; they never
+    // read content or open a live database inode through another descriptor.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        Err(std::io::Error::last_os_error())
+    } else {
+        // SAFETY: CreateFileW returned a valid, uniquely owned handle.
+        Ok(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) })
+    }
+}
+
+#[cfg(windows)]
+fn icacls_for_test(path: &Path, action: &str, rights: &str) {
+    let output = std::process::Command::new("icacls")
+        .arg(path)
+        .args([action, rights])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "icacls: {output:?}");
+}
+
+#[cfg(windows)]
+pub(crate) struct DeniedReadForTest(PathBuf);
+
+#[cfg(windows)]
+impl Drop for DeniedReadForTest {
+    fn drop(&mut self) {
+        icacls_for_test(&self.0, "/remove:d", "*S-1-1-0");
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn deny_read_for_test<T>(
+    path: &Path,
+    operation: &str,
+    probe: impl FnOnce() -> std::io::Result<T>,
+) -> (DeniedReadForTest, bool) {
+    // Everyone's read-data right is also the directory-listing right. A SID
+    // avoids depending on the localized account name on the Windows runner.
+    icacls_for_test(path, "/deny", "*S-1-1-0:(RD)");
+    let restore = DeniedReadForTest(path.to_path_buf());
+    // Installing an access control entry does not prove the process observes it.
+    // Probe the operation the fixture needs denied before asserting denial-dependent behavior.
+    let enforced = match probe() {
+        Err(error) => {
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{error}"
+            );
+            eprintln!("ACL denial confirmed: {operation} at {}", path.display());
+            true
+        }
+        Ok(_) => {
+            eprintln!(
+                "note: this machine cannot model ACL denial for {operation} at {}; \
+                 the operation succeeded after icacls /deny; skipping only the \
+                 ACL-dependent assertions, not the accounting checks",
+                path.display()
+            );
+            false
+        }
+    };
+    (restore, enforced)
+}
+
+/// A deletion can make the initial metadata open fail with error 5, then remove
+/// the name before std's FindFirstFileExW fallback, which returns the original
+/// error 5. Denying parent listing after enumeration makes that fallback fail
+/// deterministically while a legacy delete-pending handle keeps the file alive.
+#[cfg(windows)]
+#[test]
+fn accounting_uses_listed_metadata_for_a_delete_pending_file() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, SetFileInformationByHandle, DELETE, FILE_DISPOSITION_INFO,
+        FILE_READ_ATTRIBUTES,
+    };
+
+    let root = tempdir().unwrap();
+    let dir = family_dir(root.path(), A).unwrap();
+    fs::create_dir_all(&dir).unwrap();
+    let pending = dir.join("..retention-sweep.lock.tmp");
+    let payload = b"delete-pending lock bytes";
+    fs::write(&pending, payload).unwrap();
+    let handle = open_permission_fixture(&pending, DELETE | FILE_READ_ATTRIBUTES).unwrap();
+    let handle = std::rc::Rc::new(handle);
+    let pending_handle = std::rc::Rc::clone(&handle);
+    let removed = std::rc::Rc::new(std::cell::Cell::new(false));
+    let observed = std::rc::Rc::clone(&removed);
+    let denied = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let hook_denied = std::rc::Rc::clone(&denied);
+    let race_modelled = std::rc::Rc::new(std::cell::Cell::new(false));
+    let hook_modelled = std::rc::Rc::clone(&race_modelled);
+    WALK_BEFORE_STAT.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |path| {
+            if path == pending && !observed.replace(true) {
+                let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+                // Set legacy disposition explicitly: pathname deletion can use
+                // POSIX semantics instead of leaving a delete-pending name.
+                assert_ne!(
+                    unsafe {
+                        SetFileInformationByHandle(
+                            pending_handle.as_raw_handle(),
+                            FileDispositionInfo,
+                            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                            std::mem::size_of_val(&disposition) as u32,
+                        )
+                    },
+                    0,
+                    "{}",
+                    std::io::Error::last_os_error()
+                );
+                let (guard, enforced) = deny_read_for_test(
+                    path.parent().unwrap(),
+                    "stat of a delete-pending file",
+                    || fs::symlink_metadata(path),
+                );
+                *hook_denied.borrow_mut() = Some(guard);
+                if enforced {
+                    assert_eq!(
+                        fs::symlink_metadata(path).unwrap_err().raw_os_error(),
+                        Some(5)
+                    );
+                }
+                hook_modelled.set(enforced);
+            }
+        }));
+    });
+    let result = allocated_bytes_until(&dir, None);
+    WALK_BEFORE_STAT.with(|hook| *hook.borrow_mut() = None);
+    denied.borrow_mut().take();
+
+    assert!(removed.get(), "the walk did not reach the pending file");
+    eprintln!("pathname-stat race modelled: {}", race_modelled.get());
+    // The listing's length is a conservative charge until a later measurement.
+    assert_eq!(result.unwrap(), Some(payload.len() as u64));
+    drop(handle);
+}
+
+#[cfg(windows)]
+#[test]
+fn accounting_counts_unreadable_files_but_refuses_unreadable_directories() {
+    let root = tempdir().unwrap();
+    let dir = family_dir(root.path(), A).unwrap();
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("unreadable");
+    let payload = b"still charged from the directory listing";
+    fs::write(&file, payload).unwrap();
+
+    let (denied, file_denial_enforced) = deny_read_for_test(&file, "file content open", || {
+        open_permission_fixture(
+            &file,
+            windows_sys::Win32::Storage::FileSystem::FILE_READ_DATA,
+        )
+    });
+    let read = open_permission_fixture(
+        &file,
+        windows_sys::Win32::Storage::FileSystem::FILE_READ_DATA,
+    );
+    let measured = allocated_bytes_until(&dir, None);
+    drop(denied);
+    if file_denial_enforced {
+        assert_eq!(
+            read.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+    // File content access is unnecessary for accounting, but its bytes must
+    // never be silently discarded just because the content is unreadable.
+    assert_eq!(measured.unwrap(), Some(payload.len() as u64));
+
+    let (denied, directory_denial_enforced) =
+        deny_read_for_test(&dir, "directory listing", || fs::read_dir(&dir));
+    let measured = allocated_bytes_until(&dir, None);
+    drop(denied);
+    if directory_denial_enforced {
+        let Error::Io(error) = measured.unwrap_err() else {
+            panic!("unreadable directory must report an I/O error");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    } else {
+        assert_eq!(measured.unwrap(), Some(payload.len() as u64));
+    }
+}
+
 #[cfg(unix)]
 pub(super) fn inventory(path: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
@@ -1922,4 +2132,34 @@ fn a_recheck_stopped_by_the_deadline_never_saves_a_total_below_usage() {
         "saved {saved} is below the family's {actual}"
     );
     assert_eq!(measured, Measurement::Owed);
+}
+#[cfg(unix)]
+#[test]
+fn semantic_batch_lease_metadata_placement() {
+    let _guard = serial();
+    let root = tempdir().unwrap();
+    seed(root.path(), A);
+    let family = family_dir(root.path(), A).unwrap();
+    let lock = ReservationLock::acquire(root.path()).unwrap();
+    let writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
+    let before = inventory(&family);
+    assert_eq!(writer.accounting().unwrap().usage(), before);
+    drop(writer);
+    drop(lock);
+    let lease = crate::views::semantic_batch_lease::try_acquire(root.path(), A, "producer")
+        .unwrap()
+        .unwrap();
+    let lock = ReservationLock::acquire(root.path()).unwrap();
+    let writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
+    assert_eq!(inventory(&family), before);
+    assert_eq!(writer.accounting().unwrap().usage(), before);
+    drop(writer);
+    drop(lock);
+    // Publication accepts the semantic batch lease directory without treating
+    // it as another blob-data directory or counting heartbeat bytes as payloads.
+    publish(root.path(), A, 0, None, |_| Ok(())).unwrap();
+    let lock = ReservationLock::acquire(root.path()).unwrap();
+    let writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
+    assert_eq!(writer.accounting().unwrap().usage(), inventory(&family));
+    drop(lease);
 }

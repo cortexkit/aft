@@ -303,6 +303,12 @@ fn private_finish_restores_journaling_and_full_synchronous_on_owner() {
     };
     assert_eq!(journal_mode(), "off");
     assert_eq!(synchronous(), 0);
+    assert_eq!(
+        connection
+            .query_row("PRAGMA mmap_size", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
 
     finish_private_database(&connection).unwrap();
 
@@ -344,6 +350,93 @@ fn manifest_blob_reader_decodes_each_payload_once() {
 
     assert!(Arc::ptr_eq(&first, &second));
     assert_eq!(reader.decoded.borrow().len(), 1);
+    let weak = Arc::downgrade(&first);
+    drop((first, second));
+    assert!(
+        weak.upgrade().is_none(),
+        "the reader must not pin emitted blobs"
+    );
+}
+
+#[test]
+fn cold_materialization_decodes_parse_payloads_once_across_join_and_dispatch() {
+    struct Reader<'a> {
+        inner: ManifestViewBlobReader<'a>,
+        reads: RefCell<BTreeMap<String, usize>>,
+    }
+    impl join::ManifestBlobReader for Reader<'_> {
+        fn read_callgraph_blob(
+            &self,
+            key: &str,
+        ) -> std::result::Result<Option<Vec<u8>>, join::ManifestJoinError> {
+            *self.reads.borrow_mut().entry(key.to_string()).or_default() += 1;
+            self.inner.read_payload(key)
+        }
+    }
+    let f = fixture();
+    let connection = Connection::open(&f.blobs).unwrap();
+    let reader = Reader {
+        inner: ManifestViewBlobReader::new(&connection),
+        reads: Default::default(),
+    };
+    let database = f.dir.path().join("decoded-once.sqlite");
+    materialize_from_blob_reader(&database, &f.base, &reader).unwrap();
+    let reads = reader.reads.borrow();
+    assert_eq!(reads.len(), 4);
+    assert!(reads.values().all(|count| *count == 1), "{reads:?}");
+    let normal = f.dir.path().join("normal.sqlite");
+    materialize_manifest_view_database(&normal, &f.blobs, &f.base).unwrap();
+    assert_snapshot_parity(&snapshot(&database), &snapshot(&normal));
+}
+
+#[test]
+fn materialization_join_omits_only_the_duplicate_resolution_order() {
+    let f = fixture();
+    let connection = Connection::open(&f.blobs).unwrap();
+    let reader = ManifestViewBlobReader::new(&connection);
+    let empty = BTreeSet::new();
+    let cached = BTreeMap::new();
+    let full = join::join_selected_manifest_reusing_surfaces(
+        &f.base, &reader, None, &cached, &empty, &empty, &empty, None,
+    )
+    .unwrap();
+    let rows = join::join_selected_manifest_for_materialization(
+        &f.base, &reader, None, &cached, &empty, &empty, &empty, None,
+    )
+    .unwrap();
+    assert!(!full.result.resolution_order.is_empty());
+    assert!(rows.result.resolution_order.is_empty());
+    assert_eq!(full.result.rows, rows.result.rows);
+    assert_eq!(full.bindings, rows.bindings);
+}
+
+#[test]
+fn cold_reference_batches_match_unbatched_rows_and_dispatch() {
+    let f = fixture();
+    let connection = Connection::open(&f.blobs).unwrap();
+    let mut source = String::from("struct Thing; impl Thing { fn run(&self) {} } fn target() {} fn caller() { let thing = Thing; ");
+    for _ in 0..5000 {
+        source.push_str("thing.run(); target(); ");
+    }
+    source.push('}');
+    let manifest = manifest(&connection, &[("batch.rs", &source)]);
+    let reader = ManifestViewBlobReader::new(&connection);
+    let bounded = f.dir.path().join("batched.sqlite");
+    let unbatched = f.dir.path().join("unbatched.sqlite");
+    drop(Connection::open(&unbatched).unwrap());
+    let (batched, _) =
+        materialize_reading(&bounded, &manifest, None, &reader, Some(&connection)).unwrap();
+    let (whole, _) =
+        materialize_reading(&unbatched, &manifest, None, &reader, Some(&connection)).unwrap();
+    assert!(batched.resolved_refs > 4096);
+    assert!(batched.dispatch_resolved_sites > 0);
+    assert_eq!(batched.inserted, whole.inserted);
+    assert_eq!(batched.resolved_refs, whole.resolved_refs);
+    assert_eq!(
+        batched.dispatch_resolved_sites,
+        whole.dispatch_resolved_sites
+    );
+    assert_snapshot_parity(&snapshot(&bounded), &snapshot(&unbatched));
 }
 
 #[test]
