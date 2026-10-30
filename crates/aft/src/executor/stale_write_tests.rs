@@ -50,7 +50,7 @@ fn request(tool: Tool, path: &Path, number: usize) -> RawRequest {
         ),
         Tool::Symbol => (
             "edit_symbol",
-            json!({"file": path, "symbol": "value", "operation": "replace", "content": format!("const value = {number};")}),
+            json!({"file": path, "symbol": "value", "operation": "replace", "content": format!("value = {number}")}),
         ),
     };
     let mut value = params;
