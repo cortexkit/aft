@@ -320,7 +320,7 @@ pub(crate) fn run_diagnostics_category(
                 let lsp = ctx.lsp();
                 warm_files
                     .iter()
-                    .filter(|file| !lsp.has_authoritative_report_for_file(file))
+                    .filter(|file| !lsp.has_diagnostic_report_for_file(file))
                     .cloned()
                     .collect::<Vec<_>>()
             };
@@ -335,6 +335,9 @@ pub(crate) fn run_diagnostics_category(
         }
         _ => None,
     };
+    if let Some(sweep) = &mut sweep {
+        sweep.revalidate_requested_reports();
+    }
     let mut collection = if applicability_is_empty {
         // No applicable producer means there is no diagnostic artifact to wait
         // for; the empty category is authoritative for this applicability snapshot.
@@ -432,7 +435,7 @@ pub(crate) fn run_diagnostics_category(
         // An opened document with no publication is unknown too. A report with
         // no document version must never turn that absence into checked-clean.
         for file in &warm_files {
-            if !lsp.has_authoritative_report_for_file(file)
+            if !lsp.has_diagnostic_report_for_file(file)
                 && !collection
                     .scope_coverage_gaps
                     .iter()
@@ -1215,16 +1218,16 @@ impl DiagnosticsCollection {
                 ScopedFileCoverage::Covered
                     | ScopedFileCoverage::NoProducer
                     | ScopedFileCoverage::ExcludedByTsconfig
-            ) && ctx
-                .lsp()
-                .unverified_diagnostic_files()
-                .iter()
-                .any(|(_, path)| path == file)
+            ) && ctx.lsp().unverified_diagnostic_file(file).is_some()
             {
                 self.scope_coverage_gaps.push(ScopedCoverageGap {
                     file: file.clone(),
                     reason: CURRENT_CONTENT_UNVERIFIED_REASON,
-                    cause: CoverageCause::unattributed(CURRENT_CONTENT_UNVERIFIED_REASON),
+                    cause: sweep
+                        .and_then(|sweep| sweep_cause(sweep, file))
+                        .unwrap_or_else(|| {
+                            CoverageCause::unattributed(CURRENT_CONTENT_UNVERIFIED_REASON)
+                        }),
                 });
                 continue;
             }
@@ -1866,14 +1869,17 @@ mod payload_count_tests {
             Box::new(crate::parser::TreeSitterProvider::new()),
             Config::default(),
         );
-        let outside = PathBuf::from("/external/selected.rs");
-        let unrelated = PathBuf::from("/external/unrelated.rs");
+        let external = tempfile::tempdir().unwrap();
+        let outside = external.path().join("selected.rs");
+        let unrelated = external.path().join("unrelated.rs");
         for file in [&outside, &unrelated] {
+            std::fs::write(file, "pub fn f() {}\n").unwrap();
             let mut diagnostic = collection().diagnostics.remove(0).diagnostic;
             diagnostic.file = file.clone();
             ctx.lsp()
                 .diagnostics_store_mut_for_test()
                 .publish_with_kind(ServerKind::Rust, file.clone(), vec![diagnostic]);
+            ctx.lsp().certify_diagnostic_content_for_test(file);
         }
         let files = [outside.clone()];
         let scoped =

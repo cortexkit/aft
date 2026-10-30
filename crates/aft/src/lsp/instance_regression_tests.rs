@@ -92,7 +92,7 @@ fn frame(message: Value) -> String {
 
 fn diagnostics(file: &Path, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {
-        "uri": uri_for_path(file).unwrap(), "diagnostics": [{
+        "uri": uri_for_path(file).unwrap(), "version": 0, "diagnostics": [{
             "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
             "severity": 1, "message": message
         }]
@@ -270,6 +270,8 @@ fn current_reader_events_still_apply() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("main.ts");
     let mut manager = LspManager::new();
+    std::fs::write(&file, "const value = 1;\n").unwrap();
+    manager.sync_document_version_for_test(&key(dir.path()), &file, 0);
     let instance = ServerInstanceId::next();
     let pause = Pause::install(instance, Stage::Reader);
     let command = format!(
@@ -340,6 +342,8 @@ fn startup_replay_preserves_reader_instance() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("main.ts");
     let mut manager = LspManager::new();
+    std::fs::write(&file, "const value = 1;\n").unwrap();
+    manager.sync_document_version_for_test(&key(dir.path()), &file, 0);
     let instance = ServerInstanceId::next();
     let pause = Pause::install(instance, Stage::Reader);
     let command = format!(

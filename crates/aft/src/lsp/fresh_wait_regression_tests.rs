@@ -55,6 +55,7 @@ fn fresh_wait_releases_manager_and_requires_each_producer_version() {
             .unwrap();
             client.set_rust_analyzer_quiescent(true);
             lsp.insert_client_for_test(client);
+            lsp.sync_document_version_for_test(key, &file, 1);
             lsp.enqueue_event_for_test(publish(key, 1, json!([])));
         }
         lsp.drain_events();
@@ -72,6 +73,9 @@ fn fresh_wait_releases_manager_and_requires_each_producer_version() {
         publish(&keys[1], 2, json!([])),
         publish(&keys[0], 2, json!([])),
     ];
+    for key in &keys {
+        manager.lock().sync_document_version_for_test(key, &file, 2);
+    }
     let parks = Rc::new(Cell::new(0));
     let observed_parks = Rc::clone(&parks);
     let parked_manager = Arc::clone(&manager);

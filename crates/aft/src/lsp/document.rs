@@ -41,7 +41,9 @@ pub struct DocumentEntry {
 #[derive(Debug, Default)]
 pub struct DocumentStore {
     entries: HashMap<PathBuf, DocumentEntry>,
-    closed_versions: HashMap<PathBuf, i32>,
+    /// Higher than every version of a closed document. A scalar floor avoids
+    /// retaining one path forever for every file an inspect briefly opened.
+    reopen_version_floor: i32,
 }
 
 impl DocumentStore {
@@ -64,8 +66,9 @@ impl DocumentStore {
         self.entries.contains_key(path)
     }
 
-    /// Open a new document, recording the current on-disk metadata/hash. Returns
-    /// the initial version (0), or a later version on reopen. If metadata cannot be read, the
+    /// Open a document, recording its on-disk metadata/hash. The initial version
+    /// starts at zero and advances past every closed document's last version.
+    /// If metadata cannot be read, the
     /// document is still tracked but `mtime`/`size` will be `None`, which
     /// causes `is_stale_on_disk()` to conservatively report stale on the
     /// next check (forcing a resync).
@@ -77,7 +80,7 @@ impl DocumentStore {
     /// [`Self::open`] with the file's disk state already read, so a document
     /// opened in several servers reads and hashes the file once.
     pub fn open_with(&mut self, path: PathBuf, snapshot: &DiskSnapshot) -> i32 {
-        let version = self.next_open_version(&path);
+        let version = self.next_open_version();
         let entry = DocumentEntry {
             version,
             mtime: snapshot.mtime,
@@ -89,10 +92,8 @@ impl DocumentStore {
     }
 
     /// Reopening must not reuse a version that a delayed publication can carry.
-    pub(crate) fn next_open_version(&self, path: &Path) -> i32 {
-        self.closed_versions
-            .get(path)
-            .map_or(0, |version| version + 1)
+    pub(crate) fn next_open_version(&self) -> i32 {
+        self.reopen_version_floor
     }
 
     /// Bump the version for an already-open document and refresh the
@@ -138,8 +139,7 @@ impl DocumentStore {
     /// version, or `None` if the document was not open.
     pub fn close(&mut self, path: &Path) -> Option<i32> {
         let entry = self.entries.remove(path)?;
-        self.closed_versions
-            .insert(path.to_path_buf(), entry.version);
+        self.reopen_version_floor = self.reopen_version_floor.max(entry.version + 1);
         Some(entry.version)
     }
 
@@ -287,6 +287,34 @@ mod tests {
 
     fn content_reads() -> usize {
         CONTENT_READS.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn large_diagnostics_document_detects_same_metadata_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.ts");
+        let mut content = vec![b'a'; 4 * 1024 * 1024 + 1];
+        fs::write(&path, &content).unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let mut store = DocumentStore::new();
+        store.open(path.clone());
+        content[0] = b'b';
+        fs::write(&path, content).unwrap();
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(modified)).unwrap();
+        assert!(store.is_stale_on_disk(&path));
+    }
+
+    #[test]
+    fn diagnostics_sync_hash_describes_sent_text_not_a_later_disk_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.ts");
+        fs::write(&path, "new disk text").unwrap();
+        let mut store = DocumentStore::new();
+        store.open_with(
+            path.clone(),
+            &DiskSnapshot::for_content(&path, "sent old text"),
+        );
+        assert!(store.is_stale_on_disk(&path));
     }
 
     #[test]

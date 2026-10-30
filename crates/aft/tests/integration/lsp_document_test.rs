@@ -114,8 +114,8 @@ fn test_document_store_version_tracking() {
     let path = temp_dir.path().join("demo.rs");
     let mut store = DocumentStore::new();
 
-    assert_eq!(store.open(path.clone()), 0);
-    assert_eq!(store.version(&path), Some(0));
+    assert_eq!(store.open(path.clone()), 1);
+    assert_eq!(store.version(&path), Some(1));
     assert_eq!(store.bump_version(&path), Some(1));
     assert_eq!(store.bump_version(&path), Some(2));
     assert_eq!(store.version(&path), Some(2));

@@ -592,16 +592,6 @@ impl DiagnosticsStore {
             .map(|((server, file), entry)| (server, file.as_path(), entry))
     }
 
-    /// Current authoritative reports retain producer identity, including empty reports.
-    pub(crate) fn authoritative_reports(
-        &self,
-    ) -> impl Iterator<Item = (&ServerKey, &Path, &[StoredDiagnostic])> {
-        self.entries
-            .iter()
-            .filter(|(_, entry)| !entry.stale && !entry.provisional)
-            .map(|((server, file), entry)| (server, file.as_path(), entry.diagnostics.as_slice()))
-    }
-
     /// All current diagnostics with the entry-level readiness marker.
     pub fn all_with_provisional(&self) -> Vec<(&StoredDiagnostic, bool)> {
         self.entries

@@ -149,9 +149,16 @@ fn document_pull_ingests_related_full_and_unchanged_reports() {
         None,
         serde_json::from_value(unchanged).unwrap(),
     );
-    assert!(manager
+    assert!(!manager
         .diagnostics
         .has_fresh_report_for_server_file(&key, &related));
+    assert_eq!(
+        manager.diagnostics.entries_for_file(&related)[0]
+            .1
+            .diagnostics[0]
+            .message,
+        "dependent error"
+    );
 }
 
 #[test]
@@ -161,6 +168,8 @@ fn workspace_pull_preserves_versions_and_refreshes_unchanged_reports() {
     let file = tmp.path().join("lib.rs");
     let uri = uri_for_path(&file).unwrap();
     let mut manager = LspManager::new();
+    std::fs::write(&file, "pub fn f() {}\n").unwrap();
+    manager.sync_document_version_for_test(&key, &file, 7);
     manager
         .finish_workspace_pull(
             &key,
@@ -185,6 +194,7 @@ fn workspace_pull_preserves_versions_and_refreshes_unchanged_reports() {
         }]}),
     );
     manager.diagnostics.mark_stale_for_file(&file);
+    manager.sync_document_version_for_test(&key, &file, 8);
     let result = manager.finish_workspace_pull(&key, reply).unwrap();
     assert_eq!(result.files_reported, vec![file.clone()]);
     assert!(manager
@@ -194,6 +204,7 @@ fn workspace_pull_preserves_versions_and_refreshes_unchanged_reports() {
         manager.diagnostics.entries_for_file(&file)[0].1.version,
         Some(8)
     );
+    manager.sync_document_version_for_test(&key, &file, 9);
     manager
         .finish_workspace_pull(
             &key,

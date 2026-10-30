@@ -1133,7 +1133,13 @@ pub(crate) fn main() -> io::Result<()> {
                         .ok()
                         .and_then(|value| value.parse::<u64>().ok())
                     {
-                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        // A file gate lets a test obtain an initial report, then
+                        // hold subsequent pulls by creating the configured file.
+                        let delay_enabled = std::env::var_os("AFT_FAKE_LSP_PULL_DELAY_WHEN_FILE_EXISTS")
+                            .is_none_or(|path| std::path::Path::new(&path).exists());
+                        if delay_enabled {
+                            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        }
                     }
                     let force_unchanged =
                         std::env::var("AFT_FAKE_LSP_PULL_UNCHANGED").ok().as_deref() == Some("1");
