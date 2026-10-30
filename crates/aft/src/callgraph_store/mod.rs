@@ -174,6 +174,9 @@ pub(crate) mod work_counts {
     static STAGING_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
     static DIRECTORY_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
     static GO_PACKAGE_BUILDS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    static CANONICAL_PATHS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    static REALPATHS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    static WORKSPACE_DIRECTORIES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
 
     fn note(map: &OnceLock<Mutex<HashMap<PathBuf, usize>>>, path: &Path) {
         *map.get_or_init(Default::default)
@@ -220,6 +223,41 @@ pub(crate) mod work_counts {
         under(&DIRECTORY_READS, root, None)
     }
 
+    pub(crate) fn note_canonical_path(path: &Path) {
+        note(&CANONICAL_PATHS, path);
+    }
+
+    pub(crate) fn note_realpath(path: &Path) {
+        note(&REALPATHS, path);
+    }
+
+    pub(crate) fn realpaths_under(root: &Path) -> usize {
+        under(&REALPATHS, root, None)
+    }
+
+    pub(crate) fn note_workspace_directory(path: &Path) {
+        note(&WORKSPACE_DIRECTORIES, path);
+    }
+
+    pub(crate) fn filesystem_counts(root: &Path) -> (usize, usize, usize, usize) {
+        let paths = CANONICAL_PATHS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap();
+        let unique = paths.keys().filter(|path| path.starts_with(root)).count();
+        let calls = paths
+            .iter()
+            .filter(|(path, _)| path.starts_with(root))
+            .map(|(_, count)| count)
+            .sum();
+        (
+            calls,
+            unique,
+            under(&WORKSPACE_DIRECTORIES, root, None),
+            directory_reads_under(root),
+        )
+    }
+
     pub(crate) fn note_go_package_build(path: &Path) {
         note(&GO_PACKAGE_BUILDS, path);
     }
@@ -260,6 +298,9 @@ pub(crate) mod work_counts {
             &STAGING_READS,
             &DIRECTORY_READS,
             &GO_PACKAGE_BUILDS,
+            &CANONICAL_PATHS,
+            &REALPATHS,
+            &WORKSPACE_DIRECTORIES,
         ] {
             map.get_or_init(Default::default)
                 .lock()
@@ -23952,6 +23993,8 @@ thread_local! {
 fn fs_canonicalize(path: &Path) -> std::io::Result<PathBuf> {
     #[cfg(test)]
     CANONICALIZE_CALLS.with(|calls| calls.set(calls.get() + 1));
+    #[cfg(test)]
+    work_counts::note_realpath(path);
     std::fs::canonicalize(path)
 }
 
@@ -23963,6 +24006,8 @@ fn fs_canonicalize(path: &Path) -> std::io::Result<PathBuf> {
 /// in each ancestor directory, `index.ts` beside each import), and most probes
 /// name a file that does not exist.
 fn canonicalize_path(path: &Path) -> PathBuf {
+    #[cfg(test)]
+    work_counts::note_canonical_path(path);
     if let Ok(canonical) = fs_canonicalize(path) {
         return canonical;
     }

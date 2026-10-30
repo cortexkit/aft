@@ -994,6 +994,29 @@ fn report(label: &str, counts: &WorkCounts) {
     );
 }
 
+/// Run against a fixed checkout so filesystem work and every persisted edge can
+/// be compared across resolver implementations, independently of source edits.
+#[test]
+#[ignore = "measurement: needs AFT_CALLGRAPH_MEASURE_ROOT and AFT_CALLGRAPH_MEASURE_DUMP"]
+fn cold_callgraph_filesystem_real_repo() {
+    let root = PathBuf::from(std::env::var("AFT_CALLGRAPH_MEASURE_ROOT").expect("root"));
+    let dump = PathBuf::from(std::env::var("AFT_CALLGRAPH_MEASURE_DUMP").expect("dump"));
+    let files = callgraph::walk_project_files(&root).collect::<Vec<_>>();
+    let dir = tempfile::tempdir().unwrap();
+    let (store, counts) = cold_build_counts(&root, &dir.path().join("store"), &files);
+    report("cold_callgraph_filesystem", &counts);
+    let (canonical, unique, workspace_dirs, all_dirs) = work_counts::filesystem_counts(&root);
+    let realpaths = work_counts::realpaths_under(&root);
+    let rows = dump_graph_rows(&store);
+    let edges = rows
+        .lines()
+        .filter(|line| line.starts_with("edges\t"))
+        .collect::<Vec<_>>();
+    fs::create_dir_all(&dump).unwrap();
+    fs::write(dump.join("edges.txt"), edges.join("\n")).unwrap();
+    eprintln!("cold filesystem: files={} edges={} canonicalize_path={canonical} unique_paths={unique} repeated_paths={} realpaths={realpaths} workspace_directory_visits={workspace_dirs} all_directory_reads={all_dirs} wall_ms={}", files.len(), edges.len(), canonical - unique, counts.wall.as_millis());
+}
+
 /// Frozen tracked inputs and sorted logical rows follow the extraction-work
 /// census, but include both storage paths and the dead-code consumer this time.
 #[test]

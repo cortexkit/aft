@@ -3504,6 +3504,8 @@ fn collect_workspace_member_dirs(
     members: &mut Vec<PathBuf>,
     facts: &FactPaths<'_>,
 ) {
+    #[cfg(test)]
+    crate::callgraph_store::work_counts::note_workspace_directory(dir);
     for entry in facts.list_dir(dir) {
         if entry.kind != EntryKind::Directory {
             continue;
