@@ -1,9 +1,5 @@
-#[cfg(target_os = "linux")]
-use std::ffi::OsString;
 #[cfg(unix)]
 use std::path::Path;
-#[cfg(target_os = "linux")]
-use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 /// Shared process-termination helpers for both foreground bash and background
@@ -347,110 +343,7 @@ fn user_name(uid: u32) -> String {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) struct SystemdScopeLauncher {
-    path: PathBuf,
-    supports_expand_environment: bool,
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn systemd_scope_argv(
-    launcher: &SystemdScopeLauncher,
-    executable: &Path,
-    args: &[OsString],
-) -> (PathBuf, Vec<OsString>) {
-    let mut wrapped = ["--user", "--scope", "--collect", "--quiet"]
-        .into_iter()
-        .map(OsString::from)
-        .collect::<Vec<_>>();
-    if launcher.supports_expand_environment {
-        wrapped.push(OsString::from("--expand-environment=no"));
-    }
-    wrapped.push(executable.as_os_str().to_os_string());
-    wrapped.extend_from_slice(args);
-    (launcher.path.clone(), wrapped)
-}
-
-#[cfg(target_os = "linux")]
-fn select_systemd_scope_launcher_with(
-    find: impl FnOnce() -> Option<PathBuf>,
-    probe: impl FnOnce(&Path) -> Option<bool>,
-) -> Option<SystemdScopeLauncher> {
-    let path = find()?;
-    let supports_expand_environment = probe(&path)?;
-    Some(SystemdScopeLauncher {
-        path,
-        supports_expand_environment,
-    })
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn select_systemd_scope_launcher() -> Option<SystemdScopeLauncher> {
-    select_systemd_scope_launcher_with(
-        || which::which("systemd-run").ok(),
-        |launcher| probe_systemd_scope(launcher, Duration::from_secs(1)),
-    )
-}
-
-#[cfg(target_os = "linux")]
-fn probe_systemd_scope(launcher: &Path, limit: Duration) -> Option<bool> {
-    let deadline = Instant::now() + limit;
-    if probe_systemd_scope_with(launcher, true, deadline) {
-        return Some(true);
-    }
-    // Pre-254 systemd lacks this option but passes scope argv through literally.
-    // Never escape dollars on that path: doing so would change the shell's input.
-    probe_systemd_scope_with(launcher, false, deadline).then_some(false)
-}
-
-#[cfg(target_os = "linux")]
-fn probe_systemd_scope_with(
-    launcher: &Path,
-    supports_expand_environment: bool,
-    deadline: Instant,
-) -> bool {
-    if Instant::now() >= deadline {
-        return false;
-    }
-    let (_, args) = systemd_scope_argv(
-        &SystemdScopeLauncher {
-            path: launcher.to_path_buf(),
-            supports_expand_environment,
-        },
-        Path::new("/bin/true"),
-        &[],
-    );
-    let mut command = std::process::Command::new(launcher);
-    command
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    start_new_session(&mut command);
-    let Ok(mut child) = command.spawn() else {
-        return false;
-    };
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if Instant::now() < deadline => return status.success(),
-            Ok(None) if Instant::now() < deadline => {
-                thread::sleep(
-                    Duration::from_millis(10)
-                        .min(deadline.saturating_duration_since(Instant::now())),
-                );
-            }
-            _ => {
-                // The availability probe must not retain a launch indefinitely.
-                // Kill its session as well as the client, then reap the client.
-                unsafe {
-                    libc::killpg(child.id() as i32, libc::SIGKILL);
-                }
-                let _ = child.kill();
-                let _ = child.wait();
-                return false;
-            }
-        }
-    }
-}
+pub(crate) use super::task_scope::{select_systemd_scope_launcher, systemd_scope_argv};
 
 /// Describe at most [`LIVE_DESCENDANT_CAP`] group members, lowest pid first,
 /// and count the rest without describing them. Listing a member is cheap (its
@@ -1081,45 +974,6 @@ mod tests {
     }
     use super::*;
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linux_scope_argv_wraps_the_tool_shell() {
-        let command = "X=inner; echo ${X} $X $$; cd /usr; echo ${PWD}";
-        let args = vec![OsString::from("-c"), OsString::from(command)];
-        for supports_expand_environment in [true, false] {
-            let launcher = SystemdScopeLauncher {
-                path: PathBuf::from("/usr/bin/systemd-run"),
-                supports_expand_environment,
-            };
-            let (program, wrapped) = systemd_scope_argv(&launcher, Path::new("/bin/sh"), &args);
-            assert_eq!(program, launcher.path);
-            let mut expected = vec!["--user", "--scope", "--collect", "--quiet"];
-            if supports_expand_environment {
-                expected.push("--expand-environment=no");
-            }
-            expected.extend(["/bin/sh", "-c", command]);
-            assert_eq!(
-                wrapped,
-                expected.into_iter().map(OsString::from).collect::<Vec<_>>()
-            );
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linux_scope_falls_back_when_user_manager_is_unreachable() {
-        let probes = std::cell::Cell::new(0);
-        let selected = select_systemd_scope_launcher_with(
-            || Some(PathBuf::from("/usr/bin/systemd-run")),
-            |_| {
-                probes.set(probes.get() + 1);
-                None
-            },
-        );
-        assert!(selected.is_none());
-        assert_eq!(probes.get(), 1);
-    }
-
     #[test]
     fn is_process_alive_returns_true_for_self() {
         assert!(is_process_alive(std::process::id()));
@@ -1498,19 +1352,6 @@ fn lifecycle_empty_group_avoids_proc_scan() {
         PROC_SCAN_COUNT.with(std::cell::Cell::get),
         0,
         "empty group required a host-wide scan"
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn lifecycle_scope_probe_deadline_falls_back() {
-    let dir = tempfile::tempdir().unwrap();
-    let launcher = dir.path().join("systemd-run");
-    crate::executable_cache::write_executable(&launcher, b"#!/bin/sh\nsleep 0.1\nexit 0\n")
-        .unwrap();
-    assert!(
-        probe_systemd_scope(&launcher, Duration::ZERO).is_none(),
-        "expired probe still reported availability"
     );
 }
 

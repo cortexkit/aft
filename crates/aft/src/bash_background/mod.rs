@@ -14,6 +14,7 @@ pub mod process;
 pub mod pty_process;
 pub mod pty_runtime;
 pub mod registry;
+pub(crate) mod task_scope;
 mod temp_cleanup;
 pub(crate) mod viewed_task;
 pub mod watch_lines;
