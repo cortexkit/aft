@@ -8,5 +8,5 @@
   "slices": [
     "flake-batch-27"
   ],
-  "note": "Test-only fixes: the dirty-pages measurement VFS allocates and frees a methods copy per open. No changed path matches RANKING_FENCE_PREFIXES."
+  "note": "Test-only fixes: dirty-pages measurement VFS methods copy per open; inspect dedup test deadline; v3 free-space test overrides scoped by storage root. No changed path matches RANKING_FENCE_PREFIXES."
 }
