@@ -95,7 +95,10 @@ fn child_view_failures_reach_the_parent_roots_health() {
     assert_eq!(counts.get("parent_trigram:io"), Some(&2), "{counts:?}");
     assert_eq!(counts.len(), 1, "a busy store must not count: {counts:?}");
     let last = last.unwrap();
-    assert_eq!((last.plane.as_str(), last.count, last.total), ("parent_trigram", 2, 2));
+    assert_eq!(
+        (last.plane.as_str(), last.count, last.total),
+        ("parent_trigram", 2, 2)
+    );
     assert_eq!(last.error, format!("repo-a: {error}"));
 
     // The parent root's own health snapshot reports them.
@@ -106,10 +109,8 @@ fn child_view_failures_reach_the_parent_roots_health() {
         ..crate::config::Config::default()
     };
     config.views.enabled = true;
-    let ctx = crate::context::AppContext::new(
-        Box::new(crate::parser::TreeSitterProvider::new()),
-        config,
-    );
+    let ctx =
+        crate::context::AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
     let health = ctx.try_health_snapshot(&root);
     assert_eq!(
         health.view_load_failures.get("parent_trigram:io"),

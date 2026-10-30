@@ -6038,7 +6038,9 @@ impl AppContext {
                         if last.as_ref().is_some_and(|last| {
                             view_load_failure_last
                                 .as_ref()
-                                .is_none_or(|own: &ViewLoadFailure| own.last_at_ms <= last.last_at_ms)
+                                .is_none_or(|own: &ViewLoadFailure| {
+                                    own.last_at_ms <= last.last_at_ms
+                                })
                         }) {
                             view_load_failure_last = last;
                         }

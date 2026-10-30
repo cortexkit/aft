@@ -623,9 +623,10 @@ pub(crate) fn try_child_load_failures(
 /// Counts a failed child view load under the parent `root` by plane and
 /// cause, keeping the full error (prefixed with the child's path) for the
 /// parent root's health, and logs it at error level at most once a minute per
-/// plane. A busy store is contention the worker retries, so it is not counted.
+/// plane. A busy or locked store, or a child that changed mid-read, clears by
+/// itself and the worker retries it, so it is not counted.
 fn record_child_failure(root: &Path, child: &str, plane: &'static str, error: &str) {
-    if super::trigram::bind_is_busy(error) {
+    if super::semantic_runtime::is_transient_reason(error) {
         return;
     }
     let cause = crate::context::view_load_cause(error);

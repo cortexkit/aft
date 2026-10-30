@@ -556,7 +556,10 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
                             Err(reason) => {
                                 // A built semantic view whose index cannot be
                                 // served is a view failure: count it in health.
-                                self.ctx.note_view_load_failure("semantic", &reason);
+                                // Contention clears by itself and is not counted.
+                                if !crate::views::semantic_runtime::is_transient_reason(&reason) {
+                                    self.ctx.note_view_load_failure("semantic", &reason);
+                                }
                                 unserved(SemanticIndexStatus::Failed(reason))
                             }
                         },
@@ -1535,8 +1538,11 @@ fn split_semantic_results(
                 answer.results
             }
             Err(error) => {
-                // The reply names the gap; health counts the failed view.
-                ctx.note_view_load_failure("semantic", &error);
+                // The reply names the gap; health counts the failed view
+                // unless it is contention that clears by itself.
+                if !crate::views::semantic_runtime::is_transient_reason(&error) {
+                    ctx.note_view_load_failure("semantic", &error);
+                }
                 checkout_gaps = Some(CheckoutSemanticGaps::unavailable(error));
                 Vec::new()
             }
@@ -6636,8 +6642,11 @@ fn handle_semantic_or_hybrid_search(
                 answer.results
             }
             Err(error) => {
-                // The reply names the gap; health counts the failed view.
-                ctx.note_view_load_failure("semantic", &error);
+                // The reply names the gap; health counts the failed view
+                // unless it is contention that clears by itself.
+                if !crate::views::semantic_runtime::is_transient_reason(&error) {
+                    ctx.note_view_load_failure("semantic", &error);
+                }
                 semantic_gaps = Some(CheckoutSemanticGaps::unavailable(error));
                 Vec::new()
             }
