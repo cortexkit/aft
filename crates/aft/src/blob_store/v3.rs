@@ -270,13 +270,94 @@ pub fn view_dir(storage: &Path, family: &str, scope: &str) -> Result<PathBuf> {
     Ok(family_dir(storage, family)?.join("views").join(scope))
 }
 
-static FREE_SPACE: Mutex<Option<(u64, u64)>> = Mutex::new(None);
-/// Process-local probe override for integration children. Production never calls it.
+struct FreeSpaceOverrides {
+    storage: std::collections::BTreeMap<PathBuf, FreeSpaceOverride>,
+    unlimited: usize,
+}
+struct FreeSpaceOverride {
+    canonical: Option<PathBuf>,
+    value: (u64, u64),
+}
+static FREE_SPACE: Mutex<FreeSpaceOverrides> = Mutex::new(FreeSpaceOverrides {
+    storage: std::collections::BTreeMap::new(),
+    unlimited: 0,
+});
+
+/// Restores a storage root's previous test probe when dropped, including on unwind.
 #[doc(hidden)]
-pub fn set_free_space_for_test(free: u64, capacity: u64) {
-    *FREE_SPACE
+#[must_use]
+pub struct FreeSpaceTestGuard {
+    storage: PathBuf,
+    previous: Option<FreeSpaceOverride>,
+}
+impl Drop for FreeSpaceTestGuard {
+    fn drop(&mut self) {
+        let mut overrides = FREE_SPACE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(previous) = self.previous.take() {
+            overrides.storage.insert(self.storage.clone(), previous);
+        } else {
+            overrides.storage.remove(&self.storage);
+        }
+    }
+}
+
+/// Overrides probes under `storage` on every thread until the guard drops.
+/// Raw and canonical spellings both match; the most specific root wins.
+/// Production never calls this setter.
+#[doc(hidden)]
+pub fn set_free_space_for_test(storage: &Path, free: u64, capacity: u64) -> FreeSpaceTestGuard {
+    let storage = storage.to_path_buf();
+    let entry = FreeSpaceOverride {
+        canonical: canonical_free_space_path(&storage),
+        value: (free, capacity),
+    };
+    let previous = FREE_SPACE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((free, capacity));
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .storage
+        .insert(storage.clone(), entry);
+    FreeSpaceTestGuard { storage, previous }
+}
+
+/// Admission can run before a storage root or its descendants exist. Resolve
+/// the existing ancestor, preserving missing components only for comparison.
+fn canonical_free_space_path(path: &Path) -> Option<PathBuf> {
+    for ancestor in path.ancestors() {
+        let existing = if ancestor.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            ancestor
+        };
+        if let Ok(canonical) = fs::canonicalize(existing) {
+            return Some(canonical.join(path.strip_prefix(ancestor).ok()?));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+pub(crate) struct UnlimitedFreeSpaceForTestProcess;
+#[cfg(test)]
+impl Drop for UnlimitedFreeSpaceForTestProcess {
+    fn drop(&mut self) {
+        FREE_SPACE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unlimited -= 1;
+    }
+}
+/// Existing shared fixtures acquire their guard before creating one or more
+/// storage roots. Their fallback can only allow admission; refusal simulations
+/// must name a storage root and always take precedence over this fallback.
+#[cfg(test)]
+fn unlimited_free_space_for_test_process() -> UnlimitedFreeSpaceForTestProcess {
+    FREE_SPACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unlimited += 1;
+    UnlimitedFreeSpaceForTestProcess
 }
 /// The platform probe itself, bypassing the test override.
 #[cfg(test)]
@@ -284,10 +365,35 @@ pub(crate) fn probe_free_space_for_test(path: &Path) -> Option<(u64, u64)> {
     probe_free_space(path)
 }
 fn free_space(path: &Path) -> Option<(u64, u64)> {
-    if let Some(value) = *FREE_SPACE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-    {
+    let value = {
+        let overrides = FREE_SPACE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let canonical = if overrides.storage.is_empty() {
+            None
+        } else {
+            canonical_free_space_path(path)
+        };
+        overrides
+            .storage
+            .iter()
+            .filter_map(|(root, entry)| {
+                let canonical_depth = canonical.as_ref().and_then(|path| {
+                    entry
+                        .canonical
+                        .as_ref()
+                        .filter(|root| path.starts_with(root))
+                        .map(|root| root.components().count())
+                });
+                let depth = canonical_depth
+                    .or_else(|| path.starts_with(root).then(|| root.components().count()))?;
+                Some((depth, entry.value))
+            })
+            .max_by_key(|(depth, _)| *depth)
+            .map(|(_, value)| value)
+            .or_else(|| (overrides.unlimited > 0).then_some((u64::MAX, u64::MAX / 2)))
+    };
+    if let Some(value) = value {
         return Some(value);
     }
     probe_free_space(path)
@@ -2187,11 +2293,10 @@ impl PlaneReader {
     }
 }
 
-/// Serializes tests that depend on the process-wide free-space override and
-/// sets it to unlimited, so admission in other modules' tests never races the
-/// refusal cases in `tests`.
+/// Retains the shared v3 test lock and an unlimited process fallback. Explicit
+/// storage-scoped probes take precedence, even on a different thread.
 #[cfg(test)]
-pub(crate) fn serial_for_test() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn serial_for_test() -> tests::SerialTestGuard {
     tests::serial()
 }
 

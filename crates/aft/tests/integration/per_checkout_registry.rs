@@ -869,7 +869,7 @@ fn per_checkout_child() {
                 aft::blob_store::v2::parse_hex32(&std::env::var("PER_CHECKOUT_KEY").unwrap())
                     .unwrap(),
             );
-            v3::set_free_space_for_test(u64::MAX, u64::MAX / 2);
+            let _space = v3::set_free_space_for_test(&storage, u64::MAX, u64::MAX / 2);
             let observer = ParkAt {
                 step: DurabilityStep::parse(&step).unwrap(),
                 ready,
@@ -1277,7 +1277,7 @@ fn a_v3_copy_killed_at_either_v3_boundary_keeps_its_source_and_restarts() {
             other => panic!("{other:?} is not a v3-only boundary"),
         };
 
-        v3::set_free_space_for_test(u64::MAX, u64::MAX / 2);
+        let _space = v3::set_free_space_for_test(storage.path(), u64::MAX, u64::MAX / 2);
         let outcome = v3::copy_on_first_use(
             storage.path(),
             v3::CopySource::V2 {

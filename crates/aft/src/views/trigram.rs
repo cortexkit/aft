@@ -1744,6 +1744,47 @@ mod tests {
     }
 
     #[test]
+    fn lexical_views_setup_isolated_from_another_threads_free_space_override() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let storage = temp.path().join("storage");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.rs"), "needle\n").unwrap();
+        let source = BaseBuilderTestSource::new(
+            &root,
+            &storage,
+            "lexical-free-space",
+            TrigramPolicy {
+                max_file_size: 1024,
+            },
+        );
+        let other_storage = temp.path().join("other-storage");
+        let (installed, ready) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let _guard = crate::blob_store::v3::serial_for_test();
+            let _space =
+                crate::blob_store::v3::set_free_space_for_test(&other_storage, 1 << 20, 1 << 40);
+            let refusal = || {
+                crate::blob_store::v3::publish(&other_storage, "full-device", 1, None, |_| Ok(()))
+                    .unwrap_err()
+                    .to_string()
+            };
+            installed.send(refusal()).unwrap();
+            let _ = wait.recv();
+            assert_eq!(refusal(), "device_free_space_floor");
+        });
+        let refusal = ready.recv().unwrap();
+        // Keep the refusing probe installed until the independent checkout has
+        // finished binding; scheduling cannot hide a cross-storage override.
+        let snapshot = source.acquire();
+        drop(release);
+        worker.join().unwrap();
+        assert_eq!(refusal, "device_free_space_floor");
+        snapshot.unwrap_or_else(|error| panic!("independent checkout setup failed: {error}"));
+    }
+
+    #[test]
     fn lexical_views_projection_refuses_uncertain_or_wrong_policy_snapshots() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("project");

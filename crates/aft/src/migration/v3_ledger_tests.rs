@@ -299,9 +299,9 @@ fn a_storage_gap_releases_the_row_and_a_later_run_resumes_it() {
     let storage = dir.path().join("storage");
     legacy_trigram(&storage, &root);
     // Room for a 64 KiB ledger write above the 4 GiB floor, not for a batch.
-    v3::set_free_space_for_test((4 << 30) + (512 << 10), 1 << 30);
+    let _low_space = v3::set_free_space_for_test(&storage, (4 << 30) + (512 << 10), 1 << 30);
     let report = run_v3_import(&request(&storage, &root, None), None);
-    v3::set_free_space_for_test(u64::MAX, u64::MAX / 2);
+    let _space = v3::set_free_space_for_test(&storage, u64::MAX, u64::MAX / 2);
     let report = report.unwrap();
     assert_eq!(
         outcome(&report, LegacyArtifact::Trigram),
@@ -517,7 +517,7 @@ fn v3_import_kill_child() {
     };
     let at = std::env::var(KILL_AT).unwrap();
     let subject = PathBuf::from(subject);
-    v3::set_free_space_for_test(u64::MAX, u64::MAX / 2);
+    let _space = v3::set_free_space_for_test(&subject.join("storage"), u64::MAX, u64::MAX / 2);
     let park = Park {
         at,
         ready: subject.join("ready"),

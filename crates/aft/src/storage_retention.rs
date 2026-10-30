@@ -13492,7 +13492,7 @@ mod v3_collector_tests {
                 assert!(warning.is_none(), "{warning:?}");
                 config
             });
-        v3::set_free_space_for_test(u64::MAX, u64::MAX / 2);
+        let _space = v3::set_free_space_for_test(&storage, u64::MAX, u64::MAX / 2);
         v3::publish(&storage, FAMILY, 1 << 20, None, |publication| {
             for line in members.lines() {
                 let mut fields = line.split('\t');
