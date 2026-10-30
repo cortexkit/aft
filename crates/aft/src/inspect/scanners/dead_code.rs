@@ -48,6 +48,7 @@ type ExportNode = (String, String);
 #[derive(Default)]
 struct CanonicalPaths {
     paths: parking_lot::RwLock<HashMap<PathBuf, PathBuf>>,
+    relative: parking_lot::RwLock<HashMap<PathBuf, HashMap<PathBuf, String>>>,
 }
 
 thread_local! {
@@ -7325,17 +7326,37 @@ fn collect_freshness(file: &Path) -> FileFreshness {
 
 fn relative_path(project_root: &Path, path: &Path) -> String {
     let absolute = if path.is_absolute() {
-        path.to_path_buf()
+        std::borrow::Cow::Borrowed(path)
     } else {
-        project_root.join(path)
+        std::borrow::Cow::Owned(project_root.join(path))
     };
+    let paths = current_canonical_paths();
+    if let Some(paths) = &paths {
+        if let Some(relative) = paths
+            .relative
+            .read()
+            .get(project_root)
+            .and_then(|files| files.get(absolute.as_ref()))
+        {
+            return relative.clone();
+        }
+    }
     let normalized_root = canonicalize_normalized(project_root);
     let normalized = canonicalize_normalized(&absolute);
-    normalized
+    let relative = normalized
         .strip_prefix(&normalized_root)
         .unwrap_or(normalized.as_path())
         .to_string_lossy()
-        .replace('\\', "/")
+        .replace('\\', "/");
+    if let Some(paths) = paths {
+        paths
+            .relative
+            .write()
+            .entry(project_root.to_path_buf())
+            .or_default()
+            .insert(absolute.into_owned(), relative.clone());
+    }
+    relative
 }
 
 fn canonical_or_normalized(project_root: &Path, path: &Path) -> PathBuf {
@@ -7761,8 +7782,16 @@ mod tests {
     #[test]
     #[ignore = "opt-in CPU measurement using a cold callgraph of this checkout"]
     fn live_cpu_test_origins_checkout_cost() {
-        let root = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+        let root = fs::canonicalize(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/aft-bridge"),
+        )
+        .unwrap();
         let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        eprintln!(
+            "test-origin measurement setup: root={} files={}",
+            root.display(),
+            files.len()
+        );
         let storage = tempfile::tempdir().unwrap();
         let store = crate::callgraph_store::CallGraphStore::open(
             storage.path().to_path_buf(),
@@ -7770,10 +7799,27 @@ mod tests {
         )
         .unwrap();
         store.cold_build(&files).unwrap();
+        eprintln!("test-origin measurement setup: callgraph built");
         let graph =
             crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path()).unwrap();
         let job = job(&root, files, graph.clone());
-        let rows = run_dead_code_scan(&job).outcome.unwrap().contributions;
+        let rows = with_job_canonical_paths(|| {
+            let fallback = fallback_export_contributions_by_file(&job, &graph);
+            job.scope_files
+                .iter()
+                .map(|file| {
+                    gather_file_contribution(
+                        &job,
+                        file,
+                        &fallback,
+                        &BTreeMap::new(),
+                        &BTreeMap::new(),
+                        &[],
+                        &mut DeadCodeFileAnalyzer::default(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
         let parsed = parse_dead_code_contributions(&root, &rows);
         let affected = parsed
             .iter()
@@ -7789,6 +7835,7 @@ mod tests {
                 &affected,
             )
         });
+        eprintln!("test-origin measurement setup: facts materialized; comparing propagation");
         let before = Instant::now();
         let expected = legacy_test_only_callers_by_target(&facts);
         let before_time = before.elapsed();
@@ -7796,6 +7843,10 @@ mod tests {
         let after = Instant::now();
         let actual = test_only_callers_by_target(&facts);
         let after_time = after.elapsed();
+        assert!(
+            !actual.is_empty(),
+            "checkout must exercise test-origin propagation"
+        );
         assert_eq!(
             serde_json::to_vec(&actual.iter().collect::<Vec<_>>()).unwrap(),
             serde_json::to_vec(&expected.iter().collect::<Vec<_>>()).unwrap()
