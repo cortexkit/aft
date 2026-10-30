@@ -14748,7 +14748,21 @@ INHERITED FLAGS
     #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
     #[test]
     fn future_issued_at_fixture_is_refused_and_aged_fixture_serves_governed_classification() {
+        // Self-report reads process-wide config. Keep fixtures that disable the
+        // shim from changing it while this test observes an active manifest.
+        let _lock = crate::test_env::process_env_lock();
         let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_str().unwrap();
+        let _home = ScopedTestEnvVar::set("HOME", Some(root));
+        let _profile = ScopedTestEnvVar::set("USERPROFILE", Some(root));
+        let _xdg = ScopedTestEnvVar::set("XDG_CONFIG_HOME", Some(root));
+        let config = crate::subc_config::user_config_path_from(
+            Some(directory.path().as_os_str()),
+            Some(directory.path().as_os_str()),
+        )
+        .unwrap();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(config, br#"{"github":{"shim":true}}"#).unwrap();
         let paths = StatePaths::from_root(directory.path().to_path_buf());
 
         write_envelope_fixture(
