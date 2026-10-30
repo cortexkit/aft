@@ -101,7 +101,6 @@ mod linux {
                 .cloned()
         }
 
-        #[expect(dead_code, reason = "used by Task 7: scope termination")]
         pub(crate) fn kill(&self, task_id: &str) -> io::Result<()> {
             if let Some(handle) = self.get(task_id) {
                 handle.kill()?;
@@ -665,6 +664,12 @@ mod linux {
 
     impl ScopeHandle {
         pub(crate) fn kill(&self) -> io::Result<()> {
+            #[cfg(test)]
+            KILL_EVENTS.with(|slot| {
+                if let Some(events) = slot.borrow().as_ref() {
+                    events.lock().unwrap().push("scope-kill");
+                }
+            });
             match std::fs::OpenOptions::new()
                 .write(true)
                 .open(self.cgroup.join("cgroup.kill"))
@@ -710,6 +715,24 @@ mod linux {
             }
             Ok(())
         }
+    }
+
+    #[cfg(test)]
+    thread_local! { static KILL_EVENTS: std::cell::RefCell<Option<std::sync::Arc<Mutex<Vec<&'static str>>>>> = const { std::cell::RefCell::new(None) }; }
+    #[cfg(test)]
+    pub(crate) fn with_kill_events_for_test<T>(
+        events: std::sync::Arc<Mutex<Vec<&'static str>>>,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                KILL_EVENTS.with(|slot| slot.take());
+            }
+        }
+        KILL_EVENTS.with(|slot| slot.replace(Some(events)));
+        let _restore = Restore;
+        run()
     }
 
     #[cfg(test)]

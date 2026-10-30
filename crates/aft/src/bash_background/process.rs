@@ -178,6 +178,36 @@ pub(crate) mod test_hooks {
     static MEMBERS_INVISIBLE: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
     static MEMBERS_UNREADABLE: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
     static OUTSIDERS_UNREADABLE: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+    #[cfg(target_os = "linux")]
+    thread_local! { static SIGNAL_EVENTS: std::cell::RefCell<Option<(i32, std::sync::Arc<Mutex<Vec<&'static str>>>)>> = const { std::cell::RefCell::new(None) }; }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_signal_events<T>(
+        pgid: i32,
+        events: std::sync::Arc<Mutex<Vec<&'static str>>>,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                SIGNAL_EVENTS.with(|slot| slot.take());
+            }
+        }
+        SIGNAL_EVENTS.with(|slot| slot.replace(Some((pgid, events))));
+        let _restore = Restore;
+        run()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn signal_event(pgid: i32, event: &'static str) {
+        SIGNAL_EVENTS.with(|slot| {
+            if let Some((group, events)) = slot.borrow().as_ref() {
+                if *group == pgid {
+                    events.lock().unwrap().push(event);
+                }
+            }
+        });
+    }
 
     fn insert(set: &OnceLock<Mutex<HashSet<i32>>>, pgid: i32) {
         set.get_or_init(Default::default)
@@ -873,6 +903,8 @@ pub fn terminate_pgid(pgid: i32, mut child: Option<&mut Child>) {
 
 #[cfg(unix)]
 pub(crate) fn terminate_pgid_with(pgid: i32, mut leader_exited: impl FnMut() -> bool) {
+    #[cfg(all(test, target_os = "linux"))]
+    test_hooks::signal_event(pgid, "group-term");
     unsafe {
         libc::killpg(pgid, libc::SIGTERM);
     }
@@ -892,6 +924,8 @@ pub(crate) fn terminate_pgid_with(pgid: i32, mut leader_exited: impl FnMut() -> 
     if test_hooks::sigkill_denied(pgid) {
         return;
     }
+    #[cfg(all(test, target_os = "linux"))]
+    test_hooks::signal_event(pgid, "group-kill");
     unsafe {
         libc::killpg(pgid, libc::SIGKILL);
     }

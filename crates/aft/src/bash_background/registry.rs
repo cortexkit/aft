@@ -4949,6 +4949,22 @@ impl BgTaskRegistry {
         Ok(None)
     }
 
+    pub(crate) fn kill_task_scope(&self, task_id: &str) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        {
+            let unit = super::task_scope::scope_unit(task_id).map_err(|error| error.to_string())?;
+            self.inner
+                .task_scopes
+                .kill(task_id)
+                .map_err(|error| format!("failed to kill task scope {unit}: {error}"))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = task_id;
+            Ok(())
+        }
+    }
+
     pub(crate) fn memory_limit_exceeded(&self, task: &Arc<BgTask>) -> Option<String> {
         let mut state = task.lock_state().ok()?;
         if (state.metadata.remote.is_some() && !state.metadata.local_fallback_started)
@@ -5450,6 +5466,7 @@ impl BgTaskRegistry {
         }
         if let Err(error) = self.arm_secret_proxy(&spawn_plan, &task_id, child_pid) {
             super::process::terminate_pgid(child_pid as i32, None);
+            self.kill_task_scope(&task_id)?;
             if let Some(scope) = scope.as_ref() {
                 let _ = scope.stop();
             }
@@ -5459,6 +5476,7 @@ impl BgTaskRegistry {
         if let Some(mut monitor) = memory_monitor.take() {
             if let Err(error) = monitor.attach(child_pid) {
                 super::process::terminate_pgid(child_pid as i32, None);
+                self.kill_task_scope(&task_id)?;
                 if let Some(scope) = scope.as_ref() {
                     let _ = scope.stop();
                 }
@@ -7685,6 +7703,7 @@ impl BgTaskRegistry {
                             metadata.child_pid,
                             None,
                         );
+                        self.kill_task_scope(&metadata.task_id)?;
                         settle_killed_process_group(&metadata.task_id, metadata.pgid);
                     }
                     let recovered = "recovered from inconsistent killing state on replay";
@@ -13503,6 +13522,7 @@ impl BgTaskRegistry {
             }
         };
 
+        let mut scope_killed = false;
         match plan {
             KillSignalPlan::Nothing => {}
             #[cfg(any(windows, test))]
@@ -13554,6 +13574,8 @@ impl BgTaskRegistry {
                     crate::slog_info!("scope diagnostic phase=signal_started task={task_id} child_pid={child_pid:?} elapsed_ms={}", diagnostic_start.elapsed().as_millis());
                 }
                 terminate_piped_task(&task.task_id, pgid, child_pid, child.as_mut());
+                let scope_result = self.kill_task_scope(&task.task_id);
+                scope_killed = true;
                 #[cfg(feature = "test-timing-hooks")]
                 if scope_diagnostic {
                     crate::slog_info!(
@@ -13576,6 +13598,7 @@ impl BgTaskRegistry {
                 state.kill_in_flight = false;
                 state.child_exit_observed |= child_exit_observed;
                 task.kill_settled.notify_all();
+                scope_result?;
                 // A terminal state published while the signal was in flight
                 // (the task's own exit marker, read by the watchdog) stands.
                 if !state.metadata.status.is_terminal() {
@@ -13668,6 +13691,9 @@ impl BgTaskRegistry {
             }
         }
 
+        if !scope_killed {
+            self.kill_task_scope(&task.task_id)?;
+        }
         if terminalized {
             #[cfg(test)]
             wait_on_kill_signal_gate_for_test(&format!("{task_id}:terminal-published"));
@@ -13702,6 +13728,7 @@ impl BgTaskRegistry {
     #[cfg(unix)]
     fn terminate_terminal_survivors(&self, task: &Arc<BgTask>, pgid: i32) -> Result<(), String> {
         terminate_pgid(pgid, None);
+        self.kill_task_scope(&task.task_id)?;
         settle_killed_process_group(&task.task_id, Some(pgid));
         let sample = live_process_group_members(pgid);
         let mut db = DeferredDbWrites::new(self, task);

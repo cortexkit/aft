@@ -203,6 +203,117 @@ fn task_scope_memory_denied_setup_keeps_payload_gate_closed() {
 }
 
 #[test]
+fn task_scope_kill_reaches_setsid_descendant() {
+    if !manager_available() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let r = BgTaskRegistry::default();
+    let command = "setsid /bin/sh -c 'trap \"\" TERM; echo $$ > escaped; while :; do sleep 1; done' & while [ ! -s escaped ]; do sleep .02; done; sleep 60";
+    let id = scope_spawn(
+        &r,
+        root.path(),
+        command,
+        super::super::HardKill::Default,
+        None,
+    );
+    let _stop = StopOnDrop(id.clone());
+    until(|| root.path().join("escaped").exists());
+    let scope = super::super::task_scope::lookup(&id).unwrap().unwrap();
+    r.kill(&id, "task-scope").unwrap();
+    until(
+        || match std::fs::read_to_string(scope.cgroup().join("cgroup.events")) {
+            Ok(text) => text.lines().any(|line| line == "populated 0"),
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        },
+    );
+}
+
+#[test]
+fn task_scope_kill_follows_group_signal_order() {
+    let root = tempfile::tempdir().unwrap();
+    let r = BgTaskRegistry::default();
+    r.inner.shutdown.store(true, Ordering::SeqCst);
+    let id = r
+        .spawn(
+            SpawnPlan::Unsandboxed,
+            "echo ready; sleep 60",
+            "order".into(),
+            root.path().into(),
+            HashMap::new(),
+            super::super::HardKill::Default,
+            None,
+            root.path().into(),
+            8,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+    let task = r.task(&id).unwrap();
+    until(|| {
+        std::fs::read_to_string(&task.paths.stdout)
+            .unwrap_or_default()
+            .contains("ready")
+    });
+    let pgid = task.lock_state().unwrap().metadata.pgid.unwrap();
+    let cgroup = root.path().join("fake-cgroup");
+    std::fs::create_dir(&cgroup).unwrap();
+    std::fs::write(cgroup.join("cgroup.kill"), "0").unwrap();
+    r.inner
+        .task_scopes
+        .register(super::super::task_scope::handle_for_test(
+            &id,
+            cgroup.clone(),
+        ));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    super::super::process::test_hooks::with_signal_events(pgid, events.clone(), || {
+        super::super::task_scope::with_kill_events_for_test(events.clone(), || {
+            r.kill(&id, "order").unwrap()
+        })
+    });
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["group-term", "group-kill", "scope-kill"]
+    );
+    assert_eq!(
+        std::fs::read_to_string(cgroup.join("cgroup.kill")).unwrap(),
+        "1"
+    );
+}
+
+#[test]
+fn task_scope_kill_reports_live_controller_permission_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let id = random_slug();
+    let control = root.path().join("cgroup.kill");
+    std::fs::write(&control, "0").unwrap();
+    std::fs::set_permissions(&control, std::fs::Permissions::from_mode(0o400)).unwrap();
+    let r = BgTaskRegistry::default();
+    r.inner
+        .task_scopes
+        .register(super::super::task_scope::handle_for_test(
+            &id,
+            root.path().into(),
+        ));
+    assert!(r
+        .kill_task_scope(&id)
+        .unwrap_err()
+        .contains(&format!("failed to kill task scope aft-task-{id}.scope")));
+    std::fs::remove_file(&control).unwrap();
+    assert!(
+        r.kill_task_scope(&id).is_err(),
+        "live cgroup without its controller was accepted"
+    );
+    let gone = root.path().join("collected");
+    r.inner
+        .task_scopes
+        .register(super::super::task_scope::handle_for_test(&id, gone));
+    r.kill_task_scope(&id).unwrap();
+}
+
+#[test]
 fn task_scope_actor_created_after_daemon_attach_has_named_membership() {
     if !manager_available() {
         return;
