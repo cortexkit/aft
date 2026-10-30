@@ -270,13 +270,15 @@ pub fn view_dir(storage: &Path, family: &str, scope: &str) -> Result<PathBuf> {
     Ok(family_dir(storage, family)?.join("views").join(scope))
 }
 
-static FREE_SPACE: Mutex<Option<(u64, u64)>> = Mutex::new(None);
-/// Process-local probe override for integration children. Production never calls it.
+thread_local! {
+    static FREE_SPACE: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+}
+/// Overrides the free-space probe only on the calling thread. Production never calls it.
+/// Other test threads must keep probing their own storage volume, even while a
+/// reservation-refusal test simulates a full device.
 #[doc(hidden)]
 pub fn set_free_space_for_test(free: u64, capacity: u64) {
-    *FREE_SPACE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((free, capacity));
+    FREE_SPACE.set(Some((free, capacity)));
 }
 /// The platform probe itself, bypassing the test override.
 #[cfg(test)]
@@ -284,10 +286,7 @@ pub(crate) fn probe_free_space_for_test(path: &Path) -> Option<(u64, u64)> {
     probe_free_space(path)
 }
 fn free_space(path: &Path) -> Option<(u64, u64)> {
-    if let Some(value) = *FREE_SPACE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-    {
+    if let Some(value) = FREE_SPACE.get() {
         return Some(value);
     }
     probe_free_space(path)
@@ -2187,11 +2186,10 @@ impl PlaneReader {
     }
 }
 
-/// Serializes tests that depend on the process-wide free-space override and
-/// sets it to unlimited, so admission in other modules' tests never races the
-/// refusal cases in `tests`.
+/// Retains the shared v3 test lock and installs unlimited space on the calling
+/// thread. Dropping the guard restores the previous probe, including on panic.
 #[cfg(test)]
-pub(crate) fn serial_for_test() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn serial_for_test() -> tests::FreeSpaceTestGuard {
     tests::serial()
 }
 

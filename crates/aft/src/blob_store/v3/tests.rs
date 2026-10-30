@@ -4,14 +4,42 @@ use tempfile::tempdir;
 
 const A: &str = "0123456789abcdef";
 const B: &str = "fedcba9876543210";
-pub(super) fn serial() -> MutexGuard<'static, ()> {
+pub(crate) struct FreeSpaceTestGuard {
+    previous: Option<(u64, u64)>,
+    _serial: MutexGuard<'static, ()>,
+}
+impl Drop for FreeSpaceTestGuard {
+    fn drop(&mut self) {
+        FREE_SPACE.set(self.previous);
+    }
+}
+pub(super) fn serial() -> FreeSpaceTestGuard {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let guard = LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    set_free_space_for_test(u64::MAX, u64::MAX / 2);
-    guard
+    FreeSpaceTestGuard {
+        previous: FREE_SPACE.replace(Some((u64::MAX, u64::MAX / 2))),
+        _serial: guard,
+    }
+}
+
+#[test]
+fn free_space_override_guard_restores_after_unwind() {
+    std::thread::spawn(|| {
+        assert_eq!(FREE_SPACE.get(), None);
+        let panic = std::panic::catch_unwind(|| {
+            let _guard = serial();
+            set_free_space_for_test(1, 1 << 40);
+            assert_eq!(FREE_SPACE.get(), Some((1, 1 << 40)));
+            panic!("unwind the free-space test guard");
+        });
+        assert!(panic.is_err());
+        assert_eq!(FREE_SPACE.get(), None);
+    })
+    .join()
+    .unwrap();
 }
 fn key() -> FamilyKey {
     FamilyKey::new(FamilyPlane::Semantic, [7; 32])
