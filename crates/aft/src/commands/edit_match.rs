@@ -203,6 +203,16 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         return edit::no_change_response(&req.id);
     }
 
+    let version = match edit::mutation::Version::read(path.as_path()) {
+        Ok(version) => version,
+        Err(error) => return Response::error(&req.id, "io_error", error.to_string()),
+    };
+    edit::mutation::before_check(path.as_path());
+    let file_locks = edit::mutation::lock_files(&[path.as_path()]);
+    if let Err(error) = version.check(path.as_path()) {
+        return Response::error(&req.id, error.code(), error.to_string());
+    }
+
     let _mutation = crate::runtime_drain::record_file_mutation(ctx, [path.as_path()]);
     if create_dirs {
         if let Some(parent) = path.parent() {
@@ -343,6 +353,9 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
             ));
         }
     }
+
+    drop(file_handle);
+    drop(file_locks);
 
     // Run the project formatter on the appended file. `auto_format` honors
     // `config.format_on_edit` internally and returns `(false, None)` when
@@ -755,6 +768,7 @@ fn handle_glob_edit_match_inner(
         original_source: String,
         new_source: String,
         capture: Option<CapturedRegularFile>,
+        version: edit::mutation::Version,
         count: usize,
     }
     let mut pending: Vec<PendingEdit> = Vec::new();
@@ -776,6 +790,7 @@ fn handle_glob_edit_match_inner(
             });
             continue;
         }
+        let mut version = edit::mutation::Version::existing(path, std::sync::Arc::from([]));
         let (source, capture) = match CapturedRegularFile::read_text(path) {
             Ok(Some((capture, source))) => (source, Some(capture)),
             Ok(None) => match std::fs::read_to_string(path) {
@@ -808,6 +823,7 @@ fn handle_glob_edit_match_inner(
         let count = positions.len();
         let new_source = source.replace(match_str, replacement);
         let file_str = path.display().to_string();
+        version.set_bytes(std::sync::Arc::from(source.as_bytes()));
 
         pending.push(PendingEdit {
             path: validated_path,
@@ -815,6 +831,7 @@ fn handle_glob_edit_match_inner(
             original_source: source,
             new_source,
             capture,
+            version,
             count,
         });
         total_replacements += count;
@@ -892,6 +909,16 @@ fn handle_glob_edit_match_inner(
         pending.iter().map(|edit| edit.path.as_path()),
     );
 
+    for pending_edit in &pending {
+        edit::mutation::before_check(&pending_edit.path);
+    }
+    let lock_paths: Vec<_> = pending.iter().map(|edit| edit.path.as_path()).collect();
+    let file_locks = edit::mutation::lock_files(&lock_paths);
+    for pending_edit in &pending {
+        if let Err(error) = pending_edit.version.check(&pending_edit.path) {
+            return Response::error(&req.id, error.code(), error.to_string());
+        }
+    }
     let mut captures = pending
         .iter()
         .filter_map(|edit| {
@@ -950,14 +977,16 @@ fn handle_glob_edit_match_inner(
     let mut written_paths: Vec<PathBuf> = Vec::new();
 
     for edit in &pending {
-        if let Err(e) = std::fs::write(&edit.path, &edit.new_source) {
+        if let Err(e) = edit::atomic_write_source(&edit.path, edit.new_source.as_bytes()) {
             let mut rollback_ok = true;
             if let Some(name) = &checkpoint_name {
                 rollback_ok =
                     restore_glob_checkpoint(ctx, req.session(), name, &written_paths).is_ok();
                 delete_glob_checkpoint(ctx, req.session(), name);
             }
-            if let Err(rollback_error) = std::fs::write(&edit.path, &edit.original_source) {
+            if let Err(rollback_error) =
+                edit::atomic_write_source(&edit.path, edit.original_source.as_bytes())
+            {
                 crate::slog_warn!(
                     "glob edit_match rollback: failed to restore attempted file {}: {}",
                     edit.path.display(),
@@ -978,6 +1007,8 @@ fn handle_glob_edit_match_inner(
         }
         written_paths.push(edit.path.clone());
     }
+
+    drop(file_locks);
 
     // --- Phase 2: Format all changed files (after all writes are done) ---
     //
@@ -1924,6 +1955,9 @@ fn handle_single_file_edit_match(
     ) {
         Ok(r) => r,
         Err(e) => {
+            ctx.backup()
+                .lock()
+                .discard_operation_entries(req.session(), op_id);
             return Response::error(&req.id, e.code(), e.to_string());
         }
     };

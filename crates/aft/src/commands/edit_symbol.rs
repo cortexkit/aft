@@ -335,6 +335,9 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     ) {
         Ok(r) => r,
         Err(e) => {
+            ctx.backup()
+                .lock()
+                .discard_operation_entries(req.session(), &op_id);
             return Response::error(&req.id, e.code(), e.to_string());
         }
     };

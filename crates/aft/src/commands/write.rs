@@ -62,7 +62,7 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
     // See GitHub #45.
     let (original_bytes, observation) = if existed {
         match edit::read_edit_bytes(path.as_path()) {
-            Ok((content, observation)) => (content, Some(observation)),
+            Ok((content, observation)) => (content, observation),
             Err(error) => {
                 crate::slog_warn!(
                     "write: failed to read existing file before diff for {}: {}",
@@ -73,7 +73,10 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
             }
         }
     } else {
-        (std::sync::Arc::<[u8]>::from([]), None)
+        (
+            std::sync::Arc::<[u8]>::from([]),
+            edit::EditObservation::missing(path.as_path()),
+        )
     };
     // Binary originals participate in identity and recovery, but cannot supply
     // an honest text-diff baseline.
@@ -103,24 +106,14 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
     // Auto-backup existing files before overwriting. For create-only writes,
     // record a tombstone so operation undo removes the created file.
     let backup_id = if existed {
-        let backup = if let Some(observation) = observation.as_ref() {
-            edit::auto_backup_observed(
-                ctx,
-                req.session(),
-                path.as_path(),
-                "write: pre-write backup",
-                Some(&op_id),
-                observation,
-            )
-        } else {
-            edit::auto_backup(
-                ctx,
-                req.session(),
-                path.as_path(),
-                "write: pre-write backup",
-                Some(&op_id),
-            )
-        };
+        let backup = edit::auto_backup_observed(
+            ctx,
+            req.session(),
+            path.as_path(),
+            "write: pre-write backup",
+            Some(&op_id),
+            &observation,
+        );
         match backup {
             Ok(id) => id,
             Err(e) => {
@@ -161,33 +154,21 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Write, format, and validate via shared pipeline
     let tool_policy = &crate::sandbox_spawn::ToolLaunchPolicy::for_request(ctx);
-    let written = if let (Some(observation), Some(original)) = (observation.as_ref(), original) {
-        edit::write_format_validate_observed(
-            tool_policy,
-            path.as_path(),
-            content,
-            &ctx.config(),
-            &req.params,
-            original,
-            observation,
-        )
-    } else {
-        edit::write_format_validate(
-            tool_policy,
-            path.as_path(),
-            content,
-            &ctx.config(),
-            &req.params,
-        )
-    };
+    let written = edit::write_format_validate_bytes_observed(
+        tool_policy,
+        path.as_path(),
+        content,
+        &ctx.config(),
+        &req.params,
+        original,
+        &observation,
+    );
     let mut write_result = match written {
         Ok(r) => r,
         Err(e) => {
-            if !existed {
-                ctx.backup()
-                    .lock()
-                    .discard_operation_entries(req.session(), &op_id);
-            }
+            ctx.backup()
+                .lock()
+                .discard_operation_entries(req.session(), &op_id);
             return Response::error(&req.id, e.code(), e.to_string());
         }
     };
