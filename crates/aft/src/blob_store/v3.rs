@@ -2199,7 +2199,7 @@ pub(crate) fn serial_for_test() -> std::sync::MutexGuard<'static, ()> {
 pub(crate) fn with_changing_namespace_for_test<T>(
     storage: &Path,
     family: &str,
-    run: impl FnOnce() -> T,
+    run: impl FnOnce(&std::sync::atomic::AtomicUsize) -> T,
 ) -> (T, usize) {
     tests::with_changing_namespace(storage, family, run)
 }

@@ -148,7 +148,7 @@ pub(super) fn measurement_recheck_hook() -> Result<()> {
 pub(super) fn with_changing_namespace<T>(
     storage: &Path,
     family: &str,
-    run: impl FnOnce() -> T,
+    run: impl FnOnce(&std::sync::atomic::AtomicUsize) -> T,
 ) -> (T, usize) {
     struct Restore(Option<RecheckHook>);
     impl Drop for Restore {
@@ -158,9 +158,11 @@ pub(super) fn with_changing_namespace<T>(
     }
     let dir = view_dir(storage, family, "measurement-writer").unwrap();
     fs::create_dir_all(&dir).unwrap();
+    let completed = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|scope| {
         let (write, requests) = crossbeam_channel::bounded(0);
         let (done, writes) = crossbeam_channel::bounded(0);
+        let completed = &completed;
         let writer = scope.spawn(move || {
             let mut count = 0;
             while requests.recv().is_ok() {
@@ -175,6 +177,7 @@ pub(super) fn with_changing_namespace<T>(
                     Ok(())
                 })();
                 count += 1;
+                completed.store(count, std::sync::atomic::Ordering::SeqCst);
                 if done.send(result).is_err() {
                     break;
                 }
@@ -187,7 +190,7 @@ pub(super) fn with_changing_namespace<T>(
                 writes.recv().unwrap()
             })))
         }));
-        let result = run();
+        let result = run(completed);
         drop(restore);
         (result, writer.join().unwrap())
     })

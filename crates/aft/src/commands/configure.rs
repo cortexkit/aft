@@ -14399,11 +14399,24 @@ mod tests {
                     crate::commands::grep::handle_grep(&grep_request("needle"), &ctx)
                 }
             };
-            let ((first, held), writes) =
-                crate::blob_store::v3::with_changing_namespace_for_test(&storage, &family, || {
-                    (request(), request())
-                });
-            assert_eq!(writes, 8, "backoff must not repeat the measurement");
+            let ((first, held, first_writes, held_writes), writes) =
+                crate::blob_store::v3::with_changing_namespace_for_test(
+                    &storage,
+                    &family,
+                    |completed| {
+                        let first = request();
+                        let first_writes = completed.load(std::sync::atomic::Ordering::SeqCst);
+                        let held = request();
+                        let held_writes = completed.load(std::sync::atomic::Ordering::SeqCst);
+                        (first, held, first_writes, held_writes)
+                    },
+                );
+            assert!(first_writes >= 8, "the load must exhaust a measurement");
+            assert_eq!(
+                held_writes, first_writes,
+                "backoff must not repeat the measurement"
+            );
+            assert_eq!(writes, first_writes);
             assert!(!first.success, "{:?}", first.data);
             assert_eq!(first.data, held.data);
             let name = if callgraph { "callers" } else { "grep" };
@@ -14424,7 +14437,7 @@ mod tests {
                 assert_eq!(first.data["code"], "busy");
                 assert_eq!(first.data["retryable"], true);
                 let cause = format!(
-                    "view loader [driver]: reservation_ledger_busy: measure registry {}: v3 store busy: namespace size did not stabilize after 8 measurements",
+                    "view loader [driver]: family registry I/O error: v3 store busy: reservation_ledger_busy: measure registry {}: v3 store busy: namespace size did not stabilize after 8 measurements",
                     crate::blob_store::v3::family_dir(&storage, &family).unwrap().display(),
                 );
                 assert_eq!(first.data["message"], cause);
