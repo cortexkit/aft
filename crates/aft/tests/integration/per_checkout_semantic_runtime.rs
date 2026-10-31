@@ -720,10 +720,25 @@ fn views_on_semantic_member_stores_no_call_graph_database() {
         if edit_published {
             break (semantic_derived, callgraph_derived);
         }
-        assert!(
-            Instant::now() < deadline,
-            "the semantic member never published a generation with the edit"
-        );
+        if Instant::now() >= deadline {
+            let mut members = Vec::new();
+            for family in std::fs::read_dir(storage.path().join("blobs/v3")).unwrap() {
+                let views = family.unwrap().path().join("views");
+                for member in std::fs::read_dir(&views).into_iter().flatten() {
+                    let member = member.unwrap().path();
+                    let files: Vec<_> = std::fs::read_dir(&member)
+                        .into_iter()
+                        .flatten()
+                        .map(|file| file.unwrap().file_name().to_string_lossy().into_owned())
+                        .collect();
+                    members.push((member.file_name().unwrap().to_owned(), files));
+                }
+            }
+            panic!(
+                "the semantic member never published a generation with the edit; status={:?}; members={members:?}",
+                ctx.semantic_index_status().read().unwrap()
+            );
+        }
         thread::sleep(Duration::from_millis(50));
     };
     assert!(

@@ -43,6 +43,25 @@ use super::snapshot::{DiskState, LiveDelta, Snapshot};
 /// register (for example the call graph of a lexical-only view).
 pub const UNREGISTERED_PRODUCER: &str = "unregistered";
 
+/// The producers of a checkout's semantic member, for building it and for
+/// opening it by producers (the parent folder worker does).
+///
+/// The call graph is unregistered, as for lexical-only views: the checkout's
+/// call graph is its own member (`<scope>.callgraph`), and nothing reads one
+/// from this member. A registered call-graph producer made this member's base
+/// and every publication extract call-graph facts and write a resolved
+/// call-graph database of their own (a clone where the filesystem supports
+/// clones, a full copy elsewhere), rebuilt whenever only embeddings changed.
+/// Unregistered, the base keeps its call-graph entries pending and builds no
+/// database.
+pub(crate) fn member_producers(trigram: String, semantic: String) -> Producers {
+    Producers {
+        trigram,
+        semantic: Some(semantic),
+        callgraph: UNREGISTERED_PRODUCER.into(),
+    }
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
@@ -176,19 +195,7 @@ impl CheckoutSemantic {
         wake: Weak<CheckoutSemanticSlot>,
     ) -> Result<Self, String> {
         let plane = shared_plane(&storage.artifacts, producer);
-        // The call graph is unregistered here, as for lexical-only views: the
-        // checkout's call graph is its own member (`<scope>.callgraph`), and
-        // nothing reads one from this member. A registered call-graph producer
-        // made this member's base and every publication extract call-graph
-        // facts and write a resolved call-graph database of their own, a clone
-        // on filesystems that support clones and a full copy elsewhere, and
-        // rebuild it whenever only embeddings changed. Unregistered, the
-        // base keeps its call-graph entries pending and builds no database.
-        let producers = Producers {
-            trigram: policy.fingerprint_hex(),
-            semantic: Some(plane.semantic_producer().id()),
-            callgraph: UNREGISTERED_PRODUCER.into(),
-        };
+        let producers = member_producers(policy.fingerprint_hex(), plane.semantic_producer().id());
         let composite: Arc<dyn CompositePlane> = plane.clone();
         let adapter: Arc<dyn PlaneAdapter> = plane.clone();
         let trigram = Arc::new(super::first_load::TrigramBridge::new(
