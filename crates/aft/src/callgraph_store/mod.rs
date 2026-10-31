@@ -2062,6 +2062,7 @@ pub enum CallGraphStoreError {
     },
     Suspended(crate::build_breaker::BuildSuspension),
     Superseded,
+    CorpusSnapshotMissing(PathBuf),
     StaleFiles(Vec<String>),
 }
 
@@ -2120,6 +2121,11 @@ impl fmt::Display for CallGraphStoreError {
             Self::Superseded => {
                 write!(formatter, "callgraph store build superseded before publish")
             }
+            Self::CorpusSnapshotMissing(path) => write!(
+                formatter,
+                "callgraph corpus snapshot lookup invariant failed: {} was not admitted",
+                path.display()
+            ),
             Self::StaleFiles(files) => {
                 write!(
                     formatter,
@@ -8058,10 +8064,9 @@ impl CallGraphStore {
 
         let fingerprint = staged_corpus_fingerprint(&conn, &self.project_root, corpus)?;
         if corpus.is_some_and(|corpus| corpus.fingerprint != fingerprint) {
-            return Err(CallGraphStoreError::StaleFiles(vec![self
-                .project_root
-                .display()
-                .to_string()]));
+            return Err(CallGraphStoreError::Unavailable(
+                "callgraph corpus inventory changed after admission".to_string(),
+            ));
         }
         Ok(fingerprint)
     }
@@ -13553,9 +13558,10 @@ fn staged_content_matches(
             return Ok(true);
         }
         return Ok(corpus
-            .files
-            .get(path)
-            .and_then(|file| file.hash.as_ref().ok())
+            .required_file(project_root, path)?
+            .hash
+            .as_ref()
+            .ok()
             .is_some_and(|hash| staged_hash == hash_to_hex(*hash)));
     }
     #[cfg(test)]
@@ -13683,10 +13689,12 @@ fn staged_corpus_fingerprint(
         let rel_path = row.get::<_, String>(0)?;
         let path = project_root.join(rel_path);
         if let Some(corpus) = corpus {
-            let file = corpus
-                .files
-                .get(&path)
-                .ok_or_else(|| CallGraphStoreError::StaleFiles(vec![path.display().to_string()]))?;
+            let file = corpus.file(project_root, &path)?.ok_or_else(|| {
+                CallGraphStoreError::Unavailable(format!(
+                    "callgraph corpus inventory changed after admission: {} was added",
+                    path.display()
+                ))
+            })?;
             fingerprint.add_hash(
                 project_root,
                 &path,
@@ -15103,13 +15111,16 @@ impl BuildPool {
         let extract_one =
             |path: &PathBuf| match build_file_extract_in_corpus(project_root, path, memo, corpus) {
                 Ok(extract) => Ok(Ok(extract)),
-                Err(error @ CallGraphStoreError::StaleFiles(_)) => Err(error),
+                Err(
+                    error @ (CallGraphStoreError::StaleFiles(_)
+                    | CallGraphStoreError::CorpusSnapshotMissing(_)),
+                ) => Err(error),
                 Err(error) => {
                     let abs_path = normalize_file_path(project_root, path)
                         .unwrap_or_else(|_| path.to_path_buf());
                     let rel_path = relative_path(project_root, &abs_path);
                     let freshness = if let Some(corpus) = corpus {
-                        corpus.freshness(&abs_path)
+                        corpus.freshness(project_root, &abs_path)?
                     } else {
                         cache_freshness::collect(&abs_path).ok()
                     };
@@ -15358,7 +15369,7 @@ fn build_file_extract_in_corpus(
     work_counts::note_parse(&abs_path);
     let read = source_stat::read_source(&abs_path, |bytes| {
         if let Some(corpus) = corpus {
-            corpus.verify_bytes(&abs_path, bytes)?;
+            corpus.verify_bytes(project_root, &abs_path, bytes)?;
         }
         Ok(())
     });
@@ -15366,7 +15377,7 @@ fn build_file_extract_in_corpus(
         Err(CallGraphStoreError::Io(error))
             if corpus.is_some() && error.kind() != std::io::ErrorKind::InvalidData =>
         {
-            let expected = &corpus.unwrap().files[&abs_path].hash;
+            let expected = &corpus.unwrap().required_file(project_root, &abs_path)?.hash;
             if expected.as_ref().err() != Some(&error.to_string()) {
                 return Err(CallGraphStoreError::StaleFiles(vec![rel_path]));
             }
@@ -24683,26 +24694,44 @@ pub(crate) fn with_corpus_memo<R>(memo: std::sync::Weak<CorpusMemo>, run: impl F
 }
 
 impl CorpusSnapshot {
-    fn freshness(&self, path: &Path) -> Option<FileFreshness> {
-        let hash = *self.files.get(path)?.hash.as_ref().ok()?;
-        let metadata = std::fs::metadata(path).ok()?;
-        Some(FileFreshness {
+    fn file(&self, project_root: &Path, path: &Path) -> Result<Option<&CorpusFile>> {
+        // Admission and lookups must share canonical absolute keys, even when
+        // the root retains a symlink, a Windows short name or a verbatim prefix.
+        let key = normalize_file_path(project_root, path)?;
+        Ok(self.files.get(&key))
+    }
+
+    fn required_file(&self, project_root: &Path, path: &Path) -> Result<&CorpusFile> {
+        // Inventory changes are refused before extraction. A miss after that
+        // check is a lookup invariant failure, not evidence of changed bytes.
+        self.file(project_root, path)?
+            .ok_or_else(|| CallGraphStoreError::CorpusSnapshotMissing(path.to_path_buf()))
+    }
+
+    fn freshness(&self, project_root: &Path, path: &Path) -> Result<Option<FileFreshness>> {
+        let file = self.required_file(project_root, path)?;
+        let Ok(hash) = file.hash.as_ref() else {
+            return Ok(None);
+        };
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return Ok(None);
+        };
+        let Ok(mtime) = metadata.modified() else {
+            return Ok(None);
+        };
+        Ok(Some(FileFreshness {
             size: metadata.len(),
-            mtime: metadata.modified().ok()?,
+            mtime,
             content_hash: if metadata.len() > cache_freshness::CONTENT_HASH_SIZE_CAP {
                 cache_freshness::zero_hash()
             } else {
-                hash
+                *hash
             },
-        })
+        }))
     }
 
-    fn verify_bytes(&self, path: &Path, bytes: &[u8]) -> Result<()> {
-        if self
-            .files
-            .get(path)
-            .and_then(|file| file.hash.as_ref().ok())
-            == Some(&blake3::hash(bytes))
+    fn verify_bytes(&self, project_root: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+        if self.required_file(project_root, path)?.hash.as_ref().ok() == Some(&blake3::hash(bytes))
         {
             return Ok(());
         }
@@ -24735,15 +24764,17 @@ fn corpus_snapshot_for(project_root: &Path, files: &[PathBuf]) -> Result<Arc<Cor
         // Native identity and change time catch in-place rewrites that restore
         // size/mtime. Unsupported filesystems conservatively rehash on probes.
         let before = crate::views::NativeStat::read(&path).ok();
-        let cached = previous
-            .as_ref()
-            .and_then(|corpus| corpus.files.get(&path))
-            .filter(|file| {
-                file.stamp
-                    .as_ref()
-                    .zip(before.as_ref())
-                    .is_some_and(|(old, current)| old.reusable(current, file.observed_ns))
-            });
+        let cached = if let Some(corpus) = &previous {
+            corpus.file(project_root, &path)?
+        } else {
+            None
+        }
+        .filter(|file| {
+            file.stamp
+                .as_ref()
+                .zip(before.as_ref())
+                .is_some_and(|(old, current)| old.reusable(current, file.observed_ns))
+        });
         let file = if let Some(file) = cached {
             file.clone()
         } else {
@@ -29701,6 +29732,67 @@ export function leaf() {}
             assert!(!probe.paths().iter().any(|path| files.contains(path)));
             eprintln!("256-source suspension probe after build: 0 source opens");
         }
+    }
+
+    #[test]
+    fn corpus_snapshot_missing_lookup_is_not_a_byte_change() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let admitted = root.join("admitted.ts");
+        let source = b"export function entry() {}\n";
+        fs::write(&admitted, source).unwrap();
+        let corpus = corpus_snapshot_for(root, &[admitted]).unwrap();
+        let unadmitted = root.join("unadmitted.ts");
+        fs::write(&unadmitted, source).unwrap();
+
+        assert!(matches!(
+            corpus.verify_bytes(root, &unadmitted, source),
+            Err(CallGraphStoreError::CorpusSnapshotMissing(_))
+        ));
+        assert!(matches!(
+            corpus.freshness(root, &unadmitted),
+            Err(CallGraphStoreError::CorpusSnapshotMissing(_))
+        ));
+        assert!(matches!(
+            BuildPool::new().build_extracts(
+                root,
+                &[unadmitted],
+                &callgraph::ModuleResolutionMemo::default(),
+                Some(&corpus),
+            ),
+            Err(CallGraphStoreError::CorpusSnapshotMissing(_))
+        ));
+    }
+
+    #[test]
+    fn cold_build_inventory_changes_are_not_byte_changes() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let admitted = root.join("admitted.ts");
+        fs::write(&admitted, "export function entry() {}\n").unwrap();
+        let corpus = corpus_snapshot_for(root, &[]).unwrap();
+        let store = CallGraphStore::open(root.join(".store"), root.to_path_buf()).unwrap();
+        let added = root.join("added.ts");
+        fs::write(&added, "export function leaf() {}\n").unwrap();
+        let error = store
+            .stage_cold_build_file_inventory_checked(&[], Some(&corpus))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CallGraphStoreError::Unavailable(ref reason)
+                if reason.contains("inventory changed after admission") && reason.contains("was added")
+        ));
+
+        fs::remove_file(added).unwrap();
+        fs::remove_file(admitted).unwrap();
+        let error = store
+            .stage_cold_build_file_inventory_checked(&[], Some(&corpus))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CallGraphStoreError::Unavailable(ref reason)
+                if reason.contains("inventory changed after admission")
+        ));
     }
 
     #[test]

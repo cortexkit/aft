@@ -1613,8 +1613,9 @@ fn cold_callgraph_build_through_symlinked_project_root() {
     }
 
     let store_dir = dir.path().join("store");
-    let (store, stats) = CallGraphStore::cold_build_with_lease(store_dir.clone(), root.clone(), &[])
-        .expect("an unchanged project reached through a symlink builds a cold call graph");
+    let (store, stats) =
+        CallGraphStore::cold_build_with_lease(store_dir.clone(), root.clone(), &[])
+            .expect("an unchanged project reached through a symlink builds a cold call graph");
     assert_eq!(stats.files, 1);
     drop(store);
     let store = CallGraphStore::open_readonly(store_dir, root)
