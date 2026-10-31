@@ -33,3 +33,4 @@ mod daemon_search_test;
 mod idle_root_watcher_test;
 mod semantic_refresh_watcher_test;
 mod watcher_search_semantic_regression_test;
+mod windows_directory_move_test;
