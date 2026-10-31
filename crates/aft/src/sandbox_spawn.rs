@@ -2156,10 +2156,11 @@ fn build_relaxed_profile(
             .read_metadata_allow
             .extend(git.metadata_allow.iter().cloned());
         for key in ["core.hooksPath", "mason.originalHooksPath"] {
-            if !git
-                .configured_paths
-                .iter()
-                .any(|(existing, _)| existing == key)
+            if !git.repository_paths_resolved
+                && !git
+                    .configured_paths
+                    .iter()
+                    .any(|(existing, _)| existing == key)
             {
                 let mut metadata = Vec::new();
                 if let Some((_, path)) = configured_git_path(root, key, &mut metadata)? {
@@ -2391,10 +2392,11 @@ fn checkout_control_denies(root: &Path, git: &GitPolicy) -> Result<Vec<PathBuf>,
             .map(|(_, path)| path.clone()),
     );
     for key in ["core.hooksPath", "mason.originalHooksPath"] {
-        if !git
-            .configured_paths
-            .iter()
-            .any(|(existing, _)| existing == key)
+        if !git.repository_paths_resolved
+            && !git
+                .configured_paths
+                .iter()
+                .any(|(existing, _)| existing == key)
         {
             if let Some((_, path)) = configured_git_path(root, key, &mut Vec::new())? {
                 denies.push(path);
@@ -3100,6 +3102,10 @@ struct GitPolicy {
     /// and the shared common directory of the main repository.
     linked: Option<(PathBuf, PathBuf)>,
     configured_paths: Vec<(String, PathBuf)>,
+    // True after querying repository hook/excludes keys for a jailed worker,
+    // including unset keys. Resolution outside a worker jail omits those
+    // queries, so control-file deny/grant builders must query missing keys.
+    repository_paths_resolved: bool,
     metadata_allow: Vec<PathBuf>,
 }
 
@@ -4004,6 +4010,7 @@ fn resolve_git_policy_uncached(
                     hooks: vec![dot_git.join("hooks")],
                     linked: None,
                     configured_paths: Vec::new(),
+                    repository_paths_resolved: false,
                     metadata_allow: Vec::new(),
                 },
                 None,
@@ -4150,12 +4157,17 @@ fn resolve_git_policy_uncached(
         read_roots.dedup();
         read_roots
     };
+    let repository_paths_resolved = worker;
+    #[cfg(all(test, target_os = "linux"))]
+    let repository_paths_resolved = repository_paths_resolved
+        && !git_policy_cache_tests::BENCH_UNBATCHED.with(|value| value.get());
     Ok((
         GitPolicy {
             read_roots,
             hooks: vec![hooks],
             linked,
             configured_paths,
+            repository_paths_resolved,
             metadata_allow,
         },
         inputs,
@@ -7909,9 +7921,9 @@ mod git_policy_cache_tests {
         pub(super) static BENCH_UNBATCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
-    // Keep the former per-key Git query schedule available only to the manual
-    // benchmark, so both schedules run in one binary with the same sandbox and
-    // filesystem inputs. Policy construction and cache validation are shared.
+    // Keep the former per-key queries and missing-key fallback reads available
+    // only to the manual benchmark, so both schedules run in one binary with
+    // the same sandbox rules, filesystem inputs and cache validation.
     #[cfg(target_os = "linux")]
     pub(super) fn legacy_git_path_values(
         project_root: &Path,
@@ -8080,6 +8092,7 @@ mod git_policy_cache_tests {
                     hooks: Vec::new(),
                     linked: None,
                     configured_paths: Vec::new(),
+                    repository_paths_resolved: false,
                     metadata_allow: Vec::new(),
                 },
                 inputs: GitPolicyInputs {
@@ -8136,6 +8149,42 @@ mod git_policy_cache_tests {
     }
 
     #[test]
+    fn git_policy_cache_worker_denies_reuse_absent_repository_paths() {
+        let fixture = Fixture::new();
+        let (policy, _) = fixture.resolve();
+        let before = fixture.state(|state| state.calls);
+        checkout_control_denies(&fixture.root, &policy).unwrap();
+        assert_eq!(
+            fixture.state(|state| state.calls),
+            before,
+            "an absent repository key was already resolved"
+        );
+
+        let config = fixture.root.join(".git/config");
+        let mut contents = std::fs::read_to_string(&config).unwrap();
+        contents.push_str("[mason]\noriginalHooksPath = new-original\n");
+        std::fs::write(config, contents).unwrap();
+        let (changed, calls) = fixture.resolve();
+        assert!(
+            calls > 0,
+            "creating an absent policy setting must invalidate the entry"
+        );
+        let before = fixture.state(|state| state.calls);
+        let denies = checkout_control_denies(&fixture.root, &changed).unwrap();
+        assert!(denies.contains(&fixture.root.join("new-original")));
+        assert_eq!(fixture.state(|state| state.calls), before);
+
+        let head = with_worker_jail(false, || resolve_git_policy(&fixture.root)).unwrap();
+        let before = fixture.state(|state| state.calls);
+        let denies = checkout_control_denies(&fixture.root, &head).unwrap();
+        assert!(denies.contains(&fixture.root.join("new-original")));
+        assert!(
+            fixture.state(|state| state.calls) > before,
+            "non-worker policies still need repository-scope fallbacks"
+        );
+    }
+
+    #[test]
     fn git_policy_cache_summary_is_changed_only_and_minute_limited() {
         let mut report = GitPolicyReport::default();
         let now = Instant::now();
@@ -8159,7 +8208,7 @@ mod git_policy_cache_tests {
             "[core]\nhooksPath = worktree-hooks\nexcludesFile =\n[mason]\noriginalHooksPath =\n",
         )
         .unwrap();
-        std::fs::write(fixture.root.join("global"), "[mason]\noriginalHooksPath = discarded\noriginalHooksPath = global-original\n[core]\nexcludesFile = ~aft-policy-missing-user/unused\n").unwrap();
+        std::fs::write(fixture.root.join("global"), "[mason]\noriginalHooksPath = discarded\noriginalHooksPath = global-original\n[core]\nexcludesFile = global-excludes\n").unwrap();
         std::fs::write(
             fixture.root.join("system"),
             "[mason]\noriginalHooksPath = system-original\n",
@@ -8199,12 +8248,21 @@ mod git_policy_cache_tests {
         let mut contents = std::fs::read_to_string(&config).unwrap();
         contents.push_str("[core]\nexcludesFile = ~aft-policy-missing-user/overridden\nexcludesFile = local-excludes\n");
         std::fs::write(config, contents).unwrap();
-        let (policy, _) = fixture.resolve();
-        assert!(policy.configured_paths.contains(&(
-            "core.excludesFile".into(),
-            fixture.root.join("local-excludes")
-        )));
-        assert_eq!(fixture.resolve().1, 0);
+        let paths = configured_git_paths_with_inputs(
+            &fixture.root,
+            &["core.excludesFile"],
+            &mut Vec::new(),
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(
+            paths,
+            vec![(
+                "core.excludesFile".into(),
+                fixture.root.join("local-excludes"),
+                fixture.root.join("local-excludes")
+            )]
+        );
     }
 
     #[test]
@@ -10697,6 +10755,7 @@ mod policy_tests {
             hooks: vec![common.join("hooks")],
             linked: Some((own.clone(), common.clone())),
             configured_paths: Vec::new(),
+            repository_paths_resolved: false,
             metadata_allow: Vec::new(),
         };
         let main = GitPolicy {
@@ -10704,6 +10763,7 @@ mod policy_tests {
             hooks: Vec::new(),
             linked: None,
             configured_paths: Vec::new(),
+            repository_paths_resolved: false,
             metadata_allow: Vec::new(),
         };
         let grants = linked_git_grants(&[linked, main]);
@@ -10749,6 +10809,7 @@ mod policy_tests {
             hooks: vec![common.join("hooks")],
             linked: Some((own, common.clone())),
             configured_paths: Vec::new(),
+            repository_paths_resolved: false,
             metadata_allow: Vec::new(),
         };
         let grants = worker_jail_grants(&home, &[worktree], &[git], &policy);
