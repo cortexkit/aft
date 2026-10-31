@@ -10456,6 +10456,123 @@ mod tests {
     }
 
     #[test]
+    fn bash_background_restart_runner_first_preserves_opencode_completion() {
+        use crate::bash_background::persistence::{
+            create_task_layout, read_task, write_task, PersistedTask,
+        };
+
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let project = tempfile::tempdir().unwrap();
+        init_git_fixture(project.path());
+        let storage = tempfile::tempdir().unwrap();
+        let session = "restart-opencode-head";
+        let task_id = "bash-000000000000c10d";
+        let layout =
+            create_task_layout(&storage.path().join("opencode"), session, task_id).unwrap();
+        let paths = &layout.paths;
+        let mut metadata = PersistedTask::starting(
+            task_id.into(),
+            session.into(),
+            "printf recovered".into(),
+            project.path().into(),
+            Some(project.path().into()),
+            None,
+            true,
+            true,
+        );
+        metadata.harness = Some("opencode".into());
+        metadata.status = crate::bash_background::BgTaskStatus::Running;
+        metadata.completion_has_env_secrets = Some(false);
+        metadata.completion_has_non_ticket_env_secrets = Some(false);
+        write_task(&paths.json, &metadata).unwrap();
+        fs::write(&paths.stdout, "recovered after restart\n").unwrap();
+        fs::write(&paths.stderr, "").unwrap();
+        // The detached wrapper finished while AFT was down, so the metadata
+        // and database had not yet been updated.
+        fs::write(&paths.exit, "0").unwrap();
+        {
+            let db = crate::db::open(&storage.path().join("aft.db")).unwrap();
+            crate::db::bash_tasks::upsert_bash_task(
+                &db,
+                &metadata.to_bash_task_row("opencode", paths).unwrap(),
+            )
+            .unwrap();
+        }
+        let before = fs::read(&paths.json).unwrap();
+        let restarted = test_context();
+        let bind = |harness: &str, session: &str| {
+            let response = handle_configure_for_test(
+                &configure_request_with_session(
+                    json!({
+                        "project_root": project.path(),
+                        "storage_dir": storage.path(),
+                        "harness": harness,
+                        "config": [user_tier(json!({
+                            "indexes": {"trigram": false, "semantic": false, "callgraph": false},
+                            "views": {"enabled": false}
+                        }))]
+                    }),
+                    session,
+                ),
+                &restarted,
+            );
+            assert!(response.success, "{response:?}");
+            super::drain_deferred_configure_maintenance(&restarted);
+        };
+        let (_, runner_logs) =
+            crate::logging::capture_log_lines(|| bind("runner", "restart-runner"));
+        let runner_completions = restarted
+            .bash_background()
+            .drain_completions_for_session(Some("restart-runner"));
+        let untouched = fs::read(&paths.json).unwrap() == before;
+        let row_after_runner = {
+            let db = crate::db::open(&storage.path().join("aft.db")).unwrap();
+            crate::db::bash_tasks::get_bash_task(&db, "opencode", session, task_id)
+                .unwrap()
+                .unwrap()
+        };
+
+        bind("opencode", session);
+        let completions = restarted
+            .bash_background()
+            .drain_completions_for_session(Some(session));
+        assert_eq!(
+            completions.len(),
+            1,
+            "head lost its completion after runner-first replay: {runner_logs:?}"
+        );
+        assert_eq!(completions[0].task_id, task_id);
+        assert_eq!(
+            completions[0].status,
+            crate::bash_background::BgTaskStatus::Completed
+        );
+        assert_eq!(completions[0].exit_code, Some(0));
+        assert!(completions[0]
+            .output_preview
+            .contains("recovered after restart"));
+        let recovered = read_task(&paths.json).unwrap();
+        assert_eq!(
+            recovered.status,
+            crate::bash_background::BgTaskStatus::Completed
+        );
+        assert_eq!(recovered.exit_code, Some(0));
+        assert!(runner_completions.is_empty());
+        assert!(untouched, "runner rewrote opencode metadata");
+        assert_eq!(row_after_runner.status, "running");
+        assert!(
+            !row_after_runner.completion_delivered,
+            "runner acknowledged opencode completion"
+        );
+        assert!(
+            !runner_logs.iter().any(|line| line.contains(task_id)),
+            "runner inspected another harness's task: {runner_logs:?}"
+        );
+        restarted.bash_background().detach();
+    }
+
+    #[test]
     fn bash_background_project_replay_maintenance_recovers_all_disk_tasks() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let (_project, ctx, mut state, task_ids) = bash_background_replay_fixture(520, None);
