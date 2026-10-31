@@ -1,6 +1,6 @@
 /**
  * ast_grep_search + ast_grep_replace — AST-aware pattern search/rewrite.
- * 11 languages: typescript, tsx, javascript, python, rust, go, CUDA, Metal, pascal, R, Objective-C.
+ * Languages include TypeScript, Python, Rust, Go, CUDA, Metal, Pascal, R, Objective-C and SystemVerilog/Verilog.
  */
 
 import { coerceBoolean } from "@cortexkit/aft-bridge";
@@ -52,6 +52,8 @@ const AstLang = StringEnum(
     "pascal",
     "r",
     "objc",
+    "systemverilog",
+    "verilog",
   ] as const,
   {
     description: "Target language",
@@ -61,7 +63,7 @@ const AstLang = StringEnum(
 const SearchParams = Type.Object({
   pattern: Type.String({
     description:
-      "AST pattern with meta-variables (`$VAR` matches one node, `$$$` matches many). Must be a complete AST node.",
+      "AST pattern with meta-variables (`$VAR` matches one node, `$$$` matches many). Must be a complete AST node. For SystemVerilog/Verilog, $[NAME] denotes literal $NAME in patterns and rewrites.",
   }),
   lang: AstLang,
   paths: Type.Optional(
@@ -78,8 +80,14 @@ const SearchParams = Type.Object({
 });
 
 const ReplaceParams = Type.Object({
-  pattern: Type.String({ description: "AST pattern with meta-variables" }),
-  rewrite: Type.String({ description: "Replacement pattern, can reference $VAR from pattern" }),
+  pattern: Type.String({
+    description:
+      "Complete AST pattern with meta-variables. Name variadic captures reused in the rewrite, e.g. send($$$ARGS). SystemVerilog/Verilog $[NAME] denotes literal $NAME",
+  }),
+  rewrite: Type.String({
+    description:
+      "Replacement pattern, can reference $VAR or named $$$ARGS captured in pattern, e.g. deliver($$$ARGS); anonymous $$$ cannot be expanded. SystemVerilog/Verilog $[NAME] denotes literal $NAME",
+  }),
   lang: AstLang,
   paths: Type.Optional(Type.Array(Type.String(), { description: "Paths (default: ['.'])" })),
   globs: Type.Optional(Type.Array(Type.String(), { description: "Include/exclude globs" })),

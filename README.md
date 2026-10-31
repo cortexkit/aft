@@ -177,6 +177,7 @@ _Coming soon._
 | JSON | ✓ | ✓ | ✓ | | | |
 | TOML | ✓ | ✓ | | ✓ | | |
 | Solidity | ✓ | ✓ | ✓ | ✓ | ✓ | |
+| SystemVerilog / Verilog (`.sv`, `.svh`, `.v`, `.vh`) | ✓ | ✓ | ✓ | ✓ | | |
 | Pascal | ✓ | ✓ | ✓ | ✓ | | |
 | R | ✓ | ✓ | ✓ | ✓ | | |
 | Groovy (incl. Gradle / Jenkinsfile / Spock) | ✓ | ✓ | ✓ | ✓ | | |

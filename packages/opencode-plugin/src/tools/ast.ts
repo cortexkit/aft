@@ -64,13 +64,16 @@ const SUPPORTED_LANGS = [
   "pascal",
   "r",
   "objc",
+  "systemverilog",
+  "verilog",
 ] as const;
 
 export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
   const searchTool: ToolDefinition = {
     description:
-      "Search code patterns across filesystem using AST-aware matching. Supports 11 languages.\n\n" +
+      "Search code patterns across filesystem using AST-aware matching.\n\n" +
       "Use meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\n" +
+      "For SystemVerilog/Verilog, $[NAME] matches a literal system identifier $NAME in patterns and rewrites.\n" +
       "IMPORTANT: Patterns must be complete AST nodes (valid code fragments).\n" +
       "For functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\n" +
       "Examples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc'",
@@ -112,14 +115,22 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
     description:
       "Replace code patterns across filesystem with AST-aware rewriting. Applies changes by default — set dryRun=true to preview.\n\n" +
       "Use meta-variables in the rewrite pattern to preserve matched content from the pattern.\n" +
+      "To reuse a variadic capture, name it in both pattern and rewrite: pattern='send($$$ARGS)', rewrite='deliver($$$ARGS)'. Anonymous $$$ is valid in search patterns but cannot be expanded in rewrites.\n" +
+      "For SystemVerilog/Verilog, $[NAME] denotes literal $NAME in patterns and rewrites.\n" +
       "IMPORTANT: Patterns must be complete AST nodes (valid code fragments).\n\n" +
       "Example: pattern='console.log($MSG)' rewrite='logger.info($MSG)' lang='typescript' — replaces all console.log calls with logger.info across TypeScript files.\n\n" +
       "**Warning: This tool modifies files directly.** Use dryRun=true to preview (shows per-file unified diff, capped at 8KB). Consider creating an aft_safety checkpoint before bulk replacements.",
     args: {
       pattern: z
         .string()
-        .describe("AST pattern with meta-variables ($VAR, $$$). Must be complete AST node."),
-      rewrite: z.string().describe("Replacement pattern (can use $VAR from pattern)"),
+        .describe(
+          "Complete AST pattern with meta-variables. Name variadic captures reused in the rewrite, e.g. send($$$ARGS).",
+        ),
+      rewrite: z
+        .string()
+        .describe(
+          "Replacement pattern (can use $VAR or named $$$ARGS captured in pattern; anonymous $$$ cannot be expanded)",
+        ),
       lang: z.enum(SUPPORTED_LANGS).describe("Target language"),
       paths: z.array(z.string()).optional().describe("Paths to search (default: ['.'])"),
       globs: z.array(z.string()).optional().describe("Include/exclude globs (prefix ! to exclude)"),

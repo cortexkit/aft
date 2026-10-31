@@ -758,6 +758,7 @@ pub enum LangId {
     Groovy,
     ObjC,
     Toml,
+    SystemVerilog,
 }
 
 /// Maps file extension to language identifier.
@@ -801,6 +802,7 @@ pub fn detect_language(path: &Path) -> Option<LangId> {
         "groovy" | "gvy" | "gy" | "gsh" | "gradle" => Some(LangId::Groovy),
         "m" | "mm" => Some(LangId::ObjC),
         "toml" => Some(LangId::Toml),
+        "sv" | "svh" | "v" | "vh" => Some(LangId::SystemVerilog),
         _ => None,
     }
 }
@@ -841,6 +843,7 @@ pub fn grammar_for(lang: LangId) -> Language {
         LangId::Groovy => dekobon_tree_sitter_groovy::LANGUAGE.into(),
         LangId::ObjC => tree_sitter_objc::LANGUAGE.into(),
         LangId::Toml => tree_sitter_toml::LANGUAGE.into(),
+        LangId::SystemVerilog => tree_sitter_systemverilog::LANGUAGE.into(),
     }
 }
 
@@ -877,6 +880,7 @@ fn query_for(lang: LangId) -> Option<&'static str> {
         LangId::Groovy => Some(GROOVY_QUERY),
         LangId::ObjC => Some(OBJC_QUERY),
         LangId::Toml => None,
+        LangId::SystemVerilog => None,
     }
 }
 
@@ -970,7 +974,8 @@ fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
         | LangId::Vue
         | LangId::Json
         | LangId::Yaml
-        | LangId::Toml => None,
+        | LangId::Toml
+        | LangId::SystemVerilog => None,
     };
 
     query
@@ -2375,6 +2380,9 @@ fn extract_symbols_from_tree_unbounded(
 ) -> Result<Vec<Symbol>, AftError> {
     let root = tree.root_node();
 
+    if lang == LangId::SystemVerilog {
+        return crate::systemverilog::extract_symbols(source, root);
+    }
     if lang == LangId::Rust {
         return extract_rs_symbols(source, &root);
     }
@@ -2433,7 +2441,8 @@ fn extract_symbols_from_tree_unbounded(
         | LangId::Vue
         | LangId::Json
         | LangId::Yaml
-        | LangId::Toml => unreachable!("handled before query lookup"),
+        | LangId::Toml
+        | LangId::SystemVerilog => unreachable!("handled before query lookup"),
     }
 }
 
@@ -2515,6 +2524,7 @@ fn node_range_with_decorators_inner(node: &Node, source: &str, lang: LangId) -> 
             | LangId::Cpp
             | LangId::Cuda
             | LangId::Metal
+            | LangId::SystemVerilog
             | LangId::ObjC
             | LangId::Zig
             | LangId::CSharp

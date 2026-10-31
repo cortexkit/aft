@@ -41,7 +41,8 @@ impl IndentStyle {
             | LangId::Lua
             | LangId::Scss
             | LangId::Yaml
-            | LangId::Toml => IndentStyle::Spaces(2),
+            | LangId::Toml
+            | LangId::SystemVerilog => IndentStyle::Spaces(2),
             LangId::Rust => IndentStyle::Spaces(4),
             LangId::Go => IndentStyle::Tabs,
             LangId::C

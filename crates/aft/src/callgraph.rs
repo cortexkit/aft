@@ -854,7 +854,8 @@ pub fn is_entry_point(name: &str, kind: &SymbolKind, exported: bool, lang: LangI
         | LangId::R
         | LangId::Groovy
         | LangId::ObjC
-        | LangId::Toml => false,
+        | LangId::Toml
+        | LangId::SystemVerilog => false,
     }
 }
 
