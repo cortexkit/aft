@@ -18,6 +18,7 @@ struct Daemon {
     child: Child,
     stream: TcpStream,
     corr: u64,
+    views: bool,
 }
 
 impl Drop for Daemon {
@@ -36,7 +37,7 @@ async fn receive(stream: &mut TcpStream) -> Frame {
 }
 
 impl Daemon {
-    async fn start(root: &Path, state: &Path) -> Self {
+    async fn start(root: &Path, state: &Path, views: bool) -> Self {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(state, std::fs::Permissions::from_mode(0o700)).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -64,7 +65,7 @@ impl Daemon {
             json!({
                 "storage_dir": state.join("storage"),
                 "indexes": {"trigram": true, "semantic": false, "callgraph": false},
-                "views": {"enabled": false},
+                "views": {"enabled": views},
                 "git": {"co_author": "off"},
                 "bash": {"shell": "/bin/bash"},
             })
@@ -163,6 +164,7 @@ impl Daemon {
             child,
             stream,
             corr: 10,
+            views,
         }
     }
 
@@ -223,7 +225,17 @@ async fn assert_visible(daemon: &mut Daemon, relative: &str, marker: &str) {
                 rows.iter()
                     .any(|r| r["file"].as_str().is_some_and(|p| p.ends_with(relative)))
             });
-        if data["index_status"] == "Ready" && data["total_matches"] == 1 && search_found {
+        if data["index_status"] == "Ready"
+            && data["total_matches"] == 1
+            && search_found
+            && (!daemon.views || data["complete"] == true)
+        {
+            if daemon.views {
+                assert_eq!(
+                    data["files_read_directly"], 0,
+                    "views must serve the index: {grep}"
+                );
+            }
             return;
         }
         assert!(
@@ -236,6 +248,15 @@ async fn assert_visible(daemon: &mut Daemon, relative: &str, marker: &str) {
 
 #[tokio::test]
 async fn bound_daemon_external_changes_reach_indexed_grep_and_search() {
+    external_changes_reach_indexed_grep_and_search(false).await;
+}
+
+#[tokio::test]
+async fn bound_daemon_views_on_external_changes_reach_indexed_grep_and_search() {
+    external_changes_reach_indexed_grep_and_search(true).await;
+}
+
+async fn external_changes_reach_indexed_grep_and_search(views: bool) {
     let _serial = crate::helpers::watcher_serial_lock();
     let project = tempfile::tempdir().unwrap();
     let root = project.path();
@@ -272,7 +293,7 @@ async fn bound_daemon_external_changes_reach_indexed_grep_and_search() {
     git(root, &["add", "."]);
     git(root, &["commit", "-qm", "add crate"]);
     git(root, &["checkout", "-q", "-"]);
-    let mut daemon = Daemon::start(root, state.path()).await;
+    let mut daemon = Daemon::start(root, state.path(), views).await;
     assert_visible(
         &mut daemon,
         "crates/old/src/lib.rs",
