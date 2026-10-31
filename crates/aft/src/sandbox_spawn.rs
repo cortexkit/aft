@@ -8069,10 +8069,11 @@ mod git_policy_cache_tests {
                 assert!(response.success, "{response:?}");
                 let id = response.data["task_id"].as_str().unwrap();
                 while !ctx.bash_background().is_task_terminal(id) {
-                    let task = ctx.bash_background().task(id).unwrap();
-                    ctx.bash_background().poll_task(&task).unwrap();
+                    ctx.bash_background()
+                        .status(id, "policy-cost", None, None, 1024)
+                        .unwrap();
                     assert!(began.elapsed() < Duration::from_secs(15));
-                    std::thread::yield_now();
+                    std::thread::sleep(Duration::from_millis(1));
                 }
                 assert_eq!(
                     ctx.bash_background()
