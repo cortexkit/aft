@@ -6123,7 +6123,7 @@ mod storage_retention_tests {
             let started = Instant::now();
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             let cpu = thread_cpu_seconds();
-            let report = run_pass_entry_bound(&storage);
+            let report = run_pass_entry_bound(&storage.artifacts);
             let io = PASS_IO.with(|count| count.get());
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             eprintln!("offline root pass={pass} cpu_ms={:.3} wall_ms={:.3} listings={} file_open_attempts={} timings={:?}",
