@@ -1,0 +1,1 @@
+- With views on, AFT no longer opens the older view format on every project at startup, which ran Git over every tracked file twice and left status showing those files as pending.
