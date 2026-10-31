@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "gh-shim-queue-refusals"
+  ],
+  "note": "gh shim: explanation rows for the Plexus merge-queue refusals pull_request_head_moved and pull_request_not_open, plus a test that every vendored Plexus refusal code has one. No changed path matches RANKING_FENCE_PREFIXES."
+}

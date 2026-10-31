@@ -10,9 +10,9 @@
 //! twice, only to reach the same answer again.
 //!
 //! A remembered verdict is trusted only while everything it was derived from
-//! is unchanged: the session folder (a task layout appearing or vanishing
-//! beside it), the task folder (its `control/` or `io/` folder replaced), and
-//! the metadata file itself. Metadata is always written by atomic replacement,
+//! is unchanged: the session folder's identity (and listing for flat layouts),
+//! the task folder (its `control/` or `io/` folder replaced), and the metadata
+//! file itself. Metadata is always written by atomic replacement,
 //! so any rewrite gives the file a new identity and a new modification time.
 //! A rate-limited validation cursor checks those stamps, including changes
 //! made by foreign writers. An ordered deadline index also selects tasks at
@@ -160,8 +160,8 @@ impl Verdict {
         }
     }
 
-    /// Whether the task is still certainly not deletable. Any stamp that
-    /// differs or cannot be read means "judge it again", never "skip".
+    /// Whether the task is still certainly not deletable. A changed bundle or
+    /// session identity, or an unreadable stamp, means "judge it again".
     fn still_waiting(
         &self,
         session_dir: &Path,
@@ -171,7 +171,35 @@ impl Verdict {
         now: SystemTime,
     ) -> bool {
         if self.session != *session {
-            return false;
+            // Sibling creation/removal changes the session's mtime and size,
+            // not this task. Keep directory-layout verdicts when the session
+            // is still the same directory; the task and metadata stamps below
+            // detect changes within the bundle. Flat layouts still depend on
+            // the whole session, and an unavailable identity proves nothing.
+            if self.layout != TaskLayout::Directory
+                || !matches!(
+                    self.session.identity,
+                    crate::file_identity::FileIdentity::Known { .. }
+                )
+                || self.session.identity != session.identity
+            {
+                return false;
+            }
+            #[cfg(windows)]
+            if self.session.created != session.created {
+                return false;
+            }
+            // A same-id legacy file makes an otherwise intact directory
+            // layout ambiguous. Preserve the resolver's collision check even
+            // when only the session stamp changed. Errors mean re-evaluate.
+            #[cfg(test)]
+            super::persistence::work_counts::record_stat();
+            if !matches!(
+                std::fs::symlink_metadata(session_dir.join(format!("{task_id}.json"))),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ) {
+                return false;
+            }
         }
         if let Some(task_dir) = &self.task_dir {
             if Stamp::of(&session_dir.join(task_id)).ok().as_ref() != Some(task_dir) {
@@ -850,6 +878,58 @@ pub(crate) fn persisted_gc_health_for(root: &Path) -> Option<PersistedGcHealth> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_churn_keeps_only_unambiguous_directory_verdicts() {
+        let storage = tempfile::tempdir().unwrap();
+        let session = storage.path().join("session");
+        let task_id = "bash-0000000000000001";
+        let task = session.join(task_id);
+        let metadata = task
+            .join("control")
+            .join(super::super::persistence::METADATA_FILE);
+        std::fs::create_dir_all(metadata.parent().unwrap()).unwrap();
+        std::fs::write(&metadata, b"{}").unwrap();
+        let mut verdict = Verdict {
+            layout: TaskLayout::Directory,
+            session: Stamp::of(&session).unwrap(),
+            task_dir: Some(Stamp::of(&task).unwrap()),
+            metadata: Stamp::of(&metadata).unwrap(),
+            wait: Wait::Grace,
+        };
+        let now = SystemTime::now();
+        let grace = super::super::registry::PERSISTED_GC_GRACE;
+        // Model a changed session listing independently of filesystem clock
+        // granularity; the bundle itself remains untouched.
+        let mut changed = verdict.session;
+        changed.modified += Duration::from_secs(1);
+        changed.len += 1;
+        assert!(verdict.still_waiting(&session, &changed, task_id, grace, now));
+
+        let collision = session.join(format!("{task_id}.json"));
+        std::fs::write(&collision, b"{}").unwrap();
+        assert!(!verdict.still_waiting(&session, &changed, task_id, grace, now));
+        std::fs::remove_file(collision).unwrap();
+
+        verdict.layout = TaskLayout::Flat;
+        assert!(!verdict.still_waiting(&session, &changed, task_id, grace, now));
+        verdict.layout = TaskLayout::Directory;
+        let known_session = verdict.session;
+        verdict.session.identity = crate::file_identity::FileIdentity::Unavailable;
+        changed.identity = crate::file_identity::FileIdentity::Unavailable;
+        assert!(!verdict.still_waiting(&session, &changed, task_id, grace, now));
+
+        verdict.session = known_session;
+        std::fs::rename(&session, storage.path().join("old-session")).unwrap();
+        std::fs::create_dir(&session).unwrap();
+        assert!(!verdict.still_waiting(
+            &session,
+            &Stamp::of(&session).unwrap(),
+            task_id,
+            grace,
+            now,
+        ));
+    }
+
     #[test]
     fn gc_grace_keeps_future_mtime() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000_000);

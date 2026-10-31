@@ -64,7 +64,7 @@ pub(crate) mod semantic_batch_lease;
 pub mod semantic_runtime;
 mod tree_base;
 pub mod trigram;
-mod verification;
+pub(crate) mod verification;
 
 #[cfg(test)]
 mod dispatch_parity_probe;

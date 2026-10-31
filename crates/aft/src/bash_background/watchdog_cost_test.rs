@@ -411,6 +411,167 @@ fn gc_until_lap(registry: &BgTaskRegistry, storage: &Path, laps: u64) {
     panic!("the sweep never completed lap {laps}");
 }
 
+#[cfg(unix)]
+fn measured_gc_lap(registry: &BgTaskRegistry, storage: &Path, label: &str) -> (usize, usize) {
+    let next_lap = gc_health(storage).laps_completed + 1;
+    let mut passes = Vec::new();
+    for _ in 0..64 {
+        work_counts::reset();
+        registry.maybe_gc_persisted(storage).unwrap();
+        let counts = work_counts::get();
+        passes.push((
+            counts.metadata_opens,
+            counts.metadata_reads,
+            counts.metadata_writes,
+        ));
+        if gc_health(storage).laps_completed >= next_lap {
+            eprintln!("{label}: per-pass (metadata opens, reads, writes) = {passes:?}");
+            return (
+                passes.iter().map(|counts| counts.0).sum(),
+                passes.iter().map(|counts| counts.2).sum(),
+            );
+        }
+    }
+    panic!("the measured sweep never completed lap {next_lap}");
+}
+
+#[cfg(unix)]
+#[test]
+fn watchdog_cost_persisted_gc_session_churn_does_not_reopen_terminal_history() {
+    const SESSIONS: usize = 50;
+    const FINISHED: usize = 2_000;
+    let storage = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let mut history = Vec::new();
+    for index in 0..FINISHED {
+        history.push(
+            fixture(
+                storage.path(),
+                &format!("session-{}", index % SESSIONS),
+                false,
+                2,
+            )
+            .1,
+        );
+    }
+    let mut running = Vec::new();
+    for index in 0..4 {
+        let (_, paths) = fixture(storage.path(), &format!("session-{index}"), false, 0);
+        rewrite_fixture(&paths, |metadata| {
+            metadata.mark_running(std::process::id(), std::process::id() as i32);
+            metadata.finished_at = None;
+            metadata.duration_ms = None;
+        });
+        running.push(paths);
+    }
+    // Initialize the completed-lap counter without visiting tasks, so the
+    // measured cold lap includes every record's first metadata read.
+    registry
+        .gc_persisted_with_clock(storage.path(), SystemTime::now, false)
+        .unwrap();
+    measured_gc_lap(
+        &registry,
+        storage.path(),
+        "2000 finished / 50 sessions + 4 running, cold",
+    );
+    assert_eq!(
+        measured_gc_lap(&registry, storage.path(), "unchanged warm lap"),
+        (0, 0),
+    );
+
+    // A new task changes the session directory's mtime, but none of its
+    // siblings' metadata or task directories. Only the new records need opens.
+    let mut new_tasks = Vec::new();
+    for index in 0..SESSIONS {
+        let session = format!("session-{index}");
+        let (_, paths) = fixture(storage.path(), &session, false, 2);
+        // Force a distinct session stamp even on coarse timestamp filesystems.
+        filetime::set_file_mtime(
+            &paths.session_dir,
+            filetime::FileTime::from_unix_time(1_700_000_000 + index as i64, 0),
+        )
+        .unwrap();
+        new_tasks.push(paths);
+    }
+    let churn = measured_gc_lap(&registry, storage.path(), "one new task per session");
+    assert_eq!(churn.1, 0, "a keep-only sweep wrote task metadata");
+    assert!(
+        churn.0 <= 3 * SESSIONS,
+        "session churn reopened terminal history: {churn:?}"
+    );
+    assert!(history.iter().all(|paths| paths.json.exists()));
+
+    for paths in new_tasks {
+        delete_task_bundle(&paths).unwrap();
+    }
+    assert_eq!(
+        measured_gc_lap(&registry, storage.path(), "new sibling tasks removed"),
+        (0, 0),
+    );
+
+    // A metadata change still invalidates a running task's verdict immediately,
+    // even when its recorded process remains alive. Remove that process from
+    // the terminal record so it is safe to collect the synthetic fixture.
+    for paths in &running {
+        rewrite_fixture(paths, |metadata| {
+            metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+            metadata.child_pid = None;
+            metadata.pgid = None;
+            metadata.completion_delivered = true;
+        });
+    }
+    assert_eq!(
+        registry.maybe_gc_persisted(storage.path()).unwrap(),
+        running.len()
+    );
+    assert!(running.iter().all(|paths| !paths.dir.exists()));
+}
+
+#[test]
+fn watchdog_cost_terminal_persist_retry_does_not_rewrite_a_successful_retry() {
+    let storage = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let (metadata, paths) = fixture(storage.path(), "session", false, 0);
+    registry
+        .insert_rehydrated_task(metadata, paths.clone(), false)
+        .unwrap();
+    let task = registry.task(&paths.task_id).unwrap();
+    task.terminal_persist_dirty.store(true, Ordering::SeqCst);
+    let (checked_tx, checked_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let retry_registry = registry.clone();
+    let retry_task = task.clone();
+    let retry = std::thread::spawn(move || {
+        TERMINAL_PERSIST_AFTER_DIRTY_CHECK.with(|slot| {
+            slot.replace(Some(Box::new(move || {
+                checked_tx.send(()).unwrap();
+                resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            })));
+        });
+        work_counts::reset();
+        retry_registry.retry_terminal_persist(&retry_task).unwrap();
+        work_counts::get().metadata_writes
+    });
+    checked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    work_counts::reset();
+    registry.retry_terminal_persist(&task).unwrap();
+    let first = work_counts::get().metadata_writes;
+    resume_tx.send(()).unwrap();
+    let concurrent = retry.join().unwrap();
+    work_counts::reset();
+    for _ in 0..20 {
+        registry.retry_terminal_persist(&task).unwrap();
+    }
+    let sequential = work_counts::get().metadata_writes;
+    eprintln!("terminal persist writes: successful retry={first}, concurrent retry={concurrent}, 20 later retries={sequential}");
+    assert_eq!(first, 1);
+    assert_eq!(sequential, 0);
+    assert_eq!(
+        concurrent, 0,
+        "another caller already persisted this terminal state"
+    );
+}
+
 #[test]
 fn watchdog_cost_persisted_gc_selects_newly_eligible_history() {
     let storage = tempfile::tempdir().unwrap();
