@@ -3149,17 +3149,18 @@ async fn bind_route_stamped_with_mode(
     let wire = handle.wire.clone();
     let channel = wire.next_channel.fetch_add(1, Ordering::SeqCst);
     let corr = wire.corr();
-    let bind = serde_json::json!({
-    "route_channel": channel,
-    "epoch": 1,
-    "target": RouteTarget::ToolProvider {
+    let bind = {
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: channel,
+            epoch: 1,
+            target: RouteTarget::ToolProvider {
                 module_id: "aft".into(),
             },
-    "identity": serde_json::json!({"harness": harness, "session": session, "project_root": project}),
-    "principal": Some(decode_principal(&stamp.principal)?),
-    "consumer_capabilities": consumer_capabilities,
-    "admission_facts": serde_json::Value::Null,
-    "scope": { let scope: Option<subc_protocol::scope::ScopeStamp> = stamp
+            identity: BindIdentity::new(harness, session),
+            principal: Some(decode_principal(&stamp.principal)?),
+            consumer_capabilities,
+            admission_facts: None,
+            scope: stamp
                 .scope
                 .as_ref()
                 .map(|scope| {
@@ -3177,10 +3178,17 @@ async fn bind_route_stamped_with_mode(
                         ),
                     ))
                 })
-                .transpose()?; scope.map(|mut stamp| { if stamp.workdir.is_none() { stamp.workdir = Some(std::path::Path::new(&(project)).to_string_lossy().into_owned()); } stamp }) },
-    "role_versions": role_versions,
-    "call_mode": mode
-    });
+                .transpose()?,
+            role_versions,
+            call_mode: mode,
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(project);
+        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
+            bind["scope"]["workdir"] = serde_json::json!(project);
+        }
+        bind
+    };
     let mut reply = wire.expect(0, corr);
     wire.send(
         &Frame::build(

@@ -775,56 +775,72 @@ impl Jail {
             "attributes": {"agent_id":"worker-read-principal", "delegates":true},
         }))
         .unwrap();
-        let bind = serde_json::json!({
-        "route_channel": 1,
-        "epoch": 1,
-        "target": RouteTarget::ToolProvider {
-                        module_id: "aft".into(),
-                    },
-        "identity": serde_json::json!({"harness": "runner", "session": "worker-session", "project_root": &self.worktree}),
-        "principal": Some(Principal::Reserved {
-                        module_id: "broca".into(),
-                    }),
-        "consumer_capabilities": serde_json::Value::Null,
-        "admission_facts": serde_json::Value::Null,
-        "scope": { let scope: Option<subc_protocol::scope::ScopeStamp> = Some(scope); scope.map(|mut stamp| { if stamp.workdir.is_none() { stamp.workdir = Some(std::path::Path::new(&(&self.worktree)).to_string_lossy().into_owned()); } stamp }) },
-        "role_versions": Some(std::collections::BTreeMap::from([(
-                        "tool-provider".into(),
-                        "v1".into(),
-                    )])),
-        "call_mode": serde_json::Value::Null
-        });
+        let bind = {
+            let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                route_channel: 1,
+                epoch: 1,
+                target: RouteTarget::ToolProvider {
+                    module_id: "aft".into(),
+                },
+                identity: BindIdentity::new("runner", "worker-session"),
+                principal: Some(Principal::Reserved {
+                    module_id: "broca".into(),
+                }),
+                consumer_capabilities: None,
+                admission_facts: None,
+                scope: Some(scope),
+                role_versions: Some(std::collections::BTreeMap::from([(
+                    "tool-provider".into(),
+                    "v1".into(),
+                )])),
+                call_mode: None,
+            })
+            .unwrap();
+            bind["identity"]["project_root"] = serde_json::json!(&self.worktree);
+            if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
+                bind["scope"]["workdir"] = serde_json::json!(&self.worktree);
+            }
+            bind
+        };
         self.bind(bind).await;
     }
 
     async fn bind_grant_head(&mut self) {
         let root = self.base.clone();
-        self.bind(serde_json::json!({
-"route_channel": 2,
-"epoch": 1,
-"target": RouteTarget::ToolProvider {
-                module_id: "aft".into(),
-            },
-"identity": serde_json::json!({"harness": "runner", "session": "head-session", "project_root": &root}),
-"principal": Some(Principal::Reserved {
-                module_id: "broca".into(),
-            }),
-"consumer_capabilities": serde_json::Value::Null,
-"admission_facts": serde_json::Value::Null,
-"scope": { let scope: Option<subc_protocol::scope::ScopeStamp> = Some(
-                serde_json::from_value(json!({
-                    "owner": {"kind":"reserved","module_id":"prefrontal-core"},
-                    "ref":"head-scope", "scope_epoch":7, "kind":"head",
-                    "owner_authorized":true, "attributes":{"agent_id":"head"},
-                }))
-                .unwrap(),
-            ); scope.map(|mut stamp| { if stamp.workdir.is_none() { stamp.workdir = Some(std::path::Path::new(&(&root)).to_string_lossy().into_owned()); } stamp }) },
-"role_versions": Some(std::collections::BTreeMap::from([(
-                "tool-provider".into(),
-                "v1".into(),
-            )])),
-"call_mode": serde_json::Value::Null
-}))
+        self.bind({
+            let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                route_channel: 2,
+                epoch: 1,
+                target: RouteTarget::ToolProvider {
+                    module_id: "aft".into(),
+                },
+                identity: BindIdentity::new("runner", "head-session"),
+                principal: Some(Principal::Reserved {
+                    module_id: "broca".into(),
+                }),
+                consumer_capabilities: None,
+                admission_facts: None,
+                scope: Some(
+                    serde_json::from_value(json!({
+                        "owner": {"kind":"reserved","module_id":"prefrontal-core"},
+                        "ref":"head-scope", "scope_epoch":7, "kind":"head",
+                        "owner_authorized":true, "attributes":{"agent_id":"head"},
+                    }))
+                    .unwrap(),
+                ),
+                role_versions: Some(std::collections::BTreeMap::from([(
+                    "tool-provider".into(),
+                    "v1".into(),
+                )])),
+                call_mode: None,
+            })
+            .unwrap();
+            bind["identity"]["project_root"] = serde_json::json!(&root);
+            if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
+                bind["scope"]["workdir"] = serde_json::json!(&root);
+            }
+            bind
+        })
         .await;
     }
 
@@ -3610,25 +3626,33 @@ async fn worker_gh_read_t8_live_scope_rebind_refuses_before_upstream() {
     wait_test_file(&ready).await;
     let mut scope = jail.read_holder.lock().unwrap().binds["worker-session"].clone();
     scope.scope_epoch += 1;
-    jail.bind(serde_json::json!({
-"route_channel": 2,
-"epoch": 1,
-"target": RouteTarget::ToolProvider {
-            module_id: "aft".into(),
-        },
-"identity": serde_json::json!({"harness": "runner", "session": "worker-session", "project_root": &jail.worktree}),
-"principal": Some(Principal::Reserved {
-            module_id: "broca".into(),
-        }),
-"consumer_capabilities": serde_json::Value::Null,
-"admission_facts": serde_json::Value::Null,
-"scope": { let scope: Option<subc_protocol::scope::ScopeStamp> = Some(scope); scope.map(|mut stamp| { if stamp.workdir.is_none() { stamp.workdir = Some(std::path::Path::new(&(&jail.worktree)).to_string_lossy().into_owned()); } stamp }) },
-"role_versions": Some(std::collections::BTreeMap::from([(
-            "tool-provider".into(),
-            "v1".into(),
-        )])),
-"call_mode": serde_json::Value::Null
-}))
+    jail.bind({
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: 2,
+            epoch: 1,
+            target: RouteTarget::ToolProvider {
+                module_id: "aft".into(),
+            },
+            identity: BindIdentity::new("runner", "worker-session"),
+            principal: Some(Principal::Reserved {
+                module_id: "broca".into(),
+            }),
+            consumer_capabilities: None,
+            admission_facts: None,
+            scope: Some(scope),
+            role_versions: Some(std::collections::BTreeMap::from([(
+                "tool-provider".into(),
+                "v1".into(),
+            )])),
+            call_mode: None,
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(&jail.worktree);
+        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
+            bind["scope"]["workdir"] = serde_json::json!(&jail.worktree);
+        }
+        bind
+    })
     .await;
     std::fs::write(go, "go").unwrap();
     assert_ne!(wait_test_file(&outcome).await.trim(), "0");
@@ -3782,25 +3806,33 @@ async fn cross_command_broker_isolation(profile: &str) {
     std::os::unix::fs::symlink(parts[0], &alias).unwrap();
     let mut other_scope = jail.read_holder.lock().unwrap().binds["worker-session"].clone();
     other_scope.scope_ref = "other-worker-scope".into();
-    jail.bind(serde_json::json!({
-"route_channel": 2,
-"epoch": 1,
-"target": RouteTarget::ToolProvider {
-            module_id: "aft".into(),
-        },
-"identity": serde_json::json!({"harness": "runner", "session": "other-worker-session", "project_root": &other_root}),
-"principal": Some(Principal::Reserved {
-            module_id: "broca".into(),
-        }),
-"consumer_capabilities": serde_json::Value::Null,
-"admission_facts": serde_json::Value::Null,
-"scope": { let scope: Option<subc_protocol::scope::ScopeStamp> = Some(other_scope); scope.map(|mut stamp| { if stamp.workdir.is_none() { stamp.workdir = Some(std::path::Path::new(&(&other_root)).to_string_lossy().into_owned()); } stamp }) },
-"role_versions": Some(std::collections::BTreeMap::from([(
-            "tool-provider".into(),
-            "v1".into(),
-        )])),
-"call_mode": serde_json::Value::Null
-}))
+    jail.bind({
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: 2,
+            epoch: 1,
+            target: RouteTarget::ToolProvider {
+                module_id: "aft".into(),
+            },
+            identity: BindIdentity::new("runner", "other-worker-session"),
+            principal: Some(Principal::Reserved {
+                module_id: "broca".into(),
+            }),
+            consumer_capabilities: None,
+            admission_facts: None,
+            scope: Some(other_scope),
+            role_versions: Some(std::collections::BTreeMap::from([(
+                "tool-provider".into(),
+                "v1".into(),
+            )])),
+            call_mode: None,
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(&other_root);
+        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
+            bind["scope"]["workdir"] = serde_json::json!(&other_root);
+        }
+        bind
+    })
     .await;
     let task_temp_root = Path::new(parts[1])
         .parent()
@@ -4303,25 +4335,33 @@ async fn worker_gh_read_t10_promotion_keeps_the_original_command_grant() {
         "start as a foreground command"
     );
     let scope = jail.read_holder.lock().unwrap().binds["worker-session"].clone();
-    jail.bind(serde_json::json!({
-"route_channel": 2,
-"epoch": 1,
-"target": RouteTarget::ToolProvider {
-            module_id: "aft".into(),
-        },
-"identity": serde_json::json!({"harness": "runner", "session": "worker-session", "project_root": &jail.worktree}),
-"principal": Some(Principal::Reserved {
-            module_id: "broca".into(),
-        }),
-"consumer_capabilities": serde_json::Value::Null,
-"admission_facts": serde_json::Value::Null,
-"scope": { let scope: Option<subc_protocol::scope::ScopeStamp> = Some(scope); scope.map(|mut stamp| { if stamp.workdir.is_none() { stamp.workdir = Some(std::path::Path::new(&(&jail.worktree)).to_string_lossy().into_owned()); } stamp }) },
-"role_versions": Some(std::collections::BTreeMap::from([(
-            "tool-provider".into(),
-            "v1".into(),
-        )])),
-"call_mode": serde_json::Value::Null
-}))
+    jail.bind({
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: 2,
+            epoch: 1,
+            target: RouteTarget::ToolProvider {
+                module_id: "aft".into(),
+            },
+            identity: BindIdentity::new("runner", "worker-session"),
+            principal: Some(Principal::Reserved {
+                module_id: "broca".into(),
+            }),
+            consumer_capabilities: None,
+            admission_facts: None,
+            scope: Some(scope),
+            role_versions: Some(std::collections::BTreeMap::from([(
+                "tool-provider".into(),
+                "v1".into(),
+            )])),
+            call_mode: None,
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(&jail.worktree);
+        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
+            bind["scope"]["workdir"] = serde_json::json!(&jail.worktree);
+        }
+        bind
+    })
     .await;
     // Detaching the route's foreground wait promotes its running bash command
     // to a background task without ending the scope. The replacement route

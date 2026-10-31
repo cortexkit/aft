@@ -76,7 +76,7 @@ fn opening_refusal(error: TransportError, expected: &ScopeSelector) -> Refusal {
 impl SubcRelayTransport {
     pub(super) async fn reserve_scoped(
         &self,
-        project: &str,
+        _project: &str,
         session: &str,
         scope: &ScopeStamp,
         body: Value,

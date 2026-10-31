@@ -2684,7 +2684,7 @@ impl BgTaskRegistry {
         &self,
         client: &mut ExecRemoteClient,
         sink: &mut TaskSink,
-        root: &Path,
+        _root: &Path,
         mut fresh: bool,
     ) -> Result<Option<exec::RemoteStream>, String> {
         sink.checkpoint_progress().map_err(|e| e.to_string())?;
@@ -3846,7 +3846,7 @@ impl BgTaskRegistry {
         client: &mut ExecRemoteClient,
         point: ResumePoint,
         remote: &RemoteTask,
-        root: &Path,
+        _root: &Path,
         task: &Arc<BgTask>,
         recovery: &mut ReattachBudget,
     ) -> Result<Attached, String> {
@@ -4634,7 +4634,6 @@ async fn cancel_unknown_remote(metadata: &PersistedTask, job_id: Uuid) -> Result
         .connection_file
         .as_ref()
         .ok_or("no runner connection was saved")?;
-    let root = metadata.project_root.as_deref().unwrap_or(Path::new("/"));
     let client = ExecRemoteClient::connect(
         connection,
         subc_protocol::BindIdentity::new(remote.harness.clone(), remote.session.clone()),
@@ -5205,10 +5204,6 @@ async fn cancel_with_backoff(
         );
         return Err("no runner connection was saved".into());
     };
-    let root = metadata
-        .project_root
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("/"));
     let mut wait = OWED_CANCEL_FIRST_BACKOFF;
     let mut last_error = String::new();
     for attempt in 1..=OWED_CANCEL_ATTEMPTS {

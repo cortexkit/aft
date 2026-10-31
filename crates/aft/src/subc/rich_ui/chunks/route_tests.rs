@@ -142,19 +142,27 @@ impl Wire {
         scope: Option<subc_protocol::scope::ScopeStamp>,
         v1: bool,
     ) -> Frame {
-        let bind = serde_json::json!({
-        "route_channel": channel,
-        "epoch": 1,
-        "target": target,
-        "identity": serde_json::json!({"harness": "runner", "session": &format!("session-{channel}"), "project_root": &self.root}),
-        "principal": Some(principal),
-        "consumer_capabilities": serde_json::Value::Null,
-        "admission_facts": serde_json::json!({}),
-        "scope": { let scope: Option<subc_protocol::scope::ScopeStamp> = scope; scope.map(|mut stamp| { if stamp.workdir.is_none() { stamp.workdir = Some(std::path::Path::new(&(&self.root)).to_string_lossy().into_owned()); } stamp }) },
-        "role_versions": v1
-                        .then(|| BTreeMap::from([("tool-provider".to_string(), "v1".to_string())])),
-        "call_mode": serde_json::Value::Null
-        });
+        let bind = {
+            let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                route_channel: channel,
+                epoch: 1,
+                target,
+                identity: subc_protocol::BindIdentity::new("runner", &format!("session-{channel}")),
+                principal: Some(principal),
+                consumer_capabilities: None,
+                admission_facts: Default::default(),
+                scope,
+                role_versions: v1
+                    .then(|| BTreeMap::from([("tool-provider".to_string(), "v1".to_string())])),
+                call_mode: None,
+            })
+            .unwrap();
+            bind["identity"]["project_root"] = serde_json::json!(&self.root);
+            if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
+                bind["scope"]["workdir"] = serde_json::json!(&self.root);
+            }
+            bind
+        };
         let corr = 1_000 + u64::from(channel);
         self.send(
             FrameType::Request,

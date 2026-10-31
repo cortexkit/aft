@@ -1931,7 +1931,7 @@ impl SubcRelayTransport {
     async fn call(
         &self,
         target: subc_protocol::RouteTarget,
-        project_root: &str,
+        _project_root: &str,
         session: &str,
         scope: Option<&ScopeSelector>,
         body: Value,

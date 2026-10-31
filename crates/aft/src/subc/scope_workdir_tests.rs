@@ -106,20 +106,25 @@ fn bind_observed(
                 lossy_seq: Arc::new(AtomicU64::new(0)),
                 fleet_status_client: FleetStatusClient::channel(1).0,
             };
-            let request = serde_json::json!({
-"route_channel": 7,
-"epoch": 1,
-"target": RouteTarget::ToolProvider {
-                    module_id: "aft".into(),
-                },
-"identity": serde_json::json!({"harness": "opencode", "session": "folder-session", "project_root": root}),
-"principal": Some(Principal::Direct),
-"consumer_capabilities": serde_json::Value::Null,
-"admission_facts": serde_json::json!({}),
-"scope": { let scope: Option<subc_protocol::scope::ScopeStamp> = scope.clone(); scope.map(|mut stamp| { if stamp.workdir.is_none() { stamp.workdir = Some(std::path::Path::new(&(root)).to_string_lossy().into_owned()); } stamp }) },
-"role_versions": serde_json::Value::Null,
-"call_mode": serde_json::Value::Null
-});
+            let request = {
+                let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                    route_channel: 7,
+                    epoch: 1,
+                    target: RouteTarget::ToolProvider {
+                        module_id: "aft".into(),
+                    },
+                    identity: subc_protocol::BindIdentity::new("opencode", "folder-session"),
+                    principal: Some(Principal::Direct),
+                    consumer_capabilities: None,
+                    admission_facts: Default::default(),
+                    scope: scope.clone(),
+                    role_versions: None,
+                    call_mode: None,
+                })
+                .unwrap();
+                bind["identity"]["project_root"] = serde_json::json!(root);
+                bind
+            };
             let frame = Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -599,7 +604,7 @@ fn scope_workdir_mismatch_logs_once_and_binds_stamped_project() {
 }
 
 #[test]
-fn scope_workdir_old_stamp_is_silent_and_preserves_project_root() {
+fn scope_workdir_old_stamp_refuses_legacy_root_fallback() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let root = canonical_root(dir.path());
@@ -609,11 +614,12 @@ fn scope_workdir_old_stamp_is_silent_and_preserves_project_root() {
     assert!(old_stamp.workdir.is_none());
     assert!(old_stamp.project_id.is_none());
     assert_eq!(serde_json::to_vec(&old_stamp).unwrap(), br#"{"owner":{"kind":"direct"},"ref":"session-scope","scope_epoch":4,"kind":"head","owner_authorized":false}"#);
-    let (lines, old_reply) = bind(&root, Some(old_stamp), &root);
-    let (unscoped_lines, unscoped_reply) = bind(&root, None, &root);
-    assert!(lines.is_empty(), "{lines:?}");
+    assert_eq!(
+        resolve_route_project_root(Some(&root), Some(&old_stamp)),
+        Err(PROJECT_REQUIRED)
+    );
+    let (unscoped_lines, _) = bind(&root, None, &root);
     assert!(unscoped_lines.is_empty(), "{unscoped_lines:?}");
-    assert_eq!(old_reply, unscoped_reply);
     let literal_root = root.join(".");
     let (lines, _) = bind(&literal_root, None, &literal_root);
     assert!(lines.is_empty(), "{lines:?}");
@@ -725,7 +731,6 @@ fn scope_workdir_bind_reply_is_byte_for_byte_unchanged() {
     std::fs::create_dir(&other).unwrap();
     for (scope, expected) in [
         (None, &root),
-        (Some(stamp()), &root),
         (
             Some(stamp().with_workdir(Some(root.to_string_lossy().into_owned()))),
             &root,

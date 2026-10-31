@@ -90,18 +90,26 @@ async fn bind(
         stream,
         0,
         corr,
-        serde_json::to_value(serde_json::json!({
-"route_channel": channel,
-"epoch": 1,
-"target": target,
-"identity": serde_json::json!({"harness": "opencode", "session": format!("malloc-soak-{channel}"), "project_root": root.to_path_buf()}),
-"consumer_capabilities": serde_json::Value::Null,
-"principal": Some(Principal::Direct),
-"admission_facts": serde_json::json!({}),
-"scope": None::<subc_protocol::scope::ScopeStamp>,
-"role_versions": serde_json::Value::Null,
-"call_mode": serde_json::Value::Null
-}))
+        serde_json::to_value({
+            let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                route_channel: channel,
+                epoch: 1,
+                target,
+                identity: BindIdentity::new("opencode", format!("malloc-soak-{channel}")),
+                consumer_capabilities: None,
+                principal: Some(Principal::Direct),
+                admission_facts: Default::default(),
+                scope: None,
+                role_versions: None,
+                call_mode: None,
+            })
+            .unwrap();
+            bind["identity"]["project_root"] = serde_json::json!(root.to_path_buf());
+            if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
+                bind["scope"]["workdir"] = serde_json::json!(root.to_path_buf());
+            }
+            bind
+        })
         .unwrap(),
         out,
     )

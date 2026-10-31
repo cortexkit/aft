@@ -823,20 +823,31 @@ mod tests {
     fn frame_loop_context_names_control_operation_root_and_session() {
         use super::super::*;
         let metrics = DispatchPathMetrics::new();
-        let request = serde_json::json!({
-        "route_channel": 125,
-        "epoch": 1,
-        "target": subc_protocol::RouteTarget::ToolProvider {
-                        module_id: "aft".to_string(),
-                    },
-        "identity": serde_json::json!({"harness": "runner".to_string(), "session": "sidekick-session".to_string(), "project_root": PathBuf::from("/isolated/root")}),
-        "principal": serde_json::Value::Null,
-        "consumer_capabilities": serde_json::Value::Null,
-        "admission_facts": serde_json::json!({}),
-        "scope": None::<subc_protocol::scope::ScopeStamp>,
-        "role_versions": serde_json::Value::Null,
-        "call_mode": serde_json::Value::Null
-        });
+        let request = {
+            let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                route_channel: 125,
+                epoch: 1,
+                target: subc_protocol::RouteTarget::ToolProvider {
+                    module_id: "aft".to_string(),
+                },
+                identity: subc_protocol::BindIdentity::new(
+                    "runner".to_string(),
+                    "sidekick-session".to_string(),
+                ),
+                principal: None,
+                consumer_capabilities: None,
+                admission_facts: Default::default(),
+                scope: None,
+                role_versions: None,
+                call_mode: None,
+            })
+            .unwrap();
+            bind["identity"]["project_root"] = serde_json::json!(PathBuf::from("/isolated/root"));
+            if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
+                bind["scope"]["workdir"] = serde_json::json!(PathBuf::from("/isolated/root"));
+            }
+            bind
+        };
         let frame = Frame::build(
             FrameType::Request,
             control_flags(),
@@ -1368,20 +1379,31 @@ mod tests {
         });
         held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let root = fixture._storage.path().to_path_buf();
-        let request = serde_json::json!({
-        "route_channel": 125,
-        "epoch": 1,
-        "target": subc_protocol::RouteTarget::ToolProvider {
-                        module_id: "aft".to_string(),
-                    },
-        "identity": serde_json::json!({"harness": "runner".to_string(), "session": "sidekick-session".to_string(), "project_root": root.clone()}),
-        "principal": serde_json::Value::Null,
-        "consumer_capabilities": serde_json::Value::Null,
-        "admission_facts": serde_json::json!({}),
-        "scope": None::<subc_protocol::scope::ScopeStamp>,
-        "role_versions": serde_json::Value::Null,
-        "call_mode": serde_json::Value::Null
-        });
+        let request = {
+            let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                route_channel: 125,
+                epoch: 1,
+                target: subc_protocol::RouteTarget::ToolProvider {
+                    module_id: "aft".to_string(),
+                },
+                identity: subc_protocol::BindIdentity::new(
+                    "runner".to_string(),
+                    "sidekick-session".to_string(),
+                ),
+                principal: None,
+                consumer_capabilities: None,
+                admission_facts: Default::default(),
+                scope: None,
+                role_versions: None,
+                call_mode: None,
+            })
+            .unwrap();
+            bind["identity"]["project_root"] = serde_json::json!(root.clone());
+            if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
+                bind["scope"]["workdir"] = serde_json::json!(root.clone());
+            }
+            bind
+        };
         let frame = Frame::build(
             FrameType::Request,
             control_flags(),

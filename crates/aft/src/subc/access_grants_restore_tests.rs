@@ -110,22 +110,33 @@ impl WireRestore {
             .send(FrameType::HelloAck, 0, HELLO_CORR, json!({}))
             .await;
         for (channel, scope) in [(41, fixture.revived.scope.clone()), (42, None)] {
-            let bind = serde_json::json!({
-            "route_channel": channel,
-            "epoch": 1,
-            "target": RouteTarget::ToolProvider {
-                                module_id: "aft".into(),
-                            },
-            "identity": serde_json::json!({"harness": "runner", "session": if channel == 41 { "worker" } else { "healthy" }, "project_root": &fixture.revived.project_root}),
-            "principal": Some(Principal::Reserved {
-                                module_id: "broca".into(),
-                            }),
-            "consumer_capabilities": serde_json::Value::Null,
-            "admission_facts": serde_json::json!({}),
-            "scope": { let scope: Option<subc_protocol::scope::ScopeStamp> = scope; scope.map(|mut stamp| { if stamp.workdir.is_none() { stamp.workdir = Some(std::path::Path::new(&(&fixture.revived.project_root)).to_string_lossy().into_owned()); } stamp }) },
-            "role_versions": serde_json::Value::Null,
-            "call_mode": serde_json::Value::Null
-            });
+            let bind = {
+                let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                    route_channel: channel,
+                    epoch: 1,
+                    target: RouteTarget::ToolProvider {
+                        module_id: "aft".into(),
+                    },
+                    identity: subc_protocol::BindIdentity::new(
+                        "runner",
+                        if channel == 41 { "worker" } else { "healthy" },
+                    ),
+                    principal: Some(Principal::Reserved {
+                        module_id: "broca".into(),
+                    }),
+                    consumer_capabilities: None,
+                    admission_facts: Default::default(),
+                    scope,
+                    role_versions: None,
+                    call_mode: None,
+                })
+                .unwrap();
+                bind["identity"]["project_root"] = serde_json::json!(&fixture.revived.project_root);
+                if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
+                    bind["scope"]["workdir"] = serde_json::json!(&fixture.revived.project_root);
+                }
+                bind
+            };
             fixture
                 .send(
                     FrameType::Request,

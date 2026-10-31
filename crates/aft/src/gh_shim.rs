@@ -3153,7 +3153,7 @@ fn probe_governance_with_retry(
 fn probe_governance(
     paths: &StatePaths,
     connection_file: &Path,
-    cwd: &Path,
+    _cwd: &Path,
     deadline: std::time::Instant,
     agent_id: &str,
 ) -> ProbeResult {
@@ -3171,7 +3171,6 @@ fn probe_governance(
         };
     }
     let connection_file = connection_file.to_path_buf();
-    let project_root = project_root_for(cwd);
     let record_paths = paths.clone();
     let agent_id = agent_id.to_string();
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()

@@ -293,8 +293,6 @@ fn fetch_management_census(
             ));
         }
 
-        let project_root = std::env::current_dir()
-            .map_err(|error| format!("could not resolve the profile working directory: {error}"))?;
         let route = consumer
             .open_route(
                 RouteTarget::ManagementSurface {

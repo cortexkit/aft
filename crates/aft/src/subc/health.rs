@@ -999,8 +999,16 @@ impl DispatchPathMetrics {
         if let Ok(mut operation) = self.frame_operation.try_lock() {
             operation.op = name;
             operation.awaited = awaited;
-            if let super::ModuleControlRequest::RouteBind { identity, .. } = request {
-                operation.root = identity.project_root.to_string_lossy().into_owned();
+            if let super::ModuleControlRequest::RouteBind {
+                identity, scope, ..
+            } = request
+            {
+                operation.root = match scope {
+                    Some(stamp) => stamp.workdir.clone().unwrap_or_default(),
+                    None => super::legacy_route_project_root(frame)
+                        .map(|root| root.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                };
                 operation.session.clone_from(&identity.session);
             }
         }

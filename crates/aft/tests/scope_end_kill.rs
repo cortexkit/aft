@@ -359,27 +359,35 @@ impl Daemon {
     ) {
         self.corr += 1;
         let corr = self.corr;
-        let bind = serde_json::json!({
-        "route_channel": channel,
-        "epoch": bind_epoch,
-        "target": RouteTarget::ToolProvider {
-                        module_id: "aft".into(),
-                    },
-        "identity": serde_json::json!({"harness": "runner", "session": session, "project_root": &self.root.join("project")}),
-        "principal": Some(if principal == "direct" {
-                        Principal::Direct
-                    } else {
-                        Principal::Reserved {
-                            module_id: principal.into(),
-                        }
-                    }),
-        "consumer_capabilities": Some(vec!["elicitation".into()]),
-        "admission_facts": serde_json::Value::Null,
-        "scope": { let scope: Option<subc_protocol::scope::ScopeStamp> = scope; scope.map(|mut stamp| { if stamp.workdir.is_none() { stamp.workdir = Some(std::path::Path::new(&(&self.root.join("project"))).to_string_lossy().into_owned()); } stamp }) },
-        "role_versions": (!legacy)
-                        .then(|| BTreeMap::from([("tool-provider".into(), "v1".into())])),
-        "call_mode": serde_json::Value::Null
-        });
+        let bind = {
+            let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                route_channel: channel,
+                epoch: bind_epoch,
+                target: RouteTarget::ToolProvider {
+                    module_id: "aft".into(),
+                },
+                identity: BindIdentity::new("runner", session),
+                principal: Some(if principal == "direct" {
+                    Principal::Direct
+                } else {
+                    Principal::Reserved {
+                        module_id: principal.into(),
+                    }
+                }),
+                consumer_capabilities: Some(vec!["elicitation".into()]),
+                admission_facts: None,
+                scope,
+                role_versions: (!legacy)
+                    .then(|| BTreeMap::from([("tool-provider".into(), "v1".into())])),
+                call_mode: None,
+            })
+            .unwrap();
+            bind["identity"]["project_root"] = serde_json::json!(&self.root.join("project"));
+            if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
+                bind["scope"]["workdir"] = serde_json::json!(&self.root.join("project"));
+            }
+            bind
+        };
         self.send(
             FrameType::Request,
             0,

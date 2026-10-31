@@ -1417,20 +1417,28 @@ async fn bind_route_as_at_epoch(
     )
     .expect("write project config");
 
-    let request = serde_json::json!({
-    "route_channel": channel,
-    "epoch": epoch,
-    "target": RouteTarget::ToolProvider {
+    let request = {
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: channel,
+            epoch,
+            target: RouteTarget::ToolProvider {
                 module_id: "aft".to_string(),
             },
-    "identity": serde_json::json!({"harness": harness.to_string(), "session": SESSION_ID.to_string(), "project_root": root.to_path_buf()}),
-    "principal": Some(Principal::Direct),
-    "consumer_capabilities": serde_json::Value::Null,
-    "admission_facts": serde_json::json!({}),
-    "scope": None::<subc_protocol::scope::ScopeStamp>,
-    "role_versions": serde_json::Value::Null,
-    "call_mode": serde_json::Value::Null
-    });
+            identity: BindIdentity::new(harness.to_string(), SESSION_ID.to_string()),
+            principal: Some(Principal::Direct),
+            consumer_capabilities: None,
+            admission_facts: Default::default(),
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(root.to_path_buf());
+        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
+            bind["scope"]["workdir"] = serde_json::json!(root.to_path_buf());
+        }
+        bind
+    };
     send_frame(
         stream,
         Frame::build(
@@ -1658,4 +1666,189 @@ fn assert_process_alive(pid: u32, label: &str) {
 
 pub(super) fn control_flags() -> Flags {
     Flags::new(false, Priority::Passive, false)
+}
+
+// These binds exercise the wire without a real daemon's scope admission policy:
+// AFT must accept caller-owned scope metadata and keep trust tied to the bind principal.
+fn scope_project_bind_034(project: &Path) -> Value {
+    json!({
+        "op": "route.bind", "route_channel": ROUTE_CHANNEL, "epoch": 1,
+        "target": {"kind": "tool_provider", "module_id": "aft"},
+        "identity": {"harness": "opencode", "session": SESSION_ID},
+        "principal": {"kind": "direct"},
+        "scope": {
+            "owner": {"kind": "direct"}, "ref": "caller-owned",
+            "scope_epoch": 1, "kind": "head", "owner_authorized": false,
+            "workdir": project,
+        },
+    })
+}
+
+fn scope_project_case_034(
+    make_bind: impl FnOnce(&Path, &Path) -> Value,
+    bind_error: Option<&str>,
+    rootless: bool,
+) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let project = tempfile::tempdir().unwrap();
+        let decoy = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let conn_dir = tempfile::tempdir().unwrap();
+        let config_home = tempfile::tempdir().unwrap();
+        let data_home = tempfile::tempdir().unwrap();
+        write_user_config(config_home.path(), storage.path());
+        std::fs::write(project.path().join("marker.txt"), "scope_project_034_marker\n").unwrap();
+        std::fs::write(decoy.path().join("marker.txt"), "wrong_legacy_project\n").unwrap();
+        let listener = write_connection_file(conn_dir.path()).await;
+        let mut module = ModuleProcess::spawn(&conn_dir.path().join("subc-connection.json"), config_home.path(), data_home.path());
+        let mut stream = accept_module(&listener).await;
+        let bind = make_bind(project.path(), decoy.path());
+        send_frame(&mut stream, Frame::build(FrameType::Request, control_flags(), 0, 0, 10, serde_json::to_vec(&bind).unwrap()).unwrap()).await;
+        let ack = read_frame_timeout(&mut stream, "scope project bind").await;
+        assert_eq!((ack.header.channel, ack.header.corr), (0, 10));
+        if let Some(code) = bind_error {
+            assert_eq!(ack.header.ty, FrameType::Error, "{}", frame_body(&ack));
+            let error: Value = serde_json::from_slice(&ack.body).unwrap();
+            assert_eq!(error["code"], code);
+        } else {
+            assert_eq!(ack.header.ty, FrameType::Response, "{}", frame_body(&ack));
+            for (corr, body) in [
+                (20, json!({"name":"read", "preset":"head", "arguments":{"path":"marker.txt"}})),
+                (21, json!({"name":"grep", "preset":"head", "arguments":{"pattern":"scope_project_034_marker", "path":"."}})),
+            ] {
+                send_frame(&mut stream, Frame::build(FrameType::Request, Flags::new(false, Priority::Interactive, false), ROUTE_CHANNEL, 1, corr, serde_json::to_vec(&body).unwrap()).unwrap()).await;
+                let reply = read_frame_timeout(&mut stream, "scope project tool").await;
+                assert_eq!(reply.header.corr, corr);
+                if rootless {
+                    assert_eq!(reply.header.ty, FrameType::Error);
+                    let error: Value = serde_json::from_slice(&reply.body).unwrap();
+                    assert_eq!(error["code"], "project_required");
+                    assert!(error["message"].as_str().unwrap().contains("scope workdir"));
+                } else {
+                    assert_eq!(reply.header.ty, FrameType::Response, "{}", frame_body(&reply));
+                    assert!(!tool_result_is_error(&reply), "{}", frame_body(&reply));
+                    assert!(frame_body(&reply).contains("scope_project_034_marker"), "{}", frame_body(&reply));
+                    assert!(!frame_body(&reply).contains("wrong_legacy_project"));
+                }
+            }
+            if rootless {
+                for (corr, op) in [(22, "tool.catalog"), (23, "role.describe")] {
+                    send_frame(&mut stream, Frame::build(FrameType::Request, Flags::new(false, Priority::Interactive, false), ROUTE_CHANNEL, 1, corr, serde_json::to_vec(&json!({"op":op})).unwrap()).unwrap()).await;
+                    let reply = read_frame_timeout(&mut stream, "project-free metadata").await;
+                    assert_eq!(reply.header.ty, FrameType::Response, "{}", frame_body(&reply));
+                    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+                    if op == "tool.catalog" { assert!(body["tools"].as_array().is_some_and(|tools| !tools.is_empty()), "{body}"); }
+                    else { assert!(body.is_object()); }
+                }
+            }
+        }
+        send_connection_goodbye(&mut stream).await;
+        assert!(module.wait_for_exit("scope project shutdown").success());
+    });
+}
+
+#[test]
+fn subc_034_project_free_scoped_bind_reads_and_greps_workdir_without_core_approval() {
+    scope_project_case_034(|project, _| scope_project_bind_034(project), None, false);
+}
+
+#[test]
+fn subc_034_project_matching_legacy_scoped_bind_reads_and_greps_as_before() {
+    scope_project_case_034(
+        |project, _| {
+            let mut bind = scope_project_bind_034(project);
+            bind["identity"]["project_root"] = json!(project);
+            bind["scope"]["owner_authorized"] = json!(true);
+            bind
+        },
+        None,
+        false,
+    );
+}
+
+#[test]
+fn subc_034_project_mismatching_legacy_scoped_bind_uses_workdir() {
+    scope_project_case_034(
+        |project, decoy| {
+            let mut bind = scope_project_bind_034(project);
+            bind["identity"]["project_root"] = json!(decoy);
+            bind
+        },
+        None,
+        false,
+    );
+}
+
+#[test]
+fn subc_034_project_relative_scope_workdir_is_refused_before_canonicalization() {
+    scope_project_case_034(
+        |project, _| {
+            let mut bind = scope_project_bind_034(project);
+            // This relative directory exists in every AFT test process's working
+            // directory. Canonicalizing before validation would wrongly accept it.
+            bind["scope"]["workdir"] = json!(".");
+            bind["identity"]["project_root"] = json!(project);
+            bind
+        },
+        Some("invalid_workdir"),
+        false,
+    );
+}
+
+#[test]
+fn subc_034_project_empty_scope_workdir_is_refused() {
+    scope_project_case_034(
+        |project, _| {
+            let mut bind = scope_project_bind_034(project);
+            bind["scope"]["workdir"] = json!("");
+            bind
+        },
+        Some("invalid_workdir"),
+        false,
+    );
+}
+
+#[test]
+fn subc_034_project_missing_scope_workdir_does_not_use_legacy_root() {
+    scope_project_case_034(
+        |project, _| {
+            let mut bind = scope_project_bind_034(project);
+            bind["scope"].as_object_mut().unwrap().remove("workdir");
+            bind["identity"]["project_root"] = json!(project);
+            bind
+        },
+        Some("invalid_workdir"),
+        false,
+    );
+}
+
+#[test]
+fn subc_034_project_unscoped_project_free_route_refuses_files_but_serves_catalog() {
+    scope_project_case_034(
+        |project, _| {
+            let mut bind = scope_project_bind_034(project);
+            bind.as_object_mut().unwrap().remove("scope");
+            bind
+        },
+        None,
+        true,
+    );
+}
+
+#[test]
+fn subc_034_project_unscoped_legacy_root_keeps_serving_files() {
+    scope_project_case_034(
+        |project, _| {
+            let mut bind = scope_project_bind_034(project);
+            bind.as_object_mut().unwrap().remove("scope");
+            bind["identity"]["project_root"] = json!(project);
+            bind
+        },
+        None,
+        false,
+    );
 }

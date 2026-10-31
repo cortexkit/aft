@@ -2465,20 +2465,28 @@ fn send_bind_epoch(
     doc: Value,
 ) {
     publish_storm_project_config(root, &doc);
-    let request = serde_json::json!({
-    "route_channel": channel,
-    "epoch": epoch,
-    "target": RouteTarget::ToolProvider {
+    let request = {
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: channel,
+            epoch,
+            target: RouteTarget::ToolProvider {
                 module_id: "aft".to_string(),
             },
-    "identity": serde_json::json!({"harness": "opencode".to_string(), "session": session.to_string(), "project_root": root.to_path_buf()}),
-    "consumer_capabilities": serde_json::Value::Null,
-    "principal": Some(Principal::Direct),
-    "admission_facts": serde_json::json!({}),
-    "scope": None::<subc_protocol::scope::ScopeStamp>,
-    "role_versions": serde_json::Value::Null,
-    "call_mode": serde_json::Value::Null
-    });
+            identity: BindIdentity::new("opencode".to_string(), session.to_string()),
+            consumer_capabilities: None,
+            principal: Some(Principal::Direct),
+            admission_facts: Default::default(),
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(root.to_path_buf());
+        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
+            bind["scope"]["workdir"] = serde_json::json!(root.to_path_buf());
+        }
+        bind
+    };
     send_control(tx, corr, request);
 }
 
@@ -2490,20 +2498,28 @@ async fn write_measure_bind(
 ) {
     publish_storm_project_config(root, &storm_project_config(false, false, false, 0));
     let corr = 700_000 + u64::from(channel);
-    let request = serde_json::json!({
-    "route_channel": channel,
-    "epoch": 1,
-    "target": RouteTarget::ToolProvider {
+    let request = {
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: channel,
+            epoch: 1,
+            target: RouteTarget::ToolProvider {
                 module_id: "aft".to_string(),
             },
-    "identity": serde_json::json!({"harness": "opencode".to_string(), "session": session.to_string(), "project_root": root.to_path_buf()}),
-    "consumer_capabilities": serde_json::Value::Null,
-    "principal": Some(Principal::Direct),
-    "admission_facts": serde_json::json!({}),
-    "scope": None::<subc_protocol::scope::ScopeStamp>,
-    "role_versions": serde_json::Value::Null,
-    "call_mode": serde_json::Value::Null
-    });
+            identity: BindIdentity::new("opencode".to_string(), session.to_string()),
+            consumer_capabilities: None,
+            principal: Some(Principal::Direct),
+            admission_facts: Default::default(),
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(root.to_path_buf());
+        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
+            bind["scope"]["workdir"] = serde_json::json!(root.to_path_buf());
+        }
+        bind
+    };
     let frame = Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Passive, false),

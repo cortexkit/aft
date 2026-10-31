@@ -38,24 +38,32 @@ mod tests {
                 lossy_seq: Arc::new(AtomicU64::new(0)),
                 fleet_status_client: FleetStatusClient::channel(1).0,
             };
-            let request = serde_json::json!({
-"route_channel": 7,
-"epoch": 1,
-"target": RouteTarget::ManagementSurface {
-                    module_id: "aft".into(),
-                },
-"identity": serde_json::json!({"harness": harness, "session": "bind-log", "project_root": Path::new(".")}),
-"principal": principal.clone(),
-"consumer_capabilities": if capabilities.is_empty() {
-                    None
-                } else {
-                    Some(capabilities.to_vec())
-                },
-"admission_facts": serde_json::json!({}),
-"scope": None::<subc_protocol::scope::ScopeStamp>,
-"role_versions": serde_json::Value::Null,
-"call_mode": serde_json::Value::Null
-});
+            let request = {
+                let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                    route_channel: 7,
+                    epoch: 1,
+                    target: RouteTarget::ManagementSurface {
+                        module_id: "aft".into(),
+                    },
+                    identity: subc_protocol::BindIdentity::new(harness, "bind-log"),
+                    principal: principal.clone(),
+                    consumer_capabilities: if capabilities.is_empty() {
+                        None
+                    } else {
+                        Some(capabilities.to_vec())
+                    },
+                    admission_facts: Default::default(),
+                    scope: None,
+                    role_versions: None,
+                    call_mode: None,
+                })
+                .unwrap();
+                bind["identity"]["project_root"] = serde_json::json!(Path::new("."));
+                if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
+                    bind["scope"]["workdir"] = serde_json::json!(Path::new("."));
+                }
+                bind
+            };
             let frame = Frame::build(
                 FrameType::Request,
                 control_flags(),

@@ -33,10 +33,11 @@ async fn exhausted_bind(tool: bool, completion_capacity: bool) {
             );
         }
     }
-    let request = serde_json::json!({
-    "route_channel": 7,
-    "epoch": 1,
-    "target": if tool {
+    let request = {
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: 7,
+            epoch: 1,
+            target: if tool {
                 RouteTarget::ToolProvider {
                     module_id: "aft".into(),
                 }
@@ -45,14 +46,21 @@ async fn exhausted_bind(tool: bool, completion_capacity: bool) {
                     module_id: "aft".into(),
                 }
             },
-    "identity": serde_json::json!({"harness": "pi", "session": "capacity", "project_root": root.as_path()}),
-    "principal": Some(Principal::Direct),
-    "consumer_capabilities": serde_json::Value::Null,
-    "admission_facts": serde_json::json!({}),
-    "scope": None::<subc_protocol::scope::ScopeStamp>,
-    "role_versions": serde_json::Value::Null,
-    "call_mode": serde_json::Value::Null
-    });
+            identity: subc_protocol::BindIdentity::new("pi", "capacity"),
+            principal: Some(Principal::Direct),
+            consumer_capabilities: None,
+            admission_facts: Default::default(),
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(root.as_path());
+        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
+            bind["scope"]["workdir"] = serde_json::json!(root.as_path());
+        }
+        bind
+    };
     let frame = Frame::build(
         FrameType::Request,
         control_flags(),

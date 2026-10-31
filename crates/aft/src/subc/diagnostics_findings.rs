@@ -949,20 +949,26 @@ mod tests {
         });
         assert_eq!(trust_for_bind("basal", &basal), BindTrust::Untrusted);
         let bind = |channel, principal, scope| {
-            serde_json::json!({
-            "route_channel": channel,
-            "epoch": 1,
-            "target": RouteTarget::ManagementSurface {
-                            module_id: "aft".into(),
-                        },
-            "identity": serde_json::json!({"harness": "basal", "session": "flow-diagnostics", "project_root": &root}),
-            "principal": principal,
-            "consumer_capabilities": serde_json::Value::Null,
-            "admission_facts": serde_json::json!({}),
-            "scope": { let scope: Option<subc_protocol::scope::ScopeStamp> = scope; scope.map(|mut stamp| { if stamp.workdir.is_none() { stamp.workdir = Some(std::path::Path::new(&(&root)).to_string_lossy().into_owned()); } stamp }) },
-            "role_versions": serde_json::Value::Null,
-            "call_mode": Some(subc_protocol::call_mode::CallMode::Flow)
+            let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                route_channel: channel,
+                epoch: 1,
+                target: RouteTarget::ManagementSurface {
+                    module_id: "aft".into(),
+                },
+                identity: subc_protocol::BindIdentity::new("basal", "flow-diagnostics"),
+                principal,
+                consumer_capabilities: None,
+                admission_facts: Default::default(),
+                scope,
+                role_versions: None,
+                call_mode: Some(subc_protocol::call_mode::CallMode::Flow),
             })
+            .unwrap();
+            bind["identity"]["project_root"] = serde_json::json!(&root);
+            if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
+                bind["scope"]["workdir"] = serde_json::json!(&root);
+            }
+            bind
         };
 
         let mut invalid_scopes = vec![None, Some(scope(ScopeKind::Head))];

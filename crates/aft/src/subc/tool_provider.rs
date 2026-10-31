@@ -4905,20 +4905,29 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(stamp.attributes.flow_id.as_deref(), Some("flow-1"));
-        let bind = subc_protocol::session::serde_json::json!({
-        "route_channel": 1,
-        "epoch": 1,
-        "target": subc_protocol::RouteTarget::ToolProvider {
+        let bind = {
+            let mut bind =
+                serde_json::to_value(subc_protocol::session::ModuleControlRequest::RouteBind {
+                    route_channel: 1,
+                    epoch: 1,
+                    target: subc_protocol::RouteTarget::ToolProvider {
                         module_id: "aft".into(),
                     },
-        "identity": serde_json::json!({"harness": "runner", "session": "session", "project_root": "/tmp/project"}),
-        "principal": Some(subc_protocol::Principal::Direct),
-        "consumer_capabilities": serde_json::Value::Null,
-        "admission_facts": serde_json::json!({}),
-        "scope": { let scope: Option<subc_protocol::scope::ScopeStamp> = Some(stamp.clone()); scope.map(|mut stamp| { if stamp.workdir.is_none() { stamp.workdir = Some(std::path::Path::new(&("/tmp/project")).to_string_lossy().into_owned()); } stamp }) },
-        "role_versions": serde_json::Value::Null,
-        "call_mode": serde_json::Value::Null
-        });
+                    identity: subc_protocol::BindIdentity::new("runner", "session"),
+                    principal: Some(subc_protocol::Principal::Direct),
+                    consumer_capabilities: None,
+                    admission_facts: Default::default(),
+                    scope: Some(stamp.clone()),
+                    role_versions: None,
+                    call_mode: None,
+                })
+                .unwrap();
+            bind["identity"]["project_root"] = serde_json::json!("/tmp/project");
+            if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
+                bind["scope"]["workdir"] = serde_json::json!("/tmp/project");
+            }
+            bind
+        };
         let decoded: subc_protocol::session::ModuleControlRequest =
             serde_json::from_slice(&serde_json::to_vec(&bind).unwrap()).unwrap();
         let subc_protocol::session::ModuleControlRequest::RouteBind { scope, .. } = decoded else {

@@ -1568,7 +1568,7 @@ enum ManagementAdmission {
     #[default]
     FirstParty,
     FlowOnly,
-    /// Tool-provider metadata without a project actor; never management authority.
+    /// Tool-provider metadata without a project root; grants no management authority.
     ProjectFree,
 }
 
@@ -8051,8 +8051,14 @@ fn resolve_route_project_root(
 }
 
 const PROJECT_REQUIRED: &str =
-    "AFT project tools require an absolute scope workdir or an unscoped legacy project root.";
+    "AFT cannot serve project tools because this route has no absolute scope workdir or unscoped legacy project root.";
 const PROJECT_REQUIRED_CODE: &str = "project_required";
+
+fn legacy_route_project_root(frame: &Frame) -> Option<PathBuf> {
+    serde_json::from_slice::<Value>(&frame.body)
+        .ok()
+        .and_then(|body| body["identity"]["project_root"].as_str().map(PathBuf::from))
+}
 
 fn log_route_project_key_change(
     identity: &subc_protocol::BindIdentity,
@@ -8330,9 +8336,7 @@ async fn handle_control_request(
             // Protocol 0.34 drops project fields from BindIdentity. Read the
             // legacy claim separately for unscoped clients and mismatch logging;
             // it must never supply a scoped route's project.
-            let legacy_root = serde_json::from_slice::<Value>(&frame.body)
-                .ok()
-                .and_then(|body| body["identity"]["project_root"].as_str().map(PathBuf::from));
+            let legacy_root = legacy_route_project_root(frame);
             if epoch == 0 {
                 return send_route_bind_error(
                     tx,
@@ -8936,11 +8940,22 @@ async fn handle_project_free_request(
     frame: &Frame,
     metrics: &DispatchPathMetrics,
 ) -> Result<(), SubcError> {
-    let body = serde_json::from_slice::<Value>(&frame.body).unwrap_or(Value::Null);
-    let result = match body.get("op").and_then(Value::as_str) {
+    let mut body = serde_json::from_slice::<Value>(&frame.body).unwrap_or(Value::Null);
+    let operation = body
+        .get("op")
+        .or_else(|| body.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let arguments = if body.get("op").is_some() {
+        body.as_object_mut().unwrap().remove("op");
+        body
+    } else {
+        body.get("arguments").cloned().unwrap_or_else(|| json!({}))
+    };
+    let result = match operation.as_deref() {
         Some("role.describe") => Ok(tool_provider::describe()),
         Some("tool.catalog") => {
-            tool_provider::validate_catalog_request(body).and_then(|(request, preset)| {
+            tool_provider::validate_catalog_request(arguments).and_then(|(request, preset)| {
                 tool_provider::catalog_for_request(
                     request,
                     preset,
@@ -15109,20 +15124,31 @@ mod tests {
             write_frame(&mut daemon, &ack)
                 .await
                 .map_err(|e| e.to_string())?;
-            let bind = serde_json::json!({
-"route_channel": 75,
-"epoch": 1,
-"target": RouteTarget::ToolProvider {
-                    module_id: "aft".into(),
-                },
-"identity": serde_json::json!({"harness": "opencode", "session": "standing-busy-root-isolation", "project_root": healthy_root.as_path()}),
-"principal": Some(subc_protocol::Principal::Direct),
-"consumer_capabilities": serde_json::Value::Null,
-"admission_facts": serde_json::json!({}),
-"scope": None::<subc_protocol::scope::ScopeStamp>,
-"role_versions": serde_json::Value::Null,
-"call_mode": serde_json::Value::Null
-});
+            let bind = {
+                let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                    route_channel: 75,
+                    epoch: 1,
+                    target: RouteTarget::ToolProvider {
+                        module_id: "aft".into(),
+                    },
+                    identity: subc_protocol::BindIdentity::new(
+                        "opencode",
+                        "standing-busy-root-isolation",
+                    ),
+                    principal: Some(subc_protocol::Principal::Direct),
+                    consumer_capabilities: None,
+                    admission_facts: Default::default(),
+                    scope: None,
+                    role_versions: None,
+                    call_mode: None,
+                })
+                .unwrap();
+                bind["identity"]["project_root"] = serde_json::json!(healthy_root.as_path());
+                if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
+                    bind["scope"]["workdir"] = serde_json::json!(healthy_root.as_path());
+                }
+                bind
+            };
             let bind = Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -15275,20 +15301,28 @@ mod tests {
             write_frame(&mut daemon, &ack)
                 .await
                 .map_err(|e| e.to_string())?;
-            let bind = serde_json::json!({
-"route_channel": 71,
-"epoch": 1,
-"target": RouteTarget::ToolProvider {
-                    module_id: "aft".into(),
-                },
-"identity": serde_json::json!({"harness": "opencode", "session": "standing-isolation", "project_root": root.as_path()}),
-"principal": Some(subc_protocol::Principal::Direct),
-"consumer_capabilities": serde_json::Value::Null,
-"admission_facts": serde_json::json!({}),
-"scope": None::<subc_protocol::scope::ScopeStamp>,
-"role_versions": serde_json::Value::Null,
-"call_mode": serde_json::Value::Null
-});
+            let bind = {
+                let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                    route_channel: 71,
+                    epoch: 1,
+                    target: RouteTarget::ToolProvider {
+                        module_id: "aft".into(),
+                    },
+                    identity: subc_protocol::BindIdentity::new("opencode", "standing-isolation"),
+                    principal: Some(subc_protocol::Principal::Direct),
+                    consumer_capabilities: None,
+                    admission_facts: Default::default(),
+                    scope: None,
+                    role_versions: None,
+                    call_mode: None,
+                })
+                .unwrap();
+                bind["identity"]["project_root"] = serde_json::json!(root.as_path());
+                if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
+                    bind["scope"]["workdir"] = serde_json::json!(root.as_path());
+                }
+                bind
+            };
             let bind = Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -15344,20 +15378,28 @@ mod tests {
         holder.join().unwrap();
         let recovery: Result<(), String> = if while_held.is_ok() {
             async {
-                let bind = serde_json::json!({
-"route_channel": 73,
-"epoch": 1,
-"target": RouteTarget::ToolProvider {
-                        module_id: "aft".into(),
-                    },
-"identity": serde_json::json!({"harness": "opencode", "session": "standing-recovery", "project_root": root.as_path()}),
-"principal": Some(subc_protocol::Principal::Direct),
-"consumer_capabilities": serde_json::Value::Null,
-"admission_facts": serde_json::json!({}),
-"scope": None::<subc_protocol::scope::ScopeStamp>,
-"role_versions": serde_json::Value::Null,
-"call_mode": serde_json::Value::Null
-});
+                let bind = {
+                    let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                        route_channel: 73,
+                        epoch: 1,
+                        target: RouteTarget::ToolProvider {
+                            module_id: "aft".into(),
+                        },
+                        identity: subc_protocol::BindIdentity::new("opencode", "standing-recovery"),
+                        principal: Some(subc_protocol::Principal::Direct),
+                        consumer_capabilities: None,
+                        admission_facts: Default::default(),
+                        scope: None,
+                        role_versions: None,
+                        call_mode: None,
+                    })
+                    .unwrap();
+                    bind["identity"]["project_root"] = serde_json::json!(root.as_path());
+                    if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
+                        bind["scope"]["workdir"] = serde_json::json!(root.as_path());
+                    }
+                    bind
+                };
                 let frame = Frame::build(
                     FrameType::Request,
                     control_flags(),
@@ -15677,20 +15719,31 @@ mod tests {
                 lossy_seq: Arc::new(AtomicU64::new(0)),
                 fleet_status_client: FleetStatusClient::channel(1).0,
             };
-            let request = serde_json::json!({
-"route_channel": 1,
-"epoch": 1,
-"target": RouteTarget::ToolProvider {
-                    module_id: "aft".to_string(),
-                },
-"identity": serde_json::json!({"harness": "opencode", "session": "bind-health-work-count", "project_root": root.as_path()}),
-"principal": Some(subc_protocol::Principal::Direct),
-"consumer_capabilities": serde_json::Value::Null,
-"admission_facts": serde_json::json!({}),
-"scope": None::<subc_protocol::scope::ScopeStamp>,
-"role_versions": serde_json::Value::Null,
-"call_mode": serde_json::Value::Null
-});
+            let request = {
+                let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                    route_channel: 1,
+                    epoch: 1,
+                    target: RouteTarget::ToolProvider {
+                        module_id: "aft".to_string(),
+                    },
+                    identity: subc_protocol::BindIdentity::new(
+                        "opencode",
+                        "bind-health-work-count",
+                    ),
+                    principal: Some(subc_protocol::Principal::Direct),
+                    consumer_capabilities: None,
+                    admission_facts: Default::default(),
+                    scope: None,
+                    role_versions: None,
+                    call_mode: None,
+                })
+                .unwrap();
+                bind["identity"]["project_root"] = serde_json::json!(root.as_path());
+                if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
+                    bind["scope"]["workdir"] = serde_json::json!(root.as_path());
+                }
+                bind
+            };
             let frame = Frame::build_with_version(
                 PROTOCOL_VERSION,
                 FrameType::Request,

@@ -406,7 +406,6 @@ async fn purge_via_daemon(connection_file: PathBuf, request: &PurgeRequest) -> O
         ));
     }
 
-    let project_root = request.storage_dir.clone();
     let route = match consumer
         .open_route(
             RouteTarget::ManagementSurface {

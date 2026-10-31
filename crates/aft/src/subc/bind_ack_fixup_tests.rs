@@ -37,10 +37,11 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for GateWrite<W> {
 }
 
 fn bind(root: &Path, tool: bool, epoch: u32, corr: u64) -> Frame {
-    let request = serde_json::json!({
-    "route_channel": 7,
-    "epoch": epoch,
-    "target": if tool {
+    let request = {
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: 7,
+            epoch,
+            target: if tool {
                 RouteTarget::ToolProvider {
                     module_id: "aft".into(),
                 }
@@ -49,14 +50,21 @@ fn bind(root: &Path, tool: bool, epoch: u32, corr: u64) -> Frame {
                     module_id: "aft".into(),
                 }
             },
-    "identity": serde_json::json!({"harness": "opencode", "session": "retracted-bind", "project_root": root}),
-    "principal": Some(subc_protocol::Principal::Direct),
-    "consumer_capabilities": serde_json::Value::Null,
-    "admission_facts": serde_json::json!({}),
-    "scope": None::<subc_protocol::scope::ScopeStamp>,
-    "role_versions": serde_json::Value::Null,
-    "call_mode": serde_json::Value::Null
-    });
+            identity: subc_protocol::BindIdentity::new("opencode", "retracted-bind"),
+            principal: Some(subc_protocol::Principal::Direct),
+            consumer_capabilities: None,
+            admission_facts: Default::default(),
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(root);
+        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
+            bind["scope"]["workdir"] = serde_json::json!(root);
+        }
+        bind
+    };
     Frame::build(
         FrameType::Request,
         control_flags(),
