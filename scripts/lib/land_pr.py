@@ -309,7 +309,7 @@ def submit(args: argparse.Namespace) -> str:
     if git("status", "--porcelain"):
         raise ValueError("working tree must be clean before landing")
     branch = f"land/{args.name}"
-    path = Path(git("rev-parse", "--git-path", f"aft-land/{args.name}.json"))
+    path = Path(git("rev-parse", "--git-common-dir")) / "aft-land" / f"{args.name}.json"
     state = json.loads(path.read_text()) if path.exists() else {}
     repo = gh("repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner")
     owner = repo.split("/")[0]

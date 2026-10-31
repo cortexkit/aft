@@ -68,6 +68,72 @@ fn queue_rows_require_both_v23_and_the_signed_declaration_on_supported_platforms
     }
 }
 
+/// Manifest v23 reads a queue-shaped `gh pr merge` as the bot's enqueue. Under
+/// the operator bypass it must stay the operator's audited `pr merge`, pinned
+/// or not: the operator queues pull requests the bot did not open, and before
+/// v23 that ran through the real gh. Without the bypass the unpinned form is
+/// refused before routing and never reaches the real gh.
+#[test]
+fn operator_bypass_keeps_queue_shaped_pr_merge_on_the_operators_gh() {
+    use super::v22_tests::{args, binding, rung, EnvGuard};
+
+    let _lock = crate::test_env::process_env_lock();
+    let manifest = manifest();
+    let sha = "0123456789abcdef0123456789abcdef01234567";
+    let forms = [
+        args(&["pr", "merge", "7", "--auto"]),
+        args(&["pr", "merge", "7", "--auto", "--match-head-commit", sha]),
+        args(&["pr", "merge", "7", "--match-head-commit", sha]),
+    ];
+    for argv in &forms {
+        assert!(
+            matches!(classify(argv, &manifest, "linux"), Classification::Governed { ref tuple, .. } if tuple == "pr enqueue"),
+            "{argv:?} is the bot's enqueue for bot callers"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        let _bypass = EnvGuard::set("GH_SHIM_BYPASS", Some("operator"));
+        assert_eq!(
+            dispatch_r3(
+                argv,
+                classify(argv, &manifest, "linux"),
+                &manifest,
+                &paths,
+                &rung(),
+                &binding(),
+                1_700_000_000,
+                |forwarded| {
+                    assert_eq!(forwarded, argv.as_slice());
+                    let records = read_bypass_audit(&paths).0.unwrap();
+                    assert_eq!(records.len(), 1);
+                    assert_eq!(records[0]["tuple"], "pr merge");
+                    73
+                },
+            ),
+            73,
+            "{argv:?} under the bypass"
+        );
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let paths = StatePaths::from_root(directory.path().to_path_buf());
+    let _bypass = EnvGuard::set("GH_SHIM_BYPASS", None);
+    assert_eq!(
+        dispatch_r3(
+            &forms[0],
+            classify(&forms[0], &manifest, "linux"),
+            &manifest,
+            &paths,
+            &rung(),
+            &binding(),
+            1_700_000_000,
+            |_| panic!("an unpinned queue merge reached the real gh without the bypass"),
+        ),
+        REFUSAL_EXIT_STATUS
+    );
+    assert!(!paths.bypass_audit.exists());
+}
+
 #[test]
 fn direct_merge_flags_and_disable_auto_keep_their_existing_classification() {
     let current = manifest();

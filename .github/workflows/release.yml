@@ -44,8 +44,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Fetch main
-        run: git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+      # Release branches carry retry tags; the gate verifies their provenance.
+      - name: Fetch main and release branches
+        run: git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main '+refs/heads/release/*:refs/remotes/origin/release/*'
 
       - name: Require a green tests.yml run for this commit
         env:
