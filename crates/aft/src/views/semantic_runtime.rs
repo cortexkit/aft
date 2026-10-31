@@ -187,7 +187,12 @@ impl CheckoutSemantic {
             storage.artifacts.clone(),
             policy,
         ));
-        let callgraph = Arc::new(super::first_load::CallgraphBridge::default());
+        // No call-graph plane here. The checkout's call graph is its own
+        // member (`<scope>.callgraph`), and nothing reads a call graph from
+        // this semantic member. Attaching the call-graph plane made every
+        // publication of this member extract call-graph facts and write a
+        // second resolved call-graph database for the checkout, a clone on
+        // filesystems that support clones and a full copy elsewhere.
         let member_scope = view_scope(scope);
         let driver = Arc::new(
             CheckoutDriver::new_v3(
@@ -197,7 +202,7 @@ impl CheckoutSemantic {
                 root,
                 producers.clone(),
                 Arc::new(ConfiguredMembershipWalker),
-                vec![trigram, composite, callgraph],
+                vec![trigram, composite],
             )
             .map_err(|error| error.to_string())?
             .with_adapters(vec![adapter]),

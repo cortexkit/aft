@@ -603,6 +603,139 @@ fn views_on_worktrees_and_sessions_embed_each_chunk_once() {
     );
 }
 
+/// The checkout's call graph lives in its own `<scope>.callgraph` member, so
+/// the semantic member must not resolve and store a second copy of it. A
+/// callers query first builds the base's call graph and the call-graph member.
+/// An uncommitted edit then makes the semantic member publish a generation
+/// over that ready base, which is when a call-graph plane in the semantic
+/// driver would clone and patch the base's database. The semantic member must
+/// hold no derived call-graph database, while the call-graph member holds one.
+#[test]
+fn views_on_semantic_member_stores_no_call_graph_database() {
+    let _settings = crate::test_helpers::without_storage_override();
+    let server = MockEmbedder::start();
+    let repo = repository();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = Arc::new(
+        AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config::default()),
+        )
+        .with_test_checkpoint_store(),
+    );
+    let mut payload = configure_payload(&repo.main, storage.path(), &server, true, MODEL, 5_000);
+    payload["config"] = crate::helpers::user_config(json!({
+        "indexes": { "trigram": true, "semantic": true, "callgraph": true },
+        "views": { "enabled": true },
+        "semantic": {
+            "backend": "openai_compatible",
+            "model": MODEL,
+            "base_url": server.base_url,
+            "timeout_ms": 5_000,
+            "max_batch_size": 64,
+            "max_files": 2_000
+        }
+    }));
+    let configured = aft::commands::configure::handle_configure(&request(payload.clone()), &ctx);
+    assert!(configured.success, "configure failed: {configured:?}");
+    aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+    wait_views_filled(&ctx);
+
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        drain(&ctx);
+        let answer = aft::commands::callers::handle_callers(
+            &request(json!({
+                "id": "semantic-member-callers",
+                "command": "callers",
+                "file": repo.main.join("src/parse.rs"),
+                "symbol": "trim_comment",
+            })),
+            &ctx,
+        );
+        if answer.success {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the call-graph view never answered: {:?}",
+            answer.data
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    write(
+        &repo.main,
+        "src/uncommitted.rs",
+        "pub fn uncommitted_helper() -> u64 { 7 }\n",
+    );
+    // Binding again verifies the checkout against disk, so the semantic
+    // member publishes the edit without depending on watcher delivery.
+    let rebound = aft::commands::configure::handle_configure(&request(payload), &ctx);
+    assert!(rebound.success, "configure failed: {rebound:?}");
+    aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+
+    // What the v3 member directories hold: whether a semantic manifest names
+    // the edited file, the semantic members' derived databases, and how many
+    // derived databases the call-graph members hold.
+    let scan = || {
+        let mut edit_published = false;
+        let mut semantic_derived = Vec::new();
+        let mut callgraph_derived = 0;
+        for family in std::fs::read_dir(storage.path().join("blobs/v3")).unwrap() {
+            let views = family.unwrap().path().join("views");
+            let Ok(members) = std::fs::read_dir(&views) else {
+                continue;
+            };
+            for member in members {
+                let member = member.unwrap().path();
+                let name = member.file_name().unwrap().to_string_lossy().into_owned();
+                let Ok(files) = std::fs::read_dir(&member) else {
+                    continue;
+                };
+                for file in files {
+                    let file = file.unwrap().file_name().to_string_lossy().into_owned();
+                    let derived = file.starts_with("derived-") && file.ends_with(".sqlite");
+                    if name.ends_with(".semantic") {
+                        if file.starts_with("manifest-") && file.ends_with(".json") {
+                            edit_published |= std::fs::read_to_string(member.join(&file))
+                                .is_ok_and(|text| text.contains("src/uncommitted.rs"));
+                        }
+                        if derived {
+                            semantic_derived.push(member.join(&file));
+                        }
+                    } else if name.ends_with(".callgraph") && derived {
+                        callgraph_derived += 1;
+                    }
+                }
+            }
+        }
+        (edit_published, semantic_derived, callgraph_derived)
+    };
+    // Until the semantic member has published a generation that holds the
+    // edit, an empty result proves nothing.
+    let deadline = Instant::now() + DEADLINE;
+    let (semantic_derived, callgraph_derived) = loop {
+        drain(&ctx);
+        let (edit_published, semantic_derived, callgraph_derived) = scan();
+        if edit_published {
+            break (semantic_derived, callgraph_derived);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the semantic member never published a generation with the edit"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        semantic_derived.is_empty(),
+        "the semantic member stored its own call graph: {semantic_derived:?}"
+    );
+    assert!(
+        callgraph_derived > 0,
+        "the call-graph member must still hold the checkout's call graph"
+    );
+}
+
 /// Holds the owner's response until the other process acknowledges contention.
 /// A second provider arrival is a failure, never a condition for releasing it.
 #[test]
