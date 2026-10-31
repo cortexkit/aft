@@ -11862,6 +11862,19 @@ fn runon_cd_snapshot_missing_git_keeps_failure_branch() {
 }
 
 #[test]
+fn runon_cd_sequential_command_after_setup_is_allowed() {
+    let (_dir, request) = runon_cd_snapshot_fixture();
+    let checkout = Path::new(&request.workspace_key);
+    for package in ["plugin", "e2e-tests"] {
+        let path = checkout.join("packages").join(package);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("source.ts"), "source\n").unwrap();
+    }
+    let command = "printf setup; cd packages/plugin && bun test src/__tests__; cd ../e2e-tests && bun test src/__tests__";
+    assert_eq!(runon_cd_refusal(command, &request).unwrap(), None);
+}
+
+#[test]
 fn runon_cd_snapshot_rule_invalid_cd_keeps_failure_branch() {
     let (_dir, request) = runon_cd_snapshot_fixture();
     let checkout = Path::new(&request.workspace_key);
