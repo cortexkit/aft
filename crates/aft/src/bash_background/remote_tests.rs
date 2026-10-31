@@ -3673,25 +3673,23 @@ async fn runon_restart_first_watch_reattaches(watch_before_replay: bool) {
     let project = root.path().join("project");
     fs::create_dir(&project).unwrap();
     ensure_git_fixture(&project);
-    let child = tokio::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "bash_background::registry::remote::tests::runon_restart_reattach_drain_child",
-            "--nocapture",
-        ])
-        .env("AFT_RUNON_RESTART_FIXTURE", root.path())
-        .env("AFT_RUNON_RESTART_CONNECTION", &daemon.connection)
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
-            .await
-            .expect("draining AFT fixture must exit")
+    let fixture_root = root.path().to_path_buf();
+    let connection = daemon.connection.clone();
+    let child = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "bash_background::registry::remote::tests::runon_restart_reattach_drain_child",
+                "--nocapture",
+            ])
+            .env("AFT_RUNON_RESTART_FIXTURE", fixture_root)
+            .env("AFT_RUNON_RESTART_CONNECTION", connection)
+            .output()
             .unwrap()
-            .status
-            .success()
-    );
+    })
+    .await
+    .unwrap();
+    assert!(child.status.success(), "{child:?}");
     let task_id = fs::read_to_string(root.path().join("task-id")).unwrap();
     let ctx = runon_restart_context(&project, &root.path().join("storage"));
     ctx.bash_background()
