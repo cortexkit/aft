@@ -1056,19 +1056,52 @@ async fn try_apply_covering_grant(
     let call_key_clone = call_key.clone();
     let holder_clone = holder.clone();
     let db_for_claim = Arc::clone(&db);
-    let joined: Option<Option<Vec<Permission>>> = tokio::task::spawn_blocking(move || {
+    let identity = call.identity.clone();
+    let joined = tokio::task::spawn_blocking(move || {
         let conn = db_for_claim.lock().ok()?;
-        let claimed = asks::claim(&conn, &key_clone, &call_key_clone, &holder_clone).ok()?;
-        Some(claimed)
+        let claim = || -> rusqlite::Result<Applied> {
+            let tx = rusqlite::Transaction::new_unchecked(
+                &conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let applied = if approval_origin_ended(&tx, &identity, &key_clone.scope)? {
+                asks::discard(&tx, &key_clone)?;
+                Applied::Withdrawn
+            } else {
+                match asks::claim_in_transaction(&tx, &key_clone, &call_key_clone, &holder_clone)? {
+                    Some(once) => Applied::Run(once),
+                    None => Applied::NotClaimed,
+                }
+            };
+            tx.commit()?;
+            Ok(applied)
+        };
+        let stamp = identity.scope.as_ref()?;
+        let live_claim = || match identity.run_scope.get() {
+            Some(run) => run.with_live_authority(claim),
+            None => Some(claim()),
+        };
+        ctx.bash_background()
+            .with_live_scope(stamp, live_claim)
+            .flatten()
+            .unwrap_or(Ok(Applied::Withdrawn))
+            .ok()
     })
     .await
     .ok()
     .flatten();
-    let Some(claimed) = joined else {
-        return None;
-    };
-    let Some(once) = claimed else {
-        return Some(Hold::Answer(retry_answer(call, &prep.grant)));
+    let once = match joined {
+        Some(Applied::Run(once)) => once,
+        Some(Applied::Withdrawn) => {
+            return Some(Hold::Answer(refused_answer(
+                call,
+                &prep.grant,
+                "access_withdrawn",
+                None,
+            )))
+        }
+        Some(Applied::NotClaimed) => return Some(Hold::Answer(retry_answer(call, &prep.grant))),
+        _ => return None,
     };
     let claim = Arc::new(ClaimedAsk {
         db: Arc::clone(&db),
@@ -3102,47 +3135,88 @@ fn apply_allow(
         }
     }
     with_head_policy(db, ctx, identity, !by_user, |conn, head| {
-        if let Some(ledger_key) = ledger_key {
-            if !crate::db::call_ledger::get(conn, ledger_key)?
-                .is_some_and(|row| row.state == crate::db::call_ledger::State::Prepared)
-            {
-                asks::discard(conn, key)?;
-                return Ok(Applied::Withdrawn);
-            }
-        }
-        // A head may pass on only what it holds now: its authority is
-        // checked again against the head's current policy and grants.
-        if !by_user
-            && grant
-                .file()
-                .is_none_or(|grant| head_policy(head.as_ref(), grant) != HeadPolicy::Allow)
-        {
-            asks::discard(conn, key)?;
-            return Ok(Applied::HeadNotHeld);
-        }
-        let audit = if scope { asks::get(conn, key)? } else { None };
-        let Some(approved) = asks::claim(conn, key, call_key, claimant)? else {
-            return Ok(Applied::NotClaimed);
-        };
-        if scope {
-            crate::db::access_grants::insert(
+        let apply = || -> rusqlite::Result<Applied> {
+            let tx = rusqlite::Transaction::new_unchecked(
                 conn,
-                &access_grants::policy_scope_key(identity),
-                grant.file().expect("only file scopes persist"),
+                rusqlite::TransactionBehavior::Immediate,
             )?;
-            if let Some(record) = audit {
-                log_consent(
-                    &identity.session,
-                    ConsentEvent::Granted {
-                        epoch: key.scope.epoch,
-                    },
-                    record.elicitation_id.as_deref().unwrap_or(call_key),
-                    grant,
-                );
-            }
-        }
-        Ok(Applied::Run(approved))
+            let applied = (|| -> rusqlite::Result<Applied> {
+                let conn = &*tx;
+                // The head may remain live after its program ended. Fence the
+                // asking scope, not only the head that would receive the grant.
+                if approval_origin_ended(conn, identity, &key.scope)? {
+                    asks::discard(conn, key)?;
+                    return Ok(Applied::Withdrawn);
+                }
+                if let Some(ledger_key) = ledger_key {
+                    if !crate::db::call_ledger::get(conn, ledger_key)?
+                        .is_some_and(|row| row.state == crate::db::call_ledger::State::Prepared)
+                    {
+                        asks::discard(conn, key)?;
+                        return Ok(Applied::Withdrawn);
+                    }
+                }
+                // A head may pass on only what it holds now: its authority is
+                // checked again against the head's current policy and grants.
+                if !by_user
+                    && grant
+                        .file()
+                        .is_none_or(|grant| head_policy(head.as_ref(), grant) != HeadPolicy::Allow)
+                {
+                    asks::discard(conn, key)?;
+                    return Ok(Applied::HeadNotHeld);
+                }
+                let audit = if scope { asks::get(conn, key)? } else { None };
+                let Some(approved) = asks::claim_in_transaction(conn, key, call_key, claimant)?
+                else {
+                    return Ok(Applied::NotClaimed);
+                };
+                if scope {
+                    crate::db::access_grants::insert(
+                        conn,
+                        &access_grants::policy_scope_key(identity),
+                        grant.file().expect("only file scopes persist"),
+                    )?;
+                    if let Some(record) = audit {
+                        log_consent(
+                            &identity.session,
+                            ConsentEvent::Granted {
+                                epoch: key.scope.epoch,
+                            },
+                            record.elicitation_id.as_deref().unwrap_or(call_key),
+                            grant,
+                        );
+                    }
+                }
+                Ok(Applied::Run(approved))
+            })()?;
+            tx.commit()?;
+            Ok(applied)
+        };
+        let Some(stamp) = identity.scope.as_ref() else {
+            return Ok(Applied::Withdrawn);
+        };
+        let live_apply = || match identity.run_scope.get() {
+            Some(run) => run.with_live_authority(apply),
+            None => Some(apply()),
+        };
+        ctx.bash_background()
+            .with_live_scope(stamp, live_apply)
+            .flatten()
+            .unwrap_or_else(|| {
+                asks::discard(conn, key)?;
+                Ok(Applied::Withdrawn)
+            })
     })
+}
+
+fn approval_origin_ended(
+    conn: &rusqlite::Connection,
+    identity: &RouteIdentity,
+    scope: &crate::db::access_grants::ScopeKey,
+) -> rusqlite::Result<bool> {
+    Ok(identity.run_scope.get().is_some_and(|run| run.revoked())
+        || crate::db::access_grants::scope_ended(conn, scope)?)
 }
 
 /// A run-scoped call that ends with `access_pending` leaves its ask with the

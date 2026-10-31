@@ -369,6 +369,29 @@ pub(crate) fn hold_permission(
 /// and this transition are serialized by the owning database connection.
 pub(crate) fn begin_approved(conn: &Connection, key: &Key) -> rusqlite::Result<bool> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let Some(row) = get(&tx, key)?.filter(|row| row.state == State::Prepared) else {
+        return Ok(false);
+    };
+    if let Some(scope) = &row.scope {
+        let owner = match scope.owner.as_str() {
+            "direct" => subc_protocol::Principal::Direct,
+            "unverified" => subc_protocol::Principal::Unverified,
+            other => match other.strip_prefix("reserved:") {
+                Some(module_id) => subc_protocol::Principal::Reserved {
+                    module_id: module_id.into(),
+                },
+                None => return Err(rusqlite::Error::InvalidQuery),
+            },
+        };
+        let origin = super::access_grants::ScopeKey {
+            owner: serde_json::to_string(&owner).expect("principal is JSON"),
+            scope_ref: scope.scope_ref.clone(),
+            epoch: scope.scope_epoch,
+        };
+        if super::access_grants::scope_ended(&tx, &origin)? {
+            return Ok(false);
+        }
+    }
     let changed = transition(&tx, key, State::Prepared, State::Authorized)?
         && transition(&tx, key, State::Authorized, State::DispatchStarted)?;
     tx.commit()?;
@@ -1419,6 +1442,47 @@ mod tests {
         assert!(end_scope(&conn, &own, now_ms()).unwrap().is_empty());
     }
     use super::*;
+
+    #[test]
+    fn approved_dispatch_checks_ended_scope_even_when_settlement_left_it_prepared() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let scope = ScopeIdentity {
+            owner: "reserved:prefrontal-core".into(),
+            scope_ref: "run:ended".into(),
+            scope_epoch: 7,
+        };
+        let key = Key {
+            carrier: "reserved:basal".into(),
+            call_key: "approved".into(),
+        };
+        admit(&conn, &key, "digest", Some(&scope), State::Prepared).unwrap();
+        let origin = crate::db::access_grants::ScopeKey {
+            owner: serde_json::to_string(&subc_protocol::Principal::Reserved {
+                module_id: "prefrontal-core".into(),
+            })
+            .unwrap(),
+            scope_ref: scope.scope_ref.clone(),
+            epoch: scope.scope_epoch,
+        };
+        crate::db::access_grants::end_scope_grants(&conn, &origin).unwrap();
+        assert!(!begin_approved(&conn, &key).unwrap());
+        assert_eq!(get(&conn, &key).unwrap().unwrap().state, State::Prepared);
+        let live_scope = ScopeIdentity {
+            scope_ref: "run:live".into(),
+            ..scope
+        };
+        let live = Key {
+            call_key: "live".into(),
+            ..key
+        };
+        admit(&conn, &live, "digest", Some(&live_scope), State::Prepared).unwrap();
+        assert!(begin_approved(&conn, &live).unwrap());
+        assert_eq!(
+            get(&conn, &live).unwrap().unwrap().state,
+            State::DispatchStarted
+        );
+    }
 
     #[test]
     fn concurrent_ledger_writers_do_not_upgrade_stale_snapshots() {

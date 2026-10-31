@@ -142,6 +142,7 @@ pub(super) struct RunScope {
     describe_lock: tokio::sync::Mutex<()>,
     budget: StdMutex<Option<RunBudget>>,
     revoked: AtomicBool,
+    authorization: StdMutex<()>,
     /// Permission asks this run's calls left open with `access_pending`.
     /// They are withdrawn once the run's scope is confirmed ended.
     parked_asks: StdMutex<Vec<super::consent::ParkedAsk>>,
@@ -152,6 +153,28 @@ impl RunScope {
     /// Whether scope.describe confirmed that the run's scope ended.
     pub(super) fn revoked(&self) -> bool {
         self.revoked.load(Ordering::Acquire)
+    }
+
+    /// Serialize the final grant/dispatch decision with a scope-end notification.
+    pub(super) fn with_live_authority<T>(&self, run: impl FnOnce() -> T) -> Option<T> {
+        let _authorization = self
+            .authorization
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.revoked() {
+            None
+        } else {
+            Some(run())
+        }
+    }
+
+    fn revoke(&self) {
+        let _authorization = self
+            .authorization
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.revoked.store(true, Ordering::Release);
+        self.withdraw_parked_asks();
     }
 
     /// Keep an ask the run left open so the run's end withdraws it. An ask
@@ -284,8 +307,7 @@ impl RunScopes {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&super::scope_describe::stamp_key(stamp))
         {
-            scope.revoked.store(true, Ordering::Release);
-            scope.withdraw_parked_asks();
+            scope.revoke();
         }
     }
 
@@ -327,6 +349,7 @@ impl RunScopes {
                             describe_lock: tokio::sync::Mutex::new(()),
                             budget: StdMutex::new(None),
                             revoked: AtomicBool::new(false),
+                            authorization: StdMutex::new(()),
                             parked_asks: StdMutex::new(Vec::new()),
                             permission_budget: Arc::default(),
                         })
@@ -497,8 +520,7 @@ impl RunBudget {
 impl RunScope {
     #[cfg(unix)]
     pub(super) fn end_for_test(&self) {
-        self.revoked.store(true, Ordering::Release);
-        self.withdraw_parked_asks();
+        self.revoke();
     }
 
     pub(super) fn for_test(deadline: Option<Instant>) -> Arc<Self> {
@@ -535,6 +557,7 @@ impl RunScope {
                 now_for_test: now,
             })),
             revoked: AtomicBool::new(false),
+            authorization: StdMutex::new(()),
             parked_asks: StdMutex::new(Vec::new()),
             permission_budget: Arc::default(),
         })
@@ -544,6 +567,29 @@ impl RunScope {
 #[cfg(test)]
 mod lifetime_tests {
     use super::*;
+
+    #[test]
+    fn authorization_lease_holds_the_revocation_lock_and_refuses_after_end() {
+        let scope = RunScope::for_test(None);
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let applying = scope.clone();
+        let worker = std::thread::spawn(move || {
+            applying.with_live_authority(|| {
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+            })
+        });
+        started.recv_timeout(Duration::from_secs(10)).unwrap();
+        let locked = scope.authorization.try_lock().is_err();
+        release.send(()).unwrap();
+        assert!(worker.join().unwrap().is_some());
+        assert!(locked);
+        scope.revoke();
+        assert!(scope
+            .with_live_authority(|| panic!("ended authority must not be used"))
+            .is_none());
+    }
 
     #[test]
     fn confirmed_scope_end_invalidates_cached_run_budget() {

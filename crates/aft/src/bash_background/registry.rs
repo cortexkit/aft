@@ -11908,9 +11908,8 @@ impl BgTaskRegistry {
             .collect()
     }
 
-    pub(crate) fn kill_scope(&self, scope: &subc_protocol::scope::ScopeStamp) {
-        // Remember the end before taking the task snapshot. A dispatch already
-        // queued on another thread may register its process after this pass.
+    /// Fence approvals before asynchronous scope cleanup can block or fail.
+    pub(crate) fn fence_scope_end(&self, scope: &subc_protocol::scope::ScopeStamp) {
         self.inner
             .revoked_scopes
             .lock()
@@ -11920,6 +11919,36 @@ impl BgTaskRegistry {
                 scope.scope_ref.clone(),
                 scope.scope_epoch,
             ));
+    }
+
+    /// Serialize the final approval/dispatch check with confirmed scope ends.
+    /// Callers hold the owning database lock first; the closure must not take
+    /// task-state locks. Scope-end insertion itself never takes the database lock.
+    pub(crate) fn with_live_scope<T>(
+        &self,
+        scope: &subc_protocol::scope::ScopeStamp,
+        run: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let revoked = self
+            .inner
+            .revoked_scopes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if revoked.contains(&(
+            serde_json::to_string(&scope.owner).expect("principal is JSON"),
+            scope.scope_ref.clone(),
+            scope.scope_epoch,
+        )) {
+            None
+        } else {
+            Some(run())
+        }
+    }
+
+    pub(crate) fn kill_scope(&self, scope: &subc_protocol::scope::ScopeStamp) {
+        // Remember the end before taking the task snapshot. A dispatch already
+        // queued on another thread may register its process after this pass.
+        self.fence_scope_end(scope);
         #[cfg(unix)]
         {
             let mut proxies = self

@@ -10280,11 +10280,21 @@ impl PlainToolRun {
                 approved_io_window,
                 reply_deadline,
             } = run_spec;
-            if identity_for_run.run_owner.is_some() && approved_io_window.is_some() {
-                if let Some(key) = &ledger_key {
-                    if let Err(response) =
-                        tool_provider::begin_approved_call(ctx, key, &request_id_for_force)
-                    {
+            if identity_for_run.run_owner.is_some() {
+                if let Err(response) = tool_provider::check_program_scope(
+                    ctx,
+                    &request_id_for_force,
+                    &identity_for_run,
+                ) {
+                    return response;
+                }
+                if let Some(key) = ledger_key.as_ref().filter(|_| approved_io_window.is_some()) {
+                    if let Err(response) = tool_provider::begin_approved_call(
+                        ctx,
+                        key,
+                        &request_id_for_force,
+                        &identity_for_run,
+                    ) {
                         return response;
                     }
                 }

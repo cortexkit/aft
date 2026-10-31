@@ -254,7 +254,20 @@ pub fn claim(
     holder: &str,
 ) -> rusqlite::Result<Option<Vec<Permission>>> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    let Some(record) = get(&tx, key)? else {
+    let approved = claim_in_transaction(&tx, key, call_key, holder)?;
+    tx.commit()?;
+    Ok(approved)
+}
+
+/// The caller serializes origin-scope checks and grant insertion in this transaction.
+pub(crate) fn claim_in_transaction(
+    conn: &Connection,
+    key: &AskKey,
+    call_key: &str,
+    holder: &str,
+) -> rusqlite::Result<Option<Vec<Permission>>> {
+    debug_assert!(!conn.is_autocommit());
+    let Some(record) = get(conn, key)? else {
         return Ok(None);
     };
     if record.call_key.as_deref() != Some(call_key) {
@@ -266,7 +279,7 @@ pub fn claim(
             approved.push(grant);
         }
     }
-    let changed = tx.execute(
+    let changed = conn.execute(
         "UPDATE access_asks SET call_key=NULL, elicitation_id=NULL, request=NULL, pending=NULL, approved=?6, holder=?7
          WHERE owner=?1 AND scope_ref=?2 AND epoch=?3 AND args_hash=?4 AND call_key=?5",
         params![
@@ -279,7 +292,6 @@ pub fn claim(
             holder
         ],
     )?;
-    tx.commit()?;
     Ok((changed == 1).then_some(approved))
 }
 

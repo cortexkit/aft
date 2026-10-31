@@ -74,6 +74,7 @@ pub(super) fn begin_approved_call(
     ctx: &crate::context::AppContext,
     key: &crate::db::call_ledger::Key,
     request_id: &str,
+    identity: &super::RouteIdentity,
 ) -> Result<(), crate::protocol::Response> {
     let started = (|| {
         let db = ctx
@@ -82,7 +83,27 @@ pub(super) fn begin_approved_call(
         let conn = db
             .lock()
             .map_err(|_| "Call ledger database mutex is poisoned".to_owned())?;
-        crate::db::call_ledger::begin_approved(&conn, key).map_err(|error| error.to_string())
+        let Some(stamp) = identity.scope.as_ref() else {
+            return Ok(false);
+        };
+        let begin = || {
+            if identity
+                .run_scope
+                .get()
+                .is_some_and(|scope| scope.revoked())
+            {
+                return Ok(false);
+            }
+            crate::db::call_ledger::begin_approved(&conn, key).map_err(|error| error.to_string())
+        };
+        let live_begin = || match identity.run_scope.get() {
+            Some(run) => run.with_live_authority(begin),
+            None => Some(begin()),
+        };
+        ctx.bash_background()
+            .with_live_scope(stamp, live_begin)
+            .flatten()
+            .unwrap_or(Ok(false))
     })();
     match started {
         Ok(true) => Ok(()),
@@ -93,6 +114,56 @@ pub(super) fn begin_approved_call(
                 Err(error) => error,
                 _ => "Durable authorization transition was not applied".to_owned(),
             },
+        )),
+    }
+}
+
+pub(super) fn check_program_scope(
+    ctx: &crate::context::AppContext,
+    request_id: &str,
+    identity: &super::RouteIdentity,
+) -> Result<(), crate::protocol::Response> {
+    let allowed = (|| -> Result<bool, String> {
+        let db = ctx.db();
+        let conn = match db.as_ref() {
+            Some(db) => Some(
+                db.lock()
+                    .map_err(|_| "Call ledger database mutex is poisoned".to_owned())?,
+            ),
+            None => None,
+        };
+        let Some(stamp) = identity.scope.as_ref() else {
+            return Ok(false);
+        };
+        let check = || match conn.as_ref() {
+            Some(conn) => crate::db::access_grants::scope_ended(
+                conn,
+                &super::access_grants::scope_key(identity),
+            )
+            .map(|ended| !ended)
+            .map_err(|error| error.to_string()),
+            None => Ok(true),
+        };
+        let live_check = || match identity.run_scope.get() {
+            Some(run) => run.with_live_authority(check),
+            None => Some(check()),
+        };
+        ctx.bash_background()
+            .with_live_scope(stamp, live_check)
+            .flatten()
+            .unwrap_or(Ok(false))
+    })();
+    match allowed {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(crate::protocol::Response::error(
+            request_id,
+            "run_scope_revoked",
+            "the codemode run's scope has ended",
+        )),
+        Err(error) => Err(crate::protocol::Response::error(
+            request_id,
+            "database_unavailable",
+            error,
         )),
     }
 }

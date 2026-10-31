@@ -204,6 +204,161 @@ async fn audit_durable_scope_end_before_application_prevents_execution_and_grant
     );
 }
 
+static END_FENCE_READ_DISPATCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn end_fence_read_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
+    END_FENCE_READ_DISPATCHES.fetch_add(1, Ordering::SeqCst);
+    read_dispatch(request, ctx)
+}
+
+#[tokio::test]
+async fn audit_scope_fence_also_blocks_initial_program_dispatch_without_an_ask() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    for durable in [false, true] {
+        let f = fixture(FakeCingulate::up());
+        let run = program(
+            &f,
+            false,
+            if durable {
+                "run:audit-initial-durable"
+            } else {
+                "run:audit-initial-live"
+            },
+        );
+        END_FENCE_READ_DISPATCHES.store(0, Ordering::SeqCst);
+        if durable {
+            crate::db::access_grants::end_scope_grants(
+                &f.ctx.db().unwrap().lock().unwrap(),
+                &access_grants::scope_key(&run),
+            )
+            .unwrap();
+        } else {
+            f.ctx
+                .bash_background()
+                .fence_scope_end(run.scope.as_ref().unwrap());
+        }
+        assert!(!run.run_scope.get().unwrap().revoked());
+        let mut replies = f
+            .send_with(
+                &run,
+                &f.head_root.join("shared.txt"),
+                9413,
+                end_fence_read_dispatch,
+            )
+            .await;
+        let mut reply = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        reply.project_tool_result().unwrap();
+        let result: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(result["isError"], true, "{result}");
+        assert_eq!(result["errorCode"], "run_scope_revoked");
+        assert_eq!(END_FENCE_READ_DISPATCHES.load(Ordering::SeqCst), 0);
+        assert!(f.fake.calls("consent.request").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn audit_scope_tombstone_or_live_fence_blocks_claim_without_atomic_notice() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    for durable in [false, true] {
+        let f = fixture(FakeCingulate::up());
+        let control = Controlled::install(f.fake.clone());
+        let run = program(
+            &f,
+            false,
+            if durable {
+                "run:audit-durable-claim"
+            } else {
+                "run:audit-live-claim"
+            },
+        );
+        END_FENCE_READ_DISPATCHES.store(0, Ordering::SeqCst);
+        let gate = FinishGateOverride::install("subc-41-9411", false);
+        let target = f.dir.path().join("elsewhere.txt");
+        let mut replies = f
+            .send_with(&run, &target, 9411, end_fence_read_dispatch)
+            .await;
+        held(&mut replies).await;
+        control.answer(&control.request(0).await, "allow_scope");
+        wait_for(|| gate.0.entered.load(Ordering::SeqCst)).await;
+        if durable {
+            crate::db::access_grants::end_scope_grants(
+                &f.ctx.db().unwrap().lock().unwrap(),
+                &access_grants::scope_key(&run),
+            )
+            .unwrap();
+        } else {
+            f.ctx
+                .bash_background()
+                .fence_scope_end(run.scope.as_ref().unwrap());
+        }
+        assert!(!run.run_scope.get().unwrap().revoked());
+        assert_eq!(
+            ledger::get(
+                &f.ctx.db().unwrap().lock().unwrap(),
+                &tool_provider::LedgerEdge::key(&run, "program-9411")
+            )
+            .unwrap()
+            .unwrap()
+            .state,
+            ledger::State::Prepared
+        );
+        gate.release();
+        let result = late(&f, &run, 9411).await;
+        assert_eq!(result["isError"], true, "{result}");
+        assert_eq!(result["errorCode"], "access_withdrawn");
+        assert_eq!(END_FENCE_READ_DISPATCHES.load(Ordering::SeqCst), 1);
+        assert!(crate::db::access_grants::list(
+            &f.ctx.db().unwrap().lock().unwrap(),
+            &access_grants::policy_scope_key(&run)
+        )
+        .unwrap()
+        .is_empty());
+    }
+}
+
+#[tokio::test]
+async fn audit_scope_end_between_claim_and_dispatch_cannot_start_the_read() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    for fence in ["durable", "live", "atomic"] {
+        let f = fixture(FakeCingulate::up());
+        let control = Controlled::install(f.fake.clone());
+        let run = program(&f, false, &format!("run:audit-dispatch-{fence}"));
+        END_FENCE_READ_DISPATCHES.store(0, Ordering::SeqCst);
+        let gate = FinishGateOverride::install("subc-41-9412", true);
+        let target = f.dir.path().join("elsewhere.txt");
+        let mut replies = f
+            .send_with(&run, &target, 9412, end_fence_read_dispatch)
+            .await;
+        held(&mut replies).await;
+        control.answer(&control.request(0).await, "allow_once");
+        wait_for(|| gate.0.entered.load(Ordering::SeqCst)).await;
+        match fence {
+            "durable" => crate::db::access_grants::end_scope_grants(
+                &f.ctx.db().unwrap().lock().unwrap(),
+                &access_grants::scope_key(&run),
+            )
+            .unwrap(),
+            "live" => f
+                .ctx
+                .bash_background()
+                .fence_scope_end(run.scope.as_ref().unwrap()),
+            _ => run.run_scope.get().unwrap().end_for_test(),
+        }
+        gate.release();
+        let result = late(&f, &run, 9412).await;
+        assert_eq!(result["isError"], true, "{fence}: {result}");
+        assert_eq!(
+            END_FENCE_READ_DISPATCHES.load(Ordering::SeqCst),
+            1,
+            "{fence}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn audit_parallel_wait_budget_expires_all_calls_without_execution() {
     let _lock = CONSENT_TEST_LOCK.lock().await;

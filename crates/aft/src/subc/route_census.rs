@@ -38,9 +38,30 @@ pub(super) struct ScopeDescriptions {
     entries: HashMap<ScopeKey, (Instant, Value)>,
     order: VecDeque<ScopeKey>,
     evicted: u64,
+    cleanup_pending: HashSet<ScopeKey>,
+    cleanup_failed_attempts: u64,
 }
 
 impl ScopeDescriptions {
+    pub(super) fn cleanup_started(&mut self, stamp: &ScopeStamp) {
+        self.cleanup_pending
+            .insert(scope_describe::stamp_key(stamp));
+    }
+
+    pub(super) fn cleanup_result(&mut self, stamp: &ScopeStamp, complete: bool) {
+        let key = scope_describe::stamp_key(stamp);
+        if complete {
+            self.cleanup_pending.remove(&key);
+        } else {
+            self.cleanup_pending.insert(key);
+            self.cleanup_failed_attempts = self.cleanup_failed_attempts.saturating_add(1);
+        }
+    }
+
+    pub(super) fn cleanup_health(&self) -> Value {
+        json!({"pending_scopes": self.cleanup_pending.len(), "failed_attempts": self.cleanup_failed_attempts})
+    }
+
     pub(super) fn record(
         &mut self,
         stamp: &ScopeStamp,
@@ -79,6 +100,9 @@ impl ScopeDescriptions {
             .map_or(Value::Null, |(at, value)| {
                 let mut value = value.clone();
                 value["age_ms"] = json!(age(now, *at));
+                value["cleanup_pending"] = json!(self
+                    .cleanup_pending
+                    .contains(&scope_describe::stamp_key(stamp)));
                 value
             })
     }
@@ -290,6 +314,7 @@ pub(super) fn snapshot(
         summary: json!({"bound_roots": root_count, "bound_routes": route_count,
             "all_routes_idle_over_30m_roots": idle_roots, "roots_with_ended_scopes": ended_roots,
             "scope_describe_cache_evicted": descriptions.evicted,
+            "scope_cleanup": descriptions.cleanup_health(),
             "scoped": scoped.value(), "unscoped": unscoped.value(), "by_principal": by_principal,
             "principal_limit": PRINCIPAL_LIMIT, "principals_omitted": omitted_principals,
             "omitted_principal_routes": omitted_routes, "omitted_principal_roots": omitted_roots.len()}),

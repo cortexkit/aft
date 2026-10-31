@@ -2422,9 +2422,15 @@ pub(super) fn submit_deferred_bash(
                     lsp_hints: None,
                     session_id: Some(session_for_spawn.clone()),
                     params: Value::Object(translated.args), };
+                    if program_call {
+                        if let Err(response) = super::tool_provider::check_program_scope(ctx, &request_id_for_spawn, secret_identity.as_ref().expect("program call has an authenticated identity")) {
+                            return finish_bash_spawn_immediate(response, ctx, &session_for_spawn,
+                                &format_context_for_spawn, &mut spawn_text_tx, &mut spawn_control_tx, true, &mut repeat_for_spawn);
+                        }
+                    }
                     if program_approval {
                         if let Some(key) = &ledger_key {
-                            if let Err(response) = super::tool_provider::begin_approved_call(ctx, key, &request_id_for_spawn) {
+                            if let Err(response) = super::tool_provider::begin_approved_call(ctx, key, &request_id_for_spawn, secret_identity.as_ref().expect("program approval has an authenticated identity")) {
                                 return finish_bash_spawn_immediate(response, ctx, &session_for_spawn,
                                     &format_context_for_spawn, &mut spawn_text_tx, &mut spawn_control_tx, true, &mut repeat_for_spawn);
                             }
