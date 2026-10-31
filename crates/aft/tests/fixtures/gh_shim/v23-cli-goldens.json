@@ -64,6 +64,27 @@
     "stderr": "gh-shim: gh_shim_unsupported_flag: Jumping the merge queue is operator-only.\n"
   },
   {
+    "name": "enqueue-pinned-admin",
+    "argv": ["pr", "merge", "7", "--match-head-commit", "0123456789abcdef0123456789abcdef01234567", "--admin"],
+    "exit": 86,
+    "stdout": "",
+    "stderr": "gh-shim: gh_shim_admin_tier: `pr merge` is administration-tier — it runs under the operator's identity, not the bot's. Re-run with GH_SHIM_BYPASS=operator; the shim records an operator-attributed audit line.\n"
+  },
+  {
+    "name": "enqueue-auto-pinned-admin",
+    "argv": ["pr", "merge", "7", "--match-head-commit", "0123456789abcdef0123456789abcdef01234567", "--auto", "--admin"],
+    "exit": 86,
+    "stdout": "",
+    "stderr": "gh-shim: gh_shim_admin_tier: `pr merge` is administration-tier — it runs under the operator's identity, not the bot's. Re-run with GH_SHIM_BYPASS=operator; the shim records an operator-attributed audit line.\n"
+  },
+  {
+    "name": "enqueue-unpinned-admin",
+    "argv": ["pr", "merge", "7", "--admin"],
+    "exit": 86,
+    "stdout": "",
+    "stderr": "gh-shim: gh_shim_admin_tier: `pr merge` is administration-tier — it runs under the operator's identity, not the bot's. Re-run with GH_SHIM_BYPASS=operator; the shim records an operator-attributed audit line.\n"
+  },
+  {
     "name": "dequeue-jump",
     "argv": ["pr", "dequeue", "7", "--jump=true"],
     "exit": 86,

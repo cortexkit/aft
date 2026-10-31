@@ -26,7 +26,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -375,6 +375,8 @@ struct CapturedFrame {
     request_nonce: Option<Value>,
     on_route: bool,
     body: Vec<u8>,
+    /// Preserve the received JSON frame body without parsing or reserializing it.
+    wire_body: Vec<u8>,
 }
 
 /// Translate a recorded `gh.route` holder response into the reply the AFT
@@ -647,6 +649,7 @@ async fn serve_connection(
                             .map(|value| value["params"]["request_nonce"].clone()),
                         on_route: bot_write,
                         body,
+                        wire_body: frame.body.clone(),
                     });
                 match op.as_deref() {
                     Some("catalog.list") => Some(response_frame(
@@ -1940,6 +1943,7 @@ struct V22Run {
     upstream_invocations: Option<String>,
     routed_request: Option<Value>,
     request_nonces: Vec<Value>,
+    routed_wire_bodies: Vec<Vec<u8>>,
 }
 
 /// Run one row through the real shim with the given signed manifest bytes,
@@ -2105,6 +2109,11 @@ fn run_row_with_options(
         .iter()
         .filter_map(|frame| frame.request_nonce.clone())
         .collect();
+    let routed_wire_bodies = captured
+        .iter()
+        .filter(|frame| frame.on_route)
+        .map(|frame| frame.wire_body.clone())
+        .collect();
     let routed = captured
         .into_iter()
         .filter(|frame| frame.on_route)
@@ -2122,6 +2131,7 @@ fn run_row_with_options(
         stderr: String::from_utf8(output.stderr).expect("stderr is UTF-8"),
         upstream_invocations: fs::read_to_string(&recorder).ok(),
         request_nonces,
+        routed_wire_bodies,
         routed_request: routed.into_iter().next(),
     }
 }
@@ -2314,6 +2324,46 @@ fn reply_contract_row(vector: &Value) -> V22Row {
     }
 }
 
+/// Both transcript-producing tests share one fresh file, regardless of test order.
+fn write_v23_transcript(section: &str) {
+    let Some(path) = std::env::var_os("AFT_GH_SHIM_V23_TRANSCRIPT") else {
+        return;
+    };
+    static TRANSCRIPT: OnceLock<Mutex<fs::File>> = OnceLock::new();
+    let file = TRANSCRIPT.get_or_init(|| {
+        let path = Path::new(&path);
+        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            fs::create_dir_all(parent).expect("create transcript directory");
+        }
+        let mut file = fs::File::create(path).expect("create v23 transcript");
+        file.write_all(
+            b"# gh-shim v23 real-shim rig transcript\n\n\
+              The real shim ran against the strict Plexus-contract stand-in, not live GitHub.\n\
+              Each sent JSON block preserves the received frame body byte for byte; the newline before its closing fence is not part of the payload.\n\
+              The frame wraps the governed request in `params.request` and carries a fresh `params.request_nonce`.\n\
+              Request comparisons substitute the rig repository (`cortexkit/aft`) and manifest version (23), and ignore runtime metadata and rung timestamps.\n\
+              Vector requests below are the unmodified vendored expectations. GitHub read/write counts come from those vectors, not live traffic.\n\
+              Ownership and head-moved refusals reach Plexus by design: only Plexus can read PR ownership and head. Their vectors record no GitHub write.\n\n",
+        )
+        .expect("write transcript header");
+        Mutex::new(file)
+    });
+    let mut file = file.lock().expect("transcript lock");
+    file.write_all(section.as_bytes())
+        .expect("write transcript section");
+    file.flush().expect("flush transcript");
+}
+
+fn transcript_outcome(run: &V22Run) -> Value {
+    json!({
+        "exit_code": run.exit_code,
+        "stdout": run.stdout,
+        "stderr": run.stderr,
+        "route_count": run.routed_wire_bodies.len(),
+        "delegation_count": run.upstream_invocations.as_deref().map_or(0, |calls| calls.lines().count()),
+    })
+}
+
 #[test]
 fn every_plexus_reply_vector_round_trips_through_the_real_shim() {
     let vectors = plexus_contract_judge::load_reply_vectors();
@@ -2370,6 +2420,24 @@ fn every_plexus_reply_vector_round_trips_through_the_real_shim() {
             "{}: retry changed nonce",
             row.name
         );
+        if queue && std::env::var_os("AFT_GH_SHIM_V23_TRANSCRIPT").is_some() {
+            let mut section = format!("## Queue reply vector: {}\n\n", row.name);
+            for body in &run.routed_wire_bodies {
+                section.push_str(&format!(
+                    "Sent JSON frame body ({} bytes):\n\n```json\n{}\n```\n\n",
+                    body.len(),
+                    std::str::from_utf8(body).expect("wire request is UTF-8"),
+                ));
+            }
+            section.push_str(&format!(
+                "Vector expected request:\n\n```json\n{}\n```\n\nOutcome:\n\n```json\n{}\n```\n\nVector GitHub reads: {}; writes: {}.\n\n",
+                serde_json::to_string_pretty(&vector["request"]).unwrap(),
+                serde_json::to_string_pretty(&transcript_outcome(&run)).unwrap(),
+                vector["github_reads"].as_array().map_or(0, Vec::len),
+                vector["github_writes"].as_array().map_or(0, Vec::len),
+            ));
+            write_v23_transcript(&section);
+        }
         let mut routed = run.routed_request.expect("at least one routed request");
         let mut expected = vector["request"].clone();
         expected["repository"] = json!(REPOSITORY);
@@ -2446,7 +2514,7 @@ fn v23_queue_cli_goldens_route_only_the_pinned_queue_actions() {
         serde_json::from_str(include_str!("fixtures/gh_shim/v23-cli-goldens.json")).unwrap();
     let replies = plexus_contract_judge::load_reply_vectors();
     let manifest = synthetic_v23_manifest(unix_seconds());
-    assert_eq!(goldens.len(), 15);
+    assert_eq!(goldens.len(), 18);
     let mut stderr_mismatches = Vec::new();
     for golden in goldens {
         let row = V22Row {
@@ -2470,6 +2538,16 @@ fn v23_queue_cli_goldens_route_only_the_pinned_queue_actions() {
             })
             .unwrap_or_else(|| b"{}".to_vec());
         let run = run_v22_row_with_reply(&row, &manifest, "alfonso-aft", native);
+        if golden.get("request").is_none() {
+            write_v23_transcript(&format!(
+                "## Local CLI refusal: {}\n\nCommand line:\n\n```sh\ngh {}\n```\n\nOutcome:\n\n```json\n{}\n```\n\n",
+                row.name,
+                row.argv.join(" "),
+                serde_json::to_string_pretty(&transcript_outcome(&run)).unwrap(),
+            ));
+            assert_eq!(run.routed_wire_bodies.len(), 0, "{} routed", row.name);
+            assert!(run.upstream_invocations.is_none(), "{} delegated", row.name);
+        }
         assert_eq!(
             run.exit_code,
             Some(golden["exit"].as_i64().unwrap() as i32),
