@@ -168,6 +168,21 @@ fn options(role_versions: Option<&[(&str, &str)]>) -> CallOptions {
     }
 }
 
+fn fixture_logs(directory: &Path) -> String {
+    let mut logs = String::new();
+    if let Ok(entries) = std::fs::read_dir(directory) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                logs.push_str(&fixture_logs(&path));
+            } else if let Ok(text) = std::fs::read_to_string(&path) {
+                logs.push_str(&format!("{}:\n{text}\n", path.display()));
+            }
+        }
+    }
+    logs
+}
+
 async fn open(
     consumer: &SubcConsumer,
     project: &Path,
@@ -179,7 +194,8 @@ async fn open(
     while !ready.exists() {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "test scope owner did not register its workdir"
+            "test scope owner did not register its workdir:\n{}",
+            fixture_logs(&project.parent().unwrap().join("logs"))
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
