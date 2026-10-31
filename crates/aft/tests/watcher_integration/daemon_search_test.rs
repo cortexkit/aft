@@ -169,6 +169,12 @@ impl Daemon {
     }
 
     async fn call(&mut self, name: &str, arguments: Value) -> Value {
+        let body = self.request(name, arguments).await;
+        assert_ne!(body["isError"], true, "{name}: {body}");
+        body
+    }
+
+    async fn request(&mut self, name: &str, arguments: Value) -> Value {
         self.corr += 1;
         write_frame(
             &mut self.stream,
@@ -188,7 +194,6 @@ impl Daemon {
             let frame = receive(&mut self.stream).await;
             if frame.header.ty == FrameType::Response && frame.header.corr == self.corr {
                 let body: Value = serde_json::from_slice(&frame.body).unwrap();
-                assert_ne!(body["isError"], true, "{name}: {body}");
                 return body;
             }
         }
@@ -213,11 +218,11 @@ async fn assert_visible(daemon: &mut Daemon, relative: &str, marker: &str) {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let grep = daemon
-            .call("grep", json!({"pattern":marker, "path":"crates"}))
+            .request("grep", json!({"pattern":marker, "path":"crates"}))
             .await;
         let data = &grep["structuredContent"];
         let search = daemon
-            .call("search", json!({"pattern":marker, "includeTests":true}))
+            .request("search", json!({"pattern":marker, "includeTests":true}))
             .await;
         let search_found = search["structuredContent"]["results"]
             .as_array()
