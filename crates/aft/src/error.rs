@@ -1,5 +1,8 @@
 use std::fmt;
 
+pub(crate) const FILE_CHANGED_SINCE_READ_MESSAGE: &str =
+    "{path} changed on disk after this call read it; nothing was written. Read the file again and retry.";
+
 /// Core error type for the aft binary.
 ///
 /// Each variant maps to a structured error response with a `code` string
@@ -18,6 +21,9 @@ pub enum AftError {
         message: String,
     },
     FileNotFound {
+        path: String,
+    },
+    FileChangedSinceRead {
         path: String,
     },
     InvalidRequest {
@@ -66,6 +72,7 @@ impl AftError {
             AftError::AmbiguousSymbol { .. } => "ambiguous_symbol",
             AftError::ParseError { .. } => "parse_error",
             AftError::FileNotFound { .. } => "file_not_found",
+            AftError::FileChangedSinceRead { .. } => "file_changed_since_read",
             AftError::InvalidRequest { .. } => "invalid_request",
             AftError::CheckpointNotFound { .. } => "checkpoint_not_found",
             AftError::NoUndoHistory { .. } => "no_undo_history",
@@ -111,6 +118,9 @@ impl fmt::Display for AftError {
             }
             AftError::FileNotFound { path } => {
                 write!(f, "file not found: {}", path)
+            }
+            AftError::FileChangedSinceRead { path } => {
+                f.write_str(&FILE_CHANGED_SINCE_READ_MESSAGE.replace("{path}", path))
             }
             AftError::InvalidRequest { message } => {
                 write!(f, "invalid request: {}", message)
