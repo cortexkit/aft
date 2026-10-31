@@ -636,7 +636,7 @@ fn views_on_semantic_member_stores_no_call_graph_database() {
             "max_files": 2_000
         }
     }));
-    let configured = aft::commands::configure::handle_configure(&request(payload.clone()), &ctx);
+    let configured = aft::commands::configure::handle_configure(&request(payload), &ctx);
     assert!(configured.success, "configure failed: {configured:?}");
     aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
     wait_views_filled(&ctx);
@@ -663,16 +663,18 @@ fn views_on_semantic_member_stores_no_call_graph_database() {
         );
         thread::sleep(Duration::from_millis(50));
     }
-    write(
-        &repo.main,
-        "src/uncommitted.rs",
-        "pub fn uncommitted_helper() -> u64 { 7 }\n",
+    // An edit through AFT's own write command wakes the semantic member, as an
+    // agent's edit does, so it publishes the edit without watcher delivery.
+    let written = aft::commands::write::handle_write(
+        &request(json!({
+            "id": "semantic-member-edit",
+            "command": "write",
+            "file": repo.main.join("src/uncommitted.rs"),
+            "content": "pub fn uncommitted_helper() -> u64 { 7 }\n",
+        })),
+        &ctx,
     );
-    // Binding again verifies the checkout against disk, so the semantic
-    // member publishes the edit without depending on watcher delivery.
-    let rebound = aft::commands::configure::handle_configure(&request(payload), &ctx);
-    assert!(rebound.success, "configure failed: {rebound:?}");
-    aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+    assert!(written.success, "write failed: {written:?}");
 
     // What the v3 member directories hold: whether a semantic manifest names
     // the edited file, the semantic members' derived databases, and how many
