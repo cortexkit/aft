@@ -4759,6 +4759,77 @@ fn store_errors_name_the_gap_without_a_retry_loop() {
     );
 }
 
+/// A store that is only busy (here another connection holds the family
+/// registry's write lock while the fill publishes) is retried on the backoff
+/// and completes once the lock goes, with no wake. A store error that would
+/// fail again, by contrast, waits for a wake
+/// (`store_errors_name_the_gap_without_a_retry_loop`).
+#[test]
+fn busy_store_errors_retry_on_the_backoff_until_the_fill_publishes() {
+    use crate::db::file_identity::IdentityConnection;
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    let (slot, epoch, wake, runtime) = served_lane(storage.path(), root.path());
+    std::fs::write(
+        root.path().join("src/gamma.rs"),
+        "pub fn gamma_busy_edit() {}\n",
+    )
+    .unwrap();
+    runtime
+        .driver()
+        .record_absolute_change(&root.path().join("src/gamma.rs"));
+    let registry = crate::blob_store::v3::family_dir(storage.path(), "family")
+        .unwrap()
+        .join("members.sqlite");
+    let blocker = IdentityConnection::open_with_flags(
+        &registry,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        "semantic-busy-store-blocker",
+    )
+    .unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let root = root.path().to_path_buf();
+        std::thread::spawn(move || {
+            let schedule = fast_schedule(&root);
+            serve_fills(&weak, epoch, &wake, &schedule, &mut |texts: Vec<String>| {
+                Ok(texts.iter().map(|text| vector(text)).collect())
+            });
+        })
+    };
+    // Each attempt waits out the ledger's busy timeout, so two attempts take
+    // a little over ten seconds.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while runtime.refresh_attempts() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "a busy store was not retried on the backoff: attempts={} unavailable={:?}",
+            runtime.refresh_attempts(),
+            runtime.unavailable_reason()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    blocker.execute_batch("ROLLBACK;").unwrap();
+    drop(blocker);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let answer = query(&runtime, "gamma_busy_edit");
+        if answer.complete() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the fill never published after the store freed: {answer:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(runtime.unavailable_reason().is_none());
+    slot.clear();
+    worker.join().unwrap();
+}
+
 /// A worker superseded by a lane restart (here a model change) is held just
 /// before its final publication while the new lane publishes; when released,
 /// its publication is refused and the view still names the new producer. No

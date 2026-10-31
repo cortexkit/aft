@@ -2575,11 +2575,28 @@ where
                 }
                 let advanced = report.installed > 0 || report.failed > 0;
                 progress |= advanced;
-                // A store that refuses what was embedded will refuse it again
-                // on a timer: record it as the checkout's unavailable reason
-                // and wait for the next wake.
                 if let Some(error) = report.store_errors.first() {
-                    mark_unavailable(runtime, schedule, format!("semantic store: {error}"));
+                    let reason = format!("semantic store: {error}");
+                    // Contention (a busy or locked store, a namespace another
+                    // process is writing) clears by itself: retry on the
+                    // backoff. Before this, a busy ledger left the checkout
+                    // unavailable until something else woke it.
+                    if is_transient_reason(&reason) {
+                        crate::slog_warn!(
+                            "semantic view fill will retry a busy store root={} error={}",
+                            schedule.root.display(),
+                            reason
+                        );
+                        warm_index(runtime);
+                        return FillOutcome::Retry {
+                            progress,
+                            reason: Some(reason),
+                        };
+                    }
+                    // A store that refuses what was embedded will refuse it
+                    // again on a timer: record it as the checkout's
+                    // unavailable reason and wait for the next wake.
+                    mark_unavailable(runtime, schedule, reason);
                     warm_index(runtime);
                     return FillOutcome::Settled;
                 }

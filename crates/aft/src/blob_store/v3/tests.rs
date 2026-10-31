@@ -595,7 +595,7 @@ fn busy_validation_is_not_persisted_as_schema_drift() {
 }
 
 #[test]
-fn changing_derived_database_reports_busy_then_measurement_recovers() {
+fn changing_derived_database_records_an_owed_overstatement_then_measurement_recovers() {
     let _guard = serial();
     let root = tempdir().unwrap();
     seed(root.path(), A);
@@ -621,17 +621,19 @@ fn changing_derived_database_reports_busy_then_measurement_recovers() {
             Ok(())
         }))
     });
-    let result = writer.covering_measurement();
+    let reservation = writer.reserve(1024).unwrap();
+    let result = writer.measure_and_release(Some(reservation.id), None);
     RECHECK_HOOK.with(|hook| *hook.borrow_mut() = None);
-    let error = result.unwrap_err();
+    // A namespace that never holds still is not a failure: the reservation is
+    // released, and the largest total seen is recorded and left owed.
+    assert_eq!(result.unwrap(), Measurement::Owed);
     assert_eq!(writes.get(), 8);
-    assert!(error.is_busy(), "{error}");
-    let detail = error.to_string();
+    assert_eq!(writer.accounting().unwrap().reserved_bytes, 0);
+    let recorded = writer.accounting().unwrap().measured_bytes;
     assert!(
-        detail.starts_with("reservation_ledger_busy: measure registry"),
-        "{detail}"
+        recorded >= allocated_bytes(writer.family_dir()).unwrap(),
+        "{recorded} understates the namespace"
     );
-    assert!(detail.contains("8 measurements"), "{detail}");
 
     let measured = writer.covering_measurement().unwrap();
     assert_eq!(measured, allocated_bytes(writer.family_dir()).unwrap());

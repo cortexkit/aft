@@ -1344,10 +1344,12 @@ impl<'a> RegistryWriter<'a> {
     }
     /// After deleting namespace files, call this to refresh accounting. It releases dead rows
     /// in the same barrier transaction as the measurement, retaining plane data.
+    /// Returns the recorded total: the confirmed walk, or, when concurrent
+    /// writers kept the namespace changing, the largest total a walk saw.
     pub fn covering_measurement(&mut self) -> Result<u64> {
         match self.measure_and_release(None, None)? {
             Measurement::Recorded(bytes) => Ok(bytes),
-            Measurement::Owed => unreachable!("a measurement without a deadline completes"),
+            Measurement::Owed => Ok(self.accounting()?.measured_bytes),
         }
     }
     /// [`Self::covering_measurement`] that stops at `deadline`, recording
@@ -1368,6 +1370,10 @@ impl<'a> RegistryWriter<'a> {
         // The last total this call committed, with the registry-file bytes the
         // walk behind it counted.
         let mut committed: Option<(u64, u64)> = None;
+        // The largest total any walk of this call saw, and the registry-file
+        // bytes counted before the latest one.
+        let mut largest = 0u64;
+        let mut last_counted = 0u64;
         for _ in 0..8 {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             // Nothing writes the registry files between this stat and the
@@ -1451,15 +1457,30 @@ impl<'a> RegistryWriter<'a> {
             tests::measurement_recheck_hook()?;
             match allocated_bytes_until(&self.dir, deadline)? {
                 Some(again) if again == bytes => return Ok(Measurement::Recorded(bytes)),
-                Some(_) => {}
+                Some(again) => {
+                    largest = largest.max(bytes).max(again);
+                    last_counted = counted;
+                }
                 None => return settle_registry_growth(&mut connection, &self.dir, bytes, counted),
             }
         }
-        Err(Error::ledger(
-            &self.dir,
-            "measure registry",
-            Error::Busy("namespace size did not stabilize after 8 measurements"),
-        ))
+        // Writers outside the reservation lock (derived databases commit
+        // without it) kept changing the namespace through every recheck. The
+        // first committed pass already released `release` and the dead
+        // reservations, so the work this call was asked to settle is done;
+        // what failed is only the confirmation of the total. Record the
+        // largest total seen, raised by the registry's own growth since, so
+        // it overstates rather than understates, and leave the measurement
+        // owed: the next writer open measures again. v3 sets no family byte
+        // limit, so the total only paces retention.
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE accounting SET measured_bytes=MAX(measured_bytes,?1) WHERE singleton=1",
+            [largest],
+        )?;
+        tx.commit()?;
+        checkpoint(&connection)?;
+        settle_registry_growth(&mut connection, &self.dir, largest, last_counted)
     }
     pub fn with_barrier<T>(
         &mut self,
