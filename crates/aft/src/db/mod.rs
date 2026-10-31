@@ -1104,7 +1104,10 @@ mod tests {
                 .unwrap();
             assert!(present, "missing {table}");
         }
-        assert_eq!(MIGRATION_VERSIONS, (1..=24).collect::<Vec<_>>());
+        assert_eq!(
+            MIGRATION_VERSIONS,
+            (1..=CURRENT_SCHEMA_VERSION).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1151,7 +1154,7 @@ mod tests {
         assert!(!migration_already_applied(&conn, 24).unwrap());
         let count: u32 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('bash_watch_delivery_acks','bash_watch_delivery_gaps')", [], |row| row.get(0)).unwrap();
         assert_eq!(count, 0);
-        assert_eq!(run_migrations(&mut conn).unwrap(), 24);
+        assert_eq!(run_migrations(&mut conn).unwrap(), CURRENT_SCHEMA_VERSION);
         assert!(migration_already_applied(&conn, 24).unwrap());
         bash_watches::acknowledge_delivery(&conn, "opencode", "session", "task", "watch", 7, None)
             .unwrap();
