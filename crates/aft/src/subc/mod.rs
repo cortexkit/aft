@@ -8366,20 +8366,6 @@ async fn handle_control_request(
             };
 
             let bind_trust = trust_for_bind(&identity.harness, &principal);
-            let bind_project_root = if matches!(target, RouteTarget::ToolProvider { .. }) {
-                match resolve_route_project_root(legacy_root.as_deref(), scope.as_ref()) {
-                    Ok(root) => root,
-                    Err(reason) => {
-                        return send_route_bind_error(tx, frame, "invalid_workdir", reason, metrics)
-                            .await
-                    }
-                }
-            } else {
-                None
-            };
-            let project_free =
-                matches!(target, RouteTarget::ToolProvider { .. }) && bind_project_root.is_none();
-            schedule_scope_workdir_comparison(&identity, legacy_root.as_deref(), scope.as_ref());
             if installed_route_epochs
                 .get(&route_channel)
                 .is_some_and(|installed| *installed >= epoch)
@@ -8405,6 +8391,21 @@ async fn handle_control_request(
                     return send_route_bind_error_body(tx, frame, &refusal, metrics).await
                 }
             };
+            // Refuse an exhausted bind budget before probing project folders.
+            let bind_project_root = if matches!(target, RouteTarget::ToolProvider { .. }) {
+                match resolve_route_project_root(legacy_root.as_deref(), scope.as_ref()) {
+                    Ok(root) => root,
+                    Err(reason) => {
+                        return send_route_bind_error(tx, frame, "invalid_workdir", reason, metrics)
+                            .await
+                    }
+                }
+            } else {
+                None
+            };
+            let project_free =
+                matches!(target, RouteTarget::ToolProvider { .. }) && bind_project_root.is_none();
+            schedule_scope_workdir_comparison(&identity, legacy_root.as_deref(), scope.as_ref());
             if matches!(target, RouteTarget::ManagementSurface { .. }) || project_free {
                 if let Err(refusal) = if project_free {
                     Ok(())
