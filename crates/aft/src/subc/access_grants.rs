@@ -367,7 +367,7 @@ pub(super) fn ask_route(identity: &RouteIdentity) -> crate::access_policy::AskRo
     // but rejects worker-program asks. Programs without held replies also
     // retain the unavailable route: no final result could reach them later.
     if identity.run_owner.as_ref().is_some_and(|owner| {
-        matches!(owner.kind, super::RunKind::Worker { .. })
+        matches!(owner.kind, super::codemode::RunKind::Worker { .. })
             || !identity.held_reply
             || !identity.tool_result_body
     }) {

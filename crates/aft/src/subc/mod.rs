@@ -11392,8 +11392,8 @@ async fn handle_tool_call_with_capabilities(
                 crate::access_policy::AskRoute::Unavailable
             )
         {
-            // An untrusted head's shell call asks its consumer first; a
-            // program's run route has nobody to put that question to.
+            // Worker programs and programs without held replies cannot carry
+            // an untrusted shell approval through the consent service.
             let error = subc_protocol::ErrorBody::new(
                 crate::access_policy::PERMISSION_ASK_UNAVAILABLE,
                 "this shell call needs an approval, and a codemode program can't ask for it",

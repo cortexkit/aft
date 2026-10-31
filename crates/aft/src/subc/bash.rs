@@ -1632,9 +1632,8 @@ mod unanswered_deadline_tests {
     }
 }
 
-/// A codemode program's shell call that would need the user's approval
-/// (a scanned permission or a host escalation) is refused by name: nobody can
-/// be asked on the head agent's behalf from a run route yet.
+/// Preserve the unavailable refusal for worker programs and run routes that
+/// cannot receive held replies. Capable agent programs use Cingulate instead.
 fn refuse_run_permission_ask(response: Response, run_scoped: bool) -> Response {
     if !run_scoped
         || response.success
@@ -1727,7 +1726,7 @@ pub(super) fn submit_deferred_bash(
         identity
             .run_owner
             .as_ref()
-            .is_some_and(|owner| matches!(owner.kind, super::RunKind::Agent { .. }))
+            .is_some_and(|owner| matches!(owner.kind, super::codemode::RunKind::Agent { .. }))
             && matches!(
                 super::access_grants::ask_route(identity),
                 crate::access_policy::AskRoute::Consent { .. }

@@ -50,7 +50,7 @@ const MAX_AWAIT: Duration = Duration::from_millis(120_000);
 const UNDECLARED_REPLY_BUDGET: Duration = Duration::from_secs(25);
 /// Time kept back from the reply budget to run the approved call and deliver it.
 pub(super) const RERUN_MARGIN: Duration = Duration::from_secs(5);
-/// No call is held longer than this, whatever its reply budget.
+/// Direct calls are never held longer than this, whatever their reply budget.
 const MAX_HOLD: Duration = Duration::from_secs(100);
 /// Mirrors the Basal codemode runner's ten-minute person-wait allowance;
 /// keep this provider-side backstop in step with the runner's allowance.
@@ -1330,7 +1330,7 @@ impl Drop for ClaimedAsk {
     }
 }
 
-/// Run a stamped worker's call, holding it on Cingulate whenever the access
+/// Run an authenticated Alfonso call, holding it on Cingulate whenever the access
 /// check asks. `first` is the call's first response; `rerun` runs it again
 /// with approved capabilities installed. Returns the final response with its
 /// formatted text when the run produced one, or `None` when nobody waits.
@@ -2251,10 +2251,9 @@ fn head_policy_name(policy: HeadPolicy) -> &'static str {
     }
 }
 
-/// `consent.request` parameters asking permission for one in-process read or
-/// write of `path`: exactly the fields Cingulate accepts, since it refuses
-/// unknown ones. Cingulate's `command` field is only for asks to run a shell
-/// command, which AFT does not send (shell file access is never asked).
+/// Base `consent.request` parameters: exactly the fields Cingulate accepts,
+/// since it refuses unknown ones. Shell requests additionally supply `command`
+/// and use the `exec` operation; they never create filesystem capabilities.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn request_params(
     call_key: &str,

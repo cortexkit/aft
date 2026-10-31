@@ -2897,6 +2897,12 @@ impl LedgerEdge {
                 }
                 let actual = actual.clone();
                 let detached = call.detached;
+                if detached {
+                    if let Err(error) = outgoing.project_tool_result() {
+                        log::warn!("held terminal projection failed: {error}");
+                        continue;
+                    }
+                }
                 let (tool_body_for_job, projection_error) =
                     match outgoing.tool_result_source_for_retention() {
                         Ok(body) => (body, None),

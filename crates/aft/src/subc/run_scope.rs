@@ -495,6 +495,11 @@ impl RunBudget {
 
 #[cfg(test)]
 impl RunScope {
+    pub(super) fn end_for_test(&self) {
+        self.revoked.store(true, Ordering::Release);
+        self.withdraw_parked_asks();
+    }
+
     pub(super) fn for_test(deadline: Option<Instant>) -> Arc<Self> {
         Self::for_test_with_clock(deadline, None)
     }
