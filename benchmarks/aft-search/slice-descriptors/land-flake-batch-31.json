@@ -8,5 +8,5 @@
   "slices": [
     "flake-batch-31"
   ],
-  "note": "Test-only changes. The ranking-fenced semantic_search mod.rs change gives one split-request test's file-count-cap case a 30 s disk-walk budget, so a loaded runner cannot end the walk before it reaches the three files. The other change is a views semantic_runtime test helper's queue wait. Enumeration, lane selection, scores, fusion, ordering and page cuts are unchanged; benchmark rows must remain byte-identical."
+  "note": "Test-only. The ranking-fenced semantic_search mod.rs change gives one split-request test's file-count-cap case a 30 s disk-walk budget, so a loaded runner cannot end the walk before it reaches the three files. Enumeration, lane selection, scores, fusion, ordering and page cuts are unchanged; benchmark rows must remain byte-identical."
 }
