@@ -671,7 +671,7 @@ mod tests {
         }
         let _shutdown = Shutdown(&registry);
         let mut tasks = Vec::new();
-        for mode in ["background", "promoted", "pty"] {
+        for mode in ["background", "promoted", "pty", "host"] {
             let environment = HashMap::from([
                 (
                     "PATH".to_owned(),
@@ -700,9 +700,63 @@ mod tests {
                  shim_status=$?; \"$AFT_GH_SHIM_BINARY\" --list pinned_executable_cleanup_preserves_live_owner > binary-output-{mode} 2>&1; \
                  printf '%s:%s' \"$shim_status\" \"$?\" > status-{mode}.tmp; /bin/mv status-{mode}.tmp status-{mode}"
             );
+            let plan = if mode == "host" {
+                use crate::sandbox_spawn::{
+                    AuthenticatedPrincipal, HostEscalationAttempt, RequestedSandboxTier,
+                    SandboxTaskKind,
+                };
+                let mut config = crate::config::Config {
+                    project_root: Some(storage.clone()),
+                    storage_dir: Some(storage.clone()),
+                    ..crate::config::Config::default()
+                };
+                config.sandbox.profile.head = crate::config::SandboxMode::Strict;
+                let ctx = crate::context::AppContext::new(
+                    Box::new(crate::parser::TreeSitterProvider::new()),
+                    config,
+                );
+                let approved = environment
+                    .iter()
+                    .map(|(key, value)| (key.into(), value.into()))
+                    .collect();
+                let attempt = HostEscalationAttempt {
+                    grant_id: crate::sandbox_spawn::mint_host_escalation_grant(
+                        &ctx,
+                        &AuthenticatedPrincipal::FirstParty,
+                        command.as_bytes(),
+                        &storage,
+                        &storage,
+                        Path::new("/bin/bash"),
+                        &approved,
+                        &storage,
+                        "pin-lifetime",
+                    )
+                    .unwrap(),
+                    command: command.as_bytes().to_vec(),
+                    root: storage.clone(),
+                    cwd: storage.clone(),
+                    shell_path: PathBuf::from("/bin/bash"),
+                    environment: approved,
+                };
+                let plan = crate::sandbox_spawn::resolve_sandbox_spawn(
+                    &ctx,
+                    &AuthenticatedPrincipal::FirstParty,
+                    RequestedSandboxTier::Host,
+                    SandboxTaskKind::BashBackground,
+                    &storage,
+                    Some(&attempt),
+                );
+                assert!(
+                    plan.refusal_code().is_none(),
+                    "host grant rejected: {plan:?}"
+                );
+                plan
+            } else {
+                SpawnPlan::Unsandboxed
+            };
             let task_id = if mode == "pty" {
                 registry.spawn_pty_with_shell(
-                    SpawnPlan::Unsandboxed,
+                    plan,
                     &command,
                     BashShell::Bash,
                     PathBuf::from("/bin/bash"),
@@ -721,7 +775,7 @@ mod tests {
                 )
             } else {
                 registry.spawn_with_shell_in_slot(
-                    SpawnPlan::Unsandboxed,
+                    plan,
                     &command,
                     BashShell::Bash,
                     PathBuf::from("/bin/bash"),

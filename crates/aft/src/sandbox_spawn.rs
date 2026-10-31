@@ -1012,6 +1012,11 @@ fn consume_host_escalation_grant_at(
         &task_id,
     )
     .map_err(|_| EscalationRefusal::DigestMismatch)?;
+    let mut environment = attempt.environment.clone();
+    crate::pinned_executable::task_environment(
+        &crate::pinned_executable::task_executable(&task.paths.io_dir),
+        &mut environment,
+    );
     verify_payload(
         task,
         &attempt.command,
@@ -1019,7 +1024,7 @@ fn consume_host_escalation_grant_at(
         &attempt.cwd,
         principal,
         &attempt.shell_path,
-        &attempt.environment,
+        &environment,
         Some(digest),
         true,
     )
