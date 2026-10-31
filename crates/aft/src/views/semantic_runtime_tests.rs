@@ -1623,6 +1623,15 @@ fn semantic_states(
         .collect()
 }
 
+/// Gives a fixture checkout a base of its own. Bases are content-keyed, so two
+/// checkouts with the same files and ignore policy share one base. Some tests
+/// race two checkouts' fills on the same embedded chunks, which are stored
+/// once per repository family, and need each checkout on its own base. Each
+/// gets an `.aftignore` that differs only by a comment.
+fn separate_base(root: &Path, tag: &str) {
+    std::fs::write(root.join(".aftignore"), format!("# {tag}\n")).unwrap();
+}
+
 #[test]
 fn family_fill_rechecks_completed_work_after_acquiring_claim() {
     let storage = tempfile::tempdir().unwrap();
@@ -1631,6 +1640,8 @@ fn family_fill_rechecks_completed_work_after_acquiring_claim() {
     let files = [("src/file.rs", "pub fn one_chunk() -> u8 { 1 }\n")];
     write_tree(first.path(), &files);
     write_tree(second.path(), &files);
+    separate_base(first.path(), "first");
+    separate_base(second.path(), "second");
     let a = open(storage.path(), "a", first.path());
     let b = Arc::new(open(storage.path(), "b", second.path()));
     let model = Arc::new(Model::default());
@@ -1668,8 +1679,14 @@ fn family_fill_rechecks_completed_work_after_acquiring_claim() {
     assert_eq!(usage.rows, ROWS_PER_ONE_CHUNK_FILE);
     // Both checkouts name the same content with the same semantic key. Their
     // manifests differ only in what is checkout-specific (the base each one
-    // composes and its own publication frontier).
-    assert_eq!(semantic_states(&a), semantic_states(&b));
+    // composes and how far its own publications have progressed) and in the
+    // `.aftignore` that keeps their bases apart.
+    let source_states = |runtime: &CheckoutSemantic| {
+        let mut states = semantic_states(runtime);
+        states.retain(|(path, ..)| path.as_bytes() != b".aftignore");
+        states
+    };
+    assert_eq!(source_states(&a), source_states(b.as_ref()));
     assert_eq!(
         rows(first.path(), &query(&a, "one chunk").results),
         rows(second.path(), &query(&b, "one chunk").results)
@@ -2244,11 +2261,11 @@ fn large_semantic_materialization_batches_pins_and_touches() {
     for (key, payload) in blobs {
         assert_eq!(store.get(&key).unwrap().unwrap(), payload);
     }
-    // One key-list write each for the trigram and semantic planes.
-    assert_eq!((after.0 - writes, after.1 - syncs), (2, 0));
-    // The semantic plane's file and chunk-vector keys plus the trigram
-    // plane's keys for the same 2048 entries, each plane in one write.
-    assert_eq!(written_bytes, 2048 * 65 * 3);
+    // The fold pins the trigram keys of the 2048 entries in one key-list
+    // write. The semantic keys were pinned as they were stored, and this
+    // member has no call-graph plane, so there is nothing else to pin.
+    assert_eq!((after.0 - writes, after.1 - syncs), (1, 0));
+    assert_eq!(written_bytes, 2048 * 65);
     // Every key was just stored in this epoch, so folding needs no writer.
     assert_eq!(transactions, 0);
 }
@@ -2258,10 +2275,19 @@ fn large_semantic_materialization_batches_pins_and_touches() {
 /// independent cold index, not to another copy of the fast path.
 #[test]
 fn large_checkout_edit_counts_source_work_and_preserves_outputs() {
+    // The assertions (one edit embeds one text; answers match a strict and a
+    // cold index) hold at any size. 512 files keep the default run short on
+    // loaded Windows runners, where 2048 took over 7 minutes in a CI shard;
+    // AFT_STRESS=1 keeps the full size.
+    let files = if std::env::var("AFT_STRESS").as_deref() == Ok("1") {
+        2048
+    } else {
+        512
+    };
     let storage = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(root.path()).unwrap();
-    for i in 0..2048 {
+    for i in 0..files {
         let path = root.join(format!("file_{i:04}.rs"));
         std::fs::write(&path, format!("pub fn item_{i:04}() -> u32 {{ {i} }}\n")).unwrap();
         // Windows refuses to change times through a read-only handle.
@@ -2357,11 +2383,12 @@ fn large_checkout_edit_counts_source_work_and_preserves_outputs() {
             "unchanged files should cost a stat, not a source read"
         );
         assert_eq!(work.content_hash_bytes, changed.len());
-        // One attachment per registered plane (trigram, semantic and call
-        // graph) for the one file read.
-        assert_eq!(work.attachments, 3);
+        // One attachment per registered plane (trigram and semantic; the
+        // semantic member has no call-graph plane) for the one file read.
+        assert_eq!(work.attachments, 2);
         assert_eq!(
-            work.stats, 2049,
+            work.stats,
+            files + 1,
             "one stat per member plus a post-read stability stat"
         );
     }
@@ -2879,8 +2906,9 @@ fn semantic_batch_lease_durable_chunks_reused_during_cold_readmission() {
     let storage = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let sibling_root = tempfile::tempdir().unwrap();
-    for root in [root.path(), sibling_root.path()] {
+    for (tag, root) in [("owner", root.path()), ("sibling", sibling_root.path())] {
         write_tree(root, &[("file.rs", "pub fn readmission_chunk() {}\n")]);
+        separate_base(root, tag);
     }
     let (slot, epoch, _wake, runtime) = served_lane(storage.path(), root.path());
     let schedule = fast_schedule(root.path());
@@ -3247,6 +3275,7 @@ fn semantic_fill_waiter_yields_cold_slot(shared_content: bool) {
                 )],
             );
         }
+        separate_base(root.path(), &format!("sibling-{i}"));
         let slot = Arc::new(CheckoutSemanticSlot::default());
         let (epoch, wake) = slot.begin();
         let runtime = Arc::new(open(storage.path(), &format!("sibling-{i}"), root.path()));
@@ -4529,13 +4558,53 @@ fn live_view_holders_match_runtimes_and_planes_have_unique_ids() {
     assert_ne!(replacement.id(), id);
 }
 
+/// A namespace another writer keeps changing no longer makes a load busy: the
+/// reservation ledger records the largest family size it measured, and the
+/// next writer to open the family measures it again.
 #[test]
-fn views_busy_load_measurement_keeps_semantic_building_until_retry_succeeds() {
+fn views_changing_namespace_does_not_make_the_semantic_load_busy() {
     let _git_env = crate::test_env::hermetic_git_env_guard();
     let _serial = crate::blob_store::v3::serial_for_test();
     let storage = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     write_tree(root.path(), &[("a.ts", "export const value = 'needle';\n")]);
+    let slot = Arc::new(CheckoutSemanticSlot::default());
+    let runtime = CheckoutSemantic::new(
+        &crate::root_cache::StoragePaths::same(storage.path()),
+        "family",
+        "churn-semantic",
+        root.path(),
+        producer(),
+        Arc::downgrade(&slot),
+    )
+    .unwrap();
+    let (result, writes) =
+        crate::blob_store::v3::with_changing_namespace_for_test(storage.path(), "family", |_| {
+            runtime.load().map(|_| ())
+        });
+    assert!(
+        writes >= 8,
+        "the namespace must change through every recheck"
+    );
+    result.expect("a changing namespace is not a busy store");
+}
+
+/// A store that is busy (here another connection holds the family registry
+/// in exclusive locking mode) keeps the semantic lane building, with no view
+/// load failure counted and no "This is an AFT bug" line in the reply, until
+/// a retry loads it.
+#[test]
+fn views_busy_load_keeps_semantic_building_until_retry_succeeds() {
+    use crate::db::file_identity::IdentityConnection;
+    let _git_env = crate::test_env::hermetic_git_env_guard();
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), &[("a.ts", "export const value = 'needle';\n")]);
+    crate::blob_store::v3::publish(storage.path(), "family", 1024, None, |_| Ok(())).unwrap();
+    let registry = crate::blob_store::v3::family_dir(storage.path(), "family")
+        .unwrap()
+        .join("members.sqlite");
     let ctx = crate::context::AppContext::new(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
@@ -4585,17 +4654,23 @@ fn views_busy_load_measurement_keeps_semantic_building_until_retry_succeeds() {
                 "a stopped writer must not keep the load busy"
             );
             if attempts == 1 {
-                let (result, writes) = crate::blob_store::v3::with_changing_namespace_for_test(
-                    storage.path(),
-                    "family",
-                    |_| runtime.load().map(|_| ()),
-                );
-                assert!(writes >= 8);
-                let error = result.unwrap_err();
-                assert!(
-                    error.contains("reservation_ledger_busy: measure registry"),
-                    "{error}"
-                );
+                let blocker = IdentityConnection::open_with_flags(
+                    &registry,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+                    "semantic-busy-load-blocker",
+                )
+                .unwrap();
+                // Exclusive locking mode keeps every other connection out of
+                // the registry until this transaction and connection end.
+                blocker
+                    .execute_batch(
+                        "PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; UPDATE accounting SET watermark=watermark+1;",
+                    )
+                    .unwrap();
+                let error = runtime.load().map(|_| ()).unwrap_err();
+                assert!(super::super::trigram::bind_is_busy(&error), "{error}");
+                blocker.execute_batch("ROLLBACK").unwrap();
+                drop(blocker);
                 return Err(error);
             }
             assert!(matches!(slot.state(), Some(CheckoutSemanticState::Loading)));
@@ -4605,7 +4680,7 @@ fn views_busy_load_measurement_keeps_semantic_building_until_retry_succeeds() {
             );
             let response = crate::commands::semantic_search::handle_semantic_search(
                 &crate::protocol::RawRequest {
-                    id: "semantic-measurement-busy".into(),
+                    id: "semantic-load-busy".into(),
                     command: "semantic_search".into(),
                     lsp_hints: None,
                     session_id: None,
@@ -4635,7 +4710,7 @@ fn views_busy_load_measurement_keeps_semantic_building_until_retry_succeeds() {
                 .is_empty());
             runtime
                 .load()
-                .expect("the semantic view must load after the writer stops");
+                .expect("the semantic view must load once the registry is free");
             Ok(())
         },
     );
@@ -4730,6 +4805,98 @@ fn store_errors_name_the_gap_without_a_retry_loop() {
     );
 }
 
+/// A store that is only busy (here another connection holds the family's
+/// semantic plane write lock while the fill stores its vectors) is retried on
+/// the backoff and completes once the lock goes, with no wake. A store error that would
+/// fail again, by contrast, waits for a wake
+/// (`store_errors_name_the_gap_without_a_retry_loop`).
+#[test]
+fn busy_store_errors_retry_on_the_backoff_until_the_fill_publishes() {
+    use crate::db::file_identity::IdentityConnection;
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    let (slot, epoch, wake, runtime) = served_lane(storage.path(), root.path());
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let root = root.path().to_path_buf();
+        std::thread::spawn(move || {
+            let schedule = fast_schedule(&root);
+            serve_fills(&weak, epoch, &wake, &schedule, &mut |texts: Vec<String>| {
+                Ok(texts.iter().map(|text| vector(text)).collect())
+            });
+        })
+    };
+    // The first fill creates the semantic plane and settles complete.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !query(&runtime, "gamma").complete() {
+        assert!(Instant::now() < deadline, "the first fill never completed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let plane = crate::blob_store::v3::plane_path(
+        storage.path(),
+        "family",
+        crate::blob_store::v2::FamilyPlane::Semantic,
+    )
+    .unwrap();
+    let blocker = IdentityConnection::open_with_flags(
+        &plane,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        "semantic-busy-store-blocker",
+    )
+    .unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    let before = runtime.refresh_attempts();
+    std::fs::write(
+        root.path().join("src/gamma.rs"),
+        "pub fn gamma_busy_edit() {}\n",
+    )
+    .unwrap();
+    runtime
+        .driver()
+        .record_absolute_change(&root.path().join("src/gamma.rs"));
+    // One wake only: a second attempt must come from the backoff.
+    slot.wake();
+    // Each attempt waits out the store's busy timeout, so two attempts take
+    // a little over ten seconds.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while runtime.refresh_attempts() < before + 2 {
+        assert!(
+            Instant::now() < deadline,
+            "a busy store was not retried on the backoff: attempts={} unavailable={:?}",
+            runtime.refresh_attempts() - before,
+            runtime.unavailable_reason()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // While it retries, the reason names the busy store, as for any transient
+    // fill error; the publish below clears it.
+    let reason = runtime.unavailable_reason();
+    assert!(
+        reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("database is locked")),
+        "{reason:?}"
+    );
+    blocker.execute_batch("ROLLBACK;").unwrap();
+    drop(blocker);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let answer = query(&runtime, "gamma_busy_edit");
+        if answer.complete() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the fill never published after the store freed: {answer:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(runtime.unavailable_reason().is_none());
+    slot.clear();
+    worker.join().unwrap();
+}
+
 /// A worker superseded by a lane restart (here a model change) is held just
 /// before its final publication while the new lane publishes; when released,
 /// its publication is refused and the view still names the new producer. No
@@ -4792,7 +4959,7 @@ fn superseded_lane_cannot_publish_over_its_replacement() {
         }
         .fingerprint_hex(),
         semantic: Some(SemanticProducer::current(model, EmbedTextCaps::default()).id()),
-        callgraph: super::super::callgraph::PRODUCER.into(),
+        callgraph: super::UNREGISTERED_PRODUCER.into(),
     };
     let member = super::view_scope("scope");
     assert!(super::super::base_refs::open_foreign_v3(

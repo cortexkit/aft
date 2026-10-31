@@ -1,0 +1,11 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "non_ranking",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "land/windows-hermetic-test-fixtures"
+  ]
+}

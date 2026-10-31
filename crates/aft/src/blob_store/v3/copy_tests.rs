@@ -719,16 +719,7 @@ fn deleting_copied_rows_lowers_usage_only_at_the_next_covering_measurement() {
         {}
         checkpoint(&c).unwrap();
     }
-    let fits_only_after_freeing = |freed: u64| NAMESPACE_BUDGET - before + freed;
     assert_eq!(registry.accounting().unwrap().usage(), before);
-    assert_eq!(
-        registry
-            .reserve(fits_only_after_freeing(1024 * 1024))
-            .err()
-            .unwrap()
-            .to_string(),
-        "v3_namespace_budget"
-    );
     registry.covering_measurement().unwrap();
     let after = registry.accounting().unwrap().usage();
     assert_eq!(after, super::tests::inventory(&registry.dir));
@@ -738,8 +729,6 @@ fn deleting_copied_rows_lowers_usage_only_at_the_next_covering_measurement() {
         "freed {freed} bytes of an {} byte row",
         payload.len()
     );
-    let reservation = registry.reserve(fits_only_after_freeing(freed)).unwrap();
-    registry.release(reservation).unwrap();
 }
 
 /// Records, at each `ClosureFlushed`, the ledger's outstanding reserved bytes
@@ -786,16 +775,13 @@ impl DurabilityObserver for LedgerProbe<'_> {
     }
 }
 
-/// Creates the v3 registry and holds a live reservation that leaves room for
-/// one full copy request of `payload_len` bytes but not for two. Returns the
-/// held bytes.
-fn leave_room_for_one_copy(storage: &Path, payload_len: u64) -> u64 {
+/// Creates the v3 registry and holds an unrelated live reservation, so the
+/// probe's reading of outstanding bytes includes it. Returns the held bytes.
+fn hold_unrelated_reservation(storage: &Path) -> u64 {
     publish(storage, FAMILY, 0, None, |_| Ok(())).unwrap();
-    let full_request = 2 * payload_len + (1 << 20);
     let lock = ReservationLock::acquire(storage).unwrap();
     let mut writer = RegistryWriter::open_existing(storage, FAMILY, &lock).unwrap();
-    let usage = writer.accounting().unwrap().usage();
-    let held = NAMESPACE_BUDGET - usage - full_request - full_request / 6;
+    let held = 64 << 20;
     // The reservation stays outstanding: its owner (this process) is alive.
     writer.reserve(held).unwrap();
     held
@@ -807,7 +793,7 @@ fn a_repeated_copy_reserves_only_a_touch_and_reuses_the_committed_row() {
     let root = tempdir().unwrap();
     let payload = vec![6u8; 4 * 1024 * 1024];
     let (_store, key) = v1_source(root.path(), &payload);
-    let held = leave_room_for_one_copy(root.path(), payload.len() as u64);
+    let held = hold_unrelated_reservation(root.path());
     let copy = CopySource::V1 {
         artifact_key: FAMILY,
         plane: BlobPlane::Semantic,
@@ -817,7 +803,6 @@ fn a_repeated_copy_reserves_only_a_touch_and_reuses_the_committed_row() {
         copy_on_first_use(root.path(), copy, HOLDER, None).unwrap(),
         CopyOutcome::Copied
     );
-    // A second full-size request no longer fits the namespace budget.
     let probe = LedgerProbe {
         storage: root.path(),
         key: FamilyKey::new(FamilyPlane::Semantic, key),

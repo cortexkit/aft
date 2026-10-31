@@ -615,6 +615,8 @@ fn refusal_explanation_table_covers_bot_request_codes() {
         "review_thread_not_own",
         "issue_edit_not_own",
         "pr_head_cross_repository",
+        "pull_request_head_moved",
+        "pull_request_not_open",
         "probe_unproven",
         "repository_unbound",
         "request_deadline_exceeded",
@@ -663,6 +665,50 @@ fn refusal_explanation_table_covers_bot_request_codes() {
         assert_eq!(refusal_explanation(json!({"result": {
             "status": "refused", "refusal_code": code, "retry_same_nonce": false,
         }})), format!("Plexus refused the bot write: {code}. A permission or service check stopped the current step. Earlier reads or writes may have reached GitHub. The agent must change the request. Check GitHub before rerunning; a rerun may repeat the steps that were sent."));
+    }
+}
+
+/// Every refusal code in the vendored Plexus reply vectors has its own
+/// explanation. Without one the shim falls back to saying it doesn't know the
+/// code and that whether anything reached GitHub is unknown, even when the
+/// vector shows nothing was written. The merge-queue codes shipped that way.
+#[test]
+fn every_vendored_plexus_refusal_code_has_an_explanation() {
+    fn codes(value: &Value, found: &mut std::collections::BTreeSet<String>) {
+        match value {
+            Value::Object(map) => {
+                if let Some(Value::String(code)) = map.get("refusal_code") {
+                    found.insert(code.split('{').next().unwrap().trim().to_string());
+                }
+                map.values().for_each(|value| codes(value, found));
+            }
+            Value::Array(items) => items.iter().for_each(|value| codes(value, found)),
+            _ => {}
+        }
+    }
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/gh_shim/plexus-contract/replies-contract");
+    let mut found = std::collections::BTreeSet::new();
+    let mut files = 0;
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|ext| ext == "json") {
+            files += 1;
+            let vector: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            codes(&vector, &mut found);
+        }
+    }
+    assert!(
+        files > 0 && !found.is_empty(),
+        "no vendored reply vectors found in {dir:?}"
+    );
+    for code in &found {
+        assert!(
+            REFUSAL_EXPLANATIONS
+                .iter()
+                .any(|(name, selector, ..)| name == code && selector.is_empty()),
+            "vendored Plexus refusal code {code} has no explanation row"
+        );
     }
 }
 
@@ -731,6 +777,8 @@ fn approved_refusal_table_wording_is_pinned_byte_for_byte() {
         ("Plexus", "review_thread_not_own", "The pull request was not opened by this bot.", READS_AGENT),
         ("Plexus", "issue_edit_not_own", "The issue was not opened by this bot.", READS_AGENT),
         ("Plexus", "pr_head_cross_repository", "The pull request head is outside the bound repository.", UNSENT_AGENT),
+        ("Plexus", "pull_request_head_moved", "The pull request's head changed after the commit given with --match-head-commit; read its current head and enqueue again with that commit.", READS_AGENT),
+        ("Plexus", "pull_request_not_open", "The pull request is closed or merged, so it can't join or leave the merge queue.", READS_AGENT),
         ("Plexus", "probe_unproven", "The bot handle has not passed its proof check.", UNSENT_OPERATOR),
         ("Plexus", "repository_unbound", "The repository has no bot binding.", MAYBE_OPERATOR),
         ("Plexus", "request_deadline_exceeded", "The request deadline expired before dispatch.", UNSENT_TRANSIENT),
@@ -2212,6 +2260,130 @@ fn not_sent_pre_reads_retry_only_transient_reasons_once_with_the_same_nonce_and_
             assert_eq!(sent, &body, "{code}: changed request or nonce");
         }
         assert!(io.now() <= timing.deadline());
+    }
+}
+
+#[test]
+fn queue_transport_failures_distinguish_not_sent_from_unknown_without_resending() {
+    struct FailingIo {
+        not_sent: bool,
+        attempts: std::cell::Cell<usize>,
+        now: Instant,
+    }
+    impl ExchangeIo for FailingIo {
+        fn now(&self) -> Instant {
+            self.now
+        }
+        async fn sleep(&self, _: Duration) {
+            panic!("transport failures must not trigger a retry");
+        }
+        async fn request(&self, bytes: Vec<u8>, _: CallOptions) -> Result<Vec<u8>, CallError> {
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            if body["op"] == BINDINGS_READ_OPERATION {
+                return Ok(serde_json::to_vec(&bindings_ok()).unwrap());
+            }
+            self.attempts.set(self.attempts.get() + 1);
+            if self.not_sent {
+                Err(CallError::NotSent(Box::new(std::io::Error::other(
+                    "pre-send transport failure",
+                ))))
+            } else {
+                Err(CallError::OutcomeUnknown(Box::new(std::io::Error::other(
+                    "transport failed after accepting the write",
+                ))))
+            }
+        }
+    }
+    let manifest = super::super::v23_tests::manifest();
+    for (action, argv) in [
+        (
+            "pr enqueue",
+            vec![
+                "pr",
+                "merge",
+                "7",
+                "--match-head-commit",
+                "0123456789abcdef0123456789abcdef01234567",
+                "--repo",
+                "cortexkit/aft",
+            ],
+        ),
+        (
+            "pr dequeue",
+            vec!["pr", "dequeue", "7", "--repo", "cortexkit/aft"],
+        ),
+    ] {
+        let args = argv.iter().map(OsString::from).collect::<Vec<_>>();
+        let Classification::Governed { tuple, canonical } = classify(&args, &manifest, "linux")
+        else {
+            panic!("queue action must be governed");
+        };
+        assert_eq!(tuple, action);
+        let request = super::super::canonicalize_governed_from(
+            &args,
+            &tuple,
+            &canonical,
+            23,
+            &mut std::io::empty(),
+        )
+        .unwrap();
+        let rung =
+            RungDetermination::r1(TEST_NOW, super::super::R1Reason::AbsentOrUnparseable).record;
+        let wire = super::super::governed_wire_request(&rung, "alfonso-aft", request);
+        assert_eq!(wire["action"], action);
+        for not_sent in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = StatePaths::from_root(temp.path().join("state"));
+            let io = FailingIo {
+                not_sent,
+                attempts: Default::default(),
+                now: Instant::now(),
+            };
+            let stage = Mutex::new(ProbeStage::Request);
+            let timing = Exchange {
+                io: &io,
+                ticket: "test-ticket",
+                stage: &stage,
+                started: io.now,
+                budget: Duration::from_secs(5),
+            };
+            let binding = AgentBinding {
+                repo: "cortexkit/aft".into(),
+                agent_id: "alfonso-aft".into(),
+            };
+            let body = json!({"op": BOT_REQUEST_OPERATION, "params": {"request_nonce": "queue-transport-nonce", "request": wire}});
+            let outcome = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(exchange(
+                    &timing,
+                    &paths,
+                    &binding,
+                    &manifest,
+                    &body,
+                    [Duration::from_millis(1); 2],
+                ));
+            if not_sent {
+                assert!(
+                    matches!(outcome, RouteOutcome::GovernanceUnavailable),
+                    "{action}: {outcome:?}"
+                );
+            } else {
+                assert!(
+                    matches!(outcome, RouteOutcome::OutcomeUnknown { .. }),
+                    "{action}: {outcome:?}"
+                );
+            }
+            assert_eq!(io.attempts.get(), 1, "{action}: not_sent={not_sent}");
+            assert_eq!(
+                super::super::governed_outcome_status(&paths, &binding, TEST_NOW, outcome),
+                if not_sent {
+                    REFUSAL_EXIT_STATUS
+                } else {
+                    OUTCOME_UNKNOWN_EXIT_STATUS
+                }
+            );
+        }
     }
 }
 

@@ -144,6 +144,118 @@ pub(crate) fn result_digest(case: &str, value: &impl serde::Serialize) {
     );
 }
 
+/// Replay captured benchmark requests against one shared lexical-only context.
+/// Corpus setup and response serialization stay outside the measured interval.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "set AFT_PERF_CORPUS and AFT_ENGINE_PROFILE_OUT; Linux parallel real-query profile"]
+fn engine_only_real_query_parallel_profile() {
+    use crate::commands::semantic_search::handle_semantic_search;
+    use crate::config::Config;
+    use crate::context::{AppContext, SemanticIndexStatus};
+    use crate::parser::TreeSitterProvider;
+    use crate::protocol::RawRequest;
+    use crate::search_index::SearchIndex;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    fn cpu_ms() -> f64 {
+        let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+        // The clock writes the timespec only on success.
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, time.as_mut_ptr()) },
+            0
+        );
+        let time = unsafe { time.assume_init() };
+        time.tv_sec as f64 * 1000.0 + time.tv_nsec as f64 / 1_000_000.0
+    }
+
+    let root = PathBuf::from(std::env::var_os("AFT_PERF_CORPUS").expect("AFT_PERF_CORPUS"));
+    let output =
+        PathBuf::from(std::env::var_os("AFT_ENGINE_PROFILE_OUT").expect("AFT_ENGINE_PROFILE_OUT"));
+    let manifest: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../benchmarks/aft-search/real-query-manifest.json"
+    ))
+    .unwrap();
+    let rows = manifest["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row.get("excluded_reason").is_none())
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 108);
+    let index = SearchIndex::build(&root);
+    let file_count = index.file_count();
+    assert!(
+        file_count > 1000,
+        "use the pinned AFT corpus, not a synthetic fixture"
+    );
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        },
+    );
+    *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::Disabled;
+    *ctx.search_index().write().unwrap() = Some(index);
+    let samples = Mutex::new(Vec::new());
+    for (label, workers, repeats) in [("serial", 1, 1), ("parallel", 4, 4)] {
+        std::thread::scope(|scope| {
+            for worker in 0..workers {
+                let ctx = &ctx;
+                let rows = &rows;
+                let samples = &samples;
+                let root = &root;
+                scope.spawn(move || {
+                    for number in (worker..rows.len() * repeats).step_by(workers) {
+                        let row = rows[number % rows.len()];
+                        let id = format!("engine-profile-{number}");
+                        let mut request = serde_json::json!({
+                            "id": id, "command": "semantic_search", "query": row["query"],
+                            "include_tests": row["include_tests"],
+                            "top_k": if label == "serial" { 50 } else { row["recorded_top_k"].as_u64().unwrap_or(10) },
+                        });
+                        if let Some(pattern) = row.get("pattern") {
+                            request["pattern"] = pattern.clone();
+                        }
+                        let request: RawRequest = serde_json::from_value(request).unwrap();
+                        reset();
+                        let cpu = cpu_ms();
+                        let started = Instant::now();
+                        let response = handle_semantic_search(&request, ctx);
+                        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+                        let cpu_ms = cpu_ms() - cpu;
+                        let work = counts();
+                        let value = serde_json::to_value(response).unwrap();
+                        assert_eq!(value["success"], true, "{value}");
+                        let bytes = serde_json::to_string(&value).unwrap()
+                            .replace(root.to_str().unwrap(), "<corpus>");
+                        samples.lock().unwrap().push(serde_json::json!({
+                            "mode": label, "number": number, "episode_id": row["episode_id"],
+                            "elapsed_ms": elapsed_ms, "cpu_ms": cpu_ms, "work": work,
+                            "response_blake3": blake3::hash(bytes.as_bytes()).to_hex().to_string(),
+                            "response": serde_json::from_str::<serde_json::Value>(&bytes).unwrap(),
+                        }));
+                    }
+                });
+            }
+        });
+    }
+    let mut samples = samples.into_inner().unwrap();
+    samples.sort_by_key(|sample| {
+        (
+            sample["mode"].as_str().unwrap().to_string(),
+            sample["number"].as_u64().unwrap(),
+        )
+    });
+    std::fs::write(
+        output,
+        serde_json::to_vec(&serde_json::json!({"files": file_count, "samples": samples})).unwrap(),
+    )
+    .unwrap();
+}
+
 #[test]
 #[ignore = "set AFT_PERF_CORPUS to a real corpus; opt-in disk and allocation benchmark"]
 fn real_corpus_lane_work_counts() {

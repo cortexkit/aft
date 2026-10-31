@@ -4,10 +4,11 @@ name: Tests
 # merge-group run tests the actual landing candidate with the full suite.
 # Heavy jobs inside reusable suites are skipped on PRs so required checks
 # pass without running twice; policy, descriptors, formatting and lint still
-# catch mistakes early. Main, train and CI-experiment pushes and manual runs
-# retain the full suite, with exact-SHA main-push runs serving release evidence.
-# Tag pushes go through release.yml, which builds/publishes only after
-# release-ci-gate.sh finds a successful Tests main-push run for the exact tagged
+# catch mistakes early. Main, train, release-branch and CI-experiment pushes and
+# manual runs retain the full suite. Release evidence is an exact-SHA run: a
+# main push or merge-queue run for tags on main, or a release/X.Y push run for a
+# retry tag. Tag pushes go through release.yml, which builds/publishes only after
+# release-ci-gate.sh finds such a successful Tests run for the exact tagged
 # commit and verifies every required job succeeded in that run.
 #
 # IMPORTANT: any change to bridge transport, bash spawning, ONNX install,
@@ -29,6 +30,8 @@ on:
       - main
       - "train/**"
       - "ci-speed/**"
+      # Retry fixes for a failed release tag; see scripts/lib/release_retry.py.
+      - "release/**"
   workflow_dispatch:
     inputs:
       storm_profile_probe:
@@ -43,11 +46,12 @@ on:
 
 # Separate merge-queue candidates (each PR plus the PRs ahead of it) need
 # independent checks. A newer candidate must not cancel an earlier one's run.
-# Main runs are also commit-scoped: publication needs CI evidence for the exact
-# final commit being tagged, even if another commit lands while its tests run.
+# Main and release-branch runs are also commit-scoped: publication needs CI
+# evidence for the exact final commit being tagged, even if another commit lands
+# while its tests run.
 concurrency:
-  group: tests-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ (github.event_name == 'merge_group' || github.ref == 'refs/heads/main') && github.sha || 'latest' }}
-  cancel-in-progress: ${{ github.event_name != 'merge_group' && github.ref != 'refs/heads/main' }}
+  group: tests-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ (github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && github.sha || 'latest' }}
+  cancel-in-progress: ${{ github.event_name != 'merge_group' && github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/release/') }}
 
 env:
   # Keep the compiler cache server alive between build steps so its final

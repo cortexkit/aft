@@ -1,0 +1,1 @@
+- AFT uses less CPU cleaning up old background-command records in sessions that keep starting new commands.

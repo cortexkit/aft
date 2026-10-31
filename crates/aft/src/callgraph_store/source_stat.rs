@@ -54,16 +54,23 @@ impl SourceStat {
     }
 }
 
-pub(super) fn read_source(path: &Path) -> std::io::Result<(String, FileFreshness, Option<String>)> {
-    read_open_source(crate::project_content::open(path)?)
+pub(super) fn read_source(
+    path: &Path,
+    verify: impl FnOnce(&[u8]) -> Result<()>,
+) -> Result<(String, FileFreshness, Option<String>)> {
+    read_open_source(crate::project_content::open(path)?, verify)
 }
 
 fn read_open_source(
     mut file: std::fs::File,
-) -> std::io::Result<(String, FileFreshness, Option<String>)> {
+    verify: impl FnOnce(&[u8]) -> Result<()>,
+) -> Result<(String, FileFreshness, Option<String>)> {
     let before = SourceStat::of_file(&file)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
+    // Check the bytes from this handle, including undecodable and oversized
+    // sources, before they can contribute rows to a cold generation.
+    verify(&bytes)?;
     crate::views::io::WORK
         .content_read_bytes
         .fetch_add(bytes.len() as u64, AtomicOrdering::Relaxed);
@@ -92,6 +99,23 @@ fn read_open_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cold_verifier_checks_raw_bytes_even_when_freshness_hash_is_capped_or_utf8_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.ts");
+        for bytes in [
+            vec![0xff],
+            vec![b' '; cache_freshness::CONTENT_HASH_SIZE_CAP as usize + 1],
+        ] {
+            std::fs::write(&path, &bytes).unwrap();
+            let result = read_source(&path, |read| {
+                assert_eq!(read, bytes);
+                Err(CallGraphStoreError::StaleFiles(vec!["changed".to_string()]))
+            });
+            assert!(matches!(result, Err(CallGraphStoreError::StaleFiles(_))));
+        }
+    }
 
     #[test]
     fn stat_first_unavailable_identity_is_never_unchanged() {
@@ -132,7 +156,7 @@ mod tests {
             &path,
             source.replace("before", "after_").as_bytes(),
         );
-        let (read, freshness, identity) = read_open_source(opened).unwrap();
+        let (read, freshness, identity) = read_open_source(opened, |_| Ok(())).unwrap();
         assert_eq!(read, source);
         assert_eq!(
             freshness.content_hash,

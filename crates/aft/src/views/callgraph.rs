@@ -1252,7 +1252,7 @@ mod tests {
                     super::super::verification::BindGuard::capture(&root, None)
                         .unwrap()
                         .policy
-                        .digest,
+                        .base_digest,
                 ),
                 history: None,
                 budget: DiskBudget::default(),
@@ -1426,6 +1426,240 @@ mod tests {
             .expect("a failed bind must not strand a live claim");
         assert_eq!(callers(&ready, "a.ts", "target").len(), 1);
         assert_eq!(failed.installed_snapshot().generation().name(), "empty");
+    }
+
+    /// Runs a setup Git command with a fixed identity, so commits work on a
+    /// machine without one configured.
+    fn setup_git(root: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(root)
+            .args([
+                "-c",
+                "user.name=aft-test",
+                "-c",
+                "user.email=aft-test@example.invalid",
+                "-c",
+                "init.defaultBranch=main",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A linked worktree at the commit the main checkout already built has the
+    /// same files, so it must resolve the main checkout's base and clone its
+    /// sealed donor, parsing nothing. Base identity once hashed the policy
+    /// inputs' absolute paths and Git's config origins (`.git/config` in a
+    /// main checkout, an absolute path in a linked worktree), so every
+    /// checkout built a full base of its own. It also once hashed ignore
+    /// files, so a self-ignoring file a tool writes into the main checkout
+    /// only (OpenCode's `.opencode/.gitignore` is one) split the bases too.
+    #[test]
+    fn linked_worktree_at_the_same_commit_shares_the_base_and_its_donor() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let main = checkout(&temp.path().join("main"));
+        std::fs::write(main.join(".gitignore"), "dist/\n").unwrap();
+        setup_git(&main, &["init", "-q"]);
+        // Windows runners set core.autocrlf, which would check the linked
+        // worktree out with CRLF line endings: different bytes, so not the
+        // same commit's content as the main checkout's LF files.
+        setup_git(&main, &["config", "core.autocrlf", "false"]);
+        setup_git(&main, &["add", "-A"]);
+        setup_git(&main, &["commit", "-q", "-m", "fixture"]);
+        // Shared by every checkout of the repository.
+        std::fs::write(main.join(".git/info/exclude"), "scratch/\n").unwrap();
+        // A tool's folder that ignores itself, present in the main checkout
+        // only. It changes no member, so it must not change the base.
+        std::fs::create_dir(main.join(".tool")).unwrap();
+        std::fs::write(main.join(".tool/.gitignore"), "*\n").unwrap();
+        let linked = temp.path().join("linked");
+        setup_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let linked = std::fs::canonicalize(&linked).unwrap();
+
+        let main_view = view(&main, &storage);
+        let main_store = main_view.reader().unwrap();
+        assert_eq!(callers(&main_store, "a.ts", "target").len(), 1);
+        assert!(
+            main_view.extraction_count() > 0,
+            "the main checkout builds the base"
+        );
+
+        let linked_view = view(&linked, &storage);
+        let linked_store = linked_view.reader().unwrap();
+        assert_eq!(
+            callers(&linked_store, "a.ts", "target"),
+            callers(&main_store, "a.ts", "target")
+        );
+        assert_eq!(
+            linked_view.extraction_count(),
+            0,
+            "the linked worktree built its own base instead of sharing the main checkout's"
+        );
+        let producers = super::super::manifest_v2::Producers {
+            trigram: crate::blob_store::v2::TrigramPolicy {
+                max_file_size: 1 << 20,
+            }
+            .fingerprint_hex(),
+            semantic: None,
+            callgraph: PRODUCER.into(),
+        };
+        let base_of = |root: &Path| {
+            super::super::base_refs::open_foreign_v3(
+                &storage,
+                "donor-reuse",
+                &view_scope(root),
+                &producers,
+            )
+            .unwrap()
+            .unwrap()
+            .base_header()
+            .unwrap()
+            .scope
+            .clone()
+        };
+        assert_eq!(base_of(&linked), base_of(&main));
+        assert!(matches!(
+            events(
+                &crate::blob_store::v3::view_dir(&storage, "donor-reuse", &view_scope(&linked))
+                    .unwrap()
+            )
+            .as_slice(),
+            [super::super::donor::DonorEvent::Cloned(_)]
+        ));
+
+        // Ignore rules stay out of the base policy, but they still change the
+        // checkout's own location-bound digest that saved file stats check.
+        // Attribute sources still change the base policy: they can change
+        // how a member's bytes are interpreted without changing its content.
+        let policy = |root: &Path| {
+            super::super::verification::BindGuard::capture(root, None)
+                .unwrap()
+                .policy
+        };
+        assert_eq!(policy(&main).base_digest, policy(&linked).base_digest);
+        let before = policy(&linked);
+        std::fs::create_dir(linked.join(".tool")).unwrap();
+        std::fs::write(linked.join(".tool/.gitignore"), "other\n").unwrap();
+        let ignored = policy(&linked);
+        assert_eq!(ignored.base_digest, before.base_digest);
+        assert_ne!(ignored.digest, before.digest);
+        std::fs::write(linked.join(".gitattributes"), "*.ts text eol=crlf\n").unwrap();
+        assert_ne!(policy(&linked).base_digest, before.base_digest);
+    }
+
+    /// A worktree at another commit is another base. Its graph must start as
+    /// a clone of the sealed graph of the base it nearly equals, patched with
+    /// the difference, and answer exactly what a cold build of that commit
+    /// answers. Before, every commit's base resolved the whole graph again.
+    #[test]
+    fn a_new_commits_base_starts_from_the_nearest_sealed_base() {
+        use super::super::donor::DonorEvent;
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let main = checkout(&temp.path().join("main"));
+        setup_git(&main, &["init", "-q"]);
+        setup_git(&main, &["config", "core.autocrlf", "false"]);
+        setup_git(&main, &["add", "-A"]);
+        setup_git(&main, &["commit", "-q", "-m", "fixture"]);
+        let linked = temp.path().join("linked");
+        setup_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let linked = std::fs::canonicalize(&linked).unwrap();
+        // The worktree moves to its own commit with one more caller.
+        std::fs::write(
+            linked.join("c.ts"),
+            "import { target } from './a';\nexport function third() { return target(); }\n",
+        )
+        .unwrap();
+        setup_git(&linked, &["add", "-A"]);
+        setup_git(&linked, &["commit", "-q", "-m", "next"]);
+
+        let producers = super::super::manifest_v2::Producers {
+            trigram: crate::blob_store::v2::TrigramPolicy {
+                max_file_size: 1 << 20,
+            }
+            .fingerprint_hex(),
+            semantic: None,
+            callgraph: PRODUCER.into(),
+        };
+        let base_dir = |storage: &Path, root: &Path| {
+            let scope = super::super::base_refs::open_foreign_v3(
+                storage,
+                "donor-reuse",
+                &view_scope(root),
+                &producers,
+            )
+            .unwrap()
+            .unwrap()
+            .base_header()
+            .unwrap()
+            .scope
+            .clone();
+            crate::blob_store::v3::view_dir(storage, "donor-reuse", &scope).unwrap()
+        };
+
+        // Shared storage: main's base is built and sealed first.
+        let storage = temp.path().join("storage");
+        let main_view = view(&main, &storage);
+        assert_eq!(
+            callers(&main_view.reader().unwrap(), "a.ts", "target").len(),
+            1
+        );
+        let linked_view = view(&linked, &storage);
+        let patched = callers(&linked_view.reader().unwrap(), "a.ts", "target");
+        assert_eq!(patched.len(), 2, "{patched:?}");
+        assert_ne!(base_dir(&storage, &linked), base_dir(&storage, &main));
+        let base_events = events(&base_dir(&storage, &linked));
+        assert!(
+            base_events
+                .iter()
+                .any(|event| matches!(event, DonorEvent::Cloned(_))),
+            "the new commit's base resolved its whole graph cold: {base_events:?}"
+        );
+        assert!(
+            base_events.contains(&DonorEvent::Sealed),
+            "the patched base graph must still be sealed: {base_events:?}"
+        );
+
+        // A store with only the worktree builds the same base cold.
+        drop((main_view, linked_view));
+        let cold_storage = temp.path().join("cold-storage");
+        let cold_view = view(&linked, &cold_storage);
+        assert_eq!(
+            callers(&cold_view.reader().unwrap(), "a.ts", "target"),
+            patched
+        );
+        assert!(!events(&base_dir(&cold_storage, &linked))
+            .iter()
+            .any(|event| matches!(event, DonorEvent::Cloned(_))));
     }
 
     #[test]

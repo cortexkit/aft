@@ -415,8 +415,123 @@ impl BuildClaim {
             self.attempt, self.token
         )
     }
+    /// Starts this base's graph as a clone of the sealed graph of the nearest
+    /// other base in the family, patched with the difference between the two
+    /// manifests, the same way a checkout patches a clone of its own base.
+    /// Worker checkouts usually sit a few commits behind main, and each
+    /// commit is its own base, so without this every one of them resolves the
+    /// whole graph again and, on a cloning filesystem, shares none of its
+    /// pages with the bases it nearly equals.
+    ///
+    /// Returns false, leaving no file at `database`, when there is no sealed
+    /// base to start from or the nearest one differs in more than half its
+    /// entries: patching that much rewrites most pages, so it saves neither
+    /// time nor disk over a cold build.
+    fn patch_nearest_base(
+        &self,
+        store: &ViewStore,
+        database: &Path,
+        projected: &crate::views::Manifest,
+        reader: &super::callgraph::V3BlobReader,
+    ) -> Result<bool> {
+        let Some((donor, donor_projected, _donor_base)) = self.nearest_sealed_base(projected)
+        else {
+            return Ok(false);
+        };
+        let mechanism = super::donor::clone_sealed(&donor, database)
+            .map_err(|reason| BaseRefError::Io(std::io::Error::other(reason)))?;
+        match super::materialization::apply_manifest_diff_from_blob_reader(
+            database,
+            &donor_projected,
+            projected,
+            reader,
+        ) {
+            Ok(_) => {
+                super::donor::record(
+                    store.view_dir(),
+                    super::donor::DonorEvent::Cloned(mechanism),
+                );
+                Ok(true)
+            }
+            Err(error) if super::materialization::is_base_fingerprint_mismatch(&error) => {
+                super::first_load::remove_private_database(database);
+                super::donor::record(
+                    store.view_dir(),
+                    super::donor::DonorEvent::Cold(
+                        super::donor::ColdReason::BaseFingerprintMismatch,
+                    ),
+                );
+                Ok(false)
+            }
+            Err(error) => {
+                super::first_load::remove_private_database(database);
+                Err(BaseRefError::Io(std::io::Error::other(error.to_string())))
+            }
+        }
+    }
+
+    /// The sealed graph and projected manifest of the other live base in this
+    /// family whose projection differs least from `projected`, with the base
+    /// generation that holds its read marker. Any base that can't be resolved,
+    /// isn't sealed or has another graph producer is skipped: it only means
+    /// this base builds cold, as it did before.
+    fn nearest_sealed_base(
+        &self,
+        projected: &crate::views::Manifest,
+    ) -> Option<(
+        PathBuf,
+        crate::views::Manifest,
+        std::sync::Arc<super::snapshot::ComposedGeneration>,
+    )> {
+        let ledger = v3::LedgerReader::open_existing(&self.storage, &self.family).ok()?;
+        let scopes = ledger
+            .read(|connection| {
+                let mut statement = connection.prepare(
+                    "SELECT scope FROM members WHERE kind=?1 AND state<>?2 AND scope<>?3 ORDER BY scope",
+                )?;
+                let rows = statement
+                    .query_map(params![KIND_BASE, STATE_EVICTING, self.scope], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .ok()?;
+        let mut best: Option<(usize, usize, PathBuf, crate::views::Manifest, _)> = None;
+        for scope in scopes {
+            let Ok(base) = super::base_refs::resolve_base(&self.storage, &self.family, &scope)
+            else {
+                continue;
+            };
+            let generation = base.into_generation(&self.storage, &self.family);
+            let Ok(donor) = super::first_load::sealed_donor(&generation) else {
+                continue;
+            };
+            let Ok(donor_projected) = super::callgraph::project_manifest(&generation) else {
+                continue;
+            };
+            let size = super::materialization::manifest_diff_size(&donor_projected, projected);
+            if best
+                .as_ref()
+                .is_none_or(|(changed, ..)| size.changed < *changed)
+            {
+                best = Some((
+                    size.changed,
+                    size.entries,
+                    donor,
+                    donor_projected,
+                    generation,
+                ));
+            }
+        }
+        let (changed, entries, donor, donor_projected, generation) = best?;
+        (changed.saturating_mul(2) <= entries).then_some((donor, donor_projected, generation))
+    }
+
     /// Builds the base's derived call graph for `generation` once every
-    /// callgraph member of `manifest` is ready, as
+    /// callgraph member of `manifest` is ready, starting from the nearest
+    /// other base's sealed graph when one is close enough
+    /// ([`Self::patch_nearest_base`]), as
     /// `derived-<generation>-a<attempt>-<owner_token>.sqlite` with a
     /// `derived-<generation>.ref` naming it, so a takeover never reuses a
     /// dead attempt's file. While any member is pending nothing is built.
@@ -427,9 +542,9 @@ impl BuildClaim {
         manifest: &ManifestV2,
     ) -> Result<()> {
         let composed = super::snapshot::ComposedGeneration::new(generation, manifest.clone(), None);
-        if super::callgraph::project_manifest(&composed).is_err() {
+        let Ok(projected) = super::callgraph::project_manifest(&composed) else {
             return Ok(());
-        }
+        };
         let owner = format!("{generation}-a{}-{}", self.attempt, self.token);
         // `derived_name` is `derived-<owner>.sqlite`: the name the
         // reference file below resolves to.
@@ -439,8 +554,10 @@ impl BuildClaim {
             &self.family,
             FamilyPlane::Callgraph,
         )?);
-        super::callgraph::materialize(&database, &composed, &reader)
-            .map_err(|error| BaseRefError::Io(std::io::Error::other(error.reason)))?;
+        if !self.patch_nearest_base(store, &database, &projected, &reader)? {
+            super::callgraph::materialize(&database, &composed, &reader)
+                .map_err(|error| BaseRefError::Io(std::io::Error::other(error.reason)))?;
+        }
         let (busy, frames, checkpointed) =
             super::sqlite_full_sync_checkpoint(&database, "base_builder::build_derived")?;
         if busy != 0 || (frames >= 0 && checkpointed != frames) {

@@ -928,9 +928,215 @@ fn applicability_walk_entry_budget_reports_incomplete() {
         RootPathMode::WalkEntry,
     )
     .unwrap_err();
-    assert!(
-        matches!(error, ApplicabilityResolutionError::RootUnreadable { reason, .. } if reason.contains("incomplete: entry limit 3"))
+    assert!(matches!(
+        error,
+        ApplicabilityResolutionError::EntryLimitReached { entries: 3, .. }
+    ));
+}
+
+#[test]
+fn applicability_walk_incomplete_backoff_reuses_failure_and_caps_retries() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    for n in 0..10 {
+        std::fs::write(root.join(format!("{n}.txt")), "").unwrap();
+    }
+    let config = config(&root);
+    let cache = super::super::applicability_cache::ApplicabilityCache::default();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut now = Instant::now();
+    let mut expected_walks = 0;
+    // Use a virtual retry clock so the full 30-second to 10-minute schedule is
+    // checked without sleeps. Request deadlines still use the real clock.
+    for seconds in [30, 60, 120, 240, 480, 600, 600] {
+        let request = |now| {
+            cache.walk_with_clock(
+                &root,
+                &config,
+                deadline,
+                || now,
+                || {
+                    walk_applicable_area_uncached(
+                        &root,
+                        None,
+                        &config,
+                        deadline,
+                        3,
+                        RootPathMode::WalkEntry,
+                    )
+                },
+            )
+        };
+        assert!(matches!(
+            request(now),
+            Err(ApplicabilityResolutionError::EntryLimitReached { entries: 3, .. })
+        ));
+        expected_walks += 1;
+        for offset in [0, 1, seconds - 1] {
+            assert!(matches!(
+                request(now + Duration::from_secs(offset)),
+                Err(ApplicabilityResolutionError::EntryLimitReached { entries: 3, .. })
+            ));
+        }
+        assert_eq!(cache.metrics(&root).full_walks, expected_walks);
+        now += Duration::from_secs(seconds);
+    }
+}
+
+#[test]
+fn applicability_walk_incomplete_watcher_churn_preserves_backoff_and_can_complete() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    for n in 0..10 {
+        std::fs::write(root.join(format!("{n}.txt")), "").unwrap();
+    }
+    let config = config(&root);
+    let cache = super::super::applicability_cache::ApplicabilityCache::default();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let start = Instant::now();
+    let request = |now| {
+        cache.walk_with_clock(
+            &root,
+            &config,
+            deadline,
+            || now,
+            || {
+                walk_applicable_area_uncached(
+                    &root,
+                    None,
+                    &config,
+                    deadline,
+                    3,
+                    RootPathMode::WalkEntry,
+                )
+            },
+        )
+    };
+    assert!(request(start).is_err());
+    let changed = root.join("0.txt");
+    std::fs::write(&changed, "changed").unwrap();
+    assert!(cache
+        .invalidate_batch(&root, std::slice::from_ref(&changed), true)
+        .is_some());
+    assert!(request(start + Duration::from_secs(1)).is_err());
+    assert_eq!(cache.metrics(&root).full_walks, 1);
+
+    // Repeated writes inside the same retry window must not restart discovery.
+    for seconds in 2..22 {
+        std::fs::write(&changed, format!("write {seconds}")).unwrap();
+        assert!(cache
+            .invalidate_batch(&root, std::slice::from_ref(&changed), true)
+            .is_some());
+        assert!(request(start + Duration::from_secs(seconds)).is_err());
+        assert_eq!(cache.metrics(&root).full_walks, 1);
+    }
+    assert!(request(start + Duration::from_secs(29)).is_err());
+    assert_eq!(cache.metrics(&root).full_walks, 1);
+    assert!(request(start + Duration::from_secs(30)).is_err());
+    assert_eq!(cache.metrics(&root).full_walks, 2);
+
+    // A smaller area still waits for the doubled delay before it can complete.
+    for n in 1..10 {
+        std::fs::remove_file(root.join(format!("{n}.txt"))).unwrap();
+    }
+    assert!(cache
+        .invalidate_batch(&root, &[root.join("1.txt")], false)
+        .is_some());
+    assert!(request(start + Duration::from_secs(31)).is_err());
+    assert!(request(start + Duration::from_secs(89)).is_err());
+    assert_eq!(cache.metrics(&root).full_walks, 2);
+    let complete = request(start + Duration::from_secs(90)).unwrap();
+    assert_eq!(complete.entries, 2); // The root directory and its remaining file.
+    let cached = request(start + Duration::from_secs(3600)).unwrap();
+    assert_eq!(signature(&cached), signature(&complete));
+    assert_eq!(cache.metrics(&root).full_walks, 3);
+    assert_eq!(cache.metrics(&root).hits, 1);
+
+    // Completion clears the retry history: a newly oversized area starts at 30s.
+    for n in 1..10 {
+        std::fs::write(root.join(format!("{n}.txt")), "").unwrap();
+    }
+    cache.invalidate(
+        &root,
+        crate::lsp::applicability_cache::InvalidationCause::OverflowLostEvents,
     );
+    let now = start + Duration::from_secs(3601);
+    assert!(request(now).is_err());
+    assert!(request(now + Duration::from_secs(29)).is_err());
+    assert_eq!(cache.metrics(&root).full_walks, 4);
+    assert!(request(now + Duration::from_secs(30)).is_err());
+    assert_eq!(cache.metrics(&root).full_walks, 5);
+}
+
+#[test]
+fn applicability_walk_incomplete_backoff_survives_invalidation_during_scan() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    for n in 0..10 {
+        std::fs::write(root.join(format!("{n}.txt")), "").unwrap();
+    }
+    let config = config(&root);
+    let cache = super::super::applicability_cache::ApplicabilityCache::default();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut now = Instant::now();
+    for (index, seconds) in [30, 60].into_iter().enumerate() {
+        assert!(cache
+            .walk_with_clock(
+                &root,
+                &config,
+                deadline,
+                || now,
+                || {
+                    let result = walk_applicable_area_uncached(
+                        &root,
+                        None,
+                        &config,
+                        deadline,
+                        3,
+                        RootPathMode::WalkEntry,
+                    );
+                    // Simulate an event arriving before the scan's result is stored.
+                    cache.invalidate_batch(&root, &[root.join("0.txt")], true);
+                    result
+                }
+            )
+            .is_err());
+        assert!(cache
+            .walk_with_clock(
+                &root,
+                &config,
+                deadline,
+                || now + Duration::from_secs(seconds - 1),
+                || panic!("an event during the failed scan must not bypass backoff")
+            )
+            .is_err());
+        assert_eq!(cache.metrics(&root).full_walks, index as u64 + 1);
+        now += Duration::from_secs(seconds);
+    }
+}
+
+#[test]
+fn applicability_walk_incomplete_backoff_does_not_cache_other_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    let config = config(&root);
+    let cache = super::super::applicability_cache::ApplicabilityCache::default();
+    for _ in 0..2 {
+        assert!(cache
+            .walk(
+                &root,
+                &config,
+                Instant::now() + Duration::from_secs(30),
+                || {
+                    Err(ApplicabilityResolutionError::RootUnreadable {
+                        root: root.clone(),
+                        reason: "permission denied".into(),
+                    })
+                }
+            )
+            .is_err());
+    }
+    assert_eq!(cache.metrics(&root).full_walks, 2);
 }
 
 #[test]

@@ -717,11 +717,10 @@ fn refresh_semantic(session: &ParentSession, child: &Child) {
         }
     };
     let scope = super::super::semantic_runtime::view_scope(&child.scope);
-    let producers = Producers {
-        trigram: session.trigram_policy.fingerprint_hex(),
-        semantic: Some(semantic.producer_id.clone()),
-        callgraph: super::super::callgraph::PRODUCER.into(),
-    };
+    let producers = super::super::semantic_runtime::member_producers(
+        session.trigram_policy.fingerprint_hex(),
+        semantic.producer_id.clone(),
+    );
     let generation = match super::super::base_refs::open_foreign_v3(
         &session.storage,
         family,

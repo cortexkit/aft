@@ -994,6 +994,32 @@ fn report(label: &str, counts: &WorkCounts) {
     );
 }
 
+#[test]
+#[ignore = "measurement: cold-builds the AFT checkout"]
+fn cold_callgraph_snapshot_lookup_cost_on_aft_checkout() {
+    let root = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    work_counts::reset_under(&root);
+    let started = Instant::now();
+    let (_, stats) =
+        CallGraphStore::cold_build_with_lease(dir.path().join("store"), root.clone(), &[]).unwrap();
+    let wall = started.elapsed();
+    let lookups = work_counts::corpus_lookups_under(&root);
+    let calls = lookups.iter().map(|counts| counts.0).sum::<usize>();
+    let realpaths = lookups.iter().map(|counts| counts.1).sum::<usize>();
+    let ns = lookups.iter().map(|counts| counts.2).sum::<u128>();
+    assert!(!lookups.is_empty());
+    eprintln!(
+        "AFT cold snapshot: files={} lookup_files={} lookup_calls={calls} per_file_min={} per_file_max={} lookup_realpaths={realpaths} lookup_ms={:.3} wall_ms={:.3}",
+        stats.files,
+        lookups.len(),
+        lookups.iter().map(|counts| counts.0).min().unwrap(),
+        lookups.iter().map(|counts| counts.0).max().unwrap(),
+        ns as f64 / 1_000_000.0,
+        wall.as_secs_f64() * 1000.0,
+    );
+}
+
 /// Run against a fixed checkout so filesystem work and every persisted edge can
 /// be compared across resolver implementations, independently of source edits.
 #[test]

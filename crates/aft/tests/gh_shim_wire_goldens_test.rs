@@ -26,7 +26,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -375,6 +375,8 @@ struct CapturedFrame {
     request_nonce: Option<Value>,
     on_route: bool,
     body: Vec<u8>,
+    /// Preserve the received JSON frame body without parsing or reserializing it.
+    wire_body: Vec<u8>,
 }
 
 /// Translate a recorded `gh.route` holder response into the reply the AFT
@@ -647,6 +649,7 @@ async fn serve_connection(
                             .map(|value| value["params"]["request_nonce"].clone()),
                         on_route: bot_write,
                         body,
+                        wire_body: frame.body.clone(),
                     });
                 match op.as_deref() {
                     Some("catalog.list") => Some(response_frame(
@@ -1892,6 +1895,28 @@ fn synthetic_v22_manifest(now: u64) -> Vec<u8> {
     serde_json::to_vec(&manifest).expect("serialize synthetic v22 manifest")
 }
 
+fn synthetic_v23_manifest(now: u64) -> Vec<u8> {
+    let mut manifest: Value = serde_json::from_slice(&synthetic_v22_manifest(now)).unwrap();
+    let additions: Value =
+        serde_json::from_str(include_str!("fixtures/gh_shim/v23-additions.json")).unwrap();
+    manifest["tiers"]["governed"]
+        .as_array_mut()
+        .unwrap()
+        .extend(
+            additions["tiers"]["governed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .cloned(),
+        );
+    manifest["canonicalization"]
+        .as_object_mut()
+        .unwrap()
+        .extend(additions["canonicalization"].as_object().unwrap().clone());
+    manifest["manifest_version"] = json!(23);
+    serde_json::to_vec(&manifest).unwrap()
+}
+
 fn write_signed_manifest_bytes(state_dir: &Path, manifest_bytes: &[u8], now: u64) {
     let key = Ed25519KeyPair::from_seed_unchecked(&DEV_MANIFEST_SEED).expect("dev signing key");
     let envelope = json!({
@@ -1918,6 +1943,7 @@ struct V22Run {
     upstream_invocations: Option<String>,
     routed_request: Option<Value>,
     request_nonces: Vec<Value>,
+    routed_wire_bodies: Vec<Vec<u8>>,
 }
 
 /// Run one row through the real shim with the given signed manifest bytes,
@@ -1945,7 +1971,38 @@ fn run_v22_row_with_input(
     reply: Vec<u8>,
     input: &str,
 ) -> V22Run {
-    run_v22_row_with_timing(row, manifest_bytes, agent_id, reply, input, 5000, 1)
+    run_row_with_options(
+        row,
+        manifest_bytes,
+        agent_id,
+        reply,
+        input,
+        false,
+        true,
+        5000,
+        1,
+    )
+}
+
+fn run_queue_row(
+    row: &V22Row,
+    manifest_bytes: &[u8],
+    agent_id: &str,
+    reply: Vec<u8>,
+    worker: bool,
+    provisioned: bool,
+) -> V22Run {
+    run_row_with_options(
+        row,
+        manifest_bytes,
+        agent_id,
+        reply,
+        "",
+        worker,
+        provisioned,
+        5000,
+        1,
+    )
 }
 
 fn run_v22_row_with_timing(
@@ -1954,6 +2011,30 @@ fn run_v22_row_with_timing(
     agent_id: &str,
     reply: Vec<u8>,
     input: &str,
+    timeout_ms: u64,
+    expected_max_requests: usize,
+) -> V22Run {
+    run_row_with_options(
+        row,
+        manifest_bytes,
+        agent_id,
+        reply,
+        input,
+        false,
+        true,
+        timeout_ms,
+        expected_max_requests,
+    )
+}
+
+fn run_row_with_options(
+    row: &V22Row,
+    manifest_bytes: &[u8],
+    agent_id: &str,
+    reply: Vec<u8>,
+    input: &str,
+    worker: bool,
+    provisioned: bool,
     timeout_ms: u64,
     expected_max_requests: usize,
 ) -> V22Run {
@@ -1978,7 +2059,9 @@ fn run_v22_row_with_timing(
     let recorder = temp.path().join("upstream-invocations.txt");
     write_upstream_gh(&upstream_bin);
     let now = unix_seconds();
-    write_signed_manifest_bytes(&state_dir, manifest_bytes, now);
+    if provisioned {
+        write_signed_manifest_bytes(&state_dir, manifest_bytes, now);
+    }
 
     let inherited_path = std::env::var_os("PATH").expect("test PATH");
     let path = std::env::join_paths(
@@ -2010,6 +2093,9 @@ fn run_v22_row_with_timing(
     for name in WORKER_BROKER_ENV {
         command.env_remove(name);
     }
+    if worker {
+        command.env("AFT_GH_SHIM_WORKER", "1");
+    }
     let mut child = command.spawn().expect("run gh shim");
     child
         .stdin
@@ -2022,6 +2108,11 @@ fn run_v22_row_with_timing(
     let request_nonces = captured
         .iter()
         .filter_map(|frame| frame.request_nonce.clone())
+        .collect();
+    let routed_wire_bodies = captured
+        .iter()
+        .filter(|frame| frame.on_route)
+        .map(|frame| frame.wire_body.clone())
         .collect();
     let routed = captured
         .into_iter()
@@ -2040,6 +2131,7 @@ fn run_v22_row_with_timing(
         stderr: String::from_utf8(output.stderr).expect("stderr is UTF-8"),
         upstream_invocations: fs::read_to_string(&recorder).ok(),
         request_nonces,
+        routed_wire_bodies,
         routed_request: routed.into_iter().next(),
     }
 }
@@ -2156,6 +2248,18 @@ fn reply_contract_row(vector: &Value) -> V22Row {
         .or(request["verb"].as_str())
         .unwrap();
     let argv: Vec<String> = match action {
+        "pr enqueue" => vec![
+            "pr".into(),
+            "merge".into(),
+            request["target"]["number"].to_string(),
+            "--match-head-commit".into(),
+            text(&request["body"]["expected_head_sha"]),
+        ],
+        "pr dequeue" => vec![
+            "pr".into(),
+            "dequeue".into(),
+            request["target"]["number"].to_string(),
+        ],
         "pr ready" => {
             let mut argv = vec!["pr".into(), "ready".into(), text(&request["number"])];
             if request["undo"] == true {
@@ -2220,23 +2324,60 @@ fn reply_contract_row(vector: &Value) -> V22Row {
     }
 }
 
+/// Both transcript-producing tests share one fresh file, regardless of test order.
+fn write_v23_transcript(section: &str) {
+    let Some(path) = std::env::var_os("AFT_GH_SHIM_V23_TRANSCRIPT") else {
+        return;
+    };
+    static TRANSCRIPT: OnceLock<Mutex<fs::File>> = OnceLock::new();
+    let file = TRANSCRIPT.get_or_init(|| {
+        let path = Path::new(&path);
+        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            fs::create_dir_all(parent).expect("create transcript directory");
+        }
+        let mut file = fs::File::create(path).expect("create v23 transcript");
+        file.write_all(
+            b"# gh-shim v23 real-shim rig transcript\n\n\
+              The real shim ran against the strict Plexus-contract stand-in, not live GitHub.\n\
+              Each sent JSON block preserves the received frame body byte for byte; the newline before its closing fence is not part of the payload.\n\
+              The frame wraps the governed request in `params.request` and carries a fresh `params.request_nonce`.\n\
+              Request comparisons substitute the rig repository (`cortexkit/aft`) and manifest version (23), and ignore runtime metadata and rung timestamps.\n\
+              Vector requests below are the unmodified vendored expectations. GitHub read/write counts come from those vectors, not live traffic.\n\
+              Ownership and head-moved refusals reach Plexus by design: only Plexus can read PR ownership and head. Their vectors record no GitHub write.\n\n",
+        )
+        .expect("write transcript header");
+        Mutex::new(file)
+    });
+    let mut file = file.lock().expect("transcript lock");
+    file.write_all(section.as_bytes())
+        .expect("write transcript section");
+    file.flush().expect("flush transcript");
+}
+
+fn transcript_outcome(run: &V22Run) -> Value {
+    json!({
+        "exit_code": run.exit_code,
+        "stdout": run.stdout,
+        "stderr": run.stderr,
+        "route_count": run.routed_wire_bodies.len(),
+        "delegation_count": run.upstream_invocations.as_deref().map_or(0, |calls| calls.lines().count()),
+    })
+}
+
 #[test]
-fn every_supported_plexus_reply_vector_round_trips_through_the_real_shim() {
+fn every_plexus_reply_vector_round_trips_through_the_real_shim() {
     let vectors = plexus_contract_judge::load_reply_vectors();
     assert_eq!(vectors.len(), 27);
-    for name in plexus_contract_judge::UNSUPPORTED_REAL_SHIM_REPLY_VECTORS {
-        assert!(
-            vectors.iter().any(|vector| vector["name"] == *name),
-            "missing unsupported vector {name}"
-        );
-    }
-    let manifest = synthetic_v22_manifest(unix_seconds());
     for vector in vectors {
-        if plexus_contract_judge::UNSUPPORTED_REAL_SHIM_REPLY_VECTORS
-            .contains(&vector["name"].as_str().unwrap())
-        {
-            continue;
-        }
+        let queue = matches!(
+            vector["request"]["action"].as_str(),
+            Some("pr enqueue" | "pr dequeue")
+        );
+        let manifest = if queue {
+            synthetic_v23_manifest(unix_seconds())
+        } else {
+            synthetic_v22_manifest(unix_seconds())
+        };
         let row = reply_contract_row(&vector);
         let native = serde_json::to_vec(&vector["reply"]).unwrap();
         let wrapped: Value = serde_json::from_slice(
@@ -2279,9 +2420,31 @@ fn every_supported_plexus_reply_vector_round_trips_through_the_real_shim() {
             "{}: retry changed nonce",
             row.name
         );
+        if queue && std::env::var_os("AFT_GH_SHIM_V23_TRANSCRIPT").is_some() {
+            let mut section = format!("## Queue reply vector: {}\n\n", row.name);
+            for body in &run.routed_wire_bodies {
+                section.push_str(&format!(
+                    "Sent JSON frame body ({} bytes):\n\n```json\n{}\n```\n\n",
+                    body.len(),
+                    std::str::from_utf8(body).expect("wire request is UTF-8"),
+                ));
+            }
+            section.push_str(&format!(
+                "Vector expected request:\n\n```json\n{}\n```\n\nOutcome:\n\n```json\n{}\n```\n\nVector GitHub reads: {}; writes: {}.\n\n",
+                serde_json::to_string_pretty(&vector["request"]).unwrap(),
+                serde_json::to_string_pretty(&transcript_outcome(&run)).unwrap(),
+                vector["github_reads"].as_array().map_or(0, Vec::len),
+                vector["github_writes"].as_array().map_or(0, Vec::len),
+            ));
+            write_v23_transcript(&section);
+        }
         let mut routed = run.routed_request.expect("at least one routed request");
         let mut expected = vector["request"].clone();
         expected["repository"] = json!(REPOSITORY);
+        if queue {
+            // Plexus vectors pin the facade contract, not manifest activation.
+            expected["manifest_version"] = json!(23);
+        }
         if row.name == "comment-edit-pre-read-unknown" {
             // Plexus accepts comment edits without author_scope, but the signed
             // shim manifest requires own-comment targeting and stamps it explicitly.
@@ -2298,8 +2461,12 @@ fn every_supported_plexus_reply_vector_round_trips_through_the_real_shim() {
         let result = &vector["reply"]["result"];
         if result["status"] == "completed" {
             assert_eq!(run.exit_code, Some(0), "{}: {}", row.name, run.stderr);
-            assert_eq!(row.name, "resolve-thread-own", "unhandled completed vector");
-            assert_eq!(run.stdout, "id: \"PRRT_kwDOAbc123\"\nresolved: true\n");
+            if queue {
+                assert_eq!(run.stdout, "https://github.com/org/repo/pull/7\n");
+            } else {
+                assert_eq!(row.name, "resolve-thread-own", "unhandled completed vector");
+                assert_eq!(run.stdout, "id: \"PRRT_kwDOAbc123\"\nresolved: true\n");
+            }
         } else {
             assert_eq!(run.exit_code, Some(86), "{}: {}", row.name, run.stderr);
             assert!(run.stdout.is_empty(), "{}", row.name);
@@ -2338,6 +2505,256 @@ fn v22_speech_rows_route_exactly_the_declared_requests_and_lookalikes_never_rout
     for row in v22_rows() {
         let run = run_v22_row(&row, &manifest, "alfonso-aft");
         check_v22_row(&row, &run, "alfonso-aft");
+    }
+}
+
+#[test]
+fn v23_queue_cli_goldens_route_only_the_pinned_queue_actions() {
+    let goldens: Vec<Value> =
+        serde_json::from_str(include_str!("fixtures/gh_shim/v23-cli-goldens.json")).unwrap();
+    let replies = plexus_contract_judge::load_reply_vectors();
+    let manifest = synthetic_v23_manifest(unix_seconds());
+    assert_eq!(goldens.len(), 18);
+    let mut stderr_mismatches = Vec::new();
+    for golden in goldens {
+        let row = V22Row {
+            name: leak(golden["name"].as_str().unwrap().to_string()),
+            argv: golden["argv"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|arg| leak(arg.as_str().unwrap().to_string()))
+                .collect(),
+            expect: V22Expect::Refused("unused"),
+        };
+        let native = golden["reply"]
+            .as_str()
+            .map(|name| {
+                let vector = replies
+                    .iter()
+                    .find(|vector| vector["name"] == name)
+                    .unwrap();
+                serde_json::to_vec(&vector["reply"]).unwrap()
+            })
+            .unwrap_or_else(|| b"{}".to_vec());
+        let run = run_v22_row_with_reply(&row, &manifest, "alfonso-aft", native);
+        if golden.get("request").is_none() {
+            write_v23_transcript(&format!(
+                "## Local CLI refusal: {}\n\nCommand line:\n\n```sh\ngh {}\n```\n\nOutcome:\n\n```json\n{}\n```\n\n",
+                row.name,
+                row.argv.join(" "),
+                serde_json::to_string_pretty(&transcript_outcome(&run)).unwrap(),
+            ));
+            assert_eq!(run.routed_wire_bodies.len(), 0, "{} routed", row.name);
+            assert!(run.upstream_invocations.is_none(), "{} delegated", row.name);
+        }
+        assert_eq!(
+            run.exit_code,
+            Some(golden["exit"].as_i64().unwrap() as i32),
+            "{}: {}",
+            row.name,
+            run.stderr
+        );
+        assert_eq!(
+            run.stdout,
+            golden["stdout"].as_str().unwrap(),
+            "{}",
+            row.name
+        );
+        if run.stderr != golden["stderr"].as_str().unwrap() {
+            stderr_mismatches.push(
+                json!({"name": row.name, "actual": run.stderr, "expected": golden["stderr"]}),
+            );
+        }
+        assert!(run.upstream_invocations.is_none(), "{} delegated", row.name);
+        if let Some(expected) = golden.get("request") {
+            let mut routed = run.routed_request.expect("one queue request");
+            assert_eq!(routed["operation"], "gh.route");
+            assert_eq!(routed["gh_route_schema"], 1);
+            assert_eq!(routed["manifest_version"], 23);
+            assert!(routed["metadata"]["pid"]
+                .as_u64()
+                .is_some_and(|pid| pid > 0));
+            assert_eq!(routed["metadata"]["agent_id"], "alfonso-aft");
+            assert!(routed["rung_as_of_unix_secs"].is_u64());
+            for field in [
+                "operation",
+                "gh_route_schema",
+                "manifest_version",
+                "metadata",
+                "rung_as_of_unix_secs",
+            ] {
+                routed.as_object_mut().unwrap().remove(field);
+            }
+            assert_eq!(&routed, expected, "{}", row.name);
+        } else {
+            assert!(run.routed_request.is_none(), "{} routed", row.name);
+        }
+    }
+    assert!(
+        stderr_mismatches.is_empty(),
+        "stderr mismatches: {}",
+        json!(stderr_mismatches)
+    );
+}
+
+#[test]
+fn queue_pre_read_refusals_and_uncertain_writes_keep_their_retry_boundaries() {
+    let manifest = synthetic_v23_manifest(unix_seconds());
+    for vector in plexus_contract_judge::load_reply_vectors()
+        .into_iter()
+        .filter(|vector| {
+            matches!(
+                vector["name"].as_str(),
+                Some("pr-enqueue-own" | "pr-dequeue-own")
+            )
+        })
+    {
+        let row = reply_contract_row(&vector);
+        for (result, attempts, exit, sentence) in [
+            (
+                json!({"status": "refused", "refusal_code": "pre_dispatch_read_incomplete{reason: transport_unknown}", "transmission": "not_sent", "retry_same_nonce": true}),
+                2,
+                86,
+                "The GitHub read did not finish. Nothing reached GitHub. Rerunning the command is safe.",
+            ),
+            (
+                json!({"status": "refused", "refusal_code": "pre_dispatch_read_incomplete{reason: invalid_response}", "transmission": "not_sent", "retry_same_nonce": true}),
+                1,
+                86,
+                "Nothing reached GitHub. Rerunning the command is safe.",
+            ),
+            (
+                json!({"status": "refused", "refusal_code": "vendor_rejected{status: 422}", "transmission": "not_sent", "retry_same_nonce": true}),
+                1,
+                86,
+                "Nothing reached GitHub. The agent must change the request.",
+            ),
+            (
+                json!({"status": "refused", "refusal_code": "transport_not_sent", "transmission": "not_sent", "retry_same_nonce": true}),
+                1,
+                86,
+                "Nothing reached GitHub.",
+            ),
+            (
+                json!({"status": "outcome_unknown"}),
+                1,
+                87,
+                "the bot write may have executed; check before retrying",
+            ),
+        ] {
+            let mut reply = vector["reply"].clone();
+            reply["result"] = result.clone();
+            let run = run_v22_row_with_timing(
+                &row,
+                &manifest,
+                "alfonso-aft",
+                serde_json::to_vec(&reply).unwrap(),
+                "",
+                15000,
+                attempts,
+            );
+            assert_eq!(run.exit_code, Some(exit), "{}: {result}: {}", row.name, run.stderr);
+            assert!(run.stderr.contains(sentence), "{}: {result}: {}", row.name, run.stderr);
+            assert!(run.stdout.is_empty(), "{}: {result}", row.name);
+            assert!(run.upstream_invocations.is_none(), "{} delegated", row.name);
+            assert_eq!(run.request_nonces.len(), attempts, "{}: {result}", row.name);
+            assert!(run.request_nonces[0].as_str().is_some_and(|nonce| !nonce.is_empty()));
+            assert!(run.request_nonces.iter().all(|nonce| nonce == &run.request_nonces[0]));
+            assert_eq!(run.routed_request.unwrap()["action"], vector["request"]["action"]);
+        }
+    }
+}
+
+#[test]
+fn queue_writes_from_worker_shells_keep_the_approved_refusal() {
+    let manifest = synthetic_v23_manifest(unix_seconds());
+    for argv in [
+        vec![
+            "pr",
+            "merge",
+            "7",
+            "--match-head-commit",
+            "0123456789abcdef0123456789abcdef01234567",
+        ],
+        vec!["pr", "dequeue", "7"],
+    ] {
+        let row = V22Row {
+            name: "worker queue write",
+            argv,
+            expect: V22Expect::Refused("gh_shim_worker_write_refused"),
+        };
+        let run = run_queue_row(&row, &manifest, "alfonso-aft", b"{}".to_vec(), true, true);
+        assert_eq!(run.exit_code, Some(86));
+        assert_eq!(run.stderr, "gh-shim: gh_shim_worker_write_refused: workers cannot write to GitHub; report what should be posted to your parent instead\n");
+        assert!(run.stdout.is_empty());
+        assert!(run.routed_request.is_none());
+        assert!(run.upstream_invocations.is_none());
+    }
+}
+
+#[test]
+fn queue_actions_never_route_under_v22_even_with_v23_rows_signed() {
+    let mut premature: Value =
+        serde_json::from_slice(&synthetic_v23_manifest(unix_seconds())).unwrap();
+    premature["manifest_version"] = json!(22);
+    let mut absent: Value =
+        serde_json::from_slice(&synthetic_v22_manifest(unix_seconds())).unwrap();
+    absent["manifest_version"] = json!(23);
+    for manifest in [
+        synthetic_v22_manifest(unix_seconds()),
+        serde_json::to_vec(&premature).unwrap(),
+        serde_json::to_vec(&absent).unwrap(),
+    ] {
+        for argv in [
+            vec![
+                "pr",
+                "merge",
+                "7",
+                "--match-head-commit",
+                "0123456789abcdef0123456789abcdef01234567",
+            ],
+            vec!["pr", "dequeue", "7"],
+        ] {
+            let row = V22Row {
+                name: "queue not activated",
+                argv,
+                expect: V22Expect::Refused("unused"),
+            };
+            let run = run_v22_row_with_reply(&row, &manifest, "alfonso-aft", b"{}".to_vec());
+            assert_eq!(run.exit_code, Some(86), "{}", run.stderr);
+            assert!(run.routed_request.is_none());
+            assert!(run.upstream_invocations.is_none());
+            let code = if row.argv[1] == "merge" {
+                "gh_shim_admin_tier"
+            } else {
+                "gh_shim_unclassified"
+            };
+            assert!(
+                run.stderr.starts_with(&format!("gh-shim: {code}: ")),
+                "{}",
+                run.stderr
+            );
+        }
+    }
+}
+
+#[test]
+fn unprovisioned_head_shell_keeps_unknown_dequeue_and_merge_passthrough() {
+    for argv in [
+        vec!["pr", "dequeue", "7"],
+        vec!["pr", "merge", "7", "--auto"],
+    ] {
+        let row = V22Row {
+            name: "unprovisioned queue",
+            argv,
+            expect: V22Expect::Refused("unused"),
+        };
+        let run = run_queue_row(&row, &[], "alfonso-aft", b"{}".to_vec(), false, false);
+        assert_eq!(run.exit_code, Some(73), "{}", run.stderr);
+        assert!(run.routed_request.is_none());
+        let recorded = run.upstream_invocations.expect("delegated unchanged to gh");
+        assert_eq!(recorded, format!("{}\n", row.argv.join(" ")));
     }
 }
 

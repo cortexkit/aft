@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "land/views-base-ignore-rules"
+  ],
+  "note": "Views base identity leaves ignore-rule files out of the policy digest; membership already decides the base. Views are off by default. No changed path matches RANKING_FENCE_PREFIXES."
+}
