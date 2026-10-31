@@ -36,3 +36,5 @@ High-match queries still benefit from `memchr` SIMD scanning and early terminati
 Index builds in ~2s for most projects (under 2K files). Larger codebases like Chromium/base
 (~4K files) take ~2 minutes for the initial build. Once built, the index persists to disk for
 instant cold starts and stays fresh via file watcher and mtime verification.
+
+<!-- merge-queue permission probe; this draft PR is closed unmerged -->
