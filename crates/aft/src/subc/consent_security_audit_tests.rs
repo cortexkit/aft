@@ -446,6 +446,17 @@ async fn audit_keyed_reply(
     serde_json::from_slice(&reply.body).unwrap()
 }
 
+fn audit_assert_call_key_conflict(reply: &Value) {
+    assert_eq!(
+        reply,
+        &json!({
+            "code":"invalid_request",
+            "message":"key already names different content or scope",
+            "detail":{"field":"call_key"}
+        })
+    );
+}
+
 #[tokio::test]
 async fn audit_shell_same_key_replay_is_once_and_changed_command_conflicts() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -487,10 +498,7 @@ async fn audit_shell_same_key_replay_is_once_and_changed_command_conflicts() {
         "program-9409",
     )
     .await;
-    assert!(
-        conflict.to_string().contains("call_key_conflict"),
-        "{conflict}"
-    );
+    audit_assert_call_key_conflict(&conflict);
     assert_eq!(std::fs::read_to_string(marker).unwrap(), "x");
     assert_eq!(f.fake.calls("consent.request").len(), 1);
 }
@@ -528,11 +536,11 @@ async fn audit_pending_call_binds_key_operation_path_cwd_and_scope() {
             ),
         ] {
             let reply = audit_keyed_reply(&f, &run, name, changed, "program-9410").await;
-            assert!(reply.to_string().contains("call_key_conflict"), "{reply}");
+            audit_assert_call_key_conflict(&reply);
         }
         let other = program(&f, false, "run:audit-other-binding");
         let reply = audit_keyed_reply(&f, &other, "read", args, "program-9410").await;
-        assert!(reply.to_string().contains("call_key_conflict"), "{reply}");
+        audit_assert_call_key_conflict(&reply);
         assert_eq!(f.fake.calls("consent.request").len(), 1);
         control.answer(&request, "allow_once");
         assert!(late(&f, &run, 9410)
@@ -598,10 +606,7 @@ async fn audit_shell_approval_cannot_release_a_different_waiting_command() {
         "program-9411",
     )
     .await;
-    assert!(
-        changed_cwd.to_string().contains("call_key_conflict"),
-        "{changed_cwd}"
-    );
+    audit_assert_call_key_conflict(&changed_cwd);
     control.answer(&request_a, "allow_once");
     assert!(late(&f, &run, 9411)
         .await
