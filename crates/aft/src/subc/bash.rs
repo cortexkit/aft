@@ -2015,9 +2015,10 @@ pub(super) fn submit_deferred_bash(
     let speech_seed = cancel.speech_seed.clone();
     let secret_identity = super::secret_consent::current_identity();
     let program_held = secret_identity.as_ref().is_some_and(running_hold_route);
-    let program_approval = secret_identity
+    let program_call = secret_identity
         .as_ref()
-        .is_some_and(|identity| identity.run_owner.is_some())
+        .is_some_and(|identity| identity.run_owner.is_some());
+    let program_approval = program_call
         && permissions_granted
             .as_ref()
             .is_some_and(|permissions| !permissions.is_empty());
@@ -2369,9 +2370,12 @@ pub(super) fn submit_deferred_bash(
                         }
                     };
                     if let Some(grants) = permissions_granted {
-                        translated
-                            .args
-                            .insert("permissions_requested".to_string(), Value::Bool(true));
+                        // Re-entering a trusted program's preflight does not
+                        // enable the Bash permission scanner when the same
+                        // command issued directly would not use that scanner.
+                        if !program_call || matches!(bind_trust, BindTrust::Untrusted) {
+                            translated.args.insert("permissions_requested".to_string(), Value::Bool(true));
+                        }
                         translated.args.insert(
                             "permissions_granted".to_string(),
                             Value::Array(grants.into_iter().map(Value::String).collect()),
