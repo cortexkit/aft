@@ -260,9 +260,7 @@ async fn bind_route_as(
         })
         .unwrap();
         bind["identity"]["project_root"] = serde_json::json!(root);
-        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-            bind["scope"]["workdir"] = serde_json::json!(root);
-        }
+
         bind
     };
     send_frame(

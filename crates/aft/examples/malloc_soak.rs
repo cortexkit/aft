@@ -105,9 +105,7 @@ async fn bind(
             })
             .unwrap();
             bind["identity"]["project_root"] = serde_json::json!(root.to_path_buf());
-            if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-                bind["scope"]["workdir"] = serde_json::json!(root.to_path_buf());
-            }
+
             bind
         })
         .unwrap(),

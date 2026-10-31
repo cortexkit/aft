@@ -34,9 +34,7 @@ async fn bind_scoped_worker(stream: &mut tokio::net::TcpStream, root: &std::path
         })
         .unwrap();
         bind["identity"]["project_root"] = serde_json::json!(root);
-        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-            bind["scope"]["workdir"] = serde_json::json!(root);
-        }
+
         bind
     })
     .await;

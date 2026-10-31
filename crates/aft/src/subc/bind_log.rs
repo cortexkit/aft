@@ -59,9 +59,7 @@ mod tests {
                 })
                 .unwrap();
                 bind["identity"]["project_root"] = serde_json::json!(Path::new("."));
-                if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-                    bind["scope"]["workdir"] = serde_json::json!(Path::new("."));
-                }
+
                 bind
             };
             let frame = Frame::build(

@@ -312,9 +312,7 @@ async fn tool_result_ast_search_t6_complete_and_budget_cut_on_negotiated_route()
         })
         .unwrap();
         bind["identity"]["project_root"] = serde_json::json!(&root);
-        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-            bind["scope"]["workdir"] = serde_json::json!(&root);
-        }
+
         bind
     };
     write_frame(
@@ -648,9 +646,7 @@ async fn tool_result_capability_is_selected_per_bind_not_per_call() {
             })
             .unwrap();
             bind["identity"]["project_root"] = serde_json::json!(&root);
-            if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-                bind["scope"]["workdir"] = serde_json::json!(&root);
-            }
+
             bind
         };
         write_frame(
@@ -820,9 +816,7 @@ async fn tool_result_non_negotiating_routes_keep_legacy_success_and_error_bytes(
             })
             .unwrap();
             bind["identity"]["project_root"] = serde_json::json!(&root);
-            if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-                bind["scope"]["workdir"] = serde_json::json!(&root);
-            }
+
             bind
         };
         write_frame(

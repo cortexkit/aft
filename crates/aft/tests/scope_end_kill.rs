@@ -383,9 +383,7 @@ impl Daemon {
             })
             .unwrap();
             bind["identity"]["project_root"] = serde_json::json!(&self.root.join("project"));
-            if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-                bind["scope"]["workdir"] = serde_json::json!(&self.root.join("project"));
-            }
+
             bind
         };
         self.send(

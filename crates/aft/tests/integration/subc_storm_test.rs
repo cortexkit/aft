@@ -2482,9 +2482,7 @@ fn send_bind_epoch(
         })
         .unwrap();
         bind["identity"]["project_root"] = serde_json::json!(root.to_path_buf());
-        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-            bind["scope"]["workdir"] = serde_json::json!(root.to_path_buf());
-        }
+
         bind
     };
     send_control(tx, corr, request);
@@ -2515,9 +2513,7 @@ async fn write_measure_bind(
         })
         .unwrap();
         bind["identity"]["project_root"] = serde_json::json!(root.to_path_buf());
-        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-            bind["scope"]["workdir"] = serde_json::json!(root.to_path_buf());
-        }
+
         bind
     };
     let frame = Frame::build(

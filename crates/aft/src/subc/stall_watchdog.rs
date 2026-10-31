@@ -843,9 +843,7 @@ mod tests {
             })
             .unwrap();
             bind["identity"]["project_root"] = serde_json::json!(PathBuf::from("/isolated/root"));
-            if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-                bind["scope"]["workdir"] = serde_json::json!(PathBuf::from("/isolated/root"));
-            }
+
             bind
         };
         let frame = Frame::build(
@@ -1399,9 +1397,7 @@ mod tests {
             })
             .unwrap();
             bind["identity"]["project_root"] = serde_json::json!(root.clone());
-            if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-                bind["scope"]["workdir"] = serde_json::json!(root.clone());
-            }
+
             bind
         };
         let frame = Frame::build(

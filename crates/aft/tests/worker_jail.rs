@@ -797,9 +797,7 @@ impl Jail {
             })
             .unwrap();
             bind["identity"]["project_root"] = serde_json::json!(&self.worktree);
-            if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-                bind["scope"]["workdir"] = serde_json::json!(&self.worktree);
-            }
+
             bind
         };
         self.bind(bind).await;
@@ -836,9 +834,7 @@ impl Jail {
             })
             .unwrap();
             bind["identity"]["project_root"] = serde_json::json!(&root);
-            if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-                bind["scope"]["workdir"] = serde_json::json!(&root);
-            }
+
             bind
         })
         .await;
@@ -3648,9 +3644,7 @@ async fn worker_gh_read_t8_live_scope_rebind_refuses_before_upstream() {
         })
         .unwrap();
         bind["identity"]["project_root"] = serde_json::json!(&jail.worktree);
-        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-            bind["scope"]["workdir"] = serde_json::json!(&jail.worktree);
-        }
+
         bind
     })
     .await;
@@ -3828,9 +3822,7 @@ async fn cross_command_broker_isolation(profile: &str) {
         })
         .unwrap();
         bind["identity"]["project_root"] = serde_json::json!(&other_root);
-        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-            bind["scope"]["workdir"] = serde_json::json!(&other_root);
-        }
+
         bind
     })
     .await;
@@ -4357,9 +4349,7 @@ async fn worker_gh_read_t10_promotion_keeps_the_original_command_grant() {
         })
         .unwrap();
         bind["identity"]["project_root"] = serde_json::json!(&jail.worktree);
-        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-            bind["scope"]["workdir"] = serde_json::json!(&jail.worktree);
-        }
+
         bind
     })
     .await;

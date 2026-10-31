@@ -3184,9 +3184,7 @@ async fn bind_route_stamped_with_mode(
         })
         .unwrap();
         bind["identity"]["project_root"] = serde_json::json!(project);
-        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-            bind["scope"]["workdir"] = serde_json::json!(project);
-        }
+
         bind
     };
     let mut reply = wire.expect(0, corr);

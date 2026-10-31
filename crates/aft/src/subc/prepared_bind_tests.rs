@@ -135,9 +135,7 @@ async fn real_bind_dispatch_scope_survives_config_edits_before_executor_admissio
         })
         .unwrap();
         bind["identity"]["project_root"] = serde_json::json!(root.as_path());
-        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-            bind["scope"]["workdir"] = serde_json::json!(root.as_path());
-        }
+
         bind
     };
     let frame = Frame::build(

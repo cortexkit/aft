@@ -56,9 +56,7 @@ async fn exhausted_bind(tool: bool, completion_capacity: bool) {
         })
         .unwrap();
         bind["identity"]["project_root"] = serde_json::json!(root.as_path());
-        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-            bind["scope"]["workdir"] = serde_json::json!(root.as_path());
-        }
+
         bind
     };
     let frame = Frame::build(

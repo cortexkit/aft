@@ -3540,9 +3540,7 @@ async fn drive_undecodable_control_request_daemon(input: FakeDaemonInput) {
         })
         .unwrap();
         bind["identity"]["project_root"] = serde_json::json!(root1.clone());
-        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-            bind["scope"]["workdir"] = serde_json::json!(root1.clone());
-        }
+
         bind
     })
     .expect("route bind body");
@@ -4309,9 +4307,7 @@ async fn drive_s1_rejection_daemon(
         })
         .unwrap();
         bind["identity"]["project_root"] = serde_json::json!(root.clone());
-        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-            bind["scope"]["workdir"] = serde_json::json!(root.clone());
-        }
+
         bind
     };
     send_frame(
@@ -4571,9 +4567,7 @@ async fn drive_readiness_daemon(
         })
         .unwrap();
         bind["identity"]["project_root"] = serde_json::json!(root.clone());
-        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-            bind["scope"]["workdir"] = serde_json::json!(root.clone());
-        }
+
         bind
     };
     send_frame(
@@ -11755,9 +11749,7 @@ async fn send_route_bind_with_elicitation_capability(
         })
         .unwrap();
         bind["identity"]["project_root"] = serde_json::json!(root.to_path_buf());
-        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-            bind["scope"]["workdir"] = serde_json::json!(root.to_path_buf());
-        }
+
         bind
     };
     send_frame(
@@ -12847,9 +12839,7 @@ async fn drive_malformed_fed_harness_bind_production_daemon(
         })
         .unwrap();
         bind["identity"]["project_root"] = serde_json::json!(root);
-        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-            bind["scope"]["workdir"] = serde_json::json!(root);
-        }
+
         bind
     };
     send_frame(
@@ -13830,9 +13820,7 @@ async fn drive_management_surface_daemon(input: FakeDaemonInput) {
         })
         .unwrap();
         bind["identity"]["project_root"] = serde_json::json!(root1.clone());
-        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-            bind["scope"]["workdir"] = serde_json::json!(root1.clone());
-        }
+
         bind
     })
     .await;
@@ -14839,9 +14827,7 @@ async fn send_management_route_bind_with_harness(
         })
         .unwrap();
         bind["identity"]["project_root"] = serde_json::json!(identity_root.to_path_buf());
-        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-            bind["scope"]["workdir"] = serde_json::json!(identity_root.to_path_buf());
-        }
+
         bind
     })
     .await;
@@ -15047,9 +15033,7 @@ async fn send_route_bind_with_harness_session_principal_and_doc_epoch(
         })
         .unwrap();
         bind["identity"]["project_root"] = serde_json::json!(root.to_path_buf());
-        if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-            bind["scope"]["workdir"] = serde_json::json!(root.to_path_buf());
-        }
+
         bind
     };
     send_frame(

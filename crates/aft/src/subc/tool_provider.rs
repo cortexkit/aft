@@ -4923,9 +4923,7 @@ mod tests {
                 })
                 .unwrap();
             bind["identity"]["project_root"] = serde_json::json!("/tmp/project");
-            if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-                bind["scope"]["workdir"] = serde_json::json!("/tmp/project");
-            }
+
             bind
         };
         let decoded: subc_protocol::session::ModuleControlRequest =

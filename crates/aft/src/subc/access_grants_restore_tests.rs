@@ -132,9 +132,7 @@ impl WireRestore {
                 })
                 .unwrap();
                 bind["identity"]["project_root"] = serde_json::json!(&fixture.revived.project_root);
-                if bind["scope"].is_object() && bind["scope"].get("workdir").is_none() {
-                    bind["scope"]["workdir"] = serde_json::json!(&fixture.revived.project_root);
-                }
+
                 bind
             };
             fixture
