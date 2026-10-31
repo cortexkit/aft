@@ -6517,16 +6517,9 @@ pub(in crate::subc) mod route_tests {
                 |request, ctx| crate::commands::bash_status::handle(&request, ctx),
             ).await;
             let reply: Value = serde_json::from_slice(&reply.body).unwrap();
-            assert_eq!(reply["structuredContent"]["status"], "running", "{reply}");
-            let output = reply["structuredContent"]["output_preview"]
-                .as_str()
-                .unwrap();
-            for stream in ["stdout", "stderr"] {
-                let expected = format!("{stream} {phase} restart");
-                assert!(output.contains(&expected), "{reply}");
-            }
+            assert!(reply.get("structuredContent").is_none(), "{reply}");
             // Piped status text deliberately hides running previews to avoid
-            // encouraging polling. The structured reply still retains them.
+            // encouraging polling. AFT's native response still retains them.
             assert_eq!(
                 reply["content"][0]["text"],
                 format!("Task {task_id}: running\nTo wait for it, call bash_watch; don't poll.")
@@ -6540,6 +6533,17 @@ pub(in crate::subc) mod route_tests {
             })).unwrap();
             let resumed = crate::commands::bash_status::handle(&request, &ctx);
             assert!(resumed.success, "{:?}", resumed.data);
+            assert_eq!(resumed.data["status"], "running");
+            for stream in ["stdout", "stderr"] {
+                assert!(
+                    resumed.data["output_preview"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&format!("{stream} {phase} restart")),
+                    "{:?}",
+                    resumed.data
+                );
+            }
             for (index, (stream, chunk, cursor)) in [
                 ("stdout", "output_chunk_base64", "output_next_offset"),
                 ("stderr", "stderr_chunk_base64", "stderr_next_offset"),
@@ -6575,7 +6579,14 @@ pub(in crate::subc) mod route_tests {
         )
         .await;
         let reply: Value = serde_json::from_slice(&reply.body).unwrap();
-        assert_eq!(reply["structuredContent"]["status"], "completed", "{reply}");
+        assert!(reply.get("structuredContent").is_none(), "{reply}");
+        let request = serde_json::from_value(json!({
+            "id": "runner-completed-output", "command": "bash_status", "session_id": "runner-restore",
+            "params": {"task_id": task_id},
+        })).unwrap();
+        let completed = crate::commands::bash_status::handle(&request, &ctx);
+        assert!(completed.success, "{:?}", completed.data);
+        assert_eq!(completed.data["status"], "completed");
         let text = reply["content"][0]["text"].as_str().unwrap();
         assert!(
             text.starts_with(&format!("Task {task_id}: completed (exit 0)")),
@@ -6585,7 +6596,7 @@ pub(in crate::subc) mod route_tests {
             for phase in ["before", "after"] {
                 let expected = format!("{stream} {phase} restart");
                 assert!(
-                    reply["structuredContent"]["output_preview"]
+                    completed.data["output_preview"]
                         .as_str()
                         .unwrap()
                         .contains(&expected),
@@ -6957,7 +6968,7 @@ pub(in crate::subc) mod route_tests {
                 let routes = HashMap::from([(route_key(41, 1), identity)]);
                 let (edge, _ready) = LedgerEdge::new();
                 for body in [
-                    json!({"name":"late_results", "arguments":{}}),
+                    json!({"name":"late_results", "arguments":{"since":null}}),
                     json!({"name":"tool.withdraw", "arguments":{"call_key":"late-edit"}}),
                 ] {
                     let decoded = DecodedFrame {
@@ -6990,7 +7001,12 @@ pub(in crate::subc) mod route_tests {
                         .await
                         .unwrap()
                         .unwrap();
-                    assert_eq!(reply.header.ty, FrameType::Response);
+                    assert_eq!(
+                        reply.header.ty,
+                        FrameType::Response,
+                        "{}",
+                        String::from_utf8_lossy(&reply.body)
+                    );
                     let reply: Value = serde_json::from_slice(&reply.body).unwrap();
                     let delivered = if body["name"] == "late_results" {
                         assert_eq!(reply["entries"].as_array().unwrap().len(), 1);
@@ -7435,7 +7451,8 @@ pub(in crate::subc) mod route_tests {
         }).await;
         assert_eq!(reply.header.ty, FrameType::Response);
         let result: Value = serde_json::from_slice(&reply.body).unwrap();
-        assert_eq!(result["structuredContent"]["success"], true, "{result}");
+        assert_eq!(result["isError"], false, "{result}");
+        assert!(result.get("structuredContent").is_none(), "{result}");
         assert!(String::from_utf8_lossy(&reply.body).contains("pinned_symbol"));
         for name in ["bash", "inspect", "write"] {
             let reply = exchange_with_actor(
