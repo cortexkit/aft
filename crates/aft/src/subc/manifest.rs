@@ -475,8 +475,8 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
     // entry, because a required capability with no provider would hold AFT
     // not-ready.
     //
-    // A subc daemon older than 0.17.20 refuses this manifest, so that version
-    // is the minimum supported daemon version.
+    // The Subconscious transport requires daemon 0.39 for project-free route
+    // opens. The manifest's wire shape itself first required daemon 0.17.20.
     let mut manifest = ModuleManifest::builder("aft", env!("CARGO_PKG_VERSION"))
         .protocol_ver(PROTOCOL_VERSION)
         .trust_tier(Some(TrustTier::FirstParty))
