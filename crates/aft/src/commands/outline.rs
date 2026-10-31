@@ -1122,9 +1122,7 @@ fn structure_entries_from_regions(
                 Ok(included) => {
                     let count = match outline_skip_reason(&included, Some(&mut *parser)) {
                         Some(reason) => Err(reason),
-                        None => parser
-                            .extract_symbols(&included)
-                            .map(|symbols| symbols.len())
+                        None => test_include_symbol_count(&included, parser)
                             .map_err(|error| outline_error_reason(&error)),
                     };
                     match count {
@@ -2818,6 +2816,28 @@ fn batch_file_structure(
         req_id,
         session_id,
     )
+}
+
+/// Count an included test module without reopening its validated source or
+/// copying its symbol table. Keep outline facts too: the same module may be
+/// included again or requested as a structure-map file later in the batch.
+fn test_include_symbol_count(path: &Path, parser: &mut FileParser) -> Result<usize, AftError> {
+    if let Ok(metadata) = crate::bounded_io::metadata(path) {
+        if let Ok(mtime) = metadata.modified() {
+            if let Some(count) = crate::parser::cached_symbol_count_shared(
+                &parser.symbol_cache(),
+                path,
+                mtime,
+                metadata.len(),
+            ) {
+                return Ok(count);
+            }
+        }
+    }
+    let parsed = parser.parse_snapshot(path)?;
+    let symbols = parser.extract_symbols_from_snapshot(path, &parsed)?;
+    parser.store_outline_facts(path, &parsed, Arc::new(outline_parse_facts(path, &parsed)));
+    Ok(symbols.len())
 }
 
 /// One file's structure-map entries for a provider other than tree-sitter,
@@ -5766,6 +5786,57 @@ mod tests {
         let skipped = response["skipped_files"].as_array().expect("skipped files");
         assert_eq!(skipped.len(), 1, "{response}");
         assert_eq!(skipped[0]["reason"], "parse_error");
+    }
+
+    #[test]
+    fn multi_file_outline_reuses_included_test_snapshots() {
+        for directory_mode in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let parent = temp.path().join("a.rs");
+            let included = temp.path().join("z.rs");
+            std::fs::write(
+                &parent,
+                "pub fn product() {}\n#[cfg(test)]\n#[path = \"z.rs\"]\nmod first;\n#[cfg(test)]\n#[path = \"z.rs\"]\nmod second;\n",
+            )
+            .unwrap();
+            std::fs::write(&included, "fn helper() {}\n#[test]\nfn checks() {}\n").unwrap();
+            let ctx = AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                crate::config::Config::default(),
+            );
+            let request: RawRequest = serde_json::from_value(if directory_mode {
+                serde_json::json!({"id":"includes", "command":"outline", "directory":temp.path()})
+            } else {
+                serde_json::json!({"id":"includes", "command":"outline", "files":[parent, included]})
+            })
+            .unwrap();
+
+            let (cold, reads, parses) = navigation_counts(&request, &ctx);
+            assert_eq!((reads, parses), (2, 2), "{cold}");
+            let text = cold["text"].as_str().unwrap();
+            assert!(text.contains("first (path z.rs): 2 items"), "{text}");
+            assert!(text.contains("second (path z.rs): 2 items"), "{text}");
+            assert!(text.contains("fn helper()"), "{text}");
+            assert_eq!(cold["files_shown"], 2);
+
+            let (warm, reads, parses) = navigation_counts(&request, &ctx);
+            assert_eq!((reads, parses), (0, 0));
+            assert_eq!(warm, cold);
+
+            std::fs::write(
+                &included,
+                "fn helper() {}\n#[test]\nfn checks() {}\n#[test]\nfn another() {}\n",
+            )
+            .unwrap();
+            let (edited, reads, parses) = navigation_counts(&request, &ctx);
+            assert_eq!((reads, parses), (1, 1), "{edited}");
+            let text = edited["text"].as_str().unwrap();
+            assert!(text.contains("first (path z.rs): 3 items"), "{text}");
+            assert!(text.contains("second (path z.rs): 3 items"), "{text}");
+            let (warm, reads, parses) = navigation_counts(&request, &ctx);
+            assert_eq!((reads, parses), (0, 0));
+            assert_eq!(warm, edited);
+        }
     }
 
     /// A warm multi-file outline renders test summaries, module layout and
