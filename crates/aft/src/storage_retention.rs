@@ -46,6 +46,30 @@ pub(crate) const TREE_ENTRIES: usize = 4096;
 const TRASH_SCAN_HANDLES: usize = 64;
 const HISTORY_ENTRIES: usize = 8192;
 static REPORTED_BINDING_READ_ERRORS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+#[cfg(test)]
+thread_local! {
+    // Counts explicit retention directory listings and JSON opens; the
+    // durable census reports its own directory opens separately.
+    static PASS_IO: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+fn retention_read_dir(path: &Path) -> io::Result<ReadDir> {
+    #[cfg(test)]
+    PASS_IO.with(|count| {
+        let (directories, files) = count.get();
+        count.set((directories + 1, files));
+    });
+    fs::read_dir(path)
+}
+
+fn retention_read(path: &Path) -> io::Result<Vec<u8>> {
+    #[cfg(test)]
+    PASS_IO.with(|count| {
+        let (directories, files) = count.get();
+        count.set((directories, files + 1));
+    });
+    fs::read(path)
+}
 const DOMAINS: [&str; 6] = [
     "views",
     "callgraph",
@@ -176,11 +200,34 @@ impl ProtectionFailure {
 impl TrashReport {
     fn keep(&mut self, path: &Path, reason: &str, detail: impl std::fmt::Display) {
         *self.kept_by_reason.entry(reason.into()).or_default() += 1;
+        let state = TreeNodeState::read(path).ok();
+        let mut reported = retained_warnings()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reported.get(path) == Some(&state) {
+            return;
+        }
+        reported.insert(path.to_path_buf(), state);
+        drop(reported);
         crate::slog_warn!(
             "storage retention trash={} retained reason={reason}: {detail}",
             path.display()
         );
     }
+}
+
+type RetainedWarnings = HashMap<PathBuf, Option<TreeNodeState>>;
+
+fn retained_warnings() -> &'static Mutex<RetainedWarnings> {
+    static WARNINGS: OnceLock<Mutex<RetainedWarnings>> = OnceLock::new();
+    WARNINGS.get_or_init(Default::default)
+}
+
+fn forget_retained_warning(path: &Path) {
+    retained_warnings()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(path);
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -291,6 +338,88 @@ struct TrashScan {
     deferred: VecDeque<fs::DirEntry>,
     omitted_prefix: bool,
     touched: Instant,
+    retained: HashMap<PathBuf, RetainedTrash>,
+    lap: u64,
+}
+
+impl TrashScan {
+    fn finish_lap(&mut self) {
+        self.retained.retain(|path, entry| {
+            if entry.lap == self.lap {
+                true
+            } else {
+                forget_retained_warning(path);
+                false
+            }
+        });
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TreeNodeState {
+    len: u64,
+    modified: std::time::SystemTime,
+    created: Option<std::time::SystemTime>,
+    readonly: bool,
+    directory: bool,
+    symlink: bool,
+    #[cfg(unix)]
+    unix: (u64, u64, u32, u32, u32, i64, i64),
+}
+
+impl TreeNodeState {
+    fn read(path: &Path) -> io::Result<Self> {
+        let metadata = fs::symlink_metadata(path)?;
+        Ok(Self {
+            len: metadata.len(),
+            modified: metadata.modified()?,
+            created: metadata.created().ok(),
+            readonly: metadata.permissions().readonly(),
+            directory: metadata.is_dir(),
+            symlink: metadata.file_type().is_symlink(),
+            #[cfg(unix)]
+            unix: {
+                use std::os::unix::fs::MetadataExt;
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.mode(),
+                    metadata.uid(),
+                    metadata.gid(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec(),
+                )
+            },
+        })
+    }
+}
+
+#[derive(Default)]
+struct TreeObservation(Vec<(PathBuf, TreeNodeState)>);
+
+impl TreeObservation {
+    fn record(&mut self, path: &Path) -> io::Result<()> {
+        self.0
+            .push((path.to_path_buf(), TreeNodeState::read(path)?));
+        Ok(())
+    }
+
+    fn unchanged(&self, admission: &mut dyn FnMut() -> io::Result<()>) -> io::Result<bool> {
+        for (path, state) in &self.0 {
+            admission()?;
+            if TreeNodeState::read(path).ok().as_ref() != Some(state) {
+                return Ok(false);
+            }
+        }
+        Ok(!self.0.is_empty())
+    }
+}
+
+struct RetainedTrash {
+    tree: TreeObservation,
+    reason: String,
+    bytes: u64,
+    lap: u64,
 }
 
 type TrashScans = HashMap<(PathBuf, PathBuf), Option<TrashScan>>;
@@ -1527,7 +1656,7 @@ fn read_binding_record(path: &Path) -> Result<(serde_json::Value, Binding), Bind
             digest: None,
         });
     }
-    let bytes = fs::read(path).map_err(|error| BindingReadError {
+    let bytes = retention_read(path).map_err(|error| BindingReadError {
         error,
         truncated: false,
         digest: None,
@@ -1681,6 +1810,11 @@ fn unreadable_binding_sentinel(storage: &Path, scope: &str) -> Binding {
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {
+    #[cfg(test)]
+    PASS_IO.with(|count| {
+        let (directories, files) = count.get();
+        count.set((directories, files + 1));
+    });
     if fs::metadata(path)?.len() > 8 * 1024 * 1024 {
         return Err(io::Error::other("retention metadata exceeds 8 MiB"));
     }
@@ -1688,7 +1822,7 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {
 }
 
 pub(crate) fn bounded_dirs(directory: &Path, cap: usize) -> io::Result<Vec<fs::DirEntry>> {
-    let entries = match fs::read_dir(directory) {
+    let entries = match retention_read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
@@ -2026,7 +2160,7 @@ fn traversal_batch_filtered(
         }
         let remaining = limit - result.len();
         let mut names = BTreeMap::new();
-        match fs::read_dir(directory) {
+        match retention_read_dir(directory) {
             Ok(entries) => {
                 for entry in entries {
                     let entry = entry?;
@@ -2610,6 +2744,16 @@ fn validate_tree_with_admission(
     measure: bool,
     admission: &dyn Fn() -> io::Result<()>,
 ) -> io::Result<Vec<(PathBuf, u64)>> {
+    validate_tree_observed(cache, deadline, measure, admission, &mut None)
+}
+
+fn validate_tree_observed(
+    cache: &Path,
+    deadline: Instant,
+    measure: bool,
+    admission: &dyn Fn() -> io::Result<()>,
+    observation: &mut Option<TreeObservation>,
+) -> io::Result<Vec<(PathBuf, u64)>> {
     #[cfg(test)]
     test_hook(cache, "walk");
     if !fs::symlink_metadata(cache)?.is_dir() {
@@ -2624,7 +2768,10 @@ fn validate_tree_with_admission(
         if Instant::now() >= deadline {
             return Err(io::Error::new(io::ErrorKind::TimedOut, RetentionDeadline));
         }
-        let mut entries = fs::read_dir(&directory)?;
+        if let Some(observation) = observation {
+            observation.record(&directory)?;
+        }
+        let mut entries = retention_read_dir(&directory)?;
         loop {
             admission()?;
             if Instant::now() >= deadline {
@@ -2646,6 +2793,9 @@ fn validate_tree_with_admission(
                 }
                 pending.push(entry.path());
             } else if measure {
+                if let Some(observation) = observation {
+                    observation.record(&entry.path())?;
+                }
                 #[cfg(test)]
                 test_hook(cache, "measure-file");
                 result.push((entry.path(), entry.metadata()?.len()));
@@ -2778,6 +2928,9 @@ fn verify_retirement_proof(
         Ok(_) => verify_retirement_witness(storage, directory, nonce, budget),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             verify_unwitnessed_cache_retirement(directory, budget).map_err(|error| {
+                if crate::bash_background::persistence::is_repair_budget_stop(&error) {
+                    return error;
+                }
                 io::Error::new(
                     error.kind(),
                     format!(
@@ -2798,9 +2951,27 @@ fn verify_retirement_proof(
 fn unwitnessed_cache_file(name: &str) -> bool {
     if matches!(
         name,
-        "writer.lease" | "cache.lock" | "semantic.lock" | "symbols.lock"
+        "writer.lease"
+            | "cache.lock"
+            | "semantic.lock"
+            | "symbols.lock"
+            | "symbols.bin"
+            | ".symbols.lock.reclaim"
     ) {
         return true;
+    }
+    // Snapshot staging and lease publication both use pid/time/counter names.
+    // Do not accept arbitrary files merely because they start with "symbols".
+    if let Some(suffix) = name
+        .strip_prefix("symbols.bin.tmp.")
+        .or_else(|| name.strip_prefix(".symbols.lock.tmp."))
+    {
+        let mut parts = suffix.split('.');
+        return (0..3).all(|_| {
+            parts.next().is_some_and(|part| {
+                !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        }) && parts.next().is_none();
     }
     if let Some(key) = name.strip_suffix(".current") {
         return key_valid(key);
@@ -3034,11 +3205,25 @@ fn reap_trash_with_snapshot_budget(
             })
             .map(|(_, scan)| scan)
             .collect::<Vec<_>>();
+        let active = scans
+            .values()
+            .filter(|scan| {
+                scan.as_ref()
+                    .is_none_or(|scan| scan.entries.is_some() || !scan.deferred.is_empty())
+            })
+            .count();
         let (cursor, full) = if let Some(slot) = scans.get_mut(&key) {
-            let cursor = slot.take();
-            let busy = cursor.is_none();
-            (cursor, busy)
-        } else if scans.len() < TRASH_SCAN_HANDLES {
+            let needs_handle = slot
+                .as_ref()
+                .is_some_and(|scan| scan.entries.is_none() && scan.deferred.is_empty());
+            if needs_handle && active >= TRASH_SCAN_HANDLES {
+                (None, true)
+            } else {
+                let cursor = slot.take();
+                let busy = cursor.is_none();
+                (cursor, busy)
+            }
+        } else if active < TRASH_SCAN_HANDLES {
             // A None slot reserves a handle for the active pass, so concurrent
             // reapers cannot exceed the bound before publishing their cursors.
             scans.insert(key.clone(), None);
@@ -3070,8 +3255,9 @@ fn reap_trash_with_snapshot_budget(
         &mut cursor,
     );
     if let Some(mut cursor) = cursor.filter(|scan| {
-        (scan.entries.is_some() || !scan.deferred.is_empty())
-            && (scan.omitted_prefix || !scan.deferred.is_empty())
+        !scan.retained.is_empty()
+            || ((scan.entries.is_some() || !scan.deferred.is_empty())
+                && (scan.omitted_prefix || !scan.deferred.is_empty()))
     }) {
         cursor.touched = Instant::now();
         let previous = {
@@ -3128,16 +3314,23 @@ fn reap_trash_with_cursor(
                         .directory_identity()?;
                 // Keep the live iterator, not a name to skip after reopening:
                 // rereading a retained prefix can itself exhaust admission.
-                let scan = match previous.filter(|scan| scan.identity == identity) {
+                let mut scan = match previous.filter(|scan| scan.identity == identity) {
                     Some(scan) => scan,
                     None => TrashScan {
                         identity,
-                        entries: Some(fs::read_dir(trash)?),
+                        entries: Some(retention_read_dir(trash)?),
                         deferred: VecDeque::new(),
                         omitted_prefix: false,
                         touched: Instant::now(),
+                        retained: HashMap::new(),
+                        lap: 0,
                     },
                 };
+                if scan.entries.is_none() && scan.deferred.is_empty() {
+                    scan.entries = Some(retention_read_dir(trash)?);
+                    scan.omitted_prefix = false;
+                    scan.lap = scan.lap.wrapping_add(1);
+                }
                 if scan.omitted_prefix {
                     report.incomplete = true;
                     report.keep(
@@ -3226,34 +3419,13 @@ fn reap_trash_with_cursor(
         }
     };
     if entries.is_empty() && !mount_local {
+        if let Some(scan) = cursor.as_mut() {
+            if scan.entries.is_none() && scan.deferred.is_empty() {
+                scan.finish_lap();
+            }
+        }
         return Ok(report.incomplete);
     }
-    let protected = report
-        .protections
-        .get_or_insert_with(|| {
-            crate::root_cache::retention_protections_with_budget(
-                storage,
-                budget,
-                &mut report.protection_census,
-            )
-            .map(Arc::new)
-            .map_err(Arc::new)
-        })
-        .clone();
-    let protected = match protected {
-        Ok(protected) => protected,
-        Err(error) => {
-            let reason = ProtectionFailure::from_error(&error);
-            report.protection_failure = Some(reason);
-            report.incomplete = true;
-            report.entries += entries.len();
-            report.keep(trash, reason.reason(), error);
-            // An incomplete census authorizes no unlink or tree walk. Retry the
-            // prefetched entries with fresh protections on the next pass.
-            cursor.as_mut().unwrap().deferred.extend(entries);
-            return Ok(true);
-        }
-    };
     let parent = crate::bash_background::persistence::PinnedDir::repair_open_path(
         trash
             .parent()
@@ -3271,7 +3443,6 @@ fn reap_trash_with_cursor(
             break;
         }
         let entry = entries.next().unwrap();
-        cursor.as_mut().unwrap().omitted_prefix = true;
         report.entries += 1;
         let path = entry.path();
         let age = entry
@@ -3291,24 +3462,64 @@ fn reap_trash_with_cursor(
         let name = name.to_string_lossy();
         let mut bytes = 0;
         let mut measured = false;
+        let mut observation = Some(TreeObservation::default());
+        let scan = cursor.as_mut().unwrap();
+        let cached = scan.retained.remove(&path);
+        if let Some(mut cached) = cached {
+            // Compare every recorded node, not only the top directory's mtime:
+            // an edit deep in a subtree does not change its ancestors. Reusing
+            // a refusal authorizes no deletion; successful proofs are never cached.
+            if cached
+                .tree
+                .unchanged(&mut || {
+                    budget.entry()?;
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(io::ErrorKind::TimedOut, RetentionDeadline));
+                    }
+                    Ok(())
+                })
+                .unwrap_or(false)
+            {
+                cached.lap = scan.lap;
+                report.bytes_estimate = report.bytes_estimate.saturating_add(cached.bytes);
+                if let Some(age) = age {
+                    report.oldest_age_ms = Some(report.oldest_age_ms.unwrap_or(0).max(age));
+                }
+                *report
+                    .kept_by_reason
+                    .entry(cached.reason.clone())
+                    .or_default() += 1;
+                scan.retained.insert(path, cached);
+                scan.omitted_prefix = true;
+                pending = true;
+                retained = true;
+                continue;
+            }
+            forget_retained_warning(&path);
+        }
         let result = (|| -> Result<(), (&str, io::Error)> {
             budget.enter(0).map_err(|error| ("budget", error))?;
             // Measure only safe, same-filesystem trees. Measurements omit unsafe
             // or unexamined trees and can precede a partially successful unlink.
-            let oversized =
-                match validate_tree_with_admission(&path, deadline, true, &|| budget.enter(0)) {
-                    Ok(files) => {
-                        bytes = files.iter().map(|(_, size)| *size).sum();
-                        measured = true;
-                        false
-                    }
-                    // A tree larger than one validation walk may examine could
-                    // never be validated, so it would never be reclaimed. It is
-                    // removed below by a walk that applies the same rules as it
-                    // goes and keeps its progress when a pass ends.
-                    Err(error) if is_tree_entry_limit(&error) => true,
-                    Err(error) => return Err(("tree_guard", error)),
-                };
+            let oversized = match validate_tree_observed(
+                &path,
+                deadline,
+                true,
+                &|| budget.enter(0),
+                &mut observation,
+            ) {
+                Ok(files) => {
+                    bytes = files.iter().map(|(_, size)| *size).sum();
+                    measured = true;
+                    false
+                }
+                // A tree larger than one validation walk may examine could
+                // never be validated, so it would never be reclaimed. It is
+                // removed below by a walk that applies the same rules as it
+                // goes and keeps its progress when a pass ends.
+                Err(error) if is_tree_entry_limit(&error) => true,
+                Err(error) => return Err(("tree_guard", error)),
+            };
             if !name.strip_prefix("retired-").is_some_and(|nonce| {
                 nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
             }) {
@@ -3334,6 +3545,26 @@ fn reap_trash_with_cursor(
                 .map_err(|error| ("identity", error))?;
             verify_retirement_proof(storage, &child, &name["retired-".len()..], budget)
                 .map_err(|error| ("witness", error))?;
+            // Scan the identities of durable directories only before an
+            // unlink, to protect aliases of task and session storage. A refused
+            // proof keeps the tree regardless of those identities.
+            let protected = report
+                .protections
+                .get_or_insert_with(|| {
+                    crate::root_cache::retention_protections_with_budget(
+                        storage,
+                        budget,
+                        &mut report.protection_census,
+                    )
+                    .map(Arc::new)
+                    .map_err(Arc::new)
+                })
+                .clone()
+                .map_err(|error| {
+                    let reason = ProtectionFailure::from_error(&error);
+                    report.protection_failure = Some(reason);
+                    (reason.reason(), io::Error::other(error.to_string()))
+                })?;
             #[cfg(test)]
             test_hook(&storage.artifacts, "reap-root");
             let mut warnings = Vec::new();
@@ -3399,6 +3630,13 @@ fn reap_trash_with_cursor(
             }
         })();
         if let Err((reason, error)) = result {
+            if report.protection_failure.is_none() && report.protections.is_none() {
+                if crate::bash_background::persistence::is_repair_budget_stop(&error) {
+                    report.protection_failure = Some(ProtectionFailure::from_error(&error));
+                } else if let Err(stop) = budget.enter(0) {
+                    report.protection_failure = Some(ProtectionFailure::from_error(&stop));
+                }
+            }
             pending = true;
             retained = true;
             report.incomplete |= !measured;
@@ -3406,16 +3644,53 @@ fn reap_trash_with_cursor(
             if let Some(age) = age {
                 report.oldest_age_ms = Some(report.oldest_age_ms.unwrap_or(0).max(age));
             }
+            if report.protection_failure.is_some() {
+                // A partial census never authorizes unlink. Preserve the
+                // current entry and every prefetched successor for retry.
+                report.incomplete = true;
+                report.keep(trash, report.protection_failure.unwrap().reason(), error);
+                report.entries += entries.len();
+                cursor.as_mut().unwrap().deferred.push_back(entry);
+                cursor.as_mut().unwrap().deferred.extend(entries);
+                return Ok(true);
+            }
+            if measured
+                && reason == "witness"
+                && !crate::bash_background::persistence::is_repair_budget_stop(&error)
+                // Reader liveness can change without any marker file changing.
+                && !path.join("readers").try_exists().unwrap_or(true)
+            {
+                if let Some(tree) = observation
+                    .filter(|tree| tree.unchanged(&mut || budget.entry()).unwrap_or(false))
+                {
+                    let scan = cursor.as_mut().unwrap();
+                    scan.retained.insert(
+                        path.clone(),
+                        RetainedTrash {
+                            tree,
+                            reason: reason.into(),
+                            bytes,
+                            lap: scan.lap,
+                        },
+                    );
+                }
+            }
             report.keep(&path, reason, error);
         } else {
+            forget_retained_warning(&path);
             report.entries -= 1;
             report.removed_entries += 1;
         }
+        cursor.as_mut().unwrap().omitted_prefix = true;
     }
     // A stopped unlink/measurement lane must retry its prefetched tail before
     // advancing the directory iterator in a later pass.
     for entry in entries.rev() {
         cursor.as_mut().unwrap().deferred.push_front(entry);
+    }
+    let scan = cursor.as_mut().unwrap();
+    if scan.entries.is_none() && scan.deferred.is_empty() {
+        scan.finish_lap();
     }
     if mount_local {
         // Never recursively delete the container: a concurrent retirement may
@@ -3504,7 +3779,7 @@ fn reap_retired_with_budget(
         io::Error::other(error.to_string())
     })?;
     let marker = storage.durable.join("retention/mount-trash-pending");
-    let mount_scan = match fs::read(&marker) {
+    let mount_scan = match retention_read(&marker) {
         Ok(generation) => Some(generation),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
@@ -3524,7 +3799,7 @@ fn reap_retired_with_budget(
         if mount_scan.is_none() {
             continue;
         }
-        let entries = match fs::read_dir(&domain) {
+        let entries = match retention_read_dir(&domain) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
@@ -4318,21 +4593,21 @@ fn candidate_inner(
             }
         }
     }
-    let before = tree_files(&cache, deadline)?;
     if directory
         .file_name()
         .is_some_and(|name| name == "callgraph")
     {
         let pointer = cache.join(format!("{key}.current"));
         if let Ok(current) = fs::read_to_string(pointer) {
+            let before = tree_files(&cache, deadline)?;
             report.removed_generations +=
                 crate::callgraph_store::gc_old_generations(&cache, key, current.trim());
+            let after = tree_files(&cache, deadline)?;
+            let old_bytes: u64 = before.iter().map(|(_, bytes)| bytes).sum();
+            let new_bytes: u64 = after.iter().map(|(_, bytes)| bytes).sum();
+            report.removed_bytes += old_bytes.saturating_sub(new_bytes);
         }
     }
-    let after = tree_files(&cache, deadline)?;
-    let old_bytes: u64 = before.iter().map(|(_, bytes)| bytes).sum();
-    let new_bytes: u64 = after.iter().map(|(_, bytes)| bytes).sum();
-    report.removed_bytes += old_bytes.saturating_sub(new_bytes);
     // Residency protects the root, not unheld obsolete generations. An owner
     // can be alive while using a different plane in the same repository family.
     if crate::root_cache::protected_read_marker_exists(&storage.durable.join("retention"), key)
@@ -4350,6 +4625,9 @@ fn candidate_inner(
     }
     if crate::root_cache::live_scope_keys_for_storage(&storage.durable).contains(key) {
         report.skipped_live += 1;
+        return Ok(());
+    }
+    if history.contains_key(key) && !eligible(storage, key, history, now, ROOT_GRACE_MS, report)? {
         return Ok(());
     }
     for owner in bounded_dirs(&storage.durable.join("artifact-owners"), HISTORY_ENTRIES)? {
@@ -4394,9 +4672,16 @@ fn candidate_inner(
             }
         }
     }
-    if !eligible(storage, key, history, now, unknown_grace_ms, report)? {
+    if !history.contains_key(key)
+        && !eligible(storage, key, history, now, unknown_grace_ms, report)?
+    {
         return Ok(());
     }
+    // Root retention cannot remove a live or recently bound cache, so defer
+    // recursive accounting until it could matter. Generation cleanup above
+    // remains independent of the root's age and residency.
+    let before = tree_files(&cache, deadline)?;
+    let new_bytes: u64 = before.iter().map(|(_, bytes)| bytes).sum();
     if !history.contains_key(key)
         && before.iter().any(|(path, _)| {
             path.file_name().is_none_or(|name| {
@@ -4481,7 +4766,7 @@ fn candidate_inner(
         // never the directory or another key's files/coordination records.
         #[cfg(test)]
         test_hook(&cache, "flat-unlink");
-        for (path, bytes) in after {
+        for (path, bytes) in before {
             if path.parent() == Some(cache.as_path())
                 && path
                     .file_name()
@@ -6055,6 +6340,338 @@ fn record_v3_removal(domain: &mut DomainReport, bytes: Option<u64>) {
 
 #[cfg(test)]
 mod storage_retention_tests {
+    #[test]
+    fn retention_unchanged_live_tree_skips_recursive_accounting() {
+        let temp = tempfile::tempdir().unwrap();
+        for i in 0..64 {
+            let key = format!("{i:016x}");
+            for shard in 0..32 {
+                let directory = temp.path().join(format!("symbols/{key}/shard-{shard}"));
+                fs::create_dir_all(&directory).unwrap();
+                fs::write(directory.join("symbols.bin"), b"cache").unwrap();
+            }
+            atomic_json(
+                &temp.path().join(format!("retention/roots/{key}.json")),
+                &Binding {
+                    root: temp.path().to_path_buf(),
+                    artifact_key: key,
+                    last_bound_ms: crate::pins::now_ms(),
+                    volume: None,
+                    stable_volume: None,
+                    linked_worktree: false,
+                },
+            )
+            .unwrap();
+        }
+        states()
+            .lock()
+            .unwrap()
+            .entry(temp.path().to_path_buf())
+            .or_default()
+            .reaping = true;
+        for _ in 0..2 {
+            PASS_IO.with(|count| count.set((0, 0)));
+            let report = run_pass_entry_bound(temp.path());
+            let (directories, _) = PASS_IO.with(|count| count.get());
+            assert!(report.errors.is_empty(), "{report:?}");
+            assert!(
+                directories <= 32,
+                "unchanged live tree opened {directories} directories"
+            );
+            assert_eq!(report.removed_roots, 0);
+        }
+        assert!(temp
+            .path()
+            .join("symbols/0000000000000000/shard-0/symbols.bin")
+            .exists());
+    }
+
+    #[test]
+    fn retention_trash_unchanged_refusal_is_not_walked_or_warned_again() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("retention")).unwrap();
+        let entry = temp
+            .path()
+            .join("symbols/.retention-trash/retired-00000000000000000000000000000001");
+        let nested = entry.join("foreign/deep");
+        crate::private_storage::create_dir_all(&nested).unwrap();
+        let foreign = nested.join("notes.txt");
+        fs::write(&foreign, b"keep").unwrap();
+        let (_, logs) = crate::logging::capture_log_lines(|| {
+            for pass in 0..3 {
+                PASS_IO.with(|count| count.set((0, 0)));
+                reap_retired(temp.path()).unwrap();
+                let report = trash_report(temp.path());
+                assert_eq!(report.entries, 1, "{report:?}");
+                assert_eq!(report.kept_by_reason.get("witness"), Some(&1));
+                assert_eq!(
+                    report.protection_census.directories, 0,
+                    "refusal needs no census"
+                );
+                if pass > 0 {
+                    assert!(
+                        PASS_IO.with(|count| count.get().0) <= 2,
+                        "retained subtree was listed again"
+                    );
+                }
+            }
+        });
+        assert!(entry.exists());
+        assert_eq!(
+            logs.iter()
+                .filter(|line| warning_names_entry(line, &entry, "witness"))
+                .count(),
+            1,
+            "{logs:?}"
+        );
+
+        // An in-place edit changes neither the retirement directory nor its
+        // ancestors. It must still invalidate the remembered refusal.
+        fs::write(&foreign, b"changed foreign contents").unwrap();
+        let (_, logs) = crate::logging::capture_log_lines(|| {
+            reap_retired(temp.path()).unwrap();
+            reap_retired(temp.path()).unwrap();
+        });
+        assert_eq!(
+            logs.iter()
+                .filter(|line| warning_names_entry(line, &entry, "witness"))
+                .count(),
+            1,
+            "{logs:?}"
+        );
+        fs::remove_dir_all(entry.join("foreign")).unwrap();
+        fs::write(entry.join("symbols.bin"), b"now a provable cache").unwrap();
+        reap_retired(temp.path()).unwrap();
+        assert!(
+            !entry.exists(),
+            "changed entries must receive fresh proof checks"
+        );
+    }
+
+    #[test]
+    fn retention_trash_refusal_memos_survive_exact_batch_exhaustion() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("retention")).unwrap();
+        let trash = temp.path().join("symbols/.retention-trash");
+        let mut entries = Vec::new();
+        for i in 0..PASS_ENTRIES * 2 {
+            let entry = trash.join(format!("retired-{i:032x}"));
+            fs::create_dir_all(&entry).unwrap();
+            fs::write(entry.join("notes.txt"), b"foreign").unwrap();
+            entries.push(entry);
+        }
+        let (_, logs) = crate::logging::capture_log_lines(|| {
+            // Two full batches, then one empty iterator step to finish the lap.
+            for _ in 0..3 {
+                reap_retired(temp.path()).unwrap();
+            }
+            PASS_IO.with(|count| count.set((0, 0)));
+            reap_retired(temp.path()).unwrap();
+            assert!(PASS_IO.with(|count| count.get().0) <= 2);
+            assert_eq!(trash_report(temp.path()).entries, PASS_ENTRIES);
+        });
+        for entry in entries {
+            assert!(entry.exists());
+            assert_eq!(
+                logs.iter()
+                    .filter(|line| warning_names_entry(line, &entry, "witness"))
+                    .count(),
+                1,
+                "{}",
+                entry.display()
+            );
+        }
+    }
+
+    #[test]
+    fn retention_trash_reaps_unwitnessed_symbol_snapshot_and_crash_leftovers() {
+        for files in [
+            vec!["symbols.bin"],
+            vec![
+                "symbols.bin",
+                "symbols.bin.tmp.4242.123456789.0",
+                ".symbols.lock.tmp.4242.123456789.1",
+                ".symbols.lock.reclaim",
+                "symbols.lock",
+            ],
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            fs::create_dir(temp.path().join("retention")).unwrap();
+            let entry = temp
+                .path()
+                .join("symbols/.retention-trash/retired-00000000000000000000000000000001");
+            crate::private_storage::create_dir_all(&entry).unwrap();
+            for file in files {
+                fs::write(entry.join(file), b"symbol cache").unwrap();
+            }
+            reap_retired(temp.path()).unwrap();
+            assert!(!entry.exists());
+            assert_eq!(trash_report(temp.path()).removed_entries, 1);
+        }
+        for name in [
+            "symbols.bin.tmp",
+            "symbols.bin.tmp.1.2",
+            "symbols.bin.tmp.1.2.3.extra",
+            "symbols.bin.tmp.1.x.3",
+            ".symbols.lock.tmp.1.2.3.extra",
+            "symbols.bin.backup",
+        ] {
+            assert!(!unwitnessed_cache_file(name), "{name}");
+        }
+    }
+
+    /// Generated metadata-only model, never a copy of open production databases.
+    /// The harness fan-out mirrors session/task/control/io durable storage.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "offline Linux performance fixture; creates about 160k directories"]
+    fn retention_unchanged_offline_shape_benchmark() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StoragePaths::same(&temp.path().join("storage"));
+        fs::create_dir_all(&storage.durable).unwrap();
+        let shapes = [
+            ("views", 43_985, 2_232),
+            ("runner", 38_832, 113_733),
+            ("opencode", 35_647, 107_491),
+            ("rpc", 18_549, 6_064),
+            ("retention/fixture", 11_561, 18_752),
+            ("bash-tasks", 4_659, 10_595),
+            ("blobs/fixture", 1_503, 2_422),
+            ("checkpoints", 931, 1_220),
+            ("pi", 763, 2_262),
+            ("symbols", 647, 662),
+            ("index", 361, 988),
+            ("dsym", 344, 147),
+            ("inspect", 288, 430),
+            ("callgraph", 287, 713),
+            ("artifact-owners/fixture", 280, 286),
+            ("semantic", 146, 135),
+        ];
+        for (name, directories, files) in shapes {
+            let domain = storage.artifacts.join(name);
+            fs::create_dir_all(&domain).unwrap();
+            let sessions = directories.min(200);
+            let mut leaves = Vec::new();
+            for i in 0..directories {
+                let path = if DOMAINS.contains(&name) {
+                    if i < directories.min(1000) {
+                        domain.join(format!("{i:016x}"))
+                    } else {
+                        domain.join(format!("{:016x}/shard-{i}", i % 1000))
+                    }
+                } else if i < sessions {
+                    domain.join(format!("session-{i}"))
+                } else {
+                    let task = (i - sessions) / 3;
+                    let task_dir = domain.join(format!("session-{}/{task:032x}", task % sessions));
+                    match (i - sessions) % 3 {
+                        0 => task_dir,
+                        1 => task_dir.join("control"),
+                        _ => task_dir.join("io"),
+                    }
+                };
+                fs::create_dir_all(&path).unwrap();
+                leaves.push(path);
+            }
+            for i in 0..files {
+                fs::write(
+                    leaves[i % leaves.len()].join(format!("record-{i}")),
+                    b"fixture",
+                )
+                .unwrap();
+            }
+            eprintln!("offline shape: {name} directories={directories} files={files}");
+        }
+        for i in 0..1000 {
+            let root = temp.path().join(format!("checkout-{i}"));
+            fs::create_dir(&root).unwrap();
+            atomic_json(
+                &storage
+                    .durable
+                    .join(format!("retention/roots/{i:016x}.json")),
+                &Binding {
+                    root,
+                    artifact_key: format!("{i:016x}"),
+                    last_bound_ms: crate::pins::now_ms(),
+                    volume: None,
+                    stable_volume: None,
+                    linked_worktree: false,
+                },
+            )
+            .unwrap();
+        }
+        let trash = storage.artifacts.join("symbols/.retention-trash");
+        for i in 0..2 {
+            let retired = trash.join(format!("retired-{i:032x}"));
+            crate::private_storage::create_dir_all(&retired).unwrap();
+            fs::File::create(retired.join("symbols.bin"))
+                .unwrap()
+                .set_len(23 * 1024 * 1024)
+                .unwrap();
+        }
+        // Keep asynchronous work out of the root thread's CPU measurement.
+        states()
+            .lock()
+            .unwrap()
+            .entry(storage.artifacts.clone())
+            .or_default()
+            .reaping = true;
+        for pass in 0..3 {
+            PASS_IO.with(|count| count.set((0, 0)));
+            let started = Instant::now();
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let cpu = thread_cpu_seconds();
+            let report = run_pass_entry_bound(&storage.artifacts);
+            let io = PASS_IO.with(|count| count.get());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            eprintln!("offline root pass={pass} cpu_ms={:.3} wall_ms={:.3} listings={} file_open_attempts={} timings={:?}",
+                (thread_cpu_seconds() - cpu) * 1000.0, started.elapsed().as_secs_f64() * 1000.0, io.0, io.1, report.timings_ms);
+            PASS_IO.with(|count| count.set((0, 0)));
+            let started = Instant::now();
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let cpu = thread_cpu_seconds();
+            let mut report = TrashReport::default();
+            reap_retired_with_budget(
+                &storage,
+                Instant::now() + Duration::from_secs(60),
+                &mut crate::bash_background::persistence::RepairBudget::new(),
+                &mut report,
+            )
+            .unwrap();
+            let io = PASS_IO.with(|count| count.get());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            eprintln!("offline reaper pass={pass} cpu_ms={:.3} wall_ms={:.3} listings={} file_open_attempts={} report={}",
+                (thread_cpu_seconds() - cpu) * 1000.0, started.elapsed().as_secs_f64() * 1000.0, io.0, io.1, serde_json::to_string(&report).unwrap());
+        }
+        eprintln!("offline cadence: normal root admissions/hour={} startup_grace_s={} (backlog bursts excluded)",
+            3600 / INTERVAL.as_secs(), STARTUP_GRACE.as_secs());
+        for i in 2..130 {
+            let retired = trash.join(format!("retired-{i:032x}"));
+            fs::create_dir_all(retired.join("nested")).unwrap();
+            fs::write(retired.join("nested/notes.txt"), b"not an AFT cache").unwrap();
+        }
+        for pass in 0..5 {
+            PASS_IO.with(|count| count.set((0, 0)));
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let cpu = thread_cpu_seconds();
+            let mut report = TrashReport::default();
+            reap_retired_with_budget(
+                &storage,
+                Instant::now() + Duration::from_secs(60),
+                &mut crate::bash_background::persistence::RepairBudget::new(),
+                &mut report,
+            )
+            .unwrap();
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            eprintln!(
+                "offline large-trash pass={pass} cpu_ms={:.3} io={:?} report={}",
+                (thread_cpu_seconds() - cpu) * 1000.0,
+                PASS_IO.with(|count| count.get()),
+                serde_json::to_string(&report).unwrap()
+            );
+        }
+    }
+
     #[test]
     fn retention_protection_failure_backs_off_and_stays_in_health() {
         let now = Instant::now();
@@ -12120,6 +12737,10 @@ mod storage_retention_tests {
         let temp = tempfile::tempdir().unwrap();
         let key = "0123456789abcdef";
         let view = cache(temp.path(), "views", key);
+        // Only an eligible orphan needs a recursive walk. Establish and age its
+        // observation before exercising the walk's independent real deadline.
+        run_pass_entry_bound(temp.path());
+        age_orphan(temp.path(), &view, key);
         let clock = Instant::now();
         let delay = observe_test_hook(
             &view,
@@ -12144,6 +12765,11 @@ mod storage_retention_tests {
         assert!(stopped.errors[0].contains("retention deadline reached"));
         assert!(view.exists());
 
+        atomic_json(
+            &temp.path().join(format!("retention/unknown/{key}.json")),
+            &crate::pins::now_ms(),
+        )
+        .unwrap();
         let observed = run_pass_entry_bound(temp.path());
         assert_eq!(observed.orphan_views.skipped_recent, 1, "{observed:?}");
         age_orphan(temp.path(), &view, key);
@@ -13240,7 +13866,7 @@ fn prune_bindings(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if !records.contains_key(&storage.artifacts) {
-        match fs::read_dir(storage.durable.join("retention/roots")) {
+        match retention_read_dir(&storage.durable.join("retention/roots")) {
             Ok(entries) => {
                 records.insert(storage.artifacts.clone(), entries);
             }
