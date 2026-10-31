@@ -14500,12 +14500,20 @@ mod tests {
                     crate::commands::grep::handle_grep(&grep_request("needle"), &ctx)
                 }
             };
+            // The first request publishes the new file and creates the family
+            // registry. A second new file makes the next request publish again.
+            let _ = request();
+            let registry = crate::blob_store::v3::family_dir(&storage, &family)
+                .unwrap()
+                .join("members.sqlite");
+            assert!(registry.exists(), "the first request creates the registry");
+            let second = root.join("added-second.ts");
+            std::fs::write(&second, "export const second = 'needle';\n").unwrap();
+            ctx.record_checkout_watcher_change(&second);
             // Another connection holds the family registry in exclusive
             // locking mode, so opening the ledger is busy until it goes.
             let blocker = crate::db::file_identity::IdentityConnection::open_with_flags(
-                crate::blob_store::v3::family_dir(&storage, &family)
-                    .unwrap()
-                    .join("members.sqlite"),
+                &registry,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
                 "configure-busy-registry-blocker",
             )

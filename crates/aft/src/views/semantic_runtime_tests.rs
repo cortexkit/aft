@@ -4867,8 +4867,15 @@ fn busy_store_errors_retry_on_the_backoff_until_the_fill_publishes() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    // The busy store was reported as such, not as the checkout's named gap.
-    assert!(runtime.unavailable_reason().is_none());
+    // While it retries, the reason names the busy store, as for any transient
+    // fill error; the publish below clears it.
+    let reason = runtime.unavailable_reason();
+    assert!(
+        reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("database is locked")),
+        "{reason:?}"
+    );
     blocker.execute_batch("ROLLBACK;").unwrap();
     drop(blocker);
     let deadline = Instant::now() + Duration::from_secs(60);
