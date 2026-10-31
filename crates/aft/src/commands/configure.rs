@@ -15494,7 +15494,9 @@ mod tests {
         git_commit_all(&root, "graph");
         let root = std::fs::canonicalize(root).unwrap();
         let storage = temp.path().join("storage");
-        let ctx = test_context();
+        // The standalone drain takes the shared context the standalone loop owns.
+        let TestContext { context, _storage } = test_context();
+        let ctx = Arc::new(context);
         assert!(
             handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
                 .success
