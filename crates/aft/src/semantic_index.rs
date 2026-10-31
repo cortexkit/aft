@@ -8340,6 +8340,12 @@ impl SemanticIndex {
                 Some(serde_json::Value::Bool(limited)) => limited,
                 Some(_) => return Err("invalid stored summary-budget marker".to_string()),
             };
+            // Header migration state is not model identity. Keeping it in this
+            // comparison would reject valid append scans and force full reads.
+            match fields.remove("header_languages_resolved") {
+                None | Some(serde_json::Value::Bool(_)) => {}
+                Some(_) => return Err("invalid stored header-language marker".to_string()),
+            }
             let expected: serde_json::Value = serde_json::from_str(expected_fingerprint)
                 .map_err(|error| format!("invalid expected semantic identity: {error}"))?;
             if stored != expected || limited != expected_summary_budget {
@@ -11537,6 +11543,75 @@ pub(crate) use tests::saved_pre_budget_summary_fixture;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn h_header_marker_preserves_non_header_incremental_append_scan() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let file = project.path().join("lib.rs");
+        write_rust_file(&file, "before_change");
+        let mut files = vec![file.clone()];
+        // Keep a one-file update below the background compaction threshold.
+        for ordinal in 1..16 {
+            let stable = project.path().join(format!("stable_{ordinal}.rs"));
+            write_rust_file(&stable, &format!("unchanged_{ordinal}"));
+            files.push(stable);
+        }
+        let mut index = build_test_index(project.path(), &files);
+        let fingerprint = SemanticIndexFingerprint::for_config_dimension(
+            &SemanticBackendConfig::default(),
+            index.dimension(),
+        );
+        index.set_fingerprint(fingerprint.clone());
+        assert!(index.write_to_disk(storage.path(), "header-marker-scan"));
+        let data_path = storage
+            .path()
+            .join("semantic/header-marker-scan/semantic.bin");
+        let before_bytes = fs::metadata(&data_path).unwrap().len() as usize;
+        assert!(
+            index
+                .append_scan_bytes_for_test(storage.path(), "header-marker-scan")
+                .unwrap()
+                < before_bytes
+        );
+        let mut incompatible = fingerprint.clone();
+        incompatible.model.push_str("-different");
+        assert!(SemanticIndex::scan_artifact_for_append(
+            &data_path,
+            index.persistence_snapshot().unwrap(),
+            &incompatible.as_string(),
+            index.dimension(),
+            false
+        )
+        .is_err());
+        assert!(SemanticIndex::scan_artifact_for_append(
+            &data_path,
+            index.persistence_snapshot().unwrap(),
+            &fingerprint.as_string(),
+            index.dimension(),
+            true
+        )
+        .is_err());
+        write_rust_file(&file, "after_change");
+        index
+            .refresh_stale_files(
+                project.path(),
+                &files,
+                &mut test_vector_for_texts,
+                8,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        assert!(index.write_to_disk(storage.path(), "header-marker-scan"));
+        assert!(
+            index.last_append_read_bytes_for_test() < before_bytes,
+            "a non-header refresh must use the bounded append scan, not structural fallback"
+        );
+        assert_eq!(index.persistence_snapshot().unwrap().segment_count, 1);
+        assert!(index
+            .append_scan_bytes_for_test(storage.path(), "header-marker-scan")
+            .is_some());
+    }
+
     #[test]
     fn h_header_invalidation_legacy_semantic_reembeds_only_changed_headers_once() {
         let root = tempfile::tempdir().unwrap();
