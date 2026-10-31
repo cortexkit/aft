@@ -193,8 +193,13 @@ mod tests {
             fs::write(path.join(name).join("file.rs"), b"source").unwrap();
         }
         fs::write(config.project_root.join("sibling.rs"), b"sibling").unwrap();
+        super::super::EXCLUSION_TEST_OPENS.with(|opens| opens.borrow_mut().clear());
         let files = expand(&config, &matcher, &[path.clone()]).unwrap();
         assert_eq!(files, vec![path.join("src/file.rs")]);
+        // Filtering the returned files is not enough: excluded subtrees must
+        // never be opened, or they could consume the whole discovery budget.
+        let opened = super::super::EXCLUSION_TEST_OPENS.with(|opens| opens.borrow().clone());
+        assert_eq!(opened, vec![path.clone(), path.join("src")]);
         assert_eq!(config.counters.snapshot().directory_subtree_walks_total, 1);
     }
 
