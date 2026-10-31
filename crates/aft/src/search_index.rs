@@ -921,6 +921,21 @@ impl SearchIndex {
 }
 
 impl SearchIndexSnapshot {
+    /// Size and content hash of every file this snapshot serves, keyed by
+    /// its path relative to the index root with `/` separators, as
+    /// [`SearchIndex::live_file_identities`] reports them.
+    pub(crate) fn live_file_identities(&self) -> HashMap<String, (u64, blake3::Hash)> {
+        self.files
+            .iter()
+            .filter(|entry| !entry.path.as_os_str().is_empty())
+            .filter_map(|entry| {
+                let relative = entry.path.strip_prefix(&self.project_root).ok()?;
+                let relative = relative.to_string_lossy().replace('\\', "/");
+                Some((relative, (entry.size, entry.content_hash)))
+            })
+            .collect()
+    }
+
     pub(crate) fn content_generation(&self) -> String {
         let mut digest = blake3::Hasher::new();
         digest.update(&self.max_file_size.to_be_bytes());

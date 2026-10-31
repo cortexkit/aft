@@ -4825,23 +4825,13 @@ impl CompositePlane for CallgraphBridge {
         path: &RelPath,
         content: crate::blob_store::v2::ContentHash,
     ) -> Option<crate::blob_store::v2::FamilyKey> {
-        let language = if super::assembly::is_resolution_input(path.as_bytes()) {
-            "config".to_owned()
-        } else {
-            let path = std::str::from_utf8(path.as_bytes()).ok()?;
-            format!(
-                "{:?}",
-                crate::parser::detect_language(std::path::Path::new(path))?
-            )
-            .to_lowercase()
-        };
-        Some(crate::blob_store::v2::FamilyKey::from(
-            &crate::blob_store::CallgraphKey::from_source_digest(
-                *content.as_bytes(),
-                language,
-                super::callgraph::PRODUCER,
-            )
-            .full_key(),
+        let key = super::callgraph::graph_key(
+            path.as_bytes(),
+            blake3::Hash::from_bytes(*content.as_bytes()),
+        )?;
+        Some(crate::blob_store::v2::FamilyKey::new(
+            crate::blob_store::v2::FamilyPlane::Callgraph,
+            *key.as_bytes(),
         ))
     }
     fn attachment(

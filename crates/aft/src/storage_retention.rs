@@ -5800,6 +5800,67 @@ enum V3IdleStep {
     Unknown(String),
 }
 
+/// Evicts the least recently used active view member whose scope ends with
+/// `suffix` and is not in `keep`, so a new checkout can take its place under
+/// `views.callgraph_copies`. A member with a live session, pin, protected read
+/// marker, worker intent or open SQLite handle is skipped, exactly as idle
+/// eviction skips it. At most `max_examined` members are looked at, oldest
+/// first. Returns the evicted scope, or `None` when every candidate examined
+/// is held. The caller holds the storage root's reservation lock.
+pub(crate) fn evict_least_recent_v3_member(
+    storage: &Path,
+    family: &str,
+    registry: &mut crate::blob_store::v3::RegistryWriter<'_>,
+    suffix: &str,
+    keep: &[&str],
+    max_examined: usize,
+    deadline: Instant,
+) -> io::Result<Option<String>> {
+    let v3 = |error: crate::blob_store::v3::Error| io::Error::other(error.to_string());
+    let pattern = format!("%{suffix}");
+    let members: Vec<V3Member> = registry
+        .with_barrier(|tx| {
+            let mut statement = tx.prepare(
+                "SELECT scope,kind,root,view_dir,last_bind_ms,state FROM members
+                 WHERE kind='view' AND state='active' AND scope LIKE ?1
+                 ORDER BY last_bind_ms,scope LIMIT ?2",
+            )?;
+            let rows = statement
+                .query_map(
+                    rusqlite::params![pattern, (max_examined + keep.len()) as i64],
+                    v3_member_row,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .map_err(v3)?;
+    for member in members
+        .into_iter()
+        .filter(|member| !keep.contains(&member.scope.as_str()))
+        .take(max_examined)
+    {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let expected = crate::blob_store::v3::view_dir(storage, family, &member.scope);
+        let Some(view_dir) = expected.ok().filter(|path| {
+            Path::new(&member.view_dir) == path
+                && member.root.as_deref().and_then(v3_root_path).is_some()
+        }) else {
+            continue;
+        };
+        let step = registry
+            .with_barrier(|tx| Ok(v3_mark_idle_evicting(tx, &member, &view_dir)?))
+            .map_err(v3)?;
+        if !matches!(step, V3IdleStep::Evicting) {
+            continue;
+        }
+        v3_finish_eviction(storage, registry, &member.scope, &view_dir, deadline)?;
+        return Ok(Some(member.scope));
+    }
+    Ok(None)
+}
+
 fn report_v3_idle_unknown(
     view_dir: &Path,
     error: &io::Error,
