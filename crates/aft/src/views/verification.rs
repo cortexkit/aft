@@ -589,7 +589,7 @@ impl Policy {
                     },
                     &mut hash,
                 )?;
-            } else if !is_config_origin(item) && !item.is_empty() {
+            } else if !is_config_origin(item) && !item.is_empty() && is_base_config_entry(item) {
                 config_entries.push(item.to_vec());
             }
             let lower = String::from_utf8_lossy(item).to_lowercase();
@@ -650,7 +650,7 @@ impl Policy {
             }
         }
         let mut base = blake3::Hasher::new();
-        base.update(b"aft/views-v3/base-policy/1");
+        base.update(b"aft/views-v3/base-policy/2");
         base.update(&[u8::from(config_read)]);
         base.update(&(config_entries.len() as u64).to_le_bytes());
         for entry in &config_entries {
@@ -671,6 +671,29 @@ impl Policy {
             reusable,
         })
     }
+}
+
+/// Whether a Git config entry (`key\nvalue`) can change how a member's bytes
+/// or paths are read, so base identity must include it. Everything else in a
+/// repository's config (branch tracking, remotes, user identity, editor
+/// state) is left out: tools and agents rewrite those all the time, for
+/// example on every `git push -u`, and each rewrite would otherwise give
+/// every checkout of the repository a new base.
+fn is_base_config_entry(item: &[u8]) -> bool {
+    let key = item.split(|b| *b == b'\n').next().unwrap_or_default();
+    let key = String::from_utf8_lossy(key).to_ascii_lowercase();
+    key.starts_with("filter.")
+        || matches!(
+            key.as_str(),
+            "core.autocrlf"
+                | "core.eol"
+                | "core.safecrlf"
+                | "core.checkroundtripencoding"
+                | "core.attributesfile"
+                | "core.symlinks"
+                | "core.ignorecase"
+                | "core.precomposeunicode"
+        )
 }
 
 /// Whether a `git config --list --show-origin -z` record is an origin rather
@@ -1704,6 +1727,45 @@ mod tests {
             creation: 0,
         };
         assert!(!stat.reusable(&changed, observed + 1));
+    }
+
+    /// Branch tracking, remotes and user settings never change how a member
+    /// is read, so rewriting them (as `git push -u` does) keeps the base
+    /// identity; a line-ending or filter setting changes it.
+    #[test]
+    fn base_identity_ignores_config_that_cannot_change_member_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q"]);
+        fs::write(root.path().join("file.rs"), b"fn main() {}\n").unwrap();
+        git(root.path(), &["add", "."]);
+        let base = |root: &Path| BindGuard::capture(root, None).unwrap().policy.base_digest;
+        let before = base(root.path());
+        for (key, value) in [
+            ("branch.feature.remote", "origin"),
+            ("branch.feature.merge", "refs/heads/feature"),
+            ("remote.origin.url", "https://example.invalid/repo.git"),
+            ("user.name", "someone else"),
+            ("rerere.enabled", "true"),
+        ] {
+            git(root.path(), &["config", key, value]);
+        }
+        assert_eq!(
+            base(root.path()),
+            before,
+            "branch, remote and user settings must not change the base identity"
+        );
+        git(root.path(), &["config", "core.autocrlf", "input"]);
+        let line_endings = base(root.path());
+        assert_ne!(
+            line_endings, before,
+            "a line-ending setting changes the base"
+        );
+        git(root.path(), &["config", "filter.demo.clean", "cat"]);
+        assert_ne!(
+            base(root.path()),
+            line_endings,
+            "a filter setting changes the base"
+        );
     }
 
     #[test]
