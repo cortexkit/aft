@@ -2606,7 +2606,7 @@ fn print_egress_summary(observations: &[EgressObservation], push_frames: usize) 
     }
 }
 
-fn send_control(tx: &mpsc::UnboundedSender<Frame>, corr: u64, request: ModuleControlRequest) {
+fn send_control<T: serde::Serialize>(tx: &mpsc::UnboundedSender<Frame>, corr: u64, request: T) {
     tx.send(
         Frame::build(
             FrameType::Request,

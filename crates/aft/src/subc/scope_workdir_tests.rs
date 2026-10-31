@@ -626,7 +626,7 @@ fn scope_workdir_old_stamp_refuses_legacy_root_fallback() {
 }
 
 #[test]
-fn scope_workdir_stamp_binds_without_a_valid_bind_identity_folder() {
+fn scope_workdir_stamp_binds_and_warns_without_a_valid_bind_identity_folder() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let root = canonical_root(dir.path());
@@ -636,7 +636,11 @@ fn scope_workdir_stamp_binds_without_a_valid_bind_identity_folder() {
         Some(stamp().with_workdir(Some(root.to_string_lossy().into_owned()))),
         &root,
     );
-    assert!(lines.is_empty(), "{lines:?}");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].starts_with("WARN subc scope workdir differs:"),
+        "{lines:?}"
+    );
 }
 
 #[test]

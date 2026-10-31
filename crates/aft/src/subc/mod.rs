@@ -8205,9 +8205,9 @@ fn compare_scope_workdir(
     budget: crate::bounded_io::Budget,
     permit: ScopeWorkdirPermit,
 ) -> io::Result<Option<(PathBuf, PathBuf)>> {
-    // A stamped folder can have a missing tail. Normalize its existing prefix
+    // Either folder can have a missing tail. Normalize each existing prefix
     // like a routing root, including Windows path spelling, then append that tail.
-    // Bound the whole walk, including direct canonicalization of the project root.
+    // Bound both walks so a diagnostic never waits indefinitely on filesystem I/O.
     let pool = permit
         .diagnostics
         .pool
@@ -8218,14 +8218,13 @@ fn compare_scope_workdir(
             // Keep both the capacity slot and this folder's deduplication key
             // until the actual filesystem job exits, not merely until timeout.
             let _permit = permit;
-            let (Ok(project_root), Some(workdir)) = (
-                ProjectRootId::from_path(project_root),
+            let (Some(project_root), Some(workdir)) = (
+                normalized_scope_workdir(&project_root),
                 normalized_scope_workdir(&workdir),
             ) else {
                 return Ok(None);
             };
-            Ok((workdir.as_path() != project_root.as_path())
-                .then(|| (project_root.into_path_buf(), workdir)))
+            Ok((workdir != project_root).then_some((project_root, workdir)))
         })
     })
 }
@@ -8933,8 +8932,9 @@ async fn handle_control_request(
     }
 }
 
-/// Metadata is static on a project-free route. Task handles, including bash
-/// observations, belong to a project's registry and cannot be resolved here.
+/// Metadata is static on a project-free route. Task handles, including those
+/// used to read a bash task's status, belong to a project's registry and cannot
+/// be resolved here.
 async fn handle_project_free_request(
     tx: &WriterSender,
     frame: &Frame,

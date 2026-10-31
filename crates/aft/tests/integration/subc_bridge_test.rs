@@ -14761,10 +14761,10 @@ async fn poll_manifest_callgraph_until_ready(
     }
 }
 
-async fn send_control_request(
+async fn send_control_request<T: serde::Serialize>(
     stream: &mut tokio::net::TcpStream,
     corr: u64,
-    request: ModuleControlRequest,
+    request: T,
 ) {
     send_frame(
         stream,
