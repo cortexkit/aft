@@ -790,7 +790,7 @@ fn semantic_header(
     producer: &SemanticProducer,
 ) -> Result<SemanticHeader, String> {
     let version = reader.u8()?;
-    if version != super::LEGACY_SEMANTIC_V6 && version != super::LEGACY_SEMANTIC_V7 {
+    if !(super::LEGACY_SEMANTIC_V6..=super::LEGACY_SEMANTIC_V8).contains(&version) {
         return Err(format!(
             "semantic.bin version {version} has no established producer stamps"
         ));
@@ -843,7 +843,7 @@ fn semantic_entry(
 ) -> Result<(Vec<u8>, super::LegacyEntry), String> {
     let path = reader.field(MAX_PATH_BYTES)?;
     let name = reader.string(MAX_FIELD_BYTES)?;
-    let qualified_name = if header.version == super::LEGACY_SEMANTIC_V7 {
+    let qualified_name = if header.version >= super::LEGACY_SEMANTIC_V7 {
         let qualified = reader.string(MAX_FIELD_BYTES)?;
         (!qualified.is_empty()).then_some(qualified)
     } else {
@@ -880,6 +880,39 @@ fn path_digest(path: &[u8]) -> [u8; 32] {
     *blake3::hash(path).as_bytes()
 }
 
+/// Streaming counterpart of `parse_skipped_semantic_files`: validate both V8
+/// tables before emitting any file, keeping only the incomplete paths.
+fn semantic_skipped_files(
+    reader: &mut SeqReader<'_>,
+    metadata: &BTreeMap<Vec<u8>, [u8; 32]>,
+) -> Result<HashSet<Vec<u8>>, String> {
+    let total = reader.u64()?;
+    let mut decoded_total = 0_u64;
+    let mut incomplete = HashSet::new();
+    for _ in 0..2 {
+        let count = reader.u32()? as usize;
+        if count > super::MAX_LEGACY_ROWS {
+            return Err("too many skipped semantic files".to_owned());
+        }
+        let mut seen = HashSet::new();
+        for _ in 0..count {
+            let path = reader.field(MAX_PATH_BYTES)?;
+            let rows = reader.u64()?;
+            decoded_total = decoded_total
+                .checked_add(rows)
+                .ok_or("skipped chunk count overflow")?;
+            if rows == 0 || !metadata.contains_key(&path) || !seen.insert(path.clone()) {
+                return Err("invalid skipped semantic file metadata".to_owned());
+            }
+            incomplete.insert(path);
+        }
+    }
+    if decoded_total > total {
+        return Err("skipped chunk count exceeds total skipped chunks".to_owned());
+    }
+    Ok(incomplete)
+}
+
 /// Converts a legacy `semantic.bin` into view payloads under `producer`, one
 /// file's rows at a time, handing each imported file to `emit`. Returns the
 /// file's BLAKE3 and the number of files left for the plane to embed.
@@ -902,10 +935,11 @@ fn convert_semantic_streaming(
     // Pass 1: validate the whole snapshot and find paths whose rows are split.
     let mut seen = HashSet::new();
     let mut split = HashSet::new();
+    let incomplete;
     {
         let mut reader = SeqReader::new(source, 0, len);
         let header = semantic_header(&mut reader, producer)?;
-        semantic_metadata(&mut reader)?;
+        let metadata = semantic_metadata(&mut reader)?;
         let mut current: Option<[u8; 32]> = None;
         for _ in 0..header.entry_count {
             let (path, _) = semantic_entry(&mut reader, &header)?;
@@ -917,6 +951,11 @@ fn convert_semantic_streaming(
                 current = Some(digest);
             }
         }
+        incomplete = if header.version >= super::LEGACY_SEMANTIC_V8 {
+            semantic_skipped_files(&mut reader, &metadata)?
+        } else {
+            HashSet::new()
+        };
         if !reader.is_exhausted() {
             return Err(
                 "trailing bytes after semantic snapshot (segments or a torn tail are not repaired)"
@@ -943,6 +982,7 @@ fn convert_semantic_streaming(
             return Ok(());
         }
         let file = super::LegacyFile {
+            incomplete: incomplete.contains(&path),
             path,
             content_hash,
             entries,

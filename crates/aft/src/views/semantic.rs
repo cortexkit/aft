@@ -1540,6 +1540,7 @@ impl SemanticPlane {
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
     {
+        let _refusal_run = crate::semantic_index::EmbeddingRefusalRunScope::new();
         let setup_started = Instant::now();
         let access = ViewAccess::Owner(owner.clone());
         if owner.registry().storage() != self.storage {
@@ -2052,9 +2053,31 @@ impl SemanticPlane {
                         break;
                     }
                     let store_started = Instant::now();
-                    let payloads: Vec<_> = to_embed
+                    // A partially embedded file must never enter the shared cache
+                    // of file embeddings: another checkout could mistake it for full coverage.
+                    let to_store = to_embed
+                        .into_iter()
+                        .zip(runs)
+                        .filter_map(|((item, relative, full_key, claim), run)| {
+                            if run.provider_refused_chunks > 0 {
+                                let reason = crate::semantic_index::format_skipped_chunks_summary(
+                                    &root,
+                                    &BTreeMap::from([(
+                                        root.join(&relative),
+                                        run.provider_refused_chunks,
+                                    )]),
+                                    "the embedding provider refused them",
+                                )
+                                .expect("refused file has skipped chunks");
+                                failures.push((item, full_key, reason));
+                                None
+                            } else {
+                                Some(((item, relative, full_key, claim), run))
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let payloads: Vec<_> = to_store
                         .iter()
-                        .zip(&runs)
                         .map(|((_, _, _, claim), run)| {
                             (*claim.key(), run.encode_view_payload(&payload_producer))
                         })
@@ -2067,16 +2090,13 @@ impl SemanticPlane {
                             } else {
                                 report.store_errors.push(error.to_string());
                             }
-                            report.deferred += to_embed.len() + pending.count();
+                            report.deferred += to_store.len() + pending.count();
                             report.timing.store_write += store_started.elapsed();
                             break;
                         }
                     };
                     for (((item, relative, full_key, claim), mut run), ((_, payload), outcome)) in
-                        to_embed
-                            .into_iter()
-                            .zip(runs)
-                            .zip(payloads.into_iter().zip(outcomes))
+                        to_store.into_iter().zip(payloads.into_iter().zip(outcomes))
                     {
                         let key = *claim.key();
                         match outcome {
@@ -5349,6 +5369,94 @@ mod tests {
             ),
             cold(root.path(), "model-b", "alpha total")
         );
+    }
+
+    #[test]
+    fn provider_refused_file_is_failed_while_healthy_files_are_saved() {
+        use crate::semantic_index::tests::{overflow_http_config, OverflowEmbeddingServer};
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        write_tree(root.path(), FILES);
+        write_tree(
+            root.path(),
+            &[("src/poison.rs", "pub fn AFT_POISON() {}\n")],
+        );
+        let server = OverflowEmbeddingServer::refusing_text("AFT_POISON");
+        let config = overflow_http_config(&server);
+        let mut model =
+            crate::semantic_index::SemanticEmbeddingModel::from_config(&config).unwrap();
+        let plane = new_plane(storage.path(), "model-a");
+        let checkout = Checkout::open(storage.path(), "scope-a", root.path(), &plane);
+        let snapshot = checkout.load();
+        let report = plane
+            .fill(
+                &checkout.owner,
+                &snapshot,
+                FillBudget::default(),
+                &mut |texts| model.embed(texts),
+                &|| snapshot.clone(),
+            )
+            .unwrap();
+        assert_eq!((report.installed, report.failed), (3, 1));
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let poison_path = RelPath::new(b"src/poison.rs".to_vec()).unwrap();
+        let key = plane
+            .producer
+            .key(b"pub fn AFT_POISON() {}\n", &poison_path);
+        assert!(
+            checkout
+                .owner
+                .open_store(FamilyPlane::Semantic)
+                .unwrap()
+                .get(&key)
+                .unwrap()
+                .is_none(),
+            "a failed partial file run must not be reusable by another checkout"
+        );
+        let folded = checkout.load();
+        assert!(matches!(folded.generation()
+            .entry(&RelPath::new(b"src/poison.rs".to_vec()).unwrap())
+            .and_then(|entry| entry.plane_state(FamilyPlane::Semantic)),
+            Some(PlaneState::Failed { reason, .. }) if reason == "semantic search is incomplete: 1 chunks skipped because the embedding provider refused them: src/poison.rs"));
+        drop(checkout);
+        let reopened_plane = new_plane(storage.path(), "model-a");
+        let reopened = Checkout::open(storage.path(), "scope-a", root.path(), &reopened_plane);
+        let snapshot = reopened.load();
+        assert_eq!(
+            reopened_plane.readiness(&reopened.access, &snapshot),
+            PlaneReadiness::Ready {
+                pending: 0,
+                failed: 1
+            }
+        );
+        let query = reopened_plane
+            .search(
+                &reopened.access,
+                root.path(),
+                &snapshot,
+                &[1.0, 1.0, 1.0],
+                100,
+                &|_| true,
+            )
+            .unwrap();
+        assert_eq!(query.failed, vec![root.path().join("src/poison.rs")]);
+        assert!(!query.results.is_empty());
+        assert!(query
+            .results
+            .iter()
+            .all(|result| result.file != root.path().join("src/poison.rs")));
+        let requests = server.requests().len();
+        let again = reopened_plane
+            .fill(
+                &reopened.owner,
+                &snapshot,
+                FillBudget::default(),
+                &mut |texts| model.embed(texts),
+                &|| snapshot.clone(),
+            )
+            .unwrap();
+        assert_eq!(again.queued, 0);
+        assert_eq!(server.requests().len(), requests);
     }
 
     #[test]

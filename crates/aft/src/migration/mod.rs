@@ -20,7 +20,7 @@ pub mod v3_ledger;
 pub mod v3_symbols;
 pub(crate) mod views_background;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -43,6 +43,7 @@ use crate::views::{
 
 const LEGACY_SEMANTIC_V6: u8 = 6;
 const LEGACY_SEMANTIC_V7: u8 = 7;
+const LEGACY_SEMANTIC_V8: u8 = 8;
 const LEGACY_CHUNKING_VERSION: u64 = 2;
 const MAX_LEGACY_ROWS: usize = 2_000_000;
 const MAX_LEGACY_DIMENSION: usize = 16_384;
@@ -261,7 +262,7 @@ impl From<CallGraphStoreError> for MigrationError {
 
 /// Imports an eligible root's old `semantic.bin` without making embedding requests.
 ///
-/// Compatibility is intentionally strict: V6/V7 snapshots must carry the exact
+/// Compatibility is intentionally strict: V6–V8 snapshots must carry the exact
 /// configured model fingerprint and the current legacy chunking version. Earlier
 /// or unstamped snapshots are recorded as a rebuild request rather than treated as
 /// an import failure. The source snapshot is never deleted or rewritten here.
@@ -274,7 +275,7 @@ pub(crate) fn configured_fingerprint_for_legacy(
     let version = reader
         .read_u8()
         .map_err(MigrationError::InvalidLegacySnapshot)?;
-    if version != LEGACY_SEMANTIC_V6 && version != LEGACY_SEMANTIC_V7 {
+    if !(LEGACY_SEMANTIC_V6..=LEGACY_SEMANTIC_V8).contains(&version) {
         return Err(MigrationError::InvalidLegacySnapshot(format!(
             "semantic.bin version {version} has no established producer stamps"
         )));
@@ -304,6 +305,9 @@ pub(crate) fn store_live_semantic_blobs(
     let view = ViewStore::open(&request.storage, &request.view)?;
     let mut candidates = Vec::new();
     for file in parsed.files {
+        if file.incomplete {
+            continue;
+        }
         let Some(rel_path) = legacy_path_to_rel_path(&file.path, &root) else {
             continue;
         };
@@ -370,7 +374,7 @@ pub(crate) fn store_live_semantic_blobs(
 
 /// Imports an eligible root's old `semantic.bin` without making embedding requests.
 ///
-/// Compatibility is intentionally strict: V6/V7 snapshots must carry the exact
+/// Compatibility is intentionally strict: V6–V8 snapshots must carry the exact
 /// configured model fingerprint and the current legacy chunking version. Earlier
 /// or unstamped snapshots are recorded as a rebuild request rather than treated as
 /// an import failure. The source snapshot is never deleted or rewritten here.
@@ -405,6 +409,10 @@ pub fn import_legacy_semantic(
     let mut outside_root_rows = 0;
     let mut stale_rows = 0;
     for file in parsed.files {
+        if file.incomplete {
+            skipped_rows += 1;
+            continue;
+        }
         let Some(rel_path) = legacy_path_to_rel_path(&file.path, &root) else {
             outside_root_rows += 1;
             skipped_rows += 1;
@@ -806,6 +814,7 @@ struct LegacyFile {
     path: Vec<u8>,
     content_hash: [u8; 32],
     entries: Vec<LegacyEntry>,
+    incomplete: bool,
 }
 
 struct LegacyEntry {
@@ -826,7 +835,7 @@ fn parse_legacy_snapshot(
 ) -> Result<ParsedLegacySnapshot, String> {
     let mut reader = LegacyReader::new(bytes);
     let version = reader.read_u8()?;
-    if version != LEGACY_SEMANTIC_V6 && version != LEGACY_SEMANTIC_V7 {
+    if !(LEGACY_SEMANTIC_V6..=LEGACY_SEMANTIC_V8).contains(&version) {
         return Err(format!(
             "semantic.bin version {version} has no established producer stamps"
         ));
@@ -870,7 +879,7 @@ fn parse_legacy_snapshot(
     for _ in 0..entry_count {
         let path = reader.read_bytes()?;
         let name = reader.read_string()?;
-        let qualified_name = if version == LEGACY_SEMANTIC_V7 {
+        let qualified_name = if version >= LEGACY_SEMANTIC_V7 {
             let qualified = reader.read_string()?;
             (!qualified.is_empty()).then_some(qualified)
         } else {
@@ -898,6 +907,11 @@ fn parse_legacy_snapshot(
             vector,
         });
     }
+    let incomplete = if version >= LEGACY_SEMANTIC_V8 {
+        parse_skipped_semantic_files(&mut reader, &metadata)?
+    } else {
+        BTreeSet::new()
+    };
     if !reader.is_exhausted() {
         return Err("trailing bytes after semantic snapshot".to_string());
     }
@@ -906,6 +920,7 @@ fn parse_legacy_snapshot(
     for (path, content_hash) in metadata {
         files.push(LegacyFile {
             entries: entries_by_path.remove(&path).unwrap_or_default(),
+            incomplete: incomplete.contains(&path),
             path,
             content_hash,
         });
@@ -919,6 +934,41 @@ fn parse_legacy_snapshot(
         );
     }
     Ok(ParsedLegacySnapshot { files })
+}
+
+/// V8 appends a total and two path/count tables (provider refusal and context
+/// overflow). Neither kind of partial file can vouch for a complete view run.
+/// Leave those files for semantic indexing, which reports any continuing
+/// refusals rather than publishing partial vectors as full coverage.
+fn parse_skipped_semantic_files(
+    reader: &mut LegacyReader<'_>,
+    metadata: &BTreeMap<Vec<u8>, [u8; 32]>,
+) -> Result<BTreeSet<Vec<u8>>, String> {
+    let total = reader.read_u64()?;
+    let mut decoded_total = 0_u64;
+    let mut incomplete = BTreeSet::new();
+    for _ in 0..2 {
+        let count = reader.read_u32()? as usize;
+        if count > MAX_LEGACY_ROWS {
+            return Err("too many skipped semantic files".to_owned());
+        }
+        let mut seen = BTreeSet::new();
+        for _ in 0..count {
+            let path = reader.read_bytes()?;
+            let rows = reader.read_u64()?;
+            decoded_total = decoded_total
+                .checked_add(rows)
+                .ok_or("skipped chunk count overflow")?;
+            if rows == 0 || !metadata.contains_key(&path) || !seen.insert(path.clone()) {
+                return Err("invalid skipped semantic file metadata".to_owned());
+            }
+            incomplete.insert(path);
+        }
+    }
+    if decoded_total > total {
+        return Err("skipped chunk count exceeds total skipped chunks".to_owned());
+    }
+    Ok(incomplete)
 }
 
 fn fingerprint_is_compatible(legacy: &str, configured: &str) -> bool {
@@ -1107,6 +1157,56 @@ mod tests {
             1,
             "control: releasing the handoff must expose the otherwise unreferenced blob"
         );
+    }
+
+    #[test]
+    fn live_semantic_handoff_does_not_cache_refused_files_as_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir_all(root.join("src")).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let healthy = root.join("src/healthy.rs");
+        let refused = root.join("src/refused.rs");
+        let source = b"pub fn entry() {}\n";
+        fs::write(&healthy, source).unwrap();
+        fs::write(&refused, source).unwrap();
+        let mut index = crate::semantic_index::SemanticIndex::build(
+            &root,
+            &[healthy, refused.clone()],
+            &mut |texts: Vec<String>| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect()),
+            64,
+        )
+        .unwrap();
+        let fingerprint = crate::semantic_index::SemanticIndexFingerprint {
+            dimension: 2,
+            chunking_version: 2,
+            ..Default::default()
+        };
+        index.set_fingerprint(fingerprint.clone());
+        index.apply_refused_rows_update(BTreeMap::from([(refused, 1)]));
+        let request = SemanticMigrationRequest::for_root(
+            dir.path().join("storage"),
+            &root,
+            fingerprint.as_string(),
+        );
+        let handoff = store_live_semantic_blobs(&request, &index).unwrap();
+        assert_eq!(handoff.keys.len(), 1);
+        assert!(handoff.keys.contains_key(b"src/healthy.rs".as_slice()));
+        let refused_key = SemanticKey::from_bytes(
+            source,
+            b"src/refused.rs",
+            &request.chunker_version,
+            &request.embed_template_version,
+            &request.configured_model_fingerprint,
+        )
+        .full_key();
+        let store = BlobStore::open(
+            &request.storage,
+            &request.family,
+            crate::blob_store::BlobPlane::Semantic,
+        )
+        .unwrap();
+        assert!(store.get(&refused_key).unwrap().is_none());
     }
 
     #[test]
