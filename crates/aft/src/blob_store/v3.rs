@@ -43,6 +43,7 @@ mod open_tests;
 mod read_audit;
 #[cfg(test)]
 mod replay;
+mod unshared;
 #[doc(hidden)]
 pub use copy::{copy_on_first_use, CopyOutcome, CopySource, SWEEP_LEASE_WAIT};
 
@@ -468,8 +469,47 @@ pub fn allocated_bytes(path: &Path) -> Result<u64> {
 
 /// [`allocated_bytes`], stopping at `deadline`. The deadline is checked before
 /// each directory entry is read, and a walk that reaches it returns `None`:
-/// its partial sum is never a total.
+/// its partial sum is never a total. `path` is a family directory.
 pub fn allocated_bytes_until(path: &Path, deadline: Option<Instant>) -> Result<Option<u64>> {
+    walk_allocated(path, deadline, Level::Family)
+}
+
+/// Where a walk is inside a family directory.
+///
+/// Files under a member view (`views/<scope>` whose scope is not a base) are
+/// charged the bytes they hold alone. A member's derived database is a clone
+/// of its base's, and the base, charged in full, already counts the blocks
+/// they share. Everything else is charged its `stat` bytes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Level {
+    Family,
+    Views,
+    Base,
+    Member,
+    Other,
+}
+
+impl Level {
+    fn child(self, name: &std::ffi::OsStr) -> Self {
+        match self {
+            Self::Family if name == "views" => Self::Views,
+            Self::Family => Self::Other,
+            Self::Views => {
+                let name = name.to_string_lossy();
+                if name.starts_with(crate::views::base_refs::BASE_SCOPE_PREFIX)
+                    || name.starts_with(crate::views::base_refs::TREE_BASE_SCOPE_PREFIX)
+                {
+                    Self::Base
+                } else {
+                    Self::Member
+                }
+            }
+            level => level,
+        }
+    }
+}
+
+fn walk_allocated(path: &Path, deadline: Option<Instant>, level: Level) -> Result<Option<u64>> {
     let mut total = 0u64;
     for entry in fs::read_dir(path)
         .map_err(|e| crate::views::io::at("listing v3 accounting directory", path, e))?
@@ -507,10 +547,13 @@ pub fn allocated_bytes_until(path: &Path, deadline: Option<Instant>) -> Result<O
             }
         };
         if meta.is_dir() {
-            let Some(bytes) = allocated_bytes_until(&entry.path(), deadline)? else {
+            let child = level.child(&entry.file_name());
+            let Some(bytes) = walk_allocated(&entry.path(), deadline, child)? else {
                 return Ok(None);
             };
             total = total.saturating_add(bytes);
+        } else if level == Level::Member && meta.is_file() {
+            total = total.saturating_add(unshared::charge(&path, file_allocated(&meta)));
         } else {
             total = total.saturating_add(file_allocated(&meta));
         }
