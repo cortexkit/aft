@@ -55,24 +55,20 @@ async fn pipeline(stream: TcpStream) {
             .expect("numeric ID");
         let channel = command["channel"].as_u64().unwrap_or(0) as u16;
         let body = match command["op"].as_str().expect("operation") {
-            "bind" => serde_json::to_value(ModuleControlRequest::RouteBind {
-                route_channel: channel,
-                epoch: 1,
-                target: RouteTarget::ToolProvider {
+            "bind" => serde_json::to_value(serde_json::json!({
+"route_channel": channel,
+"epoch": 1,
+"target": RouteTarget::ToolProvider {
                     module_id: "aft".into(),
                 },
-                identity: BindIdentity::new(
-                    PathBuf::from(command["root"].as_str().unwrap()),
-                    "opencode",
-                    format!("views-perf-{channel}"),
-                ),
-                consumer_capabilities: None,
-                principal: Some(Principal::Direct),
-                admission_facts: Default::default(),
-                scope: None,
-                role_versions: None,
-                call_mode: None,
-            })
+"identity": serde_json::json!({"harness": "opencode", "session": format!("views-perf-{channel}"), "project_root": PathBuf::from(command["root"].as_str().unwrap())}),
+"consumer_capabilities": serde_json::Value::Null,
+"principal": Some(Principal::Direct),
+"admission_facts": serde_json::json!({}),
+"scope": None::<subc_protocol::scope::ScopeStamp>,
+"role_versions": serde_json::Value::Null,
+"call_mode": serde_json::Value::Null
+}))
             .unwrap(),
             "tool" => json!({"name":command["name"], "arguments":command["arguments"]}),
             "health" => serde_json::to_value(ModuleControlRequest::HealthCheck {}).unwrap(),
@@ -275,24 +271,20 @@ async fn main() {
         corr += 1;
         let channel = command["channel"].as_u64().unwrap_or(0) as u16;
         let body = match command["op"].as_str().unwrap() {
-            "bind" => serde_json::to_value(ModuleControlRequest::RouteBind {
-                route_channel: channel,
-                epoch: 1,
-                target: RouteTarget::ToolProvider {
+            "bind" => serde_json::to_value(serde_json::json!({
+"route_channel": channel,
+"epoch": 1,
+"target": RouteTarget::ToolProvider {
                     module_id: "aft".into(),
                 },
-                identity: BindIdentity::new(
-                    PathBuf::from(command["root"].as_str().unwrap()),
-                    "opencode",
-                    format!("views-perf-{channel}"),
-                ),
-                consumer_capabilities: None,
-                principal: Some(Principal::Direct),
-                admission_facts: Default::default(),
-                scope: None,
-                role_versions: None,
-                call_mode: None,
-            })
+"identity": serde_json::json!({"harness": "opencode", "session": format!("views-perf-{channel}"), "project_root": PathBuf::from(command["root"].as_str().unwrap())}),
+"consumer_capabilities": serde_json::Value::Null,
+"principal": Some(Principal::Direct),
+"admission_facts": serde_json::json!({}),
+"scope": None::<subc_protocol::scope::ScopeStamp>,
+"role_versions": serde_json::Value::Null,
+"call_mode": serde_json::Value::Null
+}))
             .unwrap(),
             "health" => serde_json::to_value(ModuleControlRequest::HealthCheck {}).unwrap(),
             "tool" => json!({"name":command["name"],"arguments":command["arguments"]}),

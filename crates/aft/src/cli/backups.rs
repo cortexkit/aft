@@ -413,7 +413,6 @@ async fn purge_via_daemon(connection_file: PathBuf, request: &PurgeRequest) -> O
                 module_id: "aft".to_string(),
             },
             BindIdentity::new(
-                project_root,
                 "aft-backups-purge",
                 format!("aft-backups-purge-{}", std::process::id()),
             ),

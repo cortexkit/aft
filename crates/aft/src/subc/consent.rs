@@ -196,7 +196,6 @@ struct SubcConsentTransport {
 // and role versions are fixed for this transport's consent opens.
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct ConsentRouteKey {
-    project_root: PathBuf,
     harness: String,
     session: String,
     scope_owner: String,
@@ -207,7 +206,6 @@ struct ConsentRouteKey {
 impl ConsentRouteKey {
     fn new(identity: &subc_protocol::BindIdentity, scope: &ScopeSelector) -> Self {
         Self {
-            project_root: identity.project_root.clone(),
             harness: identity.harness.clone(),
             session: identity.session.clone(),
             scope_owner: serde_json::to_string(&scope.owner)
@@ -384,11 +382,7 @@ impl SubcConsentTransport {
         use subc_client_rs::{CallError, CallOptions};
         let body = encode(call.method, &call.params)?;
         let consumer = self.consumer().await?;
-        let identity = subc_protocol::BindIdentity::new(
-            call.project_root.clone(),
-            "aft-consent",
-            call.session.clone(),
-        );
+        let identity = subc_protocol::BindIdentity::new("aft-consent", call.session.clone());
         let options = CallOptions {
             consumer_identity: crate::launch_nonce::consumer_identity(),
             timeout: call.timeout,

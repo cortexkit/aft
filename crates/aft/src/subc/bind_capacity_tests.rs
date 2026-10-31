@@ -33,26 +33,26 @@ async fn exhausted_bind(tool: bool, completion_capacity: bool) {
             );
         }
     }
-    let request = ModuleControlRequest::RouteBind {
-        route_channel: 7,
-        epoch: 1,
-        target: if tool {
-            RouteTarget::ToolProvider {
-                module_id: "aft".into(),
-            }
-        } else {
-            RouteTarget::ManagementSurface {
-                module_id: "aft".into(),
-            }
-        },
-        identity: subc_protocol::BindIdentity::new(root.as_path(), "pi", "capacity"),
-        principal: Some(Principal::Direct),
-        consumer_capabilities: None,
-        admission_facts: Default::default(),
-        scope: None,
-        role_versions: None,
-        call_mode: None,
-    };
+    let request = serde_json::json!({
+    "route_channel": 7,
+    "epoch": 1,
+    "target": if tool {
+                RouteTarget::ToolProvider {
+                    module_id: "aft".into(),
+                }
+            } else {
+                RouteTarget::ManagementSurface {
+                    module_id: "aft".into(),
+                }
+            },
+    "identity": serde_json::json!({"harness": "pi", "session": "capacity", "project_root": root.as_path()}),
+    "principal": Some(Principal::Direct),
+    "consumer_capabilities": serde_json::Value::Null,
+    "admission_facts": serde_json::json!({}),
+    "scope": None::<subc_protocol::scope::ScopeStamp>,
+    "role_versions": serde_json::Value::Null,
+    "call_mode": serde_json::Value::Null
+    });
     let frame = Frame::build(
         FrameType::Request,
         control_flags(),

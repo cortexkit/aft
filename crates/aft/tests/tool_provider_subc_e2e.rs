@@ -204,7 +204,7 @@ async fn open(
             RouteTarget::ToolProvider {
                 module_id: "aft".into(),
             },
-            BindIdentity::new(project, "runner", session),
+            BindIdentity::new("runner", session),
             options(role_versions),
         )
         .await

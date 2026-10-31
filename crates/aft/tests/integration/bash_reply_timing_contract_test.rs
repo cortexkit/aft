@@ -1229,25 +1229,21 @@ async fn bind_route(stream: &mut TcpStream, root: &Path, v1: bool) {
     )
     .expect("write project config");
 
-    let request = ModuleControlRequest::RouteBind {
-        route_channel: ROUTE_CHANNEL,
-        epoch: 1,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".to_string(),
-        },
-        identity: BindIdentity::new(
-            root.to_path_buf(),
-            "opencode".to_string(),
-            SESSION_ID.to_string(),
-        ),
-        principal: Some(Principal::Direct),
-        consumer_capabilities: None,
-        admission_facts: Default::default(),
-        scope: None,
-        call_mode: None,
-        role_versions: v1
-            .then(|| std::collections::BTreeMap::from([("tool-provider".into(), "v1".into())])),
-    };
+    let request = serde_json::json!({
+    "route_channel": ROUTE_CHANNEL,
+    "epoch": 1,
+    "target": RouteTarget::ToolProvider {
+                module_id: "aft".to_string(),
+            },
+    "identity": serde_json::json!({"harness": "opencode".to_string(), "session": SESSION_ID.to_string(), "project_root": root.to_path_buf()}),
+    "principal": Some(Principal::Direct),
+    "consumer_capabilities": serde_json::Value::Null,
+    "admission_facts": serde_json::json!({}),
+    "scope": None::<subc_protocol::scope::ScopeStamp>,
+    "call_mode": serde_json::Value::Null,
+    "role_versions": v1
+                .then(|| std::collections::BTreeMap::from([("tool-provider".into(), "v1".into())]))
+    });
     send_frame(
         stream,
         Frame::build(

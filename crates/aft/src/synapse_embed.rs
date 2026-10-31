@@ -1492,7 +1492,6 @@ impl SynapseState {
                     module_id: SYNAPSE_MODULE_ID.to_string(),
                 },
                 BindIdentity::new(
-                    self.route_project_root.to_string_lossy().into_owned(),
                     self.route_harness.clone(),
                     format!("aft-semantic-{}", std::process::id()),
                 ),

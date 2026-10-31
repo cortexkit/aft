@@ -3523,24 +3523,20 @@ async fn drive_undecodable_control_request_daemon(input: FakeDaemonInput) {
         mut stream, root1, ..
     } = open_fake_daemon_session(input).await;
 
-    let mut request = serde_json::to_value(ModuleControlRequest::RouteBind {
-        route_channel: 11,
-        epoch: 1,
-        target: RouteTarget::ToolProvider {
+    let mut request = serde_json::to_value(serde_json::json!({
+"route_channel": 11,
+"epoch": 1,
+"target": RouteTarget::ToolProvider {
             module_id: "aft".to_string(),
         },
-        identity: BindIdentity::new(
-            root1.clone(),
-            "opencode".to_string(),
-            "session-11".to_string(),
-        ),
-        principal: Some(Principal::Direct),
-        consumer_capabilities: None,
-        admission_facts: Default::default(),
-        scope: None,
-        role_versions: None,
-        call_mode: None,
-    })
+"identity": serde_json::json!({"harness": "opencode".to_string(), "session": "session-11".to_string(), "project_root": root1.clone()}),
+"principal": Some(Principal::Direct),
+"consumer_capabilities": serde_json::Value::Null,
+"admission_facts": serde_json::json!({}),
+"scope": None::<subc_protocol::scope::ScopeStamp>,
+"role_versions": serde_json::Value::Null,
+"call_mode": serde_json::Value::Null
+}))
     .expect("route bind body");
     // The control request is internally tagged (`op`), so the bind fields sit
     // at the top level.
@@ -4288,24 +4284,20 @@ async fn drive_s1_rejection_daemon(
     .await;
 
     // An mcp:* front binds a route with a CLEAN config (no marker).
-    let bind = ModuleControlRequest::RouteBind {
-        route_channel: 1,
-        epoch: 1,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".to_string(),
-        },
-        identity: BindIdentity::new(
-            root.clone(),
-            "mcp:generic".to_string(),
-            "s1-session".to_string(),
-        ),
-        principal: Some(Principal::Direct),
-        consumer_capabilities: None,
-        admission_facts: Default::default(),
-        scope: None,
-        role_versions: None,
-        call_mode: None,
-    };
+    let bind = serde_json::json!({
+    "route_channel": 1,
+    "epoch": 1,
+    "target": RouteTarget::ToolProvider {
+                module_id: "aft".to_string(),
+            },
+    "identity": serde_json::json!({"harness": "mcp:generic".to_string(), "session": "s1-session".to_string(), "project_root": root.clone()}),
+    "principal": Some(Principal::Direct),
+    "consumer_capabilities": serde_json::Value::Null,
+    "admission_facts": serde_json::json!({}),
+    "scope": None::<subc_protocol::scope::ScopeStamp>,
+    "role_versions": serde_json::Value::Null,
+    "call_mode": serde_json::Value::Null
+    });
     send_frame(
         &mut stream,
         Frame::build(
@@ -4546,24 +4538,20 @@ async fn drive_readiness_daemon(
     assert_ne!(flip_corrs[0], flip_corrs[1], "each retry is a new request");
 
     // Sessions bind as before.
-    let bind = ModuleControlRequest::RouteBind {
-        route_channel: 1,
-        epoch: 1,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".to_string(),
-        },
-        identity: BindIdentity::new(
-            root.clone(),
-            "mcp:generic".to_string(),
-            "readiness-session".to_string(),
-        ),
-        principal: Some(Principal::Direct),
-        consumer_capabilities: None,
-        admission_facts: Default::default(),
-        scope: None,
-        role_versions: None,
-        call_mode: None,
-    };
+    let bind = serde_json::json!({
+    "route_channel": 1,
+    "epoch": 1,
+    "target": RouteTarget::ToolProvider {
+                module_id: "aft".to_string(),
+            },
+    "identity": serde_json::json!({"harness": "mcp:generic".to_string(), "session": "readiness-session".to_string(), "project_root": root.clone()}),
+    "principal": Some(Principal::Direct),
+    "consumer_capabilities": serde_json::Value::Null,
+    "admission_facts": serde_json::json!({}),
+    "scope": None::<subc_protocol::scope::ScopeStamp>,
+    "role_versions": serde_json::Value::Null,
+    "call_mode": serde_json::Value::Null
+    });
     send_frame(
         &mut stream,
         Frame::build(
@@ -11723,24 +11711,20 @@ async fn send_route_bind_with_elicitation_capability(
 ) {
     write_bind_project_config(root, &minimal_bind_doc());
 
-    let body = ModuleControlRequest::RouteBind {
-        route_channel,
-        epoch: 1,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".to_string(),
-        },
-        identity: BindIdentity::new(
-            root.to_path_buf(),
-            "runner".to_string(),
-            format!("elicitation-session-{route_channel}"),
-        ),
-        principal: Some(subc_mcp_principal()),
-        consumer_capabilities: Some(vec!["elicitation".to_string()]),
-        admission_facts: Default::default(),
-        scope: None,
-        role_versions: None,
-        call_mode: None,
-    };
+    let body = serde_json::json!({
+    "route_channel": route_channel,
+    "epoch": 1,
+    "target": RouteTarget::ToolProvider {
+                module_id: "aft".to_string(),
+            },
+    "identity": serde_json::json!({"harness": "runner".to_string(), "session": format!("elicitation-session-{route_channel}"), "project_root": root.to_path_buf()}),
+    "principal": Some(subc_mcp_principal()),
+    "consumer_capabilities": Some(vec!["elicitation".to_string()]),
+    "admission_facts": serde_json::json!({}),
+    "scope": None::<subc_protocol::scope::ScopeStamp>,
+    "role_versions": serde_json::Value::Null,
+    "call_mode": serde_json::Value::Null
+    });
     send_frame(
         stream,
         Frame::build(
@@ -12811,24 +12795,20 @@ async fn drive_malformed_fed_harness_bind_production_daemon(
     )
     .await;
 
-    let bind = ModuleControlRequest::RouteBind {
-        route_channel: 1,
-        epoch: 1,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".to_string(),
-        },
-        identity: BindIdentity::new(
-            root,
-            "fed:".to_string(),
-            "fed-malformed-session".to_string(),
-        ),
-        principal: Some(Principal::Direct),
-        consumer_capabilities: None,
-        admission_facts: Default::default(),
-        scope: None,
-        role_versions: None,
-        call_mode: None,
-    };
+    let bind = serde_json::json!({
+    "route_channel": 1,
+    "epoch": 1,
+    "target": RouteTarget::ToolProvider {
+                module_id: "aft".to_string(),
+            },
+    "identity": serde_json::json!({"harness": "fed:".to_string(), "session": "fed-malformed-session".to_string(), "project_root": root}),
+    "principal": Some(Principal::Direct),
+    "consumer_capabilities": serde_json::Value::Null,
+    "admission_facts": serde_json::json!({}),
+    "scope": None::<subc_protocol::scope::ScopeStamp>,
+    "role_versions": serde_json::Value::Null,
+    "call_mode": serde_json::Value::Null
+    });
     send_frame(
         &mut stream,
         Frame::build(
@@ -13793,20 +13773,20 @@ async fn drive_management_surface_daemon(input: FakeDaemonInput) {
     send_control_request(
         &mut stream,
         340,
-        ModuleControlRequest::RouteBind {
-            route_channel: 6,
-            epoch: 1,
-            target: RouteTarget::ToolProvider {
+        serde_json::json!({
+"route_channel": 6,
+"epoch": 1,
+"target": RouteTarget::ToolProvider {
                 module_id: "aft".into(),
             },
-            identity: BindIdentity::new(root1.clone(), "opencode", "census-scoped"),
-            principal: Some(owner),
-            scope: Some(stamp),
-            consumer_capabilities: None,
-            admission_facts: Default::default(),
-            role_versions: None,
-            call_mode: None,
-        },
+"identity": serde_json::json!({"harness": "opencode", "session": "census-scoped", "project_root": root1.clone()}),
+"principal": Some(owner),
+"scope": { let scope: Option<subc_protocol::scope::ScopeStamp> = Some(stamp); scope.map(|mut stamp| { if stamp.workdir.is_none() { stamp.workdir = Some(std::path::Path::new(&(root1.clone())).to_string_lossy().into_owned()); } stamp }) },
+"consumer_capabilities": serde_json::Value::Null,
+"admission_facts": serde_json::json!({}),
+"role_versions": serde_json::Value::Null,
+"call_mode": serde_json::Value::Null
+}),
     )
     .await;
     expect_route_bind_ack(&mut stream, 340).await;
@@ -14795,24 +14775,20 @@ async fn send_management_route_bind_with_harness(
     send_control_request(
         stream,
         corr,
-        ModuleControlRequest::RouteBind {
-            route_channel,
-            epoch: 1,
-            target: RouteTarget::ManagementSurface {
+        serde_json::json!({
+"route_channel": route_channel,
+"epoch": 1,
+"target": RouteTarget::ManagementSurface {
                 module_id: "aft".to_string(),
             },
-            identity: BindIdentity::new(
-                identity_root.to_path_buf(),
-                harness.to_string(),
-                "management-route-must-not-register-session".to_string(),
-            ),
-            principal,
-            consumer_capabilities: None,
-            admission_facts: Default::default(),
-            scope: None,
-            role_versions: None,
-            call_mode: None,
-        },
+"identity": serde_json::json!({"harness": harness.to_string(), "session": "management-route-must-not-register-session".to_string(), "project_root": identity_root.to_path_buf()}),
+"principal": principal,
+"consumer_capabilities": serde_json::Value::Null,
+"admission_facts": serde_json::json!({}),
+"scope": None::<subc_protocol::scope::ScopeStamp>,
+"role_versions": serde_json::Value::Null,
+"call_mode": serde_json::Value::Null
+}),
     )
     .await;
 }
@@ -15000,20 +14976,20 @@ async fn send_route_bind_with_harness_session_principal_and_doc_epoch(
     // production; keeping it asserts it's harmlessly ignored.
     write_bind_project_config(root, &doc);
 
-    let request = ModuleControlRequest::RouteBind {
-        route_channel,
-        epoch,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".to_string(),
-        },
-        identity: BindIdentity::new(root.to_path_buf(), harness.to_string(), session.to_string()),
-        principal,
-        consumer_capabilities,
-        admission_facts: Default::default(),
-        scope: None,
-        role_versions: None,
-        call_mode: None,
-    };
+    let request = serde_json::json!({
+    "route_channel": route_channel,
+    "epoch": epoch,
+    "target": RouteTarget::ToolProvider {
+                module_id: "aft".to_string(),
+            },
+    "identity": serde_json::json!({"harness": harness.to_string(), "session": session.to_string(), "project_root": root.to_path_buf()}),
+    "principal": principal,
+    "consumer_capabilities": consumer_capabilities,
+    "admission_facts": serde_json::json!({}),
+    "scope": None::<subc_protocol::scope::ScopeStamp>,
+    "role_versions": serde_json::Value::Null,
+    "call_mode": serde_json::Value::Null
+    });
     send_frame(
         stream,
         Frame::build(

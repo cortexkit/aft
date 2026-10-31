@@ -20,20 +20,20 @@ async fn bind_scoped_worker(stream: &mut tokio::net::TcpStream, root: &std::path
     send_control_request(
         stream,
         WORKER_CHANNEL as u64,
-        ModuleControlRequest::RouteBind {
-            route_channel: WORKER_CHANNEL,
-            epoch: 1,
-            target: RouteTarget::ToolProvider {
+        serde_json::json!({
+"route_channel": WORKER_CHANNEL,
+"epoch": 1,
+"target": RouteTarget::ToolProvider {
                 module_id: "aft".into(),
             },
-            identity: BindIdentity::new(root, "opencode", "confine-admission-worker"),
-            principal: Some(Principal::Direct),
-            consumer_capabilities: None,
-            admission_facts: Default::default(),
-            scope: Some(scope),
-            role_versions: None,
-            call_mode: None,
-        },
+"identity": serde_json::json!({"harness": "opencode", "session": "confine-admission-worker", "project_root": root}),
+"principal": Some(Principal::Direct),
+"consumer_capabilities": serde_json::Value::Null,
+"admission_facts": serde_json::json!({}),
+"scope": { let scope: Option<subc_protocol::scope::ScopeStamp> = Some(scope); scope.map(|mut stamp| { if stamp.workdir.is_none() { stamp.workdir = Some(std::path::Path::new(&(root)).to_string_lossy().into_owned()); } stamp }) },
+"role_versions": serde_json::Value::Null,
+"call_mode": serde_json::Value::Null
+}),
     )
     .await;
     expect_route_bind_ack(stream, WORKER_CHANNEL as u64).await;

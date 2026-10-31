@@ -1937,16 +1937,7 @@ impl SubcRelayTransport {
         body: Value,
     ) -> Result<Value, TransportError> {
         let consumer = self.consumer().await?;
-        let identity = subc_protocol::BindIdentity::new(
-            if project_root.is_empty() {
-                "/"
-            } else {
-                project_root
-            }
-            .to_string(),
-            "aft-gh-relay",
-            session.to_string(),
-        );
+        let identity = subc_protocol::BindIdentity::new("aft-gh-relay", session.to_string());
         let mut options = subc_client_rs::CallOptions {
             consumer_identity: crate::launch_nonce::consumer_identity(),
             ..subc_client_rs::CallOptions::default()

@@ -295,20 +295,20 @@ async fn tool_result_ast_search_t6_complete_and_budget_cut_on_negotiated_route()
     )
     .await
     .unwrap();
-    let bind = ModuleControlRequest::RouteBind {
-        route_channel: 1,
-        epoch: 1,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".into(),
-        },
-        identity: subc_protocol::BindIdentity::new(&root, "opencode", "ast-t6"),
-        principal: Some(Principal::Direct),
-        consumer_capabilities: Some(vec![result_body::RESULT_FORMAT.to_owned()]),
-        admission_facts: Default::default(),
-        scope: None,
-        role_versions: None,
-        call_mode: None,
-    };
+    let bind = serde_json::json!({
+    "route_channel": 1,
+    "epoch": 1,
+    "target": RouteTarget::ToolProvider {
+                module_id: "aft".into(),
+            },
+    "identity": serde_json::json!({"harness": "opencode", "session": "ast-t6", "project_root": &root}),
+    "principal": Some(Principal::Direct),
+    "consumer_capabilities": Some(vec![result_body::RESULT_FORMAT.to_owned()]),
+    "admission_facts": serde_json::json!({}),
+    "scope": None::<subc_protocol::scope::ScopeStamp>,
+    "role_versions": serde_json::Value::Null,
+    "call_mode": serde_json::Value::Null
+    });
     write_frame(
         &mut daemon,
         &Frame::build(
@@ -623,20 +623,20 @@ async fn tool_result_capability_is_selected_per_bind_not_per_call() {
         (2, Some(vec!["content/v1".to_owned()])),
         (3, None),
     ] {
-        let bind = ModuleControlRequest::RouteBind {
-            route_channel: channel,
-            epoch: 1,
-            target: RouteTarget::ToolProvider {
-                module_id: "aft".into(),
-            },
-            identity: subc_protocol::BindIdentity::new(&root, "opencode", "result-bodies"),
-            principal: Some(Principal::Direct),
-            consumer_capabilities: capabilities,
-            admission_facts: Default::default(),
-            scope: None,
-            role_versions: None,
-            call_mode: None,
-        };
+        let bind = serde_json::json!({
+        "route_channel": channel,
+        "epoch": 1,
+        "target": RouteTarget::ToolProvider {
+                        module_id: "aft".into(),
+                    },
+        "identity": serde_json::json!({"harness": "opencode", "session": "result-bodies", "project_root": &root}),
+        "principal": Some(Principal::Direct),
+        "consumer_capabilities": capabilities,
+        "admission_facts": serde_json::json!({}),
+        "scope": None::<subc_protocol::scope::ScopeStamp>,
+        "role_versions": serde_json::Value::Null,
+        "call_mode": serde_json::Value::Null
+        });
         write_frame(
             &mut daemon,
             &Frame::build(
@@ -787,20 +787,20 @@ async fn tool_result_non_negotiating_routes_keep_legacy_success_and_error_bytes(
     .unwrap();
     let mut replies = Vec::new();
     for (channel, capabilities) in [(1, None), (2, Some(vec!["content/v1".to_owned()]))] {
-        let bind = ModuleControlRequest::RouteBind {
-            route_channel: channel,
-            epoch: 1,
-            target: RouteTarget::ToolProvider {
-                module_id: "aft".into(),
-            },
-            identity: subc_protocol::BindIdentity::new(&root, "opencode", "legacy-result-bytes"),
-            principal: Some(Principal::Direct),
-            consumer_capabilities: capabilities,
-            admission_facts: Default::default(),
-            scope: None,
-            role_versions: None,
-            call_mode: None,
-        };
+        let bind = serde_json::json!({
+        "route_channel": channel,
+        "epoch": 1,
+        "target": RouteTarget::ToolProvider {
+                        module_id: "aft".into(),
+                    },
+        "identity": serde_json::json!({"harness": "opencode", "session": "legacy-result-bytes", "project_root": &root}),
+        "principal": Some(Principal::Direct),
+        "consumer_capabilities": capabilities,
+        "admission_facts": serde_json::json!({}),
+        "scope": None::<subc_protocol::scope::ScopeStamp>,
+        "role_versions": serde_json::Value::Null,
+        "call_mode": serde_json::Value::Null
+        });
         write_frame(
             &mut daemon,
             &Frame::build(

@@ -3223,11 +3223,7 @@ fn probe_governance(
             *stage_handle.lock().unwrap() = ProbeStage::OpenRoute;
             // `BindIdentity::new` sends no registered project id; the shim
             // never resolved one before the field existed.
-            let identity = BindIdentity::new(
-                project_root.to_string_lossy().into_owned(),
-                "aft-gh-shim",
-                gh_session_id(&agent_id),
-            );
+            let identity = BindIdentity::new("aft-gh-shim", gh_session_id(&agent_id));
             let route = consumer
                 .open_route(
                     RouteTarget::ManagementSurface {

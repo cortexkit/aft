@@ -300,11 +300,7 @@ fn fetch_management_census(
                 RouteTarget::ManagementSurface {
                     module_id: "aft".to_string(),
                 },
-                BindIdentity::new(
-                    project_root,
-                    "aft-profile",
-                    format!("aft-profile-{}", std::process::id()),
-                ),
+                BindIdentity::new("aft-profile", format!("aft-profile-{}", std::process::id())),
                 CallOptions::default(),
             )
             .await

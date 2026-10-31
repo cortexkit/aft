@@ -1438,11 +1438,7 @@ pub(super) fn route(
             let route = consumer
                 .open_route(
                     RouteTarget::ManagementSurface { module_id },
-                    BindIdentity::new(
-                        project_root.to_string_lossy().into_owned(),
-                        "aft-gh-shim",
-                        gh_session_id(&agent_binding.agent_id),
-                    ),
+                    BindIdentity::new("aft-gh-shim", gh_session_id(&agent_binding.agent_id)),
                     CallOptions::default(),
                 )
                 .await
@@ -1680,7 +1676,7 @@ fn session_context(relay: &RelayContext) -> Result<Option<SessionContext>, Strin
             let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
             let route = consumer.open_route(
                 RouteTarget::ManagementSurface { module_id: RELAY_MODULE_ID.to_string() },
-                BindIdentity::new(project_root_for(&cwd).to_string_lossy().into_owned(), "aft-gh-shim", "gh-read-session"),
+                BindIdentity::new("aft-gh-shim", "gh-read-session"),
                 CallOptions::default(),
             ).await.map_err(|error| format!("worker read session lookup is unavailable; restart the AFT daemon: {error}"))?;
             let request = json!({"op": crate::gh_shim_relay::SESSION_CONTEXT_OPERATION, "params": {"ticket": ticket}});
@@ -1741,7 +1737,7 @@ pub(super) fn read_request(relay: &RelayContext, request: &Value) -> Result<Valu
                 let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
                 let route = consumer.open_route(
                     RouteTarget::ManagementSurface { module_id: RELAY_MODULE_ID.to_string() },
-                    BindIdentity::new(project_root_for(&cwd).to_string_lossy().into_owned(), "aft-gh-shim", "gh-read-request"),
+                    BindIdentity::new("aft-gh-shim", "gh-read-request"),
                     CallOptions::default(),
                 ).await.map_err(|error| error.to_string())?;
                 Ok::<_, String>((consumer, route))

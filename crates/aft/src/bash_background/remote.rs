@@ -2789,7 +2789,6 @@ impl BgTaskRegistry {
                     if let Ok(Ok(reconnected)) = tokio::time::timeout(
                         Duration::from_millis(expires.saturating_sub(unix_millis())),
                         client.reopen_route(subc_protocol::BindIdentity::new(
-                            root.display().to_string(),
                             remote.harness.clone(),
                             remote.session.clone(),
                         )),
@@ -3064,7 +3063,6 @@ impl BgTaskRegistry {
                     Ok(path) => ExecRemoteClient::connect(
                         path,
                         subc_protocol::BindIdentity::new(
-                            root.display().to_string(),
                             remote.harness.clone(),
                             remote.session.clone(),
                         ),
@@ -3889,7 +3887,6 @@ impl BgTaskRegistry {
             recovery.pause(point.job_id).await?;
             if let Some(path) = &remote.connection_file {
                 let identity = subc_protocol::BindIdentity::new(
-                    root.display().to_string(),
                     remote.harness.clone(),
                     remote.session.clone(),
                 );
@@ -4640,11 +4637,7 @@ async fn cancel_unknown_remote(metadata: &PersistedTask, job_id: Uuid) -> Result
     let root = metadata.project_root.as_deref().unwrap_or(Path::new("/"));
     let client = ExecRemoteClient::connect(
         connection,
-        subc_protocol::BindIdentity::new(
-            root.display().to_string(),
-            remote.harness.clone(),
-            remote.session.clone(),
-        ),
+        subc_protocol::BindIdentity::new(remote.harness.clone(), remote.session.clone()),
     )
     .await
     .map_err(|error| error.to_string())?;
@@ -5221,11 +5214,7 @@ async fn cancel_with_backoff(
     for attempt in 1..=OWED_CANCEL_ATTEMPTS {
         let result = match ExecRemoteClient::connect(
             connection,
-            subc_protocol::BindIdentity::new(
-                root.display().to_string(),
-                remote.harness.clone(),
-                remote.session.clone(),
-            ),
+            subc_protocol::BindIdentity::new(remote.harness.clone(), remote.session.clone()),
         )
         .await
         {

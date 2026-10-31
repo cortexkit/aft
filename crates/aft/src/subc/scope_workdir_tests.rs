@@ -106,20 +106,20 @@ fn bind_observed(
                 lossy_seq: Arc::new(AtomicU64::new(0)),
                 fleet_status_client: FleetStatusClient::channel(1).0,
             };
-            let request = ModuleControlRequest::RouteBind {
-                route_channel: 7,
-                epoch: 1,
-                target: RouteTarget::ToolProvider {
+            let request = serde_json::json!({
+"route_channel": 7,
+"epoch": 1,
+"target": RouteTarget::ToolProvider {
                     module_id: "aft".into(),
                 },
-                identity: subc_protocol::BindIdentity::new(root, "opencode", "folder-session"),
-                principal: Some(Principal::Direct),
-                consumer_capabilities: None,
-                admission_facts: Default::default(),
-                scope: scope.clone(),
-                role_versions: None,
-                call_mode: None,
-            };
+"identity": serde_json::json!({"harness": "opencode", "session": "folder-session", "project_root": root}),
+"principal": Some(Principal::Direct),
+"consumer_capabilities": serde_json::Value::Null,
+"admission_facts": serde_json::json!({}),
+"scope": { let scope: Option<subc_protocol::scope::ScopeStamp> = scope.clone(); scope.map(|mut stamp| { if stamp.workdir.is_none() { stamp.workdir = Some(std::path::Path::new(&(root)).to_string_lossy().into_owned()); } stamp }) },
+"role_versions": serde_json::Value::Null,
+"call_mode": serde_json::Value::Null
+});
             let frame = Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -462,7 +462,7 @@ fn scope_workdir_full_diagnostic_capacity_preserves_shared_file_reads() {
                 held.reached.recv_timeout(Duration::from_secs(2)).unwrap();
                 busy_reads.push((held, worker));
             }
-            let identity = subc_protocol::BindIdentity::new(&root, "opencode", "capacity-session");
+            let identity = subc_protocol::BindIdentity::new("opencode", "capacity-session");
             let mut held_diagnostics = Vec::new();
             let mut observed = Vec::new();
             for index in 0..MAX_SCOPE_WORKDIR_DIAGNOSTICS {
@@ -470,7 +470,7 @@ fn scope_workdir_full_diagnostic_capacity_preserves_shared_file_reads() {
                 let held = crate::bounded_io::stall_running_helper(&path);
                 observed.push(observe_next_comparison());
                 let scope = stamp().with_workdir(Some(path.to_string_lossy().into_owned()));
-                schedule_scope_workdir_comparison(&identity, Some(&scope));
+                schedule_scope_workdir_comparison(&identity, Some(&root), Some(&scope));
                 held.reached.recv_timeout(Duration::from_secs(1)).unwrap();
                 held_diagnostics.push(held);
             }
@@ -481,11 +481,11 @@ fn scope_workdir_full_diagnostic_capacity_preserves_shared_file_reads() {
             let scope = stamp().with_workdir(Some(
                 root.join("another-workdir").to_string_lossy().into_owned(),
             ));
-            schedule_scope_workdir_comparison(&identity, Some(&scope));
+            schedule_scope_workdir_comparison(&identity, Some(&root), Some(&scope));
             let duplicate = stamp().with_workdir(Some(
                 root.join("held-workdir-0").to_string_lossy().into_owned(),
             ));
-            schedule_scope_workdir_comparison(&identity, Some(&duplicate));
+            schedule_scope_workdir_comparison(&identity, Some(&root), Some(&duplicate));
             let bytes = crate::bounded_io::with_budget(
                 Some(crate::bounded_io::Budget::after(Duration::from_secs(1))),
                 || crate::bounded_io::read(&healthy_file, None),
@@ -585,7 +585,7 @@ fn scope_workdir_mismatch_logs_once_and_binds_stamped_project() {
     assert_eq!(lines.len(), 1, "{lines:?}");
     let line = &lines[0];
     assert!(
-        line.starts_with("INFO subc scope workdir differs:"),
+        line.starts_with("WARN subc scope workdir differs:"),
         "{line}"
     );
     for value in [

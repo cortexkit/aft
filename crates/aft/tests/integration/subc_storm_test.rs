@@ -2465,24 +2465,20 @@ fn send_bind_epoch(
     doc: Value,
 ) {
     publish_storm_project_config(root, &doc);
-    let request = ModuleControlRequest::RouteBind {
-        route_channel: channel,
-        epoch,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".to_string(),
-        },
-        identity: BindIdentity::new(
-            root.to_path_buf(),
-            "opencode".to_string(),
-            session.to_string(),
-        ),
-        consumer_capabilities: None,
-        principal: Some(Principal::Direct),
-        admission_facts: Default::default(),
-        scope: None,
-        role_versions: None,
-        call_mode: None,
-    };
+    let request = serde_json::json!({
+    "route_channel": channel,
+    "epoch": epoch,
+    "target": RouteTarget::ToolProvider {
+                module_id: "aft".to_string(),
+            },
+    "identity": serde_json::json!({"harness": "opencode".to_string(), "session": session.to_string(), "project_root": root.to_path_buf()}),
+    "consumer_capabilities": serde_json::Value::Null,
+    "principal": Some(Principal::Direct),
+    "admission_facts": serde_json::json!({}),
+    "scope": None::<subc_protocol::scope::ScopeStamp>,
+    "role_versions": serde_json::Value::Null,
+    "call_mode": serde_json::Value::Null
+    });
     send_control(tx, corr, request);
 }
 
@@ -2494,24 +2490,20 @@ async fn write_measure_bind(
 ) {
     publish_storm_project_config(root, &storm_project_config(false, false, false, 0));
     let corr = 700_000 + u64::from(channel);
-    let request = ModuleControlRequest::RouteBind {
-        route_channel: channel,
-        epoch: 1,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".to_string(),
-        },
-        identity: BindIdentity::new(
-            root.to_path_buf(),
-            "opencode".to_string(),
-            session.to_string(),
-        ),
-        consumer_capabilities: None,
-        principal: Some(Principal::Direct),
-        admission_facts: Default::default(),
-        scope: None,
-        role_versions: None,
-        call_mode: None,
-    };
+    let request = serde_json::json!({
+    "route_channel": channel,
+    "epoch": 1,
+    "target": RouteTarget::ToolProvider {
+                module_id: "aft".to_string(),
+            },
+    "identity": serde_json::json!({"harness": "opencode".to_string(), "session": session.to_string(), "project_root": root.to_path_buf()}),
+    "consumer_capabilities": serde_json::Value::Null,
+    "principal": Some(Principal::Direct),
+    "admission_facts": serde_json::json!({}),
+    "scope": None::<subc_protocol::scope::ScopeStamp>,
+    "role_versions": serde_json::Value::Null,
+    "call_mode": serde_json::Value::Null
+    });
     let frame = Frame::build(
         FrameType::Request,
         Flags::new(false, Priority::Passive, false),

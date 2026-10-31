@@ -118,20 +118,20 @@ async fn real_bind_dispatch_scope_survives_config_edits_before_executor_admissio
         lossy_seq: Arc::new(AtomicU64::new(0)),
         fleet_status_client: FleetStatusClient::channel(1).0,
     };
-    let request = ModuleControlRequest::RouteBind {
-        route_channel: 7,
-        epoch: 1,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".into(),
-        },
-        identity: subc_protocol::BindIdentity::new(root.as_path(), "pi", "prepared-bind"),
-        principal: Some(subc_protocol::Principal::Direct),
-        consumer_capabilities: None,
-        admission_facts: Default::default(),
-        scope: None,
-        role_versions: None,
-        call_mode: None,
-    };
+    let request = serde_json::json!({
+    "route_channel": 7,
+    "epoch": 1,
+    "target": RouteTarget::ToolProvider {
+                module_id: "aft".into(),
+            },
+    "identity": serde_json::json!({"harness": "pi", "session": "prepared-bind", "project_root": root.as_path()}),
+    "principal": Some(subc_protocol::Principal::Direct),
+    "consumer_capabilities": serde_json::Value::Null,
+    "admission_facts": serde_json::json!({}),
+    "scope": None::<subc_protocol::scope::ScopeStamp>,
+    "role_versions": serde_json::Value::Null,
+    "call_mode": serde_json::Value::Null
+    });
     let frame = Frame::build(
         FrameType::Request,
         control_flags(),

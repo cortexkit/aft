@@ -3149,38 +3149,38 @@ async fn bind_route_stamped_with_mode(
     let wire = handle.wire.clone();
     let channel = wire.next_channel.fetch_add(1, Ordering::SeqCst);
     let corr = wire.corr();
-    let bind = ModuleControlRequest::RouteBind {
-        route_channel: channel,
-        epoch: 1,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".into(),
-        },
-        identity: BindIdentity::new(project, harness, session),
-        principal: Some(decode_principal(&stamp.principal)?),
-        consumer_capabilities,
-        admission_facts: None,
-        scope: stamp
-            .scope
-            .as_ref()
-            .map(|scope| {
-                Ok(subc_protocol::scope::ScopeStamp::new(
-                    decode_principal(&scope.owner)?,
-                    scope.scope_ref.clone(),
-                    scope.scope_epoch,
-                    subc_protocol::scope::ScopeKind::Head,
-                )
-                .with_owner_authorized(true)
-                .with_attributes(
-                    subc_protocol::scope::ScopeAttributes::new().with_flow_id(
-                        (mode == Some(cortexkit_role_tool_provider::CallMode::Flow))
-                            .then(|| "mode-flow".into()),
-                    ),
-                ))
-            })
-            .transpose()?,
-        role_versions,
-        call_mode: mode,
-    };
+    let bind = serde_json::json!({
+    "route_channel": channel,
+    "epoch": 1,
+    "target": RouteTarget::ToolProvider {
+                module_id: "aft".into(),
+            },
+    "identity": serde_json::json!({"harness": harness, "session": session, "project_root": project}),
+    "principal": Some(decode_principal(&stamp.principal)?),
+    "consumer_capabilities": consumer_capabilities,
+    "admission_facts": serde_json::Value::Null,
+    "scope": { let scope: Option<subc_protocol::scope::ScopeStamp> = stamp
+                .scope
+                .as_ref()
+                .map(|scope| {
+                    Ok(subc_protocol::scope::ScopeStamp::new(
+                        decode_principal(&scope.owner)?,
+                        scope.scope_ref.clone(),
+                        scope.scope_epoch,
+                        subc_protocol::scope::ScopeKind::Head,
+                    )
+                    .with_owner_authorized(true)
+                    .with_attributes(
+                        subc_protocol::scope::ScopeAttributes::new().with_flow_id(
+                            (mode == Some(cortexkit_role_tool_provider::CallMode::Flow))
+                                .then(|| "mode-flow".into()),
+                        ),
+                    ))
+                })
+                .transpose()?; scope.map(|mut stamp| { if stamp.workdir.is_none() { stamp.workdir = Some(std::path::Path::new(&(project)).to_string_lossy().into_owned()); } stamp }) },
+    "role_versions": role_versions,
+    "call_mode": mode
+    });
     let mut reply = wire.expect(0, corr);
     wire.send(
         &Frame::build(

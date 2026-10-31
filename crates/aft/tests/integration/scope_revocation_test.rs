@@ -242,21 +242,21 @@ async fn bind_route_as(
         )
         .unwrap();
     }
-    let body = ModuleControlRequest::RouteBind {
-        route_channel: channel,
-        epoch: 1,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".into(),
-        },
-        identity: BindIdentity::new(root, "opencode", session),
-        principal: Some(principal),
-        consumer_capabilities: None,
-        admission_facts: Default::default(),
-        scope,
-        role_versions: v1
-            .then(|| std::collections::BTreeMap::from([("tool-provider".into(), "v1".into())])),
-        call_mode: mode,
-    };
+    let body = serde_json::json!({
+    "route_channel": channel,
+    "epoch": 1,
+    "target": RouteTarget::ToolProvider {
+                module_id: "aft".into(),
+            },
+    "identity": serde_json::json!({"harness": "opencode", "session": session, "project_root": root}),
+    "principal": Some(principal),
+    "consumer_capabilities": serde_json::Value::Null,
+    "admission_facts": serde_json::json!({}),
+    "scope": { let scope: Option<subc_protocol::scope::ScopeStamp> = scope; scope.map(|mut stamp| { if stamp.workdir.is_none() { stamp.workdir = Some(std::path::Path::new(&(root)).to_string_lossy().into_owned()); } stamp }) },
+    "role_versions": v1
+                .then(|| std::collections::BTreeMap::from([("tool-provider".into(), "v1".into())])),
+    "call_mode": mode
+    });
     send_frame(
         stream,
         Frame::build(

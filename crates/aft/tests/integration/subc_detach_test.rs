@@ -1417,24 +1417,20 @@ async fn bind_route_as_at_epoch(
     )
     .expect("write project config");
 
-    let request = ModuleControlRequest::RouteBind {
-        route_channel: channel,
-        epoch,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".to_string(),
-        },
-        identity: BindIdentity::new(
-            root.to_path_buf(),
-            harness.to_string(),
-            SESSION_ID.to_string(),
-        ),
-        principal: Some(Principal::Direct),
-        consumer_capabilities: None,
-        admission_facts: Default::default(),
-        scope: None,
-        role_versions: None,
-        call_mode: None,
-    };
+    let request = serde_json::json!({
+    "route_channel": channel,
+    "epoch": epoch,
+    "target": RouteTarget::ToolProvider {
+                module_id: "aft".to_string(),
+            },
+    "identity": serde_json::json!({"harness": harness.to_string(), "session": SESSION_ID.to_string(), "project_root": root.to_path_buf()}),
+    "principal": Some(Principal::Direct),
+    "consumer_capabilities": serde_json::Value::Null,
+    "admission_facts": serde_json::json!({}),
+    "scope": None::<subc_protocol::scope::ScopeStamp>,
+    "role_versions": serde_json::Value::Null,
+    "call_mode": serde_json::Value::Null
+    });
     send_frame(
         stream,
         Frame::build(

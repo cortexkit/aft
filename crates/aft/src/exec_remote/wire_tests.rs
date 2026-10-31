@@ -1397,12 +1397,9 @@ async fn outage_daemon_with(started: bool, replay: OutageReplay) -> OutageDaemon
 }
 
 async fn client(daemon: &Daemon) -> ExecRemoteClient {
-    ExecRemoteClient::connect(
-        &daemon.connection,
-        BindIdentity::new("/workspace", "aft-test", "session"),
-    )
-    .await
-    .unwrap()
+    ExecRemoteClient::connect(&daemon.connection, BindIdentity::new("aft-test", "session"))
+        .await
+        .unwrap()
 }
 
 async fn drain(stream: &mut RemoteStream, sink: &mut MemorySink) -> Result<Verdict, Error> {
@@ -1516,11 +1513,9 @@ async fn remote_progress_is_requested_only_with_the_advertised_capability() {
 #[tokio::test]
 async fn dotted_capability_is_not_a_discovery_claim() {
     let daemon = daemon(Script::Lost, "exec.remote/v1").await;
-    let result = ExecRemoteClient::connect(
-        &daemon.connection,
-        BindIdentity::new("/workspace", "aft-test", "session"),
-    )
-    .await;
+    let result =
+        ExecRemoteClient::connect(&daemon.connection, BindIdentity::new("aft-test", "session"))
+            .await;
     assert!(matches!(
         result,
         Err(Error::Transport(
@@ -1580,7 +1575,7 @@ async fn interrupted_call_reattaches_with_next_durable_seq_without_resubmission(
 #[tokio::test]
 async fn accepted_transport_loss_reconnects_and_replays_terminal_exactly_once() {
     let daemon = outage_daemon().await;
-    let identity = subc_protocol::BindIdentity::new("/workspace/task", "test", "session");
+    let identity = subc_protocol::BindIdentity::new("test", "session");
     let client = ExecRemoteClient::connect(&daemon.connection, identity.clone())
         .await
         .unwrap();

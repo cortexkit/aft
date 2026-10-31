@@ -2178,7 +2178,7 @@ async fn gh_shim_relay_cancellation_after_acquisition_releases_lease() {
             subc_protocol::RouteTarget::ToolProvider {
                 module_id: "plexus".into(),
             },
-            subc_protocol::BindIdentity::new("/project", "lease-test", "cancel-acquire"),
+            subc_protocol::BindIdentity::new("lease-test", "cancel-acquire"),
             None,
             Default::default(),
             RELAY_CALL_TIMEOUT,

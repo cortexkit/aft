@@ -1568,6 +1568,8 @@ enum ManagementAdmission {
     #[default]
     FirstParty,
     FlowOnly,
+    /// Tool-provider metadata without a project actor; never management authority.
+    ProjectFree,
 }
 
 impl RouteIdentity {
@@ -1579,7 +1581,7 @@ impl RouteIdentity {
 #[derive(Debug)]
 struct RouteIdentityData {
     root: ProjectRootId,
-    /// Resolved scope workdir, or the legacy bind root when no workdir is stamped.
+    /// Resolved scope workdir, or the legacy root on an unscoped bind.
     /// The daemon's project id is retained alongside it in `scope.project_id`;
     /// persisted state continues to use the root path, not that id.
     project_root: PathBuf,
@@ -5984,6 +5986,12 @@ where
                         // before any store, provider, or general tool dispatch.
                         // Tool routes retain their separate call-mode contract.
                         if let Some(identity) = management_routes.get(&route) {
+                            if identity.admission == ManagementAdmission::ProjectFree {
+                                if let Err(error) = handle_project_free_request(&writer_tx, &decoded.frame, &dispatch_path_metrics).await {
+                                    break Err(error);
+                                }
+                                continue;
+                            }
                             if let Err(error) = admit_management_flow_request(identity, decoded.body().ok()) {
                                 if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await {
                                     break Err(error);
@@ -8024,34 +8032,40 @@ fn normalized_scope_workdir(workdir: &Path) -> Option<PathBuf> {
 }
 
 fn resolve_route_project_root(
-    identity: &subc_protocol::BindIdentity,
+    legacy_root: Option<&Path>,
     scope: Option<&subc_protocol::scope::ScopeStamp>,
-) -> PathBuf {
-    match scope.and_then(|stamp| stamp.workdir.as_deref()) {
-        Some(workdir) => {
-            let workdir = Path::new(workdir);
-            // Invalid stamped paths still go through bind validation; they must
-            // never select a different project through the compatibility fallback.
-            normalized_scope_workdir(workdir).unwrap_or_else(|| workdir.to_path_buf())
-        }
-        None => legacy_unstamped_bind_project_root(identity),
+) -> Result<Option<PathBuf>, &'static str> {
+    let root = match scope {
+        Some(stamp) => Some(Path::new(stamp.workdir.as_deref().ok_or(PROJECT_REQUIRED)?)),
+        None => legacy_root,
+    };
+    match root {
+        Some(root) if root.is_absolute() => Ok(Some(if scope.is_some() {
+            normalized_scope_workdir(root).unwrap_or_else(|| root.to_path_buf())
+        } else {
+            root.to_path_buf()
+        })),
+        Some(_) => Err(PROJECT_REQUIRED),
+        None => Ok(None),
     }
 }
 
-// Older daemons and session hosts do not always stamp a workdir. Remove this
-// compatibility fallback when BindIdentity no longer carries project_root.
-fn legacy_unstamped_bind_project_root(identity: &subc_protocol::BindIdentity) -> PathBuf {
-    identity.project_root.clone()
-}
+const PROJECT_REQUIRED: &str =
+    "AFT project tools require an absolute scope workdir or an unscoped legacy project root.";
+const PROJECT_REQUIRED_CODE: &str = "project_required";
 
 fn log_route_project_key_change(
     identity: &subc_protocol::BindIdentity,
+    legacy_root: Option<&Path>,
     project_root: &Path,
     route: RouteChannel,
 ) {
     // Catalog and consent keys use literal display strings. Compare those strings
     // so aliases that canonicalize to one folder still produce a key-change log.
-    let bind_key = identity.project_root.display().to_string();
+    let Some(legacy_root) = legacy_root else {
+        return;
+    };
+    let bind_key = legacy_root.display().to_string();
     let resolved_key = project_root.display().to_string();
     if bind_key != resolved_key {
         crate::slog_info!(
@@ -8118,8 +8132,12 @@ impl Drop for ScopeWorkdirPermit {
 
 fn schedule_scope_workdir_comparison(
     identity: &subc_protocol::BindIdentity,
+    legacy_root: Option<&Path>,
     scope: Option<&subc_protocol::scope::ScopeStamp>,
 ) {
+    let Some(legacy_root) = legacy_root else {
+        return;
+    };
     let Some(stamp) = scope else { return };
     let Some(workdir) = stamp.workdir.as_deref() else {
         return;
@@ -8129,7 +8147,12 @@ fn schedule_scope_workdir_comparison(
     let permit = match SCOPE_WORKDIR_DIAGNOSTICS.try_admit(workdir) {
         Ok(permit) => permit,
         Err(reason) => {
-            log_scope_workdir_comparison(identity, stamp, Err(io::Error::other(reason)));
+            log_scope_workdir_comparison(
+                identity,
+                legacy_root,
+                stamp,
+                Err(io::Error::other(reason)),
+            );
             #[cfg(test)]
             if let Some(observed) = observed {
                 let _ = observed.send(());
@@ -8139,7 +8162,8 @@ fn schedule_scope_workdir_comparison(
     };
     let budget = crate::bounded_io::Budget::after(crate::bounded_io::IO_BUDGET);
     let deadline = tokio::time::Instant::from_std(budget.deadline);
-    let project_root = identity.project_root.clone();
+    let project_root = legacy_root.to_path_buf();
+    let legacy_root = legacy_root.to_path_buf();
     let workdir = workdir.to_owned();
     // A diagnostic must not delay frame processing or serialize project work. The
     // bounded helper owns all filesystem work; the blocking task only waits for it.
@@ -8161,7 +8185,7 @@ fn schedule_scope_workdir_comparison(
                 "filesystem comparison budget expired",
             )),
         };
-        log_scope_workdir_comparison(&identity, &stamp, result);
+        log_scope_workdir_comparison(&identity, &legacy_root, &stamp, result);
         #[cfg(test)]
         if let Some(observed) = observed {
             let _ = observed.send(());
@@ -8202,11 +8226,12 @@ fn compare_scope_workdir(
 
 fn log_scope_workdir_comparison(
     identity: &subc_protocol::BindIdentity,
+    legacy_root: &Path,
     stamp: &subc_protocol::scope::ScopeStamp,
     result: io::Result<Option<(PathBuf, PathBuf)>>,
 ) {
     match result {
-        Ok(Some((project_root, workdir))) => crate::slog_info!(
+        Ok(Some((project_root, workdir))) => crate::slog_warn!(
             "subc scope workdir differs: project_root={} workdir={} session={} project_id={}",
             project_root.display(),
             workdir.display(),
@@ -8216,7 +8241,7 @@ fn log_scope_workdir_comparison(
         Ok(None) => {}
         Err(error) => crate::slog_info!(
             "subc scope workdir comparison skipped: project_root={} workdir={} session={} project_id={} reason={}",
-            identity.project_root.display(),
+            legacy_root.display(),
             stamp.workdir.as_deref().unwrap_or("none"),
             identity.session,
             stamp.project_id.as_deref().unwrap_or("none"),
@@ -8302,7 +8327,12 @@ async fn handle_control_request(
                 ),
                 if role_versions.is_some() { "declared" } else { "none" }
             );
-            schedule_scope_workdir_comparison(&identity, scope.as_ref());
+            // Protocol 0.34 drops project fields from BindIdentity. Read the
+            // legacy claim separately for unscoped clients and mismatch logging;
+            // it must never supply a scoped route's project.
+            let legacy_root = serde_json::from_slice::<Value>(&frame.body)
+                .ok()
+                .and_then(|body| body["identity"]["project_root"].as_str().map(PathBuf::from));
             if epoch == 0 {
                 return send_route_bind_error(
                     tx,
@@ -8325,6 +8355,20 @@ async fn handle_control_request(
             };
 
             let bind_trust = trust_for_bind(&identity.harness, &principal);
+            let bind_project_root = if matches!(target, RouteTarget::ToolProvider { .. }) {
+                match resolve_route_project_root(legacy_root.as_deref(), scope.as_ref()) {
+                    Ok(root) => root,
+                    Err(reason) => {
+                        return send_route_bind_error(tx, frame, "invalid_workdir", reason, metrics)
+                            .await
+                    }
+                }
+            } else {
+                None
+            };
+            let project_free =
+                matches!(target, RouteTarget::ToolProvider { .. }) && bind_project_root.is_none();
+            schedule_scope_workdir_comparison(&identity, legacy_root.as_deref(), scope.as_ref());
             if installed_route_epochs
                 .get(&route_channel)
                 .is_some_and(|installed| *installed >= epoch)
@@ -8350,11 +8394,16 @@ async fn handle_control_request(
                     return send_route_bind_error_body(tx, frame, &refusal, metrics).await
                 }
             };
-            if let RouteTarget::ManagementSurface { module_id } = &target {
-                if let Err(refusal) = flow_read::admit_management(scope.as_ref()) {
+            if matches!(target, RouteTarget::ManagementSurface { .. }) || project_free {
+                if let Err(refusal) = if project_free {
+                    Ok(())
+                } else {
+                    flow_read::admit_management(scope.as_ref())
+                } {
                     return send_route_bind_error_body(tx, frame, &refusal, metrics).await;
                 }
-                if module_id != "aft" {
+                if !matches!(&target, RouteTarget::ManagementSurface { module_id } | RouteTarget::ToolProvider { module_id } if module_id == "aft")
+                {
                     return send_route_bind_error(
                         tx,
                         frame,
@@ -8364,7 +8413,8 @@ async fn handle_control_request(
                     )
                     .await;
                 }
-                if !matches!(bind_trust, BindTrust::FirstParty)
+                if !project_free
+                    && !matches!(bind_trust, BindTrust::FirstParty)
                     && diagnostics_findings::admit_flow(scope.as_ref()).is_err()
                 {
                     return send_route_bind_error(
@@ -8376,7 +8426,9 @@ async fn handle_control_request(
                     )
                     .await;
                 }
-                let admission = if scope
+                let admission = if project_free {
+                    ManagementAdmission::ProjectFree
+                } else if scope
                     .as_ref()
                     .is_some_and(diagnostics_findings::is_flow_scope)
                 {
@@ -8494,7 +8546,8 @@ async fn handle_control_request(
                 .await;
             }
 
-            let bind_project_root = resolve_route_project_root(&identity, scope.as_ref());
+            let bind_project_root =
+                bind_project_root.expect("rootless tool routes install without an actor");
             let mut bind_root_id = None;
             if let Some(installed_epoch) = installed_route_epochs.get(&route_channel).copied() {
                 if installed_epoch >= epoch {
@@ -8580,7 +8633,12 @@ async fn handle_control_request(
                     }
                 },
             };
-            log_route_project_key_change(&identity, &bind_project_root, route_id);
+            log_route_project_key_change(
+                &identity,
+                legacy_root.as_deref(),
+                &bind_project_root,
+                route_id,
+            );
 
             // Reconcile RootConfig using the resolved project and the local
             // config tiers, then run it through the executor.
@@ -8867,6 +8925,49 @@ async fn handle_control_request(
                 .summary(),
             )
             .await
+        }
+    }
+}
+
+/// Metadata is static on a project-free route. Task handles, including bash
+/// observations, belong to a project's registry and cannot be resolved here.
+async fn handle_project_free_request(
+    tx: &WriterSender,
+    frame: &Frame,
+    metrics: &DispatchPathMetrics,
+) -> Result<(), SubcError> {
+    let body = serde_json::from_slice::<Value>(&frame.body).unwrap_or(Value::Null);
+    let result = match body.get("op").and_then(Value::as_str) {
+        Some("role.describe") => Ok(tool_provider::describe()),
+        Some("tool.catalog") => {
+            tool_provider::validate_catalog_request(body).and_then(|(request, preset)| {
+                tool_provider::catalog_for_request(
+                    request,
+                    preset,
+                    &[],
+                    false,
+                    false,
+                    false,
+                    crate::config::DEFAULT_BASH_WORKER_WAIT_MAX_MS,
+                )
+            })
+        }
+        _ => Err(ErrorBody::new(PROJECT_REQUIRED_CODE, PROJECT_REQUIRED)),
+    };
+    match result {
+        Err(error) => send_provider_error(tx, metrics, frame, error).await,
+        Ok(answer) => {
+            let response = Frame::build_with_version(
+                frame.header.ver,
+                FrameType::Response,
+                frame.header.flags,
+                frame.header.channel,
+                frame.header.epoch,
+                frame.header.corr,
+                serde_json::to_vec(&answer).map_err(SubcError::Json)?,
+            )
+            .map_err(SubcError::FrameBuild)?;
+            send_reliable_writer_frame(tx, metrics, response, "project-free metadata").await
         }
     }
 }
@@ -15008,24 +15109,20 @@ mod tests {
             write_frame(&mut daemon, &ack)
                 .await
                 .map_err(|e| e.to_string())?;
-            let bind = ModuleControlRequest::RouteBind {
-                route_channel: 75,
-                epoch: 1,
-                target: RouteTarget::ToolProvider {
+            let bind = serde_json::json!({
+"route_channel": 75,
+"epoch": 1,
+"target": RouteTarget::ToolProvider {
                     module_id: "aft".into(),
                 },
-                identity: subc_protocol::BindIdentity::new(
-                    healthy_root.as_path(),
-                    "opencode",
-                    "standing-busy-root-isolation",
-                ),
-                principal: Some(subc_protocol::Principal::Direct),
-                consumer_capabilities: None,
-                admission_facts: Default::default(),
-                scope: None,
-                role_versions: None,
-                call_mode: None,
-            };
+"identity": serde_json::json!({"harness": "opencode", "session": "standing-busy-root-isolation", "project_root": healthy_root.as_path()}),
+"principal": Some(subc_protocol::Principal::Direct),
+"consumer_capabilities": serde_json::Value::Null,
+"admission_facts": serde_json::json!({}),
+"scope": None::<subc_protocol::scope::ScopeStamp>,
+"role_versions": serde_json::Value::Null,
+"call_mode": serde_json::Value::Null
+});
             let bind = Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -15178,24 +15275,20 @@ mod tests {
             write_frame(&mut daemon, &ack)
                 .await
                 .map_err(|e| e.to_string())?;
-            let bind = ModuleControlRequest::RouteBind {
-                route_channel: 71,
-                epoch: 1,
-                target: RouteTarget::ToolProvider {
+            let bind = serde_json::json!({
+"route_channel": 71,
+"epoch": 1,
+"target": RouteTarget::ToolProvider {
                     module_id: "aft".into(),
                 },
-                identity: subc_protocol::BindIdentity::new(
-                    root.as_path(),
-                    "opencode",
-                    "standing-isolation",
-                ),
-                principal: Some(subc_protocol::Principal::Direct),
-                consumer_capabilities: None,
-                admission_facts: Default::default(),
-                scope: None,
-                role_versions: None,
-                call_mode: None,
-            };
+"identity": serde_json::json!({"harness": "opencode", "session": "standing-isolation", "project_root": root.as_path()}),
+"principal": Some(subc_protocol::Principal::Direct),
+"consumer_capabilities": serde_json::Value::Null,
+"admission_facts": serde_json::json!({}),
+"scope": None::<subc_protocol::scope::ScopeStamp>,
+"role_versions": serde_json::Value::Null,
+"call_mode": serde_json::Value::Null
+});
             let bind = Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -15251,24 +15344,20 @@ mod tests {
         holder.join().unwrap();
         let recovery: Result<(), String> = if while_held.is_ok() {
             async {
-                let bind = ModuleControlRequest::RouteBind {
-                    route_channel: 73,
-                    epoch: 1,
-                    target: RouteTarget::ToolProvider {
+                let bind = serde_json::json!({
+"route_channel": 73,
+"epoch": 1,
+"target": RouteTarget::ToolProvider {
                         module_id: "aft".into(),
                     },
-                    identity: subc_protocol::BindIdentity::new(
-                        root.as_path(),
-                        "opencode",
-                        "standing-recovery",
-                    ),
-                    principal: Some(subc_protocol::Principal::Direct),
-                    consumer_capabilities: None,
-                    admission_facts: Default::default(),
-                    scope: None,
-                    role_versions: None,
-                    call_mode: None,
-                };
+"identity": serde_json::json!({"harness": "opencode", "session": "standing-recovery", "project_root": root.as_path()}),
+"principal": Some(subc_protocol::Principal::Direct),
+"consumer_capabilities": serde_json::Value::Null,
+"admission_facts": serde_json::json!({}),
+"scope": None::<subc_protocol::scope::ScopeStamp>,
+"role_versions": serde_json::Value::Null,
+"call_mode": serde_json::Value::Null
+});
                 let frame = Frame::build(
                     FrameType::Request,
                     control_flags(),
@@ -15588,24 +15677,20 @@ mod tests {
                 lossy_seq: Arc::new(AtomicU64::new(0)),
                 fleet_status_client: FleetStatusClient::channel(1).0,
             };
-            let request = ModuleControlRequest::RouteBind {
-                route_channel: 1,
-                epoch: 1,
-                target: RouteTarget::ToolProvider {
+            let request = serde_json::json!({
+"route_channel": 1,
+"epoch": 1,
+"target": RouteTarget::ToolProvider {
                     module_id: "aft".to_string(),
                 },
-                identity: subc_protocol::BindIdentity::new(
-                    root.as_path(),
-                    "opencode",
-                    "bind-health-work-count",
-                ),
-                principal: Some(subc_protocol::Principal::Direct),
-                consumer_capabilities: None,
-                admission_facts: Default::default(),
-                scope: None,
-                role_versions: None,
-                call_mode: None,
-            };
+"identity": serde_json::json!({"harness": "opencode", "session": "bind-health-work-count", "project_root": root.as_path()}),
+"principal": Some(subc_protocol::Principal::Direct),
+"consumer_capabilities": serde_json::Value::Null,
+"admission_facts": serde_json::json!({}),
+"scope": None::<subc_protocol::scope::ScopeStamp>,
+"role_versions": serde_json::Value::Null,
+"call_mode": serde_json::Value::Null
+});
             let frame = Frame::build_with_version(
                 PROTOCOL_VERSION,
                 FrameType::Request,

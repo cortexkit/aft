@@ -488,6 +488,7 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                 subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
                 subc_protocol::scope::WORKER_RUNS_CAPABILITY.to_string(),
                 subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY.to_string(),
+                subc_protocol::scope::BIND_NO_PROJECT_CAPABILITY.to_string(),
                 crate::page_collect::CAPABILITY.to_string(),
             ],
             requires: Vec::new(),
