@@ -4307,16 +4307,18 @@ async fn gh_shim_router_host_v1_background_reply_is_terminal_and_model_only() {
     jail.assert_bash_completed("head-session", &warm);
     let corr = jail.submit_tool_on_channel(2, "bash", json!({"command":format!("echo ready > {}; while ! test -f {}; do sleep .02; done", quote(&ready), quote(&release)),"background":true,"timeout":10_000})).await;
     wait_test_file(&ready).await;
-    let pending = jail.reply_frame(2, corr);
-    tokio::pin!(pending);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), pending.as_mut())
-            .await
-            .is_err(),
-        "V1 must not send an early background launch response"
-    );
-    std::fs::write(release, "release").unwrap();
-    let frame = pending.await;
+    let frame = {
+        let pending = jail.reply_frame(2, corr);
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), pending.as_mut())
+                .await
+                .is_err(),
+            "V1 must not send an early background launch response"
+        );
+        std::fs::write(release, "release").unwrap();
+        pending.await
+    };
     let reply: Value = serde_json::from_slice(&frame.body).unwrap();
     jail.assert_bash_completed("head-session", &reply);
     assert_eq!(reply.as_object().unwrap().len(), 2, "{reply}");
