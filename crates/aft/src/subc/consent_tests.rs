@@ -1718,6 +1718,37 @@ async fn consent_held_call_becomes_pending_and_retry_runs_after_allow_once() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn consent_late_folder_approval_covers_a_later_file_without_another_ask() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_millis(100)));
+    let pending = f.read(&f.worker, &f.head_root, 7).await;
+    assert_eq!(code(&pending), "access_pending", "{pending}");
+    let asks = f.asks();
+    assert_eq!(asks.len(), 1);
+    assert_eq!(
+        asks[0].pending.as_ref().unwrap().file().unwrap().kind,
+        GrantKind::Subtree
+    );
+    let call_key = asks[0].call_key.as_ref().unwrap();
+    f.fake.answer(
+        call_key,
+        json!({"state":"settled", "outcome":"allow_scope", "answered_by":"head"}),
+    );
+
+    let allowed = f.read(&f.worker, &f.head_root.join("shared.txt"), 8).await;
+    assert!(text(&allowed).contains("head-owned contents"), "{allowed}");
+    assert_eq!(f.fake.calls("consent.request").len(), 1);
+    assert!(f.asks().is_empty(), "the approved folder ask is settled");
+    assert_eq!(f.worker_grants().len(), 1);
+    let again = f.read(&f.worker, &f.head_root.join("shared.txt"), 9).await;
+    assert!(text(&again).contains("head-owned contents"), "{again}");
+    assert_eq!(f.worker_grants().len(), 1, "approval is applied only once");
+    assert_eq!(f.fake.calls("consent.request").len(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn consent_answer_within_the_budget_runs_the_held_call() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture(FakeCingulate::up());
