@@ -1,0 +1,9 @@
+{
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "kind": "harness",
+  "note": "Code-mode program calls that need approval ask through Cingulate and are held (held-reply/v1) instead of refused; long shell commands in programs are held as running. No search, ranking or query routing changes.",
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none"
+}
