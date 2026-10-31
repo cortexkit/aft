@@ -1,6 +1,56 @@
 use super::*;
 
 #[test]
+fn task_scope_failed_spawn_logs_stop_error_once_and_keeps_kill_result() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("cgroup.kill"), "0").unwrap();
+    let id = random_slug();
+    let registry = BgTaskRegistry::default();
+    registry
+        .inner
+        .task_scopes
+        .register(super::super::task_scope::handle_for_test(
+            &id,
+            root.path().into(),
+        ));
+    let launch = super::super::task_scope::launch_for_test(&id);
+    let (_, lines) = crate::logging::capture_log_lines(|| {
+        super::super::task_scope::with_stop_error_for_test(|| {
+            for _ in 0..2 {
+                let mut child = Child::from(
+                    std::process::Command::new("/bin/sh")
+                        .args(["-c", "exit 0"])
+                        .spawn()
+                        .unwrap(),
+                );
+                let pid = child.id() as i32;
+                registry
+                    .cleanup_failed_scope_spawn(&id, &mut child, Some(&launch))
+                    .unwrap();
+                let mut status = 0;
+                assert_eq!(
+                    unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+                    -1
+                );
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ECHILD)
+                );
+            }
+        });
+    });
+    let message = format!("task scope aft-task-{id}.scope could not be stopped");
+    assert_eq!(
+        lines.iter().filter(|line| line.contains(&message)).count(),
+        1,
+        "failed spawn swallowed the scope-stop error"
+    );
+    assert!(!lines
+        .iter()
+        .any(|line| line.contains("injected stop error text")));
+}
+
+#[test]
 fn task_scope_failed_spawn_stops_and_reaps_after_kill_error() {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("cgroup.kill")).unwrap();

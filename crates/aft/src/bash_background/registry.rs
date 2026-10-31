@@ -2153,6 +2153,7 @@ impl BgTaskRegistry {
     ) -> Result<(), String> {
         let result = self.kill_task_scope(task_id);
         if let Some(scope) = scope {
+            // The scope's RuntimeMaxSec backstop and the next startup cleanup still end it.
             let _ = scope.stop();
         }
         let _ = child.wait();

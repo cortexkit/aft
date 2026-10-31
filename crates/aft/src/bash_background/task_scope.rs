@@ -393,6 +393,7 @@ mod linux {
         runtime: Duration,
         memory_bytes: Option<u64>,
         description: String,
+        stop_warning_logged: AtomicBool,
     }
 
     pub(crate) fn scope_description(task_id: &str, storage_root: &Path) -> String {
@@ -691,6 +692,7 @@ mod linux {
                 runtime,
                 memory_bytes,
                 description: scope_description(task_id, storage_root),
+                stop_warning_logged: AtomicBool::new(false),
             })
         }
         pub(crate) fn argv(
@@ -756,7 +758,11 @@ mod linux {
         }
 
         pub(crate) fn stop(&self) -> Result<(), String> {
-            stop_unit(&self.unit)
+            let result = stop_unit(&self.unit);
+            if result.is_err() && !self.stop_warning_logged.swap(true, Ordering::Relaxed) {
+                crate::slog_warn!("task scope {} could not be stopped", self.unit);
+            }
+            result
         }
     }
 
@@ -971,6 +977,10 @@ mod linux {
 
     fn stop_unit_with(systemctl: &Path, unit: &str) -> Result<(), String> {
         #[cfg(test)]
+        if STOP_ERROR.with(|fail| fail.get()) {
+            return Err("injected stop error text".into());
+        }
+        #[cfg(test)]
         if STOP_OBSERVER.with(|slot| {
             if let Some(observe) = slot.borrow().as_ref() {
                 observe(unit);
@@ -988,6 +998,20 @@ mod linux {
     type StopObserver = Box<dyn Fn(&str)>;
     #[cfg(test)]
     thread_local! { static STOP_OBSERVER: std::cell::RefCell<Option<StopObserver>> = const { std::cell::RefCell::new(None) }; }
+    #[cfg(test)]
+    thread_local! { static STOP_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+    #[cfg(test)]
+    pub(crate) fn with_stop_error_for_test<T>(run: impl FnOnce() -> T) -> T {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                STOP_ERROR.with(|fail| fail.set(self.0));
+            }
+        }
+        let _restore = Restore(STOP_ERROR.with(|fail| fail.replace(true)));
+        run()
+    }
     #[cfg(test)]
     pub(crate) fn with_stop_observer_for_test<T>(
         observer: impl Fn(&str) + 'static,
@@ -1142,6 +1166,7 @@ mod linux {
             runtime,
             memory_bytes: cap.map(|mib| mib.checked_mul(1024 * 1024).unwrap()),
             description: scope_description(id, Path::new("/fixture")),
+            stop_warning_logged: AtomicBool::new(false),
         }
         .argv(executable, args)
     }
