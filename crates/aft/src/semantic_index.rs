@@ -11560,7 +11560,7 @@ mod tests {
                 .into_iter()
                 .filter(|(file, _, _)| file != &files[1])
                 .map(|(file, name, vector)| ((file, name), vector))
-                .collect::<BTreeMap<_, _>>()
+                .collect::<std::collections::BTreeMap<_, _>>()
         };
         let before = preserved(&index);
         let mut bytes = index.to_bytes();
