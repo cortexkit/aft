@@ -1012,6 +1012,11 @@ fn consume_host_escalation_grant_at(
         &task_id,
     )
     .map_err(|_| EscalationRefusal::DigestMismatch)?;
+    let mut environment = attempt.environment.clone();
+    crate::pinned_executable::task_environment(
+        &crate::pinned_executable::task_executable(&task.paths.io_dir),
+        &mut environment,
+    );
     verify_payload(
         task,
         &attempt.command,
@@ -1019,7 +1024,7 @@ fn consume_host_escalation_grant_at(
         &attempt.cwd,
         principal,
         &attempt.shell_path,
-        &attempt.environment,
+        &environment,
         Some(digest),
         true,
     )
@@ -1037,6 +1042,11 @@ pub(crate) fn prepare_task_payload(
     shell_path: &Path,
     environment: &ChildEnvironment,
 ) -> Result<PreparedTask, String> {
+    let mut environment = environment.clone();
+    crate::pinned_executable::task_environment(
+        &crate::pinned_executable::task_executable(&task.paths.io_dir),
+        &mut environment,
+    );
     materialize_payload(
         crate::bash_background::persistence::ResolvedTask {
             paths: task.paths.clone(),
@@ -1047,7 +1057,7 @@ pub(crate) fn prepare_task_payload(
         cwd,
         principal,
         shell_path,
-        environment,
+        &environment,
     )
 }
 

@@ -5178,7 +5178,7 @@ impl BgTaskRegistry {
         shell_path: PathBuf,
         session_id: String,
         workdir: PathBuf,
-        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))] mut env: HashMap<String, String>,
+        mut env: HashMap<String, String>,
         hard_kill: super::HardKill,
         memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
@@ -5235,6 +5235,10 @@ impl BgTaskRegistry {
             (spawn_plan.with_prepared_task(prepared), task)
         };
         let layout_cleanup = UncommittedLayout::new(&task_layout);
+        if !spawn_plan.is_native_launcher() {
+            crate::pinned_executable::retain_task_environment(&task_layout.paths.io_dir, &mut env)
+                .map_err(|error| format!("failed to retain task startup image: {error}"))?;
+        }
         let task_id = task_layout.paths.task_id.clone();
         let paths = task_layout.paths.clone();
         let spawn_log_root = project_root.as_deref().unwrap_or(&workdir).to_path_buf();
@@ -5625,7 +5629,7 @@ impl BgTaskRegistry {
         shell_path: PathBuf,
         session_id: String,
         workdir: PathBuf,
-        env: HashMap<String, String>,
+        mut env: HashMap<String, String>,
         hard_kill: super::HardKill,
         memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
@@ -5688,6 +5692,10 @@ impl BgTaskRegistry {
         let task_layout = allocate_task_layout(&storage_dir, &session_id)
             .map_err(|error| format!("failed to create PTY task layout: {error}"))?;
         let layout_cleanup = UncommittedLayout::new(&task_layout);
+        if !spawn_plan.is_native_launcher() {
+            crate::pinned_executable::retain_task_environment(&task_layout.paths.io_dir, &mut env)
+                .map_err(|error| format!("failed to retain task startup image: {error}"))?;
+        }
         let task_id = task_layout.paths.task_id.clone();
         let paths = task_layout.paths.clone();
         let spawn_log_root = project_root.as_deref().unwrap_or(&workdir).to_path_buf();
@@ -6086,7 +6094,7 @@ impl BgTaskRegistry {
         shell_path: PathBuf,
         session_id: String,
         workdir: PathBuf,
-        env: HashMap<String, String>,
+        mut env: HashMap<String, String>,
         hard_kill: super::HardKill,
         memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
@@ -6106,6 +6114,8 @@ impl BgTaskRegistry {
         let task_layout = allocate_task_layout(&storage_dir, &session_id)
             .map_err(|error| format!("failed to create background task layout: {error}"))?;
         let layout_cleanup = UncommittedLayout::new(&task_layout);
+        crate::pinned_executable::retain_task_environment(&task_layout.paths.io_dir, &mut env)
+            .map_err(|error| format!("failed to retain task startup image: {error}"))?;
         let task_id = task_layout.paths.task_id.clone();
         let paths = task_layout.paths.clone();
         let spawn_log_root = project_root.as_deref().unwrap_or(&workdir).to_path_buf();
