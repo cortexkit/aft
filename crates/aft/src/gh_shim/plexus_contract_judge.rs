@@ -13,7 +13,7 @@
 //!
 //! 1. Every refusal rule below is evidenced by at least one vendored refused
 //!    vector, and `contract_vectors_judge_to_their_pinned_outcomes` runs all
-//!    144 vendored request vectors through `judge` and demands the exact
+//!    159 vendored request vectors through `judge` and demands the exact
 //!    pinned outcome. A rule that drifts from Plexus fails that test.
 //! 2. Where the files determine a rule's data, the test recomputes it from the
 //!    files: the closed-shape field lists must equal the key sets of the
@@ -82,7 +82,7 @@ pub const REVIEW_EVENTS: [&str; 3] = ["COMMENT", "APPROVE", "REQUEST_CHANGES"];
 /// contract test below demands an accepted vector for each one, mirroring
 /// Plexus's own missing-kind check, so a new Plexus kind fails here until the
 /// judge learns its shape.
-pub const REQUEST_KINDS: [&str; 19] = [
+pub const REQUEST_KINDS: [&str; 21] = [
     "comment",
     "comment_edit_last",
     "comment_edit",
@@ -96,6 +96,8 @@ pub const REQUEST_KINDS: [&str; 19] = [
     "pr_ready",
     "pr_draft",
     "pr_edit",
+    "pr_enqueue",
+    "pr_dequeue",
     "review_reply",
     "resolve_thread",
     "unresolve_thread",
@@ -146,8 +148,8 @@ fn check_pr_create(object: &Map<String, Value>) -> Result<(), String> {
     Ok(())
 }
 
-/// The closed nested shapes (`map` lines 84-161): `pr edit`, the
-/// review-comment reply, thread resolve/unresolve and the stack writes. Every
+/// The closed nested shapes (`map` lines 84-185): `pr edit`, queue actions,
+/// the review-comment reply, thread resolve/unresolve and stack writes. Every
 /// top-level, target and body field outside the kind's lists (plus the shim
 /// envelope, plus `author_scope` on `pr edit` only) is refused, so a typo
 /// cannot appear to work.
@@ -167,9 +169,14 @@ fn check_nested(object: &Map<String, Value>, kind: &str) -> Result<(), String> {
         .get("target")
         .and_then(Value::as_object)
         .ok_or_else(|| forbidden("target"))?;
+    if kind == "pr_dequeue" && object.contains_key("body") {
+        return Err(forbidden("body"));
+    }
+    let empty = Map::new();
     let fields = object
         .get("body")
         .and_then(Value::as_object)
+        .or_else(|| (kind == "pr_dequeue").then_some(&empty))
         .ok_or_else(|| forbidden("body"))?;
     let (targets, allowed) = nested_shape(kind);
     for field in target.keys() {
@@ -201,6 +208,20 @@ fn check_nested(object: &Map<String, Value>, kind: &str) -> Result<(), String> {
     if kind == "review_reply" && !fields.contains_key("body") {
         return Err(forbidden("body"));
     }
+    if kind == "pr_enqueue"
+        && !fields
+            .get("expected_head_sha")
+            .and_then(Value::as_str)
+            .is_some_and(|sha| sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Err(forbidden("expected_head_sha"));
+    }
+    // GraphQL's Int is signed 32-bit (`map` lines 162-165).
+    if matches!(kind, "pr_enqueue" | "pr_dequeue")
+        && positive_id(target.get("number"), "number")? > i32::MAX as u64
+    {
+        return Err(forbidden("number"));
+    }
     if matches!(kind, "stack_create" | "stack_add") {
         let valid = fields
             .get("pull_requests")
@@ -226,6 +247,8 @@ fn check_nested(object: &Map<String, Value>, kind: &str) -> Result<(), String> {
 fn nested_shape(kind: &str) -> (&'static [&'static str], &'static [&'static str]) {
     match kind {
         "pr_edit" => (&["number"], &["title", "body"]),
+        "pr_enqueue" => (&["number"], &["expected_head_sha"]),
+        "pr_dequeue" => (&["number"], &[]),
         "review_reply" => (&["number", "comment_id"], &["body"]),
         "resolve_thread" | "unresolve_thread" => (&["thread_id"], &[]),
         "stack_create" => (&[], &["pull_requests"]),
@@ -243,7 +266,7 @@ fn nested_top_extra(kind: &str) -> &'static [&'static str] {
     match kind {
         "pr_edit" => &["author_scope"],
         "review_reply" | "resolve_thread" | "unresolve_thread" | "stack_create" | "stack_add"
-        | "stack_unstack" => &[],
+        | "stack_unstack" | "pr_enqueue" | "pr_dequeue" => &[],
         _ => unreachable!("closed nested request kinds"),
     }
 }
@@ -301,6 +324,8 @@ pub fn judge(request: &Value) -> Result<&'static str, String> {
         (Some("pr create"), _, _) => "pr_create",
         (Some("issue edit"), _, _) => "issue_edit",
         (Some("pr edit"), _, _) => "pr_edit",
+        (Some("pr enqueue"), _, _) => "pr_enqueue",
+        (Some("pr dequeue"), _, _) => "pr_dequeue",
         (Some("api:POST:/repos/*/*/pulls/*/comments/*/replies"), _, _) => "review_reply",
         (Some("graphql resolvereviewthread"), _, _) => "resolve_thread",
         (Some("graphql unresolvereviewthread"), _, _) => "unresolve_thread",
@@ -343,6 +368,8 @@ pub fn judge(request: &Value) -> Result<&'static str, String> {
     if matches!(
         kind,
         "pr_edit"
+            | "pr_enqueue"
+            | "pr_dequeue"
             | "review_reply"
             | "resolve_thread"
             | "unresolve_thread"
@@ -593,6 +620,31 @@ pub fn assert_reply_contract(vector: &Value) {
         assert!(leg.get("response").is_some(), "{name}");
     }
     let result = &vector["reply"]["result"];
+    if matches!(
+        name,
+        "comment-edit-pre-read-unknown"
+            | "pr-edit-pull-request-not-found"
+            | "pr-ready-pull-request-read-incomplete"
+            | "resolve-thread-graphql-errors"
+            | "stack-unstack-stack-read-incomplete"
+    ) {
+        let expected = match name {
+            "comment-edit-pre-read-unknown" => {
+                "pre_dispatch_read_incomplete{reason: transport_unknown}"
+            }
+            "pr-edit-pull-request-not-found" => "vendor_rejected{status: 404}",
+            "resolve-thread-graphql-errors" => "vendor_rejected{status: 422}",
+            _ => "pre_dispatch_read_incomplete{reason: invalid_response}",
+        };
+        assert_eq!(
+            result,
+            &serde_json::json!({
+                "status": "refused", "refusal_code": expected,
+                "retry_same_nonce": true, "transmission": "not_sent",
+            }),
+            "{name}"
+        );
+    }
     match result["status"].as_str() {
         Some("refused") => {
             assert!(result["refusal_code"].is_string(), "{name}");
@@ -604,6 +656,43 @@ pub fn assert_reply_contract(vector: &Value) {
         }
         Some("completed") => assert!(writes.is_some_and(|w| !w.is_empty()), "{name}"),
         other => panic!("{name}: unknown reply status {other:?}"),
+    }
+    if matches!(kind, "pr_enqueue" | "pr_dequeue") {
+        let enqueue = kind == "pr_enqueue";
+        assert_eq!(reads[0]["request_line"], "POST /graphql HTTP/1.1", "{name}");
+        assert_eq!(
+            reads[0]["request_body"]["variables"],
+            serde_json::json!({"owner":"org", "repo":"repo", "number":7}),
+            "{name}"
+        );
+        let pr = &reads[0]["response"]["data"]["repository"]["pullRequest"];
+        if result["status"] == "completed" {
+            let writes = writes.unwrap();
+            assert_eq!(reads.len(), 1, "{name}");
+            assert_eq!(writes.len(), 1, "{name}");
+            assert_eq!(pr["author"]["login"], "app-fixture[bot]", "{name}");
+            assert_eq!(pr["state"], "OPEN", "{name}");
+            let variables = &writes[0]["request_body"]["variables"];
+            assert_eq!(variables["pullRequestId"], pr["id"], "{name}");
+            if enqueue {
+                assert_eq!(
+                    variables["expectedHeadOid"], request["body"]["expected_head_sha"],
+                    "{name}"
+                );
+                assert_eq!(variables["expectedHeadOid"], pr["headRefOid"], "{name}");
+            } else {
+                assert!(variables.get("expectedHeadOid").is_none(), "{name}");
+            }
+            assert_eq!(
+                result["result"],
+                serde_json::json!({
+                    "url":"https://github.com/org/repo/pull/7", "number":7,
+                    "queued":enqueue, "head_sha":"0123456789abcdef0123456789abcdef01234567",
+                }),
+                "{name}"
+            );
+        }
+        return;
     }
     if !matches!(kind, "resolve_thread" | "unresolve_thread") {
         return;
@@ -715,7 +804,7 @@ fn discriminant(request: &Value) -> (Option<String>, Option<String>, bool) {
 }
 
 /// Every vendored request vector through the stand-in judge, demanding the
-/// exact pinned outcome for all 144: every accepted request accepted, every
+/// exact pinned outcome for all 159: every accepted request accepted, every
 /// refused request refused with its exact code (the field name is part of the code).
 /// This pins the stand-in to Plexus's exact decisions: when the shim's
 /// pre-signing round trip ran against a stand-in that accepted the
@@ -728,8 +817,8 @@ fn contract_vectors_judge_to_their_pinned_outcomes() {
     let vectors = load_vectors();
     assert_eq!(
         vectors.len(),
-        144,
-        "the vendored contract holds 144 request vectors"
+        159,
+        "the vendored contract holds 159 request vectors"
     );
     let mut accepted_kinds = BTreeSet::new();
     for vector in &vectors {
@@ -809,6 +898,8 @@ fn closed_shape_allowances_come_from_the_accepted_vectors() {
     // them has unknown-field refused vectors at each closed position.
     let nested: Vec<(&str, (Option<String>, Option<String>, bool))> = vec![
         ("pr_edit", (Some("pr edit".into()), None, false)),
+        ("pr_enqueue", (Some("pr enqueue".into()), None, false)),
+        ("pr_dequeue", (Some("pr dequeue".into()), None, false)),
         (
             "review_reply",
             (

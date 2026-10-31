@@ -1189,6 +1189,7 @@ struct DaemonScript {
     /// Hold the reply to the first request until a second request arrives;
     /// answer the second at once and the first 200 ms later.
     hold_first_request: bool,
+    request_reply_delay: Option<Duration>,
 }
 
 /// Everything the fake daemon was sent.
@@ -1491,6 +1492,11 @@ async fn fake_daemon(script: DaemonScript) -> FakeDaemon {
                         _ => {}
                     }
                     for reply in replies {
+                        if header.channel != 0 && header.ty == FrameType::Request {
+                            if let Some(delay) = script.request_reply_delay {
+                                tokio::time::sleep(delay).await;
+                            }
+                        }
                         if subc_transport::write_frame(&mut stream, &reply)
                             .await
                             .is_err()
@@ -2175,6 +2181,7 @@ async fn gh_shim_relay_cancellation_after_acquisition_releases_lease() {
             subc_protocol::BindIdentity::new("/project", "lease-test", "cancel-acquire"),
             None,
             Default::default(),
+            RELAY_CALL_TIMEOUT,
             &json!({"name":"github_read"}),
         )
         .await
@@ -2215,7 +2222,7 @@ async fn gh_shim_relay_cancellation_after_forwarding_closes_route() {
                 "/project",
                 "cancel-forward",
                 Some(&scope_selector(&delegating_stamp())),
-                json!({"name":"github_read"}),
+                github_call(json!({"op":"bot_request","request_nonce":"cancel-forward"})),
             )
             .await
     });
@@ -2235,7 +2242,10 @@ async fn gh_shim_relay_cancellation_after_forwarding_closes_route() {
     caller.abort();
     let _ = caller.await;
     assert_eq!(
-        daemon.closes(1).await.len(),
+        tokio::time::timeout(Duration::from_secs(1), daemon.closes(1))
+            .await
+            .unwrap()
+            .len(),
         1,
         "canceled forwarding must close the scoped handle"
     );
@@ -2734,4 +2744,300 @@ async fn never_issued_bot_ticket_is_unknown_before_serving_or_authority() {
     assert_eq!(answer.data["refusal_code"], "ticket_unknown");
     assert_eq!(answer.data["stage"], "ticket");
     assert!(transport.calls().is_empty());
+}
+
+#[tokio::test]
+async fn governed_write_reply_budget_starts_at_send_and_outlasts_preflight() {
+    assert_eq!(WRITE_REPLY_TIMEOUT, Duration::from_secs(160));
+    // Scale 160 s to 800 ms: the 450 ms reply represents 90 s and also
+    // outlasts the remaining preparation budget.
+    let daemon = fake_daemon(DaemonScript {
+        request_reply_delay: Some(Duration::from_millis(450)),
+        ..Default::default()
+    })
+    .await;
+    let mut transport = daemon.transport().await;
+    transport.write_reply_timeout = Duration::from_millis(800);
+    let slot = transport
+        .reserve_scoped(
+            "/project",
+            "slow-write",
+            &delegating_stamp(),
+            github_call(json!({"op":"bot_request", "request_nonce":"slow-once"})),
+            tokio::time::Instant::now() + Duration::from_millis(500),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let response = slot.send().unwrap().response().await;
+    assert!(response.is_ok(), "{response:?}");
+    assert_eq!(
+        daemon.requests().len(),
+        1,
+        "a slow write must not be resent"
+    );
+    assert_eq!(
+        daemon.requests()[0]["arguments"]["request_nonce"],
+        "slow-once"
+    );
+    assert_eq!(daemon.closes(1).await.len(), 1);
+}
+
+#[tokio::test]
+async fn governed_write_reply_after_lease_budget_is_still_unknown_without_resending() {
+    let daemon = fake_daemon(DaemonScript {
+        request_reply_delay: Some(Duration::from_millis(900)),
+        ..Default::default()
+    })
+    .await;
+    let mut transport = daemon.transport().await;
+    transport.write_reply_timeout = Duration::from_millis(600);
+    let slot = transport
+        .reserve_scoped(
+            "/project",
+            "late-write",
+            &delegating_stamp(),
+            github_call(json!({"op":"bot_request", "request_nonce":"late-once"})),
+            tokio::time::Instant::now() + Duration::from_millis(500),
+        )
+        .await
+        .unwrap();
+    let response = slot.send().unwrap().response().await;
+    assert!(
+        matches!(response, Err(crate::gh_shim_speech::partner::QueuedResponseError::Unknown(ref cause)) if cause == "reply_timeout"),
+        "{response:?}"
+    );
+    assert_eq!(daemon.requests().len(), 1);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !transport.leases.holders.lock().await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("timeout must release the lease even when its failed connection is closed");
+}
+
+#[tokio::test(start_paused = true)]
+async fn pre_send_unreachable_retry_is_bounded_and_preserves_refusals() {
+    use crate::gh_shim_speech::{Code, Refusal};
+    let unavailable = || {
+        let mut error = crate::gh_shim_speech::service::binding_refusal(
+            Code::AuthorityUnavailable,
+            "binding_unverifiable",
+            "connection refused",
+        );
+        error.retry_before_send = true;
+        error
+    };
+    for recover in [true, false] {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let mut retry = PreSendRetry::new(started + Duration::from_secs(10));
+        let result = retry
+            .run(|| {
+                let attempt = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let error = unavailable();
+                async move {
+                    if recover && attempt == 1 {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    }
+                }
+            })
+            .await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(4)
+        );
+        if recover {
+            assert!(result.is_ok());
+        } else {
+            assert_eq!(result.unwrap_err().wire_data(), unavailable().wire_data());
+        }
+        let mut calls = 0;
+        let _ = retry
+            .run(|| {
+                calls += 1;
+                std::future::ready(Err::<(), _>(unavailable()))
+            })
+            .await;
+        assert_eq!(calls, 1, "binding and reservation share a single retry");
+    }
+    for reason in ["no_binding_row", "binding_changed", "repository_denied"] {
+        let expected = Refusal::new(Code::IdentityConflict, reason);
+        let mut calls = 0;
+        let mut retry = PreSendRetry::new(tokio::time::Instant::now() + Duration::from_secs(10));
+        let result = retry
+            .run(|| {
+                calls += 1;
+                std::future::ready(Err::<(), _>(expected.clone()))
+            })
+            .await;
+        assert_eq!(result.unwrap_err(), expected);
+        assert_eq!(calls, 1, "{reason} is a real refusal, not an outage");
+    }
+}
+
+#[tokio::test]
+async fn warming_reservation_is_a_retryable_pre_send_outage_not_a_binding_refusal() {
+    let daemon = fake_daemon(DaemonScript {
+        refuse_scoped_opens: Some("module_warming".into()),
+        ..Default::default()
+    })
+    .await;
+    let transport = daemon
+        .transport_with_deadline(Some(Duration::from_millis(40)))
+        .await;
+    let error = match transport
+        .reserve_scoped(
+            "/project",
+            "warming",
+            &delegating_stamp(),
+            github_call(json!({"op":"bot_request","request_nonce":"not-sent"})),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+    {
+        Ok(_) => panic!("warming cannot admit a write"),
+        Err(error) => error,
+    };
+    assert_eq!(error.reason, "relay_unavailable");
+    assert!(error.retry_before_send);
+    assert!(daemon.requests().is_empty());
+    for code in ["module_warming", "module_reloading", "target_unavailable"] {
+        assert!(TransportError::Refused {
+            code: code.into(),
+            message: "unreachable".into()
+        }
+        .unreachable_before_send());
+    }
+    for code in [
+        "no_binding_row",
+        "policy_denied",
+        "binding_mismatch",
+        "scope_ended",
+    ] {
+        assert!(!TransportError::Refused {
+            code: code.into(),
+            message: "refused".into()
+        }
+        .unreachable_before_send());
+    }
+    assert!(!TransportError::OutcomeUnknown("sent".into()).unreachable_before_send());
+}
+
+#[tokio::test(start_paused = true)]
+async fn pre_send_retry_never_outlives_the_overall_preflight_deadline() {
+    let started = tokio::time::Instant::now();
+    let mut retry = PreSendRetry::new(started + Duration::from_secs(2));
+    let error = retry
+        .run(|| async {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            Ok::<(), crate::gh_shim_speech::Refusal>(())
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.reason, "reservation_timeout");
+    assert_eq!(
+        tokio::time::Instant::now() - started,
+        Duration::from_secs(2)
+    );
+}
+
+#[tokio::test]
+async fn a_long_reply_budget_does_not_allow_enqueue_after_preflight_expires() {
+    let daemon = fake_daemon(DaemonScript::default()).await;
+    let transport = daemon.transport().await;
+    let slot = transport
+        .reserve_scoped(
+            "/project",
+            "expired-before-send",
+            &delegating_stamp(),
+            github_call(json!({"op":"bot_request","request_nonce":"never-enqueued"})),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let error = slot
+        .send()
+        .err()
+        .expect("expired preparation must not enqueue a write");
+    assert_eq!(error.reason, "reservation_timeout");
+    assert!(daemon.requests().is_empty());
+}
+
+#[tokio::test]
+async fn real_route_open_policy_refusal_never_acquires_the_outage_retry_marker() {
+    let daemon = fake_daemon(DaemonScript {
+        refuse_scoped_opens: Some("policy_denied".into()),
+        ..Default::default()
+    })
+    .await;
+    let transport = daemon.transport().await;
+    let error = transport
+        .reserve_scoped(
+            "/project",
+            "policy-refused",
+            &delegating_stamp(),
+            github_call(json!({"op":"bot_request","request_nonce":"denied"})),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .err()
+        .unwrap();
+    assert!(!error.retry_before_send);
+    assert_eq!(error.reason, "relay_unavailable");
+    assert!(daemon.requests().is_empty());
+    assert_eq!(daemon.opens().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn shim_binding_version_check_retries_only_a_pre_send_outage_once() {
+    let live = crate::bash_background::registry::with_scope_spawn(Some(delegating_stamp()), || {
+        crate::gh_shim_ticket::ScopedTicket::issue(
+            "ses-binding-outage",
+            "call-binding-outage",
+            "/p",
+        )
+    });
+    let redeemed = crate::gh_shim_ticket::redeem(live.value().unwrap()).unwrap();
+    let unavailable = TransportError::Unavailable("connection refused".into());
+    let bindings = json!({"repo_binding_generation": 3, "bindings": []});
+    for recover in [true, false] {
+        let transport = FakeTransport::default();
+        transport.push_plexus(Err(unavailable.clone()));
+        transport.push_plexus(if recover {
+            Ok(bindings.clone())
+        } else {
+            Err(unavailable.clone())
+        });
+        let started = tokio::time::Instant::now();
+        let reply = bindings_read(&transport, &redeemed).await;
+        if recover {
+            assert_eq!(reply, RelayReply::relayed(bindings.clone()));
+        } else {
+            assert_eq!(reply, transport_refusal("plexus", unavailable.clone()));
+        }
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].2, calls[1].2);
+        assert_eq!(calls[0].2["arguments"]["op"], "bindings.read_for_agent");
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(4)
+        );
+    }
+    let transport = FakeTransport::default();
+    let denied = TransportError::Refused {
+        code: "no_binding_row".into(),
+        message: "no binding".into(),
+    };
+    transport.push_plexus(Err(denied.clone()));
+    let reply = bindings_read(&transport, &redeemed).await;
+    assert_eq!(reply, transport_refusal("plexus", denied));
+    assert_eq!(transport.calls().len(), 1);
 }

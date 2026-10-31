@@ -3,11 +3,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-const CONTENT_HASH_SIZE_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
-
 /// Per-document state tracked for LSP synchronization.
 ///
-/// We track `mtime`, `size`, and (for small files) a content hash so we can
+/// We track `mtime`, `size`, and a content hash so we can
 /// detect when a file has been changed
 /// outside the AFT pipeline (another tool, another session, manual edit) and
 /// resync the LSP server before issuing diagnostic requests. Without this,
@@ -25,10 +23,12 @@ pub struct DocumentEntry {
     /// Filesystem byte size at the moment we last synced. `None` for the
     /// same reasons as `mtime`.
     pub size: Option<u64>,
-    /// BLAKE3 content hash captured at the last sync for files up to
-    /// `CONTENT_HASH_SIZE_LIMIT_BYTES`. Large files skip hashing and rely on
-    /// `(mtime, size)` to avoid expensive reads.
+    /// BLAKE3 hash of the synchronized text. Metadata alone cannot prove that
+    /// diagnostics describe the current content, even for a large document.
     pub content_hash: Option<[u8; 32]>,
+    /// FIFO dispatch order of the acknowledged didOpen/didChange carrying this
+    /// text. Absent for synthetic state and failed or unconfirmed writes.
+    pub sync_order: Option<u64>,
 }
 
 /// Tracks document state for LSP synchronization.
@@ -44,13 +44,14 @@ pub struct DocumentEntry {
 #[derive(Debug, Default)]
 pub struct DocumentStore {
     entries: HashMap<PathBuf, DocumentEntry>,
+    /// Higher than every version of a closed document. A scalar floor avoids
+    /// retaining one path forever for every file an inspect briefly opened.
+    reopen_version_floor: i32,
 }
 
 impl DocumentStore {
     pub fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-        }
+        Self::default()
     }
 
     pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
@@ -68,8 +69,9 @@ impl DocumentStore {
         self.entries.contains_key(path)
     }
 
-    /// Open a new document, recording the current on-disk metadata/hash. Returns
-    /// the initial version (0). If the file's metadata cannot be read, the
+    /// Open a document, recording its on-disk metadata/hash. The initial version
+    /// starts at zero and advances past every closed document's last version.
+    /// If metadata cannot be read, the
     /// document is still tracked but `mtime`/`size` will be `None`, which
     /// causes `is_stale_on_disk()` to conservatively report stale on the
     /// next check (forcing a resync).
@@ -81,14 +83,21 @@ impl DocumentStore {
     /// [`Self::open`] with the file's disk state already read, so a document
     /// opened in several servers reads and hashes the file once.
     pub fn open_with(&mut self, path: PathBuf, snapshot: &DiskSnapshot) -> i32 {
+        let version = self.next_open_version();
         let entry = DocumentEntry {
-            version: 0,
+            version,
             mtime: snapshot.mtime,
             size: snapshot.size,
             content_hash: snapshot.content_hash(&path),
+            sync_order: snapshot.sync_order,
         };
         self.entries.insert(path, entry);
-        0
+        version
+    }
+
+    /// Reopening must not reuse a version that a delayed publication can carry.
+    pub(crate) fn next_open_version(&self) -> i32 {
+        self.reopen_version_floor
     }
 
     /// Bump the version for an already-open document and refresh the
@@ -108,6 +117,7 @@ impl DocumentStore {
         entry.mtime = snapshot.mtime;
         entry.size = snapshot.size;
         entry.content_hash = content_hash;
+        entry.sync_order = snapshot.sync_order;
         Some(entry.version)
     }
 
@@ -133,7 +143,9 @@ impl DocumentStore {
     /// Close a document and remove from tracking. Returns the last known
     /// version, or `None` if the document was not open.
     pub fn close(&mut self, path: &Path) -> Option<i32> {
-        self.entries.remove(path).map(|e| e.version)
+        let entry = self.entries.remove(path)?;
+        self.reopen_version_floor = self.reopen_version_floor.max(entry.version + 1);
+        Some(entry.version)
     }
 
     /// Get all open document paths.
@@ -175,7 +187,6 @@ impl DocumentStore {
                 }
 
                 match current_size {
-                    Some(size) if size > CONTENT_HASH_SIZE_LIMIT_BYTES => false,
                     Some(_) => match (entry.content_hash, snapshot.content_hash(path)) {
                         (Some(prev_hash), Some(now_hash)) => prev_hash != now_hash,
                         _ => true,
@@ -190,26 +201,41 @@ impl DocumentStore {
     }
 }
 
-/// One file's disk state: metadata read at once, and for small files a
+/// One file's disk state: metadata read at once, and a
 /// BLAKE3 content hash read on first use and then shared, so every server's
 /// store and every staleness check in one operation reads the file once.
 /// Metadata fields are `None` if the path cannot be statted or if the
 /// platform doesn't support the queried metadata (rare). The hash is `None`
-/// for unreadable files and files above `CONTENT_HASH_SIZE_LIMIT_BYTES`.
-#[derive(Debug, Default)]
+/// for unreadable files.
+#[derive(Debug, Default, Clone)]
 pub struct DiskSnapshot {
     mtime: Option<SystemTime>,
     size: Option<u64>,
     content_hash: std::cell::OnceCell<Option<[u8; 32]>>,
+    sync_order: Option<u64>,
 }
 
 impl DiskSnapshot {
+    pub(crate) fn with_sync_order(mut self, order: Option<u64>) -> Self {
+        self.sync_order = order;
+        self
+    }
+    /// Use the text actually sent, not a second disk read that could observe a
+    /// concurrent write and incorrectly certify text the server never received.
+    pub(crate) fn for_content(path: &Path, content: &str) -> Self {
+        let snapshot = Self::read(path);
+        let _ = snapshot
+            .content_hash
+            .set(Some(*blake3::hash(content.as_bytes()).as_bytes()));
+        snapshot
+    }
     pub fn read(path: &Path) -> Self {
         match std::fs::metadata(path) {
             Ok(meta) => Self {
                 mtime: meta.modified().ok(),
                 size: Some(meta.len()),
                 content_hash: std::cell::OnceCell::new(),
+                sync_order: None,
             },
             Err(_) => Self::default(),
         }
@@ -217,17 +243,20 @@ impl DiskSnapshot {
 
     fn content_hash(&self, path: &Path) -> Option<[u8; 32]> {
         *self.content_hash.get_or_init(|| {
-            let size = self.size?;
-            if size > CONTENT_HASH_SIZE_LIMIT_BYTES {
-                return None;
-            }
+            self.size?;
             #[cfg(test)]
             CONTENT_READS.with(|reads| reads.set(reads.get() + 1));
-            std::fs::read(path)
-                .ok()
-                .map(|bytes| *blake3::hash(&bytes).as_bytes())
+            file_content_hash(path)
         })
     }
+}
+
+/// Stream large files rather than allocating another full document buffer.
+pub(crate) fn file_content_hash(path: &Path) -> Option<[u8; 32]> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut hasher).ok()?;
+    Some(*hasher.finalize().as_bytes())
 }
 
 #[cfg(test)]
@@ -269,6 +298,34 @@ mod tests {
 
     fn content_reads() -> usize {
         CONTENT_READS.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn large_diagnostics_document_detects_same_metadata_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.ts");
+        let mut content = vec![b'a'; 4 * 1024 * 1024 + 1];
+        fs::write(&path, &content).unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let mut store = DocumentStore::new();
+        store.open(path.clone());
+        content[0] = b'b';
+        fs::write(&path, content).unwrap();
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(modified)).unwrap();
+        assert!(store.is_stale_on_disk(&path));
+    }
+
+    #[test]
+    fn diagnostics_sync_hash_describes_sent_text_not_a_later_disk_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.ts");
+        fs::write(&path, "new disk text").unwrap();
+        let mut store = DocumentStore::new();
+        store.open_with(
+            path.clone(),
+            &DiskSnapshot::for_content(&path, "sent old text"),
+        );
+        assert!(store.is_stale_on_disk(&path));
     }
 
     #[test]

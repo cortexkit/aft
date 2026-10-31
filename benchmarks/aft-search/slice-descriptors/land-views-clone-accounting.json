@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "views-clone-accounting"
+  ],
+  "note": "v3 family accounting charges a member view's files only for the bytes they hold alone (macOS ATTR_CMNEXT_PRIVATESIZE), so a clone of its base is not charged twice. No changed path matches RANKING_FENCE_PREFIXES."
+}

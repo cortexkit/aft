@@ -2514,7 +2514,7 @@ pub(super) fn submit_deferred_bash(
                     Some(response) => response,
                     None => {
                         let startup_steps = receipt.startup_step_snapshot();
-                        let response = startup_deadline_response(&request_id, &outcome, startup_window, blocking_cap_ms, server_completion, worker_session, format_context.bash_watch_available.unwrap_or(worker_session), &executor, &root_for_task, admitted.load(Ordering::Relaxed), startup_steps.current());
+                        let response = startup_deadline_response(&request_id, &outcome, startup_window, blocking_cap_ms, server_completion, worker_session, format_context.bash_watch_available.unwrap_or(worker_session), &executor, &root_for_task, &spawn_cancel, admitted.load(Ordering::Relaxed), startup_steps.current());
                         capture_target = register_capture_target(&response);
                         let response = if blocking_intent && capture_deadline.is_some() {
                             if let Some(task_id) = response.data["task_id"].as_str().map(str::to_owned) {
@@ -2882,6 +2882,7 @@ fn startup_deadline_response(
     bash_watch_available: bool,
     executor: &Executor,
     root: &ProjectRootId,
+    cancellation: &JobCancellation,
     admitted: bool,
     slow_step: crate::bash_background::BashStartupStep,
 ) -> Response {
@@ -2924,10 +2925,13 @@ fn startup_deadline_response(
                 INLINE_STARTUP_SETTLE.as_millis()
             ),
         ),
-        StartupOutcome::Refused => Response::error(
+        StartupOutcome::Refused => startup_refusal_response(
             request_id,
-            "bash_start_deadline",
-            startup_refusal_reason(executor, root, admitted, slow_step),
+            executor,
+            root,
+            cancellation,
+            admitted,
+            slow_step,
         ),
     }
 }
@@ -2935,23 +2939,50 @@ fn startup_deadline_response(
 /// Only called once the receipt is refused: process creation and in-process
 /// rewrites both commit through that receipt, and a refused receipt never
 /// commits, so every reason here can say the command was not started.
-fn startup_refusal_reason(
+fn startup_refusal_response(
+    request_id: &str,
     executor: &Executor,
     root: &ProjectRootId,
+    cancellation: &JobCancellation,
     admitted: bool,
     slow_step: crate::bash_background::BashStartupStep,
-) -> String {
+) -> Response {
     if admitted {
-        return format!(
+        return Response::error(request_id, "bash_start_deadline", format!(
             "bash startup reply budget expired during {} before process creation committed; process creation is now refused, so the command was not started and will not start",
             slow_step.description()
-        );
+        ));
     }
     if let Some(writer) = executor
-        .try_mutating_lane_snapshots()
-        .and_then(|writers| writers.into_iter().find(|writer| &writer.root_id == root))
+        .try_root_job_snapshots(root, Some(cancellation))
+        .and_then(|jobs| jobs.into_iter().find(|job| job.lane == Lane::Mutating))
     {
-        return format!("bash startup deadline: queued behind root Mutating job {} ({}); slow startup step: {}; command was not started", writer.request_id, writer.command, slow_step.description());
+        // The scheduler reserves the lane before the worker takes the epoch
+        // gate and enters the startup callback. That occupant can be this call,
+        // not a different job blocking it. Request IDs alone are not identity.
+        let message = if writer.is_current {
+            format!("bash startup deadline: queued for executor admission or scheduler lock; slow startup step: {}; command was not started", slow_step.description())
+        } else {
+            format!("bash startup deadline: queued behind root Mutating job {} ({}); slow startup step: {}; command was not started", writer.request_id, writer.command, slow_step.description())
+        };
+        crate::slog_warn!(
+            "bash startup admission: request_id={request_id} occupant_request_id={} lane={:?} job_id={} age_ms={} execution_started={} own_job={}",
+            writer.request_id, writer.lane, writer.job_id, writer.started_age_ms,
+            writer.execution_started, writer.is_current,
+        );
+        return Response::error_with_data(
+            request_id,
+            "bash_start_deadline",
+            message,
+            json!({
+                "detail": {
+                    "job_id": writer.job_id,
+                    "age_ms": writer.started_age_ms,
+                    "execution_started": writer.execution_started,
+                    "own_job": writer.is_current,
+                }
+            }),
+        );
     }
     if executor
         .try_dispatch_liveness_snapshot()
@@ -2959,9 +2990,9 @@ fn startup_refusal_reason(
             snapshot.running.interactive + snapshot.running.maintenance >= executor.pool_size()
         })
     {
-        return format!("bash startup deadline: executor workers saturated; slow startup step: {}; command was not started", slow_step.description());
+        return Response::error(request_id, "bash_start_deadline", format!("bash startup deadline: executor workers saturated; slow startup step: {}; command was not started", slow_step.description()));
     }
-    format!("bash startup deadline: queued for executor admission or scheduler lock; slow startup step: {}; command was not started", slow_step.description())
+    Response::error(request_id, "bash_start_deadline", format!("bash startup deadline: queued for executor admission or scheduler lock; slow startup step: {}; command was not started", slow_step.description()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8245,6 +8276,106 @@ mod grant_path_tests {
         deadline_queue_case(false).await;
     }
 
+    #[test]
+    fn bash_deadline_distinguishes_own_admission_from_same_id_blocker() {
+        let (_dir, root) = super::super::test_support::test_root("bash-admission-identity");
+        let executor = Executor::new();
+        executor.register_actor(root.clone(), super::super::test_support::test_ctx());
+        let current = JobCancellation::new();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let done = executor.submit_tool_call_with_cancellation_async(
+            root.clone(),
+            Lane::Mutating,
+            "reused-call".into(),
+            "bash",
+            Box::new(move |_| {
+                entered_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                Response::success("reused-call", json!({}))
+            }),
+            current.clone(),
+        );
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // Model the scheduler/callback gap with admitted=false while keeping
+        // the occupant stable, without relying on operating-system scheduling.
+        // The job snapshot is a non-blocking read; while the scheduler holds
+        // its lock the refusal falls back to the generic sentence, by design.
+        // Retry until a read gets through, so the assertions below compare the
+        // own-job and other-job answers rather than lock timing.
+        let ((own, other), lines) = crate::logging::capture_log_lines(|| {
+            let refusal = |token: &JobCancellation| {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    let response = startup_deadline_response(
+                        "waiting-call",
+                        &crate::bash_background::StartupOutcome::Refused,
+                        80,
+                        None,
+                        false,
+                        false,
+                        false,
+                        &executor,
+                        &root,
+                        token,
+                        false,
+                        crate::bash_background::BashStartupStep::Admission,
+                    );
+                    if response.data.get("detail").is_some()
+                        || std::time::Instant::now() >= deadline
+                    {
+                        return response;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            };
+            (refusal(&current), refusal(&JobCancellation::new()))
+        });
+        release_tx.send(()).unwrap();
+        assert!(done.blocking_recv().unwrap().success);
+
+        assert_eq!(
+            own.data["message"],
+            "bash startup deadline: queued for executor admission or scheduler lock; slow startup step: executor admission; command was not started"
+        );
+        assert!(!own.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("queued behind root Mutating job"));
+        assert_eq!(
+            other.data["message"],
+            "bash startup deadline: queued behind root Mutating job reused-call (bash); slow startup step: executor admission; command was not started"
+        );
+        assert_eq!(own.data["detail"]["job_id"], other.data["detail"]["job_id"]);
+        let warnings = lines
+            .iter()
+            .filter(|line| line.starts_with("WARN ") && line.contains("bash startup admission:"))
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 2, "{lines:?}");
+        for (response, own_job) in [(&own, true), (&other, false)] {
+            assert!(!response.success);
+            assert_eq!(response.data["code"], "bash_start_deadline");
+            let detail = &response.data["detail"];
+            assert!(detail["job_id"].as_u64().is_some_and(|id| id > 0));
+            assert!(detail["age_ms"].as_u64().is_some());
+            assert_eq!(detail["execution_started"], true);
+            assert_eq!(detail["own_job"], own_job);
+            let expected = format!(
+                "job_id={} age_ms={} execution_started=true own_job={own_job}",
+                detail["job_id"], detail["age_ms"],
+            );
+            assert_eq!(
+                warnings
+                    .iter()
+                    .filter(|line| line.contains(&expected))
+                    .count(),
+                1,
+                "{lines:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn bash_deadline_refuses_executor_saturation() {
         deadline_queue_case(true).await;
@@ -9108,6 +9239,7 @@ mod grant_path_tests {
                 false,
                 &Executor::new(),
                 &root,
+                &JobCancellation::new(),
                 true,
                 receipt.startup_step_snapshot().current(),
             );

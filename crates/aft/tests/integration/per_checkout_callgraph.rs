@@ -311,7 +311,10 @@ impl FirstLoadDriver for Driver {
                 .downcast_ref::<CallgraphAttachment>()
                 .unwrap();
             store
-                .put_or_touch(&attachment.key, &attachment.blob.to_bytes().map_err(error)?)
+                .put_or_touch(
+                    &attachment.key,
+                    &attachment.payload().expect("unpublished payload"),
+                )
                 .map_err(error)?;
             let DiskState::Present { content, size } = live.disk else {
                 continue;

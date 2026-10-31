@@ -37,6 +37,8 @@
     "index_status": "Fallback",
     "truncated": false,
     "search_ms": 0.0,
+    "entries_examined": 7,
+    "files_examined": 3,
     "index": {
       "trigram": {
         "status": "fallback",

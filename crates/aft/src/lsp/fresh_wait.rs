@@ -8,7 +8,7 @@ use super::roots::ServerKey;
 
 /// Wait for authoritative diagnostics for the versions returned by
 /// `notify_file_changed_versioned`, using the snapshot taken before that notify.
-/// Older, cached, and unversioned reports cannot complete the wait.
+/// Older cached reports and publications without a current-content proof cannot complete the wait.
 ///
 /// The lock closure is used only for registration, polling, and collection;
 /// channel waits never hold the manager mutex. The absolute deadline preserves

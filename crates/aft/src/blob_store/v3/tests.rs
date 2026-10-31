@@ -4,15 +4,92 @@ use tempfile::tempdir;
 
 const A: &str = "0123456789abcdef";
 const B: &str = "fedcba9876543210";
-pub(super) fn serial() -> MutexGuard<'static, ()> {
+pub(crate) struct SerialTestGuard {
+    _unlimited: UnlimitedFreeSpaceForTestProcess,
+    _serial: MutexGuard<'static, ()>,
+}
+pub(super) fn serial() -> SerialTestGuard {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let guard = LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    set_free_space_for_test(u64::MAX, u64::MAX / 2);
-    guard
+    SerialTestGuard {
+        _unlimited: unlimited_free_space_for_test_process(),
+        _serial: guard,
+    }
 }
+
+#[test]
+fn free_space_override_guard_restores_after_unwind() {
+    let _serial = serial();
+    let storage = tempdir().unwrap();
+    let _previous = set_free_space_for_test(storage.path(), 17, 42);
+    let observed = Mutex::new(None);
+    let panic = std::panic::catch_unwind(|| {
+        let _guard = set_free_space_for_test(storage.path(), 1, 1 << 40);
+        *observed.lock().unwrap() = free_space(storage.path());
+        panic!("unwind the free-space test guard");
+    });
+    assert!(panic.is_err());
+    assert_eq!(*observed.lock().unwrap(), Some((1, 1 << 40)));
+    assert_eq!(free_space(storage.path()), Some((17, 42)));
+    drop(_previous);
+    assert_eq!(free_space(storage.path()), Some((u64::MAX, u64::MAX / 2)));
+}
+
+#[test]
+fn free_space_override_reaches_other_threads_under_its_storage_root() {
+    let _serial = serial();
+    let root = tempdir().unwrap();
+    let storage = root.path().join("storage");
+    let _space = set_free_space_for_test(&storage, 17, 42);
+    let path = storage.join("blobs/v3/plane.sqlite");
+    assert_eq!(
+        std::thread::spawn(move || free_space(&path))
+            .join()
+            .unwrap(),
+        Some((17, 42))
+    );
+    assert_eq!(
+        free_space(&root.path().join("storage-other")),
+        Some((u64::MAX, u64::MAX / 2))
+    );
+    let inner = storage.join("nested");
+    let _inner = set_free_space_for_test(&inner, 23, 84);
+    assert_eq!(free_space(&inner.join("blobs/v3")), Some((23, 84)));
+    assert_eq!(free_space(&storage), Some((17, 42)));
+}
+
+#[cfg(unix)]
+#[test]
+fn free_space_override_matches_resolved_symlink_roots() {
+    let _serial = serial();
+    let root = tempdir().unwrap();
+    let storage = root.path().join("storage");
+    fs::create_dir(&storage).unwrap();
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink(&storage, &alias).unwrap();
+    let resolved = fs::canonicalize(&storage).unwrap();
+
+    for suffix in ["", "not-created"] {
+        let raw = alias.join(suffix);
+        let canonical = resolved.join(suffix);
+        let _space = set_free_space_for_test(&raw, 17, 42);
+        assert_eq!(free_space(&raw), Some((17, 42)));
+        assert_eq!(free_space(&canonical), Some((17, 42)));
+        assert_eq!(
+            free_space(&canonical.join("missing/blobs/v3")),
+            Some((17, 42))
+        );
+        assert_eq!(
+            free_space(&root.path().join("other-storage")),
+            Some((u64::MAX, u64::MAX / 2))
+        );
+    }
+    assert!(!storage.join("not-created").exists());
+}
+
 fn key() -> FamilyKey {
     FamilyKey::new(FamilyPlane::Semantic, [7; 32])
 }
@@ -114,6 +191,216 @@ fn publication_survives_a_sidecar_disappearing_during_accounting() {
     assert_eq!(reader.get(&chunk).unwrap().unwrap(), b"chunk");
     assert_eq!(reader.get(&run).unwrap().unwrap(), b"run");
 }
+#[cfg(windows)]
+fn open_permission_fixture(
+    path: &Path,
+    access: u32,
+) -> std::io::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::{ffi::OsStrExt, io::FromRawHandle};
+    use windows_sys::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        Storage::FileSystem::{
+            CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, OPEN_EXISTING,
+        },
+    };
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // These handles probe rights on dedicated non-SQLite fixtures; they never
+    // read content or open a live database inode through another descriptor.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        Err(std::io::Error::last_os_error())
+    } else {
+        // SAFETY: CreateFileW returned a valid, uniquely owned handle.
+        Ok(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) })
+    }
+}
+
+#[cfg(windows)]
+fn icacls_for_test(path: &Path, action: &str, rights: &str) {
+    let output = std::process::Command::new("icacls")
+        .arg(path)
+        .args([action, rights])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "icacls: {output:?}");
+}
+
+#[cfg(windows)]
+pub(crate) struct DeniedReadForTest(PathBuf);
+
+#[cfg(windows)]
+impl Drop for DeniedReadForTest {
+    fn drop(&mut self) {
+        icacls_for_test(&self.0, "/remove:d", "*S-1-1-0");
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn deny_read_for_test<T>(
+    path: &Path,
+    operation: &str,
+    probe: impl FnOnce() -> std::io::Result<T>,
+) -> (DeniedReadForTest, bool) {
+    // Everyone's read-data right is also the directory-listing right. A SID
+    // avoids depending on the localized account name on the Windows runner.
+    icacls_for_test(path, "/deny", "*S-1-1-0:(RD)");
+    let restore = DeniedReadForTest(path.to_path_buf());
+    // Installing an access control entry does not prove the process observes it.
+    // Probe the operation the fixture needs denied before asserting denial-dependent behavior.
+    let enforced = match probe() {
+        Err(error) => {
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{error}"
+            );
+            eprintln!("ACL denial confirmed: {operation} at {}", path.display());
+            true
+        }
+        Ok(_) => {
+            eprintln!(
+                "note: this machine cannot model ACL denial for {operation} at {}; \
+                 the operation succeeded after icacls /deny; skipping only the \
+                 ACL-dependent assertions, not the accounting checks",
+                path.display()
+            );
+            false
+        }
+    };
+    (restore, enforced)
+}
+
+/// A deletion can make the initial metadata open fail with error 5, then remove
+/// the name before std's FindFirstFileExW fallback, which returns the original
+/// error 5. Denying parent listing after enumeration makes that fallback fail
+/// deterministically while a legacy delete-pending handle keeps the file alive.
+#[cfg(windows)]
+#[test]
+fn accounting_uses_listed_metadata_for_a_delete_pending_file() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, SetFileInformationByHandle, DELETE, FILE_DISPOSITION_INFO,
+        FILE_READ_ATTRIBUTES,
+    };
+
+    let root = tempdir().unwrap();
+    let dir = family_dir(root.path(), A).unwrap();
+    fs::create_dir_all(&dir).unwrap();
+    let pending = dir.join("..retention-sweep.lock.tmp");
+    let payload = b"delete-pending lock bytes";
+    fs::write(&pending, payload).unwrap();
+    let handle = open_permission_fixture(&pending, DELETE | FILE_READ_ATTRIBUTES).unwrap();
+    let handle = std::rc::Rc::new(handle);
+    let pending_handle = std::rc::Rc::clone(&handle);
+    let removed = std::rc::Rc::new(std::cell::Cell::new(false));
+    let observed = std::rc::Rc::clone(&removed);
+    let denied = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let hook_denied = std::rc::Rc::clone(&denied);
+    let race_modelled = std::rc::Rc::new(std::cell::Cell::new(false));
+    let hook_modelled = std::rc::Rc::clone(&race_modelled);
+    WALK_BEFORE_STAT.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |path| {
+            if path == pending && !observed.replace(true) {
+                let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+                // Set legacy disposition explicitly: pathname deletion can use
+                // POSIX semantics instead of leaving a delete-pending name.
+                assert_ne!(
+                    unsafe {
+                        SetFileInformationByHandle(
+                            pending_handle.as_raw_handle(),
+                            FileDispositionInfo,
+                            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                            std::mem::size_of_val(&disposition) as u32,
+                        )
+                    },
+                    0,
+                    "{}",
+                    std::io::Error::last_os_error()
+                );
+                let (guard, enforced) = deny_read_for_test(
+                    path.parent().unwrap(),
+                    "stat of a delete-pending file",
+                    || fs::symlink_metadata(path),
+                );
+                *hook_denied.borrow_mut() = Some(guard);
+                if enforced {
+                    assert_eq!(
+                        fs::symlink_metadata(path).unwrap_err().raw_os_error(),
+                        Some(5)
+                    );
+                }
+                hook_modelled.set(enforced);
+            }
+        }));
+    });
+    let result = allocated_bytes_until(&dir, None);
+    WALK_BEFORE_STAT.with(|hook| *hook.borrow_mut() = None);
+    denied.borrow_mut().take();
+
+    assert!(removed.get(), "the walk did not reach the pending file");
+    eprintln!("pathname-stat race modelled: {}", race_modelled.get());
+    // The listing's length is a conservative charge until a later measurement.
+    assert_eq!(result.unwrap(), Some(payload.len() as u64));
+    drop(handle);
+}
+
+#[cfg(windows)]
+#[test]
+fn accounting_counts_unreadable_files_but_refuses_unreadable_directories() {
+    let root = tempdir().unwrap();
+    let dir = family_dir(root.path(), A).unwrap();
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("unreadable");
+    let payload = b"still charged from the directory listing";
+    fs::write(&file, payload).unwrap();
+
+    let (denied, file_denial_enforced) = deny_read_for_test(&file, "file content open", || {
+        open_permission_fixture(
+            &file,
+            windows_sys::Win32::Storage::FileSystem::FILE_READ_DATA,
+        )
+    });
+    let read = open_permission_fixture(
+        &file,
+        windows_sys::Win32::Storage::FileSystem::FILE_READ_DATA,
+    );
+    let measured = allocated_bytes_until(&dir, None);
+    drop(denied);
+    if file_denial_enforced {
+        assert_eq!(
+            read.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+    // File content access is unnecessary for accounting, but its bytes must
+    // never be silently discarded just because the content is unreadable.
+    assert_eq!(measured.unwrap(), Some(payload.len() as u64));
+
+    let (denied, directory_denial_enforced) =
+        deny_read_for_test(&dir, "directory listing", || fs::read_dir(&dir));
+    let measured = allocated_bytes_until(&dir, None);
+    drop(denied);
+    if directory_denial_enforced {
+        let Error::Io(error) = measured.unwrap_err() else {
+            panic!("unreadable directory must report an I/O error");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    } else {
+        assert_eq!(measured.unwrap(), Some(payload.len() as u64));
+    }
+}
+
 #[cfg(unix)]
 pub(super) fn inventory(path: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
@@ -142,6 +429,57 @@ pub(super) fn measurement_recheck_hook() -> Result<()> {
     RECHECK_HOOK.with(|hook| match &mut *hook.borrow_mut() {
         Some(hook) => hook(),
         None => Ok(()),
+    })
+}
+
+pub(super) fn with_changing_namespace<T>(
+    storage: &Path,
+    family: &str,
+    run: impl FnOnce(&std::sync::atomic::AtomicUsize) -> T,
+) -> (T, usize) {
+    struct Restore(Option<RecheckHook>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RECHECK_HOOK.with(|hook| *hook.borrow_mut() = self.0.take());
+        }
+    }
+    let dir = view_dir(storage, family, "measurement-writer").unwrap();
+    fs::create_dir_all(&dir).unwrap();
+    let completed = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let (write, requests) = crossbeam_channel::bounded(0);
+        let (done, writes) = crossbeam_channel::bounded(0);
+        let completed = &completed;
+        let writer = scope.spawn(move || {
+            let mut count = 0;
+            while requests.recv().is_ok() {
+                let result = (|| {
+                    let derived = IdentityConnection::open(
+                        dir.join(format!("derived-{count}.sqlite")),
+                        "view-load-measurement-writer",
+                    )?;
+                    derived.execute_batch(
+                        "CREATE TABLE growing(payload BLOB); INSERT INTO growing VALUES(zeroblob(16384));",
+                    )?;
+                    Ok(())
+                })();
+                count += 1;
+                completed.store(count, std::sync::atomic::Ordering::SeqCst);
+                if done.send(result).is_err() {
+                    break;
+                }
+            }
+            count
+        });
+        let restore = Restore(RECHECK_HOOK.with(|hook| {
+            hook.replace(Some(Box::new(move || {
+                write.send(()).unwrap();
+                writes.recv().unwrap()
+            })))
+        }));
+        let result = run(completed);
+        drop(restore);
+        (result, writer.join().unwrap())
     })
 }
 
@@ -304,12 +642,13 @@ fn changing_derived_database_reports_busy_then_measurement_recovers() {
 fn floor_refusal_before_creation_and_budget_recheck_leave_no_plane_or_row() {
     let _guard = serial();
     let root = tempdir().unwrap();
-    set_free_space_for_test(NAMESPACE_BUDGET - 1, 8 * NAMESPACE_BUDGET);
+    let _low_space =
+        set_free_space_for_test(root.path(), NAMESPACE_BUDGET - 1, 8 * NAMESPACE_BUDGET);
     let error = publish(root.path(), A, 1, None, |_| Ok(())).unwrap_err();
     assert_eq!(error.to_string(), "device_free_space_floor");
     assert!(!root.path().join("blobs/v3").exists());
     assert!(!root.path().join("reader-floor.json").exists());
-    set_free_space_for_test(u64::MAX, u64::MAX / 2);
+    let _space = set_free_space_for_test(root.path(), u64::MAX, u64::MAX / 2);
     let error = publish(root.path(), A, NAMESPACE_BUDGET, None, |_| -> Result<()> {
         panic!("budget must refuse before body")
     })
@@ -332,11 +671,20 @@ fn floor_refusal_before_creation_and_budget_recheck_leave_no_plane_or_row() {
         .exists());
 }
 
-struct Recheck;
-impl DurabilityObserver for Recheck {
+struct Recheck<'a> {
+    storage: &'a Path,
+    space: Mutex<Option<FreeSpaceTestGuard>>,
+}
+impl DurabilityObserver for Recheck<'_> {
     fn reached(&self, step: DurabilityStep) {
         if step == DurabilityStep::V3FloorRaised {
-            set_free_space_for_test(NAMESPACE_BUDGET, 8 * NAMESPACE_BUDGET);
+            let mut space = self.space.lock().unwrap();
+            drop(space.take());
+            *space = Some(set_free_space_for_test(
+                self.storage,
+                NAMESPACE_BUDGET,
+                8 * NAMESPACE_BUDGET,
+            ));
         }
     }
 }
@@ -344,7 +692,11 @@ impl DurabilityObserver for Recheck {
 fn floor_recheck_refuses_without_reservation_or_plane_store() {
     let _guard = serial();
     let root = tempdir().unwrap();
-    let error = publish(root.path(), A, 1, Some(&Recheck), |_| -> Result<()> {
+    let observer = Recheck {
+        storage: root.path(),
+        space: Mutex::new(None),
+    };
+    let error = publish(root.path(), A, 1, Some(&observer), |_| -> Result<()> {
         panic!("floor must refuse")
     })
     .unwrap_err();
@@ -375,7 +727,7 @@ fn sequential_reservations_sum_other_family_without_mutating_it() {
     let mut a = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
     let reservation = a.reserve(100).unwrap();
     let before = a.accounting().unwrap();
-    set_free_space_for_test(NAMESPACE_BUDGET + 150, 8 * NAMESPACE_BUDGET);
+    let _space = set_free_space_for_test(root.path(), NAMESPACE_BUDGET + 150, 8 * NAMESPACE_BUDGET);
     let started = std::time::Instant::now();
     let error = publish_locked(root.path(), B, 100, &lock, None, |_| Ok(())).unwrap_err();
     assert!(started.elapsed() < Duration::from_secs(5));
@@ -716,7 +1068,7 @@ fn v3_child() {
     let family = std::env::var("AFT_V3_TEST_FAMILY").unwrap();
     let mode = std::env::var("AFT_V3_TEST_MODE").unwrap();
     let control = PathBuf::from(std::env::var_os("AFT_V3_TEST_CONTROL").unwrap());
-    set_free_space_for_test(u64::MAX, u64::MAX / 2);
+    let _space = set_free_space_for_test(&storage, u64::MAX, u64::MAX / 2);
     if mode.starts_with("init-") {
         publish(&storage, &family, 0, None, |p| {
             if mode.starts_with("init-plane-") {
@@ -791,7 +1143,8 @@ fn v3_child() {
         return;
     }
     if mode == "reserve" {
-        set_free_space_for_test(NAMESPACE_BUDGET + 150, 8 * NAMESPACE_BUDGET);
+        let _space =
+            set_free_space_for_test(&storage, NAMESPACE_BUDGET + 150, 8 * NAMESPACE_BUDGET);
         let result = (|| -> Result<()> {
             let rendezvous = control.parent().unwrap();
             fs::write(rendezvous.join(format!("started-{family}")), b"ready")?;
@@ -1053,7 +1406,7 @@ fn nested_writer_uses_existing_root_guard_and_does_not_touch_peer_ledger() {
 fn capacity_percentage_floor_applies_above_the_four_gib_minimum() {
     let _g = serial();
     let root = tempdir().unwrap();
-    set_free_space_for_test(2 * NAMESPACE_BUDGET, 200 * NAMESPACE_BUDGET);
+    let _space = set_free_space_for_test(root.path(), 2 * NAMESPACE_BUDGET, 200 * NAMESPACE_BUDGET);
     assert_eq!(
         publish(root.path(), A, 1, None, |_| Ok(()))
             .unwrap_err()
@@ -1520,7 +1873,7 @@ fn publish_after_dead_owner(target: &str) {
             .reserved_bytes,
         100
     );
-    set_free_space_for_test(NAMESPACE_BUDGET + 150, 8 * NAMESPACE_BUDGET);
+    let _space = set_free_space_for_test(root.path(), NAMESPACE_BUDGET + 150, 8 * NAMESPACE_BUDGET);
     publish(root.path(), target, 100, None, |_| Ok(()))
         .expect("dead reservations must be recovered before the final floor decision");
     assert_eq!(
@@ -1922,4 +2275,34 @@ fn a_recheck_stopped_by_the_deadline_never_saves_a_total_below_usage() {
         "saved {saved} is below the family's {actual}"
     );
     assert_eq!(measured, Measurement::Owed);
+}
+#[cfg(unix)]
+#[test]
+fn semantic_batch_lease_metadata_placement() {
+    let _guard = serial();
+    let root = tempdir().unwrap();
+    seed(root.path(), A);
+    let family = family_dir(root.path(), A).unwrap();
+    let lock = ReservationLock::acquire(root.path()).unwrap();
+    let writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
+    let before = inventory(&family);
+    assert_eq!(writer.accounting().unwrap().usage(), before);
+    drop(writer);
+    drop(lock);
+    let lease = crate::views::semantic_batch_lease::try_acquire(root.path(), A, "producer")
+        .unwrap()
+        .unwrap();
+    let lock = ReservationLock::acquire(root.path()).unwrap();
+    let writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
+    assert_eq!(inventory(&family), before);
+    assert_eq!(writer.accounting().unwrap().usage(), before);
+    drop(writer);
+    drop(lock);
+    // Publication accepts the semantic batch lease directory without treating
+    // it as another blob-data directory or counting heartbeat bytes as payloads.
+    publish(root.path(), A, 0, None, |_| Ok(())).unwrap();
+    let lock = ReservationLock::acquire(root.path()).unwrap();
+    let writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
+    assert_eq!(writer.accounting().unwrap().usage(), inventory(&family));
+    drop(lease);
 }

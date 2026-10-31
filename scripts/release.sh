@@ -2,11 +2,18 @@
 # Operator tooling runs through the real GitHub CLI (gh); the shim is only for AI agent commands.
 set -euo pipefail
 
+# Keep branch switches and failed preparation changes out of the operator's
+# checkout. The driver removes its disposable worktree on every normal exit.
+if [[ "${AFT_RELEASE_WORKTREE:-}" != 1 ]]; then
+  exec python3 "$(dirname "$0")/lib/release_queue.py" run "$@"
+fi
+
 # release.sh — Tag and push a new AFT release
 #
 # Usage:
 #   ./scripts/release.sh 0.2.0        # release v0.2.0
 #   ./scripts/release.sh 0.2.0 --dry  # preview without committing/pushing
+#   ./scripts/release.sh --retry-from v0.2.0 0.2.1 --fix <commit> [--fix <commit> ...]
 #
 # What it does:
 #   1. Validates the version is semver
@@ -14,7 +21,7 @@ set -euo pipefail
 #   3. Syncs version across all 7 package files
 #   4. Commits the version bump
 #   5. Opens the release PR and waits for queue integration
-#   6. Checks the exact final merge OID's green main push run, then tags it
+#   6. Checks the merge-queue or main push run for the exact final merge commit, then tags it
 #   7. CI takes over: gate on that green tests.yml run → build → publish npm +
 #      GitHub release (release.yml does not rerun the tests)
 
@@ -45,7 +52,7 @@ fi
 TAG="v$VERSION"
 RESUME_RELEASE=0
 
-RELEASE_STATE=$(git rev-parse --git-path "aft-release/$TAG.json")
+RELEASE_STATE="$(git rev-parse --git-common-dir)/aft-release/$TAG.json"
 if [[ -f "$RELEASE_STATE" ]]; then
   PHASE=$(python3 scripts/lib/release_queue.py phase "$VERSION")
   if [[ "$PHASE" == prepared ]]; then RESUME_RELEASE=1; fi
@@ -68,7 +75,7 @@ if [[ -f "$RELEASE_STATE" && "$DRY" != --dry ]]; then
   python3 scripts/lib/release_queue.py resume "$VERSION"
 fi
 BRANCH=$(git branch --show-current)
-if [[ ! -f "$RELEASE_STATE" && "$BRANCH" != main ]]; then
+if [[ ! -f "$RELEASE_STATE" && "$BRANCH" != main && -n "$BRANCH" ]]; then
   echo "Error: a new release must start on main" >&2
   exit 1
 fi
@@ -79,7 +86,7 @@ echo "  ─────────────────────"
 echo ""
 
 push_release() {
-  echo "→ Landing the release PR, checking its exact main push run, then tagging..."
+  echo "→ Landing the release PR, checking exact-SHA queue or main push CI, then tagging..."
   # macOS ships bash 3.2, where "${arr[@]}" of an empty array fails under set -u.
   python3 scripts/lib/release_queue.py publish "$VERSION" ${LEGACY_ARGS[@]+"${LEGACY_ARGS[@]}"}
   echo "  ✓ Released $TAG"
@@ -213,6 +220,26 @@ bun run typecheck 2>&1 || { echo "Error: Typecheck failed"; exit 1; }
 echo "  cargo fmt --check..."
 cargo fmt --check 2>&1 || { echo "Error: cargo fmt --check failed (run 'cargo fmt')"; exit 1; }
 
+# crates.io refuses any upload over 10 MiB, and it only says so at the final
+# publish step, after the tag and every build (0.63.3 was lost that way).
+# Packaging without verification takes seconds and compiles nothing.
+echo "  crates.io package sizes..."
+crate_limit=$((10 * 1024 * 1024))
+crate_dir=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/package
+for crate in aft-tokenizer aft-secret-rules agent-file-tools; do
+  cargo package -p "$crate" --no-verify --allow-dirty -q >/dev/null 2>&1 || {
+    echo "Error: cargo package -p $crate failed; run it to see why"; exit 1;
+  }
+  crate_file=$(ls -t "$crate_dir"/"$crate"-*.crate | head -1)
+  crate_bytes=$(wc -c <"$crate_file" | tr -d ' ')
+  if [ "$crate_bytes" -ge "$crate_limit" ]; then
+    echo "Error: $crate packages to $crate_bytes bytes; crates.io refuses uploads of $crate_limit bytes or more"
+    echo "  ↳ keep test-only files out of the crate with 'exclude' in its Cargo.toml"
+    exit 1
+  fi
+  echo "    $crate: $crate_bytes bytes"
+done
+
 # Validate publication inputs before spending time on the release suites.
 # Snapshots are disposable; only source and release policy belong in Git.
 # The final candidate snapshot is prepared after the version commit below.
@@ -257,7 +284,7 @@ fi
 
 if [ "${SKIP_RUST_TESTS:-}" = "1" ]; then
   echo "  (skipping local cargo tests — SKIP_RUST_TESTS=1)"
-  echo "  ↳ PR/queue CI and the exact final main push run still gate publication."
+  echo "  ↳ Exact-SHA queue or main push CI still gates publication."
 else
   echo "  rust test gate (unit on libtest, integration on nextest, watcher isolated)..."
   ./scripts/rust-test-gate.sh 2>&1 || { echo "Error: Rust tests failed"; exit 1; }
@@ -348,7 +375,8 @@ fi
 # retains them as an artifact; neither path commits branch-dependent digests.
 if [[ -f "$gate_script" ]]; then
   (
-    snapshot_dir="$(mktemp -d "${TMPDIR:-/tmp}/aft-release-publication.XXXXXX")"
+    mkdir -p target/scratch
+    snapshot_dir="$(mktemp -d "target/scratch/aft-release-publication.XXXXXX")"
     trap 'rm -rf "$snapshot_dir"' EXIT
     node "$gate_script" --prepare --snapshot-dir "$snapshot_dir" --candidate || exit 1
     node "$gate_script" --snapshot-dir "$snapshot_dir" --candidate || exit 1

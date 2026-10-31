@@ -254,9 +254,12 @@ fn inspect_engine_deduplicates_in_flight_waiters() {
     let (_temp_dir, root, _file) = fixture_project();
     let inspect_dir = root.join(".aft-cache").join("inspect");
     let worker_count = Arc::new(AtomicUsize::new(0));
+    // The soft deadline only bounds how long a waiter blocks before it gets a
+    // pending answer. This test is about sharing one job, so the deadline is
+    // generous: a loaded Windows runner took over 2 s for the 150 ms job.
     let manager = Arc::new(InspectManager::with_worker(
         test_worker(Arc::clone(&worker_count), Duration::from_millis(150), 7),
-        Duration::from_secs(2),
+        Duration::from_secs(30),
     ));
     let snapshot = snapshot(&root, &inspect_dir);
     let scope = JobScope::for_project(root.clone());
@@ -283,8 +286,14 @@ fn inspect_engine_deduplicates_in_flight_waiters() {
         1,
         "one worker job should serve both waiters"
     );
-    assert!(matches!(first, JobOutcome::Fresh { .. }));
-    assert!(matches!(second, JobOutcome::Fresh { .. }));
+    assert!(
+        matches!(first, JobOutcome::Fresh { .. }),
+        "first waiter: {first:?}"
+    );
+    assert!(
+        matches!(second, JobOutcome::Fresh { .. }),
+        "second waiter: {second:?}"
+    );
     assert_eq!(first.payload().unwrap()["count"], 7);
     assert_eq!(second.payload().unwrap()["count"], 7);
 }

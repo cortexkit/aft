@@ -43,6 +43,7 @@ mod open_tests;
 mod read_audit;
 #[cfg(test)]
 mod replay;
+mod unshared;
 #[doc(hidden)]
 pub use copy::{copy_on_first_use, CopyOutcome, CopySource, SWEEP_LEASE_WAIT};
 
@@ -270,13 +271,94 @@ pub fn view_dir(storage: &Path, family: &str, scope: &str) -> Result<PathBuf> {
     Ok(family_dir(storage, family)?.join("views").join(scope))
 }
 
-static FREE_SPACE: Mutex<Option<(u64, u64)>> = Mutex::new(None);
-/// Process-local probe override for integration children. Production never calls it.
+struct FreeSpaceOverrides {
+    storage: std::collections::BTreeMap<PathBuf, FreeSpaceOverride>,
+    unlimited: usize,
+}
+struct FreeSpaceOverride {
+    canonical: Option<PathBuf>,
+    value: (u64, u64),
+}
+static FREE_SPACE: Mutex<FreeSpaceOverrides> = Mutex::new(FreeSpaceOverrides {
+    storage: std::collections::BTreeMap::new(),
+    unlimited: 0,
+});
+
+/// Restores a storage root's previous test probe when dropped, including on unwind.
 #[doc(hidden)]
-pub fn set_free_space_for_test(free: u64, capacity: u64) {
-    *FREE_SPACE
+#[must_use]
+pub struct FreeSpaceTestGuard {
+    storage: PathBuf,
+    previous: Option<FreeSpaceOverride>,
+}
+impl Drop for FreeSpaceTestGuard {
+    fn drop(&mut self) {
+        let mut overrides = FREE_SPACE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(previous) = self.previous.take() {
+            overrides.storage.insert(self.storage.clone(), previous);
+        } else {
+            overrides.storage.remove(&self.storage);
+        }
+    }
+}
+
+/// Overrides probes under `storage` on every thread until the guard drops.
+/// Raw and canonical spellings both match; the most specific root wins.
+/// Production never calls this setter.
+#[doc(hidden)]
+pub fn set_free_space_for_test(storage: &Path, free: u64, capacity: u64) -> FreeSpaceTestGuard {
+    let storage = storage.to_path_buf();
+    let entry = FreeSpaceOverride {
+        canonical: canonical_free_space_path(&storage),
+        value: (free, capacity),
+    };
+    let previous = FREE_SPACE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((free, capacity));
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .storage
+        .insert(storage.clone(), entry);
+    FreeSpaceTestGuard { storage, previous }
+}
+
+/// Admission can run before a storage root or its descendants exist. Resolve
+/// the existing ancestor, preserving missing components only for comparison.
+fn canonical_free_space_path(path: &Path) -> Option<PathBuf> {
+    for ancestor in path.ancestors() {
+        let existing = if ancestor.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            ancestor
+        };
+        if let Ok(canonical) = fs::canonicalize(existing) {
+            return Some(canonical.join(path.strip_prefix(ancestor).ok()?));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+pub(crate) struct UnlimitedFreeSpaceForTestProcess;
+#[cfg(test)]
+impl Drop for UnlimitedFreeSpaceForTestProcess {
+    fn drop(&mut self) {
+        FREE_SPACE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unlimited -= 1;
+    }
+}
+/// Existing shared fixtures acquire their guard before creating one or more
+/// storage roots. Their fallback can only allow admission; refusal simulations
+/// must name a storage root and always take precedence over this fallback.
+#[cfg(test)]
+fn unlimited_free_space_for_test_process() -> UnlimitedFreeSpaceForTestProcess {
+    FREE_SPACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unlimited += 1;
+    UnlimitedFreeSpaceForTestProcess
 }
 /// The platform probe itself, bypassing the test override.
 #[cfg(test)]
@@ -284,10 +366,35 @@ pub(crate) fn probe_free_space_for_test(path: &Path) -> Option<(u64, u64)> {
     probe_free_space(path)
 }
 fn free_space(path: &Path) -> Option<(u64, u64)> {
-    if let Some(value) = *FREE_SPACE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-    {
+    let value = {
+        let overrides = FREE_SPACE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let canonical = if overrides.storage.is_empty() {
+            None
+        } else {
+            canonical_free_space_path(path)
+        };
+        overrides
+            .storage
+            .iter()
+            .filter_map(|(root, entry)| {
+                let canonical_depth = canonical.as_ref().and_then(|path| {
+                    entry
+                        .canonical
+                        .as_ref()
+                        .filter(|root| path.starts_with(root))
+                        .map(|root| root.components().count())
+                });
+                let depth = canonical_depth
+                    .or_else(|| path.starts_with(root).then(|| root.components().count()))?;
+                Some((depth, entry.value))
+            })
+            .max_by_key(|(depth, _)| *depth)
+            .map(|(_, value)| value)
+            .or_else(|| (overrides.unlimited > 0).then_some((u64::MAX, u64::MAX / 2)))
+    };
+    if let Some(value) = value {
         return Some(value);
     }
     probe_free_space(path)
@@ -362,8 +469,47 @@ pub fn allocated_bytes(path: &Path) -> Result<u64> {
 
 /// [`allocated_bytes`], stopping at `deadline`. The deadline is checked before
 /// each directory entry is read, and a walk that reaches it returns `None`:
-/// its partial sum is never a total.
+/// its partial sum is never a total. `path` is a family directory.
 pub fn allocated_bytes_until(path: &Path, deadline: Option<Instant>) -> Result<Option<u64>> {
+    walk_allocated(path, deadline, Level::Family)
+}
+
+/// Where a walk is inside a family directory.
+///
+/// Files under a member view (`views/<scope>` whose scope is not a base) are
+/// charged the bytes they hold alone. A member's derived database is a clone
+/// of its base's, and the base, charged in full, already counts the blocks
+/// they share. Everything else is charged its `stat` bytes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Level {
+    Family,
+    Views,
+    Base,
+    Member,
+    Other,
+}
+
+impl Level {
+    fn child(self, name: &std::ffi::OsStr) -> Self {
+        match self {
+            Self::Family if name == "views" => Self::Views,
+            Self::Family => Self::Other,
+            Self::Views => {
+                let name = name.to_string_lossy();
+                if name.starts_with(crate::views::base_refs::BASE_SCOPE_PREFIX)
+                    || name.starts_with(crate::views::base_refs::TREE_BASE_SCOPE_PREFIX)
+                {
+                    Self::Base
+                } else {
+                    Self::Member
+                }
+            }
+            level => level,
+        }
+    }
+}
+
+fn walk_allocated(path: &Path, deadline: Option<Instant>, level: Level) -> Result<Option<u64>> {
     let mut total = 0u64;
     for entry in fs::read_dir(path)
         .map_err(|e| crate::views::io::at("listing v3 accounting directory", path, e))?
@@ -386,10 +532,12 @@ pub fn allocated_bytes_until(path: &Path, deadline: Option<Instant>) -> Result<O
                 hook(&path);
             }
         });
-        // SQLite can remove sidecars while the namespace is being measured,
-        // even under the publication lock. A vanished entry occupies no bytes;
-        // other stat errors still leave accounting unknown and must refuse it.
-        let meta = match fs::symlink_metadata(&path) {
+        // Windows directory entries already contain size and type. Reopening a
+        // name here can fail with access denied while it is being deleted; use
+        // the listed size as a conservative charge until the next measurement.
+        // On Unix this still stats without following symlinks. Vanished entries
+        // occupy no bytes; other errors must leave accounting unknown.
+        let meta = match entry.metadata() {
             Ok(meta) => meta,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
@@ -399,10 +547,13 @@ pub fn allocated_bytes_until(path: &Path, deadline: Option<Instant>) -> Result<O
             }
         };
         if meta.is_dir() {
-            let Some(bytes) = allocated_bytes_until(&entry.path(), deadline)? else {
+            let child = level.child(&entry.file_name());
+            let Some(bytes) = walk_allocated(&entry.path(), deadline, child)? else {
                 return Ok(None);
             };
             total = total.saturating_add(bytes);
+        } else if level == Level::Member && meta.is_file() {
+            total = total.saturating_add(unshared::charge(&path, file_allocated(&meta)));
         } else {
             total = total.saturating_add(file_allocated(&meta));
         }
@@ -2185,12 +2336,22 @@ impl PlaneReader {
     }
 }
 
-/// Serializes tests that depend on the process-wide free-space override and
-/// sets it to unlimited, so admission in other modules' tests never races the
-/// refusal cases in `tests`.
+/// Retains the shared v3 test lock and an unlimited process fallback. Explicit
+/// storage-scoped probes take precedence, even on a different thread.
 #[cfg(test)]
-pub(crate) fn serial_for_test() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn serial_for_test() -> tests::SerialTestGuard {
     tests::serial()
+}
+
+/// Runs load code while a separate graph-database writer changes the namespace
+/// between every measurement and its confirmation. The hook is thread-local.
+#[cfg(test)]
+pub(crate) fn with_changing_namespace_for_test<T>(
+    storage: &Path,
+    family: &str,
+    run: impl FnOnce(&std::sync::atomic::AtomicUsize) -> T,
+) -> (T, usize) {
+    tests::with_changing_namespace(storage, family, run)
 }
 
 #[cfg(test)]
@@ -2201,3 +2362,5 @@ mod replay_tests;
 mod source_guard;
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, windows))]
+pub(crate) use tests::deny_read_for_test;

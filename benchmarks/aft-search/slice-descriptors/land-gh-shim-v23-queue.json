@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "gh-shim-v23-queue"
+  ],
+  "note": "gh shim: bot pr enqueue/dequeue for own PRs behind manifest v23, Plexus merge-queue vectors vendored. No changed path matches RANKING_FENCE_PREFIXES."
+}
