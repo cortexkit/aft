@@ -9,6 +9,7 @@ mod linux {
     const TASK_SLICE: &str = "aft.slice";
     const TASK_UNIT_PREFIX: &str = "aft-task-";
     const TIMEOUT_MARGIN: Duration = Duration::from_secs(60);
+    const FAILED_LAUNCHER_PROBE_BACKOFF: Duration = Duration::from_secs(30);
     const SCOPE_OOM_POLICY_VERSION: u32 = 253;
     const EXPAND_ENVIRONMENT_VERSION: u32 = 254;
     const _: () = assert!(SCOPE_OOM_POLICY_VERSION < EXPAND_ENVIRONMENT_VERSION);
@@ -562,24 +563,45 @@ mod linux {
 
     pub(crate) fn select_systemd_scope_launcher() -> Option<SystemdScopeLauncher> {
         static LAUNCHER: std::sync::OnceLock<SystemdScopeLauncher> = std::sync::OnceLock::new();
-        static PROBE: Mutex<()> = Mutex::new(());
+        static PROBE: Mutex<Option<Instant>> = Mutex::new(None);
         if let Some(launcher) = LAUNCHER.get() {
             return Some(launcher.clone());
         }
-        let _guard = PROBE.lock().unwrap_or_else(|error| error.into_inner());
+        let mut retry_at = PROBE.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(launcher) = LAUNCHER.get() {
             return Some(launcher.clone());
         }
-        let path = systemd_run_path_with(Path::is_file)?.to_owned();
-        let launcher = probe_launcher(path)?;
-        let _ = LAUNCHER.set(launcher.clone());
-        Some(launcher)
+        if retry_at.is_some_and(|when| launcher_probe_now() < when) {
+            return None;
+        }
+        let launcher =
+            systemd_run_path_with(Path::is_file).and_then(|path| probe_launcher(path.to_owned()));
+        match launcher {
+            Some(launcher) => {
+                let _ = LAUNCHER.set(launcher.clone());
+                *retry_at = None;
+                Some(launcher)
+            }
+            None => {
+                *retry_at = Some(launcher_probe_now() + FAILED_LAUNCHER_PROBE_BACKOFF);
+                None
+            }
+        }
+    }
+
+    fn launcher_probe_now() -> Instant {
+        #[cfg(test)]
+        if let Some(now) = LAUNCHER_PROBE_TIME.with(|clock| clock.get()) {
+            return now;
+        }
+        Instant::now()
     }
 
     #[cfg(test)]
     thread_local! {
         static LAUNCHER_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         static FAIL_NEXT_LAUNCHER_PROBE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static LAUNCHER_PROBE_TIME: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
     }
 
     fn probe_launcher(path: PathBuf) -> Option<SystemdScopeLauncher> {
@@ -1309,12 +1331,22 @@ mod linux {
         fn task_scope_launcher_ignores_process_path() {
             const INNER: &str = "AFT_TEST_SCOPE_TRUSTED_LAUNCHER";
             if std::env::var_os(INNER).is_some() {
+                let now = Instant::now();
+                LAUNCHER_PROBE_TIME.with(|clock| clock.set(Some(now)));
                 FAIL_NEXT_LAUNCHER_PROBE.with(|fail| fail.set(true));
                 assert!(select_systemd_scope_launcher().is_none());
+                assert_eq!(LAUNCHER_PROBES.with(|count| count.get()), 1);
+                assert!(
+                    select_systemd_scope_launcher().is_none(),
+                    "failed probe repeated inside its backoff window"
+                );
+                assert_eq!(LAUNCHER_PROBES.with(|count| count.get()), 1);
+                LAUNCHER_PROBE_TIME
+                    .with(|clock| clock.set(Some(now + FAILED_LAUNCHER_PROBE_BACKOFF)));
                 let selected =
                     select_systemd_scope_launcher().expect("failed probe was cached permanently");
                 let first = LAUNCHER_PROBES.with(|count| count.get());
-                assert!(first > 0);
+                assert_eq!(first, 2);
                 select_systemd_scope_launcher().unwrap();
                 assert_eq!(
                     LAUNCHER_PROBES.with(|count| count.get()),
