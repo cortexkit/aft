@@ -414,6 +414,11 @@ mod linux {
     }
 
     pub(crate) fn user_manager_command(executable: &Path) -> Command {
+        #[cfg(test)]
+        assert!(
+            LOCAL_RECOVERY_FIXTURE.with(|fixture| fixture.borrow().is_none()),
+            "memory recovery attempted a user-manager call"
+        );
         let mut command = Command::new(executable);
         // Use only the session endpoint for the user manager, not daemon credentials.
         command.env_clear().env("PATH", "/usr/bin:/bin");
@@ -785,7 +790,34 @@ mod linux {
     }
 
     pub(crate) fn current_cgroup(pid: u32) -> Option<PathBuf> {
+        #[cfg(test)]
+        if let Some(current) = LOCAL_RECOVERY_FIXTURE.with(|fixture| fixture.borrow().clone()) {
+            return Some(current);
+        }
         unified_cgroup_path(&std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?)
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static LOCAL_RECOVERY_FIXTURE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_local_recovery_fixture_for_test<T>(
+        current: PathBuf,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Restore(Option<PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                LOCAL_RECOVERY_FIXTURE.with(|fixture| {
+                    *fixture.borrow_mut() = self.0.take();
+                });
+            }
+        }
+        let _restore =
+            Restore(LOCAL_RECOVERY_FIXTURE.with(|fixture| fixture.replace(Some(current))));
+        run()
     }
 
     fn task_unit_id(unit: &str) -> Option<&str> {

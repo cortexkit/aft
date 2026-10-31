@@ -1045,6 +1045,44 @@ fn task_scope_replay_keeps_live_identity_without_user_manager() {
 }
 
 #[test]
+fn task_scope_monitor_recovery_uses_local_files_without_manager() {
+    let root = tempfile::tempdir().unwrap();
+    let manager_root = root
+        .path()
+        .join(format!("user@{}.service", unsafe { libc::geteuid() }));
+    let current = manager_root.join("app.slice/module.service");
+    let id = random_slug();
+    let cgroup = manager_root
+        .join("aft.slice")
+        .join(format!("aft-task-{id}.scope"));
+    std::fs::create_dir_all(&cgroup).unwrap();
+    std::fs::write(cgroup.join("memory.events"), "oom 0\noom_kill 0\n").unwrap();
+    std::fs::write(cgroup.join("memory.oom.group"), "0").unwrap();
+    let policy = super::super::memory_limit::MemoryPolicy {
+        mib: 64,
+        kind: super::super::memory_limit::MemoryPolicy::TASK_SCOPE_MEMORY_KIND.into(),
+        cgroup: None,
+    };
+    super::super::task_scope::with_local_recovery_fixture_for_test(current, || {
+        let mut monitor = super::super::memory_limit::Monitor::recover(policy.clone(), &id)
+            .unwrap()
+            .expect("local scope was not recovered");
+        assert!(monitor.is_task_scope());
+        assert_eq!(monitor.policy.cgroup.as_ref(), Some(&cgroup));
+        assert!(!monitor.exceeded(0));
+        assert!(
+            super::super::memory_limit::Monitor::recover(policy, &random_slug())
+                .unwrap()
+                .is_none()
+        );
+    });
+    assert_eq!(
+        std::fs::read_to_string(cgroup.join("memory.oom.group")).unwrap(),
+        "0"
+    );
+}
+
+#[test]
 fn task_scope_monitor_recovery_error_fails_closed() {
     let root = tempfile::tempdir().unwrap();
     let source = BgTaskRegistry::default();
