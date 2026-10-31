@@ -744,7 +744,7 @@ impl ViewStore {
         use std::io::Write as _;
         file.write_all(owner.as_bytes())
             .map_err(|error| ViewError::io_at("writing", &path, error))?;
-        file.sync_all()
+        crate::durability::sync_file(&file, &path)
             .map_err(|error| ViewError::io_at("syncing", &path, error))?;
         super::sync_parent(&path)?;
         super::bump_pointer_generation_epoch(&ownership)?;
@@ -1912,7 +1912,8 @@ fn clone_quiescent(source: &Path, destination: &Path) -> Result<std::result::Res
         // plain descriptor may flush it. SQLite's own publication checkpoint
         // would not: with an empty WAL it has no frames to copy and syncs
         // nothing.
-        let synced = fs::File::open(destination).and_then(|file| file.sync_all());
+        let synced = fs::File::open(destination)
+            .and_then(|file| crate::durability::sync_file(&file, destination));
         if let Err(error) = synced {
             remove_unpublished_derived_locked(destination)?;
             return fallback("sync", &error);

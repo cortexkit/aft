@@ -183,7 +183,12 @@ fn streams(path: &Path) -> io::Result<Vec<Vec<u16>>> {
 /// attributes must already match: ReplaceFileW merges attributes, while rename
 /// keeps only the replacement's attributes. Access/write times come from the
 /// replacement in both paths.
-fn prepare_metadata(destination: &Path, source: &File, replacement: &File) -> io::Result<()> {
+fn prepare_metadata(
+    destination: &Path,
+    source: &File,
+    replacement: &File,
+    replacement_path: &Path,
+) -> io::Result<()> {
     let old = information(source)?;
     let new = information(replacement)?;
     if resource_attributes(source)? != resource_attributes(replacement)? {
@@ -246,7 +251,7 @@ fn prepare_metadata(destination: &Path, source: &File, replacement: &File) -> io
     {
         return Err(io::Error::last_os_error());
     }
-    replacement.sync_all().map_err(|error| {
+    crate::durability::sync_file(replacement, replacement_path).map_err(|error| {
         io::Error::new(
             error.kind(),
             format!("syncing replacement metadata: {error}"),
@@ -357,7 +362,7 @@ fn eligible(
         return Err(io::Error::other("metadata is unknown"));
     }
     rename_name(destination)?;
-    prepare_metadata(destination, source, temp)
+    prepare_metadata(destination, source, temp, replacement)
 }
 
 fn ordinary_component_preserves_name(component: &str) -> bool {

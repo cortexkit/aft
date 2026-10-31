@@ -1035,7 +1035,7 @@ fn install_panic_hook(initial_path: PathBuf) {
             .unwrap_or_else(|| initial_path.clone());
         let persisted = open_private_log_file(&path, false).and_then(|mut file| {
             file.write_all(&report)?;
-            file.sync_all()
+            crate::durability::sync_file(&file, &path)
         });
         if persisted.is_err() {
             let _ = io::stderr().write_all(&report);
@@ -1701,7 +1701,7 @@ fn write_terminal_line(
     let _ = stderr.write_all(&line);
     let mut file = open_private_log_file(&sink.path, false)?;
     file.write_all(&line)?;
-    file.sync_all()?;
+    crate::durability::sync_file(&file, &sink.path)?;
     sink.write_counter.credit_logical(line.len() as u64);
     Ok(())
 }

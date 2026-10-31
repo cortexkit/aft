@@ -878,7 +878,7 @@ pub(super) fn write_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
             .write(true)
             .open(&temporary)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
+        crate::durability::sync_file(&file, &temporary)?;
         drop(file);
         crate::fs_lock::rename_over(&temporary, path)?;
         crate::fs_lock::sync_parent(path);

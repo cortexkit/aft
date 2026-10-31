@@ -233,7 +233,7 @@ pub(crate) fn seal(database: &Path) -> Result<SealRecord, String> {
             .create_new(true)
             .open(&temporary)?;
         file.write_all(&bytes)?;
-        file.sync_all()?;
+        crate::durability::sync_file(&file, &temporary)?;
         std::fs::rename(&temporary, &path)
     })();
     if let Err(e) = written {
