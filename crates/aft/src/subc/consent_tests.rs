@@ -8,6 +8,7 @@ mod program_approvals {
     include!("consent_running_tests.rs");
     include!("consent_held_update_tests.rs");
     include!("consent_security_audit_tests.rs");
+    include!("consent_speech_end_tests.rs");
 
     struct Controlled {
         fake: Arc<FakeCingulate>,

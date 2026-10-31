@@ -207,6 +207,125 @@ async fn audit_durable_scope_end_before_application_prevents_execution_and_grant
 static END_FENCE_READ_DISPATCHES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+struct EndAfterDispatchCommit {
+    identity: RouteIdentity,
+    key: ledger::Key,
+}
+
+static END_AFTER_DISPATCH_COMMIT: StdMutex<Option<EndAfterDispatchCommit>> = StdMutex::new(None);
+
+fn committed_read_with_later_end(request: RawRequest, ctx: &AppContext) -> Response {
+    let entry = END_FENCE_READ_DISPATCHES.fetch_add(1, Ordering::SeqCst);
+    if entry == 1 {
+        let end = END_AFTER_DISPATCH_COMMIT
+            .lock()
+            .unwrap()
+            .take()
+            .expect("approved handler reached the dispatch boundary");
+        let stamp = end.identity.scope.as_ref().unwrap();
+        {
+            let db = ctx.db().unwrap();
+            let conn = db.lock().unwrap();
+            let row = ledger::get(&conn, &end.key).unwrap().unwrap();
+            assert_eq!(row.state, ledger::State::DispatchStarted);
+            crate::db::access_grants::end_scope_grants(
+                &conn,
+                &access_grants::scope_key(&end.identity),
+            )
+            .unwrap();
+            assert!(
+                ledger::end_scope(&conn, row.scope.as_ref().unwrap(), ledger::now_ms())
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                ledger::get(&conn, &end.key).unwrap().unwrap().state,
+                ledger::State::DispatchStarted
+            );
+        }
+        end.identity.run_scope.get().unwrap().end_for_test();
+        ctx.bash_background().fence_scope_end(stamp);
+        assert!(tool_provider::check_program_scope(ctx, &request.id, &end.identity).is_err());
+    }
+    read_dispatch(request, ctx)
+}
+
+#[tokio::test]
+async fn audit_end_before_dispatch_commit_refuses_without_native_entry() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let control = Controlled::install(f.fake.clone());
+    let run = program(&f, false, "run:audit-end-before-commit");
+    END_FENCE_READ_DISPATCHES.store(0, Ordering::SeqCst);
+    let gate = FinishGateOverride::install("subc-41-9440", true);
+    let mut replies = f
+        .send_with(
+            &run,
+            &f.dir.path().join("elsewhere.txt"),
+            9440,
+            end_fence_read_dispatch,
+        )
+        .await;
+    held(&mut replies).await;
+    control.answer(&control.request(0).await, "allow_once");
+    wait_for(|| gate.0.entered.load(Ordering::SeqCst)).await;
+    let key = tool_provider::LedgerEdge::key(&run, "program-9440");
+    {
+        let db = f.ctx.db().unwrap();
+        let conn = db.lock().unwrap();
+        assert_eq!(
+            ledger::get(&conn, &key).unwrap().unwrap().state,
+            ledger::State::Prepared
+        );
+        crate::db::access_grants::end_scope_grants(&conn, &access_grants::scope_key(&run)).unwrap();
+        assert!(!ledger::begin_approved(&conn, &key).unwrap());
+        assert_eq!(
+            ledger::get(&conn, &key).unwrap().unwrap().state,
+            ledger::State::Prepared
+        );
+    }
+    gate.release();
+    assert_eq!(late(&f, &run, 9440).await["isError"], true);
+    assert_eq!(END_FENCE_READ_DISPATCHES.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn audit_dispatch_committed_before_end_completes_after_end_before_native_entry() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let control = Controlled::install(f.fake.clone());
+    let run = program(&f, false, "run:audit-committed-in-flight");
+    let target = f.dir.path().join("elsewhere.txt");
+    std::fs::write(&target, "committed-before-end private value\n").unwrap();
+    let key = tool_provider::LedgerEdge::key(&run, "program-9441");
+    *END_AFTER_DISPATCH_COMMIT.lock().unwrap() = Some(EndAfterDispatchCommit {
+        identity: run.clone(),
+        key: key.clone(),
+    });
+    END_FENCE_READ_DISPATCHES.store(0, Ordering::SeqCst);
+    let mut replies = f
+        .send_with(&run, &target, 9441, committed_read_with_later_end)
+        .await;
+    held(&mut replies).await;
+    control.answer(&control.request(0).await, "allow_once");
+    let result = late(&f, &run, 9441).await;
+    assert_eq!(result["isError"], false, "{result}");
+    assert!(result["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("committed-before-end private value"));
+    assert_eq!(END_FENCE_READ_DISPATCHES.load(Ordering::SeqCst), 2);
+    assert!(END_AFTER_DISPATCH_COMMIT.lock().unwrap().is_none());
+    let row = ledger::get(&f.ctx.db().unwrap().lock().unwrap(), &key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.outcome.as_deref(), Some("ok"));
+    assert_eq!(
+        serde_json::from_str::<Value>(&row.late_entry.unwrap()).unwrap()["kind"],
+        "result"
+    );
+}
+
 fn end_fence_read_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
     END_FENCE_READ_DISPATCHES.fetch_add(1, Ordering::SeqCst);
     read_dispatch(request, ctx)

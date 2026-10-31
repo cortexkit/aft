@@ -250,9 +250,7 @@ where
             tokio::select! {
                 Some(stamp)=observations.recv()=>{
                     if let Some(service)=&speech { if confirmed.insert(stamp_key(&stamp)) {
-                        control.metrics.scope_descriptions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).cleanup_started(&stamp);
-                        if let Some(scopes)=&run_scopes { scopes.revoke(&stamp); }
-                        fence_confirmed_end(&executor, &stamp);
+                        accept_confirmed_end(&executor, run_scopes.as_deref(), &control.metrics, &stamp);
                         let service=service.clone();
                         let executor=executor.clone();
                         let metrics=control.metrics.clone();
@@ -317,8 +315,17 @@ where
                             if let Ok(reply)=&reply{
                                 let role=if stamp.attributes.run_id.is_some(){crate::gh_shim_speech::ScopeRole::Run}else{crate::gh_shim_speech::ScopeRole::Authority};
                                 match crate::gh_shim_speech::scope::validate_scope_identity(&stamp,role,reply,&service.generation(),&generation,crate::db::call_ledger::now_ms() as u64){
-                                    Ok(crate::gh_shim_speech::scope::Answer::Ended(proof))=>{
-                                        if service.record_end(&stamp,proof).is_err(){kill_only(executor.clone(),&stamp).await;}
+                                     Ok(crate::gh_shim_speech::scope::Answer::Ended(proof))=>{
+                                        // Ordinary program authority must close before a speech
+                                        // store write can block, fail, or wait for its own retry.
+                                        if !confirmed.contains(&key) {
+                                            accept_confirmed_end(&executor, run_scopes.as_deref(), &control.metrics, &stamp);
+                                        }
+                                        if let Err(error)=service.record_end(&stamp,proof){
+                                            log::warn!("speech scope-end persistence failed scope_ref={:?} scope_epoch={} code={:?} reason={}", stamp.scope_ref, stamp.scope_epoch, error.code, error.reason);
+                                            control.metrics.scope_descriptions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).cleanup_result(&stamp, false);
+                                            kill_only(executor.clone(),&stamp).await;
+                                        }
                                         retry.remove(&key);
                                     },
                                     Ok(crate::gh_shim_speech::scope::Answer::Live(_))=>{retry.remove(&key);},
@@ -329,9 +336,7 @@ where
                             #[cfg(feature = "test-timing-hooks")]
                             crate::slog_info!("scope diagnostic phase=describe_ended scope_epoch={}", stamp.scope_epoch);
                             if confirmed.insert(key.clone()) {
-                                control.metrics.scope_descriptions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).cleanup_started(&stamp);
-                                if let Some(scopes)=&run_scopes { scopes.revoke(&stamp); }
-                                fence_confirmed_end(&executor, &stamp);
+                                accept_confirmed_end(&executor, run_scopes.as_deref(), &control.metrics, &stamp);
                                 let executor=executor.clone();
                                 let metrics=control.metrics.clone();
                                 let notices=ended.clone();
@@ -486,6 +491,23 @@ fn fence_confirmed_end(executor: &Executor, stamp: &ScopeStamp) {
     for ctx in executor.actor_contexts() {
         ctx.bash_background().fence_scope_end(stamp);
     }
+}
+
+fn accept_confirmed_end(
+    executor: &Executor,
+    runs: Option<&super::run_scope::RunScopes>,
+    metrics: &DispatchPathMetrics,
+    stamp: &ScopeStamp,
+) {
+    metrics
+        .scope_descriptions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .cleanup_started(stamp);
+    if let Some(runs) = runs {
+        runs.revoke(stamp);
+    }
+    fence_confirmed_end(executor, stamp);
 }
 
 async fn finish_confirmed_end(
@@ -918,6 +940,8 @@ mod tests {
 }
 
 async fn kill_only(executor: Arc<Executor>, stamp: &ScopeStamp) {
+    // This fallback may wait behind actor work, but authority fencing must not.
+    fence_confirmed_end(&executor, stamp);
     for (root, _) in executor.actor_entries() {
         let stamp = stamp.clone();
         let job = executor.submit_async(

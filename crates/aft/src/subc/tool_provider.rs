@@ -70,6 +70,10 @@ pub(super) fn ledger_carrier(principal: &crate::sandbox_spawn::AuthenticatedPrin
     }
 }
 
+/// Reserve one approved start at the committed DispatchStarted boundary. An
+/// earlier end refuses it; an end after commit leaves the call in flight, even
+/// if its native handler has not entered yet. Do not extend these registry/run
+/// leases around dispatch, which can take task locks in the reverse direction.
 pub(super) fn begin_approved_call(
     ctx: &crate::context::AppContext,
     key: &crate::db::call_ledger::Key,

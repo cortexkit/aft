@@ -365,8 +365,11 @@ pub(crate) fn hold_permission(
     Ok(conn.execute("UPDATE call_ledger SET state='Prepared',frame_type='Response',frame_body=?3 WHERE carrier=?1 AND call_key=?2 AND state IN ('Prepared','DispatchStarted') AND task_id IS NULL", params![key.carrier,key.call_key,retained.to_string().as_bytes()])? == 1)
 }
 
-/// Only a still-live, withdrawable approval can start the action. Withdrawal
-/// and this transition are serialized by the owning database connection.
+/// DispatchStarted is the irrevocable start boundary, not native handler entry.
+/// End fences installed before this transition refuse the call. Once committed,
+/// the call is in flight: a later end must not settle it as not_started or undo
+/// its handler. Scope cleanup still kills shell tasks belonging to that scope.
+/// The transaction ends here; no authorization lock spans native dispatch.
 pub(crate) fn begin_approved(conn: &Connection, key: &Key) -> rusqlite::Result<bool> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let Some(row) = get(&tx, key)?.filter(|row| row.state == State::Prepared) else {
