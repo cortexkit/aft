@@ -19,8 +19,7 @@ mod windows_replace;
 /// How [`atomic_write_source`] stored the new bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SourceWriteMode {
-    /// A synced sibling file replaced the target by rename or `ReplaceFileW`,
-    /// or created it.
+    /// A synced sibling file replaced the target by rename, or created it.
     Replaced,
     /// The existing file was rewritten and synced in place, because a
     /// replacement file could not be created or could not keep its hard links,
@@ -33,7 +32,8 @@ pub(crate) enum SourceWriteMode {
 pub(crate) struct SourceWriteOutcome {
     pub(crate) mode: SourceWriteMode,
     /// Each warning starts with a stable code and a colon:
-    /// `recovery_copy_found`, `no_recovery_copy` or `mode_not_restored`.
+    /// `recovery_copy_found`, `no_recovery_copy`, `mode_not_restored` or
+    /// `non_atomic_windows_write`.
     pub(crate) warnings: Vec<String>,
 }
 
@@ -49,10 +49,11 @@ pub(crate) struct SourceWriteOutcome {
 ///   were copied onto the replacement and read back equal (on Linux the ACL
 ///   is an extended attribute; on macOS it is copied by `fcopyfile` and read
 ///   back with `acl_get_fd_np`);
-/// - on Windows, a single-link file replaced by POSIX rename when its owner,
-///   streams and metadata permit it, or by `ReplaceFileW` otherwise. The
+/// - on Windows, a single-link file replaced by POSIX or MoveFileExW rename
+///   only when its owner, streams and metadata permit it. The
 ///   temporary gets the file's own protected DACL before any content is
-///   written, so it is never readable by more users than the file.
+///   written, so it is never readable by more users than the file. Named
+///   streams are copied and synced before rename; Windows regenerates short names.
 ///
 /// Any other existing file is rewritten in place, as editors do when a
 /// backup-and-rename would alter the file, so access is never silently
@@ -158,13 +159,14 @@ fn atomic_write_source_with(
     cleanup.file.take();
     #[cfg(windows)]
     if let Some(metadata) = original.as_ref() {
-        if source_replacement::replace_keeping_identity(&destination, &temporary, parent)? {
+        if source_replacement::replace_keeping_identity(&destination, &temporary)? {
             return Ok(SourceWriteOutcome {
                 mode: SourceWriteMode::Replaced,
                 warnings,
             });
         }
         drop(cleanup);
+        warnings.push("non_atomic_windows_write: atomic replacement is unavailable for this file; saved in place without removing its name. Concurrent readers may see incomplete contents.".to_owned());
         return write_source_in_place(&destination, metadata, bytes, &mut writer, warnings);
     }
     crate::fs_lock::rename_over(&temporary, &destination)?;
@@ -336,9 +338,8 @@ mod source_replacement {
         metadata.is_file() && metadata.nlink() == 1 && metadata.uid() == euid
     }
 
-    /// `ReplaceFileW` keeps the replaced file's security descriptor and
-    /// attributes, but it replaces only one name, so a file with more than
-    /// one hard link would be split from its other names.
+    /// A replacement changes only one name, so a file with more than one hard
+    /// link must be written in place to retain its other names.
     #[cfg(windows)]
     pub(super) fn may_keep_access(destination: &Path, metadata: &Metadata) -> bool {
         metadata.is_file() && super::windows_replace::link_count(destination) == Some(1)
@@ -401,10 +402,8 @@ mod source_replacement {
             && xattrs::platform_acls_match(&source, replacement)
     }
 
-    /// `ReplaceFileW` moves the replaced file's security descriptor onto the
-    /// replacement only when it commits. Until then the temporary would carry
-    /// the folder's inherited ACL, which can admit users the file does not,
-    /// so it gets the file's own protected DACL before any content is written.
+    /// Give the temporary the file's own protected DACL before any content is
+    /// written. The folder's inherited ACL can admit users the file does not.
     #[cfg(windows)]
     pub(super) fn copy_access(
         destination: &Path,
@@ -428,16 +427,15 @@ mod source_replacement {
     }
 
     /// Replace `destination` with the synced `replacement` through a guarded
-    /// POSIX rename or `ReplaceFileW`. Returns `Ok(false)` when it could not,
-    /// after making sure the original is back under its own name, so the
-    /// caller can rewrite the file in place instead.
+    /// POSIX or MoveFileExW rename. Returns `Ok(false)` without removing
+    /// the original name when neither is safe, so the caller can report the
+    /// loss of atomicity and rewrite the file in place instead.
     #[cfg(windows)]
     pub(super) fn replace_keeping_identity(
         destination: &Path,
         replacement: &Path,
-        parent: &Path,
     ) -> std::io::Result<bool> {
-        super::windows_replace::replace(destination, replacement, parent)
+        super::windows_replace::replace(destination, replacement)
     }
 
     /// Extended attributes read and written through open file descriptors.
