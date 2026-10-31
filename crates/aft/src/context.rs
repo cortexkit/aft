@@ -5131,6 +5131,27 @@ enum CallgraphBuildAdmission {
     NotStarted,
 }
 
+fn retry_changed_callgraph_corpus<T>(
+    mut build: impl FnMut() -> std::result::Result<T, CallGraphStoreError>,
+) -> std::result::Result<T, CallGraphStoreError> {
+    // A writer may change source files while a cold build is reading them.
+    // Retry immediately with a fresh inventory and content hashes, but release
+    // the worker after three attempts so an edited root cannot monopolize a slot.
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match build() {
+            Err(error) if error.is_corpus_change() && attempts < 3 => {
+                crate::slog_info!(
+                    "callgraph corpus changed during cold build; restarting attempt {} of 3",
+                    attempts + 1
+                );
+            }
+            result => return result,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct CallgraphViewInstallTestGate {
     reached: crossbeam_channel::Sender<String>,
@@ -10854,31 +10875,37 @@ impl AppContext {
         };
         // Let the store walk directly into its staging table. Keeping discovery
         // inside the builder prevents a second corpus-sized path inventory here.
-        let (store, _stats) = crate::callgraph_store::with_publish_epoch(
+        let built = crate::callgraph_store::with_publish_epoch(
             persist_epoch_flag.clone(),
             persist_epoch,
             || {
                 crate::callgraph_store::with_corpus_memo(self.callgraph_corpus_memo(), || {
-                    if force_token.is_some() {
-                        CallGraphStore::force_cold_build_with_lease_chunked(
-                            callgraph_dir.clone(),
-                            project_root.clone(),
-                            &[],
-                            self.config().callgraph_chunk_size,
-                        )
-                        .map(|(store, _stats)| (store, ()))
-                    } else {
-                        CallGraphStore::ensure_built_with_lease_chunked(
-                            callgraph_dir.clone(),
-                            project_root.clone(),
-                            &[],
-                            self.config().callgraph_chunk_size,
-                        )
-                        .map(|(store, _stats)| (store, ()))
-                    }
+                    retry_changed_callgraph_corpus(|| {
+                        if force_token.is_some() {
+                            CallGraphStore::force_cold_build_with_lease_chunked(
+                                callgraph_dir.clone(),
+                                project_root.clone(),
+                                &[],
+                                self.config().callgraph_chunk_size,
+                            )
+                            .map(|(store, _stats)| (store, ()))
+                        } else {
+                            CallGraphStore::ensure_built_with_lease_chunked(
+                                callgraph_dir.clone(),
+                                project_root.clone(),
+                                &[],
+                                self.config().callgraph_chunk_size,
+                            )
+                            .map(|(store, _stats)| (store, ()))
+                        }
+                    })
                 })
             },
-        )?;
+        );
+        let (store, _stats) = match built {
+            Err(error) if error.is_corpus_change() => return Ok(None),
+            result => result?,
+        };
         drop(store);
 
         let reopened = CallGraphStore::open_readonly(callgraph_dir, project_root);
@@ -12028,38 +12055,33 @@ impl AppContext {
                             persist_epoch_flag.clone(),
                             persist_epoch,
                             || {
-                                crate::callgraph_store::with_corpus_memo(corpus_memo, || match work
-                                {
-                                    CallgraphBackgroundWork::LegacyMigration => {
-                                        CallGraphStore::migrate_legacy_with_lease(
-                                            callgraph_dir.clone(),
-                                            project_root.clone(),
-                                        )
-                                    }
-                                    CallgraphBackgroundWork::ForceRebuild(_) => {
-                                        let files =
-                                            crate::callgraph::walk_project_files(&project_root)
-                                                .collect::<Vec<_>>();
-                                        CallGraphStore::force_cold_build_with_lease_chunked(
-                                            callgraph_dir.clone(),
-                                            project_root.clone(),
-                                            &files,
-                                            chunk_size,
-                                        )
-                                        .map(|(store, _)| Some(store))
-                                    }
-                                    CallgraphBackgroundWork::Ensure => {
-                                        let files =
-                                            crate::callgraph::walk_project_files(&project_root)
-                                                .collect::<Vec<_>>();
-                                        CallGraphStore::ensure_built_with_lease_chunked(
-                                            callgraph_dir.clone(),
-                                            project_root.clone(),
-                                            &files,
-                                            chunk_size,
-                                        )
-                                        .map(|(store, _)| Some(store))
-                                    }
+                                crate::callgraph_store::with_corpus_memo(corpus_memo, || {
+                                    retry_changed_callgraph_corpus(|| match work {
+                                        CallgraphBackgroundWork::LegacyMigration => {
+                                            CallGraphStore::migrate_legacy_with_lease(
+                                                callgraph_dir.clone(),
+                                                project_root.clone(),
+                                            )
+                                        }
+                                        CallgraphBackgroundWork::ForceRebuild(_) => {
+                                            CallGraphStore::force_cold_build_with_lease_chunked(
+                                                callgraph_dir.clone(),
+                                                project_root.clone(),
+                                                &[],
+                                                chunk_size,
+                                            )
+                                            .map(|(store, _)| Some(store))
+                                        }
+                                        CallgraphBackgroundWork::Ensure => {
+                                            CallGraphStore::ensure_built_with_lease_chunked(
+                                                callgraph_dir.clone(),
+                                                project_root.clone(),
+                                                &[],
+                                                chunk_size,
+                                            )
+                                            .map(|(store, _)| Some(store))
+                                        }
+                                    })
                                 })
                             },
                         )
@@ -12123,6 +12145,15 @@ impl AppContext {
                             reason
                         );
                         settlement.denied(reason);
+                    }
+                    Err(error) if error.is_corpus_change() => {
+                        // Dropping the worker's settlement sends a Settled
+                        // build event, which query operations report as
+                        // Building. Later demand gets a fresh retry budget
+                        // once the editing burst subsides.
+                        crate::slog_info!(
+                            "callgraph corpus still changing after 3 attempts; build deferred"
+                        );
                     }
                     Err(error) => {
                         crate::slog_warn!("callgraph store background work failed: {}", error);
@@ -20723,6 +20754,34 @@ mod callgraph_store_for_ops_tests {
             CallgraphStoreAccess::Ready(_)
         ));
         query.join().expect("callgraph query thread");
+    }
+
+    #[test]
+    fn callgraph_corpus_retry_restarts_inventory_changes_but_not_lookup_bugs() {
+        let mut attempts = 0;
+        let result = retry_changed_callgraph_corpus(|| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(CallGraphStoreError::CorpusInventoryChanged(None))
+            } else {
+                Ok("fresh inventory")
+            }
+        });
+        assert_eq!(result.unwrap(), "fresh inventory");
+        assert_eq!(attempts, 2);
+
+        let mut attempts = 0;
+        let result: std::result::Result<(), _> = retry_changed_callgraph_corpus(|| {
+            attempts += 1;
+            Err(CallGraphStoreError::CorpusSnapshotMissing(PathBuf::from(
+                "missing.rs",
+            )))
+        });
+        assert!(matches!(
+            result,
+            Err(CallGraphStoreError::CorpusSnapshotMissing(_))
+        ));
+        assert_eq!(attempts, 1);
     }
 
     fn assert_callgraph_churn_was_not_charged(ctx: &AppContext) {

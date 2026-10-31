@@ -2095,10 +2095,15 @@ pub enum CallGraphStoreError {
     Suspended(crate::build_breaker::BuildSuspension),
     Superseded,
     CorpusSnapshotMissing(PathBuf),
+    CorpusInventoryChanged(Option<PathBuf>),
     StaleFiles(Vec<String>),
 }
 
 impl CallGraphStoreError {
+    pub(crate) fn is_corpus_change(&self) -> bool {
+        matches!(self, Self::CorpusInventoryChanged(_) | Self::StaleFiles(_))
+    }
+
     pub(crate) fn is_unreadable_database(&self) -> bool {
         matches!(
             self,
@@ -2158,6 +2163,16 @@ impl fmt::Display for CallGraphStoreError {
                 "callgraph corpus snapshot lookup invariant failed: {} was not admitted",
                 path.display()
             ),
+            Self::CorpusInventoryChanged(path) => {
+                write!(
+                    formatter,
+                    "callgraph corpus inventory changed after admission"
+                )?;
+                if let Some(path) = path {
+                    write!(formatter, ": {} was added", path.display())?;
+                }
+                Ok(())
+            }
             Self::StaleFiles(files) => {
                 write!(
                     formatter,
@@ -7556,15 +7571,16 @@ impl CallGraphStore {
                 crate::build_breaker::BuildDomain::CallgraphCold,
                 corpus.fingerprint.clone(),
             );
-            match breaker
+            let attempt = match breaker
                 .admit(&breaker_key, 0)
                 .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?
             {
-                crate::build_breaker::BreakerAdmission::Admitted(_) => {
+                crate::build_breaker::BreakerAdmission::Admitted(attempt) => {
                     crate::logging::log_index_event(crate::logging::IndexEvent::from_scope(
                         crate::logging::IndexEventKind::BreakerAdmitted,
                         &scope,
                     ));
+                    attempt
                 }
                 crate::build_breaker::BreakerAdmission::Suspended(suspension) => {
                     crate::logging::log_index_event(
@@ -7577,19 +7593,41 @@ impl CallGraphStore {
                     failure_guard.disarm();
                     return Err(CallGraphStoreError::Suspended(suspension));
                 }
-            }
+            };
             ensure_cold_build_current("inventory", 0, 1)?;
-            let corpus_fingerprint =
-                temp_store.stage_cold_build_file_inventory_checked(files, Some(&corpus))?;
-            ensure_cold_build_current("inventory", 1, 1)?;
-            let stats = temp_store.cold_build_chunked_from_staged_inventory_with_resolution_memo(
-                chunk_size,
-                &corpus_fingerprint,
-                COLD_BUILD_RESOLVE_WINDOW,
-                &callgraph::ModuleResolutionMemo::default(),
-                true,
-                Some(&corpus),
-            )?;
+            let extraction = (|| {
+                let corpus_fingerprint =
+                    temp_store.stage_cold_build_file_inventory_checked(files, Some(&corpus))?;
+                ensure_cold_build_current("inventory", 1, 1)?;
+                temp_store.cold_build_chunked_from_staged_inventory_with_resolution_memo(
+                    chunk_size,
+                    &corpus_fingerprint,
+                    COLD_BUILD_RESOLVE_WINDOW,
+                    &callgraph::ModuleResolutionMemo::default(),
+                    true,
+                    Some(&corpus),
+                )
+            })();
+            let stats = match extraction {
+                Err(error) if error.is_corpus_change() => {
+                    // File edits cancel an admitted attempt; they are neither
+                    // a process death nor a failed store. Keep prior crash
+                    // history, but retire this attempt before retrying.
+                    breaker
+                        .cancel_attempt(&breaker_key, &attempt.attempt_id)
+                        .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+                    failure_guard.disarm();
+                    crate::logging::log_index_event(
+                        crate::logging::IndexEvent::from_scope(
+                            crate::logging::IndexEventKind::BuildCancelled,
+                            &scope,
+                        )
+                        .field("reason", "corpus_changed"),
+                    );
+                    return Err(error);
+                }
+                result => result?,
+            };
             let _ = temp_store.checkpoint_wal_truncate();
             temp_store.prepare_for_atomic_swap()?;
             (stats, breaker_key)
@@ -8096,9 +8134,7 @@ impl CallGraphStore {
 
         let fingerprint = staged_corpus_fingerprint(&conn, &self.project_root, corpus)?;
         if corpus.is_some_and(|corpus| corpus.fingerprint != fingerprint) {
-            return Err(CallGraphStoreError::Unavailable(
-                "callgraph corpus inventory changed after admission".to_string(),
-            ));
+            return Err(CallGraphStoreError::CorpusInventoryChanged(None));
         }
         Ok(fingerprint)
     }
@@ -13721,12 +13757,9 @@ fn staged_corpus_fingerprint(
         let rel_path = row.get::<_, String>(0)?;
         let path = project_root.join(rel_path);
         if let Some(corpus) = corpus {
-            let file = corpus.file(project_root, &path)?.ok_or_else(|| {
-                CallGraphStoreError::Unavailable(format!(
-                    "callgraph corpus inventory changed after admission: {} was added",
-                    path.display()
-                ))
-            })?;
+            let file = corpus
+                .file(project_root, &path)?
+                .ok_or_else(|| CallGraphStoreError::CorpusInventoryChanged(Some(path.clone())))?;
             fingerprint.add_hash(
                 project_root,
                 &path,
@@ -29819,8 +29852,7 @@ export function leaf() {}
             .unwrap_err();
         assert!(matches!(
             error,
-            CallGraphStoreError::Unavailable(ref reason)
-                if reason.contains("inventory changed after admission") && reason.contains("was added")
+            CallGraphStoreError::CorpusInventoryChanged(Some(_))
         ));
 
         fs::remove_file(added).unwrap();
@@ -29830,8 +29862,7 @@ export function leaf() {}
             .unwrap_err();
         assert!(matches!(
             error,
-            CallGraphStoreError::Unavailable(ref reason)
-                if reason.contains("inventory changed after admission")
+            CallGraphStoreError::CorpusInventoryChanged(None)
         ));
     }
 
