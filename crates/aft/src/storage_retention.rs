@@ -342,6 +342,19 @@ struct TrashScan {
     lap: u64,
 }
 
+impl TrashScan {
+    fn finish_lap(&mut self) {
+        self.retained.retain(|path, entry| {
+            if entry.lap == self.lap {
+                true
+            } else {
+                forget_retained_warning(path);
+                false
+            }
+        });
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TreeNodeState {
     len: u64,
@@ -3408,10 +3421,7 @@ fn reap_trash_with_cursor(
     if entries.is_empty() && !mount_local {
         if let Some(scan) = cursor.as_mut() {
             if scan.entries.is_none() && scan.deferred.is_empty() {
-                for path in scan.retained.keys() {
-                    forget_retained_warning(path);
-                }
-                scan.retained.clear();
+                scan.finish_lap();
             }
         }
         return Ok(report.incomplete);
@@ -3680,14 +3690,7 @@ fn reap_trash_with_cursor(
     }
     let scan = cursor.as_mut().unwrap();
     if scan.entries.is_none() && scan.deferred.is_empty() {
-        scan.retained.retain(|path, entry| {
-            if entry.lap == scan.lap {
-                true
-            } else {
-                forget_retained_warning(path);
-                false
-            }
-        });
+        scan.finish_lap();
     }
     if mount_local {
         // Never recursively delete the container: a concurrent retirement may
@@ -6385,6 +6388,41 @@ mod storage_retention_tests {
     }
 
     #[test]
+    fn retention_trash_refusal_memos_survive_exact_batch_exhaustion() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("retention")).unwrap();
+        let trash = temp.path().join("symbols/.retention-trash");
+        let mut entries = Vec::new();
+        for i in 0..PASS_ENTRIES * 2 {
+            let entry = trash.join(format!("retired-{i:032x}"));
+            fs::create_dir_all(&entry).unwrap();
+            fs::write(entry.join("notes.txt"), b"foreign").unwrap();
+            entries.push(entry);
+        }
+        let (_, logs) = crate::logging::capture_log_lines(|| {
+            // Two full batches, then one empty iterator step to finish the lap.
+            for _ in 0..3 {
+                reap_retired(temp.path()).unwrap();
+            }
+            PASS_IO.with(|count| count.set((0, 0)));
+            reap_retired(temp.path()).unwrap();
+            assert!(PASS_IO.with(|count| count.get().0) <= 2);
+            assert_eq!(trash_report(temp.path()).entries, PASS_ENTRIES);
+        });
+        for entry in entries {
+            assert!(entry.exists());
+            assert_eq!(
+                logs.iter()
+                    .filter(|line| warning_names_entry(line, &entry, "witness"))
+                    .count(),
+                1,
+                "{}",
+                entry.display()
+            );
+        }
+    }
+
+    #[test]
     fn retention_trash_reaps_unwitnessed_symbol_snapshot_and_crash_leftovers() {
         for files in [
             vec!["symbols.bin"],
@@ -6550,7 +6588,7 @@ mod storage_retention_tests {
             fs::create_dir_all(retired.join("nested")).unwrap();
             fs::write(retired.join("nested/notes.txt"), b"not an AFT cache").unwrap();
         }
-        for pass in 0..3 {
+        for pass in 0..5 {
             PASS_IO.with(|count| count.set((0, 0)));
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             let cpu = thread_cpu_seconds();
