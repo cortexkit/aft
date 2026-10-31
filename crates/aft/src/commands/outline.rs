@@ -5881,7 +5881,7 @@ mod tests {
             let text = cold["text"].as_str().unwrap();
             assert!(text.contains("first (path z.rs): 2 items"), "{text}");
             assert!(text.contains("second (path z.rs): 2 items"), "{text}");
-            assert!(text.contains("fn helper()"), "{text}");
+            assert!(text.contains("  - fn   helper 1:1\n"), "{text}");
             assert_eq!(cold["files_shown"], 2);
 
             let (warm, reads, parses) = navigation_counts(&request, &ctx);
