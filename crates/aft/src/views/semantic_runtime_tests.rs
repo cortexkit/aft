@@ -4558,13 +4558,51 @@ fn live_view_holders_match_runtimes_and_planes_have_unique_ids() {
     assert_ne!(replacement.id(), id);
 }
 
+/// A namespace another writer keeps changing no longer makes a load busy: the
+/// ledger records the largest total it saw and leaves the measurement owed.
 #[test]
-fn views_busy_load_measurement_keeps_semantic_building_until_retry_succeeds() {
+fn views_changing_namespace_does_not_make_the_semantic_load_busy() {
     let _git_env = crate::test_env::hermetic_git_env_guard();
     let _serial = crate::blob_store::v3::serial_for_test();
     let storage = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     write_tree(root.path(), &[("a.ts", "export const value = 'needle';\n")]);
+    let slot = Arc::new(CheckoutSemanticSlot::default());
+    let runtime = CheckoutSemantic::new(
+        &crate::root_cache::StoragePaths::same(storage.path()),
+        "family",
+        "churn-semantic",
+        root.path(),
+        producer(),
+        Arc::downgrade(&slot),
+    )
+    .unwrap();
+    let (result, writes) =
+        crate::blob_store::v3::with_changing_namespace_for_test(storage.path(), "family", |_| {
+            runtime.load().map(|_| ())
+        });
+    assert!(
+        writes >= 8,
+        "the namespace must change through every recheck"
+    );
+    result.expect("a changing namespace is not a busy store");
+}
+
+/// A store that is busy (here another connection holds the family registry
+/// in exclusive locking mode) keeps the semantic lane building, with no
+/// failure counted and no bug line, until a retry loads it.
+#[test]
+fn views_busy_load_keeps_semantic_building_until_retry_succeeds() {
+    use crate::db::file_identity::IdentityConnection;
+    let _git_env = crate::test_env::hermetic_git_env_guard();
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), &[("a.ts", "export const value = 'needle';\n")]);
+    crate::blob_store::v3::publish(storage.path(), "family", 1024, None, |_| Ok(())).unwrap();
+    let registry = crate::blob_store::v3::family_dir(storage.path(), "family")
+        .unwrap()
+        .join("members.sqlite");
     let ctx = crate::context::AppContext::new(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
@@ -4614,17 +4652,23 @@ fn views_busy_load_measurement_keeps_semantic_building_until_retry_succeeds() {
                 "a stopped writer must not keep the load busy"
             );
             if attempts == 1 {
-                let (result, writes) = crate::blob_store::v3::with_changing_namespace_for_test(
-                    storage.path(),
-                    "family",
-                    |_| runtime.load().map(|_| ()),
-                );
-                assert!(writes >= 8);
-                let error = result.unwrap_err();
-                assert!(
-                    error.contains("reservation_ledger_busy: measure registry"),
-                    "{error}"
-                );
+                let blocker = IdentityConnection::open_with_flags(
+                    &registry,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+                    "semantic-busy-load-blocker",
+                )
+                .unwrap();
+                // Exclusive locking mode keeps every other connection out of
+                // the registry until this transaction and connection end.
+                blocker
+                    .execute_batch(
+                        "PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; UPDATE accounting SET watermark=watermark+1;",
+                    )
+                    .unwrap();
+                let error = runtime.load().map(|_| ()).unwrap_err();
+                assert!(super::super::trigram::bind_is_busy(&error), "{error}");
+                blocker.execute_batch("ROLLBACK").unwrap();
+                drop(blocker);
                 return Err(error);
             }
             assert!(matches!(slot.state(), Some(CheckoutSemanticState::Loading)));
@@ -4634,7 +4678,7 @@ fn views_busy_load_measurement_keeps_semantic_building_until_retry_succeeds() {
             );
             let response = crate::commands::semantic_search::handle_semantic_search(
                 &crate::protocol::RawRequest {
-                    id: "semantic-measurement-busy".into(),
+                    id: "semantic-load-busy".into(),
                     command: "semantic_search".into(),
                     lsp_hints: None,
                     session_id: None,
@@ -4664,7 +4708,7 @@ fn views_busy_load_measurement_keeps_semantic_building_until_retry_succeeds() {
                 .is_empty());
             runtime
                 .load()
-                .expect("the semantic view must load after the writer stops");
+                .expect("the semantic view must load once the registry is free");
             Ok(())
         },
     );
@@ -4759,9 +4803,9 @@ fn store_errors_name_the_gap_without_a_retry_loop() {
     );
 }
 
-/// A store that is only busy (here another connection holds the family
-/// registry's write lock while the fill publishes) is retried on the backoff
-/// and completes once the lock goes, with no wake. A store error that would
+/// A store that is only busy (here another connection holds the family's
+/// semantic plane write lock while the fill stores its vectors) is retried on
+/// the backoff and completes once the lock goes, with no wake. A store error that would
 /// fail again, by contrast, waits for a wake
 /// (`store_errors_name_the_gap_without_a_retry_loop`).
 #[test]
@@ -4771,24 +4815,6 @@ fn busy_store_errors_retry_on_the_backoff_until_the_fill_publishes() {
     let root = tempfile::tempdir().unwrap();
     write_tree(root.path(), FILES);
     let (slot, epoch, wake, runtime) = served_lane(storage.path(), root.path());
-    std::fs::write(
-        root.path().join("src/gamma.rs"),
-        "pub fn gamma_busy_edit() {}\n",
-    )
-    .unwrap();
-    runtime
-        .driver()
-        .record_absolute_change(&root.path().join("src/gamma.rs"));
-    let registry = crate::blob_store::v3::family_dir(storage.path(), "family")
-        .unwrap()
-        .join("members.sqlite");
-    let blocker = IdentityConnection::open_with_flags(
-        &registry,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-        "semantic-busy-store-blocker",
-    )
-    .unwrap();
-    blocker.execute_batch("BEGIN IMMEDIATE;").unwrap();
     let worker = {
         let weak = Arc::downgrade(&slot);
         let root = root.path().to_path_buf();
@@ -4799,18 +4825,50 @@ fn busy_store_errors_retry_on_the_backoff_until_the_fill_publishes() {
             });
         })
     };
-    // Each attempt waits out the ledger's busy timeout, so two attempts take
+    // The first fill creates the semantic plane and settles complete.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !query(&runtime, "gamma").complete() {
+        assert!(Instant::now() < deadline, "the first fill never completed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let plane = crate::blob_store::v3::plane_path(
+        storage.path(),
+        "family",
+        crate::blob_store::v2::FamilyPlane::Semantic,
+    )
+    .unwrap();
+    let blocker = IdentityConnection::open_with_flags(
+        &plane,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        "semantic-busy-store-blocker",
+    )
+    .unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    let before = runtime.refresh_attempts();
+    std::fs::write(
+        root.path().join("src/gamma.rs"),
+        "pub fn gamma_busy_edit() {}\n",
+    )
+    .unwrap();
+    runtime
+        .driver()
+        .record_absolute_change(&root.path().join("src/gamma.rs"));
+    // One wake only: a second attempt must come from the backoff.
+    slot.wake();
+    // Each attempt waits out the store's busy timeout, so two attempts take
     // a little over ten seconds.
     let deadline = Instant::now() + Duration::from_secs(60);
-    while runtime.refresh_attempts() < 2 {
+    while runtime.refresh_attempts() < before + 2 {
         assert!(
             Instant::now() < deadline,
             "a busy store was not retried on the backoff: attempts={} unavailable={:?}",
-            runtime.refresh_attempts(),
+            runtime.refresh_attempts() - before,
             runtime.unavailable_reason()
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    // The busy store was reported as such, not as the checkout's named gap.
+    assert!(runtime.unavailable_reason().is_none());
     blocker.execute_batch("ROLLBACK;").unwrap();
     drop(blocker);
     let deadline = Instant::now() + Duration::from_secs(60);
