@@ -118,7 +118,7 @@ mod program_approvals {
             &routes,
             route,
             Some(
-                &json!({"name":"read", "preset":if worker {"worker"} else {"head"}, "arguments":{"filePath":"x"}}),
+                &json!({"name":"read", "preset":if worker {"worker"} else {"head"}, "arguments":{"path":"x"}}),
             ),
             |_| Some(Ok(codemode::EffectiveSavedPolicy::default())),
         ) {
