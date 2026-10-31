@@ -100,7 +100,8 @@ pub(crate) fn applies_to_relative(path: &[u8]) -> bool {
 /// The key a views call graph stores in `files.content_hash` for the file at
 /// root-relative `path` whose source hash is `source`: the call-graph blob key,
 /// not the source hash (materialization also stores size 0). `None` for a path
-/// no call-graph plane covers.
+/// the call graph does not index: neither a recognised source language nor a
+/// resolver configuration file such as `package.json`.
 pub(crate) fn graph_key(path: &[u8], source: blake3::Hash) -> Option<blake3::Hash> {
     let language = if super::assembly::is_resolution_input(path) {
         "config".to_owned()
