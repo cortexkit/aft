@@ -25,6 +25,8 @@ fn native_sqlite_file_sets_have_no_out_of_band_content_access() {
         ("read_audit.rs", include_str!("read_audit.rs"), false),
         ("copy.rs", include_str!("copy.rs"), false),
         ("replay.rs", include_str!("replay.rs"), false),
+        // Charges by path through getattrlist; it opens no file.
+        ("unshared.rs", include_str!("unshared.rs"), false),
         // The process harness reads only its JSON/ready files and reader-floor
         // JSON as text. It must never read or copy SQLite file-set bytes.
         ("tests.rs", include_str!("tests.rs"), true),
@@ -49,6 +51,7 @@ fn native_sqlite_file_sets_have_no_out_of_band_content_access() {
                 "initialization",
                 "read_audit",
                 "replay",
+                "unshared",
                 "copy",
                 "copy_tests",
                 "replay_tests",

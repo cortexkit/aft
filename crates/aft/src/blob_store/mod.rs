@@ -46,6 +46,8 @@ macro_rules! trace_first_open_step {
     };
 }
 
+#[cfg(test)]
+mod clone_accounting_tests;
 pub mod reclaim;
 pub mod v2;
 pub mod v3;
