@@ -3850,23 +3850,6 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                         crate::cache_freshness::invalidate_verify_memo_strict(&root);
                     }
                     state.rescan_required = true;
-                    let _ = ctx.run_if_subc_bound_generation(configure_generation, || {
-                        // The old search index cannot rule out matches in files
-                        // whose changes were lost. Stop using it now, even if
-                        // ignore reconciliation or earlier drain slices postpone
-                        // the replacement build.
-                        if !ctx.config().views.enabled {
-                            if let Some(index) = ctx
-                                .search_index()
-                                .write()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .as_mut()
-                            {
-                                index.ready = false;
-                            }
-                            ctx.search_exact_memo().clear();
-                        }
-                    });
                     state.rescan_ignore_checked = false;
                     state.rescan_reason = reason;
                     // The individual changes are gone, so any Tier-2 input
@@ -3997,6 +3980,24 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
         return outcome;
     }
 
+    if state.rescan_required {
+        let _ = ctx.run_if_subc_bound_generation(configure_generation, || {
+            // The old search index cannot rule out matches in files whose
+            // changes were lost. Stop using it before deferred reconciliation,
+            // including when a retained rescan resumes after a route rebind.
+            if !ctx.config().views.enabled {
+                if let Some(index) = ctx
+                    .search_index()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_mut()
+                {
+                    index.ready = false;
+                }
+                ctx.search_exact_memo().clear();
+            }
+        });
+    }
     if state.rescan_required && receiver_has_more_after_receive {
         outcome.has_more = true;
         *ctx.watcher_drain_slice().lock() = Some(state);
@@ -5983,43 +5984,48 @@ mod tests {
 
     #[test]
     fn watcher_rescan_stops_serving_old_trigrams_before_reconciliation() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(temp.path()).unwrap();
-        std::fs::write(root.join("seed.rs"), "// seed\n").unwrap();
-        let (ctx, tx) = watcher_context(&root);
-        let mut index = crate::search_index::SearchIndex::build(&root);
-        index.ready = true;
-        *ctx.search_index().write().unwrap() = Some(index);
-        std::fs::create_dir(root.join("new-crate")).unwrap();
-        std::fs::write(root.join("new-crate/lib.rs"), "// pending_child_marker\n").unwrap();
+        for received_now in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(temp.path()).unwrap();
+            std::fs::write(root.join("seed.rs"), "// seed\n").unwrap();
+            let (ctx, tx) = watcher_context(&root);
+            let mut index = crate::search_index::SearchIndex::build(&root);
+            index.ready = true;
+            *ctx.search_index().write().unwrap() = Some(index);
+            std::fs::create_dir(root.join("new-crate")).unwrap();
+            std::fs::write(root.join("new-crate/lib.rs"), "// pending_child_marker\n").unwrap();
 
-        // Keep ignore reconciliation unfinished: receipt of a rescan must stop
-        // stale candidate filtering before the replacement build can begin.
-        let (_ignore_tx, ignore_rx) = crossbeam_channel::unbounded();
-        let mut state = WatcherDrainSliceState::new(
-            ctx.configure_generation(),
-            ctx.configure_content_generation(),
-        );
-        state.ignore_scan = Some(ignore_rx);
-        *ctx.watcher_drain_slice().lock() = Some(state);
-        tx.send(WatcherDispatchEvent::RescanRequired(RescanReason::Unknown))
+            // Keep ignore reconciliation unfinished: receipt of a rescan must stop
+            // stale candidate filtering before the replacement build can begin.
+            let (_ignore_tx, ignore_rx) = crossbeam_channel::unbounded();
+            let mut state = WatcherDrainSliceState::new(
+                ctx.configure_generation(),
+                ctx.configure_content_generation(),
+            );
+            state.ignore_scan = Some(ignore_rx);
+            state.rescan_required = !received_now;
+            *ctx.watcher_drain_slice().lock() = Some(state);
+            if received_now {
+                tx.send(WatcherDispatchEvent::RescanRequired(RescanReason::Unknown))
+                    .unwrap();
+            }
+            assert!(drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more);
+            assert!(!ctx.search_index().read().unwrap().as_ref().unwrap().ready);
+            assert!(ctx.watcher_query_has_pending_changes());
+
+            let request = serde_json::from_value(serde_json::json!({
+                "id": "pending-child", "command": "grep", "pattern": "pending_child_marker"
+            }))
             .unwrap();
-        assert!(drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more);
-        assert!(!ctx.search_index().read().unwrap().as_ref().unwrap().ready);
-        assert!(ctx.watcher_query_has_pending_changes());
-
-        let request = serde_json::from_value(serde_json::json!({
-            "id": "pending-child", "command": "grep", "pattern": "pending_child_marker"
-        }))
-        .unwrap();
-        let response = crate::commands::grep::handle_grep(&request, &ctx);
-        assert!(response.success, "{}", response.data);
-        assert_eq!(response.data["total_matches"], 1, "{}", response.data);
-        assert_eq!(response.data["files_read_directly"], 2);
-        assert!(response.data["text"]
-            .as_str()
-            .unwrap()
-            .contains("searched all 2 files directly"));
+            let response = crate::commands::grep::handle_grep(&request, &ctx);
+            assert!(response.success, "{}", response.data);
+            assert_eq!(response.data["total_matches"], 1, "{}", response.data);
+            assert_eq!(response.data["files_read_directly"], 2);
+            assert!(response.data["text"]
+                .as_str()
+                .unwrap()
+                .contains("searched all 2 files directly"));
+        }
     }
 
     #[test]

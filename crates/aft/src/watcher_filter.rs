@@ -420,7 +420,6 @@ pub(crate) fn watcher_path_is_ignored_by_matcher(
     watcher_path_is_ignored_by_matcher_with_kind(matcher, path, root, false)
 }
 
-#[cfg(target_os = "linux")]
 pub(crate) fn watcher_directory_is_ignored_by_matcher(
     matcher: &SharedGitignore,
     path: &Path,
