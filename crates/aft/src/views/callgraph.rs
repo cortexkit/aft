@@ -1453,6 +1453,109 @@ mod tests {
         );
     }
 
+    /// `views.callgraph_copies`: a worktree past the limit borrows the main
+    /// checkout's graph while every copy is in use, and takes the place of a
+    /// copy once that copy's checkout lets go of it. A limit of 0 always
+    /// borrows, and a worktree whose files equal the main checkout's graph
+    /// borrows without counting, even under the limit.
+    #[test]
+    fn callgraph_copies_limit_borrows_when_full_and_evicts_an_idle_copy() {
+        use super::super::callgraph_copies::{self, Admission};
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let main = checkout(&temp.path().join("main"));
+        setup_git(&main, &["init", "-q"]);
+        setup_git(&main, &["config", "core.autocrlf", "false"]);
+        setup_git(&main, &["add", "-A"]);
+        setup_git(&main, &["commit", "-q", "-m", "fixture"]);
+        let worktree = |name: &str, edit: bool| {
+            let path = temp.path().join(name);
+            setup_git(
+                &main,
+                &["worktree", "add", "-q", "--detach", path.to_str().unwrap(), "HEAD"],
+            );
+            let path = std::fs::canonicalize(&path).unwrap();
+            if edit {
+                std::fs::write(
+                    path.join("c.ts"),
+                    format!("export function {name}() {{ return 1; }}\n"),
+                )
+                .unwrap();
+            }
+            path
+        };
+        let first = worktree("first", true);
+        let second = worktree("second", true);
+        let clean = worktree("clean", false);
+        let policy = crate::blob_store::v2::TrigramPolicy {
+            max_file_size: 1 << 20,
+        };
+        let family = "donor-reuse";
+        let admit = |root: &Path, copies| {
+            callgraph_copies::admit(&storage, family, policy, root, copies, || None).unwrap()
+        };
+        let main_scope = view_scope(&main);
+        let borrow_main = Admission::Borrow {
+            root: main.clone(),
+            scope: main_scope.clone(),
+        };
+
+        let main_view = view(&main, &storage);
+        main_view.reader().unwrap();
+        assert_eq!(admit(&main, 0), Admission::Own, "the main checkout always owns");
+        assert_eq!(admit(&first, 1), Admission::Own);
+        let first_view = view(&first, &storage);
+        first_view.reader().unwrap();
+        assert_eq!(admit(&first, 1), Admission::Own, "a copy already held stays owned");
+
+        // `first` holds the one copy and is in use: `second` borrows.
+        assert_eq!(admit(&second, 1), borrow_main);
+        assert_eq!(admit(&second, 0), borrow_main);
+        let (borrowed, _) =
+            callgraph_copies::open_published(&storage, family, policy, &main_scope, &second)
+                .unwrap();
+        assert_eq!(
+            callers(&borrowed, "a.ts", "target"),
+            callers(&main_view.reader().unwrap(), "a.ts", "target"),
+        );
+        drop(borrowed);
+
+        // Identical files borrow without taking one of five free copies.
+        let identities = || {
+            Some(
+                FILES
+                    .iter()
+                    .map(|(name, text)| {
+                        (
+                            (*name).to_owned(),
+                            (text.len() as u64, crate::views::io::source_hash(text.as_bytes())),
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        assert_eq!(
+            callgraph_copies::admit(&storage, family, policy, &clean, 5, identities).unwrap(),
+            borrow_main
+        );
+
+        // Once `first` lets go of its view its copy is idle, and `second`
+        // evicts it to build its own.
+        let first_dir =
+            crate::blob_store::v3::view_dir(&storage, family, &view_scope(&first)).unwrap();
+        assert!(first_dir.exists());
+        drop(first_view);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut admission = admit(&second, 1);
+        while admission != Admission::Own && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            admission = admit(&second, 1);
+        }
+        assert_eq!(admission, Admission::Own, "the idle copy was not evicted");
+        assert!(!first_dir.exists(), "the evicted copy's view directory remains");
+    }
+
     /// A linked worktree at the commit the main checkout already built has the
     /// same files, so it must resolve the main checkout's base and clone its
     /// sealed donor, parsing nothing. Base identity once hashed the policy

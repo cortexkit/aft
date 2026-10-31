@@ -278,10 +278,13 @@ pub fn disclose_borrowed_answer(
 /// callgraph answers come from this checkout's own data: the owner checkout,
 /// a per-checkout query runtime, a checkout's v3 view or a pinned per-HEAD view.
 pub fn borrowed_callgraph(ctx: &AppContext) -> Option<BorrowedCallgraph> {
-    if !ctx.shared_artifacts_read_only()
-        || ctx.checkout_query_runtime_active()
-        || ctx.callgraph_views_enabled()
-    {
+    if ctx.checkout_query_runtime_active() {
+        return None;
+    }
+    if ctx.callgraph_views_enabled() {
+        return view_borrowed_callgraph(ctx);
+    }
+    if !ctx.shared_artifacts_read_only() {
         return None;
     }
     if ctx.config().views.enabled
@@ -320,6 +323,49 @@ pub fn borrowed_callgraph(ctx: &AppContext) -> Option<BorrowedCallgraph> {
     Some(BorrowedCallgraph {
         owner_head,
         owner_checkout,
+        checkout_head,
+        changed_files: complete_list.map(<[String]>::len),
+        edits_in,
+        differing_files: differing,
+    })
+}
+
+/// With views on, a checkout over `views.callgraph_copies` reads another
+/// checkout's published call graph (`views::callgraph_copies`). The graph's
+/// files come from that reader and this checkout's from its lexical view, so
+/// the comparison reads no tree.
+fn view_borrowed_callgraph(ctx: &AppContext) -> Option<BorrowedCallgraph> {
+    let (owner, store) = ctx.borrowed_callgraph_view()?;
+    let checkout_root = canonical(&ctx.config().project_root.clone()?);
+    let owner = canonical(&owner);
+    let differing = store.file_identities().ok().and_then(|graph| {
+        let checkout = ctx.lexical_file_identities()?;
+        Some(compare_with_graph(
+            &graph,
+            checkout,
+            &checkout_root,
+            Some(&owner),
+            MAX_DISK_HASHES,
+        ))
+    });
+    let owner_head = checkout_head(&owner);
+    let checkout_head = checkout_head(&checkout_root);
+    let complete_list = differing
+        .as_ref()
+        .filter(|differing| differing.complete)
+        .map(|differing| differing.files.as_slice());
+    let edits_in = complete_list.and_then(|differing| {
+        let same_head = matches!(
+            (&owner_head, &checkout_head),
+            (Some(owner), Some(checkout)) if owner == checkout
+        );
+        (same_head && !differing.is_empty())
+            .then(|| locate_edits(&checkout_root, differing))
+            .flatten()
+    });
+    Some(BorrowedCallgraph {
+        owner_head,
+        owner_checkout: Some(owner),
         checkout_head,
         changed_files: complete_list.map(<[String]>::len),
         edits_in,
@@ -474,7 +520,7 @@ impl DiskHasher {
 ///
 /// When the disk-read budget runs out the comparison stops and returns the
 /// files found so far, marked incomplete.
-fn compare_with_graph(
+pub(crate) fn compare_with_graph(
     graph: &HashMap<String, FileIdentity>,
     checkout: HashMap<String, FileIdentity>,
     checkout_root: &Path,

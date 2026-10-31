@@ -1178,6 +1178,25 @@ pub struct ViewLoadFailure {
     pub last_at_ms: u64,
 }
 
+/// A checkout over `views.callgraph_copies` reading another checkout's
+/// published call graph (see `views::callgraph_copies`).
+struct CallgraphBorrow {
+    /// The borrowed checkout's call-graph member scope and root.
+    scope: String,
+    target_root: PathBuf,
+    /// When admission decided to borrow. It decides again after
+    /// [`CALLGRAPH_READMIT_AFTER`], so a borrower takes a free slot.
+    decided_at: Instant,
+    /// The open reader and the generation it reads.
+    reader: Option<(String, Arc<ReadonlyCallGraphStore>)>,
+    /// When the borrowed checkout's published generation was last compared
+    /// with the open reader's.
+    checked_at: Instant,
+}
+
+const CALLGRAPH_READMIT_AFTER: Duration = Duration::from_secs(60);
+const CALLGRAPH_BORROW_RECHECK_AFTER: Duration = Duration::from_secs(1);
+
 /// Per-project checkout view load health. Counts every load attempt the
 /// queries actually made (grep, glob, aft_search binds for the lexical view;
 /// navigation, zoom and inspect for the callgraph view), so a persistent
@@ -4703,6 +4722,9 @@ pub struct AppContext {
     lexical_load_retry: parking_lot::Mutex<crate::views::contracts::LoadRetry<String>>,
     lexical_routes: [AtomicU64; 3],
     callgraph_view: parking_lot::Mutex<Option<Arc<crate::views::callgraph::CallgraphView>>>,
+    /// Set while this checkout is over `views.callgraph_copies` and reads
+    /// another checkout's published call graph instead of building its own.
+    callgraph_borrow: parking_lot::Mutex<Option<CallgraphBorrow>>,
     callgraph_construction_retry: parking_lot::Mutex<
         crate::views::contracts::LoadRetry<crate::views::callgraph::CallgraphViewError>,
     >,
@@ -5639,6 +5661,7 @@ impl AppContext {
             lexical_load_retry: parking_lot::Mutex::new(Default::default()),
             lexical_routes: Default::default(),
             callgraph_view: parking_lot::Mutex::new(None),
+            callgraph_borrow: parking_lot::Mutex::new(None),
             callgraph_construction_retry: parking_lot::Mutex::new(Default::default()),
             callgraph_view_read_diagnostics: parking_lot::Mutex::new(
                 CallgraphViewReadDiagnostics::default(),
@@ -9334,6 +9357,7 @@ impl AppContext {
         if !next.views.enabled || project_root_changed {
             self.lexical_view.lock().take();
             self.callgraph_view.lock().take();
+            self.callgraph_borrow.lock().take();
             *self.lexical_load_retry.lock() = Default::default();
             *self.callgraph_construction_retry.lock() = Default::default();
         }
@@ -12600,6 +12624,120 @@ impl AppContext {
         Some(result)
     }
 
+    /// This checkout's current file identities (size and content hash by
+    /// relative path) from its lexical view, when that view is ready.
+    pub(crate) fn lexical_file_identities(
+        &self,
+    ) -> Option<std::collections::HashMap<String, (u64, blake3::Hash)>> {
+        match self.lexical_view_snapshot("bind")? {
+            Ok(crate::views::trigram::LexicalViewSnapshot::Ready(snapshot)) => {
+                Some(snapshot.live_file_identities())
+            }
+            _ => None,
+        }
+    }
+
+    /// When this checkout is over `views.callgraph_copies`, the reader of the
+    /// call graph it borrows; `None` when it builds its own view. Admission
+    /// is decided again once a minute. A failed admission builds the
+    /// checkout's own view, as before the limit existed, and logs why.
+    fn borrowed_callgraph_view_reader(
+        &self,
+        root: &Path,
+        storage: &crate::root_cache::StoragePaths,
+        family: &str,
+        policy: crate::blob_store::v2::TrigramPolicy,
+    ) -> Option<Result<Arc<ReadonlyCallGraphStore>, crate::views::callgraph::CallgraphViewError>>
+    {
+        use crate::views::callgraph_copies::{self, Admission};
+        let now = Instant::now();
+        let readmit = self
+            .callgraph_borrow
+            .lock()
+            .as_ref()
+            .is_none_or(|borrow| now.duration_since(borrow.decided_at) >= CALLGRAPH_READMIT_AFTER);
+        if readmit {
+            let admission = callgraph_copies::admit(
+                &storage.artifacts,
+                family,
+                policy,
+                root,
+                self.config().views.callgraph_copies,
+                || self.lexical_file_identities(),
+            );
+            let mut borrow = self.callgraph_borrow.lock();
+            match admission {
+                Ok(Admission::Own) => {
+                    borrow.take();
+                    return None;
+                }
+                Ok(Admission::Borrow { root: target_root, scope }) => {
+                    let reader = borrow
+                        .take()
+                        .filter(|current| current.scope == scope)
+                        .and_then(|current| current.reader);
+                    *borrow = Some(CallgraphBorrow {
+                        scope,
+                        target_root,
+                        decided_at: now,
+                        reader,
+                        checked_at: now,
+                    });
+                }
+                Err(reason) => {
+                    crate::slog_warn!(
+                        "views callgraph copy admission failed root={}: {reason}",
+                        root.display()
+                    );
+                    borrow.take();
+                    return None;
+                }
+            }
+        }
+        let mut guard = self.callgraph_borrow.lock();
+        let borrow = guard.as_mut()?;
+        if let Some((generation, store)) = &borrow.reader {
+            if now.duration_since(borrow.checked_at) < CALLGRAPH_BORROW_RECHECK_AFTER
+                || callgraph_copies::published_generation(&storage.artifacts, family, &borrow.scope)
+                    .as_deref()
+                    == Some(generation.as_str())
+            {
+                borrow.checked_at = now;
+                return Some(Ok(store.clone()));
+            }
+        }
+        borrow.checked_at = now;
+        Some(
+            match callgraph_copies::open_published(
+                &storage.artifacts,
+                family,
+                policy,
+                &borrow.scope,
+                root,
+            ) {
+                Ok((store, generation)) => {
+                    let store = Arc::new(store);
+                    borrow.reader = Some((generation, store.clone()));
+                    Ok(store)
+                }
+                Err((reason, busy)) => Err(crate::views::callgraph::CallgraphViewError {
+                    reason,
+                    busy,
+                    completion_busy: false,
+                }),
+            },
+        )
+    }
+
+    /// The checkout whose call graph this one reads, and the open reader,
+    /// while this checkout is over `views.callgraph_copies`.
+    pub(crate) fn borrowed_callgraph_view(&self) -> Option<(PathBuf, Arc<ReadonlyCallGraphStore>)> {
+        let borrow = self.callgraph_borrow.lock();
+        let borrow = borrow.as_ref()?;
+        let (_, store) = borrow.reader.as_ref()?;
+        Some((borrow.target_root.clone(), store.clone()))
+    }
+
     /// Executed v3 lexical acquisitions, ordered as grep, glob, aft_search.
     pub fn lexical_view_route_counts(&self) -> [u64; 3] {
         std::array::from_fn(|index| self.lexical_routes[index].load(Ordering::Relaxed))
@@ -12706,6 +12844,32 @@ impl AppContext {
             max_file_size: config.search_index_max_file_size,
         };
         let family = self.memoized_artifact_cache_key(&root);
+        let own_view_bound = self
+            .callgraph_view
+            .lock()
+            .as_ref()
+            .is_some_and(|view| view.matches(&root, &storage, &family, policy));
+        if !own_view_bound {
+            if let Some(borrowed) =
+                self.borrowed_callgraph_view_reader(&root, &storage, &family, policy)
+            {
+                if pinned_config_for(self.config_pin_key()).is_some() {
+                    CALLGRAPH_QUERY_READERS.with(|readers| {
+                        readers
+                            .borrow_mut()
+                            .push((self.config_pin_key(), borrowed.clone()))
+                    });
+                }
+                match &borrowed {
+                    Ok(_) => self.note_view_load_success(),
+                    Err(error) if !error.busy => {
+                        self.note_view_load_failure("callgraph", &error.reason)
+                    }
+                    Err(_) => {}
+                }
+                return Some(borrowed);
+            }
+        }
         let view = {
             let mut slot = self.callgraph_view.lock();
             if !slot
@@ -14821,6 +14985,7 @@ impl AppContext {
         // generation.
         self.lexical_view.lock().take();
         self.callgraph_view.lock().take();
+        self.callgraph_borrow.lock().take();
         *self.lexical_load_retry.lock() = Default::default();
         *self.callgraph_construction_retry.lock() = Default::default();
         self.borrowed_index_cache.lock().clear();
