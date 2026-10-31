@@ -178,6 +178,27 @@ pub(crate) mod work_counts {
     static CANONICAL_PATHS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
     static REALPATHS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
     static WORKSPACE_DIRECTORIES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    static CORPUS_LOOKUPS: OnceLock<Mutex<HashMap<PathBuf, (usize, usize, u128)>>> =
+        OnceLock::new();
+
+    pub(super) fn note_corpus_lookup(path: &Path, realpaths: usize, elapsed_ns: u128) {
+        let mut counts = CORPUS_LOOKUPS.get_or_init(Default::default).lock().unwrap();
+        let entry = counts.entry(path.to_path_buf()).or_default();
+        entry.0 += 1;
+        entry.1 += realpaths;
+        entry.2 += elapsed_ns;
+    }
+
+    pub(super) fn corpus_lookups_under(root: &Path) -> Vec<(usize, usize, u128)> {
+        CORPUS_LOOKUPS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path.starts_with(root))
+            .map(|(_, counts)| *counts)
+            .collect()
+    }
 
     fn note(map: &OnceLock<Mutex<HashMap<PathBuf, usize>>>, path: &Path) {
         *map.get_or_init(Default::default)
@@ -307,6 +328,11 @@ pub(crate) mod work_counts {
     }
 
     pub(crate) fn reset_under(root: &Path) {
+        CORPUS_LOOKUPS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .retain(|path, _| !path.starts_with(root));
         for map in [
             &PARSES,
             &FINGERPRINT_READS,
@@ -24697,7 +24723,15 @@ impl CorpusSnapshot {
     fn file(&self, project_root: &Path, path: &Path) -> Result<Option<&CorpusFile>> {
         // Admission and lookups must share canonical absolute keys, even when
         // the root retains a symlink, a Windows short name or a verbatim prefix.
+        #[cfg(test)]
+        let (started, before) = (Instant::now(), CANONICALIZE_CALLS.with(|calls| calls.get()));
         let key = normalize_file_path(project_root, path)?;
+        #[cfg(test)]
+        work_counts::note_corpus_lookup(
+            &key,
+            CANONICALIZE_CALLS.with(|calls| calls.get()) - before,
+            started.elapsed().as_nanos(),
+        );
         Ok(self.files.get(&key))
     }
 
