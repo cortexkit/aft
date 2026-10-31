@@ -23,7 +23,11 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const LAYOUT_TAG: u32 = 2;
 pub const REGISTRY_APPLICATION_ID: i64 = 0x41465452;
 pub const PLANE_APPLICATION_ID: i64 = 0x41465450;
-pub const NAMESPACE_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
+/// Free bytes a v3 reservation must leave on the device, or 5% of its
+/// capacity when that is larger. v3 sets no byte budget per family: how many
+/// copies a repository keeps is a matter of count and age, and this floor is
+/// what keeps the device from filling.
+pub const MIN_FREE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Sweep epochs a symbol-plane row survives without being touched. Symbol
 /// rows are a reusable cache that no manifest names, so the plane-row sweep
 /// ages them out by epoch instead of by marking.
@@ -1081,7 +1085,7 @@ fn for_each_registry(
 }
 fn check_space(storage: &Path, request: u64, reserved: u64) -> Result<()> {
     let (free, capacity) = free_space(storage).ok_or(Error::Refused("device_free_space_floor"))?;
-    let floor = NAMESPACE_BUDGET.max(capacity / 20);
+    let floor = MIN_FREE_BYTES.max(capacity / 20);
     if free
         .checked_sub(request)
         .and_then(|bytes| bytes.checked_sub(reserved))
@@ -1182,7 +1186,7 @@ fn check_floor(storage: &Path, request: u64, own: Option<(&Path, &Connection)>) 
                 .ok_or(Error::Refused("device_free_space_floor"))?;
         }
     }
-    let floor = NAMESPACE_BUDGET.max(capacity / 20);
+    let floor = MIN_FREE_BYTES.max(capacity / 20);
     if free
         .checked_sub(request)
         .and_then(|v| v.checked_sub(reserved))
@@ -1513,9 +1517,6 @@ impl<'a> RegistryWriter<'a> {
             // The current barrier already borrows this owner's connection.
             // Use that borrow rather than re-entering its connection mutex.
             check_floor(&storage,request,Some((&path,tx)))?;
-            if accounting(tx)?.usage().checked_add(request).is_none_or(|n|n>NAMESPACE_BUDGET) {
-                return Err(Error::Refused("v3_namespace_budget"));
-            }
             #[cfg(test)]
             if request == 100 { tests::admission_hook(); }
             tx.execute("INSERT INTO reservations(owner_pid,owner_start,state,reserved_bytes,charge_bytes) VALUES(?1,?2,'reserved',?3,0)",params![std::process::id(),owner_start,request])?;
@@ -1528,9 +1529,8 @@ impl<'a> RegistryWriter<'a> {
         })
     }
     /// Grows a live reservation by `additional` bytes under the same
-    /// admission checks as [`Self::reserve`]: the device floor and the
-    /// namespace budget. An owner extends before it writes past its
-    /// reservation, never after.
+    /// admission check as [`Self::reserve`]: the device floor. An owner
+    /// extends before it writes past its reservation, never after.
     pub fn extend(&mut self, reservation: &Reservation, additional: u64) -> Result<()> {
         if reservation.registry != self.registry_identity()? {
             return Err(Error::ReservationRegistryMismatch);
@@ -1540,13 +1540,6 @@ impl<'a> RegistryWriter<'a> {
         let id = reservation.id;
         self.with_barrier(|tx| {
             check_floor(&storage, additional, Some((&path, tx)))?;
-            if accounting(tx)?
-                .usage()
-                .checked_add(additional)
-                .is_none_or(|n| n > NAMESPACE_BUDGET)
-            {
-                return Err(Error::Refused("v3_namespace_budget"));
-            }
             let updated = tx.execute(
                 "UPDATE reservations SET reserved_bytes=reserved_bytes+?1 WHERE id=?2 AND state='reserved'",
                 params![additional, id],
