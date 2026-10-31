@@ -1598,7 +1598,10 @@ enum ManagementAdmission {
     FirstParty,
     FlowOnly,
     /// Tool-provider metadata without a project root; grants no management authority.
-    ProjectFree,
+    ProjectFree {
+        workdir: Option<String>,
+        legacy_root: Option<PathBuf>,
+    },
 }
 
 impl RouteIdentity {
@@ -6017,8 +6020,8 @@ where
                         // before any store, provider, or general tool dispatch.
                         // Tool routes retain their separate call-mode contract.
                         if let Some(identity) = management_routes.get(&route) {
-                            if identity.admission == ManagementAdmission::ProjectFree {
-                                if let Err(error) = handle_project_free_request(&writer_tx, &decoded.frame, &dispatch_path_metrics).await {
+                            if let ManagementAdmission::ProjectFree { workdir, legacy_root } = &identity.admission {
+                                if let Err(error) = handle_project_free_request(&writer_tx, &decoded.frame, &dispatch_path_metrics, workdir.as_deref(), legacy_root.as_deref()).await {
                                     break Err(error);
                                 }
                                 continue;
@@ -8090,8 +8093,49 @@ fn resolve_route_project_root(
 }
 
 const PROJECT_REQUIRED: &str =
-    "AFT cannot serve project tools because this route has no absolute project folder other than /.";
+    "This connection has no project folder, so AFT cannot run project tools on it.";
 const PROJECT_REQUIRED_CODE: &str = "project_required";
+
+fn project_folder_refusal(
+    code: &str,
+    workdir: Option<&str>,
+    legacy_root: Option<&Path>,
+    route: RouteChannel,
+    corr: u64,
+) -> ErrorBody {
+    let (source, folder) = match workdir {
+        Some(workdir) => ("scope_workdir", Some(workdir.to_owned())),
+        None => (
+            if legacy_root.is_some() {
+                "legacy_bind"
+            } else {
+                "none"
+            },
+            legacy_root.map(|root| root.to_string_lossy().into_owned()),
+        ),
+    };
+    let cause = if code == "invalid_workdir" {
+        "invalid_workdir"
+    } else if folder.is_some() {
+        "filesystem_root"
+    } else {
+        "project_folder_missing"
+    };
+    let detail = json!({
+        "cause": cause,
+        "source": source,
+        "folder": folder,
+        "requirement": "absolute_non_root_project_directory",
+    });
+    crate::slog_warn!(
+        "subc project folder refused: code={} route={} corr={} detail={}",
+        code,
+        route,
+        corr,
+        detail,
+    );
+    ErrorBody::new(code, PROJECT_REQUIRED).with_detail(detail)
+}
 
 fn legacy_route_project_root(frame: &Frame) -> Option<PathBuf> {
     serde_json::from_slice::<Value>(&frame.body)
@@ -8426,9 +8470,15 @@ async fn handle_control_request(
             let bind_project_root = if matches!(target, RouteTarget::ToolProvider { .. }) {
                 match resolve_route_project_root(legacy_root.as_deref(), scope.as_ref()) {
                     Ok(root) => root,
-                    Err(reason) => {
-                        return send_route_bind_error(tx, frame, "invalid_workdir", reason, metrics)
-                            .await
+                    Err(_) => {
+                        let refusal = project_folder_refusal(
+                            "invalid_workdir",
+                            scope.as_ref().and_then(|stamp| stamp.workdir.as_deref()),
+                            legacy_root.as_deref(),
+                            route_id,
+                            frame.header.corr,
+                        );
+                        return send_route_bind_error_body(tx, frame, &refusal, metrics).await;
                     }
                 }
             } else {
@@ -8470,7 +8520,10 @@ async fn handle_control_request(
                     .await;
                 }
                 let admission = if project_free {
-                    ManagementAdmission::ProjectFree
+                    ManagementAdmission::ProjectFree {
+                        workdir: scope.as_ref().and_then(|stamp| stamp.workdir.clone()),
+                        legacy_root: legacy_root.clone(),
+                    }
                 } else if scope
                     .as_ref()
                     .is_some_and(diagnostics_findings::is_flow_scope)
@@ -8987,6 +9040,8 @@ async fn handle_project_free_request(
     tx: &WriterSender,
     frame: &Frame,
     metrics: &DispatchPathMetrics,
+    workdir: Option<&str>,
+    legacy_root: Option<&Path>,
 ) -> Result<(), SubcError> {
     let mut body = serde_json::from_slice::<Value>(&frame.body).unwrap_or(Value::Null);
     let operation = body
@@ -9015,7 +9070,13 @@ async fn handle_project_free_request(
                 )
             })
         }
-        _ => Err(ErrorBody::new(PROJECT_REQUIRED_CODE, PROJECT_REQUIRED)),
+        _ => Err(project_folder_refusal(
+            PROJECT_REQUIRED_CODE,
+            workdir,
+            legacy_root,
+            route_key(frame.header.channel, frame.header.epoch),
+            frame.header.corr,
+        )),
     };
     match result {
         Err(error) => send_provider_error(tx, metrics, frame, error).await,

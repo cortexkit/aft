@@ -579,6 +579,13 @@ async fn legacy_root_case(no_project: bool, scoped_without_workdir: bool) {
         if no_project {
             assert_eq!(reply.header.ty, FrameType::Error, "{body}");
             assert_eq!(body["code"], "project_required");
+            assert_eq!(
+                body["message"].as_str().unwrap().as_bytes(),
+                b"This connection has no project folder, so AFT cannot run project tools on it."
+            );
+            assert_eq!(body["detail"]["cause"], "filesystem_root");
+            assert_eq!(body["detail"]["source"], "legacy_bind");
+            assert_eq!(body["detail"]["folder"], "/");
         } else {
             assert_eq!(reply.header.ty, FrameType::Response, "{body}");
             assert_ne!(body["isError"], true, "{body}");

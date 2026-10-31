@@ -783,3 +783,74 @@ fn scope_workdir_alias_of_slash_is_not_a_project() {
         None
     );
 }
+
+#[test]
+fn scope_workdir_project_required_sentence_and_detail_are_pinned() {
+    let _serial = serial();
+    let (errors, lines) = crate::logging::capture_log_lines(|| {
+        vec![
+            project_folder_refusal(PROJECT_REQUIRED_CODE, None, None, route_key(7, 1), 20),
+            project_folder_refusal(
+                PROJECT_REQUIRED_CODE,
+                None,
+                Some(Path::new("/")),
+                route_key(7, 1),
+                21,
+            ),
+            project_folder_refusal(
+                "invalid_workdir",
+                Some("."),
+                Some(Path::new("/ignored")),
+                route_key(7, 1),
+                22,
+            ),
+        ]
+    });
+    for error in &errors {
+        assert_eq!(
+            error.message.as_bytes(),
+            b"This connection has no project folder, so AFT cannot run project tools on it."
+        );
+        assert_eq!(
+            error.detail.as_ref().unwrap()["requirement"],
+            "absolute_non_root_project_directory"
+        );
+    }
+    assert_eq!(errors[0].code, "project_required");
+    assert_eq!(
+        errors[0].detail.as_ref().unwrap()["cause"],
+        "project_folder_missing"
+    );
+    assert_eq!(errors[0].detail.as_ref().unwrap()["source"], "none");
+    assert!(errors[0].detail.as_ref().unwrap()["folder"].is_null());
+    assert_eq!(errors[1].code, "project_required");
+    assert_eq!(
+        errors[1].detail.as_ref().unwrap()["cause"],
+        "filesystem_root"
+    );
+    assert_eq!(errors[1].detail.as_ref().unwrap()["source"], "legacy_bind");
+    assert_eq!(errors[1].detail.as_ref().unwrap()["folder"], "/");
+    assert_eq!(errors[2].code, "invalid_workdir");
+    assert_eq!(
+        errors[2].detail.as_ref().unwrap()["cause"],
+        "invalid_workdir"
+    );
+    assert_eq!(
+        errors[2].detail.as_ref().unwrap()["source"],
+        "scope_workdir"
+    );
+    assert_eq!(errors[2].detail.as_ref().unwrap()["folder"], ".");
+    let warnings: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("subc project folder refused:"))
+        .collect();
+    assert_eq!(warnings.len(), 3, "{lines:?}");
+    for (line, cause) in warnings.iter().zip([
+        "project_folder_missing",
+        "filesystem_root",
+        "invalid_workdir",
+    ]) {
+        assert!(line.starts_with("WARN "), "{line}");
+        assert!(line.contains("detail=") && line.contains(cause), "{line}");
+    }
+}

@@ -1722,6 +1722,9 @@ fn scope_project_case_034(
             assert_eq!(ack.header.ty, FrameType::Error, "{}", frame_body(&ack));
             let error: Value = serde_json::from_slice(&ack.body).unwrap();
             assert_eq!(error["code"], code);
+            assert_eq!(error["message"].as_str().unwrap().as_bytes(), b"This connection has no project folder, so AFT cannot run project tools on it.");
+            assert_eq!(error["detail"]["cause"], "invalid_workdir");
+            assert_eq!(error["detail"]["source"], "scope_workdir");
         } else {
             assert_eq!(ack.header.ty, FrameType::Response, "{}", frame_body(&ack));
             for (corr, body) in [
@@ -1735,7 +1738,9 @@ fn scope_project_case_034(
                     assert_eq!(reply.header.ty, FrameType::Error);
                     let error: Value = serde_json::from_slice(&reply.body).unwrap();
                     assert_eq!(error["code"], "project_required");
-                    assert!(error["message"].as_str().unwrap().contains("project folder"));
+                    assert_eq!(error["message"].as_str().unwrap().as_bytes(), b"This connection has no project folder, so AFT cannot run project tools on it.");
+                    assert_eq!(error["detail"]["requirement"], "absolute_non_root_project_directory");
+                    assert!(error["detail"]["cause"].is_string());
                 } else {
                     assert_eq!(reply.header.ty, FrameType::Response, "{}", frame_body(&reply));
                     assert!(!tool_result_is_error(&reply), "{}", frame_body(&reply));
