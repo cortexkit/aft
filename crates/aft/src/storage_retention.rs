@@ -2915,6 +2915,9 @@ fn verify_retirement_proof(
         Ok(_) => verify_retirement_witness(storage, directory, nonce, budget),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             verify_unwitnessed_cache_retirement(directory, budget).map_err(|error| {
+                if crate::bash_background::persistence::is_repair_budget_stop(&error) {
+                    return error;
+                }
                 io::Error::new(
                     error.kind(),
                     format!(
@@ -3430,7 +3433,6 @@ fn reap_trash_with_cursor(
             break;
         }
         let entry = entries.next().unwrap();
-        cursor.as_mut().unwrap().omitted_prefix = true;
         report.entries += 1;
         let path = entry.path();
         let age = entry
@@ -3478,6 +3480,7 @@ fn reap_trash_with_cursor(
                     .entry(cached.reason.clone())
                     .or_default() += 1;
                 scan.retained.insert(path, cached);
+                scan.omitted_prefix = true;
                 pending = true;
                 retained = true;
                 continue;
@@ -3618,7 +3621,9 @@ fn reap_trash_with_cursor(
         })();
         if let Err((reason, error)) = result {
             if report.protection_failure.is_none() && report.protections.is_none() {
-                if let Err(stop) = budget.enter(0) {
+                if crate::bash_background::persistence::is_repair_budget_stop(&error) {
+                    report.protection_failure = Some(ProtectionFailure::from_error(&error));
+                } else if let Err(stop) = budget.enter(0) {
                     report.protection_failure = Some(ProtectionFailure::from_error(&stop));
                 }
             }
@@ -3666,6 +3671,7 @@ fn reap_trash_with_cursor(
             report.entries -= 1;
             report.removed_entries += 1;
         }
+        cursor.as_mut().unwrap().omitted_prefix = true;
     }
     // A stopped unlink/measurement lane must retry its prefetched tail before
     // advancing the directory iterator in a later pass.
@@ -6319,6 +6325,7 @@ mod storage_retention_tests {
     #[test]
     fn retention_trash_unchanged_refusal_is_not_walked_or_warned_again() {
         let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("retention")).unwrap();
         let entry = temp
             .path()
             .join("symbols/.retention-trash/retired-00000000000000000000000000000001");
@@ -6390,6 +6397,7 @@ mod storage_retention_tests {
             ],
         ] {
             let temp = tempfile::tempdir().unwrap();
+            fs::create_dir(temp.path().join("retention")).unwrap();
             let entry = temp
                 .path()
                 .join("symbols/.retention-trash/retired-00000000000000000000000000000001");
@@ -12629,6 +12637,10 @@ mod storage_retention_tests {
         let temp = tempfile::tempdir().unwrap();
         let key = "0123456789abcdef";
         let view = cache(temp.path(), "views", key);
+        // Only an eligible orphan needs a recursive walk. Establish and age its
+        // observation before exercising the walk's independent real deadline.
+        run_pass_entry_bound(temp.path());
+        age_orphan(temp.path(), &view, key);
         let clock = Instant::now();
         let delay = observe_test_hook(
             &view,
@@ -12653,6 +12665,11 @@ mod storage_retention_tests {
         assert!(stopped.errors[0].contains("retention deadline reached"));
         assert!(view.exists());
 
+        atomic_json(
+            &temp.path().join(format!("retention/unknown/{key}.json")),
+            &crate::pins::now_ms(),
+        )
+        .unwrap();
         let observed = run_pass_entry_bound(temp.path());
         assert_eq!(observed.orphan_views.skipped_recent, 1, "{observed:?}");
         age_orphan(temp.path(), &view, key);
