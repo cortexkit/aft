@@ -1760,6 +1760,8 @@ mod dead_code_projection;
 mod dispatch_narrowing_tests;
 #[cfg(test)]
 mod incremental_parity;
+#[cfg(test)]
+mod manifest_refresh_tests;
 
 #[cfg(test)]
 pub(crate) mod perf_tests;
@@ -5773,6 +5775,8 @@ mod rust_module_work {
 
     #[derive(Debug, Default)]
     pub(super) struct Work {
+        pub resolved_refs: usize,
+        pub resolved_files: BTreeSet<String>,
         pub parent_lookups: usize,
         pub parent_scans: usize,
         pub parent_file_visits: usize,
@@ -16811,6 +16815,11 @@ fn surface_fingerprint(
 }
 
 fn resolve_ref<I: ResolverIndex>(raw: RawRef, index: &I) -> Result<ResolvedRef> {
+    #[cfg(test)]
+    rust_module_work::note(|work| {
+        work.resolved_refs += 1;
+        work.resolved_files.insert(raw.caller_file.clone());
+    });
     if raw.kind == "import" && index.lang_for(&raw.caller_file) == Some(LangId::Go) {
         let files = raw
             .module_path
