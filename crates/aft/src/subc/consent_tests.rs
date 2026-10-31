@@ -102,6 +102,9 @@ mod program_approvals {
         data.call_mode = subc_protocol::call_mode::CallMode::Codemode;
         data.held_reply = true;
         data.tool_result_body = true;
+        if let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut data.spawn_principal {
+            *principal_id = Some("reserved:basal".into());
+        }
         data.run_scope
             .set(run_scope::RunScope::for_test(None))
             .unwrap();
