@@ -411,6 +411,7 @@ fn gc_until_lap(registry: &BgTaskRegistry, storage: &Path, laps: u64) {
     panic!("the sweep never completed lap {laps}");
 }
 
+#[cfg(unix)]
 fn measured_gc_lap(registry: &BgTaskRegistry, storage: &Path, label: &str) -> (usize, usize) {
     let next_lap = gc_health(storage).laps_completed + 1;
     let mut passes = Vec::new();
