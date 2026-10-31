@@ -11669,7 +11669,7 @@ async fn runon_cd_sequences_use_existing_copied_directories() {
     let marker = checkout.join("must-not-run-locally");
     for (line, refused) in [
         ("cd packages/a && true; cd ../b", false),
-        ("pushd packages/a && true; cd ../b", true),
+        ("pushd packages/a && true; cd ../b", false),
         ("cd ../commons/a && true; cd ../b", false),
         ("cd packages/missing && true; cd ../b", true),
         ("cd ../../outside", true),

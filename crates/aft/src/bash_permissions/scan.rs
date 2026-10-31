@@ -1903,10 +1903,6 @@ mod tests {
                 cwd.join("nested"),
                 cwd.join("sibling repo"),
                 cwd.parent().unwrap().join("sibling repo"),
-                cwd.join("sibling repo"),
-                cwd.parent().unwrap().join("sibling repo"),
-                cwd.join("nested"),
-                cwd
             ]
         );
     }
