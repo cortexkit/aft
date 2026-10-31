@@ -9575,7 +9575,7 @@ mod tests {
         for (body, expected, parses) in [
             ("int plain(void);", LangId::C, 1),
             (
-                "namespace api { class Widget { public: void run(); }; }",
+                "namespace api { template <typename T> class Widget { public: T run(T value) { return value; } }; }",
                 LangId::Cpp,
                 2,
             ),
@@ -9584,7 +9584,7 @@ mod tests {
                 LangId::ObjC,
                 3,
             ),
-            ("namespace api { class Broken {", LangId::C, 3),
+            ("int broken( {", LangId::C, 3),
         ] {
             let source = format!("// {}\n{body}\n", path.display());
             std::fs::write(&path, &source).unwrap();
@@ -9649,6 +9649,17 @@ mod tests {
             parse_resolved_source(Path::new("missing.h"), source, LangId::C).unwrap();
         assert_eq!(lang, LangId::C);
         assert_eq!(tree.root_node().to_sexp(), old_c.root_node().to_sexp());
+    }
+
+    #[test]
+    fn h_header_clean_c_tree_wins_for_ambiguous_declarations() {
+        let source = "class Widget { public: void run(); };\n";
+        let c_tree = parse_source_with_parser(Path::new("ambiguous.c"), source, LangId::C).unwrap();
+        assert!(!c_tree.root_node().has_error());
+        let (tree, language) =
+            parse_resolved_source(Path::new("ambiguous.h"), source, LangId::C).unwrap();
+        assert_eq!(language, LangId::C);
+        assert_eq!(tree.root_node().to_sexp(), c_tree.root_node().to_sexp());
     }
 
     #[test]

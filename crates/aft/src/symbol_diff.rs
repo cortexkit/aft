@@ -677,7 +677,7 @@ mod tests {
     #[test]
     fn h_header_revision_symbols_use_each_blob_language() {
         let old = b"int old_c_function(void);\n";
-        let new = b"class Widget { public: void run(); };\n";
+        let new = b"template <typename T> class Widget { public: T run(T value); };\n";
         let diff = super::symbol_diff_file(
             crate::parser::LangId::C,
             std::path::Path::new("widget.h"),

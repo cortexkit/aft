@@ -3027,8 +3027,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("widget.h");
         std::fs::write(&path, "int old_c_function(void);\n").unwrap();
-        let (tree, language) =
-            super::zoom_parse_source(&path, "class Widget { public: void run(); };\n").unwrap();
+        let (tree, language) = super::zoom_parse_source(
+            &path,
+            "template <typename T> class Widget { public: T run(T value); };\n",
+        )
+        .unwrap();
         assert_eq!(language, crate::parser::LangId::Cpp);
         assert!(!tree.root_node().has_error());
     }

@@ -11521,7 +11521,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = Path::new("widget.h");
         fs::write(root.path().join(path), "int old_c_symbol(void);\n").unwrap();
-        let source = b"namespace api { class Widget { public: int value() { return 42; } }; }\n";
+        let source =
+            b"namespace api {\nclass Widget {\npublic:\n    int value() { return 42; }\n};\n}\n";
         let chunks = chunk_view_file_uncached(root.path(), path, source, EmbedTextCaps::default())
             .unwrap()
             .unwrap();
