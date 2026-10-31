@@ -603,15 +603,29 @@ mod tests {
         fixture.bind(&root, 1, false, "direct", now);
         fixture.bind(&root, 2, false, "direct", now);
         let metrics = DispatchPathMetrics::new();
-        let value = fixture.snapshot(&executor, &metrics, now).render(&executor);
+        // Registering the actor wakes the executor scheduler. The census try-locks
+        // that scheduler before reading the task registry, so even this process-free
+        // fixture can briefly report unknown pins. Retry only unknown snapshots;
+        // the running task and watch remain registered for the exact counts below.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let value = loop {
+            let value = fixture.snapshot(&executor, &metrics, now).render(&executor);
+            let rendered = value.to_string();
+            assert!(!rendered.contains("secret pattern"));
+            assert!(!rendered.contains("fake running command"));
+            assert!(!rendered.contains("private task output"));
+            if !value["roots"][0]["routes"][0]["pins"]["running_bash"].is_null()
+                || Instant::now() >= deadline
+            {
+                break value;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
         for route in value["roots"][0]["routes"].as_array().unwrap() {
             assert_eq!(route["pins"]["running_bash"], 1);
             assert_eq!(route["pins"]["active_watch"], 1);
             assert_eq!(route["last_background_work_age_ms"], 0);
         }
-        assert!(!value.to_string().contains("secret pattern"));
-        assert!(!value.to_string().contains("fake running command"));
-        assert!(!value.to_string().contains("private task output"));
         let guard = task.state.lock().unwrap();
         let busy = fixture.snapshot(&executor, &metrics, now).render(&executor);
         assert!(busy["roots"][0]["routes"][0]["pins"]["running_bash"].is_null());
