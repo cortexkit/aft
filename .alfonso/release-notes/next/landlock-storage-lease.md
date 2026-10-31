@@ -1,0 +1,1 @@
+- AFT starts again inside Linux sandboxes, such as nono, that allow its storage folder but deny reading `/`. 0.63.4 failed there with "cannot acquire storage lease … Permission denied" (#1245).
