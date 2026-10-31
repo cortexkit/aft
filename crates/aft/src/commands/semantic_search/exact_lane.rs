@@ -667,12 +667,16 @@ struct PreparedExactSymbol {
     member_declaration: bool,
 }
 
-struct PreparedExactText {
+pub(super) struct PreparedExactText {
     normalized: String,
     symbols: Vec<PreparedExactSymbol>,
 }
 
 impl PreparedExactText {
+    pub(super) fn normalized(&self) -> &str {
+        &self.normalized
+    }
+
     fn new(text: &str) -> Self {
         let symbols = scan_symbols_in_text(text)
             .into_iter()
@@ -817,10 +821,7 @@ pub(crate) fn verify_cached_exact_matches_in_text_with_member(
     content_tokens: &[String],
     member: Option<&str>,
 ) -> Option<Vec<CandidateResult>> {
-    static CACHE: OnceLock<PreparedExactCache> = OnceLock::new();
-    let prepared = CACHE
-        .get_or_init(|| PreparedExactCache::new(32 * 1024 * 1024))
-        .prepare(digest, text);
+    let prepared = prepare_exact_text(text, digest);
     verify_prepared_exact_matches(
         file_path,
         text,
@@ -829,6 +830,17 @@ pub(crate) fn verify_cached_exact_matches_in_text_with_member(
         content_tokens,
         member,
     )
+}
+
+/// Lexical verification and the exact lane normalize the same freshly read
+/// bytes. Share their existing bounded preparation, not their phrase, window or
+/// definition match decisions. Keep both disk reads so intervening edits remain
+/// visible to the lane that reads the changed bytes.
+pub(super) fn prepare_exact_text(text: &str, digest: blake3::Hash) -> Arc<PreparedExactText> {
+    static CACHE: OnceLock<PreparedExactCache> = OnceLock::new();
+    CACHE
+        .get_or_init(|| PreparedExactCache::new(32 * 1024 * 1024))
+        .prepare(digest, text)
 }
 
 fn verify_prepared_exact_matches(

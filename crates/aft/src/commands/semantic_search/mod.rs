@@ -3712,7 +3712,8 @@ fn lexical_candidate_exactness(
     };
     let text = String::from_utf8_lossy(&bytes);
     let normalize_cost = telemetry::CostPhase::start("lexical_normalize");
-    let normalized_text = normalize_exact_phrase(&text);
+    let prepared = exact_lane::prepare_exact_text(&text, blake3::hash(&bytes));
+    let normalized_text = prepared.normalized();
     drop(normalize_cost);
     let normalized_phrase = normalize_exact_phrase(exact_phrase(query));
     let phrase_count = if normalized_phrase.is_empty() {
@@ -13968,6 +13969,59 @@ mod tests {
 
         assert_eq!(matched.0, 1);
         assert_eq!(matched.1, "export function resolveTransformMode() {}");
+    }
+
+    #[test]
+    fn lexical_exactness_reuses_exact_preparation_and_reads_edits() {
+        use crate::search_hot_path_measurements::{counts, reset};
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("shared_normalization.rs");
+        let bytes = b"// shared lexical normalization fixture\r\npub fn cache_sharing() {\r\n    let marker = \"CacheSharingMarker\";\r\n}\r\n// invalid utf8: \xff\n";
+        fs::write(&path, bytes).unwrap();
+        let query = "CacheSharingMarker";
+        let tokens = exact_lane::exact_verification_tokens(query);
+        reset();
+        assert_eq!(
+            lexical_candidate_exactness(&path, query, &tokens),
+            (true, 1, Some(1))
+        );
+        assert_eq!(counts().exact_preparations, 1);
+        let exact = exact_lane::verify_cached_exact_matches_in_text_with_member(
+            &path,
+            &String::from_utf8_lossy(bytes),
+            blake3::hash(bytes),
+            &normalize_exact_phrase(query),
+            &tokens,
+            None,
+        );
+        assert!(exact.is_some());
+        assert_eq!(
+            counts().exact_preparations,
+            1,
+            "exact verification must reuse lexical preparation"
+        );
+
+        let edited = String::from_utf8_lossy(bytes).replace(query, "DifferentMarker");
+        fs::write(&path, &edited).unwrap();
+        assert_eq!(
+            lexical_candidate_exactness(&path, query, &tokens),
+            (false, 0, None)
+        );
+        assert_eq!(
+            counts().exact_preparations,
+            2,
+            "a content edit must prepare new bytes"
+        );
+        assert!(exact_lane::verify_cached_exact_matches_in_text_with_member(
+            &path,
+            &edited,
+            blake3::hash(edited.as_bytes()),
+            &normalize_exact_phrase(query),
+            &tokens,
+            None,
+        )
+        .is_none());
+        assert_eq!(counts().exact_preparations, 2);
     }
 
     fn reference_best_content_line<'a>(
