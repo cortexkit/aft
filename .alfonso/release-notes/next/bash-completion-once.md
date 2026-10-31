@@ -1,0 +1,1 @@
+- AFT releases deleted worktrees after background commands finish, without repeatedly processing their completed tasks.

@@ -142,6 +142,30 @@ fn deleted_root_delivered_completions_settle_once_after_descendants_exit() {
 }
 
 #[test]
+fn deleted_root_reused_group_is_not_signaled_and_does_not_block_reclaim() {
+    let mut fixture = ReclaimFixture::new();
+    let registry = fixture.ctx.bash_background().clone();
+    let mut group = OwnedGroup::spawn();
+    let id = "bash-0000000000000093";
+    fixture.task(
+        id,
+        fixture.root.as_path(),
+        BgTaskStatus::Completed,
+        Some(group.0.id()),
+    );
+    deliver_terminal_and_remove_output(&registry, id);
+    // Keep the group number but make every saved start time differ from the
+    // live process, modeling a group number reused by an unrelated command.
+    disown_group_identities(&registry, id);
+    assert_eq!(fixture.sweep().evicted, 0);
+    fixture.wait_for_kill();
+    let outcome = fixture.sweep();
+    fixture.assert_reclaimed(outcome);
+    assert!(group.0.try_wait().unwrap().is_none());
+    assert_eq!(completion_attempts(&registry), 1);
+}
+
+#[test]
 fn deleted_root_terminal_survivor_is_killed_and_reclaimed_in_two_sweeps() {
     assert_terminal_survivor_reclaimed(false);
 }

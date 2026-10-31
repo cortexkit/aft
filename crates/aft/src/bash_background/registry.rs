@@ -1923,6 +1923,10 @@ pub(crate) struct BgTaskState {
     /// clear (see `finish_terminal_transition`) instead of sending a notice
     /// built before any check.
     pub(crate) descendant_sample_pending: bool,
+    /// Reclamation found no saved process identity still in the terminal
+    /// task's group. A stale descendant list, or a reused group number, must
+    /// not retain the deleted root. Rechecked after a registry restart.
+    root_reclaim_group_unowned: bool,
     /// True while a kill has released this lock to signal and reap the
     /// process group. That kill owns the terminal transition until it clears
     /// the flag: the watchdog must not declare the task dead without an exit
@@ -5462,6 +5466,7 @@ impl BgTaskRegistry {
                 child_exit_observed: false,
                 descendant_sampling_started: false,
                 descendant_sample_pending: false,
+                root_reclaim_group_unowned: false,
                 kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, BgMode::Pipes),
                 terminal_output_cache: None,
@@ -5911,6 +5916,7 @@ impl BgTaskRegistry {
                 child_exit_observed: false,
                 descendant_sampling_started: false,
                 descendant_sample_pending: false,
+                root_reclaim_group_unowned: false,
                 kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, BgMode::Pty),
                 terminal_output_cache: None,
@@ -6278,6 +6284,7 @@ impl BgTaskRegistry {
                 child_exit_observed: false,
                 descendant_sampling_started: false,
                 descendant_sample_pending: false,
+                root_reclaim_group_unowned: false,
                 kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, BgMode::Pipes),
                 terminal_output_cache: None,
@@ -10167,14 +10174,24 @@ impl BgTaskRegistry {
                 reclaim_root_paths_match(&task.project_root, &canonical_root, cfg!(windows))
             })
             .filter_map(|task| {
-                let sample_missing = {
+                let terminal_group = {
                     let state = task.lock_state().ok()?;
-                    state.metadata.status.is_terminal()
-                        && state.metadata.pgid.is_some()
-                        && state.metadata.live_descendants.is_none()
+                    (cfg!(unix)
+                        && state.metadata.status.is_terminal()
+                        && state.metadata.pgid.is_some())
+                    .then(|| state.metadata.clone())
                 };
-                if sample_missing {
-                    self.sample_task_process_group(&task);
+                if let Some(metadata) = terminal_group {
+                    // Completion-time samples can outlive the processes they
+                    // describe. Check saved identities before resampling: a
+                    // reused group number must not authorize killing its new
+                    // occupants or keep this deleted root alive.
+                    let pgid = metadata.pgid.expect("terminal group has a pgid");
+                    if finished_group_is_still_the_tasks(&metadata, pgid) {
+                        self.sample_task_process_group(&task);
+                    } else {
+                        task.lock_state().ok()?.root_reclaim_group_unowned = true;
+                    }
                 }
                 let needs_reclaim = {
                     let state = task.lock_state().ok()?;
@@ -12685,7 +12702,8 @@ impl BgTaskRegistry {
     /// `metadata.live_descendants` and `live_descendants_omitted` still do. A
     /// terminal group with no sample also waits for the kill worker to sample
     /// it; terminal status can be visible before descendant sampling finishes.
-    /// The kill path refreshes those samples after signaling. A cached routing
+    /// The kill worker checks saved process identities before refreshing those
+    /// samples, releasing groups no longer owned by the task. A cached routing
     /// identity avoids filesystem calls or process enumeration on the frame loop.
     pub(crate) fn try_has_reclaimable_tasks_for_root(
         &self,
@@ -12777,6 +12795,8 @@ impl BgTaskRegistry {
         }
         let mode = metadata.mode.clone();
         let recovered_terminal = metadata.status.is_terminal().then(|| metadata.clone());
+        let terminal_already_delivered =
+            metadata.status.is_terminal() && metadata.completion_delivered;
         #[cfg(test)]
         wait_on_rehydrated_registration_gate_for_test(&task_id);
         let mut task = BgTask {
@@ -12804,7 +12824,7 @@ impl BgTaskRegistry {
             persisted_hard_kill_ms: AtomicU64::new(persisted_hard_kill_ms),
             last_reminder_at: Mutex::new(suppress_replayed_running_reminder.then(Instant::now)),
             terminal_at: Mutex::new(metadata.finished_at.map(started_instant_from_unix_millis)),
-            terminal_notification_routed: Mutex::new(false),
+            terminal_notification_routed: Mutex::new(terminal_already_delivered),
             notice_registry: Mutex::new(None),
             exit_marker_probe: Mutex::new(Default::default()),
             #[cfg(unix)]
@@ -12843,6 +12863,7 @@ impl BgTaskRegistry {
                 child_exit_observed: false,
                 descendant_sampling_started: false,
                 descendant_sample_pending: false,
+                root_reclaim_group_unowned: false,
                 kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, mode.clone()),
                 terminal_output_cache: None,
@@ -13986,16 +14007,6 @@ impl BgTaskRegistry {
         terminal_render: Option<&TerminalOutputCache>,
         token_policy: CompletionTokenPolicy,
     ) {
-        // Only the terminal-state guard prevents double-recording here. The
-        // `completion_delivered` flag is NOT used to gate compression-event
-        // recording, because `mark_terminal` flips `completion_delivered=true`
-        // immediately for tasks with `notify_on_completion=false` (foreground
-        // bash polled via `bash_status`, which is the common case). Pre-emptive
-        // delivery flagging is correct for the push-frame queue (suppresses
-        // duplicate user-visible notifications) but would silently skip the
-        // database insert below. Compression event recording is idempotent at
-        // the DB layer (unique on harness+session+task_id), so re-entry is
-        // safe; the dedupe-by-queue check stays for the push frame side.
         if !metadata.status.is_terminal() {
             return;
         }
@@ -14018,10 +14029,14 @@ impl BgTaskRegistry {
             NoticeTarget::Nowhere => return,
         }
 
-        #[cfg(test)]
-        self.inner
-            .completion_processing_attempts
-            .fetch_add(1, Ordering::SeqCst);
+        let owner = self.task(&metadata.task_id);
+        if owner.as_ref().is_some_and(|task| {
+            task.terminal_notification_routed
+                .lock()
+                .is_ok_and(|routed| *routed)
+        }) {
+            return;
+        }
 
         let owned_buffer = if buffer.is_none() && metadata.mode != BgMode::Pty {
             paths.map(|paths| BgBuffer::registered(paths, BgMode::Pipes))
@@ -14090,6 +14105,23 @@ impl BgTaskRegistry {
                     saved.bash_output_list_envelope,
                 )
             };
+        // Rendering may call an external compressor, so do not hold the
+        // publication mutex across it. Recheck afterwards: a concurrent kill
+        // can publish while the original completion is being rendered.
+        let mut routed = owner
+            .as_ref()
+            .and_then(|task| task.terminal_notification_routed.lock().ok());
+        if let Some(routed) = routed.as_mut() {
+            if **routed {
+                return;
+            }
+            **routed = true;
+        }
+        #[cfg(test)]
+        self.inner
+            .completion_processing_attempts
+            .fetch_add(1, Ordering::SeqCst);
+
         let token_counts = self.completion_token_counts(
             metadata,
             buffer,
@@ -14118,31 +14150,12 @@ impl BgTaskRegistry {
             live_descendants_summary: live_descendants_summary(metadata),
         };
 
-        // Record the compression event BEFORE the push-frame dedupe. Event
-        // recording has its own idempotency at the DB layer (unique key on
-        // harness+session+task_id), so it's safe to attempt for every
-        // terminal-state finalize. Critically, this path runs even when
-        // `completion_delivered=true` was pre-set by `mark_terminal` for
-        // foreground bash (`notify_on_completion=false`) — which is the common
-        // case for OpenCode/Pi `bash` tool calls. Previously this code lived
-        // after the dedupe guard and never fired for foreground tasks, which
-        // meant compression accounting was effectively dead for >99% of
-        // real-world bash usage.
+        // Account once per registered task, including foreground tasks whose
+        // delivery flag is preset to suppress notices. Queue delivery/acks and
+        // restart replay are separate from this in-process publication fence;
+        // the database also deduplicates compression events across restarts.
         self.record_compression_event_if_applicable(metadata, &token_counts);
 
-        // Kill can finish a transition whose original publisher is still doing
-        // unlocked work. Route once under a separate mutex: queue dedupe alone
-        // cannot protect watches after their in-memory control flags are cleared.
-        let owner = self.task(&metadata.task_id);
-        let mut routed = owner
-            .as_ref()
-            .and_then(|task| task.terminal_notification_routed.lock().ok());
-        if let Some(routed) = routed.as_mut() {
-            if **routed {
-                return;
-            }
-            **routed = true;
-        }
         // A session ack can arrive through another root actor. Reconcile with
         // the shared rows before task-local watch flags decide terminal routing.
         self.sync_memory_watches_from_persistence(&metadata.task_id);
@@ -14227,10 +14240,17 @@ impl BgTaskRegistry {
                 compressed_bytes,
             ),
             _ => {
-                crate::slog_warn!(
-                    "compression event skipped for {}: token counts unavailable (likely spill file missing or unreadable)",
-                    metadata.task_id
-                );
+                if token_counts.intentionally_skipped {
+                    crate::slog_debug!(
+                        "compression event skipped for {}: token counting disabled for cancellation or reclamation",
+                        metadata.task_id
+                    );
+                } else {
+                    crate::slog_warn!(
+                        "compression event skipped for {}: token counts unavailable (likely spill file missing or unreadable)",
+                        metadata.task_id
+                    );
+                }
                 return;
             }
         };
@@ -14551,7 +14571,10 @@ impl BgTaskRegistry {
                 BgTaskStatus::Killed | BgTaskStatus::TimedOut
             )
         {
-            return CompletionTokenCounts::skipped();
+            return CompletionTokenCounts {
+                intentionally_skipped: true,
+                ..CompletionTokenCounts::skipped()
+            };
         }
 
         let raw = match buffer {
@@ -15806,6 +15829,7 @@ struct CompletionTokenCounts {
     original_bytes: Option<i64>,
     compressed_bytes: Option<i64>,
     tokens_skipped: bool,
+    intentionally_skipped: bool,
 }
 
 impl CompletionTokenCounts {
@@ -15816,6 +15840,7 @@ impl CompletionTokenCounts {
             original_bytes: None,
             compressed_bytes: None,
             tokens_skipped: true,
+            intentionally_skipped: false,
         }
     }
 }
@@ -15977,6 +16002,7 @@ fn completion_counts_for_text(
         original_bytes: Some(raw_output.len() as i64),
         compressed_bytes: Some(compressed_output.len() as i64),
         tokens_skipped: false,
+        intentionally_skipped: false,
     }
 }
 
@@ -16858,6 +16884,7 @@ impl BgTask {
     fn state_needs_root_reclaim(state: &BgTaskState) -> bool {
         !state.metadata.status.is_terminal()
             || (cfg!(unix)
+                && !state.root_reclaim_group_unowned
                 && state.metadata.pgid.is_some()
                 && (state
                     .metadata
@@ -19562,6 +19589,17 @@ mod tests {
             .expect("explicit status can read the delivered bundle");
         assert_eq!(snapshot.info.status, BgTaskStatus::Completed);
         assert!(registry.task_for_session(task_id, session).is_some());
+        assert!(registry.drain_completions().is_empty());
+        registry.kill(task_id, session).unwrap();
+        registry.kill(task_id, session).unwrap();
+        assert_eq!(
+            registry
+                .inner
+                .completion_processing_attempts
+                .load(Ordering::SeqCst),
+            0,
+            "a delivered task recovered for status must not be finalized again"
+        );
         assert!(registry.drain_completions().is_empty());
         registry.detach();
     }
@@ -25307,6 +25345,14 @@ mod tests {
         registry.kill(&task_id, "session").unwrap();
         assert!(completions_for(&registry, &task_id).is_empty());
         assert_eq!(pattern_match_frames(&frames).len(), 1);
+        assert_eq!(
+            registry
+                .inner
+                .completion_processing_attempts
+                .load(Ordering::SeqCst),
+            1,
+            "repeated terminal kills must not repeat completion accounting"
+        );
     }
 
     #[cfg(any(unix, windows))]

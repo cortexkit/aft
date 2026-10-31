@@ -95,6 +95,15 @@ pub(crate) fn deliver_terminal_and_remove_output(registry: &BgTaskRegistry, id: 
     fs::remove_file(&task.paths.stderr).unwrap();
 }
 
+pub(crate) fn disown_group_identities(registry: &BgTaskRegistry, id: &str) {
+    let task = registry.task_for_session(id, "reclaim").unwrap();
+    let mut state = task.lock_state().unwrap();
+    *state.metadata.child_start_time_ms.as_mut().unwrap() += 1;
+    for identity in &mut state.metadata.group_member_identities {
+        identity.started_at_ms += 1;
+    }
+}
+
 pub(crate) struct OwnedGroup(pub(crate) std::process::Child);
 
 impl OwnedGroup {
