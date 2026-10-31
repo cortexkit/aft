@@ -50,6 +50,8 @@ mod program_approvals {
 
     impl ConsentTransport for Controlled {
         fn call(&self, call: ConsentCall) -> ConsentFuture {
+            let mut wake = Box::pin(self.changed.clone().notified_owned());
+            wake.as_mut().enable();
             if call.method == "consent.request" {
                 self.scopes.lock().unwrap().push(call.scope.clone());
             }
@@ -59,7 +61,6 @@ mod program_approvals {
             }
             let fake = self.fake.clone();
             // Register before the answer can arrive, like a long-polling service.
-            let wake = self.changed.clone().notified_owned();
             Box::pin(async move {
                 let reply = match first? {
                     Some(reply) => reply,
@@ -77,7 +78,11 @@ mod program_approvals {
     fn program(f: &Fixture, worker: bool, name: &str) -> RouteIdentity {
         let base = if worker { &f.worker } else { &f.head };
         let mut stamp = serde_json::to_value(base.scope.as_ref().unwrap()).unwrap();
-        stamp["attributes"] = json!({"agent_id":"agent", "worker_id":"worker"});
+        stamp["attributes"] = if worker {
+            json!({})
+        } else {
+            json!({"agent_id":"agent"})
+        };
         let owner = identity(
             &base.project_root,
             Some(serde_json::from_value(stamp).unwrap()),
@@ -85,7 +90,7 @@ mod program_approvals {
         let parent = owner.scope.as_ref().unwrap().scope_ref.clone();
         let mut stamp = serde_json::to_value(stamp_scope(name, &parent)).unwrap();
         stamp["attributes"] = if worker {
-            json!({"worker_id":"worker", "on_behalf_of_agent":"agent", "run_id":name})
+            json!({"on_behalf_of_agent":"agent", "run_id":name})
         } else {
             json!({"agent_id":"agent", "run_id":name})
         };
