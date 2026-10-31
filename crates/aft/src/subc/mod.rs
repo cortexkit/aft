@@ -1477,6 +1477,9 @@ pub(crate) fn project_held_ledger_result(
                 BindTrust::Untrusted
             },
             tool_result_body: true,
+            // This is a stored terminal body, not delivery to a route. Late
+            // readers and keyed replays apply their own recipient policy.
+            model_only: false,
         },
         None,
         source.map(|source| source.to_vec()),

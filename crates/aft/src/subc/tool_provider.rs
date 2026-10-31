@@ -3021,17 +3021,19 @@ impl LedgerEdge {
                 }
                 let actual = actual.clone();
                 let detached = call.detached;
+                // Save the complete tool-result data before projecting the
+                // outgoing frame for a detached held call's terminal body.
+                let (tool_body_for_job, projection_error) =
+                    match outgoing.tool_result_source_for_retention() {
+                        Ok(body) => (body, None),
+                        Err(error) => (None, Some(error.to_string())),
+                    };
                 if detached {
                     if let Err(error) = outgoing.project_tool_result() {
                         log::warn!("held terminal projection failed: {error}");
                         continue;
                     }
                 }
-                let (tool_body_for_job, projection_error) =
-                    match outgoing.tool_result_source_for_retention() {
-                        Ok(body) => (body, None),
-                        Err(error) => (None, Some(error.to_string())),
-                    };
                 let recorded = RecordedFrame {
                     ty: outgoing.header.ty,
                     body: copy_terminal_body(&outgoing.body),
@@ -7059,10 +7061,37 @@ pub(in crate::subc) mod route_tests {
                         json!({
                             "metadata": {"diff": "--- a/fixture.rs\n+++ b/fixture.rs\n-old\n+new\n"},
                             "path": "fixture.rs",
+                            "output": "internal output", "output_preview": "internal output",
                         }),
                     ),
                 };
-                let full = wire::tests::legacy_tool_response_body(&result, true);
+                let mut native = build_tool_response_frame(
+                    PROTOCOL_VERSION,
+                    route_key(41, 1),
+                    7,
+                    control_flags(),
+                    &result,
+                    wire::ToolResponsePolicy::for_retention(),
+                )
+                .unwrap();
+                let legacy = RecordedFrame {
+                    ty: FrameType::Response,
+                    body: native.frame.body.clone(),
+                };
+                let source = native.tool_result_source_for_retention().unwrap().unwrap();
+                let full = project_held_ledger_result(&legacy, Some(&source), true)
+                    .unwrap()
+                    .body;
+                let held =
+                    consent::held_frame(PROTOCOL_VERSION, route_key(41, 1), 7, control_flags())
+                        .unwrap();
+                let held_body: Value = serde_json::from_slice(&held.body).unwrap();
+                assert_eq!(held_body["held"]["reason"], "consent");
+                assert_eq!(held_body["content"][0]["text"], "");
+                assert!(
+                    held_body.get("structuredContent").is_none()
+                        && held_body.get("isError").is_none()
+                );
                 let key = Key {
                     carrier: principal.into(),
                     call_key: "late-edit".into(),
@@ -7076,7 +7105,22 @@ pub(in crate::subc) mod route_tests {
                     let conn = db.lock().unwrap();
                     ledger::admit(&conn, &key, "digest", Some(&scope), State::DispatchStarted)
                         .unwrap();
-                    ledger::settle(
+                    assert!(ledger::hold_permission(&conn, &key, &held.body, true).unwrap());
+                    assert!(ledger::record_running_update(
+                        &conn,
+                        &key,
+                        "approval",
+                        ledger::now_ms()
+                    )
+                    .unwrap());
+                    assert!(ledger::transition(
+                        &conn,
+                        &key,
+                        State::Prepared,
+                        State::DispatchStarted
+                    )
+                    .unwrap());
+                    ledger::settle_with_tool_result_source(
                         &conn,
                         &key,
                         &RecordedFrame {
@@ -7086,6 +7130,7 @@ pub(in crate::subc) mod route_tests {
                         "ok",
                         None,
                         ledger::now_ms(),
+                        Some(&source),
                     )
                     .unwrap();
                 }
@@ -7097,6 +7142,8 @@ pub(in crate::subc) mod route_tests {
                 let data = Arc::get_mut(&mut identity.0).unwrap();
                 data.role = RouteRole::ToolProviderV1;
                 data.tool_result_body = tool_result_body;
+                data.held_reply = tool_result_body;
+                data.held_update = tool_result_body;
                 data.scope = Some(serde_json::from_value(json!({
                     "owner": {"kind":"reserved", "module_id":principal.strip_prefix("reserved:").unwrap()},
                     "ref":scope.scope_ref, "scope_epoch":scope.scope_epoch,
@@ -7152,8 +7199,17 @@ pub(in crate::subc) mod route_tests {
                     );
                     let reply: Value = serde_json::from_slice(&reply.body).unwrap();
                     let delivered = if body["name"] == "late_results" {
-                        assert_eq!(reply["entries"].as_array().unwrap().len(), 1);
-                        &reply["entries"][0]["result"]
+                        let entries = reply["entries"].as_array().unwrap();
+                        assert_eq!(entries.len(), if tool_result_body { 2 } else { 1 });
+                        if tool_result_body {
+                            assert_eq!(entries[0]["kind"], "held");
+                            assert_eq!(entries[0]["held"], json!({"reason":"running"}));
+                            assert!(
+                                entries[0].get("result").is_none()
+                                    && entries[0].get("structuredContent").is_none()
+                            );
+                        }
+                        &entries.last().unwrap()["result"]
                     } else {
                         assert_eq!(reply["answer"], "completed");
                         &reply["result"]
@@ -7163,7 +7219,10 @@ pub(in crate::subc) mod route_tests {
                         &json!({"content":[{"type":"text","text":"Edited fixture.rs"}], "isError":false})
                     );
                 }
-                let row = ledger::get(&db.lock().unwrap(), &key).unwrap().unwrap();
+                let row = ledger::get_for_replay(&db.lock().unwrap(), &key)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(row.tool_result_source.as_deref(), Some(source.as_slice()));
                 assert_eq!(row.frame.unwrap().body, full);
                 let entry: Value =
                     serde_json::from_str(row.late_entry.as_deref().unwrap()).unwrap();
