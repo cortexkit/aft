@@ -9757,8 +9757,10 @@ mod tests {
             });
         assert_eq!(root_row["standing"], true);
         if root_row["abbreviated"] == true {
+            // An abbreviated row keeps a path of up to 160 bytes as it is and
+            // replaces a longer one with its digest plus basename.
             let identity = root_row["standing_entry"].as_str().unwrap();
-            assert!(identity.contains(blake3::hash(literal_path.as_bytes()).to_hex().as_str()));
+            assert_eq!(identity, abbreviated_health_path(&literal_path));
             assert!(identity.ends_with("/standing-link"));
         } else {
             assert_eq!(root_row["standing_entry"], literal_path);
