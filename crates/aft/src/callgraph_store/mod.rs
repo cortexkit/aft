@@ -24220,6 +24220,9 @@ fn symbol_kind_label(kind: &SymbolKind) -> &'static str {
     match kind {
         SymbolKind::Function => "function",
         SymbolKind::Kernel => "kernel",
+        SymbolKind::Module => "module",
+        SymbolKind::Package => "package",
+        SymbolKind::Task => "task",
         SymbolKind::Class => "class",
         SymbolKind::Method => "method",
         SymbolKind::Struct => "struct",
@@ -24278,6 +24281,7 @@ fn lang_label(lang: LangId) -> &'static str {
         LangId::Groovy => "groovy",
         LangId::ObjC => "objc",
         LangId::Toml => "toml",
+        LangId::SystemVerilog => "systemverilog",
     }
 }
 
@@ -24316,6 +24320,7 @@ fn lang_from_label(label: &str) -> Option<LangId> {
         "groovy" => Some(LangId::Groovy),
         "objc" => Some(LangId::ObjC),
         "toml" => Some(LangId::Toml),
+        "systemverilog" => Some(LangId::SystemVerilog),
         _ => None,
     }
 }

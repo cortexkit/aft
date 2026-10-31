@@ -53,7 +53,7 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
                 &req.id,
                 "invalid_request",
                 format!(
-                    "ast_search: unsupported language '{lang_str}'. Supported: typescript, tsx, javascript, python, rust, go, c, cpp, cuda, metal, zig, csharp, solidity, vue, pascal, r, groovy, objc"
+                    "ast_search: unsupported language '{lang_str}'. Supported: typescript, tsx, javascript, python, rust, go, c, cpp, cuda, metal, zig, csharp, solidity, vue, pascal, r, groovy, objc, systemverilog, verilog"
                 ),
             );
         }

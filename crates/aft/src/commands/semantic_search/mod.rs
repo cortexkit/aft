@@ -8124,7 +8124,10 @@ fn semantic_kind_multiplier(kind: &SymbolKind, strength: SemanticKindPriorStreng
             | SymbolKind::Struct
             | SymbolKind::Interface
             | SymbolKind::Enum
-            | SymbolKind::TypeAlias => 1.08,
+            | SymbolKind::TypeAlias
+            | SymbolKind::Module
+            | SymbolKind::Package
+            | SymbolKind::Task => 1.08,
             SymbolKind::Variable => 0.92,
             SymbolKind::FileSummary => 0.80,
             SymbolKind::Heading => 1.0,
@@ -8137,7 +8140,10 @@ fn semantic_kind_multiplier(kind: &SymbolKind, strength: SemanticKindPriorStreng
             | SymbolKind::Struct
             | SymbolKind::Interface
             | SymbolKind::Enum
-            | SymbolKind::TypeAlias => 1.03,
+            | SymbolKind::TypeAlias
+            | SymbolKind::Module
+            | SymbolKind::Package
+            | SymbolKind::Task => 1.03,
             SymbolKind::FileSummary => 0.90,
             SymbolKind::Variable | SymbolKind::Heading => 1.0,
         },
@@ -8155,6 +8161,9 @@ fn is_definition_kind(kind: &SymbolKind) -> bool {
             | SymbolKind::Interface
             | SymbolKind::Enum
             | SymbolKind::TypeAlias
+            | SymbolKind::Module
+            | SymbolKind::Package
+            | SymbolKind::Task
     )
 }
 
@@ -9691,6 +9700,9 @@ fn symbol_kind_label(kind: &SymbolKind) -> &'static str {
     match kind {
         SymbolKind::Function => "function",
         SymbolKind::Kernel => "kernel",
+        SymbolKind::Module => "module",
+        SymbolKind::Package => "package",
+        SymbolKind::Task => "task",
         SymbolKind::Class => "class",
         SymbolKind::Method => "method",
         SymbolKind::Struct => "struct",

@@ -1239,6 +1239,7 @@ fn is_supported_language(lang: LangId) -> bool {
             | LangId::R
             | LangId::Groovy
             | LangId::ObjC
+            | LangId::SystemVerilog
     )
 }
 fn language_name(lang: LangId) -> &'static str {
@@ -1276,6 +1277,7 @@ fn language_name(lang: LangId) -> &'static str {
         LangId::Groovy => "groovy",
         LangId::ObjC => "objc",
         LangId::Toml => "toml",
+        LangId::SystemVerilog => "systemverilog",
     }
 }
 

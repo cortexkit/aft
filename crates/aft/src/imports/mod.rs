@@ -598,7 +598,8 @@ pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
         | LangId::R
         | LangId::Groovy
         | LangId::ObjC
-        | LangId::Toml => None,
+        | LangId::Toml
+        | LangId::SystemVerilog => None,
     }
 }
 
