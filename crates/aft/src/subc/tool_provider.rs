@@ -70,6 +70,108 @@ pub(super) fn ledger_carrier(principal: &crate::sandbox_spawn::AuthenticatedPrin
     }
 }
 
+/// Reserve one approved start at the committed DispatchStarted boundary. An
+/// earlier end refuses it; an end after commit leaves the call in flight, even
+/// if its native handler has not entered yet. Do not extend these registry/run
+/// leases around dispatch, which can take task locks in the reverse direction.
+pub(super) fn begin_approved_call(
+    ctx: &crate::context::AppContext,
+    key: &crate::db::call_ledger::Key,
+    request_id: &str,
+    identity: &super::RouteIdentity,
+) -> Result<(), crate::protocol::Response> {
+    let started = (|| {
+        let db = ctx
+            .db()
+            .ok_or_else(|| "Call ledger is unavailable".to_owned())?;
+        let conn = db
+            .lock()
+            .map_err(|_| "Call ledger database mutex is poisoned".to_owned())?;
+        let Some(stamp) = identity.scope.as_ref() else {
+            return Ok(false);
+        };
+        let begin = || {
+            if identity
+                .run_scope
+                .get()
+                .is_some_and(|scope| scope.revoked())
+            {
+                return Ok(false);
+            }
+            crate::db::call_ledger::begin_approved(&conn, key).map_err(|error| error.to_string())
+        };
+        let live_begin = || match identity.run_scope.get() {
+            Some(run) => run.with_live_authority(begin),
+            None => Some(begin()),
+        };
+        ctx.bash_background()
+            .with_live_scope(stamp, live_begin)
+            .flatten()
+            .unwrap_or(Ok(false))
+    })();
+    match started {
+        Ok(true) => Ok(()),
+        result => Err(crate::protocol::Response::error(
+            request_id,
+            "database_unavailable",
+            match result {
+                Err(error) => error,
+                _ => "Durable authorization transition was not applied".to_owned(),
+            },
+        )),
+    }
+}
+
+pub(super) fn check_program_scope(
+    ctx: &crate::context::AppContext,
+    request_id: &str,
+    identity: &super::RouteIdentity,
+) -> Result<(), crate::protocol::Response> {
+    let allowed = (|| -> Result<bool, String> {
+        let db = ctx.db();
+        let conn = match db.as_ref() {
+            Some(db) => Some(
+                db.lock()
+                    .map_err(|_| "Call ledger database mutex is poisoned".to_owned())?,
+            ),
+            None => None,
+        };
+        let Some(stamp) = identity.scope.as_ref() else {
+            return Ok(false);
+        };
+        let check = || match conn.as_ref() {
+            Some(conn) => crate::db::access_grants::scope_ended(
+                conn,
+                &super::access_grants::scope_key(identity),
+            )
+            .map(|ended| !ended)
+            .map_err(|error| error.to_string()),
+            None => Ok(true),
+        };
+        let live_check = || match identity.run_scope.get() {
+            Some(run) => run.with_live_authority(check),
+            None => Some(check()),
+        };
+        ctx.bash_background()
+            .with_live_scope(stamp, live_check)
+            .flatten()
+            .unwrap_or(Ok(false))
+    })();
+    match allowed {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(crate::protocol::Response::error(
+            request_id,
+            "run_scope_revoked",
+            "the codemode run's scope has ended",
+        )),
+        Err(error) => Err(crate::protocol::Response::error(
+            request_id,
+            "database_unavailable",
+            error,
+        )),
+    }
+}
+
 pub(super) fn describe() -> Value {
     serde_json::to_value(
         RoleDescribe::new(
@@ -1655,6 +1757,7 @@ fn run_custody(
     custodian: &str,
     stamp: Option<&crate::db::call_ledger::ScopeIdentity>,
     request_id: &str,
+    held_updates: bool,
 ) -> Result<CustodyReply, ErrorBody> {
     use crate::db::call_ledger::{self as ledger, Withdrawal};
     use cortexkit_role_tool_provider::withdraw::{CallerProblem, WithdrawAnswer};
@@ -1736,7 +1839,7 @@ fn run_custody(
             let conn = db
                 .lock()
                 .map_err(|_| unavailable("call ledger database mutex is poisoned".into()))?;
-            ledger::late_results(
+            ledger::late_results_for_consumer(
                 &conn,
                 custodian,
                 incarnation,
@@ -1744,6 +1847,7 @@ fn run_custody(
                 request.limit,
                 now,
                 ROLE_REPLY_BODY_LIMIT,
+                held_updates,
             )
             .map_err(|error| unavailable(error.to_string()))?
             .map(|body| CustodyReply {
@@ -2398,6 +2502,7 @@ impl LedgerEdge {
         let custodian = route_principal(&identity);
         let stamp = identity.scope.as_ref().map(ledger_scope);
         let request_id = format!("{op}-{}-{}", request.header.channel, request.header.corr);
+        let held_updates = identity.held_update;
         let (result_tx, result_rx) = oneshot::channel();
         let rx = executor.submit_async(
             identity.root.clone(),
@@ -2410,6 +2515,7 @@ impl LedgerEdge {
                     &custodian,
                     stamp.as_ref(),
                     &request_id,
+                    held_updates,
                 ));
                 Response::success(request_id, json!({}))
             }),
@@ -2858,6 +2964,26 @@ impl LedgerEdge {
                     outgoing.header.ty,
                     FrameType::Response | FrameType::Error | FrameType::StreamEnd
                 );
+                let permission_hold = outgoing.header.ty == FrameType::Response
+                    && serde_json::from_slice::<Value>(&outgoing.body).is_ok_and(|body| {
+                        body.get("held").is_some() && body.get("isError").is_none()
+                    });
+                if permission_hold {
+                    let running = serde_json::from_slice::<Value>(&outgoing.body)
+                        .is_ok_and(|body| body["held"]["reason"] == "running");
+                    {
+                        let mut calls = edge.calls.lock().unwrap();
+                        if running {
+                            calls.remove(&(route, outgoing.header.corr));
+                        } else if let Some(call) = calls.get_mut(&(route, outgoing.header.corr)) {
+                            call.detached = true;
+                        }
+                    }
+                    if actual.send(outgoing).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 let call = if terminal {
                     edge.calls
                         .lock()
@@ -2894,6 +3020,13 @@ impl LedgerEdge {
                     continue;
                 }
                 let actual = actual.clone();
+                let detached = call.detached;
+                if detached {
+                    if let Err(error) = outgoing.project_tool_result() {
+                        log::warn!("held terminal projection failed: {error}");
+                        continue;
+                    }
+                }
                 let (tool_body_for_job, projection_error) =
                     match outgoing.tool_result_source_for_retention() {
                         Ok(body) => (body, None),
@@ -2927,16 +3060,16 @@ impl LedgerEdge {
                             );
                         };
                         let row = ledger::get(&conn, &call.key).ok().flatten();
-                        let reason =
-                            row.as_ref()
-                                .filter(|row| row.state == State::Prepared)
-                                .map(|_| {
-                                    if std::time::Instant::now() >= call.expires_at {
-                                        "expired"
-                                    } else {
-                                        "denied"
-                                    }
-                                });
+                        let reason = row
+                            .as_ref()
+                            .filter(|row| row.state == State::Prepared && !detached)
+                            .map(|_| {
+                                if std::time::Instant::now() >= call.expires_at {
+                                    "expired"
+                                } else {
+                                    "denied"
+                                }
+                            });
                         let inferred = ledger::outcome(&record_for_job);
                         let outcome = if reason.is_some() {
                             "bash_denied_untrusted".into()
@@ -2997,7 +3130,7 @@ impl LedgerEdge {
                         );
                         outgoing.frame = uncertain_settlement_frame(&outgoing);
                     }
-                    if actual.send(outgoing).await.is_err() {
+                    if !detached && actual.send(outgoing).await.is_err() {
                         return;
                     }
                 });
@@ -5189,6 +5322,8 @@ pub(in crate::subc) mod route_tests {
             trust: BindTrust::FirstParty,
             spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,
+            held_reply: false,
+            held_update: false,
             tool_result_body: false,
             disabled_tools: Arc::new(disabled),
             scope,
@@ -6479,6 +6614,8 @@ pub(in crate::subc) mod route_tests {
             trust: BindTrust::FirstParty,
             spawn_principal: runner_restore_principal(&project),
             consumer_elicitation_capable: false,
+            held_reply: false,
+            held_update: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             scope: None,
@@ -7116,6 +7253,8 @@ pub(in crate::subc) mod route_tests {
                 principal_id: Some("reserved:broca".into()),
             },
             consumer_elicitation_capable: false,
+            held_reply: false,
+            held_update: false,
             tool_result_body: false,
             disabled_tools: Arc::new(vec![]),
             scope: Some(stamp("worker")),

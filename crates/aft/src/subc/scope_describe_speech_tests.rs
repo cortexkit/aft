@@ -67,18 +67,29 @@ async fn fenced_end_retries_one_failed_read_and_kills_tasks_with_scope_revoked_r
     let executor = Arc::new(Executor::new());
     executor.register_actor(ProjectRootId::from_path(&root).unwrap(), ctx.clone());
     let reads = AtomicUsize::new(0);
-    let notice = tokio::time::timeout(
+    let (notices, mut received) = mpsc::unbounded_channel();
+    let retried_notice = tokio::time::timeout(
         Duration::from_secs(5),
-        finish_fenced_notice(executor, stamp.clone(), || {
-            if reads.fetch_add(1, Ordering::SeqCst) == 0 {
-                Err(Refusal::new(Code::AuthorityUnavailable, "storage_busy"))
-            } else {
-                store.scope_ended(&stamp)
-            }
-        }),
+        finish_fenced_notice(
+            executor,
+            stamp.clone(),
+            || {
+                if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(Refusal::new(Code::AuthorityUnavailable, "storage_busy"))
+                } else {
+                    store.scope_ended(&stamp)
+                }
+            },
+            Arc::new(DispatchPathMetrics::new()),
+            notices,
+        ),
     )
     .await
     .unwrap();
+    let notice = match retried_notice {
+        Some(notice) => Some(notice),
+        None => received.recv().await,
+    };
     let snapshot = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let snapshot = ctx
