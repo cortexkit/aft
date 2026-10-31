@@ -3115,7 +3115,7 @@ mod tests {
     }
 
     fn grep_io_fixture() -> (tempfile::TempDir, AppContext) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_project::git_project_tempdir();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         for directory in 0..100 {
             let parent = root.join(format!("directory_{directory:03}"));

@@ -19314,7 +19314,7 @@ mod callgraph_store_for_ops_tests {
     /// them. Callers bind the directories for the whole test, first, so they
     /// are removed when it ends and only after the context is dropped.
     fn cold_build_context() -> ([TempDir; 2], Arc<AppContext>) {
-        let project = TempDir::new().expect("project tempdir");
+        let project = crate::test_project::project_tempdir();
         let storage = TempDir::new().expect("storage tempdir");
         let source_dir = project.path().join("src");
         std::fs::create_dir_all(&source_dir).expect("source dir");

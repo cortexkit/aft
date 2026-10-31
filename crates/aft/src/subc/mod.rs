@@ -18438,7 +18438,11 @@ mod tests {
         let _env = crate::test_env::hermetic_git_env_guard();
         let (dir, root) = test_root("parent-last-route");
         let storage = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("child/.git")).unwrap();
+        for name in ["child", "sibling"] {
+            let project = dir.path().join(name);
+            std::fs::create_dir_all(project.join(".git")).unwrap();
+            crate::test_project::mark_project(&project).unwrap();
+        }
         let ctx = test_ctx();
         ctx.mark_subc_bound();
         let request = crate::protocol::RawRequest {
@@ -18456,7 +18460,7 @@ mod tests {
         };
         let _failure = crate::watcher_filter::force_exclusion_failure_for_test(root.as_path());
         assert!(crate::commands::configure::handle_configure(&request, &ctx).success);
-        crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
+        crate::test_admission::settle(&ctx);
         let parent = crate::views::parent::session_for(&ctx).expect("parent session");
         assert!(parent.wait_rounds(1, Duration::from_secs(5)));
         wait_for_watcher_count(&ctx, 1);
@@ -18510,7 +18514,7 @@ mod tests {
         ctx.mark_subc_bound();
         roots.get_mut(&root).unwrap().reactivate_bound();
         assert!(crate::commands::configure::handle_configure(&request, &ctx).success);
-        crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
+        crate::test_admission::settle(&ctx);
         let rebound = crate::views::parent::session_for(&ctx).expect("rebound parent session");
         assert!(!Arc::ptr_eq(&parent, &rebound));
         assert!(rebound.wait_rounds(1, Duration::from_secs(5)));

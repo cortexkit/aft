@@ -15435,7 +15435,7 @@ mod v3_collector_tests {
             .unwrap();
             let response = crate::commands::configure::handle_configure(&request, &ctx);
             assert!(response.success, "{}", response.data);
-            crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
+            crate::test_admission::settle(&ctx);
             if views {
                 // The checkout's semantic runtime owns the v3 family registry;
                 // wait for it to load as the binary's drain loop would.
