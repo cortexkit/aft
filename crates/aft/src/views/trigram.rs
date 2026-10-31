@@ -49,12 +49,31 @@ pub(crate) fn bind_is_busy(reason: &str) -> bool {
     // Lexical snapshot errors carry strings. Match only the explicit retry
     // markers preserved by the v3 registry and base builder, including markers
     // nested beneath a driver or registry diagnostic.
-    reason.contains(crate::blob_store::v3::BUSY_PREFIX)
+    //
+    // A checkout that changed while its view was being loaded is in the same
+    // class: the loader refused to install a snapshot the watcher had already
+    // moved past (for example the burst of events right after a watcher
+    // starts), and the next attempt cuts a fresh one. It is retried, not
+    // counted as a failed load or reported as an AFT bug.
+    checkout_changed_during_load(reason)
+        || reason.contains(crate::blob_store::v3::BUSY_PREFIX)
         || reason.contains("reservation_ledger_busy:")
         || reason.contains("v3 base build busy; retain direct-scan coverage and retry")
         || reason.contains("callgraph derived store is busy:")
         || reason.contains("callgraph v3 store is busy:")
         || reason.contains("v3 base plane completion is owned elsewhere: Busy {")
+}
+
+/// The loader's markers for a checkout that changed between its snapshot cut
+/// and installation, or while it was being reconciled.
+fn checkout_changed_during_load(reason: &str) -> bool {
+    [
+        super::first_load::CHECKOUT_CHANGED_BEFORE_INSTALL,
+        super::first_load::CHECKOUT_CHANGED_DURING_RECONCILE,
+        super::first_load::CHECKOUT_WRITE_ACTIVE,
+    ]
+    .iter()
+    .any(|marker| reason.contains(marker))
 }
 
 #[derive(Clone, Debug)]

@@ -17701,8 +17701,15 @@ mod tests {
             "family registry I/O error: reservation_ledger_busy: read format: database is locked",
             "[driver]: v3 store busy: reservation lock timeout",
             "[driver]: v3 base build busy; retain direct-scan coverage and retry",
+            // Live specimen: a watcher's start-up events moved the checkout
+            // past the loader's cut before it installed the snapshot.
+            "view loader [driver]: checkout changed before snapshot installation: EpochChanged { cut: 1, current: 3 }",
+            "view loader [reconciliation]: checkout changed during strict reconciliation; retry load",
+            "view loader [reconciliation]: checkout write still active during reconciliation",
         ] {
             assert!(crate::views::trigram::bind_is_busy(reason), "{reason}");
+            let message = crate::context::view_load_failure_message(reason);
+            assert_eq!(message, reason, "a retryable load is not an AFT bug");
         }
         for reason in [
             "reservation_ledger_unreadable: permission denied",
