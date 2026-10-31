@@ -136,6 +136,8 @@ pub(super) struct WriterFrame {
     pub(super) frame: Frame,
     body_storage: WriterFrameBody,
     pub(super) tool_response_trace: Option<ToolResponseWriteTrace>,
+    /// Keep the recipient policy after retention consumes result_projection.
+    response_policy: Option<ToolResponsePolicy>,
     result_projection: Option<(ToolResponsePolicy, usize, Option<ToolCallResult>)>,
     prepared_projection: Option<Arc<Vec<u8>>>,
     ack_receipt: Option<(
@@ -165,6 +167,7 @@ impl WriterFrame {
             frame,
             body_storage: WriterFrameBody::Owned,
             tool_response_trace: None,
+            response_policy: None,
             result_projection: None,
             prepared_projection: None,
             ack_receipt: None,
@@ -178,6 +181,7 @@ impl WriterFrame {
             frame,
             body_storage: WriterFrameBody::SharedPush(body),
             tool_response_trace: None,
+            response_policy: None,
             result_projection: None,
             prepared_projection: None,
             ack_receipt: None,
@@ -264,6 +268,7 @@ impl WriterFrame {
         image_alt: Option<&str>,
     ) -> Self {
         let mut outgoing = Self::plain(frame);
+        outgoing.response_policy = Some(policy);
         if policy.tool_result_body {
             let source = if outgoing.header.ty == FrameType::Response {
                 if outgoing.frame.body.len() >= super::result_body::MAX_RESULT_BYTES {
@@ -338,6 +343,7 @@ impl WriterFrame {
                 });
                 if valid {
                     let mut outgoing = Self::plain(frame);
+                    outgoing.response_policy = Some(policy);
                     outgoing.prepared_projection = Some(Arc::new(rendered.bytes));
                     return outgoing;
                 }
@@ -438,6 +444,21 @@ impl WriterFrame {
         )
         .map_err(SubcError::FrameBuild)?;
         Ok(())
+    }
+
+    /// A failed ledger write may report the result, but must not bypass the
+    /// recipient's projection by quoting the complete retained legacy body.
+    pub(super) fn settlement_error_body(&self) -> Cow<'_, [u8]> {
+        if !self.response_policy.is_some_and(|policy| policy.model_only) {
+            return Cow::Borrowed(&self.frame.body);
+        }
+        if let Some(body) = &self.prepared_projection {
+            return Cow::Borrowed(body.as_slice());
+        }
+        Cow::Owned(
+            model_only_body(&self.frame.body)
+                .unwrap_or_else(|_| b"runner result could not be projected".to_vec()),
+        )
     }
 
     fn prepare_tool_result(&mut self) -> Result<(), SubcError> {
@@ -1067,6 +1088,16 @@ pub(super) struct ToolResponsePolicy {
 }
 
 impl ToolResponsePolicy {
+    /// Retain the complete native result when the original route is gone.
+    /// Delivery must instead derive its policy from the receiving route.
+    pub(super) fn for_retention() -> Self {
+        Self {
+            trust: BindTrust::FirstParty,
+            tool_result_body: true,
+            model_only: false,
+        }
+    }
+
     fn include_structured(self) -> bool {
         !matches!(self.trust, BindTrust::Untrusted) && !self.model_only
     }
@@ -1191,6 +1222,7 @@ pub(super) fn build_tool_response_frame_with_limit(
             .transpose()
             .map_err(SubcError::Json)?;
         let mut outgoing = WriterFrame::plain(frame);
+        outgoing.response_policy = Some(policy);
         outgoing.prepared_projection = projection.map(Arc::new);
         return Ok(outgoing);
     }
@@ -1231,6 +1263,7 @@ pub(super) fn build_tool_response_frame_with_limit(
         }
     }
     let mut outgoing = WriterFrame::plain(frame);
+    outgoing.response_policy = Some(policy);
     outgoing.result_projection = Some((policy, max_body_len, Some(source)));
     Ok(outgoing)
 }

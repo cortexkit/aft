@@ -1436,11 +1436,7 @@ pub(crate) fn recovered_bash_frame(
         1,
         control_flags(),
         &result,
-        wire::ToolResponsePolicy {
-            trust: BindTrust::FirstParty,
-            tool_result_body: true,
-            model_only: false,
-        },
+        wire::ToolResponsePolicy::for_retention(),
     )
     .ok()?;
     projected.frame = Frame::build_with_version(

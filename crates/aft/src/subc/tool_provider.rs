@@ -2995,7 +2995,7 @@ impl LedgerEdge {
                             outgoing.header.corr,
                             settled.data
                         );
-                        outgoing.frame = uncertain_settlement_frame(&outgoing.frame);
+                        outgoing.frame = uncertain_settlement_frame(&outgoing);
                     }
                     if actual.send(outgoing).await.is_err() {
                         return;
@@ -3029,13 +3029,14 @@ pub(super) const AUTHORIZATION_FAILURE_MESSAGE: &str =
 
 const SETTLEMENT_RESULT_EXCERPT_BYTES: usize = 8192;
 
-fn uncertain_settlement_frame(original: &subc_protocol::Frame) -> subc_protocol::Frame {
-    // Untrusted routes already omit native structured fields from this wire
-    // body. Excerpt that filtered body; do not rebuild it from a native response.
-    let prefix_len = original.body.len().min(SETTLEMENT_RESULT_EXCERPT_BYTES);
-    let prefix = String::from_utf8_lossy(&original.body[..prefix_len]);
+fn uncertain_settlement_frame(original: &super::WriterFrame) -> subc_protocol::Frame {
+    // Preserve existing excerpts except where the receiving runner is entitled
+    // only to the model-facing projection, not the retained structured result.
+    let body = original.settlement_error_body();
+    let prefix_len = body.len().min(SETTLEMENT_RESULT_EXCERPT_BYTES);
+    let prefix = String::from_utf8_lossy(&body[..prefix_len]);
     let end = prefix.floor_char_boundary(SETTLEMENT_RESULT_EXCERPT_BYTES);
-    let truncated = prefix_len < original.body.len() || end < prefix.len();
+    let truncated = prefix_len < body.len() || end < prefix.len();
     super::build_error_frame_with_detail(original.header.ver, original.header.channel,
         original.header.epoch, original.header.corr, original.header.flags,
         "outcome_unknown",
@@ -8566,6 +8567,11 @@ mod settlement_failure_tests {
     use crate::subc::*;
 
     async fn failed_settlement(case: &str, body: Vec<u8>) -> Frame {
+        let original = Frame::build(FrameType::Response, control_flags(), 42, 3, 7, body).unwrap();
+        failed_settlement_frame(case, original.into()).await
+    }
+
+    async fn failed_settlement_frame(case: &str, original: WriterFrame) -> Frame {
         let (_dir, root) = test_support::test_root("ledger-settlement-failure");
         let executor = Arc::new(Executor::new());
         let key = crate::db::call_ledger::Key {
@@ -8596,7 +8602,7 @@ mod settlement_failure_tests {
                             &key,
                             &crate::db::call_ledger::RecordedFrame {
                                 ty: FrameType::Response,
-                                body: body.clone(),
+                                body: original.frame.body.clone(),
                             },
                             "ok",
                             None,
@@ -8636,7 +8642,6 @@ mod settlement_failure_tests {
         let metrics = Arc::new(DispatchPathMetrics::new());
         let (actual, mut receiver) = tokio::sync::mpsc::channel(4);
         let (writer, proxy) = edge.proxy(actual, executor.clone(), metrics.clone());
-        let original = Frame::build(FrameType::Response, control_flags(), 42, 3, 7, body).unwrap();
         send_reliable_writer_frame(&writer, &metrics, original, "settlement fixture")
             .await
             .unwrap();
@@ -8730,6 +8735,77 @@ mod settlement_failure_tests {
         let excerpt = error["detail"]["original_result_excerpt"].as_str().unwrap();
         assert!(excerpt.len() <= 8192);
         assert_eq!(error["detail"]["original_result_truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn runner_settlement_failure_excerpt_is_model_only_and_plugin_excerpt_is_unchanged() {
+        use subc_protocol::call_mode::CallMode;
+        let (_dir, root) = test_support::test_root("runner-settlement-excerpt");
+        let result = ToolCallResult {
+            text: "Edited fixture.rs".into(),
+            response: Response::success(
+                "edit-id",
+                json!({
+                    "metadata":{"diff":"--- a/fixture.rs\n+++ b/fixture.rs\n-old private line\n+new private line\n"},
+                    "output":"internal output", "output_preview":"internal output",
+                }),
+            ),
+        };
+        for (principal, mode, model_only) in [
+            ("reserved:broca", CallMode::Classic, true),
+            ("reserved:thalamus-harness", CallMode::Classic, true),
+            ("direct", CallMode::Classic, false),
+            ("reserved:broca", CallMode::Codemode, false),
+            ("reserved:broca", CallMode::Flow, false),
+            (
+                "reserved:broca",
+                CallMode::Unknown("future-mode".into()),
+                false,
+            ),
+        ] {
+            for tool_result_body in [false, true] {
+                let mut identity = test_support::route_identity(&root, "settlement-excerpt");
+                let data = Arc::get_mut(&mut identity.0).unwrap();
+                data.tool_result_body = tool_result_body;
+                data.call_mode = mode.clone();
+                let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
+                    &mut data.spawn_principal
+                else {
+                    unreachable!("fixture route bind")
+                };
+                *principal_id = Some(principal.into());
+                let outgoing = build_tool_response_frame(
+                    PROTOCOL_VERSION,
+                    route_key(42, 3),
+                    7,
+                    control_flags(),
+                    &result,
+                    &identity,
+                )
+                .unwrap();
+                let original = outgoing.frame.body.clone();
+                let terminal = failed_settlement_frame("sql", outgoing).await;
+                let error: Value = serde_json::from_slice(&terminal.body).unwrap();
+                assert_eq!(error["code"], "outcome_unknown");
+                assert_eq!(error["message"], "The request produced a terminal result, but AFT could not confirm that it was durably recorded. Its durable outcome is uncertain; replay is not guaranteed.");
+                assert_eq!(error["detail"]["original_result_truncated"], false);
+                let excerpt = error["detail"]["original_result_excerpt"].as_str().unwrap();
+                if model_only {
+                    assert_eq!(
+                        excerpt,
+                        r#"{"content":[{"type":"text","text":"Edited fixture.rs"}],"isError":false}"#
+                    );
+                    assert!(
+                        !excerpt.contains("private line") && !excerpt.contains("internal output")
+                    );
+                } else {
+                    assert_eq!(excerpt.as_bytes(), original);
+                    assert!(
+                        excerpt.contains("private line") && excerpt.contains("internal output")
+                    );
+                }
+            }
+        }
     }
 }
 
