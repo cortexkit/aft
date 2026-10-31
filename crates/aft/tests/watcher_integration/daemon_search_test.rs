@@ -132,11 +132,7 @@ impl Daemon {
             target: RouteTarget::ToolProvider {
                 module_id: "aft".into(),
             },
-            identity: BindIdentity::new(
-                root.to_path_buf(),
-                "opencode".into(),
-                "watcher-search".into(),
-            ),
+            identity: BindIdentity::new(root.to_path_buf(), "opencode", "watcher-search"),
             principal: Some(Principal::Direct),
             consumer_capabilities: None,
             admission_facts: Default::default(),
