@@ -66,11 +66,13 @@ pub(super) fn indexed_fixture_with_setup(shape: &str, setup: impl FnOnce(&mut Fi
     crate::test_project::mark_project(&f.policy.project_root).unwrap();
     setup(&mut f);
     std::fs::write(f.policy.project_root.join("main.rs"), SOURCE).unwrap();
+    // These samples need an installed SearchIndex, which views do not populate.
     let request: RawRequest = serde_json::from_value(json!({
         "id":"configure-session-reads", "command":"configure", "harness":"runner",
         "project_root":f.policy.project_root, "storage_dir":f.dir.path().join("storage"),
         "config":[{"tier":"user", "source":f.dir.path().join("aft.jsonc"),
-            "doc":json!({"indexes":{"trigram":true,"semantic":false,"callgraph":true}}).to_string()}]
+            "doc":json!({"indexes":{"trigram":true,"semantic":false,"callgraph":true},
+                "views":{"enabled":false}}).to_string()}]
     }))
     .unwrap();
     let response = crate::commands::configure::handle_configure(&request, &f.ctx);

@@ -58,6 +58,7 @@ impl Fixture {
         }))
         .expect("configure request");
         let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _watcher = crate::test_env::without_project_watcher();
         let response = crate::commands::configure::handle_configure(&req, &self.ctx);
         assert!(response.success, "configure failed: {:?}", response.data);
         crate::test_admission::settle(&self.ctx);

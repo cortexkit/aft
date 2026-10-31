@@ -1635,10 +1635,12 @@ mod tests {
         let root = fs::canonicalize(root).unwrap();
         let bind = || {
             let owner = borrowed_context(&root, storage.path());
+            // Replacing the checkout at this path requires fresh admission metadata.
             let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
                 "id": "replace-repository",
                 "command": "configure",
                 "project_root": root,
+                "refresh": true,
                 "harness": "opencode",
                 "storage_dir": storage.path(),
                 "config": [{
