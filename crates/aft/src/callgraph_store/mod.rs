@@ -8601,6 +8601,39 @@ impl CallGraphStore {
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         ensure_database_ready(&conn)?;
         let total_changes_before = conn.total_changes();
+        let migrate_headers = conn
+            .query_row(
+                "SELECT v FROM meta WHERE k = ?1",
+                [H_HEADER_LANGUAGE_META_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .as_deref()
+            != Some("1");
+        let mut refresh_inputs = changed_files.to_vec();
+        if migrate_headers {
+            // Existing stores used C for every header. Watcher events and
+            // unchanged timestamps cannot identify that extraction change.
+            let mut paths = conn.prepare("SELECT path FROM files WHERE substr(path, -2) = '.h'")?;
+            let headers = paths.query_map([], |row| row.get::<_, String>(0))?;
+            let mut included: HashSet<PathBuf> = changed_files
+                .iter()
+                .map(|path| {
+                    if path.is_absolute() {
+                        path.clone()
+                    } else {
+                        self.project_root.join(path)
+                    }
+                })
+                .collect();
+            for path in headers {
+                let path = self.project_root.join(path?);
+                if included.insert(path.clone()) {
+                    refresh_inputs.push(path);
+                }
+            }
+        }
+        let changed_files = refresh_inputs.as_slice();
         // One module memo and one parse pool for every file this refresh
         // parses and every import it checks.
         let memo = callgraph::ModuleResolutionMemo::default();
@@ -8722,7 +8755,10 @@ impl CallGraphStore {
                 continue;
             }
 
-            if let Some(row) = &old_row {
+            if let Some(row) = old_row
+                .as_ref()
+                .filter(|_| !(migrate_headers && rel_path.ends_with(".h")))
+            {
                 let (verdict, source_identity) = source_stat::verify_file(&abs_path, row);
                 match verdict {
                     FreshnessVerdict::HotFresh => {
@@ -9064,6 +9100,11 @@ impl CallGraphStore {
         conn.configure_refresh_wal()?;
         self.refresh_wal.lock().unwrap().before_begin(&conn);
         let tx = conn.transaction()?;
+        if migrate_headers {
+            // The marker commits with the refreshed rows, including empty or
+            // deletion-only batches; failed/cancelled refreshes retry migration.
+            mark_header_languages_current(&tx)?;
+        }
         #[cfg(test)]
         {
             let payload_bytes =
@@ -13289,6 +13330,15 @@ pub(crate) fn insert_meta(conn: &Connection) -> Result<()> {
         "INSERT OR IGNORE INTO meta(k, v) VALUES('projection_write_revision', '0')",
         [],
     )?;
+    mark_header_languages_current(conn)?;
+    Ok(())
+}
+
+fn mark_header_languages_current(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(k, v) VALUES(?1, '1')",
+        [H_HEADER_LANGUAGE_META_KEY],
+    )?;
     Ok(())
 }
 
@@ -13499,8 +13549,112 @@ fn ensure_database_ready(conn: &Connection) -> Result<()> {
 ///   completion does not duplicate documented methods.
 /// - v13: known interface contracts and their implementation fan-out retain
 ///   exact/dispatch provenance; a concrete trait call has only its actual target.
-/// - v23: `.h` definitions and references use their content-resolved language.
-const BUILD_OUTPUT_VERSION: &str = "v23-h-header-language";
+const BUILD_OUTPUT_VERSION: &str = "v22-python-import-bindings";
+
+const H_HEADER_LANGUAGE_META_KEY: &str = "h_header_language_revision";
+
+#[cfg(test)]
+mod h_header_invalidation_tests {
+    use super::*;
+
+    #[test]
+    fn h_header_legacy_migration_is_targeted_atomic_and_once() {
+        assert_eq!(BUILD_OUTPUT_VERSION, "v22-python-import-bindings");
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let files = [
+            root.join("plain.h"),
+            root.join("widget.h"),
+            root.join("main.rs"),
+        ];
+        std::fs::write(&files[0], "int plain(void);\n").unwrap();
+        std::fs::write(
+            &files[1],
+            "template <typename T> class Widget { public: T value(T x) { return x; } };\n",
+        )
+        .unwrap();
+        std::fs::write(&files[2], "pub fn untouched() {}\n").unwrap();
+        let store = CallGraphStore::open(temp.path().join("store"), root.clone()).unwrap();
+        store.cold_build(&files).unwrap();
+        let fingerprint: String = {
+            let conn = store.conn.lock().unwrap();
+            let fingerprint = conn
+                .query_row("SELECT v FROM meta WHERE k = 'fingerprint'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            conn.execute(
+                "DELETE FROM meta WHERE k = ?1",
+                [H_HEADER_LANGUAGE_META_KEY],
+            )
+            .unwrap();
+            conn.execute("UPDATE files SET lang = 'c' WHERE path = 'widget.h'", [])
+                .unwrap();
+            conn.execute_batch("CREATE TRIGGER reject_header_refresh BEFORE UPDATE ON files WHEN NEW.path = 'widget.h' BEGIN SELECT RAISE(ABORT, 'header refresh interrupted'); END;").unwrap();
+            fingerprint
+        };
+        let before = work_counts::parses_under(&root);
+        assert!(store.refresh_files_profiled(&[]).is_err());
+        {
+            let conn = store.conn.lock().unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT v FROM meta WHERE k = ?1",
+                    [H_HEADER_LANGUAGE_META_KEY],
+                    |row| row.get::<_, String>(0)
+                )
+                .optional()
+                .unwrap(),
+                None
+            );
+            conn.execute_batch("DROP TRIGGER reject_header_refresh")
+                .unwrap();
+        }
+        let (stats, _) = store.refresh_files_profiled(&[]).unwrap();
+        assert_eq!(
+            work_counts::parses_under(&root) - before,
+            4,
+            "only two headers parsed on each attempt"
+        );
+        assert_eq!(
+            stats.changed_files.into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from(["plain.h".to_string(), "widget.h".to_string()])
+        );
+        {
+            let conn = store.conn.lock().unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT lang FROM files WHERE path = 'widget.h'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+                "cpp"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT v FROM meta WHERE k = ?1",
+                    [H_HEADER_LANGUAGE_META_KEY],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+                "1"
+            );
+            assert_eq!(
+                conn.query_row("SELECT v FROM meta WHERE k = 'fingerprint'", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+                fingerprint
+            );
+        }
+        let after = work_counts::parses_under(&root);
+        let (again, _) = store.refresh_files_profiled(&[]).unwrap();
+        assert!(again.changed_files.is_empty());
+        assert_eq!(work_counts::parses_under(&root), after);
+    }
+}
 
 fn staging_file_name(project_key: &str) -> String {
     format!("{project_key}.{BUILD_OUTPUT_VERSION}.staging.sqlite.tmp.resume")

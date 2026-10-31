@@ -165,17 +165,17 @@ impl SemanticProducer {
         content: ContentHash,
         rel_path: &RelPath,
         summary_format: u32,
-    ) -> FamilyKey {
-        FamilyKey::from(
+    ) -> Option<FamilyKey> {
+        Some(FamilyKey::from(
             &SemanticKey::from_source_hash(
                 *content.as_bytes(),
                 rel_path.as_bytes(),
                 self.chunker_version.as_str(),
                 self.template_version.as_str(),
                 self.model_fingerprint.as_str(),
-            )
+            )?
             .file_key_for_summary_format(self.summary_key_format(summary_format)),
-        )
+        ))
     }
 
     pub(crate) fn legacy_key(&self, bytes: &[u8], rel_path: &RelPath) -> FamilyKey {
@@ -1222,6 +1222,22 @@ impl SemanticPlane {
                 };
                 match state {
                     PlaneState::Ready { key } => {
+                        // Old manifests can name a C-only header run. A saved
+                        // hash cannot choose its replacement language without
+                        // a cached parse; let fill read the source on a miss.
+                        // Unchanged C headers then find their original blob.
+                        if path.as_bytes().ends_with(b".h")
+                            && ![self.file_summary_format, 0].into_iter().any(|format| {
+                                self.producer
+                                    .key_for_content(content, path, format)
+                                    .is_some_and(|expected| {
+                                        crate::blob_store::v2::parse_hex32(key)
+                                            == Some(*expected.as_bytes())
+                                    })
+                            })
+                        {
+                            continue;
+                        }
                         let loaded = match (
                             crate::blob_store::v2::parse_hex32(key),
                             store.as_ref(),
@@ -1243,10 +1259,12 @@ impl SemanticPlane {
                         // must not silently turn into new embedding work.
                         if let Some(run) = loaded {
                             if self.producer.summary_key_format(self.file_summary_format) > 0
-                                && crate::blob_store::v2::parse_hex32(key)
-                                    == Some(
-                                        *self.producer.key_for_content(content, path, 0).as_bytes(),
-                                    )
+                                && self.producer.key_for_content(content, path, 0).is_some_and(
+                                    |expected| {
+                                        crate::blob_store::v2::parse_hex32(key)
+                                            == Some(*expected.as_bytes())
+                                    },
+                                )
                             {
                                 legacy_summaries.insert(path.clone());
                             }
@@ -1255,6 +1273,14 @@ impl SemanticPlane {
                         }
                     }
                     PlaneState::Failed { producer, .. } if *producer == id => {
+                        if path.as_bytes().ends_with(b".h")
+                            && crate::parser::language_for_content_hash(
+                                Path::new("header.h"),
+                                blake3::Hash::from(*content.as_bytes()),
+                            ) != Some(crate::parser::LangId::C)
+                        {
+                            continue;
+                        }
                         failed.insert(path.clone(), content);
                     }
                     _ => {}
@@ -3251,6 +3277,79 @@ impl super::first_load::CompositePlane for SemanticPlane {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn h_header_invalidation_admits_main_runs_only_when_language_is_unchanged() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let plane = new_plane(storage.path(), "model-a");
+        let checkout = Checkout::open(storage.path(), "header-admission", root.path(), &plane);
+        let snapshot = checkout.load();
+        let mut manifest =
+            super::super::manifest_v2::ManifestV2::new(snapshot.generation().header().clone());
+        let store = checkout.owner.open_store(FamilyPlane::Semantic).unwrap();
+        for (name, source, changed) in [
+            ("plain.h", "int plain(void);\n", false),
+            (
+                "widget.h",
+                "template <typename T> class Widget { public: T value(T x) { return x; } };\n",
+                true,
+            ),
+            ("lib.rs", "pub fn untouched() {}\n", false),
+        ] {
+            let path = RelPath::new(name.as_bytes().to_vec()).unwrap();
+            let content = ContentHash::of(source.as_bytes());
+            let mut hash = blake3::Hasher::new();
+            hash.update(b"aft/blob-store/semantic/v1");
+            for field in [
+                content.as_bytes().as_slice(),
+                path.as_bytes(),
+                plane.producer.chunker_version.as_bytes(),
+                plane.producer.template_version.as_bytes(),
+                plane.producer.model_fingerprint.as_bytes(),
+            ] {
+                hash.update(&(field.len() as u64).to_be_bytes());
+                hash.update(field);
+            }
+            let old_key = FamilyKey::new(FamilyPlane::Semantic, *hash.finalize().as_bytes());
+            assert_eq!(
+                plane.producer.key(source.as_bytes(), &path) != old_key,
+                changed
+            );
+            let run =
+                crate::semantic_index::SemanticVectors::synthetic_for_test(Path::new(name), 1, 3);
+            store
+                .put_or_touch(
+                    &old_key,
+                    &run.encode_view_payload(&plane.producer.payload()),
+                )
+                .unwrap();
+            manifest
+                .insert(
+                    path,
+                    super::super::manifest_v2::EntryV2::regular(
+                        content,
+                        source.len() as u64,
+                        super::super::manifest_v2::EntryPlanes {
+                            semantic: Some(PlaneState::ready(&old_key)),
+                            ..Default::default()
+                        },
+                    ),
+                )
+                .unwrap();
+        }
+        let generation = ComposedGeneration::new("main-header-runs", manifest, None);
+        let resident = plane.admit(&checkout.access, &generation).unwrap();
+        assert!(resident
+            .members
+            .contains_key(&RelPath::new(b"plain.h".to_vec()).unwrap()));
+        assert!(resident
+            .members
+            .contains_key(&RelPath::new(b"lib.rs".to_vec()).unwrap()));
+        assert!(!resident
+            .members
+            .contains_key(&RelPath::new(b"widget.h".to_vec()).unwrap()));
+    }
+
     include!("semantic_read_tests.rs");
     use super::*;
     use crate::views::contracts::PlaneLoader;

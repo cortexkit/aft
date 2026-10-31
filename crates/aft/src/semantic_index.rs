@@ -1666,9 +1666,6 @@ fn default_chunking_version() -> u32 {
     2
 }
 
-// Header language resolution changes the symbols used as chunk boundaries.
-const CURRENT_CHUNKING_VERSION: u32 = 3;
-
 /// Per-file key revision for capped summaries; it does not change model identity.
 pub(crate) const FILE_SUMMARY_BUDGET_KEY_FORMAT: u32 = 1;
 
@@ -1680,6 +1677,9 @@ struct StoredSemanticIdentity {
     fingerprint: SemanticIndexFingerprint,
     #[serde(default, skip_serializing_if = "legacy_summary_budget")]
     file_summary_budget_limited: bool,
+    /// Artifact-only migration state, not part of model or vector identity.
+    #[serde(default)]
+    header_languages_resolved: bool,
 }
 
 fn legacy_summary_budget(limited: &bool) -> bool {
@@ -1700,7 +1700,7 @@ impl SemanticIndexFingerprint {
             model: config.model.clone(),
             base_url,
             dimension,
-            chunking_version: CURRENT_CHUNKING_VERSION,
+            chunking_version: default_chunking_version(),
             embed_text_caps: EmbedTextCaps::from_config(config),
             synapse_fingerprint: None,
             synapse_table_epoch: None,
@@ -8205,6 +8205,7 @@ impl SemanticIndex {
             serde_json::to_string(&StoredSemanticIdentity {
                 fingerprint: fingerprint.clone(),
                 file_summary_budget_limited: self.persisted_summary_budget(),
+                header_languages_resolved: true,
             })
             .ok()
         })
@@ -9859,30 +9860,35 @@ impl SemanticIndex {
             || version == SEMANTIC_INDEX_VERSION_V5
             || version == SEMANTIC_INDEX_VERSION_V6
             || version == SEMANTIC_INDEX_VERSION_V7;
-        let (fingerprint, summary_budget_limited) = if has_fingerprint_field {
-            let fingerprint_len = read_u32_stream(&mut reader)? as usize;
-            if total_len
-                .is_some_and(|len| reader.bytes_read().saturating_add(fingerprint_len) > len)
-            {
-                return Err("unexpected end of data reading fingerprint".to_string());
-            }
-            if fingerprint_len == 0 {
-                (None, false)
+        let (fingerprint, summary_budget_limited, header_languages_resolved) =
+            if has_fingerprint_field {
+                let fingerprint_len = read_u32_stream(&mut reader)? as usize;
+                if total_len
+                    .is_some_and(|len| reader.bytes_read().saturating_add(fingerprint_len) > len)
+                {
+                    return Err("unexpected end of data reading fingerprint".to_string());
+                }
+                if fingerprint_len == 0 {
+                    (None, false, false)
+                } else {
+                    let mut raw = vec![0u8; fingerprint_len];
+                    read_exact_stream(
+                        &mut reader,
+                        &mut raw,
+                        "unexpected end of data reading fingerprint",
+                    )?;
+                    let raw = String::from_utf8_lossy(&raw).to_string();
+                    let stored: StoredSemanticIdentity = serde_json::from_str(&raw)
+                        .map_err(|error| format!("invalid semantic fingerprint: {error}"))?;
+                    (
+                        Some(stored.fingerprint),
+                        stored.file_summary_budget_limited,
+                        stored.header_languages_resolved,
+                    )
+                }
             } else {
-                let mut raw = vec![0u8; fingerprint_len];
-                read_exact_stream(
-                    &mut reader,
-                    &mut raw,
-                    "unexpected end of data reading fingerprint",
-                )?;
-                let raw = String::from_utf8_lossy(&raw).to_string();
-                let stored: StoredSemanticIdentity = serde_json::from_str(&raw)
-                    .map_err(|error| format!("invalid semantic fingerprint: {error}"))?;
-                (Some(stored.fingerprint), stored.file_summary_budget_limited)
-            }
-        } else {
-            (None, false)
-        };
+                (None, false, false)
+            };
 
         // File mtimes
         let mtime_count = read_u32_stream(&mut reader)? as usize;
@@ -10072,30 +10078,45 @@ impl SemanticIndex {
             .keys()
             .any(|path| !file_sizes.contains_key(path));
         let bytes_read = reader.bytes_read();
-        Ok((
-            Self {
-                entries,
-                file_mtimes,
-                file_sizes,
-                any_missing_sizes,
-                file_hashes,
-                dimension,
-                fingerprint,
-                summary_budget_limited,
-                project_root: current_canonical_root.to_path_buf(),
-                deferred_files: HashSet::new(),
-                shared_base: None,
-                tombstones: HashSet::new(),
-                view_runs: Vec::new(),
-                dirty_paths: Arc::new(Mutex::new(None)),
-                persistence: Arc::new(Mutex::new(None)),
-                last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
-                skipped_rows: 0,
-                #[cfg(test)]
-                removal_retain_passes: 0,
-            },
-            bytes_read,
-        ))
+        let mut index = Self {
+            entries,
+            file_mtimes,
+            file_sizes,
+            any_missing_sizes,
+            file_hashes,
+            dimension,
+            fingerprint,
+            summary_budget_limited,
+            project_root: current_canonical_root.to_path_buf(),
+            deferred_files: HashSet::new(),
+            shared_base: None,
+            tombstones: HashSet::new(),
+            view_runs: Vec::new(),
+            dirty_paths: Arc::new(Mutex::new(None)),
+            persistence: Arc::new(Mutex::new(None)),
+            last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
+            skipped_rows: 0,
+            #[cfg(test)]
+            removal_retain_passes: 0,
+        };
+        if index.fingerprint.is_some() && !header_languages_resolved {
+            // Older artifacts extracted every .h as C. Discard only headers
+            // whose current language changes, preserving every other vector
+            // and the model fingerprint. Refresh then fills these files only.
+            let changed_headers = index
+                .indexed_paths()
+                .into_iter()
+                .filter(|path| {
+                    path.extension().and_then(|ext| ext.to_str()) == Some("h")
+                        && matches!(
+                            crate::parser::detect_language(path),
+                            Some(crate::parser::LangId::Cpp | crate::parser::LangId::ObjC)
+                        )
+                })
+                .collect::<Vec<_>>();
+            index.invalidate_files(&changed_headers);
+        }
+        Ok((index, bytes_read))
     }
 }
 
@@ -11516,6 +11537,104 @@ pub(crate) use tests::saved_pre_budget_summary_fixture;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn h_header_invalidation_legacy_semantic_reembeds_only_changed_headers_once() {
+        let root = tempfile::tempdir().unwrap();
+        let files = [
+            root.path().join("plain.h"),
+            root.path().join("widget.h"),
+            root.path().join("lib.rs"),
+        ];
+        fs::write(&files[0], "int plain(void);\n").unwrap();
+        fs::write(&files[1], "template <typename T>\nclass Widget {\npublic:\n    T value(T x) {\n        return x;\n    }\n};\n").unwrap();
+        fs::write(&files[2], "pub fn untouched() {\n    let x = 1;\n}\n").unwrap();
+        let mut index = build_test_index(root.path(), &files);
+        index.set_fingerprint(SemanticIndexFingerprint::for_config_dimension(
+            &SemanticBackendConfig::default(),
+            index.dimension(),
+        ));
+        let fingerprint = index.fingerprint().unwrap().as_string();
+        let preserved = |index: &SemanticIndex| {
+            index
+                .entry_vectors_for_test()
+                .into_iter()
+                .filter(|(file, _, _)| file != &files[1])
+                .map(|(file, name, vector)| ((file, name), vector))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let before = preserved(&index);
+        let mut bytes = index.to_bytes();
+        let length = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
+        let mut identity: serde_json::Value =
+            serde_json::from_slice(&bytes[13..13 + length]).unwrap();
+        identity
+            .as_object_mut()
+            .unwrap()
+            .remove("header_languages_resolved");
+        let identity = serde_json::to_vec(&identity).unwrap();
+        bytes.splice(13..13 + length, identity.iter().copied());
+        bytes[9..13].copy_from_slice(&(identity.len() as u32).to_le_bytes());
+        let mut loaded = SemanticIndex::from_bytes(&bytes, root.path()).unwrap();
+        assert_eq!(preserved(&loaded), before);
+        assert_eq!(loaded.fingerprint().unwrap().as_string(), fingerprint);
+        assert!(loaded.recorded_file_freshness(&files[1]).is_none());
+        assert!(loaded.recorded_file_freshness(&files[0]).is_some());
+        let mut embedded = Vec::new();
+        loaded
+            .refresh_stale_files(
+                root.path(),
+                &files,
+                &mut |texts: Vec<String>| {
+                    embedded.extend(texts.clone());
+                    test_vector_for_texts(texts)
+                },
+                8,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        assert!(!embedded.is_empty());
+        assert!(
+            embedded.iter().all(|text| text.contains("widget.h")),
+            "{embedded:?}"
+        );
+        assert_eq!(preserved(&loaded), before);
+        let mut current = SemanticIndex::from_bytes(&loaded.to_bytes(), root.path()).unwrap();
+        assert_eq!(current.fingerprint().unwrap().as_string(), fingerprint);
+        let summary = current
+            .refresh_stale_files(
+                root.path(),
+                &files,
+                &mut |_| panic!("current artifacts must not re-embed"),
+                8,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        assert!(summary.is_noop());
+    }
+
+    #[test]
+    fn h_header_invalidation_keeps_main_semantic_fingerprint() {
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: "fixture-model".to_string(),
+            base_url: Some("https://example.invalid/v1".to_string()),
+            ..SemanticBackendConfig::default()
+        };
+        let current = SemanticIndexFingerprint::for_config_dimension(&config, 3);
+        let main = SemanticIndexFingerprint {
+            backend: "openai_compatible".to_string(),
+            model: "fixture-model".to_string(),
+            base_url: "https://example.invalid/v1".to_string(),
+            dimension: 3,
+            chunking_version: 2,
+            embed_text_caps: EmbedTextCaps::default(),
+            synapse_fingerprint: None,
+            synapse_table_epoch: None,
+            synapse_equivalent_to: Vec::new(),
+        };
+        assert_eq!(current.as_string().as_bytes(), main.as_string().as_bytes());
+    }
+
     #[test]
     fn h_header_view_chunking_uses_snapshot_language() {
         let root = tempfile::tempdir().unwrap();

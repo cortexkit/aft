@@ -33,8 +33,7 @@ use super::{Manifest, ManifestEntry, RegularPlanes, RelPath};
 /// Version 10 stores the parser's corrected symbols: Go type aliases, separate
 /// ranges for specs in a grouped `type (...)` block, and non-inverted ranges for
 /// HTML headings that share a row.
-/// Version 14 resolves ambiguous `.h` content before extracting graph evidence.
-pub const PRODUCER: &str = "ruled-callgraph-v14-h-header-language";
+pub const PRODUCER: &str = "ruled-callgraph-v13-python-import-bindings";
 
 #[derive(Clone, Debug)]
 pub struct CallgraphAttachment {
