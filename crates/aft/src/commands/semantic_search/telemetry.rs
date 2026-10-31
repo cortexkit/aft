@@ -203,6 +203,25 @@ mod cost_trace {
 
     thread_local! {
         static PHASES: RefCell<Option<Vec<(&'static str, f64)>>> = const { RefCell::new(None) };
+        static CPU_PHASES: RefCell<Vec<(&'static str, f64)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn thread_cpu_ms() -> Option<f64> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+            // clock_gettime initializes the timespec only on success.
+            if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, time.as_mut_ptr()) } != 0
+            {
+                return None;
+            }
+            let time = unsafe { time.assume_init() };
+            Some(time.tv_sec as f64 * 1000.0 + time.tv_nsec as f64 / 1_000_000.0)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
     }
 
     pub(crate) struct Request {
@@ -216,6 +235,7 @@ mod cost_trace {
             let enabled = std::env::var_os("AFT_SEARCH_COST_TRACE").is_some();
             if enabled {
                 PHASES.with(|phases| *phases.borrow_mut() = Some(Vec::new()));
+                CPU_PHASES.with(|phases| phases.borrow_mut().clear());
             }
             Self {
                 id: id.to_string(),
@@ -229,36 +249,40 @@ mod cost_trace {
         fn drop(&mut self) {
             if self.enabled {
                 let phases = PHASES.with(|phases| std::mem::take(&mut *phases.borrow_mut()));
+                let cpu_phases =
+                    CPU_PHASES.with(|phases| std::mem::take(&mut *phases.borrow_mut()));
                 eprintln!(
                     "AFT_SEARCH_COST {}",
                     serde_json::json!({
                         "id": self.id, "total_ms": self.started.elapsed().as_secs_f64() * 1000.0,
-                        "phases": phases,
+                        "phases": phases, "cpu_phases": cpu_phases,
                     })
                 );
             }
         }
     }
 
-    pub(crate) struct Phase(&'static str, Option<Instant>);
+    pub(crate) struct Phase(&'static str, Option<Instant>, Option<f64>);
 
     impl Phase {
         pub(crate) fn start(name: &'static str) -> Self {
-            Self(
-                name,
-                PHASES.with(|phases| phases.borrow().is_some().then(Instant::now)),
-            )
+            let started = PHASES.with(|phases| phases.borrow().is_some().then(Instant::now));
+            Self(name, started, started.and_then(|_| thread_cpu_ms()))
         }
     }
 
     impl Drop for Phase {
         fn drop(&mut self) {
             if let Some(started) = self.1 {
+                let cpu_ms = self.2.zip(thread_cpu_ms()).map(|(start, end)| end - start);
                 PHASES.with(|phases| {
                     if let Some(phases) = phases.borrow_mut().as_mut() {
                         phases.push((self.0, started.elapsed().as_secs_f64() * 1000.0));
                     }
                 });
+                if let Some(cpu_ms) = cpu_ms {
+                    CPU_PHASES.with(|phases| phases.borrow_mut().push((self.0, cpu_ms)));
+                }
             }
         }
     }
