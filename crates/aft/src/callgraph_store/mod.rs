@@ -170,6 +170,7 @@ pub(crate) mod work_counts {
     use std::sync::{Mutex, OnceLock};
 
     static PARSES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    static FINGERPRINT_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
     static CONFIG_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
     static STAGING_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
     static DIRECTORY_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
@@ -205,6 +206,20 @@ pub(crate) mod work_counts {
 
     pub(crate) fn note_parse(path: &Path) {
         note(&PARSES, path);
+    }
+
+    pub(super) fn note_fingerprint_read(path: &Path) {
+        note(&FINGERPRINT_READS, path);
+    }
+
+    pub(super) fn fingerprint_reads(path: &Path) -> usize {
+        FINGERPRINT_READS
+            .get_or_init(Default::default)
+            .lock()
+            .expect("work counter mutex poisoned")
+            .get(path)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub(crate) fn note_config_read(path: &Path) {
@@ -294,6 +309,7 @@ pub(crate) mod work_counts {
     pub(crate) fn reset_under(root: &Path) {
         for map in [
             &PARSES,
+            &FINGERPRINT_READS,
             &CONFIG_READS,
             &STAGING_READS,
             &DIRECTORY_READS,
@@ -24584,6 +24600,8 @@ impl CorpusFingerprint {
 }
 
 fn hash_file_bounded(path: &Path) -> std::io::Result<blake3::Hash> {
+    #[cfg(test)]
+    work_counts::note_fingerprint_read(path);
     let mut file = crate::project_content::open(path)?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0u8; 64 * 1024];
@@ -29270,6 +29288,71 @@ export function leaf() {}
             "backend freshness rows must match apart from updated_at"
         );
         assert_eq!(secondary_indexes(&reference), secondary_indexes(&optimized));
+    }
+
+    #[test]
+    fn cold_build_reads_each_source_once_for_fingerprinting_and_preserves_rows() {
+        let dir = tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let src = root.join("src");
+        fs::create_dir(&src).unwrap();
+        for index in 0..256 {
+            fs::write(
+                src.join(format!("file{index}.ts")),
+                format!(
+                    "import {{ target as next }} from './file{}';\nexport function target() {{ next(); }}\n",
+                    (index + 1) % 256
+                ),
+            )
+            .unwrap();
+        }
+        let files = callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        assert_eq!(files.len(), 256);
+        let reference = CallGraphStore::open(root.join(".reference"), root.clone()).unwrap();
+        reference.cold_build(&files).unwrap();
+        work_counts::reset_under(&root);
+        let (published, _) = CallGraphStore::cold_build_with_lease_chunked(
+            root.join(".published"),
+            root.clone(),
+            &[],
+            32,
+        )
+        .unwrap();
+        let reads = files
+            .iter()
+            .map(|path| work_counts::fingerprint_reads(path))
+            .collect::<Vec<_>>();
+        let parses = work_counts::parses_under(&root);
+        let mut rows = 0;
+        for (table, excluded) in [
+            ("files", &["indexed_at"][..]),
+            ("nodes", &[][..]),
+            ("refs", &[][..]),
+            ("edges", &[][..]),
+            ("file_dependencies", &[][..]),
+            ("dispatch_hints", &[][..]),
+            ("backend_file_state", &["updated_at"][..]),
+        ] {
+            let expected = graph_table_rows_without(&reference, table, excluded);
+            rows += expected.len();
+            assert_eq!(
+                expected,
+                graph_table_rows_without(&published, table, excluded),
+                "stored rows for {table}"
+            );
+        }
+        eprintln!(
+            "256-source fixture: fingerprint reads={} (per-file {}..={}), extraction parses={parses}, identical stored rows={rows}",
+            reads.iter().sum::<usize>(),
+            reads.iter().min().unwrap(),
+            reads.iter().max().unwrap(),
+        );
+        assert_eq!(parses, files.len());
+        assert_eq!(work_counts::max_parses_of_one_file_under(&root), 1);
+        assert!(
+            reads.iter().all(|count| *count == 1),
+            "one fingerprint read per source"
+        );
     }
 
     #[test]
