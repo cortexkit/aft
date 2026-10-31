@@ -292,6 +292,76 @@ fn task_scope_survives_module_cgroup_kill() {
 
 #[test]
 #[ignore = "requires a systemd user manager"]
+fn task_scope_deadline_survives_durable_starting_checkpoint() {
+    require_manager();
+    struct Release(std::sync::mpsc::Sender<()>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    registry.configure_task_scope_runtime(true, Duration::from_secs(60));
+    let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    *registry.inner.before_bootstrap_release.lock().unwrap() = Some((arrived_tx, release_rx));
+    let release = Release(release_tx);
+    let spawning = registry.clone();
+    let project = root.path().to_path_buf();
+    let worker = std::thread::spawn(move || {
+        spawning.spawn_with_shell_in_slot_typed(
+            SpawnPlan::Unsandboxed,
+            "sleep 60",
+            super::super::BashShell::Bash,
+            PathBuf::from("/bin/bash"),
+            "task-scope".into(),
+            project.clone(),
+            HashMap::new(),
+            super::super::HardKill::Default,
+            None,
+            project.clone(),
+            super::super::TaskSlot::Background { max: 4 },
+            true,
+            false,
+            Some(project),
+            true,
+        )
+    });
+    let id = arrived_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let _stop = StopOnDrop(id.clone());
+    let layout = super::super::persistence::resolve_task(root.path(), "task-scope", &id).unwrap();
+    let saved = read_task_at(&layout).unwrap();
+    assert_eq!(saved.status, super::super::BgTaskStatus::Starting);
+    let recovered = BgTaskRegistry::default();
+    recovered.inner.shutdown.store(true, Ordering::SeqCst);
+    recovered
+        .insert_rehydrated_task(saved.clone(), layout.paths.clone(), true)
+        .unwrap();
+    assert_eq!(
+        recovered
+            .hard_kill_deadline(&id, "task-scope")
+            .unwrap()
+            .limit_ms,
+        60000,
+        "durable checkpoint lost the earlier scope deadline"
+    );
+    let mut old_record = saved;
+    old_record.task_scope_runtime_ms = None;
+    assert_eq!(
+        HardKillDeadline::reported(&old_record, true)
+            .unwrap()
+            .limit_ms,
+        DEFAULT_BG_TIMEOUT.as_millis() as u64,
+        "old records invented a scope deadline"
+    );
+    drop(release);
+    assert_eq!(worker.join().unwrap().unwrap(), id);
+    registry.kill(&id, "task-scope").unwrap();
+}
+
+#[test]
+#[ignore = "requires a systemd user manager"]
 fn task_scope_fixed_backstop_works_without_registry() {
     require_manager();
     let root = tempfile::tempdir().unwrap();

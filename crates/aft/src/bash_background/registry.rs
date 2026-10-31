@@ -856,6 +856,7 @@ impl HardKillDeadline {
                 }
                 deadline
             }),
+            // Old records have no saved scope runtime. Report only their task deadline.
             None => deadline,
         }
     }
@@ -5685,6 +5686,10 @@ impl BgTaskRegistry {
         metadata.child_pid = Some(child_pid);
         metadata.pgid = Some(child_pid as i32);
         metadata.child_start_time_ms = crate::root_cache::process_start_time_ms(child_pid);
+        #[cfg(target_os = "linux")]
+        {
+            metadata.task_scope_runtime_ms = scope.as_ref().map(|scope| scope.runtime_ms());
+        }
         if let Err(error) = self.persist_task(&paths, &metadata) {
             drop(child.stdin.take());
             if let Some(scope) = scope.as_ref() {
@@ -5704,10 +5709,6 @@ impl BgTaskRegistry {
                 canonical_project_root,
             );
             return Err(format!("failed to persist background task metadata: {error}").into());
-        }
-        #[cfg(target_os = "linux")]
-        {
-            metadata.task_scope_runtime_ms = scope.as_ref().map(|scope| scope.runtime_ms());
         }
         metadata.mark_running(child_pid, child_pid as i32);
         if crate::privacy_spawn::requested(&env) {
@@ -16868,16 +16869,17 @@ pub(crate) fn hard_kill_reason(deadline: HardKillDeadline) -> String {
     let limit = crate::commands::bash_orchestrate::format_wait_limit(deadline.limit_ms);
     let default_ms = DEFAULT_BG_TIMEOUT.as_millis() as u64;
     match deadline.source {
-        HardKillSource::Default | HardKillSource::ScopedDefault if deadline.limit_ms > default_ms => format!(
+        HardKillSource::Default if deadline.limit_ms > default_ms => format!(
             "killed by AFT's default background limit, which waits on it had extended to {limit}, after the waits stopped (exit 124); the command itself did not fail"
         ),
-        HardKillSource::Default | HardKillSource::ScopedDefault => format!(
+        HardKillSource::Default => format!(
             "killed by AFT's default background limit of {limit} (exit 124); the command itself did not fail, pass a longer `timeout` if it needs more time"
         ),
         HardKillSource::Timeout => {
             format!("killed by the `timeout` of {limit} you passed (exit 124)")
         }
-        HardKillSource::Scope => format!("killed by the fixed Linux task scope limit of {limit} (exit 124)"),
+        // This path enforces task timeouts. Scope deadlines are report-only.
+        HardKillSource::Scope | HardKillSource::ScopedDefault => unreachable!("scope deadline in task timeout enforcement"),
     }
 }
 
