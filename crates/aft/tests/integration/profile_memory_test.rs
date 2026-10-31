@@ -230,8 +230,17 @@ fn run_profile_memory(
         .args(["profile", "--memory"])
         .current_dir(current_dir)
         .env("XDG_CONFIG_HOME", config_home)
+        .env("XDG_DATA_HOME", config_home.join("data"))
+        .env("XDG_STATE_HOME", config_home.join("state"))
+        .env("XDG_CACHE_HOME", config_home.join("cache"))
         .env("HOME", config_home)
-        .env_remove("USERPROFILE")
+        .env("USERPROFILE", config_home)
+        .env("APPDATA", config_home.join("AppData/Roaming"))
+        .env("LOCALAPPDATA", config_home.join("AppData/Local"))
+        // Startup takes a storage lease before profile dispatch, even without a daemon.
+        .env_remove("AFT_STORAGE_DIR")
+        .env_remove("AFT_CACHE_DIR")
+        .env_remove("XDG_RUNTIME_DIR")
         .env_remove("SUBC_CONNECTION_FILE");
     if with_launch_identity {
         command

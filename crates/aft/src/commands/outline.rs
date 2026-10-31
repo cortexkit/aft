@@ -5602,11 +5602,40 @@ mod tests {
     fn outline_portability_goldens_stay_lf_with_autocrlf() {
         let temp = tempfile::tempdir().unwrap();
         let prefix = format!("{}/", path_to_slash(temp.path()));
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()
-            .expect("canonicalize repository root");
-        for (name, expected) in [
+        // Build a real index from the checked-in attributes, not the surrounding
+        // checkout's Git metadata (which source-only build snapshots omit).
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path();
+        let git_config = root.join("empty-gitconfig");
+        std::fs::write(&git_config, "").unwrap();
+        std::fs::write(
+            root.join(".gitattributes"),
+            include_str!("../../../../.gitattributes"),
+        )
+        .unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(["-c", "core.attributesFile="])
+                .args(args)
+                .env("GIT_DIR", root.join(".git"))
+                .env("GIT_WORK_TREE", root)
+                .env_remove("GIT_COMMON_DIR")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_CONFIG_COUNT")
+                .env("GIT_CONFIG_GLOBAL", &git_config)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_ATTR_NOSYSTEM", "1")
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        let goldens = [
             (
                 "test_free.txt",
                 include_str!("../../tests/fixtures/outline_summaries/test_free.txt"),
@@ -5619,27 +5648,32 @@ mod tests {
                 "structure_common_root.txt",
                 include_str!("../../tests/fixtures/outline_summaries/structure_common_root.txt"),
             ),
-        ] {
+        ];
+        for (name, expected) in goldens {
             let relative = format!("crates/aft/tests/fixtures/outline_summaries/{name}");
-            let output = std::process::Command::new("git")
-                .args(["-c", "safe.directory=", "-c", "core.autocrlf=true"])
-                .arg("-c")
-                .arg(format!("safe.directory={}", root.display()))
-                .args([
-                    "checkout-index",
-                    "--force",
-                    &format!("--prefix={prefix}"),
-                    "--",
-                    &relative,
-                ])
-                .current_dir(&root)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            let path = root.join(&relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, expected).unwrap();
+        }
+        git(&[
+            "-c",
+            "core.autocrlf=false",
+            "add",
+            "--",
+            ".gitattributes",
+            "crates",
+        ]);
+        for (name, expected) in goldens {
+            let relative = format!("crates/aft/tests/fixtures/outline_summaries/{name}");
+            git(&[
+                "-c",
+                "core.autocrlf=true",
+                "checkout-index",
+                "--force",
+                &format!("--prefix={prefix}"),
+                "--",
+                &relative,
+            ]);
             let bytes = std::fs::read(temp.path().join(relative)).unwrap();
             assert!(
                 !bytes.contains(&b'\r'),
