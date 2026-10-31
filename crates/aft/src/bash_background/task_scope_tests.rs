@@ -1240,10 +1240,40 @@ fn task_scope_cleanup_retries_unconfirmed_owned_unit() {
     let root = tempfile::tempdir().unwrap();
     let registry = BgTaskRegistry::default();
     let (id, _) = tests::insert_terminal_piped_task(&registry, &root, "true", "", "", false);
+    let (other, _) = tests::insert_terminal_piped_task(&registry, &root, "true", "", "", false);
+    let mut ids = [id, other];
+    ids.sort();
+    let [id, other] = ids;
     let unit = format!("aft-task-{id}.scope");
+    let other_unit = format!("aft-task-{other}.scope");
     let description = super::super::task_scope::scope_description(&id, root.path());
+    let other_description = super::super::task_scope::scope_description(&other, root.path());
+    let foreign = "aft-task-bash-0000000000000000.scope";
     let manager = root.path().join("systemctl");
-    crate::executable_cache::write_executable(&manager, format!("#!/bin/sh\ncase \"$2\" in\nlist-units) echo '{unit}' ;;\nshow) if [ ! -e '{root}/looked-up' ]; then touch '{root}/looked-up'; exit 1; fi; printf 'LoadState=loaded\\nControlGroup=/aft.slice/{unit}\\nDescription={description}\\n' ;;\nstop) echo stopped >> '{root}/stopped' ;;\nesac\n", root = root.path().display()).as_bytes()).unwrap();
+    let script = format!(
+        r#"#!/bin/sh
+for unit in "$@"; do :; done
+case "$2" in
+list-units)
+  echo '{foreign}'
+  for unit in '{unit}' '{other_unit}'; do
+    if [ ! -e '{root}/'"$unit"'.stopped' ]; then echo "$unit"; fi
+  done ;;
+show)
+  case "$unit" in
+    '{foreign}') touch '{root}/foreign-queried'; exit 97 ;;
+    '{unit}')
+      if [ ! -e '{root}/looked-up' ]; then touch '{root}/looked-up'; exit 1; fi
+      description='{description}' ;;
+    '{other_unit}') description='{other_description}' ;;
+  esac
+  printf 'LoadState=loaded\nControlGroup=/aft.slice/%s\nDescription=%s\n' "$unit" "$description" ;;
+stop) echo "$unit" >> '{root}/stopped'; touch '{root}/'"$unit"'.stopped' ;;
+esac
+"#,
+        root = root.path().display()
+    );
+    crate::executable_cache::write_executable(&manager, script.as_bytes()).unwrap();
     registry.inner.task_scopes.set_manager_for_test(manager);
     registry.configure_task_scope_runtime(true, Duration::from_secs(86400));
     let key = canonicalized_path(root.path());
@@ -1262,7 +1292,16 @@ fn task_scope_cleanup_retries_unconfirmed_owned_unit() {
         assert!(slot.retry_at.is_some());
     }
     assert!(
-        !root.path().join("stopped").exists(),
+        !root.path().join("foreign-queried").exists(),
+        "foreign unit blocked owned cleanup"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("stopped")).unwrap(),
+        format!("{other_unit}\n"),
+        "owned lookup failure blocked another owned unit"
+    );
+    assert!(
+        !root.path().join(format!("{unit}.stopped")).exists(),
         "unconfirmed unit was stopped"
     );
     registry.start_task_scope_cleanup(root.path());
@@ -1295,7 +1334,7 @@ fn task_scope_cleanup_retries_unconfirmed_owned_unit() {
     });
     assert_eq!(
         std::fs::read_to_string(root.path().join("stopped")).unwrap(),
-        "stopped\n"
+        format!("{other_unit}\n{unit}\n")
     );
     assert_eq!(
         task_scope_cleanup_slots()

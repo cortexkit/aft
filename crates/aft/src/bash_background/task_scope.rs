@@ -196,31 +196,27 @@ mod linux {
             let manager = self.manager();
             let units = list_with(&manager)?;
             let mut stopped = 0;
+            let mut pending = None;
             for unit in select_owned_units(&units, records, terminal_only) {
                 let Some(id) = task_unit_id(&unit) else {
                     log_unconfirmed_scope();
                     continue;
                 };
                 match lookup_with(&manager, id) {
-                    Ok(Some(scope)) if recheck(id, &scope.description) => {
-                        #[cfg(test)]
-                        if self.manager_path.lock().unwrap().is_some() {
-                            stop_with(&manager, &scope.unit)?;
-                        } else {
-                            scope.stop()?;
+                    Ok(Some(scope)) if recheck(id, &scope.description) => match scope.stop() {
+                        Ok(()) => stopped += 1,
+                        Err(error) => {
+                            pending.get_or_insert(error);
                         }
-                        #[cfg(not(test))]
-                        scope.stop()?;
-                        stopped += 1;
-                    }
+                    },
                     Err(error) => {
                         log_unconfirmed_scope();
-                        return Err(error);
+                        pending.get_or_insert(error);
                     }
                     _ => {}
                 }
             }
-            Ok(stopped)
+            pending.map_or(Ok(stopped), Err)
         }
     }
 
@@ -323,6 +319,7 @@ mod linux {
             unit,
             cgroup,
             description: String::new(),
+            manager: PathBuf::from("systemctl"),
         }))
     }
 
@@ -353,6 +350,7 @@ mod linux {
         unit: String,
         cgroup: PathBuf,
         description: String,
+        manager: PathBuf,
     }
 
     impl ScopeHandle {
@@ -729,6 +727,7 @@ mod linux {
                         unit: self.unit.clone(),
                         cgroup: path,
                         description: self.description.clone(),
+                        manager: PathBuf::from("systemctl"),
                     });
                 }
                 if !super::super::process::is_process_alive(pid) {
@@ -863,6 +862,7 @@ mod linux {
             unit,
             cgroup,
             description: property("Description=").unwrap_or_default().into(),
+            manager: systemctl.to_owned(),
         }))
     }
 
@@ -903,18 +903,11 @@ mod linux {
             let Some(unit) = line.split_whitespace().next() else {
                 continue;
             };
-            let Some(id) = task_unit_id(unit) else {
+            if task_unit_id(unit).is_none() {
                 log_unconfirmed_scope();
                 continue;
-            };
-            match lookup_with(systemctl, id) {
-                Ok(Some(_)) => units.push(unit.into()),
-                Err(error) => {
-                    log_unconfirmed_scope();
-                    return Err(error);
-                }
-                _ => {}
             }
+            units.push(unit.into());
         }
         units.sort();
         units.dedup();
@@ -931,6 +924,10 @@ mod linux {
     }
 
     fn stop_unit(unit: &str) -> Result<(), String> {
+        stop_unit_with(Path::new("systemctl"), unit)
+    }
+
+    fn stop_unit_with(systemctl: &Path, unit: &str) -> Result<(), String> {
         #[cfg(test)]
         if STOP_OBSERVER.with(|slot| {
             if let Some(observe) = slot.borrow().as_ref() {
@@ -942,7 +939,7 @@ mod linux {
         }) {
             return Ok(());
         }
-        stop_with(Path::new("systemctl"), unit)
+        stop_with(systemctl, unit)
     }
 
     #[cfg(test)]
@@ -986,7 +983,7 @@ mod linux {
             }
         }
         pub(crate) fn stop(&self) -> Result<(), String> {
-            stop_unit(&self.unit)
+            stop_unit_with(&self.manager, &self.unit)
         }
         pub(crate) fn ensure_oom_group(&self) -> Result<(), String> {
             #[cfg(test)]
@@ -1058,6 +1055,7 @@ mod linux {
             unit: scope_unit(task_id).unwrap(),
             cgroup,
             description: scope_description(task_id, Path::new("/fixture")),
+            manager: PathBuf::from("systemctl"),
         }
     }
 
@@ -1223,11 +1221,14 @@ mod linux {
         }
 
         #[test]
-        fn task_scope_listing_keeps_unconfirmed_units_pending() {
+        fn task_scope_listing_returns_raw_unit_names() {
             let foreign = "aft-task-bash-0000000000000001.scope";
             let owned = "aft-task-bash-0000000000000002.scope";
             let (_dir, path) = fake(&format!("case \"$2\" in\nlist-units) printf '%s\\n' '{foreign}' '{owned}' ;;\nshow) for unit in \"$@\"; do :; done; case \"$unit\" in\n'{foreign}') printf 'LoadState=loaded\\nControlGroup=/app.slice/{foreign}\\n' ;;\n*) printf 'LoadState=loaded\\nControlGroup=/aft.slice/{owned}\\n' ;;\nesac ;;\nesac"));
-            assert!(list_with(&path).is_err());
+            assert_eq!(
+                list_with(&path).unwrap(),
+                vec![foreign.to_string(), owned.to_string()]
+            );
         }
         #[test]
         fn task_scope_version_capabilities() {
