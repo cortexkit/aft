@@ -20725,6 +20725,105 @@ mod callgraph_store_for_ops_tests {
         query.join().expect("callgraph query thread");
     }
 
+    fn assert_callgraph_churn_was_not_charged(ctx: &AppContext) {
+        let connection =
+            rusqlite::Connection::open(ctx.callgraph_store_dir().join("build-breaker.sqlite"))
+                .unwrap();
+        let charges: i64 = connection
+            .query_row(
+                "SELECT COALESCE(SUM(zero_credit_deaths + credited_deaths + in_build_burn_ms), 0)
+                 FROM breaker_records WHERE domain = 'callgraph_cold'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            charges, 0,
+            "ordinary edits must not charge the death breaker"
+        );
+        let attempts: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM breaker_attempts WHERE domain = 'callgraph_cold'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            attempts, 0,
+            "cancelled attempts cannot be attributed as deaths later"
+        );
+    }
+
+    #[test]
+    fn scheduled_callgraph_retries_an_edit_with_a_fresh_corpus_without_breaker_deaths() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        crate::callgraph_store::set_cold_build_extract_observer(Some(Arc::new(move |paths| {
+            if let Some(path) = paths
+                .iter()
+                .find(|path| path.file_name().unwrap() == "a.rs")
+            {
+                if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                    std::fs::write(path, "pub fn after_edit_marker() {}\n").unwrap();
+                }
+            }
+        })));
+        let (ctx, _project, _storage, _root, release, events) =
+            gated_callgraph_cold_build(Duration::from_secs(60));
+        crate::callgraph_store::set_cold_build_extract_observer(None);
+        release.send(()).unwrap();
+        let event = events.recv_timeout(Duration::from_secs(30)).unwrap();
+        let store = match event {
+            CallGraphStoreBuildEvent::Ready { store, .. } => store,
+            _ => panic!("the scheduled worker settled without publishing the edited corpus"),
+        };
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(store.nodes_matching("after_edit_marker").unwrap().len(), 1);
+        assert!(store.nodes_matching("a_marker").unwrap().is_empty());
+        assert_callgraph_churn_was_not_charged(&ctx);
+        assert_eq!(ctx.callgraph_cold_build_spawn_count_for_test(), 1);
+        drop(store);
+        assert!(matches!(
+            ctx.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn scheduled_callgraph_churn_budget_settles_as_building_without_breaker_deaths() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        crate::callgraph_store::set_cold_build_extract_observer(Some(Arc::new(move |paths| {
+            if let Some(path) = paths
+                .iter()
+                .find(|path| path.file_name().unwrap() == "a.rs")
+            {
+                let version = observed.fetch_add(1, Ordering::SeqCst);
+                std::fs::write(path, format!("pub fn changing_{version}() {{}}\n")).unwrap();
+            }
+        })));
+        let (ctx, _project, _storage, _root, release, events) =
+            gated_callgraph_cold_build(Duration::from_secs(60));
+        crate::callgraph_store::set_cold_build_extract_observer(None);
+        release.send(()).unwrap();
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(30)).unwrap(),
+            CallGraphStoreBuildEvent::Settled
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_callgraph_churn_was_not_charged(&ctx);
+        let _wait = callgraph_build_wait_ms(&ctx, 10_000);
+        assert!(matches!(
+            ctx.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Building
+        ));
+        assert!(matches!(
+            ctx.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Ready(_)
+        ));
+        assert_callgraph_churn_was_not_charged(&ctx);
+    }
+
     /// Schedules a callgraph cold build held at its start gate, with the
     /// given abandon grace, and returns the context, project root, the gate
     /// release, and a clone of the build's event receiver.

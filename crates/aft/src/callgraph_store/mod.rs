@@ -120,7 +120,7 @@ pub type ColdBuildPhaseObserver = dyn Fn(&'static str) + Send + Sync + 'static;
 #[cfg(test)]
 type ColdBuildSliceObserver = dyn Fn(&'static str, usize, usize) + Send + Sync + 'static;
 #[cfg(test)]
-type ColdBuildExtractObserver = dyn Fn(&[PathBuf]) + Send + Sync + 'static;
+pub(crate) type ColdBuildExtractObserver = dyn Fn(&[PathBuf]) + Send + Sync + 'static;
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1816,7 +1816,7 @@ fn notify_cold_build_slice_observer(stage: &'static str, completed: usize, total
 fn notify_cold_build_slice_observer(_stage: &'static str, _completed: usize, _total: usize) {}
 
 #[cfg(test)]
-fn set_cold_build_extract_observer(observer: Option<Arc<ColdBuildExtractObserver>>) {
+pub(crate) fn set_cold_build_extract_observer(observer: Option<Arc<ColdBuildExtractObserver>>) {
     COLD_BUILD_EXTRACT_OBSERVER.with(|slot| *slot.borrow_mut() = observer);
 }
 
@@ -1857,6 +1857,8 @@ pub fn set_legacy_migration_available_disk_for_test(bytes: Option<u64>) {
 pub(crate) struct CallgraphBackgroundTestHooks {
     available_disk: Option<u64>,
     swap_observer: Option<Arc<ColdBuildSwapObserver>>,
+    #[cfg(test)]
+    extract_observer: Option<Arc<ColdBuildExtractObserver>>,
 }
 
 impl CallgraphBackgroundTestHooks {
@@ -1864,6 +1866,8 @@ impl CallgraphBackgroundTestHooks {
         Self {
             available_disk: MIGRATION_AVAILABLE_DISK_OVERRIDE.with(|slot| *slot.borrow()),
             swap_observer: COLD_BUILD_SWAP_OBSERVER.with(|slot| slot.borrow().clone()),
+            #[cfg(test)]
+            extract_observer: COLD_BUILD_EXTRACT_OBSERVER.with(|slot| slot.borrow().clone()),
         }
     }
 
@@ -1871,6 +1875,8 @@ impl CallgraphBackgroundTestHooks {
         let previous = Self::capture();
         set_legacy_migration_available_disk_for_test(self.available_disk);
         set_cold_build_swap_observer(self.swap_observer);
+        #[cfg(test)]
+        set_cold_build_extract_observer(self.extract_observer);
         CallgraphBackgroundTestHooksGuard(previous)
     }
 }
