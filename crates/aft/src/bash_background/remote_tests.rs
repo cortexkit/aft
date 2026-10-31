@@ -3665,7 +3665,7 @@ async fn runon_restart_reattach_drain_child() {
     fs::write(root.join("task-id"), task_id).unwrap();
 }
 
-async fn runon_restart_first_watch_reattaches(watch_before_replay: bool) {
+async fn runon_restart_first_watch_reattaches(watch_before_replay: bool, relaxed_lookup: bool) {
     let daemon =
         crate::exec_remote::wire_tests::daemon_with_clients(Script::Started, "exec-remote/v1", 2)
             .await;
@@ -3700,6 +3700,18 @@ async fn runon_restart_first_watch_reattaches(watch_before_replay: bool) {
             .replay_session_for_project(&storage, "session", &project)
             .unwrap();
     };
+    if relaxed_lookup {
+        let snapshot = ctx.bash_background().status_relaxed(
+            &task_id,
+            "session",
+            &project,
+            &storage,
+            0,
+            false,
+            Duration::ZERO,
+        );
+        assert!(snapshot.is_some(), "relaxed lookup must find the saved job");
+    }
     if !watch_before_replay {
         replay();
     }
@@ -3750,12 +3762,22 @@ async fn runon_restart_first_watch_reattaches(watch_before_replay: bool) {
 
 #[tokio::test]
 async fn runon_restart_reattach_first_watch_before_replay() {
-    runon_restart_first_watch_reattaches(true).await;
+    runon_restart_first_watch_reattaches(true, false).await;
 }
 
 #[tokio::test]
 async fn runon_restart_reattach_first_watch_after_replay() {
-    runon_restart_first_watch_reattaches(false).await;
+    runon_restart_first_watch_reattaches(false, false).await;
+}
+
+#[tokio::test]
+async fn runon_restart_reattach_relaxed_lookup_before_first_watch() {
+    runon_restart_first_watch_reattaches(true, true).await;
+}
+
+#[tokio::test]
+async fn runon_restart_reattach_relaxed_lookup_before_replay() {
+    runon_restart_first_watch_reattaches(false, true).await;
 }
 
 #[tokio::test]
