@@ -13,7 +13,7 @@ fi
 # Usage:
 #   ./scripts/release.sh 0.2.0        # release v0.2.0
 #   ./scripts/release.sh 0.2.0 --dry  # preview without committing/pushing
-#   ./scripts/release.sh --retry-from v0.2.0 0.2.1 --fix <commit> [--fix <commit> ...]
+#   ./scripts/release.sh --retry-from v0.2.0 0.2.1 --fix <commit> [--fix <commit> ...] [--notes-file <path>]
 #
 # What it does:
 #   1. Validates the version is semver

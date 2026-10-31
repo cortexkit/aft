@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "release-retry-notes-file"
+  ],
+  "note": "Release tooling only: the retry release accepts --notes-file for a patch of a published release. No engine change."
+}
