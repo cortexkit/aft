@@ -21350,7 +21350,10 @@ mod callgraph_store_for_ops_tests {
                         callgraph: true,
                     },
                     callgraph_chunk_size: 1,
-                    views: crate::config::ViewsConfig { enabled: true },
+                    views: crate::config::ViewsConfig {
+                        enabled: true,
+                        ..Default::default()
+                    },
                     ..Config::default()
                 },
             );
