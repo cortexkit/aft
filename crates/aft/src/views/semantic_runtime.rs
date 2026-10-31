@@ -163,9 +163,9 @@ impl CheckoutSemantic {
     }
 
     /// [`Self::new`] for a root whose lexical views use `policy`. The view is a
-    /// v3 member (`<scope>.semantic`) with all three planes registered, so its
-    /// base carries trigram and call-graph rows too and its publications go
-    /// to the v3 namespace only.
+    /// v3 member (`<scope>.semantic`) with the trigram and semantic planes
+    /// registered; its publications go to the v3 namespace only. It has no
+    /// call-graph plane: the checkout's call graph is its own member.
     pub fn with_trigram_policy(
         storage: &crate::root_cache::StoragePaths,
         family: &str,
@@ -176,10 +176,18 @@ impl CheckoutSemantic {
         wake: Weak<CheckoutSemanticSlot>,
     ) -> Result<Self, String> {
         let plane = shared_plane(&storage.artifacts, producer);
+        // The call graph is unregistered here, as for lexical-only views: the
+        // checkout's call graph is its own member (`<scope>.callgraph`), and
+        // nothing reads one from this member. A registered call-graph producer
+        // made this member's base and every publication extract call-graph
+        // facts and write a resolved call-graph database of their own, a clone
+        // on filesystems that support clones and a full copy elsewhere, and
+        // rebuild it whenever only embeddings changed. Unregistered, the
+        // base keeps its call-graph entries pending and builds no database.
         let producers = Producers {
             trigram: policy.fingerprint_hex(),
             semantic: Some(plane.semantic_producer().id()),
-            callgraph: super::callgraph::PRODUCER.into(),
+            callgraph: UNREGISTERED_PRODUCER.into(),
         };
         let composite: Arc<dyn CompositePlane> = plane.clone();
         let adapter: Arc<dyn PlaneAdapter> = plane.clone();
@@ -187,12 +195,6 @@ impl CheckoutSemantic {
             storage.artifacts.clone(),
             policy,
         ));
-        // No call-graph plane here. The checkout's call graph is its own
-        // member (`<scope>.callgraph`), and nothing reads a call graph from
-        // this semantic member. Attaching the call-graph plane made every
-        // publication of this member extract call-graph facts and write a
-        // second resolved call-graph database for the checkout, a clone on
-        // filesystems that support clones and a full copy elsewhere.
         let member_scope = view_scope(scope);
         let driver = Arc::new(
             CheckoutDriver::new_v3(
