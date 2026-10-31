@@ -1689,6 +1689,10 @@ fn scope_project_case_034(
     bind_error: Option<&str>,
     rootless: bool,
 ) {
+    // Each case starts a full AFT process. Serialize these fixtures so the
+    // connection deadline measures one startup, not competing module startups.
+    static CASES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serial = CASES.lock().unwrap_or_else(|error| error.into_inner());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

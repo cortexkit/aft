@@ -183,21 +183,21 @@ async fn open(
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    let mut options = options(role_versions);
-    options.scope = Some(subc_protocol::scope::ScopeSelector::new(
+    let scope = subc_protocol::scope::ScopeSelector::new(
         subc_protocol::Principal::Reserved {
             module_id: "aft-test-scope-owner".into(),
         },
         "e2e-project",
         Some(1),
-    ));
+    );
     consumer
-        .open_route(
+        .open_route_scoped(
             RouteTarget::ToolProvider {
                 module_id: "aft".into(),
             },
             BindIdentity::new("runner", session),
-            options,
+            scope,
+            options(role_versions),
         )
         .await
 }
