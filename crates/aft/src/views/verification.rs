@@ -1473,7 +1473,9 @@ mod tests {
         let mut absent_fifo = blake3::Hasher::new();
         let mut absent_socket = blake3::Hasher::new();
         assert!(metadata_source(&fifo, &mut absent_fifo).unwrap().is_none());
-        assert!(metadata_source(&socket, &mut absent_socket).unwrap().is_none());
+        assert!(metadata_source(&socket, &mut absent_socket)
+            .unwrap()
+            .is_none());
         let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         // The path is NUL-terminated and the FIFO remains inside the fixture.
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
@@ -1481,7 +1483,9 @@ mod tests {
         let mut fifo_hash = blake3::Hasher::new();
         let mut socket_hash = blake3::Hasher::new();
         assert!(metadata_source(&fifo, &mut fifo_hash).unwrap().is_none());
-        assert!(metadata_source(&socket, &mut socket_hash).unwrap().is_none());
+        assert!(metadata_source(&socket, &mut socket_hash)
+            .unwrap()
+            .is_none());
         assert_eq!(fifo_hash.finalize(), absent_fifo.finalize());
         assert_eq!(socket_hash.finalize(), absent_socket.finalize());
     }

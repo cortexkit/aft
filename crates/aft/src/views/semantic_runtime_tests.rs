@@ -1623,6 +1623,14 @@ fn semantic_states(
         .collect()
 }
 
+/// Gives a fixture checkout a base of its own. Bases are content-keyed, so two
+/// checkouts with the same files and ignore policy share one base. Tests about
+/// separate checkouts racing on the same family chunks need separate bases,
+/// so each gets an `.aftignore` that differs only by a comment.
+fn separate_base(root: &Path, tag: &str) {
+    std::fs::write(root.join(".aftignore"), format!("# {tag}\n")).unwrap();
+}
+
 #[test]
 fn family_fill_rechecks_completed_work_after_acquiring_claim() {
     let storage = tempfile::tempdir().unwrap();
@@ -1631,6 +1639,8 @@ fn family_fill_rechecks_completed_work_after_acquiring_claim() {
     let files = [("src/file.rs", "pub fn one_chunk() -> u8 { 1 }\n")];
     write_tree(first.path(), &files);
     write_tree(second.path(), &files);
+    separate_base(first.path(), "first");
+    separate_base(second.path(), "second");
     let a = open(storage.path(), "a", first.path());
     let b = Arc::new(open(storage.path(), "b", second.path()));
     let model = Arc::new(Model::default());
@@ -2889,8 +2899,9 @@ fn semantic_batch_lease_durable_chunks_reused_during_cold_readmission() {
     let storage = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let sibling_root = tempfile::tempdir().unwrap();
-    for root in [root.path(), sibling_root.path()] {
+    for (tag, root) in [("owner", root.path()), ("sibling", sibling_root.path())] {
         write_tree(root, &[("file.rs", "pub fn readmission_chunk() {}\n")]);
+        separate_base(root, tag);
     }
     let (slot, epoch, _wake, runtime) = served_lane(storage.path(), root.path());
     let schedule = fast_schedule(root.path());
@@ -3257,6 +3268,7 @@ fn semantic_fill_waiter_yields_cold_slot(shared_content: bool) {
                 )],
             );
         }
+        separate_base(root.path(), &format!("sibling-{i}"));
         let slot = Arc::new(CheckoutSemanticSlot::default());
         let (epoch, wake) = slot.begin();
         let runtime = Arc::new(open(storage.path(), &format!("sibling-{i}"), root.path()));
