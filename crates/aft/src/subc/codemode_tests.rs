@@ -36,6 +36,8 @@ fn route(root: &ProjectRootId, session: &str, scope: ScopeStamp, mode: CallMode)
     let data = Arc::get_mut(&mut identity.0).unwrap();
     data.scope = Some(scope);
     data.call_mode = mode;
+    data.held_reply = data.call_mode == CallMode::Codemode;
+    data.tool_result_body = data.held_reply;
     data.disabled_tools = Arc::new(vec![format!("disabled-by-{session}")]);
     identity
 }
@@ -275,7 +277,10 @@ fn codemode_call_runs_with_head_route_access_and_run_lifetime() {
     assert!(!access_grants::alfonso_worker(&effective));
     assert_eq!(
         access_grants::ask_route(&effective),
-        crate::access_policy::AskRoute::Unavailable
+        crate::access_policy::AskRoute::Consent {
+            once: Vec::new(),
+            launch: None,
+        }
     );
     // Lifetime stays the run's: its scope keeps tagging the work it starts.
     assert_eq!(effective.scope, run.scope);

@@ -229,7 +229,7 @@ impl BashCallClaim {
         self.changed.notify_one();
     }
 
-    fn cancel_requested(&self) -> bool {
+    pub(super) fn cancel_requested(&self) -> bool {
         self.cancel_requested.load(Ordering::SeqCst)
     }
 
