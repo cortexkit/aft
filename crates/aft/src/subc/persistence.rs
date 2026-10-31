@@ -861,6 +861,8 @@ mod tests {
             trust: BindTrust::FirstParty,
             spawn_principal: unscoped.spawn_principal.clone(),
             consumer_elicitation_capable: false,
+            held_reply: false,
+            held_update: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             scope: Some(scope),
