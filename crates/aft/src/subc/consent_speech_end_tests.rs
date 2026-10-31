@@ -408,7 +408,7 @@ async fn audit_started_shell_is_killed_by_scope_cleanup_and_never_not_started() 
     );
     assert_eq!(
         snapshot.info.status_reason.as_deref(),
-        Some("scope_revoked")
+        Some("run_ended")
     );
     assert!(run.run_scope.get().unwrap().revoked());
     let reply = tokio::time::timeout(Duration::from_secs(10), replies.recv())
