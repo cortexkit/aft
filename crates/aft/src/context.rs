@@ -12657,7 +12657,7 @@ impl AppContext {
             });
         if readmit {
             let admission = callgraph_copies::admit(
-                &storage.artifacts,
+                storage,
                 family,
                 policy,
                 root,

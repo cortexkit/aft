@@ -59,13 +59,14 @@ struct Member {
 /// identities (size and content hash by relative path) when they are known,
 /// so a checkout identical to the graph it would borrow is not counted.
 pub(crate) fn admit(
-    storage: &Path,
+    paths: &crate::root_cache::StoragePaths,
     family: &str,
     policy: crate::blob_store::v2::TrigramPolicy,
     root: &Path,
     copies: u32,
     identities: impl FnOnce() -> Option<HashMap<String, (u64, blake3::Hash)>>,
 ) -> Result<Admission, String> {
+    let storage = paths.artifacts.as_path();
     let Some(main) = super::read::main_checkout_root(root) else {
         return Ok(Admission::Own);
     };
@@ -113,8 +114,39 @@ pub(crate) fn admit(
     if owned < copies as usize {
         return Ok(Admission::Own);
     }
-    // At the limit: make room by evicting copies nobody is using.
-    let needed = owned + 1 - copies as usize;
+    // At the limit: make room by evicting copies nobody is using. When none
+    // can go, or eviction fails, this checkout borrows, so the limit holds.
+    match evict_for(
+        paths,
+        family,
+        &target.scope,
+        &own,
+        owned + 1 - copies as usize,
+    ) {
+        Ok(true) => Ok(Admission::Own),
+        Ok(false) => Ok(borrow),
+        Err(reason) => {
+            crate::slog_warn!(
+                "views callgraph copy eviction failed for={own} limit={copies}: {reason}"
+            );
+            Ok(borrow)
+        }
+    }
+}
+
+/// Evicts `needed` idle call-graph copies other than `target` and `own`.
+/// `Ok(false)` when every remaining copy is in use.
+fn evict_for(
+    paths: &crate::root_cache::StoragePaths,
+    family: &str,
+    target: &str,
+    own: &str,
+    needed: usize,
+) -> Result<bool, String> {
+    let storage = paths.artifacts.as_path();
+    // View-directory removal refuses a cache whose durable owner is unknown;
+    // declare it, as storage retention does before it evicts.
+    crate::root_cache::register_durable_owner(paths).map_err(|error| error.to_string())?;
     let deadline = Instant::now() + EVICTION_BUDGET;
     let lock = crate::blob_store::v3::ReservationLock::acquire_until(storage, deadline)
         .map_err(|error| error.to_string())?;
@@ -126,19 +158,19 @@ pub(crate) fn admit(
             family,
             &mut registry,
             SUFFIX,
-            &[target.scope.as_str(), own.as_str()],
+            &[target, own],
             EVICTION_CANDIDATES,
             deadline,
         )
         .map_err(|error| error.to_string())?;
         match evicted {
-            Some(scope) => crate::slog_info!(
-                "views callgraph copy evicted scope={scope} for={own} limit={copies}"
-            ),
-            None => return Ok(borrow),
+            Some(scope) => {
+                crate::slog_info!("views callgraph copy evicted scope={scope} for={own}")
+            }
+            None => return Ok(false),
         }
     }
-    Ok(Admission::Own)
+    Ok(true)
 }
 
 /// True when the checkout's known files equal the target's published graph,

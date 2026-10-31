@@ -1530,8 +1530,9 @@ mod tests {
             max_file_size: 1 << 20,
         };
         let family = "donor-reuse";
+        let paths = crate::root_cache::StoragePaths::same(&storage);
         let admit = |root: &Path, copies| {
-            callgraph_copies::admit(&storage, family, policy, root, copies, || None).unwrap()
+            callgraph_copies::admit(&paths, family, policy, root, copies, || None).unwrap()
         };
         let main_scope = view_scope(&main);
         let borrow_main = Admission::Borrow {
@@ -1622,7 +1623,7 @@ mod tests {
         assert_eq!(edited.files, ["c.ts"], "{edited:?}");
         drop(store);
         assert_eq!(
-            callgraph_copies::admit(&storage, family, policy, &clean, 5, identities).unwrap(),
+            callgraph_copies::admit(&paths, family, policy, &clean, 5, identities).unwrap(),
             borrow_main,
         );
 
