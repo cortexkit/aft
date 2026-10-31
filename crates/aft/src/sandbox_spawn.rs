@@ -2155,22 +2155,13 @@ fn build_relaxed_profile(
         stores
             .read_metadata_allow
             .extend(git.metadata_allow.iter().cloned());
-        for key in ["core.hooksPath", "mason.originalHooksPath"] {
-            if !git.repository_paths_resolved
-                && !git
-                    .configured_paths
-                    .iter()
-                    .any(|(existing, _)| existing == key)
-            {
-                let mut metadata = Vec::new();
-                if let Some((_, path)) = configured_git_path(root, key, &mut metadata)? {
-                    if profile_candidate_is_dir(&path) {
-                        stores.read_allow.push(path);
-                    }
-                    stores.read_metadata_allow.extend(metadata);
-                }
+        let mut metadata = Vec::new();
+        for path in resolve_missing_repository_hooks(root, git, &mut metadata)? {
+            if profile_candidate_is_dir(&path) {
+                stores.read_allow.push(path);
             }
         }
+        stores.read_metadata_allow.extend(metadata);
         let listing = git_policy_output(root, &["worktree", "list", "--porcelain", "-z"])
             .map_err(|error| format!("cannot enumerate sibling checkouts: {error}"))?;
         if listing.status.success() {
@@ -2391,18 +2382,11 @@ fn checkout_control_denies(root: &Path, git: &GitPolicy) -> Result<Vec<PathBuf>,
             .filter(|(key, _)| key != "core.excludesFile")
             .map(|(_, path)| path.clone()),
     );
-    for key in ["core.hooksPath", "mason.originalHooksPath"] {
-        if !git.repository_paths_resolved
-            && !git
-                .configured_paths
-                .iter()
-                .any(|(existing, _)| existing == key)
-        {
-            if let Some((_, path)) = configured_git_path(root, key, &mut Vec::new())? {
-                denies.push(path);
-            }
-        }
-    }
+    denies.extend(resolve_missing_repository_hooks(
+        root,
+        git,
+        &mut Vec::new(),
+    )?);
     if let Some((git_dir, _)) = &git.linked {
         // Binding pointers must stay immutable too: redirecting one would
         // replace the operator-owned configuration used on the next spawn.
@@ -3102,10 +3086,6 @@ struct GitPolicy {
     /// and the shared common directory of the main repository.
     linked: Option<(PathBuf, PathBuf)>,
     configured_paths: Vec<(String, PathBuf)>,
-    // True after querying repository hook/excludes keys for a jailed worker,
-    // including unset keys. Resolution outside a worker jail omits those
-    // queries, so control-file deny/grant builders must query missing keys.
-    repository_paths_resolved: bool,
     metadata_allow: Vec<PathBuf>,
 }
 
@@ -4010,7 +3990,6 @@ fn resolve_git_policy_uncached(
                     hooks: vec![dot_git.join("hooks")],
                     linked: None,
                     configured_paths: Vec::new(),
-                    repository_paths_resolved: false,
                     metadata_allow: Vec::new(),
                 },
                 None,
@@ -4157,17 +4136,12 @@ fn resolve_git_policy_uncached(
         read_roots.dedup();
         read_roots
     };
-    let repository_paths_resolved = worker;
-    #[cfg(all(test, target_os = "linux"))]
-    let repository_paths_resolved = repository_paths_resolved
-        && !git_policy_cache_tests::BENCH_UNBATCHED.with(|value| value.get());
     Ok((
         GitPolicy {
             read_roots,
             hooks: vec![hooks],
             linked,
             configured_paths,
-            repository_paths_resolved,
             metadata_allow,
         },
         inputs,
@@ -4249,22 +4223,29 @@ fn resolve_hooks_path(
     resolve_git_policy_path(common_dir.join("hooks"), "Git hooks")
 }
 
-/// Resolve operator-owned Git path settings before any command-supplied
-/// environment is applied. `--path` expands Git's home-relative spelling.
+/// Read missing keys again at the deny/grant consumer. A cached absence is not
+/// proof that a key remains unset: optional targets or configuration files can
+/// appear, or settings can change, after the earlier policy resolution.
 #[cfg(unix)]
-fn configured_git_path(
+fn resolve_missing_repository_hooks(
     project_root: &Path,
-    key: &str,
+    git: &GitPolicy,
     metadata_allow: &mut Vec<PathBuf>,
-) -> Result<Option<(PathBuf, PathBuf)>, String> {
-    configured_git_paths_with_inputs(project_root, &[key], metadata_allow, &mut None).map(|paths| {
-        paths
-            .into_iter()
-            .next()
-            .map(|(_, input, path)| (input, path))
-    })
+) -> Result<Vec<PathBuf>, String> {
+    let missing = ["core.hooksPath", "mason.originalHooksPath"]
+        .into_iter()
+        .filter(|key| {
+            !git.configured_paths
+                .iter()
+                .any(|(existing, _)| existing == *key)
+        })
+        .collect::<Vec<_>>();
+    configured_git_paths_with_inputs(project_root, &missing, metadata_allow, &mut None)
+        .map(|paths| paths.into_iter().map(|(_, _, path)| path).collect())
 }
 
+/// Resolve operator-owned Git path settings before any command-supplied
+/// environment is applied. `--path` expands Git's home-relative spelling.
 #[cfg(unix)]
 fn configured_git_paths_with_inputs(
     project_root: &Path,
@@ -7921,9 +7902,9 @@ mod git_policy_cache_tests {
         pub(super) static BENCH_UNBATCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
-    // Keep the former per-key queries and missing-key fallback reads available
-    // only to the manual benchmark, so both schedules run in one binary with
-    // the same sandbox rules, filesystem inputs and cache validation.
+    // Keep the former per-key query schedule available only to the manual
+    // benchmark. Both schedules retain fresh consumer reads and use the same
+    // sandbox rules, filesystem inputs and cache validation.
     #[cfg(target_os = "linux")]
     pub(super) fn legacy_git_path_values(
         project_root: &Path,
@@ -8092,7 +8073,6 @@ mod git_policy_cache_tests {
                     hooks: Vec::new(),
                     linked: None,
                     configured_paths: Vec::new(),
-                    repository_paths_resolved: false,
                     metadata_allow: Vec::new(),
                 },
                 inputs: GitPolicyInputs {
@@ -8149,15 +8129,14 @@ mod git_policy_cache_tests {
     }
 
     #[test]
-    fn git_policy_cache_worker_denies_reuse_absent_repository_paths() {
+    fn git_policy_cache_worker_denies_keep_late_repository_reads() {
         let fixture = Fixture::new();
         let (policy, _) = fixture.resolve();
         let before = fixture.state(|state| state.calls);
         checkout_control_denies(&fixture.root, &policy).unwrap();
-        assert_eq!(
-            fixture.state(|state| state.calls),
-            before,
-            "an absent repository key was already resolved"
+        assert!(
+            fixture.state(|state| state.calls) > before,
+            "missing worker settings require an authoritative late read"
         );
 
         let config = fixture.root.join(".git/config");
@@ -8178,9 +8157,10 @@ mod git_policy_cache_tests {
         let before = fixture.state(|state| state.calls);
         let denies = checkout_control_denies(&fixture.root, &head).unwrap();
         assert!(denies.contains(&fixture.root.join("new-original")));
-        assert!(
-            fixture.state(|state| state.calls) > before,
-            "non-worker policies still need repository-scope fallbacks"
+        assert_eq!(
+            fixture.state(|state| state.calls) - before,
+            2,
+            "both missing head-policy keys share one extension probe and one local scope read"
         );
     }
 
@@ -10842,7 +10822,6 @@ mod policy_tests {
             hooks: vec![common.join("hooks")],
             linked: Some((own.clone(), common.clone())),
             configured_paths: Vec::new(),
-            repository_paths_resolved: false,
             metadata_allow: Vec::new(),
         };
         let main = GitPolicy {
@@ -10850,7 +10829,6 @@ mod policy_tests {
             hooks: Vec::new(),
             linked: None,
             configured_paths: Vec::new(),
-            repository_paths_resolved: false,
             metadata_allow: Vec::new(),
         };
         let grants = linked_git_grants(&[linked, main]);
@@ -10896,7 +10874,6 @@ mod policy_tests {
             hooks: vec![common.join("hooks")],
             linked: Some((own, common.clone())),
             configured_paths: Vec::new(),
-            repository_paths_resolved: false,
             metadata_allow: Vec::new(),
         };
         let grants = worker_jail_grants(&home, &[worktree], &[git], &policy);
