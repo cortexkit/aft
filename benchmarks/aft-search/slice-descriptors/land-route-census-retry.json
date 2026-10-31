@@ -1,0 +1,9 @@
+{
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "kind": "harness",
+  "note": "Test-only: the route census test retries a snapshot that reports unknown pins while the executor scheduler is briefly locked. No search, ranking or query routing changes.",
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none"
+}
