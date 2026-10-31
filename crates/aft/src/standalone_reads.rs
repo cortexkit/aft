@@ -12,6 +12,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 // Separate admission budgets keep a burst of graph queries from refusing reads.
 const LANE_CAP: usize = 256;
 
+/// What an agent sees when its call finds the project's lane full. The call
+/// was never queued, so retrying is safe.
+const STANDALONE_READS_BUSY: &str =
+    "Too many calls are waiting on this project; retry after some finish.";
+
 pub(super) struct StandaloneReads {
     executor: Arc<Executor>,
     reads: Arc<AtomicUsize>,
@@ -70,7 +75,7 @@ impl StandaloneReads {
             return DispatchOutcome::Immediate(Response::error_with_data(
                 &req.id,
                 "busy",
-                "standalone read lane is full; retry after outstanding calls finish",
+                STANDALONE_READS_BUSY,
                 serde_json::json!({"retryable": true}),
             ));
         };
@@ -446,7 +451,7 @@ mod tests {
         assert_eq!(busy.data["code"], "busy");
         assert_eq!(
             busy.data["message"],
-            "standalone read lane is full; retry after outstanding calls finish"
+            "Too many calls are waiting on this project; retry after some finish."
         );
         assert_eq!(busy.data["retryable"], true);
         // The read lane has its own budget, even when the heavy queue is full.
