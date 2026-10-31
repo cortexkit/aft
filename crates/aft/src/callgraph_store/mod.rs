@@ -8940,6 +8940,7 @@ impl CallGraphStore {
         }
         // Compare committed resolver inputs, not manifest bytes. A branch switch
         // or dependency bump usually leaves every Rust binding unchanged.
+        let mut manifest_reextract = BTreeSet::new();
         let rust_manifest_inputs = if deleted
             .iter()
             .chain(changed_extracts.keys())
@@ -8947,11 +8948,12 @@ impl CallGraphStore {
         {
             let inputs = rust_manifest::Inputs::build(&self.project_root);
             let previous = rust_manifest::Inputs::load(&conn)?;
-            let (importers, barrels) = inputs.affected_callers(&conn, previous.as_ref())?;
+            let selection = inputs.affected_callers(&conn, previous.as_ref())?;
+            manifest_reextract = selection.reextract;
             let _ = workspace_crate_prefixes
                 .0
                 .set(inputs.prefixes.clone().into_iter().collect());
-            for caller in importers {
+            for caller in selection.callers {
                 if deleted.contains(&caller) {
                     continue;
                 }
@@ -8962,7 +8964,7 @@ impl CallGraphStore {
                     all_refs_of_caller(&conn, &caller)?,
                 );
             }
-            for barrel in barrels {
+            for barrel in selection.barrels {
                 record_dependent_refs(
                     &mut selected_ref_ids,
                     &mut selected_refs_by_caller,
@@ -9049,6 +9051,13 @@ impl CallGraphStore {
             crate::cold_build_limiter::progress::advance(1);
             match extract {
                 Ok(extract) => {
+                    // Changing Cargo's library or binary entry file can move
+                    // module declarations inside unchanged source. Compare the
+                    // entire extract to replace obsolete module-reference IDs.
+                    if manifest_reextract.contains(&rel_path) {
+                        candidate_own_refresh.insert(rel_path.clone());
+                        changed_extracts.insert(rel_path.clone(), extract.clone());
+                    }
                     caller_extracts.insert(rel_path, extract);
                 }
                 // A dependent that no longer decodes keeps its stored

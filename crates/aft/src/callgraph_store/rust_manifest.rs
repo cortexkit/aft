@@ -14,6 +14,13 @@ pub(super) struct Inputs {
     targets: BTreeMap<String, Value>,
 }
 
+#[derive(Default)]
+pub(super) struct Selection {
+    pub callers: BTreeSet<String>,
+    pub barrels: BTreeSet<String>,
+    pub reextract: BTreeSet<String>,
+}
+
 impl Inputs {
     pub fn build(root: &Path) -> Self {
         let disk = DiskFacts::new(root);
@@ -54,29 +61,37 @@ impl Inputs {
         &self,
         conn: &Connection,
         previous: Option<&Self>,
-    ) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
+    ) -> Result<Selection> {
         let Some(previous) = previous else {
-            return Ok((
-                stored_rust_files(conn)?.into_iter().collect(),
-                BTreeSet::new(),
-            ));
+            let callers: BTreeSet<_> = stored_rust_files(conn)?.into_iter().collect();
+            return Ok(Selection {
+                barrels: BTreeSet::new(),
+                reextract: callers.clone(),
+                callers,
+            });
         };
         let names: BTreeSet<_> = self
             .prefixes
             .keys()
             .chain(previous.prefixes.keys())
-            .filter(|name| self.prefixes.get(*name) != previous.prefixes.get(*name))
+            .filter(|name| {
+                self.prefixes.get(*name) != previous.prefixes.get(*name)
+                    || self.prefixes.get(*name).is_some_and(|prefix| {
+                        let file = format!("{prefix}/lib.rs");
+                        self.owner(&file) != previous.owner(&file)
+                    })
+            })
             .collect();
-        let mut callers = BTreeSet::new();
-        let mut barrels = BTreeSet::new();
+        let mut selection = Selection::default();
         // Target roots and manifest presence can change local module ownership
         // without changing a crate's name. Only files owned by those manifests
         // need that conservative refresh, not their sibling crates.
         if self.targets != previous.targets {
             for file in stored_rust_files(conn)? {
                 if self.owner(&file) != previous.owner(&file) {
-                    barrels.insert(file.clone());
-                    callers.insert(file);
+                    selection.barrels.insert(file.clone());
+                    selection.reextract.insert(file.clone());
+                    selection.callers.insert(file);
                 }
             }
         }
@@ -98,12 +113,12 @@ impl Inputs {
             for row in rows {
                 let (caller, kind) = row?;
                 if kind == "reexport" {
-                    barrels.insert(caller.clone());
+                    selection.barrels.insert(caller.clone());
                 }
-                callers.insert(caller);
+                selection.callers.insert(caller);
             }
         }
-        Ok((callers, barrels))
+        Ok(selection)
     }
 
     fn owner(&self, file: &str) -> Option<(&str, &Value)> {

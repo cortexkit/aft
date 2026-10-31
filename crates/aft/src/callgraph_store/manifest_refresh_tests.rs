@@ -79,8 +79,14 @@ impl Fixture {
             ("other/Cargo.toml", "[package]\nname = \"other\"\n"),
             (
                 "dep/src/lib.rs",
-                "pub fn target() { helper(); } fn helper() {}\n",
+                "mod root; pub fn target() { helper(); } fn helper() {}\n",
             ),
+            (
+                "dep/src/root.rs",
+                "pub mod leaf; pub fn run() { leaf::target(); }\n",
+            ),
+            ("dep/src/root/leaf.rs", "pub fn target() {}\n"),
+            ("dep/src/leaf.rs", "pub fn target() {}\n"),
             (
                 "facade/src/lib.rs",
                 "pub use dep_crate::target as forwarded;\n",
@@ -177,6 +183,12 @@ fn cargo_manifest_added_dependency_resolves_zero_references() {
 #[test]
 fn cargo_manifest_rename_resolves_only_affected_files() {
     let fixture = Fixture::new();
+    let before = fixture
+        .store
+        .call_tree(Path::new("app/src/direct.rs"), "direct", 1)
+        .unwrap();
+    assert!(before.children[0].resolved);
+    assert!(!before.children[1].resolved);
     let work = fixture.refresh(
         "dep/Cargo.toml",
         "[package]\nname = \"fresh-crate\"\nversion = \"0.1.0\"\n",
@@ -188,11 +200,34 @@ fn cargo_manifest_rename_resolves_only_affected_files() {
             "app/src/direct.rs".to_string(),
             "app/src/alias.rs".to_string(),
             "app/src/glob.rs".to_string(),
-            "app/src/indirect.rs".to_string(),
             "facade/src/lib.rs".to_string(),
-            "facade2/src/lib.rs".to_string(),
         ])
     );
+    let after = fixture
+        .store
+        .call_tree(Path::new("app/src/direct.rs"), "direct", 1)
+        .unwrap();
+    assert!(!after.children[0].resolved);
+    assert!(after.children[1].resolved);
+}
+
+#[test]
+fn cargo_manifest_lib_name_selects_new_name_without_refreshing_package_importers() {
+    let fixture = Fixture::new();
+    let work = fixture.refresh(
+        "dep/Cargo.toml",
+        "[package]\nname = \"dep-crate\"\nversion = \"0.1.0\"\n[lib]\nname = \"fresh_crate\"\n",
+    );
+    assert_eq!(
+        work.resolved_files,
+        BTreeSet::from(["app/src/direct.rs".to_string()])
+    );
+    let tree = fixture
+        .store
+        .call_tree(Path::new("app/src/direct.rs"), "direct", 1)
+        .unwrap();
+    assert!(tree.children[0].resolved);
+    assert!(tree.children[1].resolved);
 }
 
 #[test]
@@ -218,4 +253,25 @@ fn cargo_manifest_workspace_members_do_not_change_stored_resolver_bindings() {
     let fixture = Fixture::new();
     let work = fixture.refresh("Cargo.toml", "[workspace]\nmembers = [\"dep\", \"app\"]\n");
     assert_eq!(work.resolved_refs, 0);
+}
+
+#[test]
+fn cargo_manifest_target_root_refreshes_module_structure_without_sibling_crates() {
+    let fixture = Fixture::new();
+    let before = fixture
+        .store
+        .call_tree(Path::new("dep/src/root.rs"), "run", 1)
+        .unwrap();
+    assert_eq!(before.children[0].file, "dep/src/root/leaf.rs");
+    let work = fixture.refresh(
+        "dep/Cargo.toml",
+        "[package]\nname = \"dep-crate\"\nversion = \"0.1.0\"\n[lib]\npath = \"src/root.rs\"\n",
+    );
+    let after = fixture
+        .store
+        .call_tree(Path::new("dep/src/root.rs"), "run", 1)
+        .unwrap();
+    assert_eq!(after.children[0].file, "dep/src/leaf.rs");
+    assert!(work.resolved_files.contains("dep/src/root.rs"));
+    assert!(!work.resolved_files.contains("other/src/lib.rs"));
 }
