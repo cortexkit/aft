@@ -13541,9 +13541,12 @@ fn staged_content_matches(
         return Ok(false);
     };
     if let Some(corpus) = corpus {
-        // A matching staged corpus fingerprint already compared full digests,
-        // including sources above the freshness hash cap. Their persisted zero
-        // hash is a sentinel, not a digest to compare with the corpus file's hash.
+        // Staging is only resumed when the fingerprint stored with the staged
+        // build (`STAGED_CORPUS_FINGERPRINT`) equals the current corpus
+        // fingerprint. That fingerprint is built from the full digest of every
+        // source, including those above the freshness hash cap, so a resumed
+        // staging already proves those large sources unchanged. Their persisted
+        // zero hash is only a sentinel, not a digest to compare here.
         if staged_size > cache_freshness::CONTENT_HASH_SIZE_CAP
             && staged_hash == hash_to_hex(cache_freshness::zero_hash())
         {
