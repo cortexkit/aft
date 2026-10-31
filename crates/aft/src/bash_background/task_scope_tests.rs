@@ -1,6 +1,19 @@
 use super::*;
 
 #[test]
+fn task_scope_report_only_deadline_has_safe_kill_reason() {
+    for source in [HardKillSource::Scope, HardKillSource::ScopedDefault] {
+        assert_eq!(
+            hard_kill_reason(HardKillDeadline {
+                limit_ms: 1000,
+                source
+            }),
+            "killed by AFT's task time limit of 1s (exit 124)",
+        );
+    }
+}
+
+#[test]
 fn task_scope_failed_spawn_logs_stop_error_once_and_keeps_kill_result() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("cgroup.kill"), "0").unwrap();

@@ -16880,7 +16880,9 @@ pub(crate) fn hard_kill_reason(deadline: HardKillDeadline) -> String {
             format!("killed by the `timeout` of {limit} you passed (exit 124)")
         }
         // This path enforces task timeouts. Scope deadlines are report-only.
-        HardKillSource::Scope | HardKillSource::ScopedDefault => unreachable!("scope deadline in task timeout enforcement"),
+        HardKillSource::Scope | HardKillSource::ScopedDefault => {
+            format!("killed by AFT's task time limit of {limit} (exit 124)")
+        }
     }
 }
 
