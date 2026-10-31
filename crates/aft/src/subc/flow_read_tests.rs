@@ -26,6 +26,7 @@ fn identity(root: &Path, scope: Value, principal: &str) -> RouteIdentity {
             principal_id: Some(principal.into()),
         },
         consumer_elicitation_capable: false,
+        held_reply: false,
         tool_result_body: false,
         disabled_tools: Arc::new(vec![]),
         scope: Some(serde_json::from_value(scope).unwrap()),

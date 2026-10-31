@@ -649,6 +649,7 @@ fn effective_identity(
         // step as the owner's direct call, which then refuses it because a run
         // route has nobody to answer.
         consumer_elicitation_capable: owner.consumer_elicitation_capable,
+        held_reply: run.held_reply,
         // Format negotiation belongs to the consumer receiving this reply.
         tool_result_body: run.tool_result_body,
         disabled_tools: Arc::clone(&owner.disabled_tools),

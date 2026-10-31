@@ -113,6 +113,7 @@ fn data(
         trust: BindTrust::FirstParty,
         spawn_principal: principal("reserved:broca"),
         consumer_elicitation_capable: false,
+        held_reply: false,
         tool_result_body: false,
         disabled_tools: Arc::new(vec![]),
         scope,

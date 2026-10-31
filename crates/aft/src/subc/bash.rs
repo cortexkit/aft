@@ -1064,7 +1064,9 @@ pub(super) fn prepare_bash_elicitation_plan(
     })
 }
 
-fn permission_grants_for_retry(asks: &[crate::bash_permissions::PermissionAsk]) -> Vec<String> {
+pub(super) fn permission_grants_for_retry(
+    asks: &[crate::bash_permissions::PermissionAsk],
+) -> Vec<String> {
     asks.iter()
         .flat_map(|ask| {
             if ask.always.is_empty() {
@@ -1721,6 +1723,181 @@ pub(super) fn submit_deferred_bash(
     reply_budget: impl Into<crate::commands::blocking_wait::ReplyBudget>,
 ) {
     let reply_budget = reply_budget.into();
+    let program = super::secret_consent::current_identity().filter(|identity| {
+        identity
+            .run_owner
+            .as_ref()
+            .is_some_and(|owner| matches!(owner.kind, super::RunKind::Agent { .. }))
+            && matches!(
+                super::access_grants::ask_route(identity),
+                crate::access_policy::AskRoute::Consent { .. }
+            )
+    });
+    if let Some(identity) = program.filter(|_| permissions_granted.is_none()) {
+        let executor = executor.clone();
+        let completion_tx = completion_tx.clone();
+        let poll_touch_tx = poll_touch_tx.clone();
+        let metrics = metrics.clone();
+        let initial_route = crate::access_policy::current_ask_route();
+        let request = request_id.clone();
+        let held = super::consent::HeldCall {
+            reply_deadline: super::consent::program_reply_deadline(),
+            identity: identity.clone(),
+            tool: "bash".into(),
+            arguments: arguments.clone(),
+            request_id: request_id.clone(),
+            executor: executor.clone(),
+            route,
+            corr,
+            active: Arc::default(),
+            connection_cancel: cancel.connection.clone(),
+            drain: cancel.drain.clone(),
+        };
+        tokio::spawn(async move {
+            let launch = |ask_route, permissions| {
+                let (tx, mut rx) = mpsc::channel(2);
+                let _scope = crate::access_policy::scope_guard(Some(
+                    super::access_grants::policy_scope_key(&identity),
+                ));
+                let _grants = crate::access_policy::scope_grants_guard(
+                    super::access_grants::scope_grants_denial(&identity),
+                );
+                let _identity =
+                    super::secret_consent::SecretIdentityGuard::install(identity.clone());
+                let _ask = crate::access_policy::ask_route_guard(Some(ask_route));
+                // The program's permission wait has its own budget. Startup
+                // and command execution get their ordinary fresh reply window.
+                submit_deferred_bash(
+                    handles_progress,
+                    &executor,
+                    &tx,
+                    &poll_touch_tx,
+                    &metrics,
+                    dispatch,
+                    root.clone(),
+                    project_root.clone(),
+                    session_id.clone(),
+                    request_id.clone(),
+                    route,
+                    corr,
+                    flags,
+                    ver,
+                    arguments.clone(),
+                    format_context.clone(),
+                    cancel.clone(),
+                    bind_trust.clone(),
+                    spawn_principal.clone(),
+                    edit_slot_survives,
+                    call_key.clone(),
+                    schema_pin.clone(),
+                    Some(permissions),
+                    repeat.clone(),
+                    worker_session,
+                    worker_preset,
+                    worker_jail,
+                    server_completion,
+                    remote_source.clone(),
+                    crate::commands::blocking_wait::ReplyBudget::new(Instant::now(), None),
+                );
+                let metrics = metrics.clone();
+                let request_id = request_id.clone();
+                async move {
+                    match rx.recv().await {
+                        Some(done) => {
+                            decrement_counted_channel(&metrics.bash_deferred_queued);
+                            done.result
+                                .map(|result| (result.response, result.text))
+                                .unwrap_or_else(|| {
+                                    (
+                                        Response::error(
+                                            &request_id,
+                                            "internal_error",
+                                            "executor dropped",
+                                        ),
+                                        String::new(),
+                                    )
+                                })
+                        }
+                        None => (
+                            Response::error(&request_id, "internal_error", "executor dropped"),
+                            String::new(),
+                        ),
+                    }
+                }
+            };
+            let first = if matches!(bind_trust, BindTrust::Untrusted) {
+                let command = arguments
+                    .get("params")
+                    .unwrap_or(&arguments)
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                (
+                    Response::error_with_data(
+                        &request,
+                        crate::protocol::ERROR_PERMISSION_REQUIRED,
+                        "bash command requires permission",
+                        json!({"asks":[{
+                            "kind":"bash", "patterns":[command], "always":[],
+                        }]}),
+                    ),
+                    String::new(),
+                )
+            } else {
+                launch(initial_route, Vec::new()).await
+            };
+            let _claim = metrics.held_bash_calls.insert(route, corr);
+            if first.0.data["code"] == crate::protocol::ERROR_PERMISSION_REQUIRED
+                && call_key.is_some()
+            {
+                let _ = send_counted_channel(
+                    &completion_tx,
+                    &metrics.bash_deferred_queued,
+                    BashDeferredCompletion {
+                        route,
+                        corr,
+                        flags,
+                        ver,
+                        root: root.clone(),
+                        request_id: request_id.clone(),
+                        result: None,
+                        fatal: false,
+                        settles_hold: false,
+                    },
+                )
+                .await;
+            }
+            let result = super::consent::run_with_consent(held, first, launch)
+                .await
+                .map(|(response, text)| {
+                    let text = text.unwrap_or_else(|| {
+                        crate::subc_format::format_response_with_context(
+                            "bash",
+                            &response,
+                            &format_context,
+                        )
+                    });
+                    ToolCallResult { response, text }
+                });
+            let fatal = result
+                .as_ref()
+                .is_some_and(|result| note_fatal_panic_response(&result.response));
+            send_bash_deferred_completion(
+                &completion_tx,
+                &metrics,
+                route,
+                corr,
+                flags,
+                ver,
+                root,
+                request_id,
+                result,
+                fatal,
+            )
+            .await;
+        });
+        return;
+    }
     let received_at = reply_budget.received_at;
     // Granted permissions resume a call after a prompt, which may outlast the
     // startup allowance. Start admission now, but keep the caller's reply clock.
@@ -1748,6 +1925,8 @@ pub(super) fn submit_deferred_bash(
     let grant_scope = crate::access_policy::current_scope();
     let grant_denial = crate::access_policy::scope_grants_denial();
     let ask_route = crate::access_policy::current_ask_route();
+    let ask_unavailable =
+        run_scoped && matches!(ask_route, crate::access_policy::AskRoute::Unavailable);
     // The attested scope decides confinement independently of consent routing:
     // heads and workers both ask, but only worker shells require the jail.
     let spawn_ctx = match executor.try_actor_context(&root) {
@@ -2175,7 +2354,7 @@ pub(super) fn submit_deferred_bash(
                                                                   let response = crate::bash_background::with_schema_pin(schema_pin, run_dispatch);
                                                                   #[cfg(test)]
                                                                   let response = with_bash_timing_for_test(spawn_timing_for_test.clone(), || crate::bash_background::with_schema_pin(schema_pin, run_dispatch));
-                                                                  let response = refuse_run_permission_ask(response, run_scoped);
+                                                                   let response = refuse_run_permission_ask(response, ask_unavailable);
                                                                   // Registration and revocation can race across actors.
                                                                   // Recheck after dispatch so neither ordering loses the task.
                                                                   if let Some(scope) = &scope_stamp {
@@ -3876,6 +4055,12 @@ pub(super) async fn handle_bash_deferred_completion(
     metrics: &DispatchPathMetrics,
 ) -> Result<(), SubcError> {
     let route_id = done.route;
+    // A nonterminal completion with no result or fatal error is the program's
+    // permission hold. Its final result will settle the same ledger attachment.
+    if !done.settles_hold && !done.fatal && done.result.is_none() {
+        let frame = super::consent::held_frame(done.ver, done.route, done.corr, done.flags)?;
+        return send_reliable_writer_frame(tx, metrics, frame, "permission hold").await;
+    }
     if done.settles_hold {
         metrics.held_bash_calls.remove(done.route, done.corr);
         if let Some(meta) = live_roots.get_mut(&done.root) {

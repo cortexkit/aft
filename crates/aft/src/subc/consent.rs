@@ -33,7 +33,7 @@ use super::*;
 use crate::access_policy::{
     AccessGrant, AccessOperation, AccessPolicy, AskRoute, GrantKind, HeadPolicy,
 };
-use crate::db::access_asks::{self as asks, AskKey};
+use crate::db::access_asks::{self as asks, AskKey, Permission};
 use std::future::Future;
 use std::pin::Pin;
 use subc_protocol::scope::ScopeSelector;
@@ -52,6 +52,111 @@ const UNDECLARED_REPLY_BUDGET: Duration = Duration::from_secs(25);
 pub(super) const RERUN_MARGIN: Duration = Duration::from_secs(5);
 /// No call is held longer than this, whatever its reply budget.
 const MAX_HOLD: Duration = Duration::from_secs(100);
+/// Mirrors the Basal codemode runner's ten-minute person-wait allowance;
+/// keep this provider-side backstop in step with the runner's allowance.
+const RUN_PERMISSION_ALLOWANCE: Duration = Duration::from_secs(10 * 60);
+const ACCESS_TIMEOUT: &str = "access_timeout";
+
+pub(super) fn program_reply_deadline() -> Instant {
+    Instant::now() + RUN_PERMISSION_ALLOWANCE + UNDECLARED_REPLY_BUDGET
+}
+
+pub(super) fn held_frame(
+    ver: u8,
+    route: RouteChannel,
+    corr: u64,
+    flags: Flags,
+) -> Result<Frame, SubcError> {
+    use cortexkit_role_tool_provider::result::{held_reasons, HeldReply, ToolResult};
+    // The permission hold has no tool output yet. An empty content list avoids
+    // suggesting a retry while the codemode runner waits for the late result.
+    let body = ToolResult::new(Vec::new()).with_held(HeldReply::new(held_reasons::CONSENT));
+    Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        flags,
+        route.channel,
+        route.epoch,
+        corr,
+        serde_json::to_vec(&body).map_err(SubcError::Json)?,
+    )
+    .map_err(SubcError::FrameBuild)
+}
+
+#[derive(Default)]
+pub(super) struct RunPermissionBudget(StdMutex<RunPermissionClock>);
+
+#[derive(Default)]
+struct RunPermissionClock {
+    spent: Duration,
+    waiting: u32,
+    updated: Option<Instant>,
+    #[cfg(test)]
+    now: Option<Instant>,
+}
+
+impl RunPermissionClock {
+    fn update(&mut self) {
+        let now = Instant::now();
+        #[cfg(test)]
+        let now = self.now.unwrap_or(now);
+        if let Some(previous) = self.updated {
+            self.spent = self.spent.saturating_add(
+                now.saturating_duration_since(previous)
+                    .saturating_mul(self.waiting),
+            );
+        }
+        self.updated = Some(now);
+    }
+}
+
+impl RunPermissionBudget {
+    fn remaining(&self) -> Duration {
+        let mut clock = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clock.update();
+        RUN_PERMISSION_ALLOWANCE.saturating_sub(clock.spent)
+    }
+
+    fn wait(self: &Arc<Self>) -> RunPermissionWait {
+        let mut clock = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clock.update();
+        clock.waiting += 1;
+        RunPermissionWait(self.clone())
+    }
+
+    #[cfg(test)]
+    fn advance(&self, elapsed: Duration) {
+        let mut clock = self.0.lock().unwrap();
+        let now = clock.now.unwrap_or_else(Instant::now);
+        clock.now = Some(now + elapsed);
+        clock.update();
+    }
+}
+
+struct RunPermissionWait(Arc<RunPermissionBudget>);
+
+impl Drop for RunPermissionWait {
+    fn drop(&mut self) {
+        let mut clock = self
+            .0
+             .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clock.update();
+        clock.waiting -= 1;
+    }
+}
+
+fn run_permission_budget(call: &HeldCall) -> Option<&Arc<RunPermissionBudget>> {
+    call.identity.run_owner.as_ref()?;
+    Some(&call.identity.run_scope.get()?.permission_budget)
+}
 /// How often a held call checks for cancellation, route close and scope end.
 const SIGNAL_POLL: Duration = Duration::from_millis(100);
 /// Bound on one `consent.request` or `consent.withdraw` round trip.
@@ -542,6 +647,67 @@ pub(super) fn requested_ask(response: &Response) -> Option<AccessGrant> {
     serde_json::from_value(response.data.get("ask")?.clone()).ok()
 }
 
+impl Permission {
+    fn path(&self) -> &Path {
+        match self {
+            Self::File(grant) => &grant.path,
+            Self::Shell { cwd, .. } => cwd,
+        }
+    }
+
+    fn operation(&self) -> &'static str {
+        match self {
+            Self::File(grant) => operation_name(grant.operation),
+            Self::Shell { .. } => "exec",
+        }
+    }
+}
+
+fn requested_permission(call: &HeldCall, response: &Response) -> Option<Permission> {
+    if let Some(grant) = requested_ask(response) {
+        return Some(Permission::File(grant));
+    }
+    if call.identity.run_owner.is_none()
+        || !matches!(call.tool.as_str(), "bash" | "powershell")
+        || response.data["code"] != crate::protocol::ERROR_PERMISSION_REQUIRED
+    {
+        return None;
+    }
+    let plan =
+        super::bash::prepare_bash_elicitation_plan(&call.arguments, &call.identity.project_root)
+            .ok()?;
+    let asks = response.data.get("asks")?.as_array()?;
+    let mut permissions = Vec::new();
+    for ask in asks {
+        if let Some(id) = ask.get("grant_id").and_then(Value::as_str) {
+            permissions.push(id.to_owned());
+        } else {
+            let ask: crate::bash_permissions::PermissionAsk =
+                serde_json::from_value(ask.clone()).ok()?;
+            permissions.extend(super::bash::permission_grants_for_retry(&[ask]));
+        }
+    }
+    if permissions.is_empty() {
+        return None;
+    }
+    let args = call.arguments.get("params").unwrap_or(&call.arguments);
+    let cwd = args
+        .get("workdir")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| call.identity.project_root.clone());
+    let cwd = if cwd.is_absolute() {
+        cwd
+    } else {
+        call.identity.project_root.join(cwd)
+    };
+    Some(Permission::Shell {
+        command: plan.command,
+        cwd,
+        permissions,
+    })
+}
+
 /// Calls currently held on each route, so a route close can withdraw their asks.
 static HELD: LazyLock<StdMutex<HashMap<RouteChannel, Vec<Arc<AtomicBool>>>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
@@ -666,6 +832,9 @@ impl Drop for LiveCoverGuard {
 
 fn track_live_coverable(call: &HeldCall, prep: &Prepared) -> LiveCoverGuard {
     let key = (prep.call_key.clone(), call.identity.session.clone());
+    let Some(grant) = prep.grant.file() else {
+        return LiveCoverGuard { key };
+    };
     let mut live = LIVE_COVERABLE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -675,8 +844,8 @@ fn track_live_coverable(call: &HeldCall, prep: &Prepared) -> LiveCoverGuard {
             key: prep.key.clone(),
             session: call.identity.session.clone(),
             scope: prep.key.scope.clone(),
-            operation: prep.grant.operation,
-            path: prep.grant.path.clone(),
+            operation: grant.operation,
+            path: grant.path.clone(),
             elicitation: None,
             covering: None,
             holds: 1,
@@ -818,7 +987,7 @@ async fn try_apply_covering_grant(
     let identity = call.identity.clone();
     let key = prep.key.clone();
     let call_key = prep.call_key.clone();
-    let pending = prep.grant.clone();
+    let pending = prep.grant.file()?.clone();
     let covered: bool = tokio::task::spawn_blocking(move || {
         let conn = db.lock().ok()?;
         let scope = access_grants::policy_scope_key(&identity);
@@ -843,7 +1012,7 @@ async fn try_apply_covering_grant(
     let call_key_clone = call_key.clone();
     let holder_clone = holder.clone();
     let db_for_claim = Arc::clone(&db);
-    let joined: Option<Option<Vec<AccessGrant>>> = tokio::task::spawn_blocking(move || {
+    let joined: Option<Option<Vec<Permission>>> = tokio::task::spawn_blocking(move || {
         let conn = db_for_claim.lock().ok()?;
         let claimed = asks::claim(&conn, &key_clone, &call_key_clone, &holder_clone).ok()?;
         Some(claimed)
@@ -890,7 +1059,7 @@ enum Hold {
     /// Run the call again with these capabilities approved once. `claim`
     /// owns them until the call finishes.
     Run {
-        once: Vec<AccessGrant>,
+        once: Vec<Permission>,
         claim: Arc<ClaimedAsk>,
     },
     /// End the call with this response.
@@ -1044,7 +1213,7 @@ impl SettlementGroup {
     async fn result(
         &self,
         call: &HeldCall,
-        grant: &AccessGrant,
+        grant: &Permission,
         route_hold: &RouteHold,
     ) -> Option<(Response, Option<String>)> {
         let mut done = self.done.subscribe();
@@ -1171,7 +1340,7 @@ pub(super) async fn run_with_consent<F, Fut>(
     rerun: F,
 ) -> Option<(Response, Option<String>)>
 where
-    F: FnMut(AskRoute) -> Fut,
+    F: FnMut(AskRoute, Vec<String>) -> Fut,
     Fut: Future<Output = (Response, String)>,
 {
     if !matches!(
@@ -1187,9 +1356,15 @@ where
             None,
         ));
     }
-    let Some(grant) = requested_ask(&first.0) else {
+    let Some(grant) = requested_permission(&call, &first.0) else {
         return Some((first.0, Some(first.1)));
     };
+    if call.identity.run_owner.is_some() && run_permission_budget(&call).is_none() {
+        return Some((
+            unavailable_answer(&call, &grant, "no consent transport is connected"),
+            None,
+        ));
+    }
     if access_grants::scope_grants_denial(&call.identity).is_some() {
         return Some((
             Response::error(
@@ -1208,12 +1383,12 @@ where
 
 async fn run_held<F, Fut>(
     call: &HeldCall,
-    mut grant: AccessGrant,
+    mut grant: Permission,
     mut rerun: F,
     flight: &Arc<SettlementFlight>,
 ) -> Option<(Response, Option<String>)>
 where
-    F: FnMut(AskRoute) -> Fut,
+    F: FnMut(AskRoute, Vec<String>) -> Fut,
     Fut: Future<Output = (Response, String)>,
 {
     let route_hold = RouteHold::new(call.route);
@@ -1227,15 +1402,40 @@ where
     );
     let mut holder: Option<Arc<ClaimedAsk>> = None;
     loop {
+        let budget = run_permission_budget(call);
+        let waiting = budget.map(|budget| budget.wait());
+        if budget.is_some_and(|budget| budget.remaining().is_zero()) {
+            return Some((refused_answer(call, &grant, ACCESS_TIMEOUT, None), None));
+        }
         let own = holder.as_ref().map(|claim| claim.holder.clone());
-        match hold(call, grant, deadline, &route_hold, own, flight).await {
+        let deadline = budget.map_or(deadline, |budget| Instant::now() + budget.remaining());
+        let held = hold(call, grant, deadline, &route_hold, own, flight).await;
+        drop(waiting);
+        match held {
             Hold::Run { once, claim } => {
                 claim.retry_after_deadline.store(false, Ordering::SeqCst);
                 holder = Some(claim);
-                let running = rerun(AskRoute::Consent {
-                    once,
-                    launch: super::access_grants::launch_key(&call.identity, "worker"),
-                });
+                let shell = once
+                    .iter()
+                    .flat_map(|permission| match permission {
+                        Permission::Shell { permissions, .. } => permissions.clone(),
+                        Permission::File(_) => Vec::new(),
+                    })
+                    .collect();
+                let once = once
+                    .into_iter()
+                    .filter_map(|permission| match permission {
+                        Permission::File(grant) => Some(grant),
+                        Permission::Shell { .. } => None,
+                    })
+                    .collect();
+                let running = rerun(
+                    AskRoute::Consent {
+                        once,
+                        launch: super::access_grants::launch_key(&call.identity, "worker"),
+                    },
+                    shell,
+                );
                 tokio::pin!(running);
                 let (response, text) = loop {
                     tokio::select! {
@@ -1260,7 +1460,7 @@ where
                         }
                     }
                 };
-                match requested_ask(&response) {
+                match requested_permission(call, &response) {
                     Some(next) => {
                         // A new outside path has its own unanswered question.
                         flight.group.settled.store(false, Ordering::SeqCst);
@@ -1331,7 +1531,7 @@ struct Prepared {
     call_key: String,
     request: Value,
     selector: ScopeSelector,
-    grant: AccessGrant,
+    grant: Permission,
 }
 
 enum Prep {
@@ -1535,7 +1735,75 @@ fn prepare_locked(
         call_key,
         request,
         selector,
-        grant: grant.clone(),
+        grant: Permission::File(grant.clone()),
+    }))
+}
+
+fn prepare_shell(
+    conn: &rusqlite::Connection,
+    identity: &RouteIdentity,
+    tool: &str,
+    arguments: &Value,
+    permission: &Permission,
+    own_holder: Option<&str>,
+) -> rusqlite::Result<Prep> {
+    let stamp = identity.scope.as_ref().expect("a program has a run stamp");
+    let key = AskKey {
+        scope: access_grants::scope_key(identity),
+        args_hash: args_hash(identity, tool, arguments),
+    };
+    let selector = selector(stamp);
+    if let Some(record) = asks::get(conn, &key)? {
+        if let (Some(call_key), Some(request), Some(grant)) = (
+            record.call_key.clone(),
+            record.request.clone(),
+            record.pending.clone(),
+        ) {
+            return Ok(Prep::Ask(Prepared {
+                key,
+                call_key,
+                request,
+                selector,
+                grant,
+            }));
+        }
+        if record.holder_is_live() && record.holder.as_deref() != own_holder {
+            return Ok(Prep::Busy);
+        }
+        if !record.holder_is_live() {
+            asks::discard(conn, &key)?;
+        }
+    }
+    let Permission::Shell { command, cwd, .. } = permission else {
+        unreachable!("file permissions use prepare_locked");
+    };
+    let call_key = new_call_key();
+    let mut request = request_params(
+        &call_key,
+        tool,
+        "exec",
+        &cwd.to_string_lossy(),
+        "bash command requires permission",
+        &key.args_hash,
+        command,
+        None,
+    );
+    request["command"] = json!(command);
+    asks::open_permission(
+        conn,
+        &key,
+        &call_key,
+        &serde_json::to_value(&selector).expect("scope selector is JSON"),
+        &request,
+        permission,
+        crate::db::call_ledger::now_ms(),
+    )?;
+    Ok(Prep::Ask(Prepared {
+        key,
+        call_key,
+        request,
+        selector,
+        grant: permission.clone(),
     }))
 }
 
@@ -1894,26 +2162,27 @@ fn scan_root_alias(directory: &Path, root: &Path) -> Option<bool> {
 /// Settle the persisted card, not a fresh probe that can time out minutes after
 /// the directory was offered. Older file-only cards must stay file-only.
 fn advertised_scope(prep: &Prepared) -> Option<AccessGrant> {
+    let grant = prep.grant.file()?;
     if prep.request.get("kind").and_then(Value::as_str) != Some("tool_permission")
         || prep.request.get("operation").and_then(Value::as_str)
-            != Some(operation_name(prep.grant.operation))
+            != Some(operation_name(grant.operation))
     {
         return None;
     }
     let advertised = prep.request.get("pattern").and_then(Value::as_str)?;
-    if advertised == pattern(&prep.grant) {
-        return Some(prep.grant.clone());
+    if advertised == pattern(grant) {
+        return Some(grant.clone());
     }
-    if prep.grant.kind != GrantKind::File {
+    if grant.kind != GrantKind::File {
         return None;
     }
-    let parent = prep.grant.path.parent()?;
+    let parent = grant.path.parent()?;
     // The filesystem root is never offered as a file's directory scope.
     parent.parent()?;
     let directory = AccessGrant {
         path: parent.to_path_buf(),
         kind: GrantKind::Subtree,
-        operation: prep.grant.operation,
+        operation: grant.operation,
     };
     (advertised == pattern(&directory)).then_some(directory)
 }
@@ -1934,15 +2203,22 @@ enum ConsentEvent<'a> {
     Granted { epoch: u64 },
 }
 
-fn log_consent(session: &str, event: ConsentEvent<'_>, ask: &str, grant: &AccessGrant) {
+fn log_consent(session: &str, event: ConsentEvent<'_>, ask: &str, grant: &Permission) {
     if !crate::logging::slog_info_enabled(module_path!()) {
         return;
     }
-    let path_hash = cortexkit_role_tool_provider::catalog::composition_digest(&json!(grant.path))
+    let path_hash = cortexkit_role_tool_provider::catalog::composition_digest(&json!(grant.path()))
         .expect("canonical consent path is JSON");
-    let kind = match grant.kind {
-        GrantKind::File => "file",
-        GrantKind::Subtree => "subtree",
+    let kind = match grant {
+        Permission::File(AccessGrant {
+            kind: GrantKind::File,
+            ..
+        }) => "file",
+        Permission::File(AccessGrant {
+            kind: GrantKind::Subtree,
+            ..
+        }) => "subtree",
+        Permission::Shell { .. } => "shell",
     };
     // Attribute only this emission; consent work may run on async or blocking
     // workers whose thread-local logging context belongs to an earlier call.
@@ -2080,11 +2356,11 @@ pub(super) fn decode_record(record: &Value) -> Result<Settlement, ConsentError> 
     }
 }
 
-fn answer(call: &HeldCall, code: &str, message: String, prep_grant: &AccessGrant) -> Response {
+fn answer(call: &HeldCall, code: &str, message: String, prep_grant: &Permission) -> Response {
     Response::error_with_data(&call.request_id, code, message, json!({"ask": prep_grant}))
 }
 
-fn pending_answer(call: &HeldCall, grant: &AccessGrant) -> Response {
+fn pending_answer(call: &HeldCall, grant: &Permission) -> Response {
     let recipient = if access_grants::alfonso_worker(&call.identity) {
         "your head"
     } else {
@@ -2095,42 +2371,33 @@ fn pending_answer(call: &HeldCall, grant: &AccessGrant) -> Response {
         "access_pending",
         format!(
             "Waiting for permission to {} {}. The request has gone to {}. End your turn now; you will be resumed with the answer, and then you should run this same call again.",
-            operation_name(grant.operation),
-            grant.path.display(),
+            grant.operation(),
+            grant.path().display(),
             recipient
         ),
         grant,
     )
 }
 
-fn retry_answer(call: &HeldCall, grant: &AccessGrant) -> Response {
+fn retry_answer(call: &HeldCall, grant: &Permission) -> Response {
     answer(call, "access_retry", ACCESS_RETRY_MESSAGE.to_owned(), grant)
 }
 
-fn unavailable_answer(call: &HeldCall, grant: &AccessGrant, detail: &str) -> Response {
+fn unavailable_answer(call: &HeldCall, grant: &Permission, detail: &str) -> Response {
     answer(
         call,
         "access_unavailable",
         format!(
             "Outside access denied: the consent service is unavailable, so permission to {} {} could not be requested ({detail}).",
-            operation_name(grant.operation),
-            grant.path.display()
+            grant.operation(),
+            grant.path().display()
         ),
         grant,
     )
 }
 
-fn refused_answer(
-    call: &HeldCall,
-    grant: &AccessGrant,
-    code: &str,
-    note: Option<&str>,
-) -> Response {
-    let target = format!(
-        "{} {}",
-        operation_name(grant.operation),
-        grant.path.display()
-    );
+fn refused_answer(call: &HeldCall, grant: &Permission, code: &str, note: Option<&str>) -> Response {
+    let target = format!("{} {}", grant.operation(), grant.path().display());
     let message = match code {
         "access_declined" => match note {
             Some(note) => format!("Permission to {target} was declined: {note}"),
@@ -2177,7 +2444,9 @@ fn stop_signal(call: &HeldCall, route_hold: &RouteHold) -> Option<Stop> {
     {
         return Some(Stop::RunEnded);
     }
-    if !active_tool_call_is_registered(&call.active, call.route, call.corr) {
+    if !matches!(call.tool.as_str(), "bash" | "powershell")
+        && !active_tool_call_is_registered(&call.active, call.route, call.corr)
+    {
         // Connection teardown cancels the connection before it drops calls,
         // so a call gone with the connection still up was cancelled or its
         // asker's route was reclaimed.
@@ -2221,6 +2490,43 @@ async fn withdraw(call: &HeldCall, prep: &Prepared, elicitation: &str) {
         {
             log::warn!("consent.withdraw failed for {elicitation}: {error:?}");
         }
+        if call.identity.run_owner.is_some() {
+            // An ended run can retrieve only an existing ask. Re-send its
+            // original key to settle a racing answer, never to resume work or
+            // install grants after withdrawal.
+            if let Ok(reply) = transport
+                .call(consent_call(
+                    call,
+                    prep,
+                    "consent.request",
+                    prep.request.clone(),
+                    UNARY_TIMEOUT,
+                ))
+                .await
+            {
+                if let Ok(id) = decode_elicitation_id(&reply) {
+                    if let Ok(record) = transport
+                        .call(consent_call(
+                            call,
+                            prep,
+                            "consent.await",
+                            json!({"elicitation_id": id, "timeout_ms": 0}),
+                            UNARY_TIMEOUT,
+                        ))
+                        .await
+                    {
+                        if let Ok(settled) = decode_record(&record) {
+                            log_consent(
+                                &call.identity.session,
+                                ConsentEvent::Settled(&settled),
+                                &id,
+                                &prep.grant,
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
     let key = prep.key.clone();
     let _ = with_db(call, move |conn, _| asks::discard(conn, &key).map(|_| ())).await;
@@ -2233,13 +2539,13 @@ async fn discard(call: &HeldCall, prep: &Prepared) {
 
 async fn hold(
     call: &HeldCall,
-    grant: AccessGrant,
+    grant: Permission,
     deadline: Instant,
     route_hold: &RouteHold,
     own_holder: Option<String>,
     flight: &Arc<SettlementFlight>,
 ) -> Hold {
-    if !consent_path_representable(&grant.path) {
+    if !consent_path_representable(grant.path()) {
         let mut response = refused_answer(call, &grant, "access_not_placed", None);
         response.data["reason"] = json!("consent_path_unrepresentable");
         return Hold::Answer(response);
@@ -2248,18 +2554,33 @@ async fn hold(
     let tool = call.tool.clone();
     let arguments = call.arguments.clone();
     let asked = grant.clone();
-    let directory_scope = scope_before_db(&grant).await;
-    let prepared = with_db_handle(call, move |db, ctx| {
-        prepare(
+    let directory_scope = match grant.file() {
+        Some(grant) => Some(scope_before_db(grant).await),
+        None => None,
+    };
+    let prepared = with_db_handle(call, move |db, ctx| match &asked {
+        Permission::File(grant) => prepare(
             db,
             ctx,
             &identity,
             &tool,
             &arguments,
-            &asked,
-            &directory_scope,
+            grant,
+            directory_scope.as_ref().expect("file scope was probed"),
             own_holder.as_deref(),
-        )
+        ),
+        Permission::Shell { .. } => {
+            let conn = db.lock().map_err(|error| error.to_string())?;
+            prepare_shell(
+                &conn,
+                &identity,
+                &tool,
+                &arguments,
+                &asked,
+                own_holder.as_deref(),
+            )
+            .map_err(|error| error.to_string())
+        }
     })
     .await;
     let prep = match prepared {
@@ -2326,6 +2647,10 @@ async fn hold(
     let mut first = true;
     loop {
         let now = Instant::now();
+        if run_permission_budget(call).is_some_and(|budget| budget.remaining().is_zero()) {
+            withdraw(call, &prep, &elicitation).await;
+            return Hold::Answer(refused_answer(call, &prep.grant, ACCESS_TIMEOUT, None));
+        }
         if now >= deadline && !first {
             park(call, &prep, &elicitation);
             return Hold::Answer(pending_answer(call, &prep.grant));
@@ -2405,6 +2730,11 @@ async fn hold(
                             withdraw(call, &prep, &elicitation).await;
                             return Hold::Answer(refused_answer(call, &prep.grant, "access_withdrawn", None));
                         }
+                        None if run_permission_budget(call).is_some_and(|budget| budget.remaining().is_zero()) => {
+                            retry_after_deadline.store(true, Ordering::SeqCst);
+                            withdraw(call, &prep, &elicitation).await;
+                            return Hold::Answer(refused_answer(call, &prep.grant, ACCESS_TIMEOUT, None));
+                        }
                         None if Instant::now() >= deadline => {
                             let received_settlement = settled_received.load(Ordering::SeqCst);
                             #[cfg(test)]
@@ -2473,7 +2803,7 @@ async fn failed(call: &HeldCall, prep: &Prepared, error: ConsentError) -> Hold {
 }
 
 enum Applied {
-    Run(Vec<AccessGrant>),
+    Run(Vec<Permission>),
     /// The head no longer holds what it allowed.
     HeadNotHeld,
     /// Another dispatch claimed the answer first, or the ask is gone.
@@ -2487,6 +2817,21 @@ async fn finish(
     retry_after_deadline: Arc<AtomicBool>,
     elicitation: &str,
 ) -> Hold {
+    if call.identity.run_owner.is_some() {
+        if call
+            .identity
+            .run_scope
+            .get()
+            .is_some_and(|scope| scope.revoked())
+        {
+            withdraw(call, prep, elicitation).await;
+            return Hold::Answer(refused_answer(call, &prep.grant, "access_withdrawn", None));
+        }
+        if run_permission_budget(call).is_some_and(|budget| budget.remaining().is_zero()) {
+            withdraw(call, prep, elicitation).await;
+            return Hold::Answer(refused_answer(call, &prep.grant, ACCESS_TIMEOUT, None));
+        }
+    }
     #[cfg(test)]
     if matches!(settled, Settlement::Deny { .. } | Settlement::Refused(_)) {
         let request = call.request_id.clone();
@@ -2524,6 +2869,9 @@ async fn finish(
             let identity = call.identity.clone();
             let key = prep.key.clone();
             let call_key = prep.call_key.clone();
+            // Shell scope answers remain call-bound, just like a direct shell
+            // retry. Only filesystem scopes become standing AFT grants.
+            let scope = scope && prep.grant.file().is_some();
             let grant = if scope {
                 let Some(grant) = advertised_scope(prep) else {
                     discard(call, prep).await;
@@ -2534,7 +2882,7 @@ async fn finish(
                         Some("the advertised scope does not match the requested permission"),
                     ));
                 };
-                grant
+                Permission::File(grant)
             } else {
                 prep.grant.clone()
             };
@@ -2592,9 +2940,8 @@ async fn finish(
                     // Beside the grant insert: withdraw every other live ask this
                     // folder grant truly covers so its card disappears from the
                     // phone and its waiting call resumes without a second answer.
-                    if scope {
-                        settle_covered_asks(call, &covering_grant, &covering_key, elicitation)
-                            .await;
+                    if let Some(grant) = covering_grant.file().filter(|_| scope) {
+                        settle_covered_asks(call, grant, &covering_key, elicitation).await;
                     }
                     Hold::Run { once, claim }
                 }
@@ -2622,7 +2969,7 @@ fn apply_allow(
     key: &AskKey,
     call_key: &str,
     claimant: &str,
-    grant: &AccessGrant,
+    grant: &Permission,
     scope: bool,
     by_user: bool,
 ) -> Result<Applied, String> {
@@ -2634,7 +2981,11 @@ fn apply_allow(
     with_head_policy(db, ctx, identity, !by_user, |conn, head| {
         // A head may pass on only what it holds now: its authority is
         // checked again against the head's current policy and grants.
-        if !by_user && head_policy(head.as_ref(), grant) != HeadPolicy::Allow {
+        if !by_user
+            && grant
+                .file()
+                .is_none_or(|grant| head_policy(head.as_ref(), grant) != HeadPolicy::Allow)
+        {
             asks::discard(conn, key)?;
             return Ok(Applied::HeadNotHeld);
         }
@@ -2646,7 +2997,7 @@ fn apply_allow(
             crate::db::access_grants::insert(
                 conn,
                 &access_grants::policy_scope_key(identity),
-                grant,
+                grant.file().expect("only file scopes persist"),
             )?;
             if let Some(record) = audit {
                 log_consent(

@@ -19,6 +19,28 @@ use crate::access_policy::AccessGrant;
 use crate::db::access_grants::ScopeKey;
 use rusqlite::{params, Connection, OptionalExtension};
 
+/// A consent answer is bound either to a file capability or to the displayed
+/// shell call. Shell approvals are never installed as filesystem grants.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum Permission {
+    File(AccessGrant),
+    Shell {
+        command: String,
+        cwd: std::path::PathBuf,
+        permissions: Vec<String>,
+    },
+}
+
+impl Permission {
+    pub(crate) fn file(&self) -> Option<&AccessGrant> {
+        match self {
+            Self::File(grant) => Some(grant),
+            Self::Shell { .. } => None,
+        }
+    }
+}
+
 pub(crate) const MIGRATION: &str = r#"
 CREATE TABLE IF NOT EXISTS access_asks (
  owner TEXT NOT NULL, scope_ref TEXT NOT NULL, epoch TEXT NOT NULL, args_hash TEXT NOT NULL,
@@ -47,9 +69,9 @@ pub struct AskRecord {
     /// The `consent.request` parameters of the open ask.
     pub request: Option<serde_json::Value>,
     /// The capability the open ask requests.
-    pub pending: Option<AccessGrant>,
+    pub pending: Option<Permission>,
     /// Capabilities already approved once for this call and not yet used up.
-    pub approved: Vec<AccessGrant>,
+    pub approved: Vec<Permission>,
     /// The dispatch that claimed `approved`, as `<process incarnation>:<token>`.
     pub holder: Option<String>,
 }
@@ -159,6 +181,26 @@ pub fn open(
     pending: &AccessGrant,
     now: i64,
 ) -> rusqlite::Result<()> {
+    open_permission(
+        conn,
+        key,
+        call_key,
+        selector,
+        request,
+        &Permission::File(pending.clone()),
+        now,
+    )
+}
+
+pub(crate) fn open_permission(
+    conn: &Connection,
+    key: &AskKey,
+    call_key: &str,
+    selector: &serde_json::Value,
+    request: &serde_json::Value,
+    pending: &Permission,
+    now: i64,
+) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO access_asks(owner,scope_ref,epoch,args_hash,call_key,elicitation_id,selector,request,pending,approved,holder,created_at)
          VALUES (?1,?2,?3,?4,?5,NULL,?6,?7,?8,'[]',NULL,?9)
@@ -210,7 +252,7 @@ pub fn claim(
     key: &AskKey,
     call_key: &str,
     holder: &str,
-) -> rusqlite::Result<Option<Vec<AccessGrant>>> {
+) -> rusqlite::Result<Option<Vec<Permission>>> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let Some(record) = get(&tx, key)? else {
         return Ok(None);
@@ -265,7 +307,7 @@ pub fn release_claim(
     call_key: &str,
     elicitation_id: Option<&str>,
     request: &serde_json::Value,
-    pending: &AccessGrant,
+    pending: &Permission,
 ) -> rusqlite::Result<bool> {
     Ok(conn.execute(
         "UPDATE access_asks SET call_key=?6, elicitation_id=?7, request=?8, pending=?9, holder=NULL
@@ -335,7 +377,7 @@ mod tests {
         let second = new_holder();
         assert_eq!(
             claim(&conn, &ask, "k1", &first).unwrap(),
-            Some(vec![grant("/a")])
+            Some(vec![Permission::File(grant("/a"))])
         );
         // While claimed, the same settled answer seen again grants nothing.
         assert_eq!(claim(&conn, &ask, "k1", &second).unwrap(), None);
@@ -356,7 +398,10 @@ mod tests {
         assert_eq!(get(&conn, &ask).unwrap().unwrap().holder, None);
         assert_eq!(
             claim(&conn, &ask, "k2", &second).unwrap(),
-            Some(vec![grant("/a"), grant("/b")])
+            Some(vec![
+                Permission::File(grant("/a")),
+                Permission::File(grant("/b"))
+            ])
         );
         assert!(!consume(&conn, &ask, &first).unwrap());
         assert!(consume(&conn, &ask, &second).unwrap());
@@ -401,12 +446,12 @@ mod tests {
                 "k1",
                 Some("acc_1"),
                 &request,
-                &grant("/a"),
+                &Permission::File(grant("/a")),
             )
         };
         assert_eq!(
             claim(&conn, &ask, "k1", &first).unwrap(),
-            Some(vec![grant("/a")])
+            Some(vec![Permission::File(grant("/a"))])
         );
         assert!(!release(&second).unwrap());
         assert!(release(&first).unwrap());
@@ -415,11 +460,11 @@ mod tests {
         assert_eq!(released.elicitation_id, original.elicitation_id);
         assert_eq!(released.request, original.request);
         assert_eq!(released.pending, original.pending);
-        assert_eq!(released.approved, vec![grant("/a")]);
+        assert_eq!(released.approved, vec![Permission::File(grant("/a"))]);
         assert_eq!(released.holder, None);
         assert_eq!(
             claim(&conn, &ask, "k1", &second).unwrap(),
-            Some(vec![grant("/a")])
+            Some(vec![Permission::File(grant("/a"))])
         );
         assert!(!release(&first).unwrap());
         open(&conn, &ask, "k2", &selector, &request, &grant("/b"), 2).unwrap();
@@ -431,7 +476,10 @@ mod tests {
         let third = new_holder();
         assert_eq!(
             claim(&conn, &ask, "k2", &third).unwrap(),
-            Some(vec![grant("/a"), grant("/b")])
+            Some(vec![
+                Permission::File(grant("/a")),
+                Permission::File(grant("/b"))
+            ])
         );
         assert!(consume(&conn, &ask, &third).unwrap());
         assert!(!release(&third).unwrap());
@@ -446,7 +494,7 @@ mod tests {
             selector: serde_json::json!({}),
             request: None,
             pending: None,
-            approved: vec![grant("/a")],
+            approved: vec![Permission::File(grant("/a"))],
             holder: Some("earlier-process:00".into()),
         };
         assert!(!record.holder_is_live());

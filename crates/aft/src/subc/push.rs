@@ -1967,6 +1967,7 @@ mod tests {
                 trust: BindTrust::FirstParty,
                 spawn_principal: AuthenticatedPrincipal::FirstParty,
                 consumer_elicitation_capable: false,
+                held_reply: false,
                 tool_result_body: false,
                 disabled_tools: Arc::default(),
                 run_scope: OnceLock::new(),

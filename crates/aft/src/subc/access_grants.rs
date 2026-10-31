@@ -363,11 +363,14 @@ pub(super) fn ask_route(identity: &RouteIdentity) -> crate::access_policy::AskRo
     if super::carrier_read_only::restricted(identity) {
         return crate::access_policy::AskRoute::Deny;
     }
-    // No path yet carries a codemode call's question to anyone who could
-    // answer it: an agent run's head agent's user, or a worker run's head.
-    // Such a call is refused rather than asked or allowed, and never filed
-    // as the head's or the worker's own ask.
-    if identity.run_owner.is_some() {
+    // Core routes an agent's codemode consent request to that agent's user,
+    // but rejects worker-program asks. Programs without held replies also
+    // retain the unavailable route: no final result could reach them later.
+    if identity.run_owner.as_ref().is_some_and(|owner| {
+        matches!(owner.kind, super::RunKind::Worker { .. })
+            || !identity.held_reply
+            || !identity.tool_result_body
+    }) {
         return crate::access_policy::AskRoute::Unavailable;
     }
     if identity.scope.as_ref().is_some_and(alfonso) {

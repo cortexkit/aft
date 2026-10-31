@@ -362,6 +362,7 @@ fn identity(root: &Path, scope: Option<subc_protocol::scope::ScopeStamp>) -> Rou
             principal_id: Some("reserved:broca".into()),
         },
         consumer_elicitation_capable: false,
+        held_reply: false,
         tool_result_body: false,
         disabled_tools: Arc::new(vec![]),
         scope,
@@ -868,7 +869,7 @@ async fn consent_nonhost_carrier_cannot_save_agent_scope_grants() {
         first.data["ask"] = serde_json::to_value(&grant).unwrap();
         let (refusal, _) = tokio::time::timeout(
             Duration::from_secs(2),
-            run_with_consent(call, (first, String::new()), |_| async {
+            run_with_consent(call, (first, String::new()), |_, _| async {
                 panic!("carrier must not rerun")
             }),
         )
@@ -2505,7 +2506,7 @@ async fn consent_scope_old_pending_file_is_not_widened() {
     let mut old_request = record.request.unwrap();
     old_request["pattern"] = json!(target);
     old_request["reason"] = json!("read needs to read a path outside this route's roots");
-    let old_grant = record.pending.unwrap();
+    let old_grant = record.pending.unwrap().file().unwrap().clone();
     {
         let db = f.ctx.db().unwrap();
         asks::open(
@@ -2563,7 +2564,7 @@ async fn consent_scope_persisted_non_parent_pattern_is_refused() {
                 record.call_key.as_deref().unwrap(),
                 &record.selector,
                 &request,
-                &record.pending.unwrap(),
+                record.pending.as_ref().unwrap().file().unwrap(),
                 crate::db::call_ledger::now_ms(),
             )
             .unwrap();
@@ -3741,7 +3742,10 @@ async fn consent_scope_reconstruction_checks_kind_and_operation() {
     // A write file card may advertise its directory too, and settling it
     // stores a write directory grant, never a read one.
     let mut write = prep.clone();
-    write.grant.operation = AccessOperation::Write;
+    let Permission::File(ref mut grant) = write.grant else {
+        panic!("file card")
+    };
+    grant.operation = AccessOperation::Write;
     write.request["operation"] = json!("write");
     assert_eq!(
         advertised_scope(&write),
@@ -3751,7 +3755,10 @@ async fn consent_scope_reconstruction_checks_kind_and_operation() {
         })
     );
     let mut mismatched = prep;
-    mismatched.grant.kind = GrantKind::Subtree;
+    let Permission::File(ref mut grant) = mismatched.grant else {
+        panic!("file card")
+    };
+    grant.kind = GrantKind::Subtree;
     assert_eq!(advertised_scope(&mismatched), None);
 }
 
@@ -4771,7 +4778,7 @@ async fn access_pending_renderer_wire_matches_golden_vector_without_consent() {
     let result = finish_tool_call_response(
         "read",
         &crate::subc_format::FormatContext::default(),
-        pending_answer(&call, &grant),
+        pending_answer(&call, &Permission::File(grant.clone())),
         false,
         None,
         None,
@@ -5675,7 +5682,7 @@ async fn assert_unrepresentable_paths_send_nothing(paths: Vec<PathBuf>) {
             connection_cancel: f.connection_cancel.clone(),
             drain: drain::ModuleDrainWindow::default(),
         };
-        let (response, _) = run_with_consent(call, (first, String::new()), |_| async {
+        let (response, _) = run_with_consent(call, (first, String::new()), |_, _| async {
             panic!("an unrepresentable consent path must never execute");
         })
         .await

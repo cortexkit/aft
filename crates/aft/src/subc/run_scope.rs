@@ -145,6 +145,7 @@ pub(super) struct RunScope {
     /// Permission asks this run's calls left open with `access_pending`.
     /// They are withdrawn once the run's scope is confirmed ended.
     parked_asks: StdMutex<Vec<super::consent::ParkedAsk>>,
+    pub(super) permission_budget: Arc<super::consent::RunPermissionBudget>,
 }
 
 impl RunScope {
@@ -327,6 +328,7 @@ impl RunScopes {
                             budget: StdMutex::new(None),
                             revoked: AtomicBool::new(false),
                             parked_asks: StdMutex::new(Vec::new()),
+                            permission_budget: Arc::default(),
                         })
                     }),
             )
@@ -528,6 +530,7 @@ impl RunScope {
             })),
             revoked: AtomicBool::new(false),
             parked_asks: StdMutex::new(Vec::new()),
+            permission_budget: Arc::default(),
         })
     }
 }

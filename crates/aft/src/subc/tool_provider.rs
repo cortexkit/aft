@@ -2842,6 +2842,24 @@ impl LedgerEdge {
                     outgoing.header.ty,
                     FrameType::Response | FrameType::Error | FrameType::StreamEnd
                 );
+                let permission_hold = outgoing.header.ty == FrameType::Response
+                    && serde_json::from_slice::<Value>(&outgoing.body).is_ok_and(|body| {
+                        body.get("held").is_some() && body.get("isError").is_none()
+                    });
+                if permission_hold {
+                    if let Some(call) = edge
+                        .calls
+                        .lock()
+                        .unwrap()
+                        .get_mut(&(route, outgoing.header.corr))
+                    {
+                        call.detached = true;
+                    }
+                    if actual.send(outgoing).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 let call = if terminal {
                     edge.calls
                         .lock()
@@ -2878,6 +2896,7 @@ impl LedgerEdge {
                     continue;
                 }
                 let actual = actual.clone();
+                let detached = call.detached;
                 let (tool_body_for_job, projection_error) =
                     match outgoing.tool_result_source_for_retention() {
                         Ok(body) => (body, None),
@@ -2981,7 +3000,7 @@ impl LedgerEdge {
                         );
                         outgoing.frame = uncertain_settlement_frame(&outgoing.frame);
                     }
-                    if actual.send(outgoing).await.is_err() {
+                    if !detached && actual.send(outgoing).await.is_err() {
                         return;
                     }
                 });
@@ -5172,6 +5191,7 @@ pub(in crate::subc) mod route_tests {
             trust: BindTrust::FirstParty,
             spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,
+            held_reply: false,
             tool_result_body: false,
             disabled_tools: Arc::new(disabled),
             scope,
@@ -6462,6 +6482,7 @@ pub(in crate::subc) mod route_tests {
             trust: BindTrust::FirstParty,
             spawn_principal: runner_restore_principal(&project),
             consumer_elicitation_capable: false,
+            held_reply: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             scope: None,
@@ -6954,6 +6975,7 @@ pub(in crate::subc) mod route_tests {
                 principal_id: Some("reserved:broca".into()),
             },
             consumer_elicitation_capable: false,
+            held_reply: false,
             tool_result_body: false,
             disabled_tools: Arc::new(vec![]),
             scope: Some(stamp("worker")),
