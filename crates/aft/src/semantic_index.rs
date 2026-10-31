@@ -11522,12 +11522,18 @@ mod tests {
         let path = Path::new("widget.h");
         fs::write(root.path().join(path), "int old_c_symbol(void);\n").unwrap();
         let source =
-            b"namespace api {\nclass Widget {\npublic:\n    int value() { return 42; }\n};\n}\n";
+            b"namespace api {\nclass Widget {\npublic:\n    int value() {\n        return 42;\n    }\n};\n}\n";
         let chunks = chunk_view_file_uncached(root.path(), path, source, EmbedTextCaps::default())
             .unwrap()
             .unwrap();
-        assert!(chunks.iter().any(|chunk| chunk.name == "Widget"));
-        assert!(chunks.iter().any(|chunk| chunk.name == "value"));
+        assert!(
+            chunks.iter().any(|chunk| chunk.name == "Widget"),
+            "{chunks:?}"
+        );
+        assert!(
+            chunks.iter().any(|chunk| chunk.name == "value"),
+            "{chunks:?}"
+        );
         assert!(!chunks.iter().any(|chunk| chunk.name == "old_c_symbol"));
     }
 
