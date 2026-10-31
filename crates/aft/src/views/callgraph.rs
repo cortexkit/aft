@@ -97,6 +97,23 @@ pub(crate) fn applies_to_relative(path: &[u8]) -> bool {
             .is_some_and(|p| source_language(Path::new(p)).is_some())
 }
 
+/// The key a views call graph stores in `files.content_hash` for the file at
+/// root-relative `path` whose source hash is `source`: the call-graph blob key,
+/// not the source hash (materialization also stores size 0). `None` for a path
+/// no call-graph plane covers.
+pub(crate) fn graph_key(path: &[u8], source: blake3::Hash) -> Option<blake3::Hash> {
+    let language = if super::assembly::is_resolution_input(path) {
+        "config".to_owned()
+    } else {
+        let path = std::str::from_utf8(path).ok()?;
+        format!("{:?}", crate::parser::detect_language(Path::new(path))?).to_lowercase()
+    };
+    let key =
+        crate::blob_store::CallgraphKey::from_source_digest(*source.as_bytes(), language, PRODUCER)
+            .full_key();
+    Some(blake3::Hash::from_bytes(*key.as_bytes()))
+}
+
 /// The subset of a checkout's file identities a call graph is built from, so
 /// documents a call graph never holds do not count as files that differ.
 pub(crate) fn callgraph_inputs(
@@ -1567,22 +1584,46 @@ mod tests {
                     .collect(),
             )
         };
-        let differing = {
-            let (store, _) =
-                callgraph_copies::open_published(&storage, family, policy, &main_scope, &clean)
-                    .unwrap();
+        // A views graph stores call-graph blob keys, not source hashes, so the
+        // comparison must map source hashes to keys: without the mapping
+        // identical files look different, with it only real edits differ.
+        let (store, _) =
+            callgraph_copies::open_published(&storage, family, policy, &main_scope, &clean)
+                .unwrap();
+        let graph = store.file_identities().unwrap();
+        let compare = |root: &Path, checkout, key: bool| {
             crate::commands::callgraph_borrowed::compare_with_graph(
-                &store.file_identities().unwrap(),
-                callgraph_inputs(identities().unwrap()),
-                &clean,
+                &graph,
+                callgraph_inputs(checkout),
+                root,
                 Some(&main),
                 64,
+                key.then_some(
+                    &crate::commands::callgraph_borrowed::views_graph_key
+                        as &dyn Fn(&str, blake3::Hash) -> Option<blake3::Hash>,
+                ),
             )
         };
+        let unmapped = compare(&clean, identities().unwrap(), false);
+        assert_eq!(unmapped.files, ["a.ts", "b.ts"]);
+        let mapped = compare(&clean, identities().unwrap(), true);
+        assert!(mapped.complete && mapped.files.is_empty(), "{mapped:?}");
+        let second_files = ["a.ts", "b.ts", "c.ts", "package.json", "notes.md"]
+            .into_iter()
+            .map(|name| {
+                let bytes = std::fs::read(second.join(name)).unwrap();
+                (
+                    name.to_owned(),
+                    (bytes.len() as u64, crate::views::io::source_hash(&bytes)),
+                )
+            })
+            .collect();
+        let edited = compare(&second, second_files, true);
+        assert_eq!(edited.files, ["c.ts"], "{edited:?}");
+        drop(store);
         assert_eq!(
             callgraph_copies::admit(&storage, family, policy, &clean, 5, identities).unwrap(),
             borrow_main,
-            "{differing:?}"
         );
 
         // Once `first` lets go of its view its copy is idle, and `second`

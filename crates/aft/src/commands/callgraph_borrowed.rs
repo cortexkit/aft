@@ -346,6 +346,7 @@ fn view_borrowed_callgraph(ctx: &AppContext) -> Option<BorrowedCallgraph> {
             &checkout_root,
             Some(&owner),
             MAX_DISK_HASHES,
+            Some(&views_graph_key),
         ))
     });
     let owner_head = checkout_head(&owner);
@@ -371,6 +372,11 @@ fn view_borrowed_callgraph(ctx: &AppContext) -> Option<BorrowedCallgraph> {
         edits_in,
         differing_files: differing,
     })
+}
+
+/// [`compare_with_graph`]'s key mapping for a views call graph.
+pub(crate) fn views_graph_key(path: &str, source: blake3::Hash) -> Option<blake3::Hash> {
+    crate::views::callgraph::graph_key(path.as_bytes(), source)
 }
 
 enum Owner {
@@ -458,6 +464,7 @@ fn files_differing_from_borrowed_graph(
         checkout_root,
         owner_root,
         MAX_DISK_HASHES,
+        None,
     ))
 }
 
@@ -520,12 +527,18 @@ impl DiskHasher {
 ///
 /// When the disk-read budget runs out the comparison stops and returns the
 /// files found so far, marked incomplete.
+///
+/// A views call graph does not store source hashes: each file row holds the
+/// file's call-graph blob key and size 0. For such a graph pass `graph_key`,
+/// which turns a path and source hash into the key the graph stores, and the
+/// graph's files are compared by that key alone.
 pub(crate) fn compare_with_graph(
     graph: &HashMap<String, FileIdentity>,
     checkout: HashMap<String, FileIdentity>,
     checkout_root: &Path,
     owner_root: Option<&Path>,
     max_disk_hashes: usize,
+    graph_key: Option<&dyn Fn(&str, blake3::Hash) -> Option<blake3::Hash>>,
 ) -> DifferingFiles {
     let mut hasher = DiskHasher {
         remaining: max_disk_hashes,
@@ -536,6 +549,7 @@ pub(crate) fn compare_with_graph(
         checkout,
         checkout_root,
         owner_root,
+        graph_key,
         &mut hasher,
         &mut differing,
     )
@@ -552,6 +566,7 @@ fn collect_differing(
     mut checkout: HashMap<String, FileIdentity>,
     checkout_root: &Path,
     owner_root: Option<&Path>,
+    graph_key: Option<&dyn Fn(&str, blake3::Hash) -> Option<blake3::Hash>>,
     hasher: &mut DiskHasher,
     differing: &mut Vec<String>,
 ) -> Result<(), BudgetSpent> {
@@ -562,13 +577,22 @@ fn collect_differing(
     graph_paths.sort_unstable_by(|left, right| left.0.cmp(right.0));
     for (relative, &expected) in graph_paths {
         let path = checkout_root.join(relative);
-        let same = match checkout.remove(relative) {
-            Some((size, hash)) => hasher.same_content(expected, size, hash, &path)?,
-            None => match fs::metadata(&path) {
-                Ok(metadata) if metadata.is_file() => {
-                    hasher.same_content(expected, metadata.len(), zero, &path)?
-                }
-                _ => false,
+        let same = match graph_key {
+            Some(key_of) => {
+                let source = match checkout.remove(relative) {
+                    Some((_, hash)) if hash != zero => Some(hash),
+                    _ => hasher.hash(&path)?,
+                };
+                source.and_then(|source| key_of(relative, source)) == Some(expected.1)
+            }
+            None => match checkout.remove(relative) {
+                Some((size, hash)) => hasher.same_content(expected, size, hash, &path)?,
+                None => match fs::metadata(&path) {
+                    Ok(metadata) if metadata.is_file() => {
+                        hasher.same_content(expected, metadata.len(), zero, &path)?
+                    }
+                    _ => false,
+                },
             },
         };
         if !same {
@@ -1603,7 +1627,7 @@ mod tests {
             ("dist/out.ts", identity("built")),
         ]);
         assert_eq!(
-            compare_with_graph(&graph, here, &checkout, Some(&owner), 8),
+            compare_with_graph(&graph, here, &checkout, Some(&owner), 8, None),
             known(&[])
         );
     }
@@ -1639,7 +1663,7 @@ mod tests {
         // unindexed.ts is in the graph but has no record in this checkout's
         // index; its file on disk is hashed instead and matches the graph.
         assert_eq!(
-            compare_with_graph(&graph, here, &checkout, Some(&owner), 8),
+            compare_with_graph(&graph, here, &checkout, Some(&owner), 8, None),
             known(&[
                 "src/added.ts",
                 "src/edited.ts",
@@ -1658,19 +1682,19 @@ mod tests {
         );
         let here = files(&[("src/a.ts", identity("aa"))]);
         assert_eq!(
-            compare_with_graph(&HashMap::new(), here, &checkout, None, 8),
+            compare_with_graph(&HashMap::new(), here, &checkout, None, 8, None),
             known(&["src/a.ts"])
         );
         let graph = files(&[("src/a.ts", identity("aa")), ("src/b.ts", identity("bb"))]);
         let here = files(&[("src/a.ts", unhashed("aa")), ("src/b.ts", unhashed("bb"))]);
         assert_eq!(
-            compare_with_graph(&graph, here.clone(), &checkout, Some(&owner), 2),
+            compare_with_graph(&graph, here.clone(), &checkout, Some(&owner), 2, None),
             known(&[])
         );
         // Past the budget the files found so far are kept, but the list is
         // marked incomplete so that no count is reported from it.
         assert_eq!(
-            compare_with_graph(&graph, here, &checkout, Some(&owner), 1),
+            compare_with_graph(&graph, here, &checkout, Some(&owner), 1, None),
             DifferingFiles {
                 files: Vec::new(),
                 complete: false
@@ -1679,7 +1703,7 @@ mod tests {
         let graph = files(&[("src/a.ts", identity("zz")), ("src/b.ts", identity("bb"))]);
         let here = files(&[("src/a.ts", identity("aa")), ("src/b.ts", unhashed("bb"))]);
         assert_eq!(
-            compare_with_graph(&graph, here, &checkout, Some(&owner), 0),
+            compare_with_graph(&graph, here, &checkout, Some(&owner), 0, None),
             DifferingFiles {
                 files: vec!["src/a.ts".to_string()],
                 complete: false

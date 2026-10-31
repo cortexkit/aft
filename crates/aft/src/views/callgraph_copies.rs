@@ -166,6 +166,7 @@ fn matches_target(
         root,
         Some(target_root),
         MATCH_DISK_READS,
+        Some(&crate::commands::callgraph_borrowed::views_graph_key),
     );
     differing.complete && differing.files.is_empty()
 }
