@@ -270,6 +270,8 @@ const REFUSAL_EXPLANATIONS: &[(&str, &str, &str, GithubReach, RefusalActor)] = &
     ("review_thread_not_own", "", "The pull request was not opened by this bot.", GithubReach::ReadsOnly, RefusalActor::Agent),
     ("issue_edit_not_own", "", "The issue was not opened by this bot.", GithubReach::ReadsOnly, RefusalActor::Agent),
     ("pr_head_cross_repository", "", "The pull request head is outside the bound repository.", GithubReach::Never, RefusalActor::Agent),
+    ("pull_request_head_moved", "", "The pull request's head changed after the commit given with --match-head-commit; read its current head and enqueue again with that commit.", GithubReach::ReadsOnly, RefusalActor::Agent),
+    ("pull_request_not_open", "", "The pull request is closed or merged, so it can't join or leave the merge queue.", GithubReach::ReadsOnly, RefusalActor::Agent),
     ("probe_unproven", "", "The bot handle has not passed its proof check.", GithubReach::Never, RefusalActor::Operator),
     ("repository_unbound", "", "The repository has no bot binding.", GithubReach::Maybe, RefusalActor::Operator),
     ("request_deadline_exceeded", "", "The request deadline expired before dispatch.", GithubReach::Never, RefusalActor::Nobody),
