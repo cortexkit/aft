@@ -404,8 +404,22 @@ fn link_image(source: &Path, destination: &Path) -> io::Result<()> {
         }
         Ok(())
     }
+    // Never give the running daemon's executable a second name on macOS. The
+    // privacy controls name the program that asks for protected files (a
+    // removable volume, Documents, ...) by the path the kernel reports for the
+    // responsible process's executable, and with several hard links that can
+    // be any of them. Every task image then looked like a different "aft", so
+    // an Allow never stuck and the prompt blocked the volume until someone
+    // answered. Returning an error makes `materialize` clone or copy the held
+    // image into a separate file, leaving the daemon at its one placed path.
     #[cfg(target_os = "macos")]
-    std::fs::hard_link(source, destination)
+    {
+        let _ = (source, destination);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the daemon's executable is never hard-linked on macOS",
+        ))
+    }
 }
 
 #[cfg(unix)]
@@ -427,6 +441,12 @@ fn materialize(
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Err(error),
         Err(_) => {
+            // On APFS a clone of the held image is a separate file that shares
+            // its blocks, so it costs no disk and keeps the signed bytes.
+            #[cfg(target_os = "macos")]
+            if clone_held_image(source, destination).is_ok() {
+                return Ok(());
+            }
             // Storage may be on another volume. Stream the already-open image
             // unchanged so embedded code signatures on macOS remain valid.
             let mut output = crate::private_storage::executable_options()
@@ -453,6 +473,30 @@ fn materialize(
             output.sync_all()?;
             output.set_permissions(std::fs::Permissions::from_mode(0o500))?;
         }
+    }
+    Ok(())
+}
+
+/// Clone the held (already open) image into `destination` as a new file, then
+/// make it owner-only like every other file under AFT's storage.
+#[cfg(target_os = "macos")]
+fn clone_held_image(source: &std::fs::File, destination: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::io::AsRawFd;
+    let target =
+        std::ffi::CString::new(destination.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    // SAFETY: the descriptor is open for this call's duration and the path is
+    // NUL-terminated. Cloning from the descriptor, not a path, copies the image
+    // this process started from even if the deployment path was replaced.
+    if unsafe { libc::fclonefileat(source.as_raw_fd(), libc::AT_FDCWD, target.as_ptr(), 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if let Err(error) =
+        std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o500))
+    {
+        let _ = std::fs::remove_file(destination);
+        return Err(error);
     }
     Ok(())
 }
@@ -954,6 +998,34 @@ mod tests {
             .unwrap();
         assert!(output.status.success(), "{output:?}");
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 test"));
+    }
+
+    /// The daemon's own executable keeps exactly one name: its pin is a separate
+    /// file, so macOS cannot report the daemon by a pin or task-image path.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pinned_executable_macos_pin_is_a_separate_file_from_the_running_image() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let storage = tempfile::tempdir().unwrap();
+        let executable = storage.path().join("deploy");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let mut source = std::fs::File::open(&executable).unwrap();
+        let destination = storage.path().join("aft");
+        materialize(&executable, &mut source, &destination, link_image).unwrap();
+        let held = source.metadata().unwrap();
+        let pinned = std::fs::metadata(&destination).unwrap();
+        assert_ne!(held.ino(), pinned.ino(), "the pin is a hard link");
+        assert_eq!(held.nlink(), 1, "the running image gained a second name");
+        assert_eq!(pinned.permissions().mode() & 0o777, 0o500);
+        assert_eq!(
+            std::fs::read(&executable).unwrap(),
+            std::fs::read(&destination).unwrap()
+        );
+        let output = std::process::Command::new(&destination)
+            .args(["--list", "pinned_executable_cleanup_preserves_live_owner"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
     }
 
     #[cfg(unix)]

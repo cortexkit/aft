@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "pin-own-inode-macos"
+  ],
+  "note": "macOS executable pin is a clone or copy, not a hard link of the running daemon. No search code changes."
+}
