@@ -4397,9 +4397,9 @@ fn configured_git_path_values(
                 );
             }
         } else {
-            // Expanding every duplicate with --path can fail on an overridden
-            // value that --get never reads. Retain the single-key semantics on
-            // that exceptional path rather than refusing a valid last value.
+            // Keep the original single-key queries authoritative when batching
+            // fails, including their errors and any Git-version-specific path
+            // expansion behavior.
             for (index, key) in pending {
                 let output =
                     git_policy_output(project_root, &["config", scope, "--path", "--get", key])
@@ -8242,27 +8242,24 @@ mod git_policy_cache_tests {
     }
 
     #[test]
-    fn git_policy_cache_batched_paths_ignore_overridden_invalid_path_expansion() {
+    fn git_policy_cache_batched_paths_preserve_invalid_path_refusal() {
         let fixture = Fixture::new();
         let config = fixture.root.join(".git/config");
         let mut contents = std::fs::read_to_string(&config).unwrap();
         contents.push_str("[core]\nexcludesFile = ~aft-policy-missing-user/overridden\nexcludesFile = local-excludes\n");
         std::fs::write(config, contents).unwrap();
-        let paths = configured_git_paths_with_inputs(
+        let error = configured_git_paths_with_inputs(
             &fixture.root,
             &["core.excludesFile"],
             &mut Vec::new(),
             &mut None,
         )
-        .unwrap();
-        assert_eq!(
-            paths,
-            vec![(
-                "core.excludesFile".into(),
-                fixture.root.join("local-excludes"),
-                fixture.root.join("local-excludes")
-            )]
+        .unwrap_err();
+        assert!(
+            error.contains("failed to query core.excludesFile"),
+            "{error}"
         );
+        assert!(error.contains("failed to expand user dir"), "{error}");
     }
 
     #[test]
