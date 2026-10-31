@@ -112,6 +112,8 @@ fn prepare(storage: &Path) -> io::Result<PinnedExecutable> {
         let executable = {
             let destination = directory.join("aft");
             materialize(&source_path, &mut source_file, &destination, link_image)?;
+            #[cfg(target_os = "macos")]
+            warm_new_image(&destination);
             destination
         };
         // Windows holds the executable image open without write/delete sharing;
@@ -475,6 +477,61 @@ fn materialize(
         }
     }
     Ok(())
+}
+
+/// Run a newly created image once, so its first launch is paid here.
+///
+/// On macOS the pin is a new file, not another name for the running image,
+/// and the first launch of a new executable can be slow (the system assesses
+/// it, and a large debug build pays for its size). The gh shim's version
+/// probe allows only two seconds, so without this a slow first launch would
+/// refuse the shim and leave shells without `gh`. A failure here is only
+/// logged: the probe still decides whether the image is usable.
+#[cfg(target_os = "macos")]
+fn warm_new_image(image: &Path) {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    const WARM_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+    let started = std::time::Instant::now();
+    let mut child = match Command::new(image)
+        .env_clear()
+        .args(["gh-shim", "--shim-version"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            log::warn!("pinned image first launch failed to start: {error}");
+            return;
+        }
+    };
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() < WARM_BUDGET => {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            _ => {
+                // SAFETY: the child leads its own process group (spawned above).
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                let _ = child.wait();
+                log::warn!(
+                    "pinned image first launch did not finish within {}s",
+                    WARM_BUDGET.as_secs()
+                );
+                return;
+            }
+        }
+    }
+    let elapsed = started.elapsed();
+    if elapsed > std::time::Duration::from_secs(1) {
+        log::info!("pinned image first launch took {}ms", elapsed.as_millis());
+    }
 }
 
 /// Clone the held (already open) image into `destination` as a new file, then
