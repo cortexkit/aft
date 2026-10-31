@@ -361,6 +361,26 @@ impl BuildDeathBreaker {
         })
     }
 
+    /// Retire an attempt that returned normally without publishing. Cancellation
+    /// preserves all prior death history and prevents a late attribution from
+    /// treating an ordinary corpus edit as a process death.
+    pub(crate) fn cancel_attempt(&self, key: &BreakerKey, attempt_id: &str) -> Result<()> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM breaker_attempts
+                 WHERE root_id = ?1 AND domain = ?2 AND corpus_fingerprint = ?3
+                   AND attempt_id = ?4 AND death_charged = 0",
+                params![
+                    key.root_id,
+                    key.domain.as_str(),
+                    key.corpus_fingerprint,
+                    attempt_id
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
     /// A ready pointer flip is the only automatic full reset. Staged commits do
     /// not call this method and therefore cannot launder a death loop.
     pub fn record_ready_publication(&self, key: &BreakerKey) -> Result<()> {
@@ -666,6 +686,23 @@ mod tests {
                 },
             )
             .unwrap()
+    }
+
+    #[test]
+    fn cancelled_attempt_ignores_late_death_without_resetting_prior_history() {
+        let (_dir, breaker) = breaker();
+        let key = key(BuildDomain::CallgraphCold);
+        let dead = admitted(&breaker, &key, 1);
+        breaker
+            .record_attributed_death_at(&key, &dead.attempt_id, 0, 0, 2)
+            .unwrap();
+        let cancelled = admitted(&breaker, &key, 3);
+        breaker.cancel_attempt(&key, &cancelled.attempt_id).unwrap();
+        assert!(breaker
+            .record_attributed_death_at(&key, &cancelled.attempt_id, 0, 100_000, 4)
+            .unwrap()
+            .is_none());
+        assert_eq!(durable_tallies(&breaker, &key), (1, 0, 0));
     }
 
     #[test]

@@ -1,0 +1,1 @@
+- On Windows, an edit no longer makes the file briefly disappear while it is replaced, so editors, language servers and file watchers never see it missing. Downloaded files keep their "downloaded from the internet" marker after an edit.

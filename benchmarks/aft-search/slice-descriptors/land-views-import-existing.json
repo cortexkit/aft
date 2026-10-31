@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs"
+  ],
+  "slices": [
+    "views-import-existing"
+  ],
+  "note": "The ranking fence hits semantic_search/mod.rs only for views on: while a legacy text and symbol import is still building, aft_search reports the trigram lane as building and answers from the bounded disk scan with the gap disclosed, instead of failing the call. Views are off by default and the views-off path is unchanged. No ranking or scoring mechanism changes; canonical-checkout ranked rows must remain byte-identical to the committed reference."
+}

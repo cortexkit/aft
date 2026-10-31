@@ -82,15 +82,16 @@ fn configured_context_with_storage(
     ctx.isolate_cold_build_limiter_for_test(2);
     crate::test_helpers::admission::settle(&ctx);
     // These fixtures exercise scheduler behavior rather than LSP startup. Seed a
-    // checked-clean report so blocking inspect can require a complete diagnostics
-    // prerequisite without changing the scheduler subject under test.
+    // checked-clean report tied to real file content so the warm inspect path
+    // can finish diagnostics without starting a language server.
+    let diagnostic_file = root.join(".aft-test-authoritative-diagnostics");
+    fs::write(&diagnostic_file, "").expect("write checked-clean fixture");
+    let diagnostic_file = crate::helpers::canonicalize_like_product(&diagnostic_file);
     ctx.lsp()
         .diagnostics_store_mut_for_test()
-        .publish_with_kind(
-            ServerKind::Rust,
-            root.join(".aft-test-authoritative-diagnostics"),
-            Vec::new(),
-        );
+        .publish_with_kind(ServerKind::Rust, diagnostic_file.clone(), Vec::new());
+    ctx.lsp()
+        .certify_diagnostic_content_for_test(&diagnostic_file);
     if callgraph_store {
         ensure_callgraph_store_ready(&ctx);
     }

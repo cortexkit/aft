@@ -253,9 +253,19 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
 
   // Content-addressed index views. When enabled, semantic and callgraph artifacts
   // are assembled from reusable per-file blobs behind an atomic manifest.
-  // User and project tiers may both set this. Default: false.
+  // User and project tiers may both set these; each tier sets only the keys it
+  // names.
   "views": {
-    "enabled": false
+    // Default: false.
+    "enabled": false,
+    // How many checkouts of one repository keep their own call graph, besides
+    // the main checkout. Another checkout reads the main checkout's graph, and
+    // its call-graph answers say which of its files differ. 0 makes every other
+    // checkout read the main checkout's graph. Default: 4.
+    "callgraph_copies": 4,
+    // Hours without use after which a checkout's view can be evicted.
+    // Default: 168 (7 days), minimum 1.
+    "idle_checkout_hours": 168
   },
 
   // When project_root is exactly $HOME, every index is force-disabled because the

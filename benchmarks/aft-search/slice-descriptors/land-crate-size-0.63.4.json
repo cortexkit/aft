@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "crate-size-0.63.4"
+  ],
+  "note": "Release packaging only: agent-file-tools leaves integration suites and in-tree test modules out of the published crate (crates.io's 10 MiB limit), release.sh checks package sizes before the cut, and the 0.63.3 notes are retitled to 0.63.4 with three new lines. No changed path matches RANKING_FENCE_PREFIXES."
+}

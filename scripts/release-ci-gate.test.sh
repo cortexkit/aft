@@ -11,7 +11,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATE="$SCRIPT_DIR/release-ci-gate.sh"
-TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/release-ci-gate-test.XXXXXX")"
+mkdir -p "$SCRIPT_DIR/../target/scratch"
+TMP_ROOT="$(mktemp -d "$SCRIPT_DIR/../target/scratch/release-ci-gate-test.XXXXXX")"
 trap 'rm -rf "$TMP_ROOT"' EXIT
 
 command -v jq >/dev/null || { echo "release-ci-gate.test.sh: jq is required" >&2; exit 2; }
@@ -204,6 +205,31 @@ write_runs "$(run_json 105 "$LANDED" main push completed cancelled 1)" \
 all_green_jobs 104
 gate "$LANDED"
 expect 1 "no green tests.yml run for $LANDED" "green train run cannot replace cancelled main evidence"
+
+# Queue evidence is accepted only for the exact tagged SHA, with all required
+# jobs green; the main-push path remains supported.
+reset_state
+write_runs "$(run_json 120 "$LANDED" gh-readonly-queue/main/pr-7 merge_group completed success 1)"
+all_green_jobs 120
+gate "$LANDED" --queue-only
+expect 0 "runs/120" "matching queue SHA with every required job is releasable"
+gate "$LANDED"
+expect 0 "runs/120" "publication also accepts exact-SHA queue evidence"
+
+reset_state
+write_runs "$(run_json 121 "$OTHER_SHA" gh-readonly-queue/main/pr-7 merge_group completed success 1)"
+all_green_jobs 121
+gate "$LANDED" --queue-only
+expect 1 "no tests.yml run" "queue run of another SHA is refused"
+
+reset_state
+write_runs "$(run_json 122 "$LANDED" gh-readonly-queue/main/pr-7 merge_group completed success 1)"
+write_jobs 122 "Unit / Unit tests (Linux)=success"
+gate "$LANDED" --queue-only
+expect 1 "missing from the run" "queue run missing a required context is refused"
+write_jobs 122 "Unit / Unit tests (Linux)=failure" "E2E / E2E (Linux Docker)=success" "Unit / Bash permission e2e (Windows)=success"
+gate "$LANDED" --queue-only
+expect 1 "failure" "queue run with a red required context is refused"
 
 # --- wrong sha --------------------------------------------------------------
 # A response carrying another commit's green run must not count, even if the

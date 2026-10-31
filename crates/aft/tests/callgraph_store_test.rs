@@ -1591,6 +1591,42 @@ fn app_context_revalidates_to_newer_published_generation() {
 }
 
 #[test]
+#[cfg(any(unix, windows))]
+fn cold_callgraph_build_through_symlinked_project_root() {
+    let dir = tempdir().unwrap();
+    let real_root = dir.path().join("real");
+    fs::create_dir(&real_root).unwrap();
+    write_file(
+        &real_root.join("main.ts"),
+        "export function entry() { leaf(); }\nfunction leaf() {}\n",
+    );
+    let root = dir.path().join("linked");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&real_root, &root).unwrap();
+    #[cfg(windows)]
+    if let Err(error) = std::os::windows::fs::symlink_dir(&real_root, &root) {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            eprintln!("skipping directory symlink test: {error}");
+            return;
+        }
+        panic!("create directory symlink: {error}");
+    }
+
+    let store_dir = dir.path().join("store");
+    let (store, stats) =
+        CallGraphStore::cold_build_with_lease(store_dir.clone(), root.clone(), &[])
+            .expect("an unchanged project reached through a symlink builds a cold call graph");
+    assert_eq!(stats.files, 1);
+    drop(store);
+    let store = CallGraphStore::open_readonly(store_dir, root)
+        .unwrap()
+        .expect("cold call graph was published");
+    let tree = store.call_tree(Path::new("main.ts"), "entry", 1).unwrap();
+    assert_eq!(tree.children.len(), 1);
+    assert_eq!(tree.children[0].name, "leaf");
+}
+
+#[test]
 fn app_context_demand_builds_once_and_worktree_reads_readonly() {
     let dir = tempdir().unwrap();
     write_file(

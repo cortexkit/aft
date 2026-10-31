@@ -1012,6 +1012,11 @@ fn consume_host_escalation_grant_at(
         &task_id,
     )
     .map_err(|_| EscalationRefusal::DigestMismatch)?;
+    let mut environment = attempt.environment.clone();
+    crate::pinned_executable::task_environment(
+        &crate::pinned_executable::task_executable(&task.paths.io_dir),
+        &mut environment,
+    );
     verify_payload(
         task,
         &attempt.command,
@@ -1019,7 +1024,7 @@ fn consume_host_escalation_grant_at(
         &attempt.cwd,
         principal,
         &attempt.shell_path,
-        &attempt.environment,
+        &environment,
         Some(digest),
         true,
     )
@@ -1037,6 +1042,11 @@ pub(crate) fn prepare_task_payload(
     shell_path: &Path,
     environment: &ChildEnvironment,
 ) -> Result<PreparedTask, String> {
+    let mut environment = environment.clone();
+    crate::pinned_executable::task_environment(
+        &crate::pinned_executable::task_executable(&task.paths.io_dir),
+        &mut environment,
+    );
     materialize_payload(
         crate::bash_background::persistence::ResolvedTask {
             paths: task.paths.clone(),
@@ -1047,7 +1057,7 @@ pub(crate) fn prepare_task_payload(
         cwd,
         principal,
         shell_path,
-        environment,
+        &environment,
     )
 }
 
@@ -1564,29 +1574,30 @@ pub fn resolve_sandbox_spawn(
 
     #[cfg(unix)]
     {
-        let profile = match build_native_profile(ctx, principal, task_bundle_dir) {
-            Ok(profile) => profile,
-            Err(error) => {
-                return sandbox_setup_refusal(ctx, principal, error);
-            }
-        };
-        let launcher_path = match native_launcher_path(ctx) {
-            Ok(path) => path,
-            Err(error) => {
-                let _ = cleanup_task_temp_dir(&profile.temp_dir);
-                return sandbox_setup_refusal(
-                    ctx,
-                    principal,
-                    format!("failed to locate the aft executable: {error}"),
-                );
-            }
-        };
-        crate::slog_info!(
+        let resolved = crate::pinned_executable::with_task_image(task_bundle_dir, || {
+            let profile = match build_native_profile(ctx, principal, task_bundle_dir) {
+                Ok(profile) => profile,
+                Err(error) => {
+                    return sandbox_setup_refusal(ctx, principal, error);
+                }
+            };
+            let launcher_path = match native_launcher_path(ctx) {
+                Ok(path) => path,
+                Err(error) => {
+                    let _ = cleanup_task_temp_dir(&profile.temp_dir);
+                    return sandbox_setup_refusal(
+                        ctx,
+                        principal,
+                        format!("failed to locate the aft executable: {error}"),
+                    );
+                }
+            };
+            crate::slog_info!(
             "sandbox profile apply: tier=native task_kind={task_kind:?} writable_roots={} read_deny={}",
             profile.writable_roots.len(),
             profile.read_deny.len()
         );
-        crate::slog_debug!(
+            crate::slog_debug!(
             "sandbox profile paths: tier=native writable_roots={:?} write_deny_nested={:?} read_deny={:?} socket_deny={:?} cache_roots={:?} temp_dir={:?}",
             profile.writable_roots,
             profile.write_deny_nested,
@@ -1595,9 +1606,18 @@ pub fn resolve_sandbox_spawn(
             profile.cache_roots,
             profile.temp_dir
         );
-        SpawnPlan::Launcher {
-            profile,
-            launcher_path,
+            SpawnPlan::Launcher {
+                profile,
+                launcher_path,
+            }
+        });
+        match resolved {
+            Ok(plan) => plan,
+            Err(error) => sandbox_setup_refusal(
+                ctx,
+                principal,
+                format!("failed to retain the startup executable for the task: {error}"),
+            ),
         }
     }
 
@@ -2145,21 +2165,13 @@ fn build_relaxed_profile(
         stores
             .read_metadata_allow
             .extend(git.metadata_allow.iter().cloned());
-        for key in ["core.hooksPath", "mason.originalHooksPath"] {
-            if !git
-                .configured_paths
-                .iter()
-                .any(|(existing, _)| existing == key)
-            {
-                let mut metadata = Vec::new();
-                if let Some((_, path)) = configured_git_path(root, key, &mut metadata)? {
-                    if profile_candidate_is_dir(&path) {
-                        stores.read_allow.push(path);
-                    }
-                    stores.read_metadata_allow.extend(metadata);
-                }
+        let mut metadata = Vec::new();
+        for path in resolve_missing_repository_hooks(root, git, &mut metadata)? {
+            if profile_candidate_is_dir(&path) {
+                stores.read_allow.push(path);
             }
         }
+        stores.read_metadata_allow.extend(metadata);
         let listing = git_policy_output(root, &["worktree", "list", "--porcelain", "-z"])
             .map_err(|error| format!("cannot enumerate sibling checkouts: {error}"))?;
         if listing.status.success() {
@@ -2380,17 +2392,11 @@ fn checkout_control_denies(root: &Path, git: &GitPolicy) -> Result<Vec<PathBuf>,
             .filter(|(key, _)| key != "core.excludesFile")
             .map(|(_, path)| path.clone()),
     );
-    for key in ["core.hooksPath", "mason.originalHooksPath"] {
-        if !git
-            .configured_paths
-            .iter()
-            .any(|(existing, _)| existing == key)
-        {
-            if let Some((_, path)) = configured_git_path(root, key, &mut Vec::new())? {
-                denies.push(path);
-            }
-        }
-    }
+    denies.extend(resolve_missing_repository_hooks(
+        root,
+        git,
+        &mut Vec::new(),
+    )?);
     if let Some((git_dir, _)) = &git.linked {
         // Binding pointers must stay immutable too: redirecting one would
         // replace the operator-owned configuration used on the next spawn.
@@ -3104,6 +3110,79 @@ struct GitPolicyCacheKey {
 }
 
 #[cfg(unix)]
+// Counts, in order: validated cache reuse, discovery with a cache key, discovery
+// without a cache key, and spawned Git children. A key identifies the worktree's
+// Git topology, environment and worker role. Discovery with a key also counts
+// invalidated inputs and callers that stop waiting for another resolver.
+static GIT_POLICY_COUNTERS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+#[cfg(unix)]
+#[derive(Default)]
+struct GitPolicyReport {
+    counters: [u64; 4],
+    last_at: Option<Instant>,
+}
+
+#[cfg(unix)]
+impl GitPolicyReport {
+    fn changed(&mut self, now: Instant, counters: [u64; 4]) -> bool {
+        if counters == self.counters
+            || self
+                .last_at
+                .is_some_and(|last| now.duration_since(last) < Duration::from_secs(60))
+        {
+            return false;
+        }
+        self.counters = counters;
+        self.last_at = Some(now);
+        true
+    }
+}
+
+#[cfg(unix)]
+fn git_policy_counters() -> [u64; 4] {
+    GIT_POLICY_COUNTERS
+        .each_ref()
+        .map(|counter| counter.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+#[cfg(unix)]
+fn log_git_policy_summary() {
+    static REPORT: OnceLock<Mutex<GitPolicyReport>> = OnceLock::new();
+    let Ok(mut report) = REPORT
+        .get_or_init(|| Mutex::new(GitPolicyReport::default()))
+        .try_lock()
+    else {
+        return;
+    };
+    let counters = git_policy_counters();
+    if report.changed(Instant::now(), counters) {
+        let [hits, misses, uncached, helpers] = counters;
+        crate::slog_info!("git policy cache cumulative: hits={hits} misses={misses} uncached_key_none={uncached} git_helpers={helpers}");
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum GitPolicyResolution {
+    Hit = 0,
+    Miss = 1,
+    Uncached = 2,
+}
+
+#[cfg(unix)]
+fn note_git_policy_resolution(_project_root: &Path, resolution: GitPolicyResolution) {
+    #[cfg(test)]
+    with_git_policy_test_state(_project_root, |state| match resolution {
+        GitPolicyResolution::Hit => state.hits += 1,
+        GitPolicyResolution::Miss => state.misses += 1,
+        GitPolicyResolution::Uncached => state.uncached += 1,
+    });
+    GIT_POLICY_COUNTERS[resolution as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(unix)]
 const GIT_POLICY_CACHE_CAPACITY: usize = 256;
 
 #[cfg(unix)]
@@ -3216,6 +3295,9 @@ struct GitPolicyTestUncachedGate {
 struct GitPolicyTestState {
     environment: Vec<(OsString, OsString)>,
     calls: usize,
+    hits: usize,
+    misses: usize,
+    uncached: usize,
     delay_ms: u64,
     uncached_gate: Option<GitPolicyTestUncachedGate>,
     waiter_signal: Option<std::sync::mpsc::Sender<()>>,
@@ -3775,7 +3857,16 @@ fn git_policy_output(project_root: &Path, args: &[&str]) -> std::io::Result<std:
     };
     #[cfg(not(test))]
     let mut command = command.build();
-    command.arg("-C").arg(project_root).args(args).output()
+    let child = command
+        .arg("-C")
+        .arg(project_root)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    GIT_POLICY_COUNTERS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    child.wait_with_output()
 }
 
 #[cfg(unix)]
@@ -3784,6 +3875,7 @@ fn resolve_git_policy(project_root: &Path) -> Result<GitPolicy, String> {
         crate::bash_background::BashStartupStep::GitPolicy,
     );
     let result = resolve_git_policy_inner(project_root);
+    log_git_policy_summary();
     crate::bash_background::enter_bash_startup_step(
         crate::bash_background::BashStartupStep::Profile,
     );
@@ -3795,6 +3887,7 @@ fn resolve_git_policy_inner(project_root: &Path) -> Result<GitPolicy, String> {
     let environment = git_policy_environment(project_root);
     let worker = worker_jail_active();
     let Some(key) = git_policy_cache_key(project_root, &environment, worker) else {
+        note_git_policy_resolution(project_root, GitPolicyResolution::Uncached);
         return resolve_git_policy_uncached(project_root, environment, worker)
             .map(|(policy, _)| policy);
     };
@@ -3820,6 +3913,7 @@ fn resolve_git_policy_inner(project_root: &Path) -> Result<GitPolicy, String> {
                 let remaining = git_policy_wait_remaining(project_root, wait_deadline);
                 if remaining.is_zero() {
                     drop(cache);
+                    note_git_policy_resolution(project_root, GitPolicyResolution::Miss);
                     return resolve_git_policy_uncached(project_root, environment, worker)
                         .map(|(policy, _)| policy);
                 }
@@ -3834,6 +3928,7 @@ fn resolve_git_policy_inner(project_root: &Path) -> Result<GitPolicy, String> {
 
         if let Some(cached) = cached {
             if cached.inputs.unchanged(project_root) {
+                note_git_policy_resolution(project_root, GitPolicyResolution::Hit);
                 return Ok(cached.policy.clone());
             }
             git_policy_cache()
@@ -3849,6 +3944,7 @@ fn resolve_git_policy_inner(project_root: &Path) -> Result<GitPolicy, String> {
         // The in-flight marker serializes misses for this exact worktree and
         // input environment until a waiter's deadline. Filesystem checks and
         // Git subprocesses stay unlocked.
+        note_git_policy_resolution(project_root, GitPolicyResolution::Miss);
         let result = resolve_git_policy_uncached(project_root, environment.clone(), worker);
         let entry = result.as_ref().ok().and_then(|(policy, inputs)| {
             let current_key = git_policy_cache_key(project_root, &environment, worker);
@@ -4021,7 +4117,7 @@ fn resolve_git_policy_uncached(
     let (hooks_input, hooks) = resolve_hooks_path(project_root, &common_dir)?;
     let mut metadata_allow = Vec::new();
     let mut configured_paths = Vec::new();
-    for key in if worker {
+    let keys = if worker {
         &[
             "core.hooksPath",
             "mason.originalHooksPath",
@@ -4029,15 +4125,14 @@ fn resolve_git_policy_uncached(
         ][..]
     } else {
         &[]
-    } {
-        if let Some((input, path)) =
-            configured_git_path_with_inputs(project_root, key, &mut metadata_allow, &mut inputs)?
-        {
-            if let Some(inputs) = &mut inputs {
-                inputs.resolved_paths.push((input, path.clone()));
-            }
-            configured_paths.push((key.to_string(), path));
+    };
+    for (key, input, path) in
+        configured_git_paths_with_inputs(project_root, keys, &mut metadata_allow, &mut inputs)?
+    {
+        if let Some(inputs) = &mut inputs {
+            inputs.resolved_paths.push((input, path.clone()));
         }
+        configured_paths.push((key, path));
     }
     // Re-resolve canonical paths on hits so creation of, or changes to, symlinks
     // in hooks/excludes paths cannot leave a deny pointing at the old target.
@@ -4138,53 +4233,48 @@ fn resolve_hooks_path(
     resolve_git_policy_path(common_dir.join("hooks"), "Git hooks")
 }
 
+/// Read missing keys again at the deny/grant consumer. A cached absence is not
+/// proof that a key remains unset: optional targets or configuration files can
+/// appear, or settings can change, after the earlier policy resolution.
+#[cfg(unix)]
+fn resolve_missing_repository_hooks(
+    project_root: &Path,
+    git: &GitPolicy,
+    metadata_allow: &mut Vec<PathBuf>,
+) -> Result<Vec<PathBuf>, String> {
+    let missing = ["core.hooksPath", "mason.originalHooksPath"]
+        .into_iter()
+        .filter(|key| {
+            !git.configured_paths
+                .iter()
+                .any(|(existing, _)| existing == *key)
+        })
+        .collect::<Vec<_>>();
+    configured_git_paths_with_inputs(project_root, &missing, metadata_allow, &mut None)
+        .map(|paths| paths.into_iter().map(|(_, _, path)| path).collect())
+}
+
 /// Resolve operator-owned Git path settings before any command-supplied
 /// environment is applied. `--path` expands Git's home-relative spelling.
 #[cfg(unix)]
-fn configured_git_path(
+fn configured_git_paths_with_inputs(
     project_root: &Path,
-    key: &str,
-    metadata_allow: &mut Vec<PathBuf>,
-) -> Result<Option<(PathBuf, PathBuf)>, String> {
-    configured_git_path_with_inputs(project_root, key, metadata_allow, &mut None)
-}
-
-#[cfg(unix)]
-fn configured_git_path_with_inputs(
-    project_root: &Path,
-    key: &str,
+    keys: &[&str],
     metadata_allow: &mut Vec<PathBuf>,
     inputs: &mut Option<GitPolicyInputs>,
-) -> Result<Option<(PathBuf, PathBuf)>, String> {
-    if !project_root.join(".git").exists() || !crate::developer_tools::git_usable() {
-        return Ok(None);
+) -> Result<Vec<(String, PathBuf, PathBuf)>, String> {
+    if keys.is_empty()
+        || !project_root.join(".git").exists()
+        || !crate::developer_tools::git_usable()
+    {
+        return Ok(Vec::new());
     }
-    let worktree_config = git_policy_output(
-        project_root,
-        &["config", "--local", "--bool", "extensions.worktreeConfig"],
-    )
-    .map_err(|error| format!("failed to query worktree config extension: {error}"))?;
-    let worktree_config = worktree_config.status.success() && worktree_config.stdout == b"true\n";
-    // AFT injects core.hooksPath through command-scope GIT_CONFIG_* settings.
-    // Its hooks then query repository scopes to run the configured policy.
-    // Resolve those same scopes so the injected path cannot hide that policy.
-    for scope in ["--worktree", "--local", "--global", "--system"] {
-        if scope == "--worktree" && !worktree_config {
+    let values = configured_git_path_values(project_root, keys)?;
+    let mut paths = Vec::new();
+    for (key, value) in keys.iter().zip(values) {
+        let Some(value) = value else {
             continue;
-        }
-        let output = git_policy_output(project_root, &["config", scope, "--path", "--get", key])
-            .map_err(|error| format!("failed to query {key}: {error}"))?;
-        if output.status.code() == Some(1) && output.stdout.is_empty() {
-            continue;
-        }
-        if !output.status.success() {
-            return Err(format!(
-                "failed to query {key}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-        let value = String::from_utf8(output.stdout)
-            .map_err(|error| format!("{key} is not UTF-8: {error}"))?;
+        };
         let path = PathBuf::from(value.trim());
         if !path.as_os_str().is_empty() {
             let path = if path.is_absolute() {
@@ -4209,10 +4299,124 @@ fn configured_git_path_with_inputs(
                     metadata_allow.push(ancestor.to_path_buf());
                 }
             }
-            return resolve_git_policy_path(path, key).map(Some);
+            let (input, path) = resolve_git_policy_path(path, key)?;
+            paths.push((key.to_string(), input, path));
         }
     }
-    Ok(None)
+    Ok(paths)
+}
+
+#[cfg(unix)]
+fn configured_git_path_values(
+    project_root: &Path,
+    keys: &[&str],
+) -> Result<Vec<Option<String>>, String> {
+    #[cfg(all(test, target_os = "linux"))]
+    if git_policy_cache_tests::BENCH_UNBATCHED.with(|value| value.get()) {
+        return git_policy_cache_tests::legacy_git_path_values(project_root, keys);
+    }
+    let worktree_config = git_policy_output(
+        project_root,
+        &["config", "--local", "--bool", "extensions.worktreeConfig"],
+    )
+    .map_err(|error| format!("failed to query worktree config extension: {error}"))?;
+    let worktree_config = worktree_config.status.success() && worktree_config.stdout == b"true\n";
+    // AFT injects core.hooksPath through command-scope GIT_CONFIG_* settings.
+    // Its hooks then query repository scopes to run the configured policy.
+    // Resolve those same scopes so the injected path cannot hide that policy.
+    let mut values = vec![None; keys.len()];
+    for scope in ["--worktree", "--local", "--global", "--system"] {
+        if scope == "--worktree" && !worktree_config {
+            continue;
+        }
+        let pending = keys
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| values[*index].is_none())
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            break;
+        }
+        let pattern = format!(
+            "^({})$",
+            pending
+                .iter()
+                .map(|(_, key)| regex::escape(&key.to_ascii_lowercase()))
+                .collect::<Vec<_>>()
+                .join("|")
+        );
+        let output = git_policy_output(
+            project_root,
+            &[
+                "config",
+                scope,
+                "--null",
+                "--path",
+                "--get-regexp",
+                &pattern,
+            ],
+        )
+        .map_err(|error| format!("failed to query Git policy paths: {error}"))?;
+        if output.status.success() || (output.status.code() == Some(1) && output.stdout.is_empty())
+        {
+            // --get-regexp returns all values in file order, whereas --get
+            // selects the last. Keep the last even when empty: an empty value
+            // falls through to the next scope, not an earlier value here.
+            let mut scoped_values = BTreeMap::new();
+            for record in output
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter(|record| !record.is_empty())
+            {
+                let (key, value) = record
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .map(|at| (&record[..at], &record[at + 1..]))
+                    .unwrap_or((record, &[]));
+                let Some((index, _)) = pending
+                    .iter()
+                    .find(|(_, name)| key.eq_ignore_ascii_case(name.as_bytes()))
+                else {
+                    return Err("git returned an unexpected policy key".into());
+                };
+                scoped_values.insert(*index, value.to_vec());
+            }
+            for (index, value) in scoped_values {
+                values[index] = Some(
+                    String::from_utf8(value)
+                        .map_err(|error| format!("{} is not UTF-8: {error}", keys[index]))?,
+                );
+            }
+        } else {
+            // Keep the original single-key queries authoritative when batching
+            // fails, including their errors and any Git-version-specific path
+            // expansion behavior.
+            for (index, key) in pending {
+                let output =
+                    git_policy_output(project_root, &["config", scope, "--path", "--get", key])
+                        .map_err(|error| format!("failed to query {key}: {error}"))?;
+                if output.status.code() == Some(1) && output.stdout.is_empty() {
+                    continue;
+                }
+                if !output.status.success() {
+                    return Err(format!(
+                        "failed to query {key}: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+                values[index] = Some(
+                    String::from_utf8(output.stdout)
+                        .map_err(|error| format!("{key} is not UTF-8: {error}"))?,
+                );
+            }
+        }
+        for value in &mut values {
+            if value.as_ref().is_some_and(|value| value.trim().is_empty()) {
+                *value = None;
+            }
+        }
+    }
+    Ok(values)
 }
 
 #[cfg(unix)]
@@ -5739,9 +5943,13 @@ fn isolated_environment_for_plan(
     }
     match plan.policy() {
         SpawnPlan::Host { environment, .. } => Some(environment.clone()),
-        SpawnPlan::Launcher { profile, .. } => {
+        SpawnPlan::Launcher {
+            profile,
+            launcher_path,
+        } => {
             let mut environment =
                 sandboxed_child_environment(request_environment, &profile.temp_dir);
+            crate::pinned_executable::task_environment(launcher_path, &mut environment);
             #[cfg(target_os = "macos")]
             if profile.temp_dir.join(".worker-bin/mktemp").is_file() {
                 let mut paths = vec![profile.temp_dir.join(".worker-bin")];
@@ -6428,6 +6636,10 @@ fn launcher_argv(
             OsString::from("--"),
             program.to_os_string(),
         ];
+        #[cfg(feature = "test-timing-hooks")]
+        if let Some(gate) = std::env::var_os("AFT_TEST_SANDBOX_START_GATE") {
+            wrapped.splice(1..1, [OsString::from("--test-start-gate"), gate]);
+        }
         wrapped.extend_from_slice(args);
         return Ok((launcher_path.as_os_str().to_os_string(), wrapped, None));
     };
@@ -6440,7 +6652,7 @@ profile_json=$2
 exit_fd=$3
 failure_fd=$4
 shift 4
-"$launcher" sandbox-launch --profile-json "$profile_json" --failure-fd "$failure_fd" -- "$@"
+"$launcher" sandbox-launch --profile-json "$profile_json" --failure-fd "$failure_fd" "$@"
 code=$?
 if [ "$code" -eq 78 ] && [ -s "/dev/fd/$failure_fd" ]; then
   if [ ! -s "/dev/fd/$exit_fd" ]; then
@@ -6454,8 +6666,12 @@ exit "$code""#,
         OsString::from(profile_json),
         OsString::from(exit_fd.to_string()),
         OsString::from(failure_fd.to_string()),
-        program.to_os_string(),
     ];
+    #[cfg(feature = "test-timing-hooks")]
+    if let Some(gate) = std::env::var_os("AFT_TEST_SANDBOX_START_GATE") {
+        wrapped.extend([OsString::from("--test-start-gate"), gate]);
+    }
+    wrapped.extend([OsString::from("--"), program.to_os_string()]);
     wrapped.extend_from_slice(args);
     Ok((OsString::from("/bin/sh"), wrapped, None))
 }
@@ -7691,6 +7907,54 @@ mod tests {
 mod git_policy_cache_tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    thread_local! {
+        pub(super) static BENCH_UNBATCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    // Keep the former per-key query schedule available only to the manual
+    // benchmark. Both schedules retain fresh consumer reads and use the same
+    // sandbox rules, filesystem inputs and cache validation.
+    #[cfg(target_os = "linux")]
+    pub(super) fn legacy_git_path_values(
+        project_root: &Path,
+        keys: &[&str],
+    ) -> Result<Vec<Option<String>>, String> {
+        keys.iter()
+            .map(|key| {
+                let extension = git_policy_output(
+                    project_root,
+                    &["config", "--local", "--bool", "extensions.worktreeConfig"],
+                )
+                .map_err(|error| format!("failed to query worktree config extension: {error}"))?;
+                let worktree_config = extension.status.success() && extension.stdout == b"true\n";
+                for scope in ["--worktree", "--local", "--global", "--system"] {
+                    if scope == "--worktree" && !worktree_config {
+                        continue;
+                    }
+                    let output =
+                        git_policy_output(project_root, &["config", scope, "--path", "--get", key])
+                            .map_err(|error| format!("failed to query {key}: {error}"))?;
+                    if output.status.code() == Some(1) && output.stdout.is_empty() {
+                        continue;
+                    }
+                    if !output.status.success() {
+                        return Err(format!(
+                            "failed to query {key}: {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        ));
+                    }
+                    let value = String::from_utf8(output.stdout)
+                        .map_err(|error| format!("{key} is not UTF-8: {error}"))?;
+                    if !value.trim().is_empty() {
+                        return Ok(Some(value));
+                    }
+                }
+                Ok(None)
+            })
+            .collect()
+    }
+
     struct Fixture {
         _dir: tempfile::TempDir,
         root: PathBuf,
@@ -7852,6 +8116,367 @@ mod git_policy_cache_tests {
         let (second, warm) = fixture.resolve();
         assert_eq!(second.hooks, first.hooks);
         assert_eq!(warm, 0, "unchanged policy must not spawn git");
+    }
+
+    #[test]
+    fn git_policy_cache_cold_worker_batches_scope_queries() {
+        let fixture = Fixture::new();
+        let (_, cold) = fixture.resolve();
+        assert!(cold <= 10, "cold worker policy used {cold} Git helpers");
+        assert_eq!(fixture.resolve().1, 0);
+        assert_eq!(
+            fixture.state(|state| (state.hits, state.misses, state.uncached)),
+            (1, 1, 0)
+        );
+        fixture.hooks("changed-hooks");
+        let (policy, changed) = fixture.resolve();
+        assert!(changed > 0);
+        assert_eq!(policy.hooks, vec![fixture.root.join("changed-hooks")]);
+        assert_eq!(
+            fixture.state(|state| (state.hits, state.misses, state.uncached)),
+            (1, 2, 0)
+        );
+    }
+
+    #[test]
+    fn git_policy_cache_worker_denies_keep_late_repository_reads() {
+        let fixture = Fixture::new();
+        let (policy, _) = fixture.resolve();
+        let before = fixture.state(|state| state.calls);
+        checkout_control_denies(&fixture.root, &policy).unwrap();
+        assert!(
+            fixture.state(|state| state.calls) > before,
+            "missing worker settings require an authoritative late read"
+        );
+
+        let config = fixture.root.join(".git/config");
+        let mut contents = std::fs::read_to_string(&config).unwrap();
+        contents.push_str("[mason]\noriginalHooksPath = new-original\n");
+        std::fs::write(config, contents).unwrap();
+        let (changed, calls) = fixture.resolve();
+        assert!(
+            calls > 0,
+            "creating an absent policy setting must invalidate the entry"
+        );
+        let before = fixture.state(|state| state.calls);
+        let denies = checkout_control_denies(&fixture.root, &changed).unwrap();
+        assert!(denies.contains(&fixture.root.join("new-original")));
+        assert_eq!(fixture.state(|state| state.calls), before);
+
+        let head = with_worker_jail(false, || resolve_git_policy(&fixture.root)).unwrap();
+        let before = fixture.state(|state| state.calls);
+        let denies = checkout_control_denies(&fixture.root, &head).unwrap();
+        assert!(denies.contains(&fixture.root.join("new-original")));
+        assert_eq!(
+            fixture.state(|state| state.calls) - before,
+            2,
+            "both missing head-policy keys share one extension probe and one local scope read"
+        );
+    }
+
+    #[test]
+    fn git_policy_cache_consumer_sees_created_optional_hooks_target() {
+        let fixture = Fixture::new();
+        let target = fixture.root.join("later-hooks");
+        let config = fixture.root.join(".git/config");
+        let mut contents = std::fs::read_to_string(&config).unwrap();
+        contents.push_str(&format!(
+            "[mason]\noriginalHooksPath = :(optional){}\n",
+            target.display()
+        ));
+        std::fs::write(config, contents).unwrap();
+        let (policy, _) = fixture.resolve();
+        assert!(!policy
+            .configured_paths
+            .iter()
+            .any(|(key, _)| key == "mason.originalHooksPath"));
+        assert_eq!(fixture.resolve().1, 0);
+
+        std::fs::create_dir(&target).unwrap();
+        let (cached, calls) = fixture.resolve();
+        assert_eq!(
+            calls, 0,
+            "optional-target existence is not tracked by the existing cache"
+        );
+        let fresh = configured_git_paths_with_inputs(
+            &fixture.root,
+            &["mason.originalHooksPath"],
+            &mut Vec::new(),
+            &mut None,
+        )
+        .unwrap();
+        assert!(fresh.iter().any(|(_, _, path)| path == &target));
+        let denies = checkout_control_denies(&fixture.root, &cached).unwrap();
+        assert!(
+            denies.contains(&target),
+            "a late read must protect a newly present optional target"
+        );
+    }
+
+    #[test]
+    fn git_policy_cache_consumer_sees_created_lf_global_candidate() {
+        let fixture = Fixture::new();
+        let parent = fixture.root.join("account\nfragment");
+        std::fs::create_dir(&parent).unwrap();
+        let global = parent.join("policy");
+        fixture.state(|state| {
+            state
+                .environment
+                .iter_mut()
+                .find(|(key, _)| key == "GIT_CONFIG_GLOBAL")
+                .unwrap()
+                .1 = global.clone().into_os_string();
+        });
+        fixture.resolve();
+        assert_eq!(fixture.resolve().1, 0);
+
+        std::fs::write(&global, "[mason]\noriginalHooksPath = newline-protected\n").unwrap();
+        let (cached, calls) = fixture.resolve();
+        assert_eq!(
+            calls, 0,
+            "the existing LF candidate discovery gap must not bypass the late read"
+        );
+        let target = fixture.root.join("newline-protected");
+        let fresh = configured_git_paths_with_inputs(
+            &fixture.root,
+            &["mason.originalHooksPath"],
+            &mut Vec::new(),
+            &mut None,
+        )
+        .unwrap();
+        assert!(fresh.iter().any(|(_, _, path)| path == &target));
+        let denies = checkout_control_denies(&fixture.root, &cached).unwrap();
+        assert!(
+            denies.contains(&target),
+            "a late read must protect a newly created configuration source"
+        );
+    }
+
+    #[test]
+    fn git_policy_cache_consumer_sees_config_edit_after_resolution() {
+        let fixture = Fixture::new();
+        let (policy, _) = fixture.resolve();
+        let config = fixture.root.join(".git/config");
+        let mut contents = std::fs::read_to_string(&config).unwrap();
+        contents.push_str("[mason]\noriginalHooksPath = late-protected\n");
+        std::fs::write(config, contents).unwrap();
+        let denies = checkout_control_denies(&fixture.root, &policy).unwrap();
+        assert!(denies.contains(&fixture.root.join("late-protected")));
+    }
+
+    #[test]
+    fn git_policy_cache_summary_is_changed_only_and_minute_limited() {
+        let mut report = GitPolicyReport::default();
+        let now = Instant::now();
+        assert!(!report.changed(now, [0; 4]));
+        assert!(report.changed(now, [1, 0, 0, 0]));
+        assert!(!report.changed(now + Duration::from_secs(59), [1, 1, 0, 12]));
+        assert!(report.changed(now + Duration::from_secs(60), [1, 1, 0, 12]));
+        assert!(!report.changed(now + Duration::from_secs(120), [1, 1, 0, 12]));
+        assert!(report.changed(now + Duration::from_secs(120), [1, 1, 1, 24]));
+    }
+
+    #[test]
+    fn git_policy_cache_batched_paths_preserve_scope_and_last_value_semantics() {
+        let fixture = Fixture::new();
+        let config = fixture.root.join(".git/config");
+        let mut contents = std::fs::read_to_string(&config).unwrap();
+        contents.push_str("[extensions]\nworktreeConfig = true\n[core]\nexcludesFile = discarded\nexcludesFile = local-excludes\n");
+        std::fs::write(config, contents).unwrap();
+        std::fs::write(
+            fixture.root.join(".git/config.worktree"),
+            "[core]\nhooksPath = worktree-hooks\nexcludesFile =\n[mason]\noriginalHooksPath =\n",
+        )
+        .unwrap();
+        std::fs::write(fixture.root.join("global"), "[mason]\noriginalHooksPath = discarded\noriginalHooksPath = global-original\n[core]\nexcludesFile = global-excludes\n").unwrap();
+        std::fs::write(
+            fixture.root.join("system"),
+            "[mason]\noriginalHooksPath = system-original\n",
+        )
+        .unwrap();
+        fixture.state(|state| {
+            state.environment.extend([
+                ("GIT_CONFIG_COUNT".into(), "1".into()),
+                ("GIT_CONFIG_KEY_0".into(), "core.hooksPath".into()),
+                ("GIT_CONFIG_VALUE_0".into(), "command-hooks".into()),
+            ])
+        });
+        let (policy, cold) = fixture.resolve();
+        assert!(cold <= 10, "batched scope resolution used {cold} helpers");
+        assert_eq!(policy.hooks, vec![fixture.root.join("command-hooks")]);
+        assert_eq!(
+            policy.configured_paths,
+            vec![
+                ("core.hooksPath".into(), fixture.root.join("worktree-hooks")),
+                (
+                    "mason.originalHooksPath".into(),
+                    fixture.root.join("global-original")
+                ),
+                (
+                    "core.excludesFile".into(),
+                    fixture.root.join("local-excludes")
+                ),
+            ]
+        );
+        assert_eq!(fixture.resolve().1, 0);
+    }
+
+    #[test]
+    fn git_policy_cache_batched_paths_preserve_invalid_path_refusal() {
+        let fixture = Fixture::new();
+        let config = fixture.root.join(".git/config");
+        let mut contents = std::fs::read_to_string(&config).unwrap();
+        contents.push_str("[core]\nexcludesFile = ~aft-policy-missing-user/overridden\nexcludesFile = local-excludes\n");
+        std::fs::write(config, contents).unwrap();
+        let error = configured_git_paths_with_inputs(
+            &fixture.root,
+            &["core.excludesFile"],
+            &mut Vec::new(),
+            &mut None,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("failed to query core.excludesFile"),
+            "{error}"
+        );
+        assert!(error.contains("failed to expand user dir"), "{error}");
+    }
+
+    #[test]
+    fn git_policy_cache_counts_redirected_roots_as_uncached_not_hits() {
+        let fixture = Fixture::new();
+        fixture.state(|state| {
+            state
+                .environment
+                .push(("GIT_DIR".into(), fixture.root.join(".git").into_os_string()))
+        });
+        assert!(fixture.resolve().1 > 0);
+        assert!(fixture.resolve().1 > 0);
+        assert_eq!(
+            fixture.state(|state| (state.hits, state.misses, state.uncached)),
+            (0, 0, 2)
+        );
+    }
+
+    /// Measures real worker bash starts under the strict sandbox profile. That
+    /// profile launches each command through the aft binary, so the test needs
+    /// a separately built one. All repositories, linked worktrees and task
+    /// storage are disposable.
+    #[test]
+    #[ignore = "manual Linux measurement; AFT_GIT_POLICY_BENCH_LAUNCHER names the aft binary"]
+    #[cfg(target_os = "linux")]
+    fn worker_bash_git_policy_cost() {
+        crate::effective_path::initialize_process_path();
+        let launcher = PathBuf::from(std::env::var_os("AFT_GIT_POLICY_BENCH_LAUNCHER").unwrap())
+            .canonicalize()
+            .unwrap();
+        let fixture = Fixture::new();
+        let storage = tempfile::tempdir().unwrap();
+        let account = tempfile::tempdir().unwrap();
+        let hooks = tempfile::tempdir().unwrap();
+        // Landlock rules only add access, so a hooks folder inside a worktree
+        // the command may write cannot be made read-only. Keep hooks outside.
+        fixture.hooks(hooks.path().to_str().unwrap());
+        let commit = git_policy_output(
+            &fixture.root,
+            &[
+                "-c",
+                "user.name=Policy Bench",
+                "-c",
+                "user.email=bench@example.invalid",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        assert!(commit.status.success(), "{commit:?}");
+        let linked = tempfile::tempdir().unwrap();
+        let mut roots = vec![(fixture.root.clone(), 10)];
+        for index in 0..4 {
+            let root = linked.path().join(format!("worker-{index}"));
+            let output = git_policy_output(
+                &fixture.root,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "--detach",
+                    root.to_str().unwrap(),
+                    "HEAD",
+                ],
+            )
+            .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            roots.push((root, 2));
+        }
+        for (label, unbatched) in [("before", true), ("after", false)] {
+            BENCH_UNBATCHED.with(|value| value.set(unbatched));
+            for (root_index, (root, starts)) in roots.iter().enumerate() {
+                fixture.register_root(root);
+                let key = git_policy_cache_key(root, &git_policy_environment(root), true).unwrap();
+                git_policy_cache().lock().unwrap().remove(&key);
+                let mut config = crate::config::Config::default();
+                config.project_root = Some(root.clone());
+                config.storage_dir =
+                    Some(storage.path().join(format!("store-{label}-{root_index}")));
+                config.github.shim = false;
+                config.git.co_author = "off".into();
+                config.bash.linux_scope = false;
+                config.sandbox.profile.head = SandboxMode::Strict;
+                config.sandbox.profile.worker = SandboxMode::Strict;
+                let ctx =
+                    AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+                let _launcher = install_sandbox_launcher_for_test(root, launcher.clone());
+                for start in 0..*starts {
+                    let before = with_git_policy_test_state(root, |state| {
+                        [state.hits, state.misses, state.uncached, state.calls]
+                    })
+                    .unwrap();
+                    let request: crate::protocol::RawRequest =
+                        serde_json::from_value(serde_json::json!({
+                            "id": "policy-cost", "command": "bash", "session_id": "policy-cost",
+                            "params": {"command": "printf git-policy-bench", "compressed": false}
+                        }))
+                        .unwrap();
+                    let began = Instant::now();
+                    let response = crate::worker_jail_canary::with_test_preparation_home(
+                        account.path(),
+                        1,
+                        || with_worker_jail(true, || crate::commands::bash::handle(&request, &ctx)),
+                    );
+                    let elapsed = began.elapsed();
+                    assert!(response.success, "{response:?}");
+                    let id = response.data["task_id"].as_str().unwrap();
+                    while !ctx.bash_background().is_task_terminal(id) {
+                        ctx.bash_background()
+                            .status(id, "policy-cost", None, None, 1024)
+                            .unwrap();
+                        assert!(began.elapsed() < Duration::from_secs(15));
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    assert_eq!(
+                        ctx.bash_background()
+                            .status(id, "policy-cost", None, None, 1024)
+                            .unwrap()
+                            .exit_code,
+                        Some(0)
+                    );
+                    let after = with_git_policy_test_state(root, |state| {
+                        [state.hits, state.misses, state.uncached, state.calls]
+                    })
+                    .unwrap();
+                    let delta =
+                        std::array::from_fn::<_, 4, _>(|index| after[index] - before[index]);
+                    assert_eq!(delta[1], usize::from(start == 0));
+                    assert_eq!(delta[2], 0);
+                    eprintln!("worker_bash phase={label} root={root_index} start={start} hits={} misses={} key_none={} git_helpers={} startup_ms={:.3}", delta[0], delta[1], delta[2], delta[3], elapsed.as_secs_f64() * 1000.0);
+                }
+            }
+        }
+        BENCH_UNBATCHED.with(|value| value.set(false));
     }
 
     #[test]

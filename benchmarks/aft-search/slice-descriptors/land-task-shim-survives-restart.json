@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "task-shim-survives-restart"
+  ],
+  "note": "Background tasks without the native sandbox keep their own copy of the startup image and gh shim, so a daemon restart cannot remove what their PATH names; dead pin directories are dropped from child PATHs. No changed path matches RANKING_FENCE_PREFIXES."
+}

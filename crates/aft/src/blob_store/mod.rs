@@ -46,6 +46,8 @@ macro_rules! trace_first_open_step {
     };
 }
 
+#[cfg(test)]
+mod clone_accounting_tests;
 pub mod reclaim;
 pub mod v2;
 pub mod v3;
@@ -164,7 +166,7 @@ pub const SEMANTIC_PAYLOAD_SCHEMA: u32 = 1;
 /// chunking version was left unchanged for the same reason.
 pub const SEMANTIC_PRODUCER_VERSION: &str = "semantic-v1";
 pub const CALLGRAPH_PAYLOAD_SCHEMA: u32 = 1;
-pub const CALLGRAPH_PRODUCER_VERSION: &str = "callgraph-v8-without-ast-index";
+pub const CALLGRAPH_PRODUCER_VERSION: &str = "callgraph-v9-python-import-bindings";
 
 const BLOB_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS blob_payloads (
@@ -1309,7 +1311,10 @@ mod tests {
                 (SEMANTIC_PAYLOAD_SCHEMA, SEMANTIC_PRODUCER_VERSION),
                 (CALLGRAPH_PAYLOAD_SCHEMA, CALLGRAPH_PRODUCER_VERSION),
             ],
-            [(1, "semantic-v1"), (1, "callgraph-v8-without-ast-index")],
+            [
+                (1, "semantic-v1"),
+                (1, "callgraph-v9-python-import-bindings")
+            ],
             "a payload encoding change must bump its producer key version in the same edit"
         );
     }

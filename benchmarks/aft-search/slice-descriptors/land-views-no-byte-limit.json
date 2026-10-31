@@ -1,0 +1,9 @@
+{
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "kind": "readiness",
+  "note": "Views: v3 admission refuses only at the device free-space floor (no per-family byte limit); an unstable namespace measurement records the largest total and stays owed instead of failing; a busy store during a semantic fill retries on the backoff. Views are off by default. No search, ranking or query routing changes.",
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none"
+}

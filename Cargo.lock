@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "aft-secret-rules"
-version = "0.63.3"
+version = "0.63.4"
 dependencies = [
  "idna",
  "serde",
@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "aft-tokenizer"
-version = "0.63.3"
+version = "0.63.4"
 dependencies = [
  "criterion",
  "fancy-regex 0.18.0",
@@ -41,7 +41,7 @@ dependencies = [
 
 [[package]]
 name = "agent-file-tools"
-version = "0.63.3"
+version = "0.63.4"
 dependencies = [
  "aft-secret-rules",
  "aft-tokenizer",
@@ -790,9 +790,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-tool-provider"
-version = "0.13.0"
+version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbe60bbeae8cefacb56ae174d7fdce081efc149c60b52a7c3ea184c38089a9d0"
+checksum = "87da4efe4e1f29ada4ecc51206b319b7708973fe32565af1c6b20c3c20201d8d"
 dependencies = [
  "serde",
  "serde_jcs",

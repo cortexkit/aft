@@ -548,7 +548,8 @@ fn tool_result_catalog_switch_preserves_schemas_digests_and_pins() {
 #[tokio::test]
 async fn tool_result_capability_is_selected_per_bind_not_per_call() {
     let _watcher_disabled = crate::test_env::without_project_watcher();
-    let project = scratch_project();
+    // Storage admission deliberately rejects directory links; the Cargo cache may use one.
+    let project = tempfile::tempdir().unwrap();
     let root = project.path().to_path_buf();
     let module_root = root.clone();
     let executor = Arc::new(Executor::new());
@@ -706,7 +707,8 @@ async fn tool_result_capability_is_selected_per_bind_not_per_call() {
 #[tokio::test]
 async fn tool_result_non_negotiating_routes_keep_legacy_success_and_error_bytes() {
     let _watcher_disabled = crate::test_env::without_project_watcher();
-    let project = scratch_project();
+    // Keep the transport's real storage admission independent of the Cargo cache layout.
+    let project = tempfile::tempdir().unwrap();
     let root = project.path().to_path_buf();
     let module_root = root.clone();
     let executor = Arc::new(Executor::new());

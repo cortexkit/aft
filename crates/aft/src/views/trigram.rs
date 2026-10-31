@@ -52,6 +52,28 @@ pub(crate) fn bind_is_busy(reason: &str) -> bool {
     reason.contains(crate::blob_store::v3::BUSY_PREFIX)
         || reason.contains("reservation_ledger_busy:")
         || reason.contains("v3 base build busy; retain direct-scan coverage and retry")
+        || reason.contains("callgraph derived store is busy:")
+        || reason.contains("callgraph v3 store is busy:")
+        || reason.contains("v3 base plane completion is owned elsewhere: Busy {")
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum LexicalViewSnapshot {
+    Ready(crate::search_index::SearchIndexSnapshot),
+    ImportBuilding,
+}
+
+impl LexicalViewSnapshot {
+    pub(crate) fn into_ready(self) -> Option<crate::search_index::SearchIndexSnapshot> {
+        match self {
+            Self::Ready(snapshot) => Some(snapshot),
+            Self::ImportBuilding => None,
+        }
+    }
+
+    pub(crate) fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
 }
 
 /// Checkout-local lexical authority, independent of the semantic worker's
@@ -63,14 +85,34 @@ pub(crate) struct LexicalView {
     family: String,
     policy: TrigramPolicy,
     source: Arc<dyn LexicalSnapshotSource>,
-    query: std::sync::Mutex<()>,
+    /// Serializes acquisition and projection, and holds the last projection
+    /// with the source revision of the cut it was built from. A query whose
+    /// source still reports that revision as steady reuses it instead of
+    /// binding and rebuilding the whole index again.
+    query: std::sync::Mutex<Option<(u64, crate::search_index::SearchIndexSnapshot)>>,
+    /// Verified acquisitions made, so tests can tell reuse from a new bind.
+    #[cfg(test)]
+    acquisitions: std::sync::atomic::AtomicUsize,
     ready: std::sync::atomic::AtomicBool,
+    legacy_import: Option<Arc<crate::migration::views_background::BackgroundImport>>,
+    current: crate::migration::v3_ledger::ImportControl,
 }
 
 /// Supplies a verified checkout snapshot without exposing its storage layout
 /// to the lexical query engine. Implementations must never publish v1/v2 data.
 pub(crate) trait LexicalSnapshotSource: Send + Sync {
     fn acquire(&self) -> Result<Snapshot, String>;
+    /// `acquire`, plus the source revision the returned cut belongs to when
+    /// the source tracks one. The view caches its projection under it.
+    fn acquire_with_revision(&self) -> Result<(Snapshot, Option<u64>), String> {
+        Ok((self.acquire()?, None))
+    }
+    /// The source revision when the cut last acquired is still current: see
+    /// `CheckoutDriver::steady_installed_revision`. `None` makes the next query
+    /// acquire a freshly verified cut.
+    fn steady_revision(&self) -> Option<u64> {
+        None
+    }
     fn record_change(&self, path: &Path);
     fn record_overflow(&self) {}
     fn record_cookie(&self, _: &Path) {}
@@ -87,6 +129,14 @@ struct CheckoutLexicalSource {
 
 impl LexicalSnapshotSource for CheckoutLexicalSource {
     fn acquire(&self) -> Result<Snapshot, String> {
+        self.acquire_with_revision().map(|(snapshot, _)| snapshot)
+    }
+
+    fn steady_revision(&self) -> Option<u64> {
+        self.driver.steady_installed_revision()
+    }
+
+    fn acquire_with_revision(&self) -> Result<(Snapshot, Option<u64>), String> {
         use super::first_load::FirstLoadDriver;
         let installed = self.driver.installed_snapshot();
         let seed = if installed.generation().name() == "empty" {
@@ -121,9 +171,10 @@ impl LexicalSnapshotSource for CheckoutLexicalSource {
         // subscription (no watcher, an unproved or incomplete one, or an
         // unsupported filesystem) overflowed at once. That mark only decides
         // that the next bind must walk the whole checkout again; this cut was
-        // just verified against the disk, so it is safe to serve.
-        let (snapshot, _) = self.driver.installed_cut();
-        Ok(snapshot)
+        // just verified against the disk, so it is safe to serve. The cut and
+        // its revision are read together under the driver's install lock.
+        let (snapshot, revision) = self.driver.installed_cut();
+        Ok((snapshot, Some(revision)))
     }
 
     fn record_change(&self, path: &Path) {
@@ -150,14 +201,48 @@ impl LexicalView {
             && self.storage == *storage
             && self.family == family
             && self.policy == policy
+            && (self.current)()
     }
 
+    #[cfg(test)]
     pub(crate) fn new(
         root: PathBuf,
         storage: crate::root_cache::StoragePaths,
         family: String,
         policy: TrigramPolicy,
     ) -> Result<Self, String> {
+        Self::new_with_import(
+            root,
+            storage,
+            family,
+            policy,
+            Arc::new(|| true),
+            crate::cold_build_limiter::global_limiter(),
+        )
+    }
+
+    pub(crate) fn new_with_import(
+        root: PathBuf,
+        storage: crate::root_cache::StoragePaths,
+        family: String,
+        policy: TrigramPolicy,
+        current: crate::migration::v3_ledger::ImportControl,
+        limiter: Arc<crate::cold_build_limiter::ColdBuildLimiter>,
+    ) -> Result<Self, String> {
+        if !current() {
+            return Err(format!(
+                "{}checkout is unbound",
+                crate::blob_store::v3::BUSY_PREFIX
+            ));
+        }
+        let legacy_import = crate::migration::views_background::BackgroundImport::start(
+            &storage.artifacts,
+            &family,
+            &root,
+            policy,
+            current.clone(),
+            limiter,
+        );
         let scope = crate::path_identity::project_scope_key(&root);
         let producers = super::manifest_v2::Producers {
             trigram: policy.fingerprint_hex(),
@@ -191,7 +276,10 @@ impl LexicalView {
             scope,
             producers,
         });
-        Ok(Self::with_source(root, storage, family, policy, source))
+        let mut view = Self::with_source(root, storage, family, policy, source);
+        view.legacy_import = legacy_import;
+        view.current = current;
+        Ok(view)
     }
 
     pub(crate) fn with_source(
@@ -207,8 +295,12 @@ impl LexicalView {
             family,
             policy,
             source,
-            query: std::sync::Mutex::new(()),
+            query: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            acquisitions: Default::default(),
             ready: std::sync::atomic::AtomicBool::new(false),
+            legacy_import: None,
+            current: Arc::new(|| true),
         }
     }
 
@@ -239,15 +331,34 @@ impl LexicalView {
 
     /// Keep acquisition separate from the read projection so a source that
     /// verifies a saved generation can supply the same query snapshot.
-    fn acquire(&self) -> Result<Snapshot, String> {
-        self.source.acquire()
+    fn acquire(&self) -> Result<(Snapshot, Option<u64>), String> {
+        #[cfg(test)]
+        self.acquisitions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.source.acquire_with_revision()
     }
 
-    pub(crate) fn snapshot(&self) -> Result<crate::search_index::SearchIndexSnapshot, String> {
+    pub(crate) fn snapshot(&self) -> Result<LexicalViewSnapshot, String> {
+        if !(self.current)() {
+            return Err(format!(
+                "{}checkout is no longer bound to this generation",
+                crate::blob_store::v3::BUSY_PREFIX
+            ));
+        }
+        if self
+            .legacy_import
+            .as_ref()
+            .is_some_and(|job| job.is_building())
+        {
+            // The legacy import has not published a snapshot yet. This is
+            // expected progress, not a failed load; queries can scan files
+            // directly and report that the index is still importing.
+            return Ok(LexicalViewSnapshot::ImportBuilding);
+        }
         let result = self.project();
         self.ready
             .store(result.is_ok(), std::sync::atomic::Ordering::Release);
-        result
+        result.map(LexicalViewSnapshot::Ready)
     }
 
     /// A watcher event or an AFT write can land between a bind's install and
@@ -255,26 +366,42 @@ impl LexicalView {
     /// again, a bounded number of times: each bind re-reads such paths from
     /// disk. Only a checkout that keeps changing through every attempt is
     /// refused.
-    fn verified_snapshot(&self) -> Result<Snapshot, String> {
+    fn verified_snapshot(&self) -> Result<(Snapshot, Option<u64>), String> {
         const ATTEMPTS: usize = 3;
         for _ in 0..ATTEMPTS {
-            let snapshot = self.acquire()?;
+            let (snapshot, revision) = self.acquire()?;
             if snapshot.pending_intent().next().is_none()
                 && snapshot.watcher() == WatcherState::Healthy
             {
-                return Ok(snapshot);
+                return Ok((snapshot, revision));
             }
         }
         Err("lexical view has unverified writes".into())
     }
 
     fn project(&self) -> Result<crate::search_index::SearchIndexSnapshot, String> {
-        use super::segment_store::PayloadSource;
-        let _query = self
+        let mut cached = self
             .query
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let snapshot = self.verified_snapshot()?;
+        if let (Some((revision, projection)), Some(steady)) =
+            (cached.as_ref(), self.source.steady_revision())
+        {
+            if *revision == steady {
+                return Ok(projection.clone());
+            }
+        }
+        let (snapshot, revision) = self.verified_snapshot()?;
+        let projection = self.project_snapshot(&snapshot)?;
+        *cached = revision.map(|revision| (revision, projection.clone()));
+        Ok(projection)
+    }
+
+    fn project_snapshot(
+        &self,
+        snapshot: &Snapshot,
+    ) -> Result<crate::search_index::SearchIndexSnapshot, String> {
+        use super::segment_store::PayloadSource;
         let mut source = None;
         let mut rows = Vec::new();
         for (path, disk) in snapshot.membership() {
@@ -1230,6 +1357,28 @@ pub fn materialize_v3(
     if manifest.header().producers.trigram != policy.fingerprint_hex() {
         return Err(plane_error("trigram producer mismatch"));
     }
+    // Imported rows have the same content-and-policy keys as fresh payloads.
+    // Pin before probing so eviction cannot turn a hit into a missing ready row.
+    let keys: Vec<_> = manifest
+        .entries()
+        .filter_map(|(_, entry)| {
+            let super::manifest_v2::EntryV2::Regular { content, .. } = entry else {
+                return None;
+            };
+            Some(
+                crate::blob_store::v2::TrigramKey {
+                    content: *content,
+                    policy,
+                }
+                .family_key(),
+            )
+        })
+        .collect();
+    live.protect(&keys)
+        .map_err(|error| plane_error(error.to_string()))?;
+    let reader =
+        crate::blob_store::v3::PlaneReader::open_existing(storage, family, FamilyPlane::Trigram)
+            .ok();
     let mut payloads = Vec::new();
     for (path, entry) in manifest.entries() {
         let super::manifest_v2::EntryV2::Regular { content, size, .. } = entry else {
@@ -1246,11 +1395,12 @@ pub fn materialize_v3(
             policy,
         }
         .family_key();
-        payloads.push((
-            path.clone(),
-            key,
-            TrigramPayload::extract(source, &policy).encode(),
-        ));
+        let payload = reader
+            .as_ref()
+            .and_then(|reader| reader.get(&key).ok().flatten())
+            .filter(|payload| TrigramPayload::decode(payload).is_ok())
+            .unwrap_or_else(|| TrigramPayload::extract(source, &policy).encode());
+        payloads.push((path.clone(), key, payload));
     }
     put_v3_payloads(storage, family, manifest, payloads, live)
 }
@@ -1642,6 +1792,47 @@ mod tests {
     }
 
     #[test]
+    fn lexical_views_setup_isolated_from_another_threads_free_space_override() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let storage = temp.path().join("storage");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.rs"), "needle\n").unwrap();
+        let source = BaseBuilderTestSource::new(
+            &root,
+            &storage,
+            "lexical-free-space",
+            TrigramPolicy {
+                max_file_size: 1024,
+            },
+        );
+        let other_storage = temp.path().join("other-storage");
+        let (installed, ready) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let _guard = crate::blob_store::v3::serial_for_test();
+            let _space =
+                crate::blob_store::v3::set_free_space_for_test(&other_storage, 1 << 20, 1 << 40);
+            let refusal = || {
+                crate::blob_store::v3::publish(&other_storage, "full-device", 1, None, |_| Ok(()))
+                    .unwrap_err()
+                    .to_string()
+            };
+            installed.send(refusal()).unwrap();
+            let _ = wait.recv();
+            assert_eq!(refusal(), "device_free_space_floor");
+        });
+        let refusal = ready.recv().unwrap();
+        // Keep the refusing probe installed until the independent checkout has
+        // finished binding; scheduling cannot hide a cross-storage override.
+        let snapshot = source.acquire();
+        drop(release);
+        worker.join().unwrap();
+        assert_eq!(refusal, "device_free_space_floor");
+        snapshot.unwrap_or_else(|error| panic!("independent checkout setup failed: {error}"));
+    }
+
+    #[test]
     fn lexical_views_projection_refuses_uncertain_or_wrong_policy_snapshots() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("project");
@@ -1711,6 +1902,66 @@ mod tests {
         }
     }
 
+    /// With a steady watcher subscription and nothing recorded since the last
+    /// verified bind, a query reuses that bind's projection instead of binding
+    /// and rebuilding the index. A recorded change, or a watcher gap hiding an
+    /// edit, makes the next query bind, and the gap's bind finds that edit.
+    #[test]
+    fn lexical_view_with_a_steady_watcher_reuses_its_projection_until_a_change_or_gap() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let temp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(temp.path()).unwrap();
+        let root = base.join("project");
+        let storage = base.join("storage");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.rs"), "fn first_needle() {}\n").unwrap();
+        let _watcher = crate::watcher_backend::subscription::start(
+            &root,
+            crate::watcher_backend::InitialCoverage::Complete,
+        );
+        let view = LexicalView::new(
+            root.clone(),
+            crate::root_cache::StoragePaths::same(&storage),
+            "lexical-steady".into(),
+            TrigramPolicy {
+                max_file_size: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let matches = |needle: &str| {
+            view.snapshot()
+                .unwrap()
+                .into_ready()
+                .unwrap()
+                .grep(needle, true, &[], &[], &root, 10)
+                .unwrap()
+                .matches
+                .len()
+        };
+        assert_eq!(matches("first_needle"), 1);
+        assert_eq!(matches("first_needle"), 1);
+        assert_eq!(
+            view.acquisitions.load(Relaxed),
+            1,
+            "an unchanged steady checkout must not bind again"
+        );
+
+        fs::write(root.join("b.rs"), "fn second_needle() {}\n").unwrap();
+        view.record_change(&root.join("b.rs"));
+        assert_eq!(matches("second_needle"), 1);
+        assert_eq!(
+            view.acquisitions.load(Relaxed),
+            2,
+            "a recorded change binds"
+        );
+
+        // Nobody reports this edit; only the gap's strict bind can find it.
+        fs::write(root.join("c.rs"), "fn third_needle() {}\n").unwrap();
+        crate::watcher_backend::subscription::gap(&root);
+        assert_eq!(matches("third_needle"), 1);
+        assert_eq!(view.acquisitions.load(Relaxed), 3, "a watcher gap binds");
+    }
+
     /// A checkout with no steady watcher subscription (no watcher, an
     /// unproved one, or an unsupported filesystem) is still served: every
     /// query binds strictly against the disk and answers from that cut,
@@ -1733,7 +1984,7 @@ mod tests {
             },
         )
         .unwrap();
-        let first = view.snapshot().unwrap();
+        let first = view.snapshot().unwrap().into_ready().unwrap();
         assert_eq!(
             first
                 .grep("first_needle", true, &[], &[], &root, 10)
@@ -1745,7 +1996,7 @@ mod tests {
         assert!(view.is_ready());
         // No event is recorded for this edit: only the strict bind sees it.
         fs::write(root.join("b.rs"), "fn second_needle() {}\n").unwrap();
-        let second = view.snapshot().unwrap();
+        let second = view.snapshot().unwrap().into_ready().unwrap();
         assert_eq!(
             second
                 .grep("second_needle", true, &[], &[], &root, 10)
@@ -1783,7 +2034,7 @@ mod tests {
             policy,
             source.clone(),
         );
-        let projected = view.snapshot().unwrap();
+        let projected = view.snapshot().unwrap().into_ready().unwrap();
         let legacy =
             crate::search_index::SearchIndex::build_with_limit_serial(&root, policy.max_file_size)
                 .snapshot();

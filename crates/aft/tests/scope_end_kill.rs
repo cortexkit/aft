@@ -164,6 +164,9 @@ impl Daemon {
         #[cfg(feature = "test-timing-hooks")]
         {
             command.env("AFT_TEST_SCOPE_DESCRIBE_CLOCK_DIR", describe_clock.path());
+            if root.join("hold-sandbox-start").exists() {
+                command.env("AFT_TEST_SANDBOX_START_GATE", root.join("sandbox-start"));
+            }
         }
         command
             .current_dir(root)
@@ -191,7 +194,12 @@ impl Daemon {
         let child = command.spawn().unwrap();
         let (mut socket, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
             .await
-            .unwrap()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "module did not attach: {error}; stderr: {}",
+                    std::fs::read_to_string(&stderr_path).unwrap_or_default()
+                )
+            })
             .unwrap();
         authenticate_server(
             &mut socket,
@@ -1331,6 +1339,81 @@ async fn connection_loss_detaches_without_queueing_or_killing() {
             && frame.header.channel == 0)
         .await
         .is_none());
+    daemon
+        .call(
+            1,
+            json!({"name":"bash_kill","preset":"head","arguments":{"taskId":task["task_id"]}}),
+        )
+        .await;
+}
+
+#[cfg(all(feature = "test-timing-hooks", unix))]
+#[tokio::test]
+async fn connection_loss_preserves_pin_until_delayed_sandbox_and_shim_run() {
+    use tokio::io::AsyncWriteExt;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("module");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("hold-sandbox-start"), b"hold").unwrap();
+    let mut daemon = Daemon::spawn(&root, &["scope.describe"]).await;
+    daemon
+        .bind(1, 1, "owner", Some(stamp("owner", 1)), false)
+        .await;
+    let mut request = gated_shell(&root, Some("delayed-sandbox"));
+    request["arguments"]["command"] = json!(format!(
+        "gh --shim-version > shim-version; printf started > started; {}",
+        request["arguments"]["command"].as_str().unwrap()
+    ));
+    let corr = daemon.start(1, 1, request).await;
+    daemon.allow(1).await;
+    let task = running_task(&mut daemon, 1, corr).await.1;
+    let until = tokio::time::Instant::now() + Duration::from_secs(15);
+    while !root.join("sandbox-start.ready").exists() {
+        assert!(
+            tokio::time::Instant::now() < until,
+            "sandbox never reached the start gate"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!root.join("project/started").exists());
+    daemon.writer.shutdown().await.unwrap();
+    daemon.reader.abort();
+    while daemon.child.try_wait().unwrap().is_none() {
+        assert!(
+            tokio::time::Instant::now() < until,
+            "module did not exit at the start gate"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        std::fs::read_dir(root.join("data/cortexkit/aft/run"))
+            .unwrap()
+            .count(),
+        0
+    );
+    std::fs::write(root.join("sandbox-start"), b"run").unwrap();
+    while !root.join("project/started").exists() {
+        assert!(
+            tokio::time::Instant::now() < until,
+            "detached sandbox never started after its daemon removed the startup pin: {:?}",
+            task_metadata(&root)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let shim = std::fs::read_to_string(root.join("project/shim-version")).unwrap();
+    assert!(
+        shim.contains("\"shim_version\""),
+        "startup shim was lost: {shim}"
+    );
+    drop(daemon);
+    let mut daemon = Daemon::spawn(&root, &["scope.describe"]).await;
+    daemon
+        .bind(1, 1, "direct", Some(stamp("owner", 1)), false)
+        .await;
+    assert!(daemon
+        .status(1, task["task_id"].as_str().unwrap())
+        .await
+        .contains("running"));
     daemon
         .call(
             1,

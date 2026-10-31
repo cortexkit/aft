@@ -82,11 +82,8 @@ const LEGACY_LOOKUP_ENTRY_BYTES: usize = 16;
 
 /// Refusals of a v3 reservation that are a lack of storage, reported as the
 /// plane's named storage gap rather than as an import failure.
-const STORAGE_GAP_REFUSALS: [&str; 3] = [
-    "v3_namespace_budget",
-    "device_free_space_floor",
-    "reservation_ledger_unreadable",
-];
+const STORAGE_GAP_REFUSALS: [&str; 2] =
+    ["device_free_space_floor", "reservation_ledger_unreadable"];
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -103,6 +100,7 @@ pub enum V3ImportError {
     /// Another owner took the row over between two steps of this attempt.
     LostClaim(String),
     Corrupt(String),
+    Cancelled,
 }
 
 impl fmt::Display for V3ImportError {
@@ -118,6 +116,7 @@ impl fmt::Display for V3ImportError {
             Self::InvalidKey(key) => write!(f, "invalid legacy key or family `{key}`"),
             Self::LostClaim(row) => write!(f, "v3 import claim of {row} was taken over"),
             Self::Corrupt(reason) => write!(f, "v3 import state is corrupt: {reason}"),
+            Self::Cancelled => write!(f, "v3 legacy import cancelled"),
         }
     }
 }
@@ -246,6 +245,7 @@ pub(super) struct Source {
     len: u64,
     identity: SourceIdentity,
     stats: ReadStats,
+    pub(super) keep_going: super::v3_ledger::ImportControl,
 }
 
 impl Source {
@@ -265,10 +265,14 @@ impl Source {
             identity: SourceIdentity::of(&metadata),
             file,
             stats: ReadStats::default(),
+            keep_going: std::sync::Arc::new(|| true),
         })
     }
 
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), String> {
+        if !(self.keep_going)() {
+            return Err("legacy import cancelled".to_owned());
+        }
         offset
             .checked_add(buf.len() as u64)
             .filter(|end| *end <= self.len)
@@ -1212,6 +1216,7 @@ pub(super) struct StageInput<'a> {
     pub trigram: &'a TrigramPolicy,
     pub semantic: Option<&'a SemanticProducer>,
     pub working_set: usize,
+    pub keep_going: super::v3_ledger::ImportControl,
 }
 
 /// Converts `artifact` into a durable staged bundle. `Ok(Err(reason))` is a
@@ -1225,9 +1230,13 @@ pub(super) fn stage(
         Ok(source) => source,
         Err(reason) => return Ok(Err(reason)),
     };
+    source.keep_going = input.keep_going.clone();
     let mut writer = StagedWriter::create(input.dir, artifact)?;
     let mut write_error = None;
     let mut emit = |entry: BundleEntry| -> Result<(), String> {
+        if !(input.keep_going)() {
+            return Err("legacy import cancelled".to_owned());
+        }
         writer.entry(&entry).map_err(|error| {
             let message = error.to_string();
             write_error = Some(error);
@@ -1288,36 +1297,41 @@ pub(super) fn check_staged(
     hash: &[u8; 32],
     input: &StageInput<'_>,
 ) -> Result<u64, String> {
-    read_staged(path, artifact, hash, &mut |entry| match artifact {
-        LegacyArtifact::Trigram => {
-            TrigramPayload::decode(&entry.payload).map_err(|error| error.to_string())?;
-            let key = TrigramKey {
-                content: entry.content,
-                policy: *input.trigram,
+    read_staged(path, artifact, hash, &mut |entry| {
+        if !(input.keep_going)() {
+            return Err("legacy import cancelled".to_owned());
+        }
+        match artifact {
+            LegacyArtifact::Trigram => {
+                TrigramPayload::decode(&entry.payload).map_err(|error| error.to_string())?;
+                let key = TrigramKey {
+                    content: entry.content,
+                    policy: *input.trigram,
+                }
+                .family_key();
+                (key.as_bytes() == &entry.key)
+                    .then_some(())
+                    .ok_or_else(|| "staged trigram key differs from its content".to_owned())
             }
-            .family_key();
-            (key.as_bytes() == &entry.key)
-                .then_some(())
-                .ok_or_else(|| "staged trigram key differs from its content".to_owned())
+            LegacyArtifact::Semantic => {
+                let producer = input
+                    .semantic
+                    .ok_or("the request carries no semantic producer")?;
+                let relative = crate::views::segment_store::rel_path_to_os(&entry.rel_path)
+                    .map_err(|error| error.to_string())?;
+                crate::semantic_index::SemanticVectors::decode_view_payload(
+                    &entry.payload,
+                    &relative,
+                    &crate::semantic_index::ViewPayloadProducer {
+                        chunker_version: &producer.chunker_version,
+                        template_version: &producer.template_version,
+                        model_fingerprint: &producer.model_fingerprint,
+                    },
+                )
+                .map(|_| ())
+            }
+            LegacyArtifact::Symbols => super::v3_symbols::check_staged_entry(&entry),
         }
-        LegacyArtifact::Semantic => {
-            let producer = input
-                .semantic
-                .ok_or("the request carries no semantic producer")?;
-            let relative = crate::views::segment_store::rel_path_to_os(&entry.rel_path)
-                .map_err(|error| error.to_string())?;
-            crate::semantic_index::SemanticVectors::decode_view_payload(
-                &entry.payload,
-                &relative,
-                &crate::semantic_index::ViewPayloadProducer {
-                    chunker_version: &producer.chunker_version,
-                    template_version: &producer.template_version,
-                    model_fingerprint: &producer.model_fingerprint,
-                },
-            )
-            .map(|_| ())
-        }
-        LegacyArtifact::Symbols => super::v3_symbols::check_staged_entry(&entry),
     })
 }
 
@@ -1326,8 +1340,10 @@ pub(super) fn source_identity(
     artifact: LegacyArtifact,
     storage: &Path,
     legacy_key: &str,
+    keep_going: super::v3_ledger::ImportControl,
 ) -> Result<([u8; 32], u64), String> {
     let mut source = Source::open(&artifact.source_path(storage, legacy_key))?;
+    source.keep_going = keep_going;
     let (hash, _) = source.checksum_pass(&[])?;
     Ok((hash, source.len))
 }
@@ -1376,6 +1392,7 @@ pub(super) fn register_staged(
     path: &Path,
     hash: &[u8; 32],
     after_batch: &mut dyn FnMut(u64),
+    keep_going: &dyn Fn() -> bool,
 ) -> V3Result<Result<RegisterOutcome, String>> {
     let plane = artifact.plane();
     let schema = plane.payload_schema();
@@ -1396,6 +1413,9 @@ pub(super) fn register_staged(
         let result = v3::publish(storage, family, request, None, |publication| {
             let mut done = Registered::default();
             for (key, payload) in batch.iter() {
+                if !keep_going() {
+                    return Err(v3::Error::Refused("legacy import cancelled"));
+                }
                 match publication.put_or_touch(key, payload, schema) {
                     Ok(true) => done.inserted += 1,
                     Ok(false) => done.reused += 1,
@@ -1430,6 +1450,9 @@ pub(super) fn register_staged(
         }
     };
     let read = read_staged(path, artifact, hash, &mut |entry| {
+        if !keep_going() {
+            return Err("legacy import cancelled".to_owned());
+        }
         batch_bytes += entry.payload.len() as u64;
         batch.push((FamilyKey::new(plane, entry.key), entry.payload));
         if batch_bytes >= REGISTER_BATCH_BYTES {

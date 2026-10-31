@@ -6,6 +6,7 @@ mod entry_points;
 mod frameworks;
 pub mod freshness;
 mod generated;
+pub(crate) mod inventory;
 pub(crate) mod scoped_diagnostics_sweep;
 pub(crate) use generated::{is_generated_file, relative_shape_is_generated};
 pub mod job;
@@ -14,6 +15,8 @@ pub mod oxc_engine;
 pub mod phase_log;
 pub mod scanners;
 pub mod tier2_scheduler;
+#[cfg(test)]
+pub(crate) mod walk_profile;
 
 pub use cache::{ContributionRecord, InspectCache, InspectCacheError};
 pub use diagnostics_category::force_scoped_diagnostic_coverage_for_test;

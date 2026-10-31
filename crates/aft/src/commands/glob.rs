@@ -200,7 +200,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             // A failed view load fails the call, like grep: no fallback
             // walk may answer for a checkout view. The error text is the
             // view's own, naming the cause.
-            Err(error) => return Response::error(&req.id, "internal_error", error),
+            Err(error) => return crate::context::view_load_error_response(&req.id, error),
         };
         indexed_mtimes = discovery.indexed_mtimes;
         if let Some(coverage) = discovery.query_walk {
@@ -240,7 +240,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 Ok(discovery) => discoveries.push(discovery),
                 // A failed view load fails the call, like grep: no fallback
                 // walk may answer for a checkout view.
-                Err(error) => return Response::error(&req.id, "internal_error", error),
+                Err(error) => return crate::context::view_load_error_response(&req.id, error),
             }
         }
         let walk_truncated = discoveries.iter().any(|d| d.walk_truncated);
@@ -658,7 +658,9 @@ fn glob_root(
         // A failed view load fails the call, like grep: answering from a
         // fallback walk would hide the outage, and the legacy snapshot may
         // describe another checkout.
-        Some(snapshot.map_err(crate::context::view_load_failure_message)?)
+        snapshot
+            .map_err(crate::context::view_load_failure_message)?
+            .into_ready()
     } else {
         let search_index = ctx
             .search_index()

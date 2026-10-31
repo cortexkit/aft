@@ -560,6 +560,8 @@ fn test_identity_data(root: &std::path::Path, stamp: ScopeStamp) -> super::Route
         trust: super::BindTrust::FirstParty,
         spawn_principal: crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
         consumer_elicitation_capable: false,
+        held_reply: false,
+        held_update: false,
         tool_result_body: false,
         disabled_tools: Arc::new(vec![]),
         scope: Some(stamp),

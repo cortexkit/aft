@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "train-push-truncated-json"
+  ],
+  "note": "Release tooling only: scripts/train-push.sh retries a truncated GitHub JSON body as a transient query error, and its test file wires in the retry and skew-log tests. No changed path matches RANKING_FENCE_PREFIXES."
+}

@@ -577,6 +577,15 @@ const IdleConfigSchema = z.object({
 const ViewsConfigSchema = z.object({
   /** Enable content-addressed index views. Default: false. */
   enabled: z.boolean().optional(),
+  /**
+   * How many checkouts of one repository keep their own call graph, besides
+   * the main checkout. Another checkout reads the main checkout's graph, and
+   * its answers say which of its files differ. 0 makes every other checkout
+   * read the main checkout's graph. Default: 4.
+   */
+  callgraph_copies: z.number().int().optional(),
+  /** Hours without use after which a checkout's view can be evicted. Default: 168, minimum 1. */
+  idle_checkout_hours: z.number().int().optional(),
 });
 
 const WorktreeConfigSchema = z.object({
@@ -2116,6 +2125,11 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   const remoteExec = mergeRemoteExecConfig(base.remote_exec, override.remote_exec);
   const backup = mergeProjectBackupConfig(base.backup, override.backup);
   const pi = mergePiConfig(base.pi, override.pi);
+  // Each tier sets only the views keys it names.
+  const views =
+    base.views !== undefined || override.views !== undefined
+      ? { ...base.views, ...override.views }
+      : undefined;
   const bridge = base.bridge;
 
   // STRICT ALLOWLIST: only project-safe top-level fields are inherited.
@@ -2128,6 +2142,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   delete safeOverride.inspect;
   delete safeOverride.worktree;
   delete safeOverride.pi;
+  delete safeOverride.views;
 
   return {
     ...base,
@@ -2143,6 +2158,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     ...(remoteExec !== undefined ? { remote_exec: remoteExec } : {}),
     ...(backup !== undefined ? { backup } : {}),
     ...(pi !== undefined ? { pi } : {}),
+    ...(views !== undefined ? { views } : {}),
     experimental,
     // Always set semantic to the merge result (even if undefined) to prevent
     // override.semantic from leaking through any future spread above.

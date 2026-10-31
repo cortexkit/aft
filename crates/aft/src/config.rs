@@ -608,12 +608,35 @@ pub fn normalize_git_co_author(value: &str) -> Option<String> {
     Some(value.to_string())
 }
 
+pub const DEFAULT_VIEWS_CALLGRAPH_COPIES: u32 = 4;
+pub const MAX_VIEWS_CALLGRAPH_COPIES: u32 = 256;
+pub const DEFAULT_VIEWS_IDLE_CHECKOUT_HOURS: u32 = 168;
+pub const MAX_VIEWS_IDLE_CHECKOUT_HOURS: u32 = 24 * 365;
+
 /// Content-addressed index view assembly.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ViewsConfig {
     /// Enable manifest-backed index views. Default false.
     pub enabled: bool,
+    /// How many checkouts of one repository keep their own call graph,
+    /// besides the main checkout. Another checkout reads the main checkout's
+    /// graph and its answers say which of its files differ. 0 makes every
+    /// other checkout read the main checkout's graph.
+    pub callgraph_copies: u32,
+    /// Hours without use after which a checkout's view counts as idle and
+    /// can be evicted.
+    pub idle_checkout_hours: u32,
+}
+
+impl Default for ViewsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            callgraph_copies: DEFAULT_VIEWS_CALLGRAPH_COPIES,
+            idle_checkout_hours: DEFAULT_VIEWS_IDLE_CHECKOUT_HOURS,
+        }
+    }
 }
 
 /// Borrow-only checkout behavior that never writes shared on-disk artifacts.

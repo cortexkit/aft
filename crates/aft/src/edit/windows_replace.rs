@@ -1,9 +1,9 @@
-//! Windows replacement policy. POSIX rename avoids ReplaceFileW's transient
-//! name removal, but does not merge the old file's security or stream metadata.
+//! Windows replacement policy. Prepare metadata and named streams before rename,
+//! which publishes the new file without removing the destination name first.
 
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
@@ -18,11 +18,11 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FileRenameInfoEx, FindClose, FindFirstFileW, FindFirstStreamW, FindNextStreamW,
-    FindStreamInfoStandard, GetFileInformationByHandle, ReplaceFileW, SetFileInformationByHandle,
+    FindStreamInfoStandard, GetFileInformationByHandle, MoveFileExW, SetFileInformationByHandle,
     SetFileTime, BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_HIDDEN,
     FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, FILE_ATTRIBUTE_READONLY,
     FILE_ATTRIBUTE_SYSTEM, FILE_ATTRIBUTE_TEMPORARY, FILE_RENAME_INFO, FILE_WRITE_ATTRIBUTES,
-    READ_CONTROL, WIN32_FIND_DATAW, WIN32_FIND_STREAM_DATA,
+    MOVEFILE_REPLACE_EXISTING, READ_CONTROL, WIN32_FIND_DATAW, WIN32_FIND_STREAM_DATA,
 };
 use windows_sys::Win32::System::Ioctl::FSCTL_GET_OBJECT_ID;
 use windows_sys::Win32::System::IO::DeviceIoControl;
@@ -177,12 +177,86 @@ fn streams(path: &Path) -> io::Result<Vec<Vec<u16>>> {
     }
 }
 
+fn named_stream_path(path: &Path, name: &[u16]) -> io::Result<std::path::PathBuf> {
+    let suffix: Vec<_> = ":$DATA".encode_utf16().collect();
+    if name.first() != Some(&u16::from(b':'))
+        || !name.ends_with(&suffix)
+        || name.len() <= suffix.len() + 1
+    {
+        return Err(io::Error::other("unsupported named stream description"));
+    }
+    let mut stream = path.as_os_str().to_os_string();
+    stream.push(std::ffi::OsString::from_wide(name));
+    Ok(stream.into())
+}
+
+fn copy_named_streams(
+    destination: &Path,
+    replacement: &Path,
+    temp: &File,
+    _fault: Fault,
+) -> io::Result<()> {
+    let old_streams = streams(destination)?;
+    #[cfg(test)]
+    let old_streams = match _fault {
+        Fault::InvalidStreamName => {
+            let mut names = old_streams;
+            names.push(vec![b'!' as u16]);
+            names
+        }
+        Fault::StreamsUnknown => return Err(io::Error::other("streams are unknown")),
+        _ => old_streams,
+    };
+    let unnamed: Vec<_> = "::$DATA".encode_utf16().collect();
+    let permissions = temp.metadata()?.permissions();
+    let mut copied = false;
+    for name in &old_streams {
+        if *name == unnamed {
+            continue;
+        }
+        // The temporary already has the source's protected discretionary
+        // access-control list. Keep names in UTF-16 to avoid selecting a
+        // different stream when a name is not valid Unicode.
+        let copy = (|| {
+            let mut source = File::open(named_stream_path(destination, name)?)?;
+            let mut target = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(named_stream_path(replacement, name)?)?;
+            io::copy(&mut source, &mut target)?;
+            target.sync_all()
+        })();
+        copy.map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "copying named stream {}: {error}",
+                    String::from_utf16_lossy(name)
+                ),
+            )
+        })?;
+        copied = true;
+    }
+    if copied {
+        // Writing a named stream can set ARCHIVE. Restore the prepared attributes so
+        // stream copying does not change the existing metadata eligibility rule.
+        temp.set_permissions(permissions)?;
+    }
+    let new_streams = streams(replacement)?;
+    if !old_streams.iter().all(|name| new_streams.contains(name)) {
+        return Err(io::Error::other("replacement is missing a copied stream"));
+    }
+    Ok(())
+}
+
 /// ReplaceFileW carries creation time, short name, object ID, compression and
-/// encryption from the destination. Copy creation time and defer unusual
-/// metadata to ReplaceFileW instead of silently discarding it. Ordinary DOS
+/// encryption from the destination. Copy creation time and retain unusual
+/// metadata by writing in place instead of silently discarding it. Ordinary DOS
 /// attributes must already match: ReplaceFileW merges attributes, while rename
 /// keeps only the replacement's attributes. Access/write times come from the
-/// replacement in both paths.
+/// replacement in both paths. Windows regenerates short aliases during rename;
+/// an existing short name is not a reason to give up atomic replacement.
 fn prepare_metadata(destination: &Path, source: &File, replacement: &File) -> io::Result<()> {
     let old = information(source)?;
     let new = information(replacement)?;
@@ -197,7 +271,7 @@ fn prepare_metadata(destination: &Path, source: &File, replacement: &File) -> io
         | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED
         | FILE_ATTRIBUTE_TEMPORARY;
     if (old.dwFileAttributes | new.dwFileAttributes) & !ordinary != 0 {
-        return Err(io::Error::other("metadata requires ReplaceFileW"));
+        return Err(io::Error::other("metadata cannot be preserved by rename"));
     }
     if old.dwFileAttributes != new.dwFileAttributes {
         return Err(io::Error::other("file attributes differ"));
@@ -210,9 +284,6 @@ fn prepare_metadata(destination: &Path, source: &File, replacement: &File) -> io
         return Err(io::Error::last_os_error());
     }
     let _handle = FindHandle(handle);
-    if found.cAlternateFileName[0] != 0 {
-        return Err(io::Error::other("short name requires ReplaceFileW"));
-    }
     let mut object_id = [0u8; 64];
     let mut returned = 0;
     // SAFETY: the handle is open; FSCTL_GET_OBJECT_ID has no input and writes
@@ -263,7 +334,7 @@ enum Fault {
     #[cfg(test)]
     OwnerUnknown,
     #[cfg(test)]
-    ExtraStream,
+    InvalidStreamName,
     #[cfg(test)]
     StreamsUnknown,
     #[cfg(test)]
@@ -279,7 +350,7 @@ enum Fault {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Method {
     PosixRename,
-    ReplaceFile,
+    MoveFile,
     InPlace,
 }
 
@@ -298,7 +369,7 @@ fn record(method: Method, reason: &str) {
     #[cfg(test)]
     LAST_REASON.with(|last| last.replace(reason.to_owned()));
     #[cfg(test)]
-    if method == Method::ReplaceFile {
+    if method != Method::PosixRename {
         FALLBACK_COUNTS
             .with(|counts| *counts.borrow_mut().entry(reason.to_owned()).or_default() += 1);
     }
@@ -331,27 +402,13 @@ fn eligible(
     if !owners_equal {
         return Err(io::Error::other("owner SIDs differ"));
     }
-    let old_streams = streams(destination)?;
-    let new_streams = streams(replacement)?;
-    #[cfg(test)]
-    let old_streams = match _fault {
-        Fault::ExtraStream => {
-            let mut names = old_streams;
-            names.push(vec![b'!' as u16]);
-            names
-        }
-        Fault::StreamsUnknown => return Err(io::Error::other("streams are unknown")),
-        _ => old_streams,
-    };
-    if !old_streams.iter().all(|name| new_streams.contains(name)) {
-        return Err(io::Error::other("destination has additional streams"));
-    }
     let dacl_equal = super::windows_dacl::matches(destination, replacement)?;
     #[cfg(test)]
     let dacl_equal = dacl_equal && !matches!(_fault, Fault::DaclMismatch);
     if !dacl_equal {
         return Err(io::Error::other("DACLs differ"));
     }
+    copy_named_streams(destination, replacement, temp, _fault)?;
     #[cfg(test)]
     if matches!(_fault, Fault::MetadataUnknown) {
         return Err(io::Error::other("metadata is unknown"));
@@ -389,7 +446,7 @@ fn ordinary_component_preserves_name(component: &str) -> bool {
 fn rename_name(destination: &Path) -> io::Result<Vec<u16>> {
     // SetFileInformationByHandle accepts DOS/UNC names, not the verbatim
     // namespace returned by canonicalize. Keep unsupported namespaces on the
-    // ReplaceFileW path instead of changing their meaning.
+    // in-place path instead of changing their meaning.
     use std::path::{Component, Prefix};
     let absolute = std::path::absolute(destination)?;
     let text = absolute
@@ -413,7 +470,7 @@ fn rename_name(destination: &Path) -> io::Result<Vec<u16>> {
             || !tail.is_some_and(|tail| tail.split('\\').all(ordinary_component_preserves_name)))
         {
             // Removing the prefix enables Win32 parsing and can select a different
-            // destination. ReplaceFileW can use the original verbatim spelling.
+            // destination. Keep the original spelling and write in place.
             return Err(io::Error::other("destination requires verbatim spelling"));
         }
     }
@@ -425,7 +482,7 @@ fn rename_name(destination: &Path) -> io::Result<Vec<u16>> {
     }
     let name: Vec<_> = path.as_os_str().encode_wide().collect();
     // Without the verbatim prefix, Win32 may impose the 260-code-unit path
-    // limit (including NUL). Keep longer names on ReplaceFileW.
+    // limit (including NUL). Keep longer names on the in-place path.
     if name.len() >= 260
         && matches!(absolute.components().next(), Some(Component::Prefix(prefix)) if matches!(
             prefix.kind(), Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(..)
@@ -486,7 +543,7 @@ fn posix_rename(temp: &File, destination: &Path, _fault: Fault) -> io::Result<()
     }
 }
 
-pub(super) fn replace(destination: &Path, replacement: &Path, parent: &Path) -> io::Result<bool> {
+pub(super) fn replace(destination: &Path, replacement: &Path) -> io::Result<bool> {
     #[cfg(not(test))]
     let fault = Fault::None;
     #[cfg(test)]
@@ -499,86 +556,104 @@ pub(super) fn replace(destination: &Path, replacement: &Path, parent: &Path) -> 
         eligible(destination, replacement, &source, &temp, fault)?;
         Ok::<_, io::Error>(temp)
     })();
-    match prepared {
-        Ok(temp) => match posix_rename(&temp, destination, fault) {
-            Ok(()) => {
-                record(Method::PosixRename, "eligible");
-                return Ok(true);
-            }
-            Err(error)
-                if matches!(
-                    error.raw_os_error().map(|code| code as u32),
-                    Some(ERROR_NOT_SUPPORTED | ERROR_INVALID_PARAMETER | ERROR_INVALID_FUNCTION)
-                ) =>
-            {
-                // The volume or API does not support POSIX rename. The benchmark
-                // counts these under "rename unsupported:" as unsupported-filesystem
-                // fallbacks, separate from per-file refusals below.
-                record(Method::ReplaceFile, &format!("rename unsupported: {error}"));
-            }
-            Err(error)
-                if matches!(
-                    error.raw_os_error().map(|code| code as u32),
-                    Some(
-                        ERROR_ACCESS_DENIED
-                            | ERROR_SHARING_VIOLATION
-                            | ERROR_LOCK_VIOLATION
-                            | ERROR_USER_MAPPED_FILE
-                    )
-                ) =>
-            {
-                // Delete-access restrictions, sharing, locks and mappings can
-                // prohibit replacement but permit writing the existing file. Try
-                // ReplaceFileW, then the caller's in-place rewrite with a recovery
-                // copy. Other errors (such as missing paths or disk/I/O failures)
-                // still abort without another method.
-                record(Method::ReplaceFile, &format!("rename failed: {error}"));
-            }
-            Err(error) => {
-                record(Method::PosixRename, &format!("rename failed: {error}"));
-                return Err(error);
-            }
+    let temp = match prepared {
+        Ok(temp) => temp,
+        Err(reason) => {
+            record(Method::InPlace, &reason.to_string());
+            return Ok(false);
+        }
+    };
+    let reason = match posix_rename(&temp, destination, fault) {
+        Ok(()) => {
+            record(Method::PosixRename, "eligible");
+            return Ok(true);
+        }
+        Err(error)
+            if matches!(
+                error.raw_os_error().map(|code| code as u32),
+                Some(ERROR_NOT_SUPPORTED | ERROR_INVALID_PARAMETER | ERROR_INVALID_FUNCTION)
+            ) =>
+        {
+            // The volume or API does not support POSIX rename. The benchmark
+            // counts these under "rename unsupported:" as unsupported-filesystem
+            // fallbacks, separate from per-file refusals below.
+            format!("rename unsupported: {error}")
+        }
+        Err(error)
+            if matches!(
+                error.raw_os_error().map(|code| code as u32),
+                Some(
+                    ERROR_ACCESS_DENIED
+                        | ERROR_SHARING_VIOLATION
+                        | ERROR_LOCK_VIOLATION
+                        | ERROR_USER_MAPPED_FILE
+                )
+            ) =>
+        {
+            // Delete-access restrictions, sharing, locks and mappings can
+            // prohibit replacement but permit writing the existing file. Try
+            // a MoveFileExW replacement, then the caller's in-place rewrite
+            // with a recovery copy. Other errors (such as missing paths or
+            // disk/I/O failures) still abort without another method.
+            format!("rename failed: {error}")
+        }
+        Err(error) => {
+            record(Method::PosixRename, &format!("rename failed: {error}"));
+            return Err(error);
+        }
+    };
+    drop(temp);
+    let replaced = move_file(destination, replacement)?;
+    record(
+        if replaced {
+            Method::MoveFile
+        } else {
+            Method::InPlace
         },
-        Err(reason) => record(Method::ReplaceFile, &reason.to_string()),
-    }
-    let replaced = replace_file(destination, replacement, parent)?;
-    if !replaced {
-        record(Method::InPlace, "ReplaceFileW failed");
-    }
+        &reason,
+    );
     Ok(replaced)
 }
 
-fn replace_file(destination: &Path, replacement: &Path, parent: &Path) -> io::Result<bool> {
-    // With a backup name, every documented failure leaves the original
-    // either under its own name or under the backup name, never gone.
-    let backup = parent.join(format!(".aft-source-{}.bak", super::random_suffix()?));
-    let (destination_w, replacement_w, backup_w) =
-        (wide(destination), wide(replacement), wide(&backup));
-    // SAFETY: all three paths are NUL-terminated and outlive the call;
-    // the two reserved pointers must be null.
-    let ok = unsafe {
-        ReplaceFileW(
-            destination_w.as_ptr(),
-            replacement_w.as_ptr(),
-            backup_w.as_ptr(),
-            0,
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    };
-    if ok != 0 {
-        let _ = std::fs::remove_file(&backup);
-        return Ok(true);
-    }
-    let error = io::Error::last_os_error();
-    if !destination.exists() && backup.exists() {
-        if let Err(restore) = std::fs::rename(&backup, destination) {
-            return Err(io::Error::new(error.kind(), format!(
-                "replacing {} failed ({error}) and moving its original back also failed ({restore}); the original bytes are in {}",
-                destination.display(), backup.display())));
+fn move_file(destination: &Path, replacement: &Path) -> io::Result<bool> {
+    let (destination_w, replacement_w) = (wide(destination), wide(replacement));
+    // Unlike ReplaceFileW with a backup, a same-volume replacement rename does
+    // not move the destination away first. Do not enable cross-volume copy/delete.
+    // MoveFileExW can refuse even delete-sharing readers, so give short-lived
+    // reader handles a bounded opportunity to close before writing in place.
+    for attempt in 0..64 {
+        // SAFETY: both paths are NUL-terminated and outlive the call.
+        if unsafe {
+            MoveFileExW(
+                replacement_w.as_ptr(),
+                destination_w.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING,
+            )
+        } != 0
+        {
+            return Ok(true);
         }
-    } else if destination.exists() {
-        let _ = std::fs::remove_file(&backup);
+        let error = io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error().map(|code| code as u32),
+            Some(ERROR_NOT_SUPPORTED | ERROR_INVALID_PARAMETER | ERROR_INVALID_FUNCTION)
+        ) {
+            return Ok(false);
+        }
+        if !matches!(
+            error.raw_os_error().map(|code| code as u32),
+            Some(
+                ERROR_ACCESS_DENIED
+                    | ERROR_SHARING_VIOLATION
+                    | ERROR_LOCK_VIOLATION
+                    | ERROR_USER_MAPPED_FILE
+            )
+        ) {
+            return Err(error);
+        }
+        if attempt < 63 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
     Ok(false)
 }

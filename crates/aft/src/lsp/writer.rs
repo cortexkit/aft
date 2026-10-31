@@ -17,13 +17,14 @@ pub(crate) const STDIN_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 
 struct WriteJob {
     payload: String,
-    done: Sender<io::Result<()>>,
+    done: Sender<io::Result<u64>>,
 }
 
 #[derive(Clone)]
 pub(crate) struct LspWriter {
     tx: Sender<WriteJob>,
     received: Arc<AtomicU64>,
+    order: Arc<AtomicU64>,
     silent_at: Arc<AtomicU64>,
     #[cfg(all(test, unix))]
     raw: Arc<Mutex<BufWriter<ChildStdin>>>,
@@ -34,6 +35,8 @@ impl LspWriter {
         let (tx, rx) = bounded::<WriteJob>(1);
         let raw = Arc::new(Mutex::new(BufWriter::new(stdin)));
         let worker_raw = Arc::clone(&raw);
+        let order = Arc::new(AtomicU64::new(0));
+        let worker_order = Arc::clone(&order);
         std::thread::Builder::new()
             .name("aft-lsp-stdin".into())
             .spawn(move || {
@@ -42,7 +45,12 @@ impl LspWriter {
                         .lock()
                         .map_err(|_| io::Error::other("writer lock poisoned"))
                         .and_then(|mut writer| {
+                            // Order actual FIFO dispatch, not time spent waiting
+                            // in the writer queue. Only successful sends expose
+                            // this fence to the synchronized document store.
+                            let sent_order = worker_order.fetch_add(1, Ordering::SeqCst) + 1;
                             transport::write_message(&mut *writer, &job.payload)
+                                .map(|()| sent_order)
                         });
                     let _ = job.done.try_send(result);
                 }
@@ -50,6 +58,7 @@ impl LspWriter {
         Ok(Self {
             tx,
             received: Arc::new(AtomicU64::new(1)),
+            order,
             silent_at: Arc::new(AtomicU64::new(0)),
             #[cfg(all(test, unix))]
             raw,
@@ -60,8 +69,9 @@ impl LspWriter {
         self.received.load(Ordering::Acquire)
     }
 
-    pub(crate) fn note_received(&self) {
+    pub(crate) fn note_received(&self) -> u64 {
         self.received.fetch_add(1, Ordering::AcqRel);
+        self.order.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     pub(crate) fn mark_unresponsive_if_silent(&self, observed: u64) {
@@ -77,6 +87,10 @@ impl LspWriter {
     }
 
     pub(crate) fn send(&self, payload: String) -> Result<(), LspError> {
+        self.send_ordered(payload).map(|_| ())
+    }
+
+    pub(crate) fn send_ordered(&self, payload: String) -> Result<u64, LspError> {
         if self.is_unresponsive() {
             return Err(LspError::ServerNotReady("server not responding".into()));
         }

@@ -45,8 +45,12 @@ pub(super) fn convert_symbols_streaming(
     let producer = SymbolProducer::current();
     let mut canonical_parents = crate::search_index::ParentCanonicalizationMemo::default();
     let mut skipped = 0_u64;
+    let keep_going = source.keep_going.clone();
     let reader = BufReader::with_capacity(READ_CHUNK, source.sequential());
     crate::symbol_cache_disk::for_each_raw_entry(reader, &mut |raw| {
+        if !keep_going() {
+            return Err("legacy import cancelled".to_owned());
+        }
         let Some(language) = symbol_store::language_of(&raw.relative_path) else {
             skipped += 1;
             return Ok(());

@@ -503,6 +503,9 @@ fn subc_process_storage_lease_covers_configure_loop_and_exit_tail() {
         );
         lock.unlock().unwrap();
         for bind in [false, true] {
+            let stderr_path = data
+                .path()
+                .join(if bind { "bound.stderr" } else { "idle.stderr" });
             let probe = data
                 .path()
                 .join(if bind { "bound.ready" } else { "idle.ready" });
@@ -511,8 +514,10 @@ fn subc_process_storage_lease_covers_configure_loop_and_exit_tail() {
                 config.path(),
                 data.path(),
                 &probe,
+                &stderr_path,
             );
-            let mut stream = accept_module(&listener).await;
+            let mut stream =
+                accept_module_with_diagnostics(&listener, &mut module.child, &stderr_path).await;
             assert!(matches!(
                 lock.try_lock(),
                 Err(std::fs::TryLockError::WouldBlock)
@@ -628,7 +633,8 @@ fn subc_connection_close_after_drain_exits_zero_and_logs_it() {
                 data_home.path(),
                 Some(&stderr_path),
             );
-            let mut stream = accept_module(&listener).await;
+            let mut stream =
+                accept_module_with_diagnostics(&listener, &mut module.child, &stderr_path).await;
             bind_route(&mut stream, project.path()).await;
             if abort {
                 // A request still held when the daemon aborts the socket: the
@@ -1040,6 +1046,7 @@ impl ModuleProcess {
         config_home: &Path,
         data_home: &Path,
         probe: &Path,
+        stderr_path: &Path,
     ) -> Self {
         use std::os::unix::process::CommandExt;
         let binary = std::env::var_os("AFT_TEST_AFT_BINARY")
@@ -1051,6 +1058,7 @@ impl ModuleProcess {
             .env("XDG_CONFIG_HOME", config_home)
             .env("XDG_DATA_HOME", data_home)
             .env("AFT_TEST_STORAGE_LEASE_EXIT_PROBE", probe)
+            .env("AFT_TEST_SUBC_STARTUP_TRACE", "1")
             .env("AFT_TEST_DISABLE_FILE_WATCHER", "1")
             .env_remove("AFT_STORAGE_DIR")
             .env_remove("AFT_DATA_HOME")
@@ -1058,7 +1066,7 @@ impl ModuleProcess {
             .env_remove("SUBC_LAUNCH_NONCE")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(std::fs::File::create(stderr_path).expect("create module stderr file"));
         unsafe {
             command.pre_exec(|| {
                 if libc::setsid() == -1 {
@@ -1159,6 +1167,7 @@ impl ModuleProcess {
             .arg("--subc")
             .arg(conn_path)
             .env("AFT_TEST_DISABLE_FILE_WATCHER", "1")
+            .env("AFT_TEST_SUBC_STARTUP_TRACE", "1")
             .env("XDG_CONFIG_HOME", config_home)
             .env("XDG_DATA_HOME", data_home)
             .env_remove("AFT_STORAGE_DIR")
@@ -1272,6 +1281,68 @@ impl Drop for ModuleProcess {
             let _ = self.child.wait();
         }
     }
+}
+
+async fn accept_module_with_diagnostics(
+    listener: &TcpListener,
+    child: &mut Child,
+    stderr_path: &Path,
+) -> TcpStream {
+    use futures_util::FutureExt;
+
+    match std::panic::AssertUnwindSafe(accept_module(listener))
+        .catch_unwind()
+        .await
+    {
+        Ok(stream) => stream,
+        Err(panic) => {
+            // Preserve the original timeout or assertion while exposing whether
+            // the child exited early or is still inside a startup phase.
+            eprintln!("{}", module_startup_diagnostics(child, stderr_path));
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+fn module_startup_diagnostics(child: &mut Child, stderr_path: &Path) -> String {
+    let mut diagnostics = format!(
+        "aft --subc startup failure: pid={} status={:?}\nstderr ({}):\n{}",
+        child.id(),
+        child.try_wait(),
+        stderr_path.display(),
+        match std::fs::read_to_string(stderr_path) {
+            Ok(stderr) => log_tail(&stderr),
+            Err(error) => format!("cannot read child stderr: {error}"),
+        }
+    );
+    if cfg!(target_os = "linux") {
+        for name in ["status", "wchan"] {
+            let path = format!("/proc/{}/{name}", child.id());
+            match std::fs::read_to_string(&path) {
+                Ok(state) => diagnostics.push_str(&format!("\n{path}:\n{state}")),
+                Err(error) => diagnostics.push_str(&format!("\n{path}: {error}")),
+            }
+        }
+    }
+    diagnostics
+}
+
+#[test]
+fn subc_startup_failure_diagnostics_include_exit_status_and_stderr() {
+    let logs = tempfile::tempdir().unwrap();
+    let stderr_path = logs.path().join("child.stderr");
+    let mut child = Command::new("sh")
+        .args(["-c", "echo startup-diagnostic-marker >&2; exit 7"])
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
+        .spawn()
+        .unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(7));
+    let diagnostics = module_startup_diagnostics(&mut child, &stderr_path);
+    assert!(diagnostics.contains("status=Ok(Some("), "{diagnostics}");
+    assert!(
+        diagnostics.contains("startup-diagnostic-marker"),
+        "{diagnostics}"
+    );
 }
 
 pub(super) async fn accept_module(listener: &TcpListener) -> TcpStream {

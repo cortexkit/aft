@@ -2786,6 +2786,8 @@ fn update_manifest_fingerprint_hash(
     hasher: &mut blake3::Hasher,
     project_root: &Path,
 ) -> Result<(), InspectCacheError> {
+    #[cfg(test)]
+    let _profile = super::walk_profile::Walk::start("manifest_hash");
     // Entry-point manifests are normalized snapshots. A bare canonical root is
     // verbatim (`\\?\`) on Windows, so mixing it with those non-verbatim
     // manifests makes `strip_prefix` hash an absolute path instead of its

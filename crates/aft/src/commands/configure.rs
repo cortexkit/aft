@@ -6348,6 +6348,7 @@ fn schedule_artifact_loads_admitted(
                 let baseline = SearchIndex::read_from_disk(&cache_dir, &root_for_search);
                 let mut persist_to_disk = true;
                 let mut record_completed_verify = true;
+                let mut warm_verification = None;
                 let refreshed = match baseline {
                     Some(mut index)
                         if index.stored_git_head() == current_head.as_deref()
@@ -6361,23 +6362,17 @@ fn schedule_artifact_loads_admitted(
                                 record_completed_verify = false;
                                 Some(index)
                             }
-                            WarmVerifyPlan::StatFirst | WarmVerifyPlan::Strict => {
-                                let strategy = match verify_plan {
-                                    WarmVerifyPlan::StatFirst => VerifyStrategy::StatFirst,
-                                    WarmVerifyPlan::Strict => VerifyStrategy::Strict,
-                                    WarmVerifyPlan::Skip => unreachable!(),
-                                };
-                                index
-                                    .verify_against_disk_with_warm_budget(
-                                        current_head.clone(),
-                                        strategy,
-                                    )
-                                    .map(|disk_changed| {
-                                        persist_to_disk =
-                                            disk_changed || index.has_pending_disk_changes();
-                                        index
-                                    })
-                            }
+                            WarmVerifyPlan::StatFirst | WarmVerifyPlan::Strict => index
+                                .verify_against_disk_with_warm_budget(
+                                    current_head.clone(),
+                                    &cache_dir,
+                                )
+                                .map(|(disk_changed, verification)| {
+                                    warm_verification = Some(verification);
+                                    persist_to_disk =
+                                        disk_changed || index.has_pending_disk_changes();
+                                    index
+                                }),
                         }
                     }
                     baseline => {
@@ -6460,12 +6455,23 @@ fn schedule_artifact_loads_admitted(
                     }
                 }
                 if generation_current() && record_completed_verify && persistence_succeeded {
-                    let _ = cache_freshness::record_verify_completed_if_unchanged(
+                    let verified = cache_freshness::record_verify_completed_if_unchanged(
                         &root_for_search,
                         VerifyArtifact::Search,
                         cache_freshness::artifact_generation(&cache_path),
                         verify_ticket,
                     );
+                    if verified && !is_worktree_bridge_for_search {
+                        if let Some(verification) = warm_verification {
+                            search_persist_epoch_flag.run_if_current(search_persist_epoch, || {
+                                if let Err(error) =
+                                    index.persist_warm_verification(&cache_dir, verification)
+                                {
+                                    slog_warn!("failed to persist search verification: {}", error);
+                                }
+                            });
+                        }
+                    }
                 }
                 let symbol_files = search_index_symbol_files(&index);
                 let prewarm_stop = SymbolPrewarmStop {
@@ -7689,6 +7695,7 @@ fn start_checkout_semantic_lane(
     };
     let lifecycle = ctx.subc_lifecycle_admission();
     let strict_lifecycle = lifecycle.clone();
+    let import_generation = ctx.configure_generation_flag();
     let config = crate::views::semantic_runtime::WorkerConfig {
         root: root.to_path_buf(),
         storage: ctx.storage_paths(),
@@ -7726,11 +7733,29 @@ fn start_checkout_semantic_lane(
                 // this background thread, into the family's v3 planes only, so
                 // the lane's fills find its vectors stored rather than
                 // embedding every file again.
-                let current = {
-                    let slot = weak_slot.clone();
-                    move || slot.upgrade().is_some_and(|slot| slot.is_current(epoch))
-                };
-                import_legacy_set_into_v3(&config, &current);
+                finish_legacy_import_before_fill(
+                    || {
+                        weak_slot
+                            .upgrade()
+                            .is_some_and(|slot| slot.is_current(epoch))
+                    },
+                    || {
+                        let slot = weak_slot.clone();
+                        let generation = import_generation.clone();
+                        let expected = generation.load(Ordering::Acquire);
+                        let lifecycle = strict_lifecycle.clone();
+                        let current: crate::migration::v3_ledger::ImportControl =
+                            Arc::new(move || {
+                                lifecycle.is_bound()
+                                    && generation.load(Ordering::Acquire) == expected
+                                    && slot.upgrade().is_some_and(|slot| slot.is_current(epoch))
+                            });
+                        if !current() {
+                            return false;
+                        }
+                        import_legacy_set_into_v3(&config, current.clone()) && current()
+                    },
+                );
                 let _pause_currency = crate::semantic_index::PauseRetryScope::new(
                     config.schedule.retry_initial,
                     config.schedule.retry_max,
@@ -7750,20 +7775,43 @@ fn start_checkout_semantic_lane(
     start_tx
 }
 
+/// A checkout's semantic worker may outlive a configure change or the brief
+/// disconnect of its last session. Resume cancelled imports before vector fills,
+/// so vectors still in semantic.bin are reused rather than recomputed. An expired
+/// worker epoch must not start another import attempt.
+/// An attempt returns true when it can hand off to fills; false means retry.
+fn finish_legacy_import_before_fill(
+    lane_current: impl Fn() -> bool,
+    mut attempt_is_complete: impl FnMut() -> bool,
+) {
+    while lane_current() {
+        if attempt_is_complete() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Imports a root's legacy (pre-view) set into the family's v3 planes before
 /// its views-on semantic lane fills, through the v3 import ledger. Nothing is
 /// written to the v2 view registry or the v2 stores. A root with no legacy
-/// artifact, or whose v3 import already finished, returns at once; another
-/// process importing the same set is not waited for.
+/// artifact, or whose v3 import already finished, returns at once. A busy
+/// import is observed on this worker until it finishes or the binding ends,
+/// so a concurrent importer does not cause duplicate cold extraction.
+/// Returns false on cancellation so a retained lane retries before filling.
 fn import_legacy_set_into_v3(
     config: &crate::views::semantic_runtime::WorkerConfig,
-    keep_going: &dyn Fn() -> bool,
-) {
+    keep_going: crate::migration::v3_ledger::ImportControl,
+) -> bool {
     let (storage, key) = (&config.storage.artifacts, &config.family);
-    if !crate::migration::per_checkout::has_importable_legacy_artifact(storage, key)
-        || !keep_going()
+    if !crate::root_cache::ArtifactAccess::for_root(&config.root)
+        .allows_write(key, &storage.join("blobs/v3").join(key))
+        || !crate::migration::per_checkout::has_importable_legacy_artifact(storage, key)
     {
-        return;
+        return true;
+    }
+    if !keep_going() {
+        return false;
     }
     *config
         .status
@@ -7778,9 +7826,9 @@ fn import_legacy_set_into_v3(
         &config.schedule.limiter,
         "legacy_import",
         &config.root,
-        keep_going,
+        || keep_going(),
     ) else {
-        return;
+        return false;
     };
     let request = crate::migration::v3_ledger::V3ImportRequest::full_plane(
         storage.clone(),
@@ -7791,21 +7839,37 @@ fn import_legacy_set_into_v3(
         crate::migration::per_checkout::legacy_semantic_producer(storage, key, &config.semantic),
     );
     let started = Instant::now();
-    match crate::migration::v3_ledger::run_v3_import(&request, None) {
-        Ok(report) => slog_info!(
-            "legacy v3 import root={} key={} outcomes={:?} elapsed_ms={}",
-            config.root.display(),
-            key,
-            report.outcomes,
-            started.elapsed().as_millis()
-        ),
-        Err(error) => slog_warn!(
-            "legacy v3 import root={} key={} failed: {}",
-            config.root.display(),
-            key,
-            error
-        ),
+    while keep_going() {
+        match crate::migration::v3_ledger::run_v3_import_while(&request, None, keep_going.clone()) {
+            Ok(report)
+                if report.outcomes.values().any(|outcome| {
+                    matches!(
+                        outcome,
+                        crate::migration::v3_ledger::ArtifactOutcome::Busy { .. }
+                    )
+                }) =>
+            {
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            Err(crate::migration::v3_import::V3ImportError::Cancelled) => return false,
+            Ok(report) => slog_info!(
+                "legacy v3 import root={} key={} outcomes={:?} elapsed_ms={}",
+                config.root.display(),
+                key,
+                report.outcomes,
+                started.elapsed().as_millis()
+            ),
+            Err(error) => slog_warn!(
+                "legacy v3 import root={} key={} failed: {}",
+                config.root.display(),
+                key,
+                error
+            ),
+        }
+        return true;
     }
+    false
 }
 
 /// Account for a finished artifact load at its hand-off to the receiver.
@@ -8449,6 +8513,20 @@ pub(crate) fn drain_standalone_configure_unit(
         && !continuation.job.root_too_broad
         && !crate::views::parent::held_by(ctx, &continuation.job.canonical_cache_root)
     {
+        if ctx.views_route_root() {
+            // As on the attached path: every read of a routed root goes through
+            // its v3 checkout views, so the v1 view is neither opened nor
+            // published. Opening it ran `git ls-tree` and `git check-attr` over
+            // every tracked path twice and wrote a pending status row per path
+            // that no publication would ever settle. Skipping it loses
+            // nothing: the checkout's v3 text view, which grep and aft_search
+            // read, is opened and attached on the first query, as it already
+            // was on this transport.
+            ctx.drop_v1_view_runtime();
+            continuation.view_load = None;
+            continuation.stage = ConfigureMaintenanceStage::StorageSweeps;
+            return true;
+        }
         if continuation.view_load.is_none() {
             let (tx, rx) = crossbeam_channel::bounded(1);
             let job = continuation.job.clone();
@@ -9136,8 +9214,14 @@ fn run_configure_maintenance_unit_inner(
                     Some(Err(error)) => {
                         slog_warn!("lexical checkout view unavailable: {}", error);
                     }
+                    Some(Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding)) => {
+                        continuation.defer_lexical_bind(Instant::now());
+                        return ConfigureMaintenanceUnitResult::Continue;
+                    }
                     // The symbol prewarm follows the files the view verified.
-                    Some(Ok(snapshot)) if ctx.views_route_root() => {
+                    Some(Ok(crate::views::trigram::LexicalViewSnapshot::Ready(snapshot)))
+                        if ctx.views_route_root() =>
+                    {
                         spawn_symbol_view_prewarm(ctx, &snapshot);
                     }
                     _ => {}
@@ -10103,6 +10187,10 @@ fn callgraph_store_upgrade_required(ctx: &AppContext) -> bool {
             })
     })
 }
+
+#[cfg(test)]
+#[path = "configure/views_import_tests.rs"]
+mod views_import_tests;
 
 #[cfg(test)]
 mod tests {
@@ -14194,6 +14282,19 @@ mod tests {
     }
 
     fn lexical_views_assert_public_parity(ctx: &AppContext, root: &Path) {
+        // Exact text parity compares ready indexes. During a legacy import,
+        // grep appends a disclosure that its index is unavailable; separate
+        // import tests verify that incomplete response.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match ctx.lexical_view_snapshot("bind") {
+                Some(Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding)) => {
+                    assert!(Instant::now() < deadline, "legacy import did not finish");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => break,
+            }
+        }
         let oracle = lexical_views_oracle(root);
         for (command, params, field) in [
             (
@@ -14548,6 +14649,150 @@ mod tests {
             glob.data
         );
         assert_eq!(ctx.lexical_view_route_counts(), [0; 3]);
+    }
+
+    #[test]
+    fn views_busy_registry_retries_without_bug_guidance_or_failure_counts() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _serial = crate::blob_store::v3::serial_for_test();
+        for callgraph in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("project");
+            init_git_fixture(&root);
+            std::fs::write(
+                root.join("a.ts"),
+                "export function target() { return 'needle'; }\nexport function caller() { return target(); }\n",
+            )
+            .unwrap();
+            let root = std::fs::canonicalize(root).unwrap();
+            let storage = temp.path().join("storage");
+            let ctx = test_context();
+            assert!(
+                handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx,)
+                    .success
+            );
+            // A new file requires publication during the next bind, even if
+            // configure already warmed the lexical member.
+            let added = root.join("added.ts");
+            std::fs::write(&added, "export const extra = 'needle';\n").unwrap();
+            ctx.record_checkout_watcher_change(&added);
+            let family = ctx.memoized_artifact_cache_key(&root);
+            let callers = RawRequest {
+                id: "measurement-busy-callers".into(),
+                command: "callers".into(),
+                lsp_hints: None,
+                session_id: None,
+                params: json!({"file": root.join("a.ts"), "symbol": "target"}),
+            };
+            let request = || {
+                if callgraph {
+                    crate::commands::callers::handle_callers(&callers, &ctx)
+                } else {
+                    crate::commands::grep::handle_grep(&grep_request("needle"), &ctx)
+                }
+            };
+            // The blocker needs the family registry to exist before the first
+            // request opens it; create it the way the call-graph view test does.
+            let registry = crate::blob_store::v3::family_dir(&storage, &family)
+                .unwrap()
+                .join("members.sqlite");
+            if !registry.exists() {
+                crate::blob_store::v3::publish(&storage, &family, 1024, None, |_| Ok(())).unwrap();
+            }
+            // Another connection holds the family registry in exclusive
+            // locking mode, so opening it is busy until that connection ends.
+            let blocker = crate::db::file_identity::IdentityConnection::open_with_flags(
+                &registry,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+                "configure-busy-registry-blocker",
+            )
+            .unwrap();
+            blocker
+                .execute_batch(
+                    "PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; UPDATE accounting SET watermark=watermark+1;",
+                )
+                .unwrap();
+            let first = request();
+            // Within the backoff the held answer is repeated, not reloaded.
+            let held = request();
+            blocker.execute_batch("ROLLBACK").unwrap();
+            drop(blocker);
+            assert!(!first.success, "{:?}", first.data);
+            assert_eq!(first.data, held.data);
+            let text = if callgraph {
+                crate::subc_format::format_response_with_context(
+                    "callgraph",
+                    &first,
+                    &crate::subc_format::FormatContext {
+                        callgraph_op: Some("callers".into()),
+                        ..Default::default()
+                    },
+                )
+            } else {
+                crate::subc_format::format_response("grep", &first, false)
+            };
+            if callgraph {
+                assert_eq!(first.data["code"], "callgraph_building");
+                assert_eq!(text, "callers: callgraph_building — callers: persisted callgraph store is busy; retry shortly");
+                let cause = ctx.callgraph_view_read_diagnostics().last_error.unwrap();
+                assert!(cause.contains("v3 store busy: "), "{cause}");
+            } else {
+                assert_eq!(first.data["code"], "busy");
+                assert_eq!(first.data["retryable"], true);
+                let cause = first.data["message"].as_str().unwrap().to_string();
+                assert!(cause.contains("v3 store busy: "), "{cause}");
+                assert!(
+                    cause.contains(
+                        &crate::blob_store::v3::family_dir(&storage, &family)
+                            .unwrap()
+                            .display()
+                            .to_string()
+                    ),
+                    "{cause}"
+                );
+                assert_eq!(text, cause);
+                let search = crate::commands::semantic_search::handle_semantic_search(
+                    &semantic_search_request("needle"),
+                    &ctx,
+                );
+                let glob = crate::commands::glob::handle_glob(
+                    &RawRequest {
+                        id: "measurement-busy-glob".into(),
+                        command: "glob".into(),
+                        lsp_hints: None,
+                        session_id: None,
+                        params: json!({"pattern": "**/*.ts"}),
+                    },
+                    &ctx,
+                );
+                for (name, response) in [("search", search), ("glob", glob)] {
+                    assert_eq!(response.data["code"], "busy");
+                    assert_eq!(response.data["retryable"], true);
+                    let expected = if name == "search" {
+                        format!("semantic_search: busy — {cause}")
+                    } else {
+                        cause.clone()
+                    };
+                    assert_eq!(
+                        crate::subc_format::format_response(name, &response, false),
+                        expected
+                    );
+                }
+            }
+            assert!(!text.contains("This is an AFT bug"), "{text}");
+            let health = ctx.try_health_snapshot(&root);
+            assert!(health.view_load_failures.is_empty(), "{health:?}");
+            assert!(health.view_load_failure_last.is_none());
+            assert!(!ctx
+                .degraded_reasons()
+                .contains(&crate::context::VIEW_LOAD_DEGRADED_REASON.to_string()));
+            // Stopping the writer alone does not bypass the pending timer.
+            assert!(!request().success);
+            ctx.view_load_retry_due_for_test();
+            let recovered = request();
+            assert!(recovered.success, "{:?}", recovered.data);
+            assert!(ctx.try_health_snapshot(&root).view_load_failures.is_empty());
+        }
     }
 
     #[test]
@@ -15458,10 +15703,75 @@ mod tests {
         assert!(!off.views_route_root());
     }
 
+    /// The standalone transport, the plugins' default, drains configure
+    /// maintenance through `drain_standalone_configure_unit` instead of the
+    /// attached path. A routed root opens no v1 view there either: no v1 blob
+    /// stores, no v1 view directory and no pending status rows.
+    #[test]
+    fn views_routed_root_on_the_standalone_drain_opens_no_v1_view() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("a.ts"),
+            "export function target() { return 1; }\n",
+        )
+        .unwrap();
+        git_commit_all(&root, "graph");
+        let root = std::fs::canonicalize(root).unwrap();
+        let storage = temp.path().join("storage");
+        // The standalone drain takes the shared context the standalone loop owns.
+        let TestContext { context, _storage } = test_context();
+        let ctx = Arc::new(context);
+        assert!(
+            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
+                .success
+        );
+        assert!(ctx.views_route_root());
+
+        let mut state = super::ConfigureMaintenanceState::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            super::drain_standalone_configure_prefix(&ctx, &mut state);
+            let worked = super::drain_standalone_configure_unit(&ctx, &mut state);
+            if !worked && !super::standalone_configure_maintenance_pending(&ctx, &mut state) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "standalone configure maintenance never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(legacy_views_on_writes(&storage), Vec::<String>::new());
+        assert!(ctx.view_runtime_snapshot().is_none());
+    }
+
     /// Idle eviction releases a routed root's lexical and call-graph views,
     /// and the next query binds them again and answers.
     #[test]
     fn views_routed_idle_eviction_releases_views_and_the_next_query_rebinds() {
+        assert_idle_eviction_releases_views(|ctx| {
+            assert!(ctx.evict_idle_artifacts());
+        });
+    }
+
+    /// The daemon's idle reaper evicts through the non-blocking path, which
+    /// must release the views too: a held view keeps its v3 members
+    /// protected, so storage retention could never evict an idle root.
+    #[test]
+    fn views_routed_reaper_eviction_releases_views_and_the_next_query_rebinds() {
+        assert_idle_eviction_releases_views(|ctx| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !ctx.try_evict_idle_artifacts() {
+                assert!(Instant::now() < deadline, "idle eviction stayed blocked");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+    }
+
+    fn assert_idle_eviction_releases_views(evict: impl Fn(&AppContext)) {
         // Holds the process environment lock: these views resolve storage and
         // the Git conversion policy through the process environment.
         let _git_env = crate::test_env::hermetic_git_env_guard();
@@ -15500,7 +15810,7 @@ mod tests {
         assert!(callers().success);
         assert!(ctx.lexical_view_is_ready() && ctx.callgraph_view_is_ready());
 
-        assert!(ctx.evict_idle_artifacts());
+        evict(&ctx);
         assert!(!ctx.lexical_view_is_ready() && !ctx.callgraph_view_is_ready());
         let before = (
             ctx.lexical_view_route_counts()[0],
@@ -15581,7 +15891,12 @@ mod tests {
 
         // A fresh cache over the same files reuses the stored rows: nothing
         // is parsed or stored again.
-        let snapshot = ctx.lexical_view_snapshot("bind").unwrap().unwrap();
+        let snapshot = ctx
+            .lexical_view_snapshot("bind")
+            .unwrap()
+            .unwrap()
+            .into_ready()
+            .unwrap();
         let fresh: crate::parser::SharedSymbolCache =
             Arc::new(std::sync::RwLock::new(crate::parser::SymbolCache::new()));
         let report = super::prewarm_symbol_cache_from_view(

@@ -109,9 +109,22 @@ pub fn run(args: Vec<OsString>) -> Result<(), SandboxLaunchError> {
             read_profile_file(path)?
         } else {
             read_profile_json(args.profile_json.as_deref().expect("source count checked"))?
+        };
+        #[cfg(feature = "test-timing-hooks")]
+        if let Some(gate) = args.start_gate.as_ref() {
+            std::fs::write(gate.with_extension("ready"), b"ready")
+                .map_err(|error| SandboxLaunchError::runtime(error.to_string()))?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !gate.exists() {
+                if std::time::Instant::now() >= deadline {
+                    return Err(SandboxLaunchError::runtime("sandbox start gate timed out"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
         }
-        .canonicalize_for_launch()
-        .map_err(|error| SandboxLaunchError::unavailable(error.to_string()));
+        let profile = profile
+            .canonicalize_for_launch()
+            .map_err(|error| SandboxLaunchError::unavailable(error.to_string()));
         let applied = profile.and_then(|profile| {
             // Seal while still privileged: confinement must not be able to
             // block descriptor flag changes. CLOEXEC keeps this launcher’s
@@ -139,6 +152,8 @@ pub fn run(args: Vec<OsString>) -> Result<(), SandboxLaunchError> {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Debug, Default)]
 struct LaunchArgs {
+    #[cfg(feature = "test-timing-hooks")]
+    start_gate: Option<PathBuf>,
     profile_fd: Option<i32>,
     profile_file: Option<PathBuf>,
     profile_json: Option<String>,
@@ -159,6 +174,13 @@ impl LaunchArgs {
         let mut parsed = Self::default();
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
+            #[cfg(feature = "test-timing-hooks")]
+            if arg == "--test-start-gate" {
+                parsed.start_gate = Some(PathBuf::from(args.next().ok_or_else(|| {
+                    SandboxLaunchError::usage("--test-start-gate requires a path")
+                })?));
+                continue;
+            }
             if arg == "--" {
                 parsed.command.extend(args);
                 break;

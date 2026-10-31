@@ -553,7 +553,15 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
                                 evicted: false,
                                 lock_contended: false,
                             },
-                            Err(reason) => unserved(SemanticIndexStatus::Failed(reason)),
+                            Err(reason) => {
+                                // A built semantic view whose index cannot be
+                                // served is a view failure: count it in health.
+                                // Contention clears by itself and is not counted.
+                                if !crate::views::semantic_runtime::is_transient_reason(&reason) {
+                                    self.ctx.note_view_load_failure("semantic", &reason);
+                                }
+                                unserved(SemanticIndexStatus::Failed(reason))
+                            }
                         },
                         CheckoutSemanticState::Loading => unserved(SemanticIndexStatus::Building {
                             stage: crate::views::semantic_runtime::CHECKOUT_VIEW_LOADING_STAGE
@@ -612,12 +620,22 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
 
         let trigram = if let Some(snapshot) = self.ctx.lexical_view_snapshot("aft_search") {
             match snapshot {
-                Ok(snapshot) => TrigramReadiness {
-                    status: IndexStatus::Ready,
-                    snapshot: Some(Arc::new(snapshot)),
-                    evicted: false,
-                    lock_contended: false,
-                },
+                Ok(crate::views::trigram::LexicalViewSnapshot::Ready(snapshot)) => {
+                    TrigramReadiness {
+                        status: IndexStatus::Ready,
+                        snapshot: Some(Arc::new(snapshot)),
+                        evicted: false,
+                        lock_contended: false,
+                    }
+                }
+                Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding) => {
+                    TrigramReadiness {
+                        status: IndexStatus::Building,
+                        snapshot: None,
+                        evicted: false,
+                        lock_contended: false,
+                    }
+                }
                 Err(_) => TrigramReadiness {
                     status: IndexStatus::Fallback,
                     snapshot: None,
@@ -980,15 +998,26 @@ fn handle_semantic_search_with_disk_fallback(
     // The extensions come from the search_b2 install point: A-side defaults
     // until campaign B2 installs its router, plans, variants and readiness.
     let extensions = crate::search_b2::install_defaults();
-    if external_root.is_none() {
-        if let Some(Err(error)) = ctx.lexical_view_snapshot("aft_search") {
-            return Response::error(
-                &req.id,
-                "internal_error",
-                crate::context::view_load_failure_message(error),
-            );
+    let import_building = if external_root.is_none() {
+        match ctx.lexical_view_snapshot("aft_search") {
+            Some(Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding)) => {
+                // Importing existing indexes is expected progress. Let the
+                // bounded file scan answer and disclose the unavailable indexes
+                // even when neither index has published a snapshot yet.
+                true
+            }
+            Some(Err(error)) => {
+                return crate::context::view_load_error_response(
+                    &req.id,
+                    crate::context::view_load_failure_message(error),
+                );
+            }
+            _ => false,
         }
-    }
+    } else {
+        false
+    };
+    let allow_disk_fallback = allow_disk_fallback || import_building;
     if let Some((pattern_text, compiled)) = pattern {
         return handle_pattern_request(
             req,
@@ -1098,6 +1127,20 @@ fn handle_semantic_search_with_disk_fallback(
     if response.success {
         let embedding_counts = crate::search_b2::embed_counter::read(&req.id);
         attach_search_execution_metadata(&mut response, &plan, embedding_counts);
+        if import_building && response.data.get("index_read_gap").is_none() {
+            let mut text = response.data["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            if let Some(body) = response.data.as_object_mut() {
+                disclose_index_gaps(
+                    &["legacy text and symbol import building".into()],
+                    &mut text,
+                    body,
+                );
+                body.insert("text".into(), serde_json::json!(text));
+            }
+        }
         attach_not_opened_notice(
             &mut response,
             req,
@@ -1498,6 +1541,11 @@ fn split_semantic_results(
                 answer.results
             }
             Err(error) => {
+                // The reply names the gap; health counts the failed view
+                // unless it is contention that clears by itself.
+                if !crate::views::semantic_runtime::is_transient_reason(&error) {
+                    ctx.note_view_load_failure("semantic", &error);
+                }
                 checkout_gaps = Some(CheckoutSemanticGaps::unavailable(error));
                 Vec::new()
             }
@@ -3659,13 +3707,17 @@ fn lexical_candidate_exactness(
     query: &str,
     content_tokens: &[String],
 ) -> (bool, usize, Option<usize>) {
+    let _cost = telemetry::CostPhase::start("lexical_exactness");
     #[cfg(test)]
     crate::search_hot_path_measurements::record_file_read_path(file);
     let Ok(bytes) = fs::read(file) else {
         return (false, 0, None);
     };
     let text = String::from_utf8_lossy(&bytes);
-    let normalized_text = normalize_exact_phrase(&text);
+    let normalize_cost = telemetry::CostPhase::start("lexical_normalize");
+    let prepared = exact_lane::prepare_exact_text(&text, blake3::hash(&bytes));
+    let normalized_text = prepared.normalized();
+    drop(normalize_cost);
     let normalized_phrase = normalize_exact_phrase(exact_phrase(query));
     let phrase_count = if normalized_phrase.is_empty() {
         0
@@ -4111,7 +4163,7 @@ fn regex_route_collection(
 ) -> Option<std::io::Result<crate::search_index::GrepFileCollection>> {
     let snapshot = if let Some(snapshot) = ctx.lexical_view_snapshot("aft_search") {
         match snapshot {
-            Ok(snapshot) => snapshot,
+            Ok(snapshot) => snapshot.into_ready()?,
             Err(error) => {
                 return Some(Err(std::io::Error::other(
                     crate::context::view_load_failure_message(error),
@@ -4651,7 +4703,9 @@ fn matching_line_from_source(
     query: &str,
     symbol_range: Option<SymbolOffsetRange>,
 ) -> Option<(u32, String)> {
+    let read_cost = telemetry::CostPhase::start("matching_read");
     let source = std::fs::read_to_string(file).ok()?;
+    drop(read_cost);
     #[cfg(test)]
     crate::search_hot_path_measurements::record_file_read_path(file);
     matching_line_in_text(&source, query, symbol_range)
@@ -4666,9 +4720,12 @@ fn matching_line_in_text(
 ) -> Option<(u32, String)> {
     let _cost = telemetry::CostPhase::start("matching_line");
     static CACHE: std::sync::OnceLock<MatchingSourceCache> = std::sync::OnceLock::new();
+    let prepare_cost = telemetry::CostPhase::start("matching_prepare");
     let prepared = CACHE
         .get_or_init(|| MatchingSourceCache::new(32 * 1024 * 1024))
         .prepare(source);
+    drop(prepare_cost);
+    let phrase_cost = telemetry::CostPhase::start("matching_phrase");
     let normalized_phrase = exact_lane::normalize_exact_phrase(exact_lane::exact_phrase(query));
     if !normalized_phrase.is_empty() {
         if let Some((line_index, line)) = source.lines().enumerate().find(|(index, _)| {
@@ -4690,6 +4747,7 @@ fn matching_line_in_text(
         }
     }
 
+    drop(phrase_cost);
     let content_tokens = query_shape::extract_content_tokens(query);
     let compact_tokens = content_tokens
         .iter()
@@ -4702,7 +4760,9 @@ fn matching_line_in_text(
         })
         .filter(|token| token.len() >= 3)
         .collect::<Vec<_>>();
+    let best_cost = telemetry::CostPhase::start("matching_best_line");
     let best = prepared.best_line(source, &compact_tokens);
+    drop(best_cost);
     if let Some((_, line_index, line)) = best {
         // Start the shown part of a long line at the earliest query token it
         // contains, so the window covers the region that made the line match.
@@ -5120,15 +5180,17 @@ fn run_engine_ranking(
             return Err("request_cancelled".to_string());
         }
     }
-    let view_snapshot = if borrowed_index.is_none() {
+    let lexical_view = if borrowed_index.is_none() {
         ctx.lexical_view_snapshot("aft_search")
             .transpose()
             .map_err(crate::context::view_load_failure_message)?
     } else {
         None
     };
-    let context_index = (borrowed_index.is_none() && view_snapshot.is_none())
+    let context_index = (borrowed_index.is_none() && lexical_view.is_none())
         .then(|| try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET));
+    let view_snapshot =
+        lexical_view.and_then(crate::views::trigram::LexicalViewSnapshot::into_ready);
     let empty_index = SearchIndex::new();
     let index = borrowed_index
         .map(|(index, _)| index)
@@ -6307,8 +6369,11 @@ fn handle_engine_only_search(
     if semantic_status != "ready" {
         warnings.push("Semantic search unavailable; using lexical-only fallback.".to_string());
     }
+    let enrich_cost = telemetry::CostPhase::start("enrich");
     let snippets_incomplete =
         enrich_snippets_from_source_with_context(&mut ranked.results, project_root, Some(ctx));
+    drop(enrich_cost);
+    let format_cost = telemetry::CostPhase::start("format");
     let mut text = format_ranked_text(
         &ranked.results,
         project_root,
@@ -6317,6 +6382,7 @@ fn handle_engine_only_search(
         Some(ctx),
         ranked.literal_absent.as_deref(),
     );
+    drop(format_cost);
     if let Some(answer) = &ranked.not_found {
         text = answer.render(project_root);
     }
@@ -6595,6 +6661,11 @@ fn handle_semantic_or_hybrid_search(
                 answer.results
             }
             Err(error) => {
+                // The reply names the gap; health counts the failed view
+                // unless it is contention that clears by itself.
+                if !crate::views::semantic_runtime::is_transient_reason(&error) {
+                    ctx.note_view_load_failure("semantic", &error);
+                }
                 semantic_gaps = Some(CheckoutSemanticGaps::unavailable(error));
                 Vec::new()
             }
@@ -7686,7 +7757,7 @@ fn search_index_ready_with_budget(
     wait_budget: Duration,
 ) -> Result<bool, SearchIndexWaitError> {
     if let Some(snapshot) = ctx.lexical_view_snapshot("aft_search") {
-        return Ok(snapshot.is_ok());
+        return Ok(snapshot.is_ok_and(|snapshot| snapshot.is_ready()));
     }
     let deadline = Instant::now() + wait_budget;
     loop {
@@ -10429,6 +10500,25 @@ mod tests {
             text.contains(&format!("semantic: unavailable for this query ({reason})")),
             "the lane footer must name the reason: {text}"
         );
+        // Health counts the view that could not serve, with its full error,
+        // and marks the project degraded until a later successful load.
+        let health = ctx.try_health_snapshot(&root);
+        let last = health
+            .view_load_failure_last
+            .expect("the semantic view failure must reach health");
+        assert_eq!(last.plane, "semantic");
+        assert_eq!(last.error, reason);
+        assert!(
+            health
+                .view_load_failures
+                .keys()
+                .any(|key| key.starts_with("semantic:")),
+            "{:?}",
+            health.view_load_failures
+        );
+        assert!(ctx
+            .degraded_reasons()
+            .contains(&crate::context::VIEW_LOAD_DEGRADED_REASON.to_string()));
     }
 
     /// A started views-on lane with no loaded view yet answers for the state
@@ -13884,6 +13974,59 @@ mod tests {
         assert_eq!(matched.1, "export function resolveTransformMode() {}");
     }
 
+    #[test]
+    fn lexical_exactness_reuses_exact_preparation_and_reads_edits() {
+        use crate::search_hot_path_measurements::{counts, reset};
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("shared_normalization.rs");
+        let bytes = b"// shared lexical normalization fixture\r\npub fn cache_sharing() {\r\n    let marker = \"CacheSharingMarker\";\r\n}\r\n// invalid utf8: \xff\n";
+        fs::write(&path, bytes).unwrap();
+        let query = "CacheSharingMarker";
+        let tokens = exact_lane::exact_verification_tokens(query);
+        reset();
+        assert_eq!(
+            lexical_candidate_exactness(&path, query, &tokens),
+            (true, 1, Some(1))
+        );
+        assert_eq!(counts().exact_preparations, 1);
+        let exact = exact_lane::verify_cached_exact_matches_in_text_with_member(
+            &path,
+            &String::from_utf8_lossy(bytes),
+            blake3::hash(bytes),
+            &normalize_exact_phrase(query),
+            &tokens,
+            None,
+        );
+        assert!(exact.is_some());
+        assert_eq!(
+            counts().exact_preparations,
+            1,
+            "exact verification must reuse lexical preparation"
+        );
+
+        let edited = String::from_utf8_lossy(bytes).replace(query, "DifferentMarker");
+        fs::write(&path, &edited).unwrap();
+        assert_eq!(
+            lexical_candidate_exactness(&path, query, &tokens),
+            (false, 0, None)
+        );
+        assert_eq!(
+            counts().exact_preparations,
+            2,
+            "a content edit must prepare new bytes"
+        );
+        assert!(exact_lane::verify_cached_exact_matches_in_text_with_member(
+            &path,
+            &edited,
+            blake3::hash(edited.as_bytes()),
+            &normalize_exact_phrase(query),
+            &tokens,
+            None,
+        )
+        .is_none());
+        assert_eq!(counts().exact_preparations, 2);
+    }
+
     fn reference_best_content_line<'a>(
         source: &'a str,
         compact_tokens: &[String],
@@ -16411,9 +16554,18 @@ mod split_request_tests {
             let ctx = external_context(session.path(), storage.path(), false);
             for query in [None, Some("scheduler drains the work queue")] {
                 regex_route::MAX_EXAMINED_FILES_OVERRIDE.with(|limit| limit.set(Some(1)));
-                let capped = search(
-                    &ctx,
-                    serde_json::json!({"query": query, "pattern": "load_config", "path": root}),
+                // This case tests the file-count cap, so the disk walk gets a
+                // generous time budget: on a loaded Windows runner the default
+                // 2 s ran out before the walk reached any of the three files.
+                let capped = external_disk_check::with_budgets_for_test(
+                    Duration::from_secs(30),
+                    Duration::from_secs(30),
+                    || {
+                        search(
+                            &ctx,
+                            serde_json::json!({"query": query, "pattern": "load_config", "path": root}),
+                        )
+                    },
                 );
                 regex_route::MAX_EXAMINED_FILES_OVERRIDE.with(|limit| limit.set(None));
                 assert_eq!(capped["success"], true, "{capped}");

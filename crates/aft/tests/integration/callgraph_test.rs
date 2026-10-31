@@ -46,6 +46,93 @@ fn format_callgraph_response(op: &str, data: &Value) -> String {
     format_response_with_context("callgraph", &response, &context)
 }
 
+#[test]
+fn callgraph_python_imports_resolve_without_same_name_fallback() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    for (file, source) in [
+        ("mod.py", "def toplevel_target():\n    pass\n\ndef local_target():\n    pass\n\ndef test_target():\n    pass\n\ndef same_file_caller():\n    toplevel_target()\n"),
+        ("caller_toplevel.py", "from mod import toplevel_target\n\ndef run_toplevel():\n    toplevel_target()\n"),
+        ("caller_local.py", "def run_local():\n    from mod import local_target\n    local_target()\n"),
+        ("tests/test_probe.py", "class TestProbe:\n    def test_local(self):\n        from mod import test_target\n        test_target()\n"),
+        ("ts_mod.ts", "export function tsTarget(): number {\n  return 7;\n}\n"),
+        ("ts_caller.ts", "import { tsTarget } from \"./ts_mod\";\n\nexport function runTsCaller(): number {\n  return tsTarget();\n}\n"),
+        ("pkg/__init__.py", ""),
+        ("pkg/mod.py", "def toplevel_target():\n    pass\n"),
+        ("pkg/caller.py", "from pkg.mod import toplevel_target\nfrom .mod import toplevel_target as relative\nimport mod\n\ndef absolute():\n    toplevel_target()\n\ndef package_relative():\n    relative()\n\ndef module():\n    mod.toplevel_target()\n"),
+        ("unrelated.py", "def toplevel_target():\n    pass\n"),
+        ("unknown.py", "from missing import toplevel_target\n\ndef unknown():\n    toplevel_target()\n"),
+    ] {
+        let path = root.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, source).unwrap();
+    }
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    for (file, symbol, include_tests, count) in [
+        ("mod.py", "toplevel_target", false, 3),
+        ("mod.py", "local_target", false, 1),
+        ("mod.py", "test_target", false, 1),
+        ("mod.py", "test_target", true, 1),
+        ("pkg/mod.py", "toplevel_target", false, 2),
+        ("unrelated.py", "toplevel_target", true, 0),
+        ("ts_mod.ts", "tsTarget", false, 1),
+    ] {
+        let response = aft.send(
+            &serde_json::json!({
+                "id": "python-callers", "command": "callers", "file": root.join(file),
+                "symbol": symbol, "depth": 1, "includeTests": include_tests,
+            })
+            .to_string(),
+        );
+        assert_eq!(response["success"], true, "{response:#}");
+        assert_eq!(
+            response["total_callers"], count,
+            "{file}::{symbol}: {response:#}"
+        );
+        let visible = if symbol == "test_target" && !include_tests {
+            0
+        } else {
+            count
+        };
+        assert_eq!(
+            flattened_caller_entries(&response).len(),
+            visible as usize,
+            "{response:#}"
+        );
+        assert!(
+            flattened_caller_entries(&response)
+                .iter()
+                .all(|entry| entry["symbol"] != "unknown"),
+            "{response:#}"
+        );
+        if file == "unrelated.py" {
+            assert_eq!(response["complete"], false, "{response:#}");
+            assert!(
+                format_callgraph_response("callers", &response).contains("analyzed Python code"),
+                "{response:#}"
+            );
+        }
+        if file == "mod.py" && symbol == "toplevel_target" {
+            assert_eq!(response["complete"], false, "{response:#}");
+            assert_eq!(response["unresolved_call_sites"], 1, "{response:#}");
+            assert_eq!(response["incomplete_reason"], "Incomplete: 1 call site named `toplevel_target` in the analyzed Python code could not be resolved; additional callers may be missing.");
+        }
+    }
+    let response = aft.send(
+        &serde_json::json!({
+            "id": "python-tree", "command": "call_tree", "file": root.join("caller_local.py"),
+            "symbol": "run_local", "depth": 2,
+        })
+        .to_string(),
+    );
+    assert_eq!(response["success"], true, "{response:#}");
+    let rendered = format_callgraph_response("call_tree", &response);
+    assert!(rendered.contains("local_target [mod.py:"), "{rendered}");
+    assert!(!rendered.contains("unresolved"), "{rendered}");
+    aft.shutdown();
+}
+
 /// `configure` sets project root and returns success.
 #[test]
 fn callgraph_configure_sets_project_root() {

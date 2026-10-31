@@ -590,6 +590,40 @@ fn audited_operator_write_rechecks_manifest_before_native_delegation() {
     let _lock = crate::test_env::process_env_lock();
     let manifest = super::tests::fixture_manifest();
     let fixture = RunWithFixture::new(&manifest);
+    // Unsupported platforms classify using the checkout's Git origin. Give the
+    // test an origin named in the signed manifest even in snapshots without .git.
+    let checkout = tempfile::tempdir().unwrap();
+    let git_dir = checkout.path().join(".git");
+    let git_config = checkout.path().join("empty-gitconfig");
+    std::fs::write(&git_config, "").unwrap();
+    let _git_env = [
+        Env::set("GIT_DIR", Some(git_dir.as_os_str())),
+        Env::set("GIT_WORK_TREE", Some(checkout.path().as_os_str())),
+        Env::set("GIT_COMMON_DIR", None),
+        Env::set("GIT_CONFIG_COUNT", None),
+        Env::set("GIT_CONFIG_GLOBAL", Some(git_config.as_os_str())),
+        Env::set("GIT_CONFIG_NOSYSTEM", Some(OsStr::new("1"))),
+    ];
+    for args in [
+        vec!["init", "--quiet"],
+        vec![
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/cortexkit/aft.git",
+        ],
+    ] {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(checkout.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git fixture failed: {output:?}");
+    }
+    assert_eq!(
+        origin_remote(&std::env::current_dir().unwrap()).as_deref(),
+        Some("https://github.com/cortexkit/aft.git")
+    );
     let _bypass = Env::set("GH_SHIM_BYPASS", Some(OsStr::new("operator")));
     let args = [
         "issue",

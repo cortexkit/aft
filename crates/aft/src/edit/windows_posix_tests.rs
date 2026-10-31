@@ -29,7 +29,100 @@ fn assert_no_temporary(dir: &Path) {
     assert_eq!(entries, [std::ffi::OsString::from("source.txt")]);
 }
 
-fn assert_fallback(fault: Fault) {
+fn short_name(path: &Path) -> std::ffi::OsString {
+    use std::os::windows::ffi::OsStringExt;
+    let mut found: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+    let handle = unsafe { FindFirstFileW(wide(path).as_ptr(), &mut found) };
+    assert_ne!(
+        handle,
+        INVALID_HANDLE_VALUE,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+    let _handle = FindHandle(handle);
+    let end = found
+        .cAlternateFileName
+        .iter()
+        .position(|c| *c == 0)
+        .unwrap();
+    std::ffi::OsString::from_wide(&found.cAlternateFileName[..end])
+}
+
+#[test]
+fn windows_posix_atomic_short_name_is_regenerated() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("windows_replace.rs");
+    std::fs::write(&path, b"original").unwrap();
+    assert!(
+        !short_name(&path).is_empty(),
+        "the test volume must generate short names"
+    );
+    let old = information(&File::open(&path).unwrap()).unwrap();
+
+    let outcome = atomic_write_source(&path, b"edited").unwrap();
+
+    assert_eq!(outcome.mode, crate::edit::SourceWriteMode::Replaced);
+    assert_eq!(LAST_METHOD.get(), Some(Method::PosixRename));
+    assert!(outcome.warnings.is_empty());
+    let new = information(&File::open(&path).unwrap()).unwrap();
+    assert_ne!(
+        (old.nFileIndexHigh, old.nFileIndexLow),
+        (new.nFileIndexHigh, new.nFileIndexLow)
+    );
+    let regenerated = short_name(&path);
+    assert!(!regenerated.is_empty());
+    assert_eq!(
+        std::fs::read(path.with_file_name(regenerated)).unwrap(),
+        b"edited"
+    );
+}
+
+#[test]
+fn windows_posix_atomic_zone_identifier_and_named_streams_preserve_bytes() {
+    use windows_sys::Win32::Storage::FileSystem::SetFileAttributesW;
+    for clear_archive in [false, true] {
+        let (dir, path) = fixture();
+        let streams: [(&str, &[u8]); 3] = [
+            (
+                "Zone.Identifier",
+                b"[ZoneTransfer]\r\nZoneId=3\r\nHostUrl=https://example.test/source\r\n",
+            ),
+            ("private-é", &[0, 255, 128, b'x', 0]),
+            ("empty", b""),
+        ];
+        for (name, bytes) in streams {
+            std::fs::write(path.with_file_name(format!("source.txt:{name}")), bytes).unwrap();
+        }
+        if clear_archive {
+            assert_ne!(
+                unsafe { SetFileAttributesW(wide(&path).as_ptr(), FILE_ATTRIBUTE_NORMAL) },
+                0
+            );
+        }
+        let old = information(&File::open(&path).unwrap()).unwrap();
+
+        let outcome = atomic_write_source(&path, b"edited").unwrap();
+
+        assert_eq!(outcome.mode, crate::edit::SourceWriteMode::Replaced);
+        assert_eq!(LAST_METHOD.get(), Some(Method::PosixRename));
+        assert!(outcome.warnings.is_empty());
+        let new = information(&File::open(&path).unwrap()).unwrap();
+        assert_ne!(
+            (old.nFileIndexHigh, old.nFileIndexLow),
+            (new.nFileIndexHigh, new.nFileIndexLow)
+        );
+        for (name, bytes) in streams {
+            assert_eq!(
+                std::fs::read(path.with_file_name(format!("source.txt:{name}"))).unwrap(),
+                bytes
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"edited");
+        assert_no_temporary(dir.path());
+    }
+}
+
+fn assert_fallback(fault: Fault, method: Method) {
     let (dir, path) = fixture();
     // Prove this volume and fixture can reach the fast path before forcing a guard.
     atomic_write_source(&path, b"control").unwrap();
@@ -39,30 +132,72 @@ fn assert_fallback(fault: Fault) {
         "{}",
         LAST_REASON.with(|r| r.borrow().clone())
     );
-    with_fault(fault, || atomic_write_source(&path, b"edited")).unwrap();
-    assert_eq!(
-        LAST_METHOD.get(),
-        Some(Method::ReplaceFile),
-        "fault={fault:?}"
-    );
+    let outcome = with_fault(fault, || atomic_write_source(&path, b"edited")).unwrap();
+    assert_eq!(LAST_METHOD.get(), Some(method), "fault={fault:?}");
+    if method == Method::InPlace {
+        assert_eq!(outcome.warnings, ["non_atomic_windows_write: atomic replacement is unavailable for this file; saved in place without removing its name. Concurrent readers may see incomplete contents."]);
+    } else {
+        assert!(outcome.warnings.is_empty());
+    }
     assert_eq!(std::fs::read(path).unwrap(), b"edited");
     assert_no_temporary(dir.path());
 }
 
 #[test]
 fn windows_posix_owner_mismatch_falls_back() {
-    assert_fallback(Fault::OwnerMismatch);
+    assert_fallback(Fault::OwnerMismatch, Method::InPlace);
 }
 
 #[test]
-fn windows_posix_extra_stream_falls_back() {
-    assert_fallback(Fault::ExtraStream);
+fn windows_posix_invalid_stream_description_falls_back() {
+    assert_fallback(Fault::InvalidStreamName, Method::InPlace);
+}
+
+#[test]
+fn windows_posix_stream_copy_failure_preserves_bytes_and_exact_warning() {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_WRITE};
     let (dir, path) = fixture();
-    let stream = path.with_file_name("source.txt:private");
-    std::fs::write(&stream, b"stream bytes").unwrap();
-    atomic_write_source(&path, b"edited").unwrap();
-    assert_eq!(LAST_METHOD.get(), Some(Method::ReplaceFile));
-    assert_eq!(std::fs::read(&stream).unwrap(), b"stream bytes");
+    let stream = path.with_file_name("source.txt:Zone.Identifier");
+    let bytes = b"[ZoneTransfer]\r\nZoneId=3\r\n";
+    std::fs::write(&stream, bytes).unwrap();
+    let old = information(&File::open(&path).unwrap()).unwrap();
+    // Sharing is per stream. Deny reads of the named stream while leaving the unnamed
+    // stream writable and allowing delete access, so only stream copying fails.
+    let held = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(&stream)
+        .unwrap();
+    assert_eq!(
+        File::open(&stream).unwrap_err().raw_os_error(),
+        Some(ERROR_SHARING_VIOLATION as i32)
+    );
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    LAST_METHOD.set(None);
+
+    let outcome = atomic_write_source(&path, b"edited").unwrap();
+
+    assert_eq!(outcome.mode, crate::edit::SourceWriteMode::InPlace);
+    assert_eq!(LAST_METHOD.get(), Some(Method::InPlace));
+    let reason = LAST_REASON.with(|r| r.borrow().clone());
+    assert!(
+        reason.starts_with("copying named stream :Zone.Identifier:$DATA:"),
+        "{reason}"
+    );
+    assert!(reason.contains("os error 32"), "{reason}");
+    assert_eq!(outcome.warnings.len(), 1);
+    assert_eq!(outcome.warnings[0].as_bytes(), b"non_atomic_windows_write: atomic replacement is unavailable for this file; saved in place without removing its name. Concurrent readers may see incomplete contents.");
+    let new = information(&File::open(&path).unwrap()).unwrap();
+    assert_eq!(
+        (old.nFileIndexHigh, old.nFileIndexLow),
+        (new.nFileIndexHigh, new.nFileIndexLow)
+    );
+    drop(held);
+    assert_eq!(std::fs::read(&stream).unwrap(), bytes);
     assert_eq!(std::fs::read(&path).unwrap(), b"edited");
     assert_no_temporary(dir.path());
 }
@@ -75,18 +210,18 @@ fn windows_posix_unknown_checks_fall_back() {
         Fault::LinksUnknown,
         Fault::MetadataUnknown,
     ] {
-        assert_fallback(fault);
+        assert_fallback(fault, Method::InPlace);
     }
 }
 
 #[test]
 fn windows_posix_dacl_mismatch_falls_back() {
-    assert_fallback(Fault::DaclMismatch);
+    assert_fallback(Fault::DaclMismatch, Method::InPlace);
 }
 
 #[test]
 fn windows_posix_link_count_guard_falls_back() {
-    assert_fallback(Fault::LinksUnknown);
+    assert_fallback(Fault::LinksUnknown, Method::InPlace);
 }
 
 #[test]
@@ -96,7 +231,7 @@ fn windows_posix_unsupported_volume_falls_back() {
         ERROR_INVALID_PARAMETER,
         ERROR_INVALID_FUNCTION,
     ] {
-        assert_fallback(Fault::Rename(code));
+        assert_fallback(Fault::Rename(code), Method::MoveFile);
         // The benchmark's unsupported-filesystem counter reads this prefix.
         let reason = LAST_REASON.with(|reason| reason.borrow().clone());
         assert!(
@@ -114,7 +249,7 @@ fn windows_posix_rename_constraints_fall_back() {
         ERROR_LOCK_VIOLATION,
         ERROR_USER_MAPPED_FILE,
     ] {
-        assert_fallback(Fault::Rename(code));
+        assert_fallback(Fault::Rename(code), Method::MoveFile);
         // Per-file refusals must not count as unsupported filesystems.
         let reason = LAST_REASON.with(|reason| reason.borrow().clone());
         assert!(reason.starts_with("rename failed:"), "{code}: {reason}");
@@ -159,6 +294,20 @@ fn windows_posix_read_only_still_refuses_write() {
     assert_no_temporary(dir.path());
     permissions.set_readonly(false);
     std::fs::set_permissions(&path, permissions).unwrap();
+}
+
+#[test]
+fn windows_posix_legacy_failure_keeps_original_name_and_bytes() {
+    let (dir, path) = fixture();
+    let missing = dir.path().join("missing.txt");
+
+    assert_eq!(
+        move_file(&path, &missing).unwrap_err().raw_os_error(),
+        Some(ERROR_FILE_NOT_FOUND as i32)
+    );
+
+    assert_eq!(std::fs::read(&path).unwrap(), b"original");
+    assert_no_temporary(dir.path());
 }
 
 fn set_times(file: &File, creation: u64, access: u64, write: u64) {
@@ -207,7 +356,7 @@ fn windows_posix_verbatim_trailing_space_preserves_neighbor() {
 
     assert_eq!(std::fs::read(&neighbor).unwrap(), b"neighbor");
     assert_eq!(std::fs::read(&destination).unwrap(), b"edited");
-    assert_eq!(LAST_METHOD.get(), Some(Method::ReplaceFile));
+    assert_eq!(LAST_METHOD.get(), Some(Method::InPlace));
     assert!(
         LAST_REASON.with(|r| r.borrow().contains("verbatim")),
         "{}",
@@ -319,18 +468,8 @@ fn windows_posix_metadata_matches_replace_file() {
         )
     }
     let mut snapshots = Vec::new();
-    for (guarded, attributes) in [
-        (false, FILE_ATTRIBUTE_ARCHIVE),
-        (true, FILE_ATTRIBUTE_ARCHIVE),
-        (
-            false,
-            FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED,
-        ),
-        (
-            true,
-            FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED,
-        ),
-    ] {
+    for guarded in [false, true] {
+        let attributes = FILE_ATTRIBUTE_ARCHIVE;
         let (dir, path) = fixture();
         let temp = dir.path().join("new.txt");
         let original = OpenOptions::new()
@@ -345,8 +484,7 @@ fn windows_posix_metadata_matches_replace_file() {
             132000000020000000,
         );
         drop(original);
-        // Compare the guarded policy with ReplaceFileW, including its
-        // merging of attributes absent from the replacement.
+        // Compare ordinary-file metadata with the historical replacement policy.
         assert_ne!(
             unsafe { SetFileAttributesW(wide(&path).as_ptr(), attributes,) },
             0
@@ -365,15 +503,25 @@ fn windows_posix_metadata_matches_replace_file() {
         std::fs::write(&dacl_copy, b"").unwrap();
         super::super::windows_dacl::copy_protected(&path, &dacl_copy).unwrap();
         if guarded {
-            assert!(replace(&path, &temp, dir.path()).unwrap());
-            let expected = if attributes == FILE_ATTRIBUTE_ARCHIVE {
-                Method::PosixRename
-            } else {
-                Method::ReplaceFile
-            };
-            assert_eq!(LAST_METHOD.get(), Some(expected));
+            assert!(replace(&path, &temp).unwrap());
+            assert_eq!(LAST_METHOD.get(), Some(Method::PosixRename));
         } else {
-            assert!(replace_file(&path, &temp, dir.path()).unwrap());
+            use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+            // Compare with the historical metadata contract without using
+            // ReplaceFileW on any production replacement path.
+            assert_ne!(
+                unsafe {
+                    ReplaceFileW(
+                        wide(&path).as_ptr(),
+                        wide(&temp).as_ptr(),
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    )
+                },
+                0
+            );
         }
         let info = information(&File::open(&path).unwrap()).unwrap();
         assert_eq!(stamp(&info).1, 132000000000000000);
@@ -388,16 +536,66 @@ fn windows_posix_metadata_matches_replace_file() {
         snapshots[1], snapshots[0],
         "POSIX metadata must match ReplaceFileW"
     );
-    assert_eq!(
-        snapshots[3], snapshots[2],
-        "attribute fallback must match ReplaceFileW"
+}
+
+#[test]
+fn windows_posix_attributes_survive_metadata_guard_in_place() {
+    use windows_sys::Win32::Storage::FileSystem::SetFileAttributesW;
+    let (dir, path) = fixture();
+    // Windows sets ARCHIVE when writing. Keep it set in the fixture so exact
+    // equality checks metadata preservation rather than write bookkeeping.
+    let attributes =
+        FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
+    assert_ne!(
+        unsafe { SetFileAttributesW(wide(&path).as_ptr(), attributes) },
+        0
     );
+    let old = information(&File::open(&path).unwrap()).unwrap();
+
+    let outcome = with_fault(Fault::MetadataUnknown, || {
+        atomic_write_source(&path, b"edited")
+    })
+    .unwrap();
+
+    assert_eq!(LAST_METHOD.get(), Some(Method::InPlace));
+    assert_eq!(outcome.warnings.len(), 1);
+    let new = information(&File::open(&path).unwrap()).unwrap();
+    assert_eq!(new.dwFileAttributes, old.dwFileAttributes);
+    assert_eq!(
+        new.ftCreationTime.dwHighDateTime,
+        old.ftCreationTime.dwHighDateTime
+    );
+    assert_eq!(
+        new.ftCreationTime.dwLowDateTime,
+        old.ftCreationTime.dwLowDateTime
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"edited");
+    assert_no_temporary(dir.path());
 }
 
 #[test]
 fn windows_posix_concurrent_reader_never_loses_destination() {
+    concurrent_reader_never_loses_destination(Fault::None, Method::PosixRename);
+}
+
+#[test]
+fn windows_posix_unsupported_concurrent_reader_never_loses_destination() {
+    for code in [
+        ERROR_NOT_SUPPORTED,
+        ERROR_INVALID_PARAMETER,
+        ERROR_INVALID_FUNCTION,
+    ] {
+        concurrent_reader_never_loses_destination(Fault::Rename(code), Method::MoveFile);
+    }
+}
+
+fn concurrent_reader_never_loses_destination(fault: Fault, method: Method) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("source.txt");
+    eprintln!(
+        "concurrent-reader fixture={} fault={fault:?}",
+        path.display()
+    );
     let bytes = vec![b'x'; 64 * 1024];
     std::fs::write(&path, &bytes).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
@@ -408,26 +606,45 @@ fn windows_posix_concurrent_reader_never_loses_destination() {
         let ready = ready.clone();
         std::thread::spawn(move || {
             let mut missing = 0;
+            let mut missing_codes = std::collections::BTreeMap::new();
             let mut reads = 0;
             ready.wait();
             while !stop.load(Ordering::Acquire) {
                 match std::fs::read(&path) {
                     Ok(content) => assert_eq!(content, vec![b'x'; 64 * 1024]),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing += 1,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        missing += 1;
+                        *missing_codes.entry(error.raw_os_error()).or_insert(0usize) += 1;
+                    }
                     Err(error) => panic!("reader: {error}"),
                 }
                 reads += 1;
             }
-            (reads, missing)
+            (reads, missing, missing_codes)
         })
     };
     ready.wait();
-    for _ in 0..200 {
-        atomic_write_source(&path, &bytes).unwrap();
-        assert_eq!(LAST_METHOD.get(), Some(Method::PosixRename));
-    }
+    let writes = std::panic::catch_unwind(|| {
+        for _ in 0..200 {
+            // Early in-place exits do not call the Windows replacement policy.
+            // Clear the previous result so they cannot masquerade as a POSIX rename.
+            LAST_METHOD.set(None);
+            with_fault(fault, || atomic_write_source(&path, &bytes)).unwrap();
+            assert_eq!(
+                LAST_METHOD.get(),
+                Some(method),
+                "{}",
+                LAST_REASON.with(|r| r.borrow().clone())
+            );
+        }
+    });
     stop.store(true, Ordering::Release);
-    let (reads, missing) = reader.join().unwrap();
+    let read_result = reader.join();
+    if let Err(panic) = writes {
+        std::panic::resume_unwind(panic);
+    }
+    let (reads, missing, missing_codes) = read_result.unwrap();
+    eprintln!("concurrent-reader reads={reads} missing_by_os_code={missing_codes:?}");
     assert!(reads > 0);
     assert_eq!(missing, 0, "destination disappeared during {reads} reads");
 }
@@ -438,7 +655,7 @@ fn windows_posix_concurrent_reader_never_loses_destination() {
 #[ignore = "1,000 durable 2 MiB edits per replacement method"]
 fn windows_posix_1000_edit_benchmark() {
     for (method, fault) in [
-        (Method::ReplaceFile, Fault::MetadataUnknown),
+        (Method::MoveFile, Fault::Rename(ERROR_NOT_SUPPORTED)),
         (Method::PosixRename, Fault::None),
     ] {
         let (dir, path) = fixture();

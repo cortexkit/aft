@@ -18,6 +18,7 @@ pub mod prune_legacy;
 pub mod v3_import;
 pub mod v3_ledger;
 pub mod v3_symbols;
+pub(crate) mod views_background;
 
 use std::collections::BTreeMap;
 use std::fmt;

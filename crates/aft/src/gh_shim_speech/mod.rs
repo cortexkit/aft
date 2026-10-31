@@ -80,6 +80,8 @@ pub(crate) struct Refusal {
     pub(crate) reason: String,
     pub(crate) role: Option<ScopeRole>,
     pub(crate) detail: Option<String>,
+    // Internal transport provenance, never part of the public refusal.
+    pub(crate) retry_before_send: bool,
 }
 
 /// Keep diagnostics out of the agent-facing refusal. Callers must supply only
@@ -104,6 +106,7 @@ impl Refusal {
             reason: reason.into(),
             role: None,
             detail: None,
+            retry_before_send: false,
         }
     }
 
@@ -113,6 +116,7 @@ impl Refusal {
             reason: reason.into(),
             role: Some(role),
             detail: None,
+            retry_before_send: false,
         }
     }
 

@@ -43,6 +43,25 @@ use super::snapshot::{DiskState, LiveDelta, Snapshot};
 /// register (for example the call graph of a lexical-only view).
 pub const UNREGISTERED_PRODUCER: &str = "unregistered";
 
+/// The producers of a checkout's semantic member, for building it and for
+/// opening it by producers (the parent folder worker does).
+///
+/// The call graph is unregistered, as for lexical-only views: the checkout's
+/// call graph is its own member (`<scope>.callgraph`), and nothing reads one
+/// from this member. A registered call-graph producer made this member's base
+/// and every publication extract call-graph facts and write a resolved
+/// call-graph database of their own (a clone where the filesystem supports
+/// clones, a full copy elsewhere), rebuilt whenever only embeddings changed.
+/// Unregistered, the base keeps its call-graph entries pending and builds no
+/// database.
+pub(crate) fn member_producers(trigram: String, semantic: String) -> Producers {
+    Producers {
+        trigram,
+        semantic: Some(semantic),
+        callgraph: UNREGISTERED_PRODUCER.into(),
+    }
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
@@ -163,9 +182,9 @@ impl CheckoutSemantic {
     }
 
     /// [`Self::new`] for a root whose lexical views use `policy`. The view is a
-    /// v3 member (`<scope>.semantic`) with all three planes registered, so its
-    /// base carries trigram and call-graph rows too and its publications go
-    /// to the v3 namespace only.
+    /// v3 member (`<scope>.semantic`) with the trigram and semantic planes
+    /// registered; its publications go to the v3 namespace only. It has no
+    /// call-graph plane: the checkout's call graph is its own member.
     pub fn with_trigram_policy(
         storage: &crate::root_cache::StoragePaths,
         family: &str,
@@ -176,18 +195,13 @@ impl CheckoutSemantic {
         wake: Weak<CheckoutSemanticSlot>,
     ) -> Result<Self, String> {
         let plane = shared_plane(&storage.artifacts, producer);
-        let producers = Producers {
-            trigram: policy.fingerprint_hex(),
-            semantic: Some(plane.semantic_producer().id()),
-            callgraph: super::callgraph::PRODUCER.into(),
-        };
+        let producers = member_producers(policy.fingerprint_hex(), plane.semantic_producer().id());
         let composite: Arc<dyn CompositePlane> = plane.clone();
         let adapter: Arc<dyn PlaneAdapter> = plane.clone();
         let trigram = Arc::new(super::first_load::TrigramBridge::new(
             storage.artifacts.clone(),
             policy,
         ));
-        let callgraph = Arc::new(super::first_load::CallgraphBridge::default());
         let member_scope = view_scope(scope);
         let driver = Arc::new(
             CheckoutDriver::new_v3(
@@ -197,7 +211,7 @@ impl CheckoutSemantic {
                 root,
                 producers.clone(),
                 Arc::new(ConfiguredMembershipWalker),
-                vec![trigram, composite, callgraph],
+                vec![trigram, composite],
             )
             .map_err(|error| error.to_string())?
             .with_adapters(vec![adapter]),
@@ -1584,6 +1598,7 @@ fn retry_activation<T>(
                 return Ok(value);
             }
             Err(RefreshError::Transient(reason)) => {
+                let store_busy = super::trigram::bind_is_busy(&reason);
                 let reason = schedule_retry(
                     slot,
                     epoch,
@@ -1592,15 +1607,28 @@ fn retry_activation<T>(
                     config.schedule.retry_initial,
                 );
                 if let Some(slot) = slot.upgrade() {
-                    slot.fail(epoch, reason.clone());
+                    if store_busy {
+                        slot.set(epoch, CheckoutSemanticState::Loading);
+                    } else {
+                        slot.fail(epoch, reason.clone());
+                    }
                 }
                 set_status(
                     slot,
                     epoch,
                     &config.status,
-                    crate::context::SemanticIndexStatus::Failed(format!(
-                        "semantic: unavailable: {reason}"
-                    )),
+                    if store_busy {
+                        crate::context::SemanticIndexStatus::Building {
+                            stage: CHECKOUT_VIEW_LOADING_STAGE.into(),
+                            files: None,
+                            entries_done: None,
+                            entries_total: None,
+                        }
+                    } else {
+                        crate::context::SemanticIndexStatus::Failed(format!(
+                            "semantic: unavailable: {reason}"
+                        ))
+                    },
                 );
                 crate::slog_warn!(
                     "semantic view unavailable root={} reason={}",
@@ -1730,16 +1758,22 @@ pub(crate) fn run_worker(
     if !is_current(&slot, epoch) {
         return;
     }
-    let runtime = match CheckoutSemantic::with_trigram_policy(
-        &config.storage,
-        &config.family,
-        &config.scope,
-        &config.root,
-        producer,
-        config.trigram_policy,
-        slot.clone(),
-    ) {
+    let runtime = match retry_activation(&slot, epoch, &wake, &config, "view registration", || {
+        CheckoutSemantic::with_trigram_policy(
+            &config.storage,
+            &config.family,
+            &config.scope,
+            &config.root,
+            producer.clone(),
+            config.trigram_policy,
+            slot.clone(),
+        )
+    }) {
         Ok(runtime) => Arc::new(runtime),
+        Err(RefreshError::Superseded) => {
+            release_lane(&slot, epoch);
+            return;
+        }
         Err(error) => return fail(format!("view registration: {error}")),
     };
     if !is_current(&slot, epoch) {
@@ -1768,8 +1802,15 @@ pub(crate) fn run_worker(
         return;
     }
     // Build the index queries score before the lane is served, so neither
-    // the first query nor a readiness sample has to build it.
-    let _ = runtime.index();
+    // the first query nor a readiness sample has to build it. A failure here
+    // is retried by the first query, which also counts it in health.
+    if let Err(error) = runtime.index() {
+        crate::slog_warn!(
+            "semantic view index build failed root={} error={}",
+            config.root.display(),
+            error
+        );
+    }
     crate::slog_info!(
         "semantic view loaded root={} family={} scope={} load_ms={}",
         config.root.display(),
@@ -2534,11 +2575,27 @@ where
                 }
                 let advanced = report.installed > 0 || report.failed > 0;
                 progress |= advanced;
-                // A store that refuses what was embedded will refuse it again
-                // on a timer: record it as the checkout's unavailable reason
-                // and wait for the next wake.
                 if let Some(error) = report.store_errors.first() {
-                    mark_unavailable(runtime, schedule, format!("semantic store: {error}"));
+                    let reason = format!("semantic store: {error}");
+                    // Contention (a busy or locked store, a namespace another
+                    // process is writing) clears by itself: retry on the
+                    // backoff rather than waiting for an unrelated wake.
+                    if is_transient_reason(&reason) {
+                        crate::slog_warn!(
+                            "semantic view fill will retry a busy store root={} error={}",
+                            schedule.root.display(),
+                            reason
+                        );
+                        warm_index(runtime);
+                        return FillOutcome::Retry {
+                            progress,
+                            reason: Some(reason),
+                        };
+                    }
+                    // A store that refuses what was embedded will refuse it
+                    // again on a timer: record it as the checkout's
+                    // unavailable reason and wait for the next wake.
+                    mark_unavailable(runtime, schedule, reason);
                     warm_index(runtime);
                     return FillOutcome::Settled;
                 }
@@ -2647,14 +2704,14 @@ impl std::fmt::Display for RefreshError {
 }
 
 /// Whether a model, load or store failure clears by itself. Embedding errors
-/// carry the backend's authoritative transient marker. The only store failure
-/// retried is SQLite's busy/locked
-/// (another connection holds the database for a moment); every other store
-/// error is surfaced as the checkout's named gap.
+/// carry the backend's authoritative transient marker. Store contention includes
+/// SQLite's busy/locked and a namespace inventory changed by another writer;
+/// every other store error is surfaced as the checkout's named gap.
 /// A publication or installation that may already have committed carries the
 /// checkout-change marker so the worker revalidates a fresh job before serving it.
 pub fn is_transient_reason(reason: &str) -> bool {
     crate::semantic_index::embedding_failure_is_transient(reason)
+        || super::trigram::bind_is_busy(reason)
         || [
             super::first_load::CHECKOUT_CHANGED_DURING_RECONCILE,
             super::first_load::CHECKOUT_WRITE_ACTIVE,
@@ -2669,9 +2726,16 @@ pub fn is_transient_reason(reason: &str) -> bool {
 }
 
 /// Rebuilds the scored index after a fill, on the worker rather than on the
-/// next query.
+/// next query. A failure is retried by the next query, which also counts it
+/// in health; the log names it here so it is not lost when no query follows.
 fn warm_index(runtime: &CheckoutSemantic) {
-    let _ = runtime.index();
+    if let Err(error) = runtime.index() {
+        crate::slog_warn!(
+            "semantic view index rebuild failed root={} error={}",
+            runtime.root.display(),
+            error
+        );
+    }
 }
 
 #[cfg(test)]

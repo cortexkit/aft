@@ -1,0 +1,62 @@
+{
+  "github_reads": [
+    {
+      "request_body": {
+        "query": "query($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { pullRequest(number: $number) { id url number author { login __typename } headRefOid state isInMergeQueue } } }",
+        "variables": {
+          "number": 7,
+          "owner": "org",
+          "repo": "repo"
+        }
+      },
+      "request_line": "POST /graphql HTTP/1.1",
+      "response": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "author": {
+                "__typename": "User",
+                "login": "human"
+              },
+              "headRefOid": "0123456789abcdef0123456789abcdef01234567",
+              "id": "PR_node_7",
+              "isInMergeQueue": true,
+              "number": 7,
+              "state": "OPEN",
+              "url": "https://github.com/org/repo/pull/7"
+            }
+          }
+        }
+      },
+      "status": 200
+    }
+  ],
+  "name": "pr-dequeue-not-own",
+  "reply": {
+    "repo_binding_generation": 1,
+    "result": {
+      "code": "pr_edit_not_own",
+      "detail": {
+        "message": "'pr edit' changes only pull requests this repository's bot opened (app-fixture[bot]); #7 was opened by human. Ask the author, or run it as the operator with GH_SHIM_BYPASS=operator."
+      },
+      "refusal_code": "pr_edit_not_own",
+      "retry_same_nonce": false,
+      "status": "refused"
+    }
+  },
+  "request": {
+    "action": "pr dequeue",
+    "gh_route_schema": 1,
+    "manifest_version": 22,
+    "metadata": {
+      "agent_id": "alfonso-aft",
+      "pid": 4242
+    },
+    "operation": "gh.route",
+    "repository": "org/repo",
+    "rung_as_of_unix_secs": 1793066213,
+    "target": {
+      "number": 7
+    }
+  }
+}

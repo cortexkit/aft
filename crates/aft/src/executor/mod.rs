@@ -24,6 +24,18 @@ use tokio::sync::oneshot;
 use crate::lock_diagnostics::{LockDiagnostics, TrackedMutex};
 use crate::{context::AppContext, path_identity::ProjectRootId, protocol::Response};
 
+// Mutation lock order: the executor's per-root mutating lane and context epoch
+// gate precede source-file admission, then backup and checkpoint locks. Never
+// wait for source-file admission while holding a backup/checkpoint lock. The
+// scheduler mutex is not held by handlers.
+// Multi-file writers admit their complete set in one registry turn, sorted by
+// resolved names with native identities covering hard-link aliases; they never
+// hold one file while waiting for another. A patch (and a symbol move) may keep
+// not-yet-written files admitted during earlier hunks' formatter runs, bounded
+// by formatter timeouts. Completed files are released after their last write
+// or delete, before their formatter/LSP waits. Single-file writers release
+// admission immediately after the atomic write, before formatting/validation.
+
 pub use single_flight::SingleFlight;
 
 const JOB_COST: isize = 1;
@@ -493,6 +505,20 @@ pub struct MutatingLaneSnapshot {
     pub request_id: String,
     pub command: String,
     pub started_age_ms: u64,
+}
+
+/// Scheduler occupants of one root, including jobs still waiting to enter
+/// their callback. Each call has a unique cancellation token, which distinguishes
+/// it from an older job that reused the same transport request ID.
+#[derive(Debug, Clone)]
+pub(crate) struct RootJobSnapshot {
+    pub(crate) job_id: u64,
+    pub(crate) request_id: String,
+    pub(crate) command: String,
+    pub(crate) lane: Lane,
+    pub(crate) started_age_ms: u64,
+    pub(crate) execution_started: bool,
+    pub(crate) is_current: bool,
 }
 
 /// Non-blocking scheduler explanation attached to a delayed RouteBind warning.
@@ -2053,6 +2079,35 @@ impl Executor {
             .state
             .try_lock()
             .map(|state| state.mutating_lane_snapshots())
+    }
+
+    pub(crate) fn try_root_job_snapshots(
+        &self,
+        root_id: &ProjectRootId,
+        current: Option<&JobCancellation>,
+    ) -> Option<Vec<RootJobSnapshot>> {
+        let state = self.inner.state.try_lock()?;
+        let now = Instant::now();
+        let mut jobs = state
+            .running_jobs
+            .iter()
+            .filter(|(_, job)| &job.root_id == root_id)
+            .map(|(job_id, job)| RootJobSnapshot {
+                job_id: *job_id,
+                request_id: job.request_id.clone(),
+                command: job.command.clone(),
+                lane: job.lane,
+                started_age_ms: duration_millis_u64(now.saturating_duration_since(job.started_at)),
+                execution_started: job.execution_started.load(Ordering::Acquire),
+                is_current: current.is_some_and(|current| {
+                    job.cancellation
+                        .as_ref()
+                        .is_some_and(|token| token.same_token(current))
+                }),
+            })
+            .collect::<Vec<_>>();
+        jobs.sort_by_key(|job| job.job_id);
+        Some(jobs)
     }
 
     pub fn try_mutating_job_state_label(

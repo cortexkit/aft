@@ -881,12 +881,17 @@ fn execute_root_profiled(
     let snapshot_started = Instant::now();
     let ignored_target = root.ignored_target;
     let mut snapshot_timed_out = false;
+    let mut import_building = false;
     let view_snapshot = (root.use_index && !ignored_target)
         .then(|| ctx.lexical_view_snapshot("grep"))
         .flatten();
     let indexed_snapshot = if let Some(snapshot) = view_snapshot {
         match snapshot {
-            Ok(snapshot) => Some(snapshot),
+            Ok(crate::views::trigram::LexicalViewSnapshot::Ready(snapshot)) => Some(snapshot),
+            Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding) => {
+                import_building = true;
+                None
+            }
             Err(error) => {
                 return (
                     failed_index_grep(std::io::Error::other(
@@ -963,13 +968,15 @@ fn execute_root_profiled(
         index_lacks_scope = true;
     }
 
-    if root.use_index && !index_lacks_scope {
+    if root.use_index && !index_lacks_scope && !import_building {
         crate::commands::configure::trigger_search_index_reload_if_evicted(ctx);
     }
     // A walk that replaces a ready index reports `Fallback`, so the response
     // discloses that these results came from the filesystem, not the index.
     let index_status = if root.use_index && !index_lacks_scope {
-        if snapshot_timed_out {
+        if import_building {
+            IndexStatus::Building
+        } else if snapshot_timed_out {
             IndexStatus::Fallback
         } else {
             current_index_status(ctx)
@@ -978,7 +985,7 @@ fn execute_root_profiled(
         IndexStatus::Fallback
     };
     let mut counts = ScopeFileCounts::default();
-    let result = fallback_grep_counted(
+    let mut result = fallback_grep_counted(
         project_root,
         &root.search_root,
         &root.filter_root,
@@ -991,6 +998,11 @@ fn execute_root_profiled(
         ignored_target,
         order,
     );
+    if import_building {
+        result
+            .index_read_gaps
+            .push("legacy text and symbol import building".into());
+    }
     (
         result,
         GrepExecutionPhaseTimings {
@@ -2907,26 +2919,38 @@ mod tests {
     #[test]
     fn progressing_walk_is_not_a_stalled_access() {
         let dir = tempfile::tempdir().unwrap();
-        for index in 0..30 {
+        // 150 entries at 60 ms each need at least 9 s, so the 6 s walk budget
+        // always runs out before the walk finishes, on any runner.
+        for index in 0..150 {
             std::fs::write(dir.path().join(format!("{index}.rs")), "needle\n").unwrap();
         }
-        let budget = crate::bounded_io::Budget::after(Duration::from_secs(5))
-            .with_access_budget(Duration::from_millis(300));
+        // Each entry takes 60 ms and one access may take 1 s. A walk that
+        // charged its steady progress to one access would stop within that
+        // second: about 16 entries, or 5 at a loaded runner's 180 ms per
+        // entry. A correct walk runs to its own 6 s budget, which leaves 33
+        // entries even at 180 ms each. The access budget stays well above one
+        // entry's time: at 300 ms, a single entry on a loaded macOS runner
+        // exceeded it and was rightly reported as a stalled access.
+        let budget = crate::bounded_io::Budget::after(Duration::from_secs(12))
+            .with_access_budget(Duration::from_secs(1));
         let response = crate::bounded_io::with_budget(Some(budget), || {
             let walked = with_fallback_walk_entry_delay_for_test(Duration::from_millis(60), || {
                 bounded_fallback_walk_files_with_limits(
                     dir.path(),
                     dir.path(),
                     &PathFilters::default(),
-                    100,
-                    Duration::from_millis(900),
+                    200,
+                    Duration::from_secs(6),
                 )
             });
             assert!(
-                walked.files.len() > 5,
+                walked.files.len() > 20,
                 "walk stopped at one access cap: {walked:?}"
             );
-            assert!(walked.walk_time_limit_reached);
+            assert!(
+                walked.walk_time_limit_reached,
+                "walk did not end on its own time budget: {walked:?}"
+            );
             crate::bounded_io::finish_response(Response::success(
                 "progressing-walk",
                 serde_json::json!({"complete": false}),

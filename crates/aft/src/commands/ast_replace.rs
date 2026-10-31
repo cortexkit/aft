@@ -25,6 +25,7 @@ struct FileChange {
     original: String,
     new_content: String,
     replacement_count: usize,
+    observation: crate::edit::EditObservation,
 }
 
 /// Result of an ast_replace dry-run diff computation.
@@ -251,7 +252,7 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
         .files
         .par_iter()
         .map(|file_path| {
-            let original = std::fs::read_to_string(file_path.as_path())
+            let (original, observation) = crate::edit::read_edit_source(file_path.as_path())
                 .map_err(|err| (file_path.clone(), err.to_string()))?;
 
             let root = lang.ast_grep(&original);
@@ -283,6 +284,7 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
                 original,
                 new_content,
                 replacement_count,
+                observation,
             }))
         })
         .collect();
@@ -333,6 +335,25 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut total_files = 0usize;
     let mut file_results: Vec<serde_json::Value> = Vec::new();
     let mut invalid_rewrites: Vec<String> = Vec::new();
+
+    let _file_locks = if dry_run {
+        Vec::new()
+    } else {
+        for change in &computed {
+            crate::edit::mutation::before_check(&change.file_path);
+        }
+        let paths: Vec<_> = computed
+            .iter()
+            .map(|change| change.file_path.as_path())
+            .collect();
+        let locks = crate::edit::mutation::lock_files(&paths);
+        for change in &computed {
+            if let Err(error) = change.observation.check(&change.file_path) {
+                return Response::error(&req.id, error.code(), error.to_string());
+            }
+        }
+        locks
+    };
 
     // Phase 2 — serial apply. Backup + write must touch shared state (BackupStore
     // is `RefCell`-wrapped on AppContext) so this stays on the main thread.
@@ -445,14 +466,20 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
 
         let mut written_changes: Vec<(PathBuf, String)> = Vec::new();
         for (change, validated_path, backup_id) in changes_to_apply {
-            match std::fs::write(validated_path.as_path(), &change.new_content) {
-                Ok(()) => {
+            match crate::edit::atomic_write_source(
+                validated_path.as_path(),
+                change.new_content.as_bytes(),
+            ) {
+                Ok(outcome) => {
                     ctx.lsp_notify_file_changed(validated_path.as_path(), &change.new_content);
                     written_changes.push((validated_path.clone(), change.original.clone()));
                     let mut entry = serde_json::json!({
                         "file": change.file_path.display().to_string(),
                         "replacements": change.replacement_count,
                     });
+                    if !outcome.warnings.is_empty() {
+                        entry["warnings"] = serde_json::json!(outcome.warnings);
+                    }
                     if let (Some(obj), Some(backup_id)) = (entry.as_object_mut(), backup_id) {
                         obj.insert(
                             "backup_id".to_string(),
@@ -670,14 +697,14 @@ fn rollback_written_changes(
 ) -> Option<String> {
     let mut failures = Vec::new();
     if let Some((path, original)) = attempted {
-        if let Err(e) = std::fs::write(path, original) {
+        if let Err(e) = crate::edit::atomic_write_source(path, original.as_bytes()) {
             failures.push(format!("{}: {}", path.display(), e));
         } else {
             ctx.lsp_notify_file_changed(path, original);
         }
     }
     for (path, original) in written_changes.iter().rev() {
-        if let Err(e) = std::fs::write(path, original) {
+        if let Err(e) = crate::edit::atomic_write_source(path, original.as_bytes()) {
             failures.push(format!("{}: {}", path.display(), e));
         } else {
             ctx.lsp_notify_file_changed(path, original);
