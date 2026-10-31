@@ -8423,8 +8423,10 @@ pub(crate) fn drain_standalone_configure_unit(
             // its v3 checkout views, so the v1 view is neither opened nor
             // published. Opening it ran `git ls-tree` and `git check-attr` over
             // every tracked path twice and wrote a pending status row per path
-            // that no publication would ever settle. The lexical view binds on
-            // the first query, as it already did on this transport.
+            // that no publication would ever settle. Skipping it loses
+            // nothing: the checkout's v3 text view, which grep and aft_search
+            // read, is opened and attached on the first query, as it already
+            // was on this transport.
             ctx.drop_v1_view_runtime();
             continuation.view_load = None;
             continuation.stage = ConfigureMaintenanceStage::StorageSweeps;
