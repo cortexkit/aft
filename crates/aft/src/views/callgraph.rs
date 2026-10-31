@@ -1615,7 +1615,10 @@ mod tests {
         // Shared storage: main's base is built and sealed first.
         let storage = temp.path().join("storage");
         let main_view = view(&main, &storage);
-        assert_eq!(callers(&main_view.reader().unwrap(), "a.ts", "target").len(), 1);
+        assert_eq!(
+            callers(&main_view.reader().unwrap(), "a.ts", "target").len(),
+            1
+        );
         let linked_view = view(&linked, &storage);
         let patched = callers(&linked_view.reader().unwrap(), "a.ts", "target");
         assert_eq!(patched.len(), 2, "{patched:?}");

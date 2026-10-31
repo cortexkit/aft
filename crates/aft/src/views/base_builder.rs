@@ -457,7 +457,9 @@ impl BuildClaim {
                 super::first_load::remove_private_database(database);
                 super::donor::record(
                     store.view_dir(),
-                    super::donor::DonorEvent::Cold(super::donor::ColdReason::BaseFingerprintMismatch),
+                    super::donor::DonorEvent::Cold(
+                        super::donor::ColdReason::BaseFingerprintMismatch,
+                    ),
                 );
                 Ok(false)
             }
@@ -513,7 +515,13 @@ impl BuildClaim {
                 .as_ref()
                 .is_none_or(|(changed, ..)| size.changed < *changed)
             {
-                best = Some((size.changed, size.entries, donor, donor_projected, generation));
+                best = Some((
+                    size.changed,
+                    size.entries,
+                    donor,
+                    donor_projected,
+                    generation,
+                ));
             }
         }
         let (changed, entries, donor, donor_projected, generation) = best?;
