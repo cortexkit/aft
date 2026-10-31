@@ -48,6 +48,7 @@ pub(super) struct BashDeferredCompletion {
     root: ProjectRootId,
     request_id: String,
     result: Option<ToolCallResult>,
+    held_frame: Option<Frame>,
     fatal: bool,
     /// True for the completion that removes the held request and decrements its
     /// root and route wait counts. A panic observed after a deadline reply sets
@@ -866,6 +867,51 @@ fn build_detached_frame(
     .map_err(SubcError::FrameBuild)
 }
 
+fn running_hold_route(identity: &RouteIdentity) -> bool {
+    identity.call_mode == subc_protocol::call_mode::CallMode::Codemode
+        && identity.held_reply
+        && identity.tool_result_body
+        && (identity.run_owner.is_some()
+            || identity
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.kind == subc_protocol::scope::ScopeKind::Ephemeral))
+}
+
+async fn running_hold_frame(
+    target: &drain::BashDetachTarget,
+    route: RouteChannel,
+    corr: u64,
+    include_structured: bool,
+) -> Result<Option<Frame>, SubcError> {
+    let frame = wire::build_held_frame(
+        target.ver,
+        route,
+        corr,
+        target.flags,
+        cortexkit_role_tool_provider::result::held_reasons::RUNNING,
+        Some(json!({"task_id": target.task_id})),
+    )?;
+    let registry = target.registry.clone();
+    let task = target.task_id.clone();
+    let body = frame.body.clone();
+    let persisted = tokio::task::spawn_blocking(move || {
+        registry.hold_running_call(&task, &body, include_structured)
+    })
+    .await;
+    match persisted {
+        Ok(Ok(publish)) => Ok(publish.then_some(frame)),
+        error => {
+            let registry = target.registry.clone();
+            let task = target.task_id.clone();
+            let session = target.session_id.clone();
+            let _ = tokio::task::spawn_blocking(move || registry.kill(&task, &session)).await;
+            log::warn!("call ledger running hold failed: {error:?}");
+            Err(SubcError::WriterClosed)
+        }
+    }
+}
+
 fn detach_held_bash_sync(target: drain::BashDetachTarget, cancelled: bool) {
     if cancelled && target.server_completion {
         let _ = target.registry.kill(&target.task_id, &target.session_id);
@@ -920,6 +966,18 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
         );
         let frame: Option<WriterFrame> = match (reason, routes.get(&route)) {
             (_, None) => None,
+            (drain::BashLoopAnswer::Drain, Some(identity))
+                if target.server_completion && running_hold_route(identity) =>
+            {
+                running_hold_frame(
+                    &target,
+                    route,
+                    corr,
+                    !matches!(identity.trust, BindTrust::Untrusted),
+                )
+                .await?
+                .map(WriterFrame::plain)
+            }
             (drain::BashLoopAnswer::Drain, Some(_)) if target.server_completion => Some(
                 build_detached_frame(
                     target.ver,
@@ -1064,7 +1122,9 @@ pub(super) fn prepare_bash_elicitation_plan(
     })
 }
 
-fn permission_grants_for_retry(asks: &[crate::bash_permissions::PermissionAsk]) -> Vec<String> {
+pub(super) fn permission_grants_for_retry(
+    asks: &[crate::bash_permissions::PermissionAsk],
+) -> Vec<String> {
     asks.iter()
         .flat_map(|ask| {
             if ask.always.is_empty() {
@@ -1630,11 +1690,10 @@ mod unanswered_deadline_tests {
     }
 }
 
-/// A codemode program's shell call that would need the user's approval
-/// (a scanned permission or a host escalation) is refused by name: nobody can
-/// be asked on the head agent's behalf from a run route yet.
-fn refuse_run_permission_ask(response: Response, run_scoped: bool) -> Response {
-    if !run_scoped
+/// Preserve the unavailable refusal for worker programs and run routes that
+/// cannot receive held replies. Capable agent programs use Cingulate instead.
+fn refuse_run_permission_ask(response: Response, unavailable: bool) -> Response {
+    if !unavailable
         || response.success
         || response.data.get("code").and_then(Value::as_str)
             != Some(crate::protocol::ERROR_PERMISSION_REQUIRED)
@@ -1721,6 +1780,224 @@ pub(super) fn submit_deferred_bash(
     reply_budget: impl Into<crate::commands::blocking_wait::ReplyBudget>,
 ) {
     let reply_budget = reply_budget.into();
+    let program = super::secret_consent::current_identity().filter(|identity| {
+        identity
+            .run_owner
+            .as_ref()
+            .is_some_and(|owner| matches!(owner.kind, super::codemode::RunKind::Agent { .. }))
+            && matches!(
+                super::access_grants::ask_route(identity),
+                crate::access_policy::AskRoute::Consent { .. }
+            )
+    });
+    if let Some(identity) = program.filter(|_| permissions_granted.is_none()) {
+        let executor = executor.clone();
+        let completion_tx = completion_tx.clone();
+        let poll_touch_tx = poll_touch_tx.clone();
+        let metrics = metrics.clone();
+        let initial_route = crate::access_policy::current_ask_route();
+        let request = request_id.clone();
+        let mut held = super::consent::HeldCall {
+            reply_deadline: super::consent::program_reply_deadline(),
+            identity: identity.clone(),
+            tool: "bash".into(),
+            arguments: arguments.clone(),
+            request_id: request_id.clone(),
+            executor: executor.clone(),
+            route,
+            corr,
+            active: Arc::default(),
+            connection_cancel: cancel.connection.clone(),
+            drain: cancel.drain.clone(),
+            ledger_key: call_key.as_ref().map(|key| crate::db::call_ledger::Key {
+                carrier: identity.run_owner.as_ref().unwrap().ledger_carrier(),
+                call_key: key.clone(),
+            }),
+            shell_claim: None,
+        };
+        tokio::spawn(async move {
+            let handed_off = Arc::new(AtomicBool::new(false));
+            let launch = |ask_route: crate::access_policy::AskRoute, permissions: Vec<String>| {
+                let approved_budget = if permissions.is_empty() {
+                    reply_budget
+                } else {
+                    crate::commands::blocking_wait::ReplyBudget::new(Instant::now(), None)
+                };
+                let (tx, mut rx) = mpsc::channel(2);
+                let _scope = crate::access_policy::scope_guard(Some(
+                    super::access_grants::policy_scope_key(&identity),
+                ));
+                let _grants = crate::access_policy::scope_grants_guard(
+                    super::access_grants::scope_grants_denial(&identity),
+                );
+                let _identity =
+                    super::secret_consent::SecretIdentityGuard::install(identity.clone());
+                let _ask = crate::access_policy::ask_route_guard(Some(ask_route));
+                // The program's permission wait has its own budget. Startup
+                // and command execution get their ordinary fresh reply window.
+                submit_deferred_bash(
+                    handles_progress,
+                    &executor,
+                    &tx,
+                    &poll_touch_tx,
+                    &metrics,
+                    dispatch,
+                    root.clone(),
+                    project_root.clone(),
+                    session_id.clone(),
+                    request_id.clone(),
+                    route,
+                    corr,
+                    flags,
+                    ver,
+                    arguments.clone(),
+                    format_context.clone(),
+                    cancel.clone(),
+                    bind_trust.clone(),
+                    spawn_principal.clone(),
+                    edit_slot_survives,
+                    call_key.clone(),
+                    schema_pin.clone(),
+                    Some(permissions),
+                    repeat.clone(),
+                    worker_session,
+                    worker_preset,
+                    worker_jail,
+                    server_completion,
+                    remote_source.clone(),
+                    approved_budget,
+                );
+                let metrics = metrics.clone();
+                let request_id = request_id.clone();
+                let completion_tx = completion_tx.clone();
+                let handed_off = handed_off.clone();
+                async move {
+                    match rx.recv().await {
+                        Some(done) => {
+                            decrement_counted_channel(&metrics.bash_deferred_queued);
+                            if done.result.is_none() {
+                                handed_off.store(true, Ordering::SeqCst);
+                                let _ = send_counted_channel(
+                                    &completion_tx,
+                                    &metrics.bash_deferred_queued,
+                                    done,
+                                )
+                                .await;
+                                None
+                            } else {
+                                done.result.map(|result| (result.response, result.text))
+                            }
+                        }
+                        None => Some((
+                            Response::error(&request_id, "internal_error", "executor dropped"),
+                            String::new(),
+                        )),
+                    }
+                }
+            };
+            let first = if matches!(bind_trust, BindTrust::Untrusted) {
+                let command = arguments
+                    .get("params")
+                    .unwrap_or(&arguments)
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                Some((
+                    Response::error_with_data(
+                        &request,
+                        crate::protocol::ERROR_PERMISSION_REQUIRED,
+                        "bash command requires permission",
+                        json!({"asks":[{
+                            "kind":"bash", "patterns":[command], "always":[],
+                        }]}),
+                    ),
+                    String::new(),
+                ))
+            } else {
+                launch(initial_route, Vec::new()).await
+            };
+            let Some(first) = first else {
+                return;
+            };
+            let _claim = metrics.held_bash_calls.insert(route, corr);
+            held.shell_claim = Some(_claim.clone());
+            if first.0.data["code"] == crate::protocol::ERROR_PERMISSION_REQUIRED
+                && call_key.is_some()
+            {
+                if super::consent::persist_permission_hold(&held)
+                    .await
+                    .is_err()
+                {
+                    send_bash_deferred_completion(
+                        &completion_tx,
+                        &metrics,
+                        route,
+                        corr,
+                        flags,
+                        ver,
+                        root,
+                        request_id,
+                        Some(ToolCallResult {
+                            response: first.0,
+                            text: first.1,
+                        }),
+                        false,
+                    )
+                    .await;
+                    return;
+                }
+                let _ = send_counted_channel(
+                    &completion_tx,
+                    &metrics.bash_deferred_queued,
+                    BashDeferredCompletion {
+                        route,
+                        corr,
+                        flags,
+                        ver,
+                        root: root.clone(),
+                        request_id: request_id.clone(),
+                        result: None,
+                        held_frame: None,
+                        fatal: false,
+                        settles_hold: false,
+                    },
+                )
+                .await;
+            }
+            let result = super::consent::run_with_consent(held, first, launch)
+                .await
+                .map(|(response, text)| {
+                    let text = text.unwrap_or_else(|| {
+                        crate::subc_format::format_response_with_context(
+                            "bash",
+                            &response,
+                            &format_context,
+                        )
+                    });
+                    ToolCallResult { response, text }
+                });
+            let fatal = result
+                .as_ref()
+                .is_some_and(|result| note_fatal_panic_response(&result.response));
+            if result.is_none() && handed_off.load(Ordering::SeqCst) {
+                return;
+            }
+            send_bash_deferred_completion(
+                &completion_tx,
+                &metrics,
+                route,
+                corr,
+                flags,
+                ver,
+                root,
+                request_id,
+                result,
+                fatal,
+            )
+            .await;
+        });
+        return;
+    }
     let received_at = reply_budget.received_at;
     // Granted permissions resume a call after a prompt, which may outlast the
     // startup allowance. Start admission now, but keep the caller's reply clock.
@@ -1737,6 +2014,14 @@ pub(super) fn submit_deferred_bash(
     let scope_stamp = cancel.scope.clone();
     let speech_seed = cancel.speech_seed.clone();
     let secret_identity = super::secret_consent::current_identity();
+    let program_held = secret_identity.as_ref().is_some_and(running_hold_route);
+    let program_call = secret_identity
+        .as_ref()
+        .is_some_and(|identity| identity.run_owner.is_some());
+    let program_approval = program_call
+        && permissions_granted
+            .as_ref()
+            .is_some_and(|permissions| !permissions.is_empty());
     let secret_scopes = secret_identity
         .as_ref()
         .map(super::secret_consent::call_scopes);
@@ -1748,6 +2033,8 @@ pub(super) fn submit_deferred_bash(
     let grant_scope = crate::access_policy::current_scope();
     let grant_denial = crate::access_policy::scope_grants_denial();
     let ask_route = crate::access_policy::current_ask_route();
+    let ask_unavailable =
+        run_scoped && matches!(ask_route, crate::access_policy::AskRoute::Unavailable);
     // The attested scope decides confinement independently of consent routing:
     // heads and workers both ask, but only worker shells require the jail.
     let spawn_ctx = match executor.try_actor_context(&root) {
@@ -2083,9 +2370,12 @@ pub(super) fn submit_deferred_bash(
                         }
                     };
                     if let Some(grants) = permissions_granted {
-                        translated
-                            .args
-                            .insert("permissions_requested".to_string(), Value::Bool(true));
+                        // Re-entering a trusted program's preflight does not
+                        // enable the Bash permission scanner when the same
+                        // command issued directly would not use that scanner.
+                        if !program_call || matches!(bind_trust, BindTrust::Untrusted) {
+                            translated.args.insert("permissions_requested".to_string(), Value::Bool(true));
+                        }
                         translated.args.insert(
                             "permissions_granted".to_string(),
                             Value::Array(grants.into_iter().map(Value::String).collect()),
@@ -2132,6 +2422,20 @@ pub(super) fn submit_deferred_bash(
                     lsp_hints: None,
                     session_id: Some(session_for_spawn.clone()),
                     params: Value::Object(translated.args), };
+                    if program_call {
+                        if let Err(response) = super::tool_provider::check_program_scope(ctx, &request_id_for_spawn, secret_identity.as_ref().expect("program call has an authenticated identity")) {
+                            return finish_bash_spawn_immediate(response, ctx, &session_for_spawn,
+                                &format_context_for_spawn, &mut spawn_text_tx, &mut spawn_control_tx, true, &mut repeat_for_spawn);
+                        }
+                    }
+                    if program_approval {
+                        if let Some(key) = &ledger_key {
+                            if let Err(response) = super::tool_provider::begin_approved_call(ctx, key, &request_id_for_spawn, secret_identity.as_ref().expect("program approval has an authenticated identity")) {
+                                return finish_bash_spawn_immediate(response, ctx, &session_for_spawn,
+                                    &format_context_for_spawn, &mut spawn_text_tx, &mut spawn_control_tx, true, &mut repeat_for_spawn);
+                            }
+                        }
+                    }
                     let (response, storage_dir) =
                         crate::sandbox_spawn::with_authenticated_principal(spawn_principal, || {
                             // Declared first so its test-only drop check runs after
@@ -2175,7 +2479,7 @@ pub(super) fn submit_deferred_bash(
                                                                   let response = crate::bash_background::with_schema_pin(schema_pin, run_dispatch);
                                                                   #[cfg(test)]
                                                                   let response = with_bash_timing_for_test(spawn_timing_for_test.clone(), || crate::bash_background::with_schema_pin(schema_pin, run_dispatch));
-                                                                  let response = refuse_run_permission_ask(response, run_scoped);
+                                                                   let response = refuse_run_permission_ask(response, ask_unavailable);
                                                                   // Registration and revocation can race across actors.
                                                                   // Recheck after dispatch so neither ordering loses the task.
                                                                   if let Some(scope) = &scope_stamp {
@@ -2786,6 +3090,23 @@ pub(super) fn submit_deferred_bash(
                         wait_for_bash_reply_deadline(reply_deadline).await;
                     } => {
                         if claim.claim_for_deadline_handoff() {
+                            if program_held {
+                                let held_frame = match running_hold_frame(&deadline_target, route, corr, !matches!(bind_trust, BindTrust::Untrusted)).await {
+                                    Ok(frame) => frame,
+                                    Err(error) => {
+                                        log::warn!("running hold could not be persisted: {error}");
+                                        let result = bash_result_from_response(Response::error(&request_id, "database_unavailable", "Call ledger is unavailable"), &deadline_target.format_context);
+                                        send_bash_deferred_completion(&completion_tx, &task_metrics, route, corr, flags, ver, root_for_task, request_id, Some(result), false).await;
+                                        return;
+                                    }
+                                };
+                                detach_held_bash_in_background(deadline_target, false);
+                                let _ = send_counted_channel(&completion_tx, &task_metrics.bash_deferred_queued, BashDeferredCompletion {
+                                    route, corr, flags, ver, root: root_for_task, request_id,
+                                    result: None, held_frame, fatal: false, settles_hold: true,
+                                }).await;
+                                return;
+                            }
                             let response = blocking_handoff_response.unwrap_or_else(|| deadline_handoff_response(&request_id, &deadline_target.task_id, wait_window_ms, worker_session, deadline_target.format_context.bash_watch_available.unwrap_or(worker_session)));
                             // Status-bar formatting can wait on diagnostic-cache or
                             // fleet-reader mutexes, so omit it from the deadline reply.
@@ -3829,6 +4150,7 @@ async fn send_ready_bash_result(
                 result: None,
                 fatal: true,
                 settles_hold: false,
+                held_frame: None,
             },
         )
         .await;
@@ -3861,6 +4183,7 @@ async fn send_bash_deferred_completion(
             result,
             fatal,
             settles_hold: true,
+            held_frame: None,
         },
     )
     .await;
@@ -3876,6 +4199,13 @@ pub(super) async fn handle_bash_deferred_completion(
     metrics: &DispatchPathMetrics,
 ) -> Result<(), SubcError> {
     let route_id = done.route;
+    let held_frame = done.held_frame;
+    // A nonterminal completion with no result or fatal error is the program's
+    // permission hold. Its final result will settle the same ledger attachment.
+    if held_frame.is_none() && !done.settles_hold && !done.fatal && done.result.is_none() {
+        let frame = super::consent::held_frame(done.ver, done.route, done.corr, done.flags)?;
+        return send_reliable_writer_frame(tx, metrics, frame, "permission hold").await;
+    }
     if done.settles_hold {
         metrics.held_bash_calls.remove(done.route, done.corr);
         if let Some(meta) = live_roots.get_mut(&done.root) {
@@ -3893,6 +4223,10 @@ pub(super) async fn handle_bash_deferred_completion(
         }
     }
 
+    if let Some(frame) = held_frame {
+        // Task-backed holds are already durable before entering this channel.
+        return send_reliable_writer_frame(tx, metrics, frame, "running hold").await;
+    }
     if let Some(result) = done.result {
         if let Some(identity) = routes.get(&route_id) {
             let frame = build_tool_response_frame(
@@ -3946,6 +4280,7 @@ pub(super) fn bash_denied_untrusted_completion(
         result: Some(bash_result_from_response(response, &format_context)),
         fatal: false,
         settles_hold: true,
+        held_frame: None,
     }
 }
 
@@ -3974,6 +4309,7 @@ pub(super) fn bash_authorization_failed_completion(
         result: Some(bash_result_from_response(response, &format_context)),
         fatal: false,
         settles_hold: true,
+        held_frame: None,
     }
 }
 
@@ -4000,6 +4336,7 @@ pub(super) fn bash_module_draining_completion(
         result: Some(bash_result_from_response(response, &format_context)),
         fatal: false,
         settles_hold: true,
+        held_frame: None,
     }
 }
 
@@ -4025,6 +4362,7 @@ pub(super) fn bash_withdrawn_completion(
         result: None,
         fatal: false,
         settles_hold: true,
+        held_frame: None,
     }
 }
 
