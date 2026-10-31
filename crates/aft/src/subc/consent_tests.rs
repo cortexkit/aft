@@ -5,6 +5,7 @@ mod program_approvals {
     use super::*;
     use crate::db::call_ledger as ledger;
     use crate::subc::codemode::{self, Admission};
+    include!("consent_running_tests.rs");
 
     struct Controlled {
         fake: Arc<FakeCingulate>,
@@ -76,6 +77,7 @@ mod program_approvals {
     }
 
     fn program(f: &Fixture, worker: bool, name: &str) -> RouteIdentity {
+        f.ctx.bash_background().set_db_pool(f.ctx.db().unwrap());
         let base = if worker { &f.worker } else { &f.head };
         let mut stamp = serde_json::to_value(base.scope.as_ref().unwrap()).unwrap();
         stamp["attributes"] = if worker {
@@ -108,6 +110,7 @@ mod program_approvals {
         data.run_scope
             .set(run_scope::RunScope::for_test(None))
             .unwrap();
+        access_grants::register(&run, &f.ctx).unwrap();
         let route = route_key(41, 1);
         let routes = HashMap::from([(route_key(40, 1), owner), (route, run)]);
         match codemode::admit(
@@ -163,7 +166,15 @@ mod program_approvals {
             }
         })
         .await
-        .expect("one terminal late result is retained");
+        .unwrap_or_else(|_| {
+            let db = f.ctx.db().unwrap();
+            let conn = db.lock().unwrap();
+            panic!(
+                "one terminal late result is retained: row={:?}, tasks={:?}",
+                ledger::get(&conn, &key).unwrap(),
+                f.ctx.bash_background().list(100)
+            );
+        });
         assert_eq!(entry["kind"], "result", "{entry}");
         assert_eq!(entry["call_key"], format!("program-{corr}"));
         assert!(entry["result"].get("held").is_none());
@@ -851,6 +862,8 @@ struct Fixture {
     active: ActiveToolCalls,
     connection_cancel: PersistentCancelSignal,
     fake: Arc<FakeCingulate>,
+    metrics: StdMutex<HashMap<u64, Arc<DispatchPathMetrics>>>,
+    deadlines: StdMutex<HashMap<u64, u64>>,
 }
 
 fn fixture(fake: Arc<FakeCingulate>) -> Fixture {
@@ -906,6 +919,8 @@ fn fixture_with_executor(
         active: Arc::default(),
         connection_cancel: PersistentCancelSignal::new(),
         fake,
+        metrics: StdMutex::default(),
+        deadlines: StdMutex::default(),
     }
 }
 
@@ -1069,6 +1084,9 @@ impl Fixture {
         if preview {
             body["preview"] = json!(true);
         }
+        if let Some(deadline) = self.deadlines.lock().unwrap().get(&corr) {
+            body["deadline_ms"] = json!(deadline);
+        }
         if identity.run_owner.is_some() {
             body["call_key"] = json!(format!("program-{corr}"));
         }
@@ -1105,6 +1123,7 @@ impl Fixture {
             Err(decoded) => decoded,
         };
         let metrics = Arc::new(DispatchPathMetrics::new());
+        self.metrics.lock().unwrap().insert(corr, metrics.clone());
         let (edge, mut ready) = tool_provider::LedgerEdge::new();
         let writer = if identity.run_owner.is_some() {
             edge.proxy(writer, self.executor.clone(), metrics.clone()).0
@@ -1113,7 +1132,12 @@ impl Fixture {
         };
         let decoded = if identity.run_owner.is_some() {
             match edge.defer(decoded, &routes, &self.executor, &writer, &metrics) {
-                Ok(()) => ready.recv().await.expect("keyed program is admitted"),
+                Ok(()) => {
+                    if matches!(name, "tool.withdraw" | "late_results" | "late_results.ack") {
+                        return (writer, replies);
+                    }
+                    ready.recv().await.expect("keyed program is admitted")
+                }
                 Err(decoded) => decoded,
             }
         } else {
@@ -1382,6 +1406,7 @@ async fn consent_nonhost_carrier_cannot_save_agent_scope_grants() {
             &prep.call_key,
             "carrier",
             &Permission::File(grant.clone()),
+            None,
             true,
             true,
         )
@@ -1476,6 +1501,7 @@ async fn consent_qualifying_hosts_and_codemode_runs_can_save_scope_grants() {
             &prep.call_key,
             &asks::new_holder(),
             &Permission::File(grant.clone()),
+            None,
             true,
             true,
         )
@@ -6292,6 +6318,7 @@ async fn consent_head_policy_resolves_with_database_unlocked() {
             &prep.call_key,
             &asks::new_holder(),
             &prep.grant,
+            None,
             true,
             false,
         )
@@ -6405,6 +6432,7 @@ async fn consent_head_revocation_during_resolution_is_judged_by_the_new_policy()
         &prep.call_key,
         &asks::new_holder(),
         &prep.grant,
+        None,
         true,
         false,
     )

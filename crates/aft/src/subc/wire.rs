@@ -1398,6 +1398,33 @@ pub(super) fn build_error_frame(
         .map_err(SubcError::FrameBuild)
 }
 
+pub(super) fn build_held_frame(
+    ver: u8,
+    route: super::RouteChannel,
+    corr: u64,
+    flags: Flags,
+    reason: &str,
+    detail: Option<Value>,
+) -> Result<Frame, SubcError> {
+    use cortexkit_role_tool_provider::result::{HeldReply, ToolResult};
+    let mut held = serde_json::to_value(HeldReply::new(reason)).map_err(SubcError::Json)?;
+    if let Some(detail) = detail {
+        held["detail"] = detail;
+    }
+    let held = serde_json::from_value(held).map_err(SubcError::Json)?;
+    let body = ToolResult::new(Vec::new()).with_held(held);
+    Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        flags,
+        route.channel,
+        route.epoch,
+        corr,
+        serde_json::to_vec(&body).map_err(SubcError::Json)?,
+    )
+    .map_err(SubcError::FrameBuild)
+}
+
 /// [`build_error_frame`] with a machine-readable `detail` object, for errors
 /// a caller must act on programmatically (such as which request field was
 /// refused).

@@ -283,8 +283,16 @@ pub fn transition(conn: &Connection, key: &Key, from: State, to: State) -> rusql
 /// A permission preflight did not dispatch the requested action. Return it to
 /// the withdrawable state and retain its held-reply/v1 body before sending that
 /// permission-wait reply to the program.
-pub(crate) fn hold_permission(conn: &Connection, key: &Key, body: &[u8]) -> rusqlite::Result<bool> {
-    Ok(conn.execute("UPDATE call_ledger SET state='Prepared',frame_type='Response',frame_body=?3 WHERE carrier=?1 AND call_key=?2 AND state IN ('Prepared','DispatchStarted') AND task_id IS NULL", params![key.carrier,key.call_key,body])? == 1)
+pub(crate) fn hold_permission(
+    conn: &Connection,
+    key: &Key,
+    body: &[u8],
+    include_structured: bool,
+) -> rusqlite::Result<bool> {
+    let mut retained: Value = serde_json::from_slice(body)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    retained["_aft_include_structured"] = json!(include_structured);
+    Ok(conn.execute("UPDATE call_ledger SET state='Prepared',frame_type='Response',frame_body=?3 WHERE carrier=?1 AND call_key=?2 AND state IN ('Prepared','DispatchStarted') AND task_id IS NULL", params![key.carrier,key.call_key,retained.to_string().as_bytes()])? == 1)
 }
 
 /// Only a still-live, withdrawable approval can start the action. Withdrawal
@@ -295,6 +303,52 @@ pub(crate) fn begin_approved(conn: &Connection, key: &Key) -> rusqlite::Result<b
         && transition(&tx, key, State::Authorized, State::DispatchStarted)?;
     tx.commit()?;
     Ok(changed)
+}
+
+/// Retain a task-backed hold before replying. A prior consent hold is kept:
+/// the protocol cannot yet change a held call's reason before its terminal entry.
+pub(crate) fn hold_running(
+    conn: &Connection,
+    key: &Key,
+    task_id: &str,
+    body: &[u8],
+    include_structured: bool,
+) -> rusqlite::Result<bool> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let row = get(&tx, key)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let consent = row.frame.as_ref().is_some_and(|frame| {
+        serde_json::from_slice::<Value>(&frame.body)
+            .is_ok_and(|body| body["held"]["reason"] == "consent")
+    });
+    if row.state != State::DispatchStarted || row.task_id.as_deref() != Some(task_id) {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    let mut retained: Value = serde_json::from_slice(body)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    // Private retention metadata is never sent in the held reply. Remember the
+    // original include_structured value so a restarted process knows whether
+    // this caller may receive the response's structured data.
+    retained["_aft_include_structured"] = json!(include_structured);
+    let retained = retained.to_string().into_bytes();
+    tx.execute("UPDATE call_ledger SET recovered=1,frame_type='Response',frame_body=?3 WHERE carrier=?1 AND call_key=?2", params![key.carrier,key.call_key, if consent { &row.frame.as_ref().unwrap().body } else { &retained }])?;
+    tx.commit()?;
+    Ok(!consent)
+}
+
+fn has_held_reply(row: &Row) -> bool {
+    row.frame.as_ref().is_some_and(|frame| {
+        serde_json::from_slice::<Value>(&frame.body).is_ok_and(|body| body.get("held").is_some())
+    })
+}
+
+fn unknown_held_result() -> RecordedFrame {
+    RecordedFrame {
+        ty: FrameType::Response,
+        body: serde_json::to_vec(
+            &json!({"content":[],"isError":true,"errorCode":"outcome_unknown"}),
+        )
+        .expect("unknown outcome is JSON"),
+    }
 }
 
 pub fn not_started(key: &Key, reason: &str) -> RecordedFrame {
@@ -315,10 +369,17 @@ pub fn outcome(frame: &RecordedFrame) -> String {
     }
     // Tool responses carry the native Response in structuredContent.
     let response = value.get("structuredContent").unwrap_or(&value);
-    if response["success"] == true || value["isError"] == false {
+    if response["success"] == true
+        || value["isError"] == false
+        || (value.get("content").is_some() && value.get("isError").is_none())
+    {
         "ok".into()
     } else {
-        response["code"].as_str().unwrap_or("unknown").into()
+        value["errorCode"]
+            .as_str()
+            .or_else(|| response["code"].as_str())
+            .unwrap_or("unknown")
+            .into()
     }
 }
 
@@ -978,6 +1039,17 @@ pub fn recover(conn: &Connection) -> rusqlite::Result<()> {
             if let Some(task) = task {
                 conn.execute("UPDATE call_ledger SET task_id=?3,recovered=1 WHERE carrier=?1 AND call_key=?2", params![key.carrier,key.call_key,task])?;
             } else {
+                if has_held_reply(&row) {
+                    settle(
+                        conn,
+                        &key,
+                        &unknown_held_result(),
+                        "outcome_unknown",
+                        None,
+                        now_ms(),
+                    )?;
+                    continue;
+                }
                 settle(
                     conn,
                     &key,
@@ -1067,6 +1139,35 @@ pub fn observe_task_with_tool_result_source(
         .optional()?
         .unwrap_or(false);
     if let Some(frame) = result.filter(|_| recovered) {
+        let row = get(conn, &key)?;
+        if row.as_ref().is_some_and(has_held_reply) {
+            let frame = if outcome == "unknown" {
+                unknown_held_result()
+            } else {
+                let structured = row
+                    .as_ref()
+                    .and_then(|row| row.frame.as_ref())
+                    .and_then(|frame| serde_json::from_slice::<Value>(&frame.body).ok())
+                    .is_some_and(|held| held["_aft_include_structured"] == true);
+                crate::subc::project_held_ledger_result(frame, body, structured).map_err(
+                    |error| {
+                        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+                            error,
+                        )))
+                    },
+                )?
+            };
+            return settle_with_tool_result_source(
+                conn,
+                &key,
+                &frame,
+                &self::outcome(&frame),
+                None,
+                now_ms(),
+                body,
+            )
+            .map(|_| true);
+        }
         settle_with_tool_result_source(conn, &key, frame, outcome, None, now_ms(), body)?;
     }
     Ok(recovered)

@@ -67,20 +67,15 @@ pub(super) fn held_frame(
     corr: u64,
     flags: Flags,
 ) -> Result<Frame, SubcError> {
-    use cortexkit_role_tool_provider::result::{held_reasons, HeldReply, ToolResult};
+    use cortexkit_role_tool_provider::result::held_reasons;
     // The permission hold has no tool output yet. An empty content list avoids
     // suggesting a retry while the codemode runner waits for the late result.
-    let body = ToolResult::new(Vec::new()).with_held(HeldReply::new(held_reasons::CONSENT));
-    Frame::build_with_version(
-        ver,
-        FrameType::Response,
-        flags,
-        route.channel,
-        route.epoch,
-        corr,
-        serde_json::to_vec(&body).map_err(SubcError::Json)?,
-    )
-    .map_err(SubcError::FrameBuild)
+    wire::build_held_frame(ver, route, corr, flags, held_reasons::CONSENT, None)
+}
+
+fn approved_command_started(_call: &HeldCall) {
+    // The runner currently has no consent-to-running transition. Keep the
+    // already-published consent hold until the terminal late result arrives.
 }
 
 #[derive(Default)]
@@ -91,6 +86,7 @@ struct RunPermissionClock {
     spent: Duration,
     waiting: u32,
     updated: Option<Instant>,
+    calls: std::collections::HashSet<(RouteChannel, u64)>,
     #[cfg(test)]
     now: Option<Instant>,
 }
@@ -120,14 +116,31 @@ impl RunPermissionBudget {
         RUN_PERMISSION_ALLOWANCE.saturating_sub(clock.spent)
     }
 
-    fn wait(self: &Arc<Self>) -> RunPermissionWait {
+    fn wait(self: &Arc<Self>, route: RouteChannel, corr: u64) -> RunPermissionWait {
         let mut clock = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         clock.update();
-        clock.waiting += 1;
-        RunPermissionWait(self.clone())
+        if clock.calls.insert((route, corr)) {
+            clock.waiting += 1;
+        }
+        RunPermissionWait {
+            budget: self.clone(),
+            route,
+            corr,
+        }
+    }
+
+    fn stop(&self, route: RouteChannel, corr: u64) {
+        let mut clock = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clock.update();
+        if clock.calls.remove(&(route, corr)) {
+            clock.waiting -= 1;
+        }
     }
 
     #[cfg(test)]
@@ -139,17 +152,15 @@ impl RunPermissionBudget {
     }
 }
 
-struct RunPermissionWait(Arc<RunPermissionBudget>);
+struct RunPermissionWait {
+    budget: Arc<RunPermissionBudget>,
+    route: RouteChannel,
+    corr: u64,
+}
 
 impl Drop for RunPermissionWait {
     fn drop(&mut self) {
-        let mut clock = self
-            .0
-             .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        clock.update();
-        clock.waiting -= 1;
+        self.budget.stop(self.route, self.corr);
     }
 }
 
@@ -1063,8 +1074,9 @@ pub(super) async fn persist_permission_hold(call: &HeldCall) -> Result<(), Strin
     let body = held_frame(PROTOCOL_VERSION, call.route, call.corr, control_flags())
         .map_err(|error| error.to_string())?
         .body;
+    let include_structured = !matches!(call.identity.trust, BindTrust::Untrusted);
     with_db(call, move |conn, _| {
-        if crate::db::call_ledger::hold_permission(conn, &key, &body)? {
+        if crate::db::call_ledger::hold_permission(conn, &key, &body, include_structured)? {
             Ok(())
         } else {
             Err(rusqlite::Error::QueryReturnedNoRows)
@@ -1360,7 +1372,7 @@ pub(super) async fn run_with_consent<F, Fut>(
 ) -> Option<(Response, Option<String>)>
 where
     F: FnMut(AskRoute, Vec<String>) -> Fut,
-    Fut: Future<Output = (Response, String)>,
+    Fut: Future<Output = Option<(Response, String)>>,
 {
     if !matches!(
         access_grants::ask_route(&call.identity),
@@ -1408,7 +1420,7 @@ async fn run_held<F, Fut>(
 ) -> Option<(Response, Option<String>)>
 where
     F: FnMut(AskRoute, Vec<String>) -> Fut,
-    Fut: Future<Output = (Response, String)>,
+    Fut: Future<Output = Option<(Response, String)>>,
 {
     let route_hold = RouteHold::new(call.route);
     if let Some(other) = flight.other_settled(false) {
@@ -1422,7 +1434,7 @@ where
     let mut holder: Option<Arc<ClaimedAsk>> = None;
     loop {
         let budget = run_permission_budget(call);
-        let waiting = budget.map(|budget| budget.wait());
+        let waiting = budget.map(|budget| budget.wait(call.route, call.corr));
         if budget.is_some_and(|budget| budget.remaining().is_zero()) {
             return Some((refused_answer(call, &grant, ACCESS_TIMEOUT, None), None));
         }
@@ -1434,13 +1446,16 @@ where
             Hold::Run { once, claim } => {
                 claim.retry_after_deadline.store(false, Ordering::SeqCst);
                 holder = Some(claim);
-                let shell = once
+                let shell: Vec<String> = once
                     .iter()
                     .flat_map(|permission| match permission {
                         Permission::Shell { permissions, .. } => permissions.clone(),
                         Permission::File(_) => Vec::new(),
                     })
                     .collect();
+                if !shell.is_empty() {
+                    approved_command_started(call);
+                }
                 let once = once
                     .into_iter()
                     .filter_map(|permission| match permission {
@@ -1458,7 +1473,15 @@ where
                 tokio::pin!(running);
                 let (response, text) = loop {
                     tokio::select! {
-                        done = &mut running => break done,
+                        done = &mut running => {
+                            match done {
+                                Some(done) => break done,
+                                None => {
+                                    if let Some(claim) = holder.take() { claim.clear().await; }
+                                    return None;
+                                }
+                            }
+                        },
                         _ = tokio::time::sleep(SIGNAL_POLL) => {
                             // The consumer closed the route while the approved
                             // run was in flight: stop the run (it is the call's
@@ -2755,7 +2778,7 @@ async fn hold(
                             withdraw(call, &prep, &elicitation).await;
                             return Hold::Answer(refused_answer(call, &prep.grant, "access_withdrawn", None));
                         }
-                        None if run_permission_budget(call).is_some_and(|budget| budget.remaining().is_zero()) => {
+                        None if !settled_received.load(Ordering::SeqCst) && run_permission_budget(call).is_some_and(|budget| budget.remaining().is_zero()) => {
                             retry_after_deadline.store(true, Ordering::SeqCst);
                             withdraw(call, &prep, &elicitation).await;
                             return Hold::Answer(refused_answer(call, &prep.grant, ACCESS_TIMEOUT, None));
@@ -2833,6 +2856,7 @@ enum Applied {
     HeadNotHeld,
     /// Another dispatch claimed the answer first, or the ask is gone.
     NotClaimed,
+    Withdrawn,
 }
 
 async fn finish(
@@ -2855,6 +2879,9 @@ async fn finish(
         if run_permission_budget(call).is_some_and(|budget| budget.remaining().is_zero()) {
             withdraw(call, prep, elicitation).await;
             return Hold::Answer(refused_answer(call, &prep.grant, ACCESS_TIMEOUT, None));
+        }
+        if let Some(budget) = run_permission_budget(call) {
+            budget.stop(call.route, call.corr);
         }
     }
     #[cfg(test)]
@@ -2894,6 +2921,11 @@ async fn finish(
             let identity = call.identity.clone();
             let key = prep.key.clone();
             let call_key = prep.call_key.clone();
+            let ledger_key = call
+                .identity
+                .run_owner
+                .as_ref()
+                .and(call.ledger_key.clone());
             // Shell scope answers remain call-bound, just like a direct shell
             // retry. Only filesystem scopes become standing AFT grants.
             let scope = scope && prep.grant.file().is_some();
@@ -2951,7 +2983,16 @@ async fn finish(
                 #[cfg(test)]
                 tests::wait_at_finish(&request_id, false);
                 let applied = apply_allow(
-                    &db, &ctx, &identity, &key, &call_key, &claimant, &grant, scope, by_user,
+                    &db,
+                    &ctx,
+                    &identity,
+                    &key,
+                    &call_key,
+                    &claimant,
+                    &grant,
+                    ledger_key.as_ref(),
+                    scope,
+                    by_user,
                 );
                 #[cfg(test)]
                 tests::wait_at_finish(&request_id, true);
@@ -2977,6 +3018,9 @@ async fn finish(
                     Some("the head no longer holds this permission itself"),
                 )),
                 Ok(Applied::NotClaimed) => Hold::Answer(retry_answer(call, &prep.grant)),
+                Ok(Applied::Withdrawn) => {
+                    Hold::Answer(refused_answer(call, &prep.grant, "access_withdrawn", None))
+                }
                 Err(error) => Hold::Answer(unavailable_answer(call, &prep.grant, &error)),
             }
         }
@@ -2995,6 +3039,7 @@ fn apply_allow(
     call_key: &str,
     claimant: &str,
     grant: &Permission,
+    ledger_key: Option<&crate::db::call_ledger::Key>,
     scope: bool,
     by_user: bool,
 ) -> Result<Applied, String> {
@@ -3004,6 +3049,14 @@ fn apply_allow(
         }
     }
     with_head_policy(db, ctx, identity, !by_user, |conn, head| {
+        if let Some(ledger_key) = ledger_key {
+            if !crate::db::call_ledger::get(conn, ledger_key)?
+                .is_some_and(|row| row.state == crate::db::call_ledger::State::Prepared)
+            {
+                asks::discard(conn, key)?;
+                return Ok(Applied::Withdrawn);
+            }
+        }
         // A head may pass on only what it holds now: its authority is
         // checked again against the head's current policy and grants.
         if !by_user

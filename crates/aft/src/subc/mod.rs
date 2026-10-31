@@ -1464,6 +1464,35 @@ pub(crate) fn recovered_bash_frame(
     ))
 }
 
+pub(crate) fn project_held_ledger_result(
+    frame: &crate::db::call_ledger::RecordedFrame,
+    source: Option<&[u8]>,
+    include_structured: bool,
+) -> Result<crate::db::call_ledger::RecordedFrame, String> {
+    let frame = Frame::build(frame.ty, control_flags(), 1, 1, 1, frame.body.clone())
+        .map_err(|error| error.to_string())?;
+    let mut outgoing = WriterFrame::retained_tool_response_with_source(
+        frame,
+        wire::ToolResponsePolicy {
+            trust: if include_structured {
+                BindTrust::FirstParty
+            } else {
+                BindTrust::Untrusted
+            },
+            tool_result_body: true,
+        },
+        None,
+        source.map(|source| source.to_vec()),
+    );
+    outgoing
+        .project_tool_result()
+        .map_err(|error| error.to_string())?;
+    Ok(crate::db::call_ledger::RecordedFrame {
+        ty: outgoing.header.ty,
+        body: outgoing.frame.body,
+    })
+}
+
 #[derive(Debug)]
 /// Per-root route metadata owned by the subc loop. The `active_bash_waits` field
 /// counts detached bash processes that are still being observed for this root.
@@ -10528,14 +10557,18 @@ async fn hold_for_consent(
                     &format_context,
                 ),
             };
-            (response, text)
+            Some((response, text))
         }
     };
     let result = if elicitation {
         standalone::run_with_elicitation(
             held,
             (response, text),
-            |route| rerun(route, Vec::<String>::new()),
+            |route| async move {
+                rerun(route, Vec::<String>::new())
+                    .await
+                    .expect("file reruns do not hand off tasks")
+            },
             writer,
             metrics,
             ver,
