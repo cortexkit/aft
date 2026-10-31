@@ -4266,6 +4266,52 @@ fn configured_git_paths_with_inputs(
     {
         return Ok(Vec::new());
     }
+    let values = configured_git_path_values(project_root, keys)?;
+    let mut paths = Vec::new();
+    for (key, value) in keys.iter().zip(values) {
+        let Some(value) = value else {
+            continue;
+        };
+        let path = PathBuf::from(value.trim());
+        if !path.as_os_str().is_empty() {
+            let path = if path.is_absolute() {
+                path
+            } else {
+                project_root.join(path)
+            };
+            // Watch the literal path before deriving metadata grants. Canonical
+            // target equality alone cannot detect a symlink replaced by a
+            // directory (or the reverse) that still reaches the same target.
+            // Unprovable identities keep the whole policy uncached.
+            if inputs
+                .as_mut()
+                .is_some_and(|inputs| inputs.watch(&path).is_none())
+            {
+                *inputs = None;
+            }
+            for ancestor in path.ancestors() {
+                if std::fs::symlink_metadata(ancestor)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    metadata_allow.push(ancestor.to_path_buf());
+                }
+            }
+            let (input, path) = resolve_git_policy_path(path, key)?;
+            paths.push((key.to_string(), input, path));
+        }
+    }
+    Ok(paths)
+}
+
+#[cfg(unix)]
+fn configured_git_path_values(
+    project_root: &Path,
+    keys: &[&str],
+) -> Result<Vec<Option<String>>, String> {
+    #[cfg(all(test, target_os = "linux"))]
+    if git_policy_cache_tests::BENCH_UNBATCHED.with(|value| value.get()) {
+        return git_policy_cache_tests::legacy_git_path_values(project_root, keys);
+    }
     let worktree_config = git_policy_output(
         project_root,
         &["config", "--local", "--bool", "extensions.worktreeConfig"],
@@ -4367,40 +4413,7 @@ fn configured_git_paths_with_inputs(
             }
         }
     }
-    let mut paths = Vec::new();
-    for (key, value) in keys.iter().zip(values) {
-        let Some(value) = value else {
-            continue;
-        };
-        let path = PathBuf::from(value.trim());
-        if !path.as_os_str().is_empty() {
-            let path = if path.is_absolute() {
-                path
-            } else {
-                project_root.join(path)
-            };
-            // Watch the literal path before deriving metadata grants. Canonical
-            // target equality alone cannot detect a symlink replaced by a
-            // directory (or the reverse) that still reaches the same target.
-            // Unprovable identities keep the whole policy uncached.
-            if inputs
-                .as_mut()
-                .is_some_and(|inputs| inputs.watch(&path).is_none())
-            {
-                *inputs = None;
-            }
-            for ancestor in path.ancestors() {
-                if std::fs::symlink_metadata(ancestor)
-                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
-                {
-                    metadata_allow.push(ancestor.to_path_buf());
-                }
-            }
-            let (input, path) = resolve_git_policy_path(path, key)?;
-            paths.push((key.to_string(), input, path));
-        }
-    }
-    Ok(paths)
+    Ok(values)
 }
 
 #[cfg(unix)]
@@ -7891,6 +7904,54 @@ mod tests {
 mod git_policy_cache_tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    thread_local! {
+        pub(super) static BENCH_UNBATCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    // Keep the former per-key Git query schedule available only to the manual
+    // benchmark, so both schedules run in one binary with the same sandbox and
+    // filesystem inputs. Policy construction and cache validation are shared.
+    #[cfg(target_os = "linux")]
+    pub(super) fn legacy_git_path_values(
+        project_root: &Path,
+        keys: &[&str],
+    ) -> Result<Vec<Option<String>>, String> {
+        keys.iter()
+            .map(|key| {
+                let extension = git_policy_output(
+                    project_root,
+                    &["config", "--local", "--bool", "extensions.worktreeConfig"],
+                )
+                .map_err(|error| format!("failed to query worktree config extension: {error}"))?;
+                let worktree_config = extension.status.success() && extension.stdout == b"true\n";
+                for scope in ["--worktree", "--local", "--global", "--system"] {
+                    if scope == "--worktree" && !worktree_config {
+                        continue;
+                    }
+                    let output =
+                        git_policy_output(project_root, &["config", scope, "--path", "--get", key])
+                            .map_err(|error| format!("failed to query {key}: {error}"))?;
+                    if output.status.code() == Some(1) && output.stdout.is_empty() {
+                        continue;
+                    }
+                    if !output.status.success() {
+                        return Err(format!(
+                            "failed to query {key}: {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        ));
+                    }
+                    let value = String::from_utf8(output.stdout)
+                        .map_err(|error| format!("{key} is not UTF-8: {error}"))?;
+                    if !value.trim().is_empty() {
+                        return Ok(Some(value));
+                    }
+                }
+                Ok(None)
+            })
+            .collect()
+    }
+
     struct Fixture {
         _dir: tempfile::TempDir,
         root: PathBuf,
@@ -8175,6 +8236,9 @@ mod git_policy_cache_tests {
         let fixture = Fixture::new();
         let storage = tempfile::tempdir().unwrap();
         let account = tempfile::tempdir().unwrap();
+        let hooks = tempfile::tempdir().unwrap();
+        // Landlock cannot subtract immutable hooks from a writable worktree.
+        fixture.hooks(hooks.path().to_str().unwrap());
         let commit = git_policy_output(
             &fixture.root,
             &[
@@ -8210,60 +8274,71 @@ mod git_policy_cache_tests {
             assert!(output.status.success(), "{output:?}");
             roots.push((root, 2));
         }
-        for (root_index, (root, starts)) in roots.iter().enumerate() {
-            fixture.register_root(root);
-            let mut config = crate::config::Config::default();
-            config.project_root = Some(root.clone());
-            config.storage_dir = Some(storage.path().join(format!("store-{root_index}")));
-            config.github.shim = false;
-            config.git.co_author = "off".into();
-            config.bash.linux_scope = false;
-            config.sandbox.profile.head = SandboxMode::Strict;
-            config.sandbox.profile.worker = SandboxMode::Strict;
-            let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
-            let _launcher = install_sandbox_launcher_for_test(root, launcher.clone());
-            for start in 0..*starts {
-                let before = with_git_policy_test_state(root, |state| {
-                    [state.hits, state.misses, state.uncached, state.calls]
-                })
-                .unwrap();
-                let request: crate::protocol::RawRequest =
-                    serde_json::from_value(serde_json::json!({
-                        "id": "policy-cost", "command": "bash", "session_id": "policy-cost",
-                        "params": {"command": "printf git-policy-bench", "compressed": false}
-                    }))
+        for (label, unbatched) in [("before", true), ("after", false)] {
+            BENCH_UNBATCHED.with(|value| value.set(unbatched));
+            for (root_index, (root, starts)) in roots.iter().enumerate() {
+                fixture.register_root(root);
+                let key = git_policy_cache_key(root, &git_policy_environment(root), true).unwrap();
+                git_policy_cache().lock().unwrap().remove(&key);
+                let mut config = crate::config::Config::default();
+                config.project_root = Some(root.clone());
+                config.storage_dir =
+                    Some(storage.path().join(format!("store-{label}-{root_index}")));
+                config.github.shim = false;
+                config.git.co_author = "off".into();
+                config.bash.linux_scope = false;
+                config.sandbox.profile.head = SandboxMode::Strict;
+                config.sandbox.profile.worker = SandboxMode::Strict;
+                let ctx =
+                    AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+                let _launcher = install_sandbox_launcher_for_test(root, launcher.clone());
+                for start in 0..*starts {
+                    let before = with_git_policy_test_state(root, |state| {
+                        [state.hits, state.misses, state.uncached, state.calls]
+                    })
                     .unwrap();
-                let began = Instant::now();
-                let response = crate::worker_jail_canary::with_test_preparation_home(
-                    account.path(),
-                    1,
-                    || with_worker_jail(true, || crate::commands::bash::handle(&request, &ctx)),
-                );
-                let elapsed = began.elapsed();
-                assert!(response.success, "{response:?}");
-                let id = response.data["task_id"].as_str().unwrap();
-                while !ctx.bash_background().is_task_terminal(id) {
-                    ctx.bash_background()
-                        .status(id, "policy-cost", None, None, 1024)
+                    let request: crate::protocol::RawRequest =
+                        serde_json::from_value(serde_json::json!({
+                            "id": "policy-cost", "command": "bash", "session_id": "policy-cost",
+                            "params": {"command": "printf git-policy-bench", "compressed": false}
+                        }))
                         .unwrap();
-                    assert!(began.elapsed() < Duration::from_secs(15));
-                    std::thread::sleep(Duration::from_millis(1));
+                    let began = Instant::now();
+                    let response = crate::worker_jail_canary::with_test_preparation_home(
+                        account.path(),
+                        1,
+                        || with_worker_jail(true, || crate::commands::bash::handle(&request, &ctx)),
+                    );
+                    let elapsed = began.elapsed();
+                    assert!(response.success, "{response:?}");
+                    let id = response.data["task_id"].as_str().unwrap();
+                    while !ctx.bash_background().is_task_terminal(id) {
+                        ctx.bash_background()
+                            .status(id, "policy-cost", None, None, 1024)
+                            .unwrap();
+                        assert!(began.elapsed() < Duration::from_secs(15));
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    assert_eq!(
+                        ctx.bash_background()
+                            .status(id, "policy-cost", None, None, 1024)
+                            .unwrap()
+                            .exit_code,
+                        Some(0)
+                    );
+                    let after = with_git_policy_test_state(root, |state| {
+                        [state.hits, state.misses, state.uncached, state.calls]
+                    })
+                    .unwrap();
+                    let delta =
+                        std::array::from_fn::<_, 4, _>(|index| after[index] - before[index]);
+                    assert_eq!(delta[1], usize::from(start == 0));
+                    assert_eq!(delta[2], 0);
+                    eprintln!("worker_bash phase={label} root={root_index} start={start} hits={} misses={} key_none={} git_helpers={} startup_ms={:.3}", delta[0], delta[1], delta[2], delta[3], elapsed.as_secs_f64() * 1000.0);
                 }
-                assert_eq!(
-                    ctx.bash_background()
-                        .status(id, "policy-cost", None, None, 1024)
-                        .unwrap()
-                        .exit_code,
-                    Some(0)
-                );
-                let after = with_git_policy_test_state(root, |state| {
-                    [state.hits, state.misses, state.uncached, state.calls]
-                })
-                .unwrap();
-                let delta = std::array::from_fn::<_, 4, _>(|index| after[index] - before[index]);
-                eprintln!("worker_bash root={root_index} start={start} hits={} misses={} key_none={} git_helpers={} startup_ms={:.3}", delta[0], delta[1], delta[2], delta[3], elapsed.as_secs_f64() * 1000.0);
             }
         }
+        BENCH_UNBATCHED.with(|value| value.set(false));
     }
 
     #[test]
