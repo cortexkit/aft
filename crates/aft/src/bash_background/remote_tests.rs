@@ -11214,7 +11214,7 @@ async fn runon_cd_outside_checkout_is_refused_before_submit() {
         PathBuf::from(std::env::var_os("HOME").unwrap()).join("aft-runon-outside-checkout");
     let cases = [
         (format!("cd '{}'", sibling.display()), sibling.clone()),
-        ("cd ~/aft-runon-outside-checkout".into(), home_target),
+        (format!("cd '{}'", home_target.display()), home_target),
         ("cd ../sibling-repo".into(), sibling.clone()),
         (
             "cd ../sibling-repo && printf remote; printf continuation".into(),
@@ -11592,7 +11592,7 @@ async fn runon_cd_skipped_changes_do_not_hide_checkout_exits() {
     let marker = checkout.path().join("must-not-run-locally");
     for (line, refused) in [
         ("false && cd nested; cd ..", true),
-        ("maybe && cd nested; cd ..", true),
+        ("maybe && cd nested; cd ..", false),
         ("cd nested; cd ..", false),
         ("true || cd nested; cd ..", true),
         ("cd \"$X\" || cd ..", true),
@@ -11669,7 +11669,7 @@ async fn runon_cd_sequences_use_existing_copied_directories() {
     let marker = checkout.join("must-not-run-locally");
     for (line, refused) in [
         ("cd packages/a && true; cd ../b", false),
-        ("pushd packages/a && true; cd ../b", true),
+        ("pushd packages/a && true; cd ../b", false),
         ("cd ../commons/a && true; cd ../b", false),
         ("cd packages/missing && true; cd ../b", true),
         ("cd ../../outside", true),
@@ -11862,6 +11862,71 @@ fn runon_cd_snapshot_missing_git_keeps_failure_branch() {
 }
 
 #[test]
+fn runon_cd_sequential_command_after_setup_is_allowed() {
+    let (_dir, request) = runon_cd_snapshot_fixture();
+    let checkout = Path::new(&request.workspace_key);
+    for package in ["plugin", "e2e-tests"] {
+        let path = checkout.join("packages").join(package);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("source.ts"), "source\n").unwrap();
+    }
+    let command = "printf setup; cd packages/plugin && bun test src/__tests__; cd ../e2e-tests && bun test src/__tests__";
+    assert_eq!(runon_cd_refusal(command, &request).unwrap(), None);
+}
+
+#[test]
+fn runon_cd_scoped_and_unknown_directories_preserve_refusals() {
+    let (_dir, request) = runon_cd_snapshot_fixture();
+    let checkout = Path::new(&request.workspace_key);
+    for folder in ["sub", "a", "b"] {
+        let path = checkout.join(folder);
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("source.txt"), "source\n").unwrap();
+    }
+    for command in [
+        "cd a && cd ../b",
+        "cd a; cd ../b",
+        "false || cd a && cd ../b",
+        "printf setup; cd a && bun test\ncd ../b",
+        "cd \"$DIR\" && cd ../x",
+        "cd \"$DIR\"; cd ../x",
+        "cd && cd ../x",
+        "cd ~ && cd ../x",
+        "cd ~/src && cd ../x",
+        "cd - && cd ../x",
+        "cd */sub && cd ../x",
+    ] {
+        assert_eq!(
+            runon_cd_refusal(command, &request).unwrap(),
+            None,
+            "{command}"
+        );
+    }
+    let outside = checkout.parent().unwrap().join("outside");
+    let expected = format!(
+        "runon refused: the command changes into {}, which is outside the checkout the build server copies ({}); the command did not run. Set the bash tool's workdir to that folder instead of using cd.",
+        outside.display(), checkout.display()
+    );
+    for command in [
+        "(cd sub && printf nested); cd ../outside".to_owned(),
+        "cd sub | cat; cd ../outside".to_owned(),
+        "printf '%s' \"$(cd sub && pwd)\"; cd ../outside".to_owned(),
+        "cd sub && printf nested & cd ../outside".to_owned(),
+        "cd sub; cd ../../outside".to_owned(),
+        "(cd sub && cd ../../outside); printf outer".to_owned(),
+        "printf '%s' \"$(cd sub && cd ../../outside)\"".to_owned(),
+        format!("cd '{}'", outside.display()),
+        format!("cd \"$DIR\"; cd ../x; cd '{}'", outside.display()),
+    ] {
+        assert_eq!(
+            runon_cd_refusal(&command, &request).unwrap(),
+            Some(expected.clone()),
+            "{command}"
+        );
+    }
+}
+
+#[test]
 fn runon_cd_snapshot_rule_invalid_cd_keeps_failure_branch() {
     let (_dir, request) = runon_cd_snapshot_fixture();
     let checkout = Path::new(&request.workspace_key);
@@ -11984,7 +12049,7 @@ async fn runon_cd_sequential_targets_follow_the_shell_cwd() {
         ("cd \"$X\" && cd .. && printf remote", false),
         ("cd - && cd .. && printf remote", false),
         ("popd && cd .. && printf remote", false),
-        ("(cd nested) && cd .. && printf remote", false),
+        ("(cd nested) && cd .. && printf remote", true),
     ] {
         let daemon = daemon(Script::Plain, "exec-remote/v1").await;
         let command = format!("{line}; printf local-proof > '{}'", marker.display());

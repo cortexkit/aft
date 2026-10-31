@@ -1,0 +1,1 @@
+- A `runon` build-server command that changes folders more than once (for example `cd packages/plugin && bun test; cd ../e2e-tests && bun test`) is no longer refused when every folder is inside the checkout. Folder changes inside `( … )` or `$( … )` no longer affect the rest of the command.
