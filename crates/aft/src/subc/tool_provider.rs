@@ -2445,6 +2445,22 @@ impl LedgerEdge {
                     if let Some(key) = reply.withdrawn_key {
                         edge.end_withdrawn_held_calls(&key, "withdrawn");
                     }
+                    let body = match identity.reply_policy().project_custody_body(reply.body) {
+                        Ok(body) => body,
+                        Err(_) => {
+                            let _ = send_provider_error(
+                                &writer,
+                                &metrics,
+                                &request,
+                                ErrorBody::new(
+                                    "internal_error",
+                                    "retained tool reply could not be decoded",
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
+                    };
                     if let Ok(frame) = subc_protocol::Frame::build_with_version(
                         request.header.ver,
                         FrameType::Response,
@@ -2452,7 +2468,7 @@ impl LedgerEdge {
                         request.header.channel,
                         request.header.epoch,
                         request.header.corr,
-                        reply.body,
+                        body,
                     ) {
                         let _ =
                             send_reliable_writer_frame(&writer, &metrics, frame, "custody reply")
@@ -6876,6 +6892,130 @@ pub(in crate::subc) mod route_tests {
         assert_eq!(error.code, "invalid_request");
         assert_eq!(error.detail.unwrap()["field"], "arguments");
         assert_eq!(ACTIONS.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn runner_late_results_are_slim_but_the_ledger_stays_complete() {
+        use crate::db::call_ledger::{self as ledger, Key, RecordedFrame, ScopeIdentity, State};
+        for principal in ["reserved:broca", "reserved:thalamus-harness"] {
+            for tool_result_body in [false, true] {
+                let (dir, root) = test_support::test_root("runner-late-results");
+                let db = Arc::new(std::sync::Mutex::new(
+                    crate::db::open(&dir.path().join("aft.db")).unwrap(),
+                ));
+                let result = ToolCallResult {
+                    text: "Edited fixture.rs".into(),
+                    response: Response::success(
+                        "edit-id",
+                        json!({
+                            "metadata": {"diff": "--- a/fixture.rs\n+++ b/fixture.rs\n-old\n+new\n"},
+                            "path": "fixture.rs",
+                        }),
+                    ),
+                };
+                let full = wire::tests::legacy_tool_response_body(&result, true);
+                let key = Key {
+                    carrier: principal.into(),
+                    call_key: "late-edit".into(),
+                };
+                let scope = ScopeIdentity {
+                    owner: principal.into(),
+                    scope_ref: "work".into(),
+                    scope_epoch: 1,
+                };
+                {
+                    let conn = db.lock().unwrap();
+                    ledger::admit(&conn, &key, "digest", Some(&scope), State::DispatchStarted)
+                        .unwrap();
+                    ledger::settle(
+                        &conn,
+                        &key,
+                        &RecordedFrame {
+                            ty: FrameType::Response,
+                            body: full.clone(),
+                        },
+                        "ok",
+                        None,
+                        ledger::now_ms(),
+                    )
+                    .unwrap();
+                }
+                let ctx = test_support::test_ctx();
+                ctx.set_db(db.clone());
+                let executor = Arc::new(Executor::new());
+                assert!(executor.register_actor(root.clone(), ctx.clone()));
+                let mut identity = test_support::route_identity(&root, "runner");
+                let data = Arc::get_mut(&mut identity.0).unwrap();
+                data.role = RouteRole::ToolProviderV1;
+                data.tool_result_body = tool_result_body;
+                let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
+                    &mut data.spawn_principal
+                else {
+                    unreachable!()
+                };
+                *principal_id = Some(principal.into());
+                let routes = HashMap::from([(route_key(41, 1), identity)]);
+                let (edge, _ready) = LedgerEdge::new();
+                for body in [
+                    json!({"name":"late_results", "arguments":{}}),
+                    json!({"name":"tool.withdraw", "arguments":{"call_key":"late-edit"}}),
+                ] {
+                    let decoded = DecodedFrame {
+                        parsed_body: Default::default(),
+                        confinement: None,
+                        launch_restore: None,
+                        codemode_policies: None,
+                        frame: Frame::build(
+                            FrameType::Request,
+                            control_flags(),
+                            41,
+                            1,
+                            7,
+                            serde_json::to_vec(&body).unwrap(),
+                        )
+                        .unwrap(),
+                        phase_trace: PhaseTrace::new(Instant::now()),
+                    };
+                    let (writer, mut replies) = mpsc::channel(8);
+                    edge.defer(
+                        decoded,
+                        &routes,
+                        &executor,
+                        &writer,
+                        &Arc::new(DispatchPathMetrics::new()),
+                    )
+                    .ok()
+                    .expect("v1 route serves custody operations");
+                    let reply = tokio::time::timeout(Duration::from_secs(5), replies.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(reply.header.ty, FrameType::Response);
+                    let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+                    let delivered = if body["name"] == "late_results" {
+                        assert_eq!(reply["entries"].as_array().unwrap().len(), 1);
+                        &reply["entries"][0]["result"]
+                    } else {
+                        assert_eq!(reply["answer"], "completed");
+                        &reply["result"]
+                    };
+                    assert_eq!(
+                        delivered,
+                        &json!({"content":[{"type":"text","text":"Edited fixture.rs"}], "isError":false})
+                    );
+                }
+                let row = ledger::get(&db.lock().unwrap(), &key).unwrap().unwrap();
+                assert_eq!(row.frame.unwrap().body, full);
+                let entry: Value =
+                    serde_json::from_str(row.late_entry.as_deref().unwrap()).unwrap();
+                assert_eq!(
+                    entry["result"]["structuredContent"]["metadata"]["diff"],
+                    result.response.data["metadata"]["diff"]
+                );
+                ctx.clear_db();
+                executor.remove_actor(&root);
+            }
+        }
     }
 
     /// Legacy routes keep refusing the custody ops by name: the ledger edge

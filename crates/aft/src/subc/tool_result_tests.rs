@@ -60,6 +60,7 @@ fn opted_in(trust: BindTrust) -> wire::ToolResponsePolicy {
     wire::ToolResponsePolicy {
         trust,
         tool_result_body: true,
+        model_only: false,
     }
 }
 
@@ -875,6 +876,7 @@ fn tool_result_retained_legacy_replies_use_the_current_route() {
                 wire::ToolResponsePolicy {
                     trust,
                     tool_result_body: enabled,
+                    model_only: false,
                 },
                 None,
             );
@@ -1398,7 +1400,8 @@ fn tool_result_retention_is_bounded_trust_independent_and_keeps_legacy_view() {
             frame,
             wire::ToolResponsePolicy {
                 trust: BindTrust::FirstParty,
-                tool_result_body: false
+                tool_result_body: false,
+                model_only: false,
             },
             None,
             Some(vec![0xff])
