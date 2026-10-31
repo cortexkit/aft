@@ -3611,6 +3611,18 @@ fn runon_restart_context(project: &Path, storage: &Path) -> Arc<crate::context::
     ))
 }
 
+fn runon_restart_principal(project: &Path) -> crate::sandbox_spawn::AuthenticatedPrincipal {
+    crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind {
+        trust: crate::sandbox_spawn::PrincipalTrust::FirstParty,
+        route_channel: 41,
+        route_epoch: 1,
+        project_root: project.into(),
+        harness: "runner".into(),
+        session_id: "session".into(),
+        principal_id: Some("reserved:broca".into()),
+    }
+}
+
 #[tokio::test]
 async fn runon_restart_reattach_drain_child() {
     let Some(root) = std::env::var_os("AFT_RUNON_RESTART_FIXTURE") else {
@@ -3627,33 +3639,37 @@ async fn runon_restart_reattach_drain_child() {
     ));
     launch.explicit_runon = true;
     launch.harness = "runner".into();
-    let task_id = ctx
-        .bash_background()
-        .spawn_remote(
-            launch,
-            SpawnPlan::Unsandboxed,
-            "printf remote-restart-proof",
-            resolve_posix_shell(),
-            "session".into(),
-            project.clone(),
-            HashMap::new(),
-            crate::bash_background::HardKill::After(Duration::from_secs(60)),
-            None,
-            storage,
-            crate::bash_background::TaskSlot::Background { max: 10 },
-            true,
-            false,
-            Some(project),
-        )
-        .unwrap();
+    let task_id = super::super::with_scope_spawn(Some(owner_scope("restart-worker")), || {
+        ctx.bash_background()
+            .spawn_remote(
+                launch,
+                SpawnPlan::Unsandboxed,
+                "printf remote-restart-proof",
+                resolve_posix_shell(),
+                "session".into(),
+                project.clone(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(60)),
+                None,
+                storage,
+                crate::bash_background::TaskSlot::Background { max: 10 },
+                true,
+                false,
+                Some(project.clone()),
+            )
+            .unwrap()
+    });
     wait_for(
         "the remote job must be accepted and started before drain",
         || {
             let task = ctx.bash_background().task(&task_id).unwrap();
             let state = task.state.lock().unwrap();
             state.metadata.remote.as_ref().and_then(|remote| {
-                (remote.accepted && remote.started.is_some() && remote.last_seq == Some(0))
-                    .then_some(())
+                (remote.accepted
+                    && remote.started.is_some()
+                    && remote.last_seq == Some(0)
+                    && remote.submission.is_some())
+                .then_some(())
             })
         },
     )
@@ -3666,9 +3682,12 @@ async fn runon_restart_reattach_drain_child() {
 }
 
 async fn runon_restart_first_watch_reattaches(watch_before_replay: bool, relaxed_lookup: bool) {
-    let daemon =
-        crate::exec_remote::wire_tests::daemon_with_clients(Script::Started, "exec-remote/v1", 2)
-            .await;
+    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+        Script::Started,
+        &["exec-remote/v1", "exec-remote-submission-key/v1"],
+        2,
+    )
+    .await;
     let root = tempfile::tempdir().unwrap();
     let project = root.path().join("project");
     fs::create_dir(&project).unwrap();
@@ -3695,11 +3714,6 @@ async fn runon_restart_first_watch_reattaches(watch_before_replay: bool, relaxed
     ctx.bash_background()
         .set_harness(crate::harness::Harness::Runner);
     let storage = crate::bash_background::task_storage_dir(&ctx);
-    let replay = || {
-        ctx.bash_background()
-            .replay_session_for_project(&storage, "session", &project)
-            .unwrap();
-    };
     if relaxed_lookup {
         let snapshot = ctx.bash_background().status_relaxed(
             &task_id,
@@ -3712,8 +3726,56 @@ async fn runon_restart_first_watch_reattaches(watch_before_replay: bool, relaxed
         );
         assert!(snapshot.is_some(), "relaxed lookup must find the saved job");
     }
-    if !watch_before_replay {
-        replay();
+    let executor = crate::executor::Executor::new();
+    let root_id = crate::path_identity::ProjectRootId::from_path(&project).unwrap();
+    assert!(executor.register_actor(root_id.clone(), ctx.clone()));
+    let bind_request = serde_json::from_value::<crate::protocol::RawRequest>(serde_json::json!({
+        "id": "restart-runner-bind",
+        "command": "configure",
+        "project_root": project,
+        "storage_dir": root.path().join("storage"),
+        "harness": "runner",
+        "session_id": "session",
+        "config": [{
+            "tier": "user", "source": "/u/aft.jsonc",
+            "doc": "{\"indexes\":{\"semantic\":false,\"trigram\":false,\"callgraph\":false}}"
+        }],
+    }))
+    .unwrap();
+    let principal = runon_restart_principal(&project);
+    let bound = executor
+        .submit_bind_cancellable_async(
+            root_id,
+            bind_request.id.clone(),
+            Arc::new(move |ctx| {
+                crate::sandbox_spawn::with_authenticated_principal(principal.clone(), || {
+                    crate::commands::configure::handle_configure(&bind_request, ctx)
+                })
+            }),
+        )
+        .0
+        .await
+        .unwrap();
+    assert!(bound.success, "{bound:?}");
+    let gate = watch_before_replay.then(|| {
+        crate::commands::configure::gate_configure_tail_stage_for_test(
+            ctx.canonical_cache_root(),
+            "replay_claimed",
+        )
+    });
+    let tail_ctx = ctx.clone();
+    let mut tail = tokio::task::spawn_blocking(move || {
+        crate::commands::configure::drain_deferred_configure_maintenance(&tail_ctx);
+    });
+    if let Some((_, reached, _)) = &gate {
+        let reached = reached.clone();
+        tokio::task::spawn_blocking(move || reached.recv_timeout(Duration::from_secs(30)).unwrap())
+            .await
+            .unwrap();
+    } else {
+        // The session bind's real configure tail, not a direct registry replay,
+        // must restore the job before this order's first watch is dispatched.
+        (&mut tail).await.unwrap();
     }
     let request = serde_json::from_value(serde_json::json!({
         "id": "first-watch-after-drain",
@@ -3724,10 +3786,14 @@ async fn runon_restart_first_watch_reattaches(watch_before_replay: bool, relaxed
         "timeout_ms": 30_000,
     }))
     .unwrap();
-    let outcome = crate::commands::bash_watch::handle_deferred(&request, ctx.clone());
+    let outcome = crate::sandbox_spawn::with_authenticated_principal(
+        runon_restart_principal(&project),
+        || crate::commands::bash_watch::handle_deferred(&request, ctx.clone()),
+    );
     daemon.wait_for_requests("exec.attach", 1).await;
-    if watch_before_replay {
-        replay();
+    if let Some((_, _, release)) = &gate {
+        release.send(()).unwrap();
+        tail.await.unwrap();
     }
     let response = match outcome {
         crate::response_finalize::DispatchOutcome::Immediate(response) => response,
