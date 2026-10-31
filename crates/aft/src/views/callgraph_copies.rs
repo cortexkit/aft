@@ -91,11 +91,22 @@ pub(crate) fn admit(
     else {
         return Ok(Admission::Own);
     };
+    let target_root = target.root.clone().unwrap_or_else(|| main.clone());
     let borrow = Admission::Borrow {
-        root: target.root.clone().unwrap_or_else(|| main.clone()),
+        root: target_root.clone(),
         scope: target.scope.clone(),
     };
-    if copies == 0 || matches_target(storage, family, policy, &target.scope, root, identities) {
+    if copies == 0
+        || matches_target(
+            storage,
+            family,
+            policy,
+            &target.scope,
+            &target_root,
+            root,
+            identities,
+        )
+    {
         return Ok(borrow);
     }
     let owned = members.iter().filter(|m| m.scope != target.scope).count();
@@ -131,12 +142,15 @@ pub(crate) fn admit(
 }
 
 /// True when the checkout's known files equal the target's published graph,
-/// so borrowing it answers exactly as a copy of its own would.
+/// so borrowing it answers exactly as a copy of its own would. Resolver
+/// configuration such as `package.json` is not stored in the graph, so it
+/// must equal the target checkout's own copy on disk.
 fn matches_target(
     storage: &Path,
     family: &str,
     policy: crate::blob_store::v2::TrigramPolicy,
     target_scope: &str,
+    target_root: &Path,
     root: &Path,
     identities: impl FnOnce() -> Option<HashMap<String, (u64, blake3::Hash)>>,
 ) -> bool {
@@ -150,7 +164,7 @@ fn matches_target(
         &graph,
         super::callgraph::callgraph_inputs(checkout),
         root,
-        None,
+        Some(target_root),
         MATCH_DISK_READS,
     );
     differing.complete && differing.files.is_empty()

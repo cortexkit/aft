@@ -1567,9 +1567,22 @@ mod tests {
                     .collect(),
             )
         };
+        let differing = {
+            let (store, _) =
+                callgraph_copies::open_published(&storage, family, policy, &main_scope, &clean)
+                    .unwrap();
+            crate::commands::callgraph_borrowed::compare_with_graph(
+                &store.file_identities().unwrap(),
+                callgraph_inputs(identities().unwrap()),
+                &clean,
+                Some(&main),
+                64,
+            )
+        };
         assert_eq!(
             callgraph_copies::admit(&storage, family, policy, &clean, 5, identities).unwrap(),
-            borrow_main
+            borrow_main,
+            "{differing:?}"
         );
 
         // Once `first` lets go of its view its copy is idle, and `second`
