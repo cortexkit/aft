@@ -144,11 +144,17 @@ fn run_bash_get_path(
         .spawn()
         .expect("spawn aft binary");
 
+    // File existence is the reader's completion signal. Publish only after
+    // printf finishes, rather than exposing the empty file redirection creates.
+    let temporary_path = output_path.with_extension("tmp");
     let cmd = serde_json::json!({
         "id": "1",
         "command": "bash",
         "params": {
-            "command": format!("printf %s \"$PATH\" > \"{}\"", output_path.display())
+            "command": format!(
+                "printf %s \"$PATH\" > \"{}\" && /bin/mv -- \"{}\" \"{}\"",
+                temporary_path.display(), temporary_path.display(), output_path.display()
+            )
         }
     });
     child
