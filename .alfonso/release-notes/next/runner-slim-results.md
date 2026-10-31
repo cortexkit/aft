@@ -1,0 +1,1 @@
+- Ordinary tool calls from Broca and Thalamus now receive only the model-facing result over subc, including held and late results, without internal fields, edit diffs or duplicate bash output in `structuredContent`. Code-mode calls, AFT's OpenCode and Pi plugins, and unidentified callers keep their full structured results. AFT's own retained records stay complete.
