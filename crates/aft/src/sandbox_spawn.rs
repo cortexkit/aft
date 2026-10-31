@@ -8062,7 +8062,7 @@ mod git_policy_cache_tests {
                 let began = Instant::now();
                 let response = crate::worker_jail_canary::with_test_preparation_home(
                     account.path(),
-                    2,
+                    1,
                     || with_worker_jail(true, || crate::commands::bash::handle(&request, &ctx)),
                 );
                 let elapsed = began.elapsed();
