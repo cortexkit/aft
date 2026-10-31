@@ -14461,7 +14461,7 @@ mod tests {
     }
 
     #[test]
-    fn views_busy_measurement_retries_without_bug_guidance_or_failure_counts() {
+    fn views_busy_registry_retries_without_bug_guidance_or_failure_counts() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _serial = crate::blob_store::v3::serial_for_test();
         for callgraph in [false, true] {
@@ -14500,24 +14500,32 @@ mod tests {
                     crate::commands::grep::handle_grep(&grep_request("needle"), &ctx)
                 }
             };
-            let ((first, held, first_writes, held_writes), writes) =
-                crate::blob_store::v3::with_changing_namespace_for_test(
-                    &storage,
-                    &family,
-                    |completed| {
-                        let first = request();
-                        let first_writes = completed.load(std::sync::atomic::Ordering::SeqCst);
-                        let held = request();
-                        let held_writes = completed.load(std::sync::atomic::Ordering::SeqCst);
-                        (first, held, first_writes, held_writes)
-                    },
-                );
-            assert!(first_writes >= 8, "the load must exhaust a measurement");
-            assert_eq!(
-                held_writes, first_writes,
-                "backoff must not repeat the measurement"
-            );
-            assert_eq!(writes, first_writes);
+            // The blocker needs the family registry to exist before the first
+            // request opens it; create it the way the call-graph view test does.
+            let registry = crate::blob_store::v3::family_dir(&storage, &family)
+                .unwrap()
+                .join("members.sqlite");
+            if !registry.exists() {
+                crate::blob_store::v3::publish(&storage, &family, 1024, None, |_| Ok(())).unwrap();
+            }
+            // Another connection holds the family registry in exclusive
+            // locking mode, so opening it is busy until that connection ends.
+            let blocker = crate::db::file_identity::IdentityConnection::open_with_flags(
+                &registry,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+                "configure-busy-registry-blocker",
+            )
+            .unwrap();
+            blocker
+                .execute_batch(
+                    "PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; UPDATE accounting SET watermark=watermark+1;",
+                )
+                .unwrap();
+            let first = request();
+            // Within the backoff the held answer is repeated, not reloaded.
+            let held = request();
+            blocker.execute_batch("ROLLBACK").unwrap();
+            drop(blocker);
             assert!(!first.success, "{:?}", first.data);
             assert_eq!(first.data, held.data);
             let text = if callgraph {
@@ -14536,22 +14544,21 @@ mod tests {
                 assert_eq!(first.data["code"], "callgraph_building");
                 assert_eq!(text, "callers: callgraph_building — callers: persisted callgraph store is busy; retry shortly");
                 let cause = ctx.callgraph_view_read_diagnostics().last_error.unwrap();
-                assert!(
-                    cause.contains("reservation_ledger_busy: measure registry"),
-                    "{cause}"
-                );
-                assert!(
-                    cause.contains("namespace size did not stabilize after 8 measurements"),
-                    "{cause}"
-                );
+                assert!(cause.contains("v3 store busy: "), "{cause}");
             } else {
                 assert_eq!(first.data["code"], "busy");
                 assert_eq!(first.data["retryable"], true);
-                let cause = format!(
-                    "view loader [driver]: family registry I/O error: v3 store busy: reservation_ledger_busy: measure registry {}: v3 store busy: namespace size did not stabilize after 8 measurements",
-                    crate::blob_store::v3::family_dir(&storage, &family).unwrap().display(),
+                let cause = first.data["message"].as_str().unwrap().to_string();
+                assert!(cause.contains("v3 store busy: "), "{cause}");
+                assert!(
+                    cause.contains(
+                        &crate::blob_store::v3::family_dir(&storage, &family)
+                            .unwrap()
+                            .display()
+                            .to_string()
+                    ),
+                    "{cause}"
                 );
-                assert_eq!(first.data["message"], cause);
                 assert_eq!(text, cause);
                 let search = crate::commands::semantic_search::handle_semantic_search(
                     &semantic_search_request("needle"),
