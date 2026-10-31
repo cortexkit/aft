@@ -4664,7 +4664,9 @@ impl CallgraphBridge {
 }
 
 /// The sealed donor of `base`'s derived graph, or why there is none.
-fn sealed_donor(base: &ComposedGeneration) -> Result<std::path::PathBuf, super::donor::ColdReason> {
+pub(super) fn sealed_donor(
+    base: &ComposedGeneration,
+) -> Result<std::path::PathBuf, super::donor::ColdReason> {
     use super::donor::ColdReason;
     let route = base.v3_route().ok_or(ColdReason::NoSealedDonor)?;
     let donor = super::resolve_derived_path(&route.member_dir(), base.name())
@@ -4676,7 +4678,7 @@ fn sealed_donor(base: &ComposedGeneration) -> Result<std::path::PathBuf, super::
     Ok(donor)
 }
 
-fn remove_private_database(database: &std::path::Path) {
+pub(super) fn remove_private_database(database: &std::path::Path) {
     for suffix in ["", "-wal", "-shm", "-journal"] {
         let mut name = database.as_os_str().to_owned();
         name.push(suffix);

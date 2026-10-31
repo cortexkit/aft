@@ -1566,6 +1566,102 @@ mod tests {
         assert_ne!(policy(&linked).base_digest, before.base_digest);
     }
 
+    /// A worktree at another commit is another base. Its graph must start as
+    /// a clone of the sealed graph of the base it nearly equals, patched with
+    /// the difference, and answer exactly what a cold build of that commit
+    /// answers. Before, every commit's base resolved the whole graph again.
+    #[test]
+    fn a_new_commits_base_starts_from_the_nearest_sealed_base() {
+        use super::super::donor::DonorEvent;
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let main = checkout(&temp.path().join("main"));
+        setup_git(&main, &["init", "-q"]);
+        setup_git(&main, &["config", "core.autocrlf", "false"]);
+        setup_git(&main, &["add", "-A"]);
+        setup_git(&main, &["commit", "-q", "-m", "fixture"]);
+        let linked = temp.path().join("linked");
+        setup_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let linked = std::fs::canonicalize(&linked).unwrap();
+        // The worktree moves to its own commit with one more caller.
+        std::fs::write(
+            linked.join("c.ts"),
+            "import { target } from './a';\nexport function third() { return target(); }\n",
+        )
+        .unwrap();
+        setup_git(&linked, &["add", "-A"]);
+        setup_git(&linked, &["commit", "-q", "-m", "next"]);
+
+        let producers = super::super::manifest_v2::Producers {
+            trigram: crate::blob_store::v2::TrigramPolicy {
+                max_file_size: 1 << 20,
+            }
+            .fingerprint_hex(),
+            semantic: None,
+            callgraph: PRODUCER.into(),
+        };
+        let base_dir = |storage: &Path, root: &Path| {
+            let scope = super::super::base_refs::open_foreign_v3(
+                storage,
+                "donor-reuse",
+                &view_scope(root),
+                &producers,
+            )
+            .unwrap()
+            .unwrap()
+            .base_header()
+            .unwrap()
+            .scope
+            .clone();
+            crate::blob_store::v3::view_dir(storage, "donor-reuse", &scope).unwrap()
+        };
+
+        // Shared storage: main's base is built and sealed first.
+        let storage = temp.path().join("storage");
+        let main_view = view(&main, &storage);
+        assert_eq!(
+            callers(&main_view.reader().unwrap(), "a.ts", "target").len(),
+            1
+        );
+        let linked_view = view(&linked, &storage);
+        let patched = callers(&linked_view.reader().unwrap(), "a.ts", "target");
+        assert_eq!(patched.len(), 2, "{patched:?}");
+        assert_ne!(base_dir(&storage, &linked), base_dir(&storage, &main));
+        let base_events = events(&base_dir(&storage, &linked));
+        assert!(
+            base_events
+                .iter()
+                .any(|event| matches!(event, DonorEvent::Cloned(_))),
+            "the new commit's base resolved its whole graph cold: {base_events:?}"
+        );
+        assert!(
+            base_events.contains(&DonorEvent::Sealed),
+            "the patched base graph must still be sealed: {base_events:?}"
+        );
+
+        // A store with only the worktree builds the same base cold.
+        drop((main_view, linked_view));
+        let cold_storage = temp.path().join("cold-storage");
+        let cold_view = view(&linked, &cold_storage);
+        assert_eq!(
+            callers(&cold_view.reader().unwrap(), "a.ts", "target"),
+            patched
+        );
+        assert!(!events(&base_dir(&cold_storage, &linked))
+            .iter()
+            .any(|event| matches!(event, DonorEvent::Cloned(_))));
+    }
+
     #[test]
     fn sealed_base_donor_serves_checkouts_without_reextraction_or_cold_builds() {
         use super::super::donor::DonorEvent;
