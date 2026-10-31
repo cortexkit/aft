@@ -283,6 +283,7 @@ async fn bound_daemon_external_changes_reach_indexed_grep_and_search() {
         "git_checkout_marker",
         "copied_file_marker",
         "bash_file_marker",
+        "moved_directory_marker",
     ] {
         daemon
             .call("search", json!({"pattern":marker,"includeTests":true}))
@@ -307,11 +308,16 @@ async fn bound_daemon_external_changes_reach_indexed_grep_and_search() {
     assert!(copied.success());
     let bash = daemon.call("bash", json!({"command":"printf '// bash_file_marker\\n' > crates/old/src/bash.rs", "wait":true})).await;
     assert_ne!(bash["isError"], true, "{bash}");
+    let moved = state.path().join("moved");
+    std::fs::create_dir_all(moved.join("src")).unwrap();
+    std::fs::write(moved.join("src/lib.rs"), "// moved_directory_marker\n").unwrap();
+    std::fs::rename(&moved, root.join("crates/moved")).unwrap();
     for (file, marker) in [
         ("crates/new/src/lib.rs", "new_directory_marker"),
         ("crates/git-added/src/lib.rs", "git_checkout_marker"),
         ("crates/copied/src/lib.rs", "copied_file_marker"),
         ("crates/old/src/bash.rs", "bash_file_marker"),
+        ("crates/moved/src/lib.rs", "moved_directory_marker"),
     ] {
         assert_visible(&mut daemon, file, marker).await;
     }
