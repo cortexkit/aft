@@ -5397,9 +5397,9 @@ fn handle_configure_inner(
         canonical_cache_root: canonical_cache_root.clone(),
         project_key: project_key.clone(),
         harness: harness.clone(),
-        storage_root,
+        storage_root: storage_root.clone(),
         artifact_root: crate::root_cache::cache_root(&next_config),
-        harness_dir: ctx.harness_dir(),
+        harness_dir: storage_root.join(harness.storage_segment()),
         session_id: req.session().to_string(),
         root_too_broad,
         format_tool_cache_clear_needed,
@@ -8025,7 +8025,7 @@ fn replay_configure_session_parts(
     root_path: &Path,
 ) {
     ctx.bash_background()
-        .repair_legacy_root_tasks(storage_root, harness);
+        .repair_legacy_root_tasks(storage_root, harness.clone());
     // A replayed task a worker was waiting on is granted one worker wait
     // window from now, so the registry needs the configured window first.
     ctx.bash_background()
@@ -8034,7 +8034,9 @@ fn replay_configure_session_parts(
         ));
     #[cfg(test)]
     CONFIGURE_REPLAY_SESSION_CALLS.fetch_add(1, Ordering::SeqCst);
-    if let Err(error) = batch.replay_session_for_project(harness_dir, session_id, root_path) {
+    if let Err(error) =
+        batch.replay_session_for_project(harness_dir, &harness, session_id, root_path)
+    {
         slog_warn!("failed to replay background bash tasks: {error}");
     }
 }
@@ -9283,6 +9285,7 @@ fn run_configure_maintenance_unit_inner(
             let retry_due_failures = continuation.replay_retry_at.take().is_some();
             match batch.continue_project_replay(
                 &job.harness_dir,
+                &job.harness,
                 &job.session_id,
                 &job.root_path,
                 retry_due_failures,
@@ -10526,6 +10529,7 @@ mod tests {
         let runner_completions = restarted
             .bash_background()
             .drain_completions_for_session(Some("restart-runner"));
+        let runner_adopted = restarted.bash_background().task_for_test(task_id).is_some();
         let untouched = fs::read(&paths.json).unwrap() == before;
         let row_after_runner = {
             let db = crate::db::open(&storage.path().join("aft.db")).unwrap();
@@ -10559,6 +10563,7 @@ mod tests {
         );
         assert_eq!(recovered.exit_code, Some(0));
         assert!(runner_completions.is_empty());
+        assert!(!runner_adopted, "runner adopted the opencode task");
         assert!(untouched, "runner rewrote opencode metadata");
         assert_eq!(row_after_runner.status, "running");
         assert!(
