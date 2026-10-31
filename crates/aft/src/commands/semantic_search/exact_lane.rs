@@ -663,7 +663,7 @@ pub fn verify_exact_matches_in_text_with_member(
 struct PreparedExactSymbol {
     name: String,
     range: SymbolOffsetRange,
-    normalized: String,
+    normalized: OnceLock<String>,
     member_declaration: bool,
 }
 
@@ -691,7 +691,7 @@ impl PreparedExactText {
                     member_declaration: !symbol_text.trim_start().starts_with(name.as_str()),
                     name: name.to_ascii_lowercase(),
                     range,
-                    normalized: normalize_exact_phrase(symbol_text),
+                    normalized: OnceLock::new(),
                 })
             })
             .collect();
@@ -708,7 +708,10 @@ impl PreparedExactText {
             + self
                 .symbols
                 .iter()
-                .map(|symbol| symbol.name.capacity() + symbol.normalized.capacity())
+                // Whitespace folding and ASCII case folding cannot grow the
+                // source slice. Reserve its full size before lazy preparation
+                // so parallel verifications cannot exceed the cache charge.
+                .map(|symbol| symbol.name.capacity() + symbol.range.end - symbol.range.start)
                 .sum::<usize>()
     }
 }
@@ -854,11 +857,13 @@ fn verify_prepared_exact_matches(
     let mut matches = Vec::new();
     let norm_text = &prepared.normalized;
     let definition_source = is_definition_source(file_path);
+    // A normalized symbol body is a substring of the normalized whole file.
+    // Missing phrases need no symbol-body preparation or per-symbol scan.
+    let phrase_present = !norm_phrase.is_empty() && norm_text.contains(norm_phrase);
 
     // 1. Check symbols first (for symbol-level candidates like `cap_chars`)
     for symbol in &prepared.symbols {
         let range = &symbol.range;
-        let norm_sym_text = &symbol.normalized;
         let lowercase_name = &symbol.name;
         // The member stand-in counts only item declarations (`fn`, `def`,
         // `function`, `class`, ...), whose line starts with a keyword. A
@@ -875,18 +880,23 @@ fn verify_prepared_exact_matches(
                 Some(*range),
                 EvidenceDescriptor::for_definition(true, false),
             ));
-        } else if !norm_phrase.is_empty() && norm_sym_text.contains(norm_phrase) {
-            let occ = norm_sym_text.matches(norm_phrase).count();
-            matches.push(CandidateResult::new_exact(
-                file_path.to_path_buf(),
-                Some(*range),
-                EvidenceDescriptor::for_e1(occ, true, false),
-            ));
+        } else if phrase_present {
+            let norm_sym_text = symbol.normalized.get_or_init(|| {
+                normalize_exact_phrase(&text[range.start..range.end.min(text.len())])
+            });
+            if norm_sym_text.contains(norm_phrase) {
+                let occ = norm_sym_text.matches(norm_phrase).count();
+                matches.push(CandidateResult::new_exact(
+                    file_path.to_path_buf(),
+                    Some(*range),
+                    EvidenceDescriptor::for_e1(occ, true, false),
+                ));
+            }
         }
     }
 
     // 2. If no symbol matched, check verbatim phrase match in whole file (E1)
-    if matches.is_empty() && !norm_phrase.is_empty() {
+    if matches.is_empty() && phrase_present {
         let occ = norm_text.matches(norm_phrase).count();
         if occ > 0 {
             matches.push(CandidateResult::new_exact(
@@ -1586,6 +1596,60 @@ pub(crate) mod tests {
             results,
             crate::search_hot_path_measurements::counts().file_reads,
         )
+    }
+
+    #[test]
+    fn exact_symbol_normalization_is_lazy_and_reserves_its_capacity() {
+        let text = "pub fn first() {\r\n    // Réused\u{2003}marker Réused marker\r\n}\r\npub fn second() {\n    // Réused marker\n}\n";
+        let prepared = PreparedExactText::new(text);
+        let reserved = prepared.retained_bytes();
+        assert_eq!(prepared.symbols.len(), 2);
+        assert!(prepared
+            .symbols
+            .iter()
+            .all(|symbol| symbol.normalized.get().is_none()));
+        assert!(verify_prepared_exact_matches(
+            Path::new("lazy.rs"),
+            text,
+            &prepared,
+            "absent phrase",
+            &[],
+            None,
+        )
+        .is_none());
+        assert!(prepared
+            .symbols
+            .iter()
+            .all(|symbol| symbol.normalized.get().is_none()));
+
+        let results = verify_prepared_exact_matches(
+            Path::new("lazy.rs"),
+            text,
+            &prepared,
+            "réused marker",
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.evidence.occurrences)
+                .collect::<Vec<_>>(),
+            vec![Some(2), Some(1)]
+        );
+        for symbol in &prepared.symbols {
+            let normalized = symbol
+                .normalized
+                .get()
+                .expect("matched phrase prepares the body");
+            assert!(normalized.capacity() <= symbol.range.end - symbol.range.start);
+        }
+        assert_eq!(
+            prepared.retained_bytes(),
+            reserved,
+            "lazy allocation is charged before it runs"
+        );
     }
 
     #[test]

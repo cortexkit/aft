@@ -5,7 +5,7 @@
   "fixtures": [
     "crates/aft/tests/integration/tool_call_parity_test.rs"
   ],
-  "note": "Performance-only: lexical exactness reuses the exact lane's existing 32-MiB content-addressed normalization and symbol preparation. Both lanes still read fresh bytes and retain their own admission, phrase, window and definition rules. Ranked paths, order, snippets, locations and envelopes must remain byte-identical on the pinned real-query rows and the parallel captured-query replay. Feature-gated Linux CPU tracing and an opt-in replay test record the costs without changing ordinary search replies.",
+  "note": "Performance-only: lexical exactness reuses the exact lane's existing 32-MiB content-addressed preparation. Symbol-body normalization is lazy, with worst-case capacity reserved before initialization, and phrases absent from the whole file skip symbol-body preparation and scans. Both lanes still read fresh bytes and retain their own admission, phrase, window and definition rules. Ranked paths, order, snippets, locations and envelopes must remain byte-identical on the pinned real-query rows and the parallel captured-query replay. Independent replay processes have different generation-token nonces; comparison preserves receiver generation counters and all result and envelope fields. Feature-gated Linux CPU tracing and an opt-in replay test record the costs without changing ordinary search replies.",
   "slices": [
     "alfonso/task/bg_006c452305c2efa5-aft-search-engine-only-path-is-23-of-busy-aft-cp"
   ]

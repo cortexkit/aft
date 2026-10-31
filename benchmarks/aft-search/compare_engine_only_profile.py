@@ -4,15 +4,30 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from copy import deepcopy
 import gzip
 import json
 from pathlib import Path
+import re
 import statistics
 
 
 def load(path: Path) -> dict:
     data = gzip.decompress(path.read_bytes()) if path.suffix == ".gz" else path.read_bytes()
     return json.loads(data)
+
+
+def response_bytes(response: dict) -> bytes:
+    """Keep all response fields except the deliberately random process nonce."""
+    response = deepcopy(response)
+    plan = response.get("structuredContent", {}).get("plan", {})
+    if "snapshot_generation" in plan:
+        generation, nonce = plan["snapshot_generation"].rsplit("_", 1)
+        assert re.fullmatch(r"[0-9a-f]{32}", nonce), "unexpected generation-token format"
+        # The prefix identifies the indexed snapshot and must still match. The
+        # random process nonce changes on every independent benchmark run.
+        plan["snapshot_generation"] = generation + "_<process-nonce>"
+    return json.dumps(response, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
 
 
 def summary(document: dict) -> dict:
@@ -73,9 +88,9 @@ def main() -> None:
         for identity, sample in old.items():
             candidate = new[identity]
             assert sample["episode_id"] == candidate["episode_id"], f"input changed: {identity}"
-            assert sample["response"] == candidate["response"], f"response changed: {identity}, {sample['episode_id']}"
-            assert sample["response_blake3"] == candidate["response_blake3"], f"response bytes changed: {identity}"
+            assert response_bytes(sample["response"]) == response_bytes(candidate["response"]), f"response changed: {identity}, {sample['episode_id']}"
         result["byte_identical_responses"] = len(old)
+        result["normalizations"] = ["corpus root", "snapshot_generation process nonce (receiver generations preserved)"]
         result["candidate"] = summary(after)
     if args.candidate_log:
         result["candidate_phases"] = phases(args.candidate_log)
