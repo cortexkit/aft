@@ -5970,7 +5970,7 @@ fn rust_collect_api_macro_text(
     }
     let padded = format!("{}{}", "\n".repeat(row), interior);
     let mut analyzer = DeadCodeFileAnalyzer::default();
-    if let Some(tree) = analyzer.parse_source(LangId::Rust, &padded) {
+    if let Some(tree) = analyzer.parse_source(Path::new(file), LangId::Rust, &padded) {
         if !tree.root_node().has_error() {
             rust_collect_api_facts(&padded, tree.root_node(), file, scope, facts);
         }
