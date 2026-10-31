@@ -6259,6 +6259,7 @@ fn schedule_artifact_loads_admitted(
                 let baseline = SearchIndex::read_from_disk(&cache_dir, &root_for_search);
                 let mut persist_to_disk = true;
                 let mut record_completed_verify = true;
+                let mut warm_verification = None;
                 let refreshed = match baseline {
                     Some(mut index)
                         if index.stored_git_head() == current_head.as_deref()
@@ -6272,23 +6273,17 @@ fn schedule_artifact_loads_admitted(
                                 record_completed_verify = false;
                                 Some(index)
                             }
-                            WarmVerifyPlan::StatFirst | WarmVerifyPlan::Strict => {
-                                let strategy = match verify_plan {
-                                    WarmVerifyPlan::StatFirst => VerifyStrategy::StatFirst,
-                                    WarmVerifyPlan::Strict => VerifyStrategy::Strict,
-                                    WarmVerifyPlan::Skip => unreachable!(),
-                                };
-                                index
-                                    .verify_against_disk_with_warm_budget(
-                                        current_head.clone(),
-                                        strategy,
-                                    )
-                                    .map(|disk_changed| {
-                                        persist_to_disk =
-                                            disk_changed || index.has_pending_disk_changes();
-                                        index
-                                    })
-                            }
+                            WarmVerifyPlan::StatFirst | WarmVerifyPlan::Strict => index
+                                .verify_against_disk_with_warm_budget(
+                                    current_head.clone(),
+                                    &cache_dir,
+                                )
+                                .map(|(disk_changed, verification)| {
+                                    warm_verification = Some(verification);
+                                    persist_to_disk =
+                                        disk_changed || index.has_pending_disk_changes();
+                                    index
+                                }),
                         }
                     }
                     baseline => {
@@ -6371,12 +6366,23 @@ fn schedule_artifact_loads_admitted(
                     }
                 }
                 if generation_current() && record_completed_verify && persistence_succeeded {
-                    let _ = cache_freshness::record_verify_completed_if_unchanged(
+                    let verified = cache_freshness::record_verify_completed_if_unchanged(
                         &root_for_search,
                         VerifyArtifact::Search,
                         cache_freshness::artifact_generation(&cache_path),
                         verify_ticket,
                     );
+                    if verified && !is_worktree_bridge_for_search {
+                        if let Some(verification) = warm_verification {
+                            search_persist_epoch_flag.run_if_current(search_persist_epoch, || {
+                                if let Err(error) =
+                                    index.persist_warm_verification(&cache_dir, verification)
+                                {
+                                    slog_warn!("failed to persist search verification: {}", error);
+                                }
+                            });
+                        }
+                    }
                 }
                 let symbol_files = search_index_symbol_files(&index);
                 let prewarm_stop = SymbolPrewarmStop {
