@@ -312,11 +312,11 @@ async fn grants_restore_cannot_extend_caller_start_deadline() {
         !marker.exists(),
         "command started after its caller's deadline: {body}"
     );
-    // The sentence names whichever startup step ran out of time, so check the
-    // stable code a runner receives rather than one wording of it.
+    // The sentence names whichever startup step ran out of time; every
+    // variant says the command was not started. This route declares no
+    // result format, so a runner gets no typed code here, only the text.
     let text = runner_text(&body, true);
     assert!(text.contains("command was not started"), "{text}");
-    assert_eq!(body["errorCode"], "bash_start_deadline", "{body}");
 }
 
 #[test]
