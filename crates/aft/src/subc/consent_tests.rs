@@ -7,6 +7,7 @@ mod program_approvals {
     use crate::subc::codemode::{self, Admission};
     include!("consent_running_tests.rs");
     include!("consent_held_update_tests.rs");
+    include!("consent_security_audit_tests.rs");
 
     struct Controlled {
         fake: Arc<FakeCingulate>,
