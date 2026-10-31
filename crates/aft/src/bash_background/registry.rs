@@ -11650,6 +11650,12 @@ impl BgTaskRegistry {
         if !task.terminal_persist_dirty.load(Ordering::SeqCst) {
             return Ok(());
         }
+        #[cfg(test)]
+        TERMINAL_PERSIST_AFTER_DIRTY_CHECK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().take() {
+                hook();
+            }
+        });
         let mut db = DeferredDbWrites::new(self, task);
         let state = task
             .lock_state()
@@ -16068,6 +16074,11 @@ type PersistedGcSlots = HashMap<PathBuf, PersistedGcSlot>;
 fn persisted_gc_slots() -> &'static Mutex<PersistedGcSlots> {
     static SLOTS: std::sync::OnceLock<Mutex<PersistedGcSlots>> = std::sync::OnceLock::new();
     SLOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TERMINAL_PERSIST_AFTER_DIRTY_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// The remote cancellation outcome `bash.kill_scope` reports for a stopped
