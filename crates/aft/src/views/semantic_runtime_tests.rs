@@ -2244,11 +2244,11 @@ fn large_semantic_materialization_batches_pins_and_touches() {
     for (key, payload) in blobs {
         assert_eq!(store.get(&key).unwrap().unwrap(), payload);
     }
-    // One key-list write each for the trigram and semantic planes.
-    assert_eq!((after.0 - writes, after.1 - syncs), (2, 0));
-    // The semantic plane's file and chunk-vector keys plus the trigram
-    // plane's keys for the same 2048 entries, each plane in one write.
-    assert_eq!(written_bytes, 2048 * 65 * 3);
+    // The fold pins the trigram keys of the 2048 entries in one key-list
+    // write. The semantic keys were pinned as they were stored, and this
+    // member has no call-graph plane, so there is nothing else to pin.
+    assert_eq!((after.0 - writes, after.1 - syncs), (1, 0));
+    assert_eq!(written_bytes, 2048 * 65);
     // Every key was just stored in this epoch, so folding needs no writer.
     assert_eq!(transactions, 0);
 }
@@ -2366,9 +2366,9 @@ fn large_checkout_edit_counts_source_work_and_preserves_outputs() {
             "unchanged files should cost a stat, not a source read"
         );
         assert_eq!(work.content_hash_bytes, changed.len());
-        // One attachment per registered plane (trigram, semantic and call
-        // graph) for the one file read.
-        assert_eq!(work.attachments, 3);
+        // One attachment per registered plane (trigram and semantic; the
+        // semantic member has no call-graph plane) for the one file read.
+        assert_eq!(work.attachments, 2);
         assert_eq!(
             work.stats,
             files + 1,
@@ -4802,7 +4802,7 @@ fn superseded_lane_cannot_publish_over_its_replacement() {
         }
         .fingerprint_hex(),
         semantic: Some(SemanticProducer::current(model, EmbedTextCaps::default()).id()),
-        callgraph: super::super::callgraph::PRODUCER.into(),
+        callgraph: super::UNREGISTERED_PRODUCER.into(),
     };
     let member = super::view_scope("scope");
     assert!(super::super::base_refs::open_foreign_v3(
