@@ -1,0 +1,1 @@
+`aft_search` does less repeated text processing for lexical-only searches, improving responsiveness when many searches run at once. Lexical and exact matching reuse prepared source text, and queries avoid normalizing symbol bodies they cannot match. Rankings, snippets, line numbers, result counts and continuation notices are unchanged.
