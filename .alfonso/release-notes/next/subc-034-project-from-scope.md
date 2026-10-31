@@ -1,1 +1,1 @@
-AFT uses the session's project folder on Subconscious 0.34 and refuses file tools when no project is bound.
+- With the Subconscious daemon, AFT takes the project folder from the session it serves. A connection with no project folder gets a clear refusal for file tools instead of AFT treating the filesystem root as the project.
