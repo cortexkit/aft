@@ -391,7 +391,7 @@ impl TreeObservation {
         Ok(())
     }
 
-    fn unchanged(&self, admission: &dyn Fn() -> io::Result<()>) -> io::Result<bool> {
+    fn unchanged(&self, admission: &mut dyn FnMut() -> io::Result<()>) -> io::Result<bool> {
         for (path, state) in &self.0 {
             admission()?;
             if TreeNodeState::read(path).ok().as_ref() != Some(state) {
@@ -3459,7 +3459,7 @@ fn reap_trash_with_cursor(
             // a refusal authorizes no deletion; successful proofs are never cached.
             if cached
                 .tree
-                .unchanged(&|| {
+                .unchanged(&mut || {
                     budget.entry()?;
                     if Instant::now() >= deadline {
                         return Err(io::Error::new(io::ErrorKind::TimedOut, RetentionDeadline));
@@ -3645,8 +3645,8 @@ fn reap_trash_with_cursor(
                 // Reader liveness can change without any marker file changing.
                 && !path.join("readers").try_exists().unwrap_or(true)
             {
-                if let Some(tree) =
-                    observation.filter(|tree| tree.unchanged(&|| budget.entry()).unwrap_or(false))
+                if let Some(tree) = observation
+                    .filter(|tree| tree.unchanged(&mut || budget.entry()).unwrap_or(false))
                 {
                     let scan = cursor.as_mut().unwrap();
                     scan.retained.insert(
