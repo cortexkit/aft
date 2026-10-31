@@ -1131,6 +1131,26 @@ where
             }
         }
         Classification::Governed { tuple, canonical } => {
+            // A queue-shaped `gh pr merge` is the bot's enqueue only for bot
+            // callers. Under the operator bypass it stays the operator's
+            // `pr merge`, audited, as it was before manifest v23 declared the
+            // queue rows: an operator may queue any pull request, including
+            // ones the bot did not open. `pr enqueue` is only ever classified
+            // from a `pr merge` invocation, so the operator's argv is passed
+            // to the real gh unchanged.
+            if operator_bypass_requested() && tuple == "pr enqueue" {
+                let repository = std::env::current_dir()
+                    .ok()
+                    .and_then(|cwd| TargetRepository::from_invocation(args).resolve(&cwd));
+                return dispatch_audited_bypass(
+                    args,
+                    "pr merge",
+                    repository.as_deref(),
+                    paths,
+                    now,
+                    delegate_to_upstream,
+                );
+            }
             // The classification already proves the manifest declares this
             // tuple at a version that reviewed it; the label row adds its own
             // version check so the bypass cannot reach an older declaration.
