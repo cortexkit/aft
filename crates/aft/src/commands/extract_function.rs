@@ -148,7 +148,7 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // --- Read and parse ---
-    let source = match std::fs::read_to_string(&path) {
+    let (source, observation) = match edit::read_edit_source(&path) {
         Ok(s) => s,
         Err(e) => {
             return Response::error(
@@ -329,12 +329,13 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     // --- Auto-backup before mutation ---
-    let backup_id = match edit::auto_backup(
+    let backup_id = match edit::auto_backup_observed(
         ctx,
         req.session(),
         &path,
         &format!("extract_function: {}", name),
         Some(&op_id),
+        &observation,
     ) {
         Ok(id) => id,
         Err(e) => {
@@ -345,15 +346,20 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
     // --- Write, format, validate ---
     let _mutation = crate::runtime_drain::record_file_mutation(ctx, [path.as_path()]);
     let tool_policy = &crate::sandbox_spawn::ToolLaunchPolicy::for_request(ctx);
-    let mut write_result = match edit::write_format_validate(
+    let mut write_result = match edit::write_format_validate_observed(
         tool_policy,
         &path,
         &new_source,
         &ctx.config(),
         &req.params,
+        &source,
+        &observation,
     ) {
         Ok(r) => r,
         Err(e) => {
+            ctx.backup()
+                .lock()
+                .discard_operation_entries(req.session(), &op_id);
             return Response::error(&req.id, e.code(), e.to_string());
         }
     };

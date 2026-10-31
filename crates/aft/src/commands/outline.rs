@@ -951,6 +951,22 @@ fn range_contains(outer: &Range, inner: &Range) -> bool {
         && (inner.end_line, inner.end_col) <= (outer.end_line, outer.end_col)
 }
 
+fn containing_test_region(regions: &[TestRegion], range: &Range) -> Option<usize> {
+    // The collector visits source order and stops descending at each accepted
+    // region, so region ends are ordered and regions do not overlap. Only the
+    // first region ending at or after the symbol can contain the whole symbol.
+    let index = regions.partition_point(|region| {
+        #[cfg(test)]
+        tests::REGION_LOOKUP_CHECKS.with(|count| count.set(count.get() + 1));
+        (region.summary.range.end_line, region.summary.range.end_col)
+            < (range.end_line, range.end_col)
+    });
+    regions
+        .get(index)
+        .filter(|region| range_contains(&region.summary.range, range))
+        .map(|_| index)
+}
+
 /// Collapse only the broad structure map. Single-file outlines and the shared
 /// symbol cache retain every symbol so zoom and other tools still see test code.
 fn outline_structure_entries(
@@ -1070,11 +1086,8 @@ fn structure_entries_from_regions(
     let mut regions = regions;
     let mut product_symbols = Vec::new();
     for symbol in symbols {
-        if let Some(region) = regions
-            .iter_mut()
-            .find(|region| range_contains(&region.summary.range, &symbol.range))
-        {
-            region.summary.items += 1;
+        if let Some(index) = containing_test_region(&regions, &symbol.range) {
+            regions[index].summary.items += 1;
         } else {
             product_symbols.push(symbol.clone());
         }
@@ -1122,9 +1135,7 @@ fn structure_entries_from_regions(
                 Ok(included) => {
                     let count = match outline_skip_reason(&included, Some(&mut *parser)) {
                         Some(reason) => Err(reason),
-                        None => parser
-                            .extract_symbols(&included)
-                            .map(|symbols| symbols.len())
+                        None => test_include_symbol_count(&included, parser)
                             .map_err(|error| outline_error_reason(&error)),
                     };
                     match count {
@@ -2820,6 +2831,28 @@ fn batch_file_structure(
     )
 }
 
+/// Count an included test module without reopening its validated source or
+/// copying its symbol table. Keep outline facts too: the same module may be
+/// included again or requested as a structure-map file later in the batch.
+fn test_include_symbol_count(path: &Path, parser: &mut FileParser) -> Result<usize, AftError> {
+    if let Ok(metadata) = crate::bounded_io::metadata(path) {
+        if let Ok(mtime) = metadata.modified() {
+            if let Some(count) = crate::parser::cached_symbol_count_shared(
+                &parser.symbol_cache(),
+                path,
+                mtime,
+                metadata.len(),
+            ) {
+                return Ok(count);
+            }
+        }
+    }
+    let parsed = parser.parse_snapshot(path)?;
+    let symbols = parser.extract_symbols_from_snapshot(path, &parsed)?;
+    parser.store_outline_facts(path, &parsed, Arc::new(outline_parse_facts(path, &parsed)));
+    Ok(symbols.len())
+}
+
 /// One file's structure-map entries for a provider other than tree-sitter,
 /// which has no shared symbol cache to keep parse facts in.
 fn fallback_file_structure(
@@ -3910,6 +3943,58 @@ pub(crate) fn symbol_to_entry(sym: &Symbol) -> OutlineEntry {
 
 #[cfg(test)]
 mod tests {
+    thread_local! {
+        pub(super) static REGION_LOOKUP_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn test_region_lookup_matches_linear_containment_without_all_pairs_work() {
+        let region = |range| TestRegion {
+            summary: TestSummary {
+                name: "tests".into(),
+                range,
+                items: 0,
+                unknown_reason: None,
+            },
+            included_path: None,
+            implicit_include: false,
+            module_scope: Vec::new(),
+            standalone: true,
+        };
+        let range = |start: u32, end: u32| Range {
+            start_line: start / 4,
+            start_col: start % 4,
+            end_line: end / 4,
+            end_col: end % 4,
+        };
+        let regions = [(2, 4), (4, 7), (10, 12), (17, 25), (27, 32)]
+            .into_iter()
+            .map(|(start, end)| region(range(start, end)))
+            .collect::<Vec<_>>();
+        for start in 0..=36 {
+            for end in start..=36 {
+                let symbol = range(start, end);
+                let expected = regions
+                    .iter()
+                    .position(|region| range_contains(&region.summary.range, &symbol));
+                assert_eq!(containing_test_region(&regions, &symbol), expected);
+            }
+        }
+
+        let regions = (0..2048)
+            .map(|i| region(range(i * 4, i * 4 + 2)))
+            .collect::<Vec<_>>();
+        REGION_LOOKUP_CHECKS.with(|count| count.set(0));
+        for (index, region) in regions.iter().enumerate() {
+            assert_eq!(
+                containing_test_region(&regions, &region.summary.range),
+                Some(index)
+            );
+        }
+        let checks = REGION_LOOKUP_CHECKS.with(|count| count.get());
+        assert!(checks <= regions.len() * 13, "{checks} containment probes");
+    }
+
     #[cfg(unix)]
     #[test]
     fn files_walk_stall_keeps_examined_paths_and_named_gap() {
@@ -5602,11 +5687,40 @@ mod tests {
     fn outline_portability_goldens_stay_lf_with_autocrlf() {
         let temp = tempfile::tempdir().unwrap();
         let prefix = format!("{}/", path_to_slash(temp.path()));
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()
-            .expect("canonicalize repository root");
-        for (name, expected) in [
+        // Build a real index from the checked-in attributes, not the surrounding
+        // checkout's Git metadata (which source-only build snapshots omit).
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path();
+        let git_config = root.join("empty-gitconfig");
+        std::fs::write(&git_config, "").unwrap();
+        std::fs::write(
+            root.join(".gitattributes"),
+            include_str!("../../../../.gitattributes"),
+        )
+        .unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(["-c", "core.attributesFile="])
+                .args(args)
+                .env("GIT_DIR", root.join(".git"))
+                .env("GIT_WORK_TREE", root)
+                .env_remove("GIT_COMMON_DIR")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_CONFIG_COUNT")
+                .env("GIT_CONFIG_GLOBAL", &git_config)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_ATTR_NOSYSTEM", "1")
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        let goldens = [
             (
                 "test_free.txt",
                 include_str!("../../tests/fixtures/outline_summaries/test_free.txt"),
@@ -5619,27 +5733,32 @@ mod tests {
                 "structure_common_root.txt",
                 include_str!("../../tests/fixtures/outline_summaries/structure_common_root.txt"),
             ),
-        ] {
+        ];
+        for (name, expected) in goldens {
             let relative = format!("crates/aft/tests/fixtures/outline_summaries/{name}");
-            let output = std::process::Command::new("git")
-                .args(["-c", "safe.directory=", "-c", "core.autocrlf=true"])
-                .arg("-c")
-                .arg(format!("safe.directory={}", root.display()))
-                .args([
-                    "checkout-index",
-                    "--force",
-                    &format!("--prefix={prefix}"),
-                    "--",
-                    &relative,
-                ])
-                .current_dir(&root)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            let path = root.join(&relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, expected).unwrap();
+        }
+        git(&[
+            "-c",
+            "core.autocrlf=false",
+            "add",
+            "--",
+            ".gitattributes",
+            "crates",
+        ]);
+        for (name, expected) in goldens {
+            let relative = format!("crates/aft/tests/fixtures/outline_summaries/{name}");
+            git(&[
+                "-c",
+                "core.autocrlf=true",
+                "checkout-index",
+                "--force",
+                &format!("--prefix={prefix}"),
+                "--",
+                &relative,
+            ]);
             let bytes = std::fs::read(temp.path().join(relative)).unwrap();
             assert!(
                 !bytes.contains(&b'\r'),
@@ -5732,6 +5851,57 @@ mod tests {
         let skipped = response["skipped_files"].as_array().expect("skipped files");
         assert_eq!(skipped.len(), 1, "{response}");
         assert_eq!(skipped[0]["reason"], "parse_error");
+    }
+
+    #[test]
+    fn multi_file_outline_reuses_included_test_snapshots() {
+        for directory_mode in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let parent = temp.path().join("a.rs");
+            let included = temp.path().join("z.rs");
+            std::fs::write(
+                &parent,
+                "pub fn product() {}\n#[cfg(test)]\n#[path = \"z.rs\"]\nmod first;\n#[cfg(test)]\n#[path = \"z.rs\"]\nmod second;\n",
+            )
+            .unwrap();
+            std::fs::write(&included, "fn helper() {}\n#[test]\nfn checks() {}\n").unwrap();
+            let ctx = AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                crate::config::Config::default(),
+            );
+            let request: RawRequest = serde_json::from_value(if directory_mode {
+                serde_json::json!({"id":"includes", "command":"outline", "directory":temp.path()})
+            } else {
+                serde_json::json!({"id":"includes", "command":"outline", "files":[parent, included]})
+            })
+            .unwrap();
+
+            let (cold, reads, parses) = navigation_counts(&request, &ctx);
+            assert_eq!((reads, parses), (2, 2), "{cold}");
+            let text = cold["text"].as_str().unwrap();
+            assert!(text.contains("first (path z.rs): 2 items"), "{text}");
+            assert!(text.contains("second (path z.rs): 2 items"), "{text}");
+            assert!(text.contains("  - fn   helper 1:1\n"), "{text}");
+            assert_eq!(cold["files_shown"], 2);
+
+            let (warm, reads, parses) = navigation_counts(&request, &ctx);
+            assert_eq!((reads, parses), (0, 0));
+            assert_eq!(warm, cold);
+
+            std::fs::write(
+                &included,
+                "fn helper() {}\n#[test]\nfn checks() {}\n#[test]\nfn another() {}\n",
+            )
+            .unwrap();
+            let (edited, reads, parses) = navigation_counts(&request, &ctx);
+            assert_eq!((reads, parses), (1, 1), "{edited}");
+            let text = edited["text"].as_str().unwrap();
+            assert!(text.contains("first (path z.rs): 3 items"), "{text}");
+            assert!(text.contains("second (path z.rs): 3 items"), "{text}");
+            let (warm, reads, parses) = navigation_counts(&request, &ctx);
+            assert_eq!((reads, parses), (0, 0));
+            assert_eq!(warm, edited);
+        }
     }
 
     /// A warm multi-file outline renders test summaries, module layout and

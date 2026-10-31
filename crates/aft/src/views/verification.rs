@@ -311,15 +311,39 @@ pub(crate) struct Policy {
     /// that record which policy a published generation was verified under.
     /// Both are only valid in the checkout that recorded them.
     pub digest: String,
-    /// The same policy named by role instead of location: inputs under the
-    /// checkout by their relative path, Git's info files by name, Git
-    /// configuration by its effective entries. Two checkouts of one
-    /// repository with the same policy get the same value, so base identity
-    /// uses this one and a worktree at a commit another checkout already
-    /// built shares that base instead of building its own.
+    /// The policy that decides how a member's bytes are interpreted, named by
+    /// role instead of location: attribute sources under the checkout by
+    /// their relative path, Git's info files by name, Git configuration by
+    /// its effective entries. Base identity uses this one, so a worktree at a
+    /// commit another checkout already built shares that base instead of
+    /// building its own.
+    ///
+    /// Ignore rules are left out. They only decide which files are members,
+    /// and base identity already covers the membership digest: every member's
+    /// path, mode, content and size, computed by each checkout under its own
+    /// rules before it looks a base up. Two checkouts with the same members
+    /// hold the same base content whatever rules produced that set. Leaving
+    /// them in split bases on files tools write for themselves, such as a
+    /// self-ignoring `.opencode/.gitignore` that only the main checkout has.
     pub base_digest: String,
     /// Missing or unscopable conversion sources forbid stat-based byte reuse.
     pub reusable: bool,
+}
+
+/// Whether a policy input only holds ignore rules: per-directory ignore
+/// files and Git's `info/exclude`. These decide membership, which base
+/// identity covers through the membership digest, so `Policy::base_digest`
+/// leaves them out. The location-bound `Policy::digest` keeps them, because
+/// saved file stats must stop being reused when the rules change.
+fn is_ignore_rule_source(path: &Path) -> bool {
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some(".gitignore" | ".ignore" | ".aftignore") => true,
+        Some("exclude") => path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|parent| parent == "info"),
+        _ => false,
+    }
 }
 
 /// Reads one policy input. A missing file, or a directory or special file
@@ -565,7 +589,7 @@ impl Policy {
                     },
                     &mut hash,
                 )?;
-            } else if !is_config_origin(item) && !item.is_empty() {
+            } else if !is_config_origin(item) && !item.is_empty() && is_base_config_entry(item) {
                 config_entries.push(item.to_vec());
             }
             let lower = String::from_utf8_lossy(item).to_lowercase();
@@ -601,7 +625,11 @@ impl Policy {
                         root.join(path)
                     };
                     let source = metadata_source(&path, &mut hash)?;
-                    locate(&path, source);
+                    // core.excludesFile holds ignore rules, which base
+                    // identity leaves out (see `Policy::base_digest`).
+                    if conversion {
+                        locate(&path, source);
+                    }
                     reusable &= !conversion;
                 }
             }
@@ -617,10 +645,12 @@ impl Policy {
                 // attribute source is conservatively an unscopable conversion.
                 reusable = false;
             }
-            locate(path, source);
+            if !is_ignore_rule_source(path) {
+                locate(path, source);
+            }
         }
         let mut base = blake3::Hasher::new();
-        base.update(b"aft/views-v3/base-policy/1");
+        base.update(b"aft/views-v3/base-policy/2");
         base.update(&[u8::from(config_read)]);
         base.update(&(config_entries.len() as u64).to_le_bytes());
         for entry in &config_entries {
@@ -641,6 +671,29 @@ impl Policy {
             reusable,
         })
     }
+}
+
+/// Whether a Git config entry (`key\nvalue`) can change how a member's bytes
+/// or paths are read, so base identity must include it. Everything else in a
+/// repository's config (branch tracking, remotes, user identity, editor
+/// state) is left out: tools and agents rewrite those all the time, for
+/// example on every `git push -u`, and each rewrite would otherwise give
+/// every checkout of the repository a new base.
+fn is_base_config_entry(item: &[u8]) -> bool {
+    let key = item.split(|b| *b == b'\n').next().unwrap_or_default();
+    let key = String::from_utf8_lossy(key).to_ascii_lowercase();
+    key.starts_with("filter.")
+        || matches!(
+            key.as_str(),
+            "core.autocrlf"
+                | "core.eol"
+                | "core.safecrlf"
+                | "core.checkroundtripencoding"
+                | "core.attributesfile"
+                | "core.symlinks"
+                | "core.ignorecase"
+                | "core.precomposeunicode"
+        )
 }
 
 /// Whether a `git config --list --show-origin -z` record is an origin rather
@@ -1674,6 +1727,45 @@ mod tests {
             creation: 0,
         };
         assert!(!stat.reusable(&changed, observed + 1));
+    }
+
+    /// Branch tracking, remotes and user settings never change how a member
+    /// is read, so rewriting them (as `git push -u` does) keeps the base
+    /// identity; a line-ending or filter setting changes it.
+    #[test]
+    fn base_identity_ignores_config_that_cannot_change_member_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q"]);
+        fs::write(root.path().join("file.rs"), b"fn main() {}\n").unwrap();
+        git(root.path(), &["add", "."]);
+        let base = |root: &Path| BindGuard::capture(root, None).unwrap().policy.base_digest;
+        let before = base(root.path());
+        for (key, value) in [
+            ("branch.feature.remote", "origin"),
+            ("branch.feature.merge", "refs/heads/feature"),
+            ("remote.origin.url", "https://example.invalid/repo.git"),
+            ("user.name", "someone else"),
+            ("rerere.enabled", "true"),
+        ] {
+            git(root.path(), &["config", key, value]);
+        }
+        assert_eq!(
+            base(root.path()),
+            before,
+            "branch, remote and user settings must not change the base identity"
+        );
+        git(root.path(), &["config", "core.autocrlf", "input"]);
+        let line_endings = base(root.path());
+        assert_ne!(
+            line_endings, before,
+            "a line-ending setting changes the base"
+        );
+        git(root.path(), &["config", "filter.demo.clean", "cat"]);
+        assert_ne!(
+            base(root.path()),
+            line_endings,
+            "a filter setting changes the base"
+        );
     }
 
     #[test]

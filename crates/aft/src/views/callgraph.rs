@@ -86,10 +86,42 @@ pub(crate) fn source_language(path: &Path) -> Option<crate::parser::LangId> {
 /// Whether a member needs a callgraph blob: a source file in a callgraph
 /// language, or resolver configuration such as `package.json`.
 pub(crate) fn applies_to(path: &RelPath) -> bool {
-    super::assembly::is_resolution_input(path.as_bytes())
-        || std::str::from_utf8(path.as_bytes())
+    applies_to_relative(path.as_bytes())
+}
+
+/// [`applies_to`] for a root-relative path with `/` separators.
+pub(crate) fn applies_to_relative(path: &[u8]) -> bool {
+    super::assembly::is_resolution_input(path)
+        || std::str::from_utf8(path)
             .ok()
             .is_some_and(|p| source_language(Path::new(p)).is_some())
+}
+
+/// The key a views call graph stores in `files.content_hash` for the file at
+/// root-relative `path` whose source hash is `source`: the call-graph blob key,
+/// not the source hash (materialization also stores size 0). `None` for a path
+/// the call graph does not index: neither a recognised source language nor a
+/// resolver configuration file such as `package.json`.
+pub(crate) fn graph_key(path: &[u8], source: blake3::Hash) -> Option<blake3::Hash> {
+    let language = if super::assembly::is_resolution_input(path) {
+        "config".to_owned()
+    } else {
+        let path = std::str::from_utf8(path).ok()?;
+        format!("{:?}", crate::parser::detect_language(Path::new(path))?).to_lowercase()
+    };
+    let key =
+        crate::blob_store::CallgraphKey::from_source_digest(*source.as_bytes(), language, PRODUCER)
+            .full_key();
+    Some(blake3::Hash::from_bytes(*key.as_bytes()))
+}
+
+/// The subset of a checkout's file identities a call graph is built from, so
+/// documents a call graph never holds do not count as files that differ.
+pub(crate) fn callgraph_inputs(
+    mut identities: std::collections::HashMap<String, (u64, blake3::Hash)>,
+) -> std::collections::HashMap<String, (u64, blake3::Hash)> {
+    identities.retain(|path, _| applies_to_relative(path.as_bytes()));
+    identities
 }
 
 /// Attach evidence computed from exactly the caller's already-read byte buffer.
@@ -1453,12 +1485,176 @@ mod tests {
         );
     }
 
+    /// `views.callgraph_copies`: a worktree past the limit borrows the main
+    /// checkout's graph while every copy is in use, and takes the place of a
+    /// copy once that copy's checkout lets go of it. A limit of 0 always
+    /// borrows, and a worktree whose files equal the main checkout's graph
+    /// borrows without counting, even under the limit.
+    #[test]
+    fn callgraph_copies_limit_borrows_when_full_and_evicts_an_idle_copy() {
+        use super::super::callgraph_copies::{self, Admission};
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let main = checkout(&temp.path().join("main"));
+        setup_git(&main, &["init", "-q"]);
+        setup_git(&main, &["config", "core.autocrlf", "false"]);
+        setup_git(&main, &["add", "-A"]);
+        setup_git(&main, &["commit", "-q", "-m", "fixture"]);
+        let worktree = |name: &str, edit: bool| {
+            let path = temp.path().join(name);
+            setup_git(
+                &main,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "--detach",
+                    path.to_str().unwrap(),
+                    "HEAD",
+                ],
+            );
+            let path = std::fs::canonicalize(&path).unwrap();
+            if edit {
+                std::fs::write(
+                    path.join("c.ts"),
+                    format!("export function {name}() {{ return 1; }}\n"),
+                )
+                .unwrap();
+            }
+            path
+        };
+        let first = worktree("first", true);
+        let second = worktree("second", true);
+        let clean = worktree("clean", false);
+        let policy = crate::blob_store::v2::TrigramPolicy {
+            max_file_size: 1 << 20,
+        };
+        let family = "donor-reuse";
+        let paths = crate::root_cache::StoragePaths::same(&storage);
+        let admit = |root: &Path, copies| {
+            callgraph_copies::admit(&paths, family, policy, root, copies, || None).unwrap()
+        };
+        let main_scope = view_scope(&main);
+        let borrow_main = Admission::Borrow {
+            root: main.clone(),
+            scope: main_scope.clone(),
+        };
+
+        let main_view = view(&main, &storage);
+        main_view.reader().unwrap();
+        assert_eq!(
+            admit(&main, 0),
+            Admission::Own,
+            "the main checkout always owns"
+        );
+        assert_eq!(admit(&first, 1), Admission::Own);
+        let first_view = view(&first, &storage);
+        first_view.reader().unwrap();
+        assert_eq!(
+            admit(&first, 1),
+            Admission::Own,
+            "a copy already held stays owned"
+        );
+
+        // `first` holds the one copy and is in use: `second` borrows.
+        assert_eq!(admit(&second, 1), borrow_main);
+        assert_eq!(admit(&second, 0), borrow_main);
+        let (borrowed, _) =
+            callgraph_copies::open_published(&storage, family, policy, &main_scope, &second)
+                .unwrap();
+        assert_eq!(
+            callers(&borrowed, "a.ts", "target"),
+            callers(&main_view.reader().unwrap(), "a.ts", "target"),
+        );
+        drop(borrowed);
+
+        // Identical files borrow without taking one of five free copies.
+        let identities = || {
+            Some(
+                FILES
+                    .iter()
+                    .map(|(name, text)| {
+                        (
+                            (*name).to_owned(),
+                            (
+                                text.len() as u64,
+                                crate::views::io::source_hash(text.as_bytes()),
+                            ),
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        // A views graph stores call-graph blob keys, not source hashes, so the
+        // comparison must map source hashes to keys: without the mapping
+        // identical files look different, with it only real edits differ.
+        let (store, _) =
+            callgraph_copies::open_published(&storage, family, policy, &main_scope, &clean)
+                .unwrap();
+        let graph = store.file_identities().unwrap();
+        let compare = |root: &Path, checkout, key: bool| {
+            crate::commands::callgraph_borrowed::compare_with_graph(
+                &graph,
+                callgraph_inputs(checkout),
+                root,
+                Some(&main),
+                64,
+                key.then_some(
+                    &crate::commands::callgraph_borrowed::views_graph_key
+                        as &dyn Fn(&str, blake3::Hash) -> Option<blake3::Hash>,
+                ),
+            )
+        };
+        let unmapped = compare(&clean, identities().unwrap(), false);
+        assert_eq!(unmapped.files, ["a.ts", "b.ts"]);
+        let mapped = compare(&clean, identities().unwrap(), true);
+        assert!(mapped.complete && mapped.files.is_empty(), "{mapped:?}");
+        let second_files = ["a.ts", "b.ts", "c.ts", "package.json", "notes.md"]
+            .into_iter()
+            .map(|name| {
+                let bytes = std::fs::read(second.join(name)).unwrap();
+                (
+                    name.to_owned(),
+                    (bytes.len() as u64, crate::views::io::source_hash(&bytes)),
+                )
+            })
+            .collect();
+        let edited = compare(&second, second_files, true);
+        assert_eq!(edited.files, ["c.ts"], "{edited:?}");
+        drop(store);
+        assert_eq!(
+            callgraph_copies::admit(&paths, family, policy, &clean, 5, identities).unwrap(),
+            borrow_main,
+        );
+
+        // Once `first` lets go of its view its copy is idle, and `second`
+        // evicts it to build its own.
+        let first_dir =
+            crate::blob_store::v3::view_dir(&storage, family, &view_scope(&first)).unwrap();
+        assert!(first_dir.exists());
+        drop(first_view);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut admission = admit(&second, 1);
+        while admission != Admission::Own && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            admission = admit(&second, 1);
+        }
+        assert_eq!(admission, Admission::Own, "the idle copy was not evicted");
+        assert!(
+            !first_dir.exists(),
+            "the evicted copy's view directory remains"
+        );
+    }
+
     /// A linked worktree at the commit the main checkout already built has the
-    /// same files and the same ignore policy, so it must resolve the main
-    /// checkout's base and clone its sealed donor, parsing nothing. Base
-    /// identity once hashed the policy inputs' absolute paths and Git's
-    /// config origins (`.git/config` in a main checkout, an absolute path in a
-    /// linked worktree), so every checkout built a full base of its own.
+    /// same files, so it must resolve the main checkout's base and clone its
+    /// sealed donor, parsing nothing. Base identity once hashed the policy
+    /// inputs' absolute paths and Git's config origins (`.git/config` in a
+    /// main checkout, an absolute path in a linked worktree), so every
+    /// checkout built a full base of its own. It also once hashed ignore
+    /// files, so a self-ignoring file a tool writes into the main checkout
+    /// only (OpenCode's `.opencode/.gitignore` is one) split the bases too.
     #[test]
     fn linked_worktree_at_the_same_commit_shares_the_base_and_its_donor() {
         let _serial = crate::blob_store::v3::serial_for_test();
@@ -1475,6 +1671,10 @@ mod tests {
         setup_git(&main, &["commit", "-q", "-m", "fixture"]);
         // Shared by every checkout of the repository.
         std::fs::write(main.join(".git/info/exclude"), "scratch/\n").unwrap();
+        // A tool's folder that ignores itself, present in the main checkout
+        // only. It changes no member, so it must not change the base.
+        std::fs::create_dir(main.join(".tool")).unwrap();
+        std::fs::write(main.join(".tool/.gitignore"), "*\n").unwrap();
         let linked = temp.path().join("linked");
         setup_git(
             &main,
@@ -1540,16 +1740,120 @@ mod tests {
             [super::super::donor::DonorEvent::Cloned(_)]
         ));
 
-        // A different ignore policy in the linked worktree is a different
-        // base, even with the same files.
+        // Ignore rules stay out of the base policy, but they still change the
+        // checkout's own location-bound digest that saved file stats check.
+        // Attribute sources still change the base policy: they can change
+        // how a member's bytes are interpreted without changing its content.
         let policy = |root: &Path| {
             super::super::verification::BindGuard::capture(root, None)
                 .unwrap()
                 .policy
         };
         assert_eq!(policy(&main).base_digest, policy(&linked).base_digest);
-        std::fs::write(linked.join(".gitignore"), "dist/\nbuild/\n").unwrap();
-        assert_ne!(policy(&main).base_digest, policy(&linked).base_digest);
+        let before = policy(&linked);
+        std::fs::create_dir(linked.join(".tool")).unwrap();
+        std::fs::write(linked.join(".tool/.gitignore"), "other\n").unwrap();
+        let ignored = policy(&linked);
+        assert_eq!(ignored.base_digest, before.base_digest);
+        assert_ne!(ignored.digest, before.digest);
+        std::fs::write(linked.join(".gitattributes"), "*.ts text eol=crlf\n").unwrap();
+        assert_ne!(policy(&linked).base_digest, before.base_digest);
+    }
+
+    /// A worktree at another commit is another base. Its graph must start as
+    /// a clone of the sealed graph of the base it nearly equals, patched with
+    /// the difference, and answer exactly what a cold build of that commit
+    /// answers. Before, every commit's base resolved the whole graph again.
+    #[test]
+    fn a_new_commits_base_starts_from_the_nearest_sealed_base() {
+        use super::super::donor::DonorEvent;
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let main = checkout(&temp.path().join("main"));
+        setup_git(&main, &["init", "-q"]);
+        setup_git(&main, &["config", "core.autocrlf", "false"]);
+        setup_git(&main, &["add", "-A"]);
+        setup_git(&main, &["commit", "-q", "-m", "fixture"]);
+        let linked = temp.path().join("linked");
+        setup_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let linked = std::fs::canonicalize(&linked).unwrap();
+        // The worktree moves to its own commit with one more caller.
+        std::fs::write(
+            linked.join("c.ts"),
+            "import { target } from './a';\nexport function third() { return target(); }\n",
+        )
+        .unwrap();
+        setup_git(&linked, &["add", "-A"]);
+        setup_git(&linked, &["commit", "-q", "-m", "next"]);
+
+        let producers = super::super::manifest_v2::Producers {
+            trigram: crate::blob_store::v2::TrigramPolicy {
+                max_file_size: 1 << 20,
+            }
+            .fingerprint_hex(),
+            semantic: None,
+            callgraph: PRODUCER.into(),
+        };
+        let base_dir = |storage: &Path, root: &Path| {
+            let scope = super::super::base_refs::open_foreign_v3(
+                storage,
+                "donor-reuse",
+                &view_scope(root),
+                &producers,
+            )
+            .unwrap()
+            .unwrap()
+            .base_header()
+            .unwrap()
+            .scope
+            .clone();
+            crate::blob_store::v3::view_dir(storage, "donor-reuse", &scope).unwrap()
+        };
+
+        // Shared storage: main's base is built and sealed first.
+        let storage = temp.path().join("storage");
+        let main_view = view(&main, &storage);
+        assert_eq!(
+            callers(&main_view.reader().unwrap(), "a.ts", "target").len(),
+            1
+        );
+        let linked_view = view(&linked, &storage);
+        let patched = callers(&linked_view.reader().unwrap(), "a.ts", "target");
+        assert_eq!(patched.len(), 2, "{patched:?}");
+        assert_ne!(base_dir(&storage, &linked), base_dir(&storage, &main));
+        let base_events = events(&base_dir(&storage, &linked));
+        assert!(
+            base_events
+                .iter()
+                .any(|event| matches!(event, DonorEvent::Cloned(_))),
+            "the new commit's base resolved its whole graph cold: {base_events:?}"
+        );
+        assert!(
+            base_events.contains(&DonorEvent::Sealed),
+            "the patched base graph must still be sealed: {base_events:?}"
+        );
+
+        // A store with only the worktree builds the same base cold.
+        drop((main_view, linked_view));
+        let cold_storage = temp.path().join("cold-storage");
+        let cold_view = view(&linked, &cold_storage);
+        assert_eq!(
+            callers(&cold_view.reader().unwrap(), "a.ts", "target"),
+            patched
+        );
+        assert!(!events(&base_dir(&cold_storage, &linked))
+            .iter()
+            .any(|event| matches!(event, DonorEvent::Cloned(_))));
     }
 
     #[test]

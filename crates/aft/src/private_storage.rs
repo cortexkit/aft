@@ -10,6 +10,20 @@ pub(crate) const DIR_MODE: u32 = 0o700;
 #[cfg(unix)]
 pub(crate) const FILE_MODE: u32 = 0o600;
 
+/// Ancestor descriptors need lookup and metadata, not directory enumeration.
+/// Linux O_PATH is allowed by Landlock without READ_DIR: keep walking from `/`
+/// with O_NOFOLLOW rather than skipping ancestors the sandbox cannot read.
+/// Ownership and symlink checks still run on the pinned descriptors. The final
+/// directory/file is opened normally before any read, chmod, or fsync.
+#[cfg(unix)]
+pub(crate) fn ancestor_dir_flags() -> libc::c_int {
+    #[cfg(target_os = "linux")]
+    let access = libc::O_PATH;
+    #[cfg(not(target_os = "linux"))]
+    let access = libc::O_RDONLY;
+    access | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+}
+
 pub fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     let path = path.as_ref();
     if let Some(access) = crate::root_cache::pin_cache_path(path)? {
@@ -459,7 +473,7 @@ fn tighten_sqlite_file(path: &Path) {
         };
         let mut handle = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .custom_flags(ancestor_dir_flags())
             .open("/")?;
         let components: Vec<_> = absolute.components().collect();
         for (index, component) in components.iter().enumerate().skip(1) {
@@ -467,14 +481,11 @@ fn tighten_sqlite_file(path: &Path) {
                 return Ok(());
             };
             let name = std::ffi::CString::new(name.as_bytes()).map_err(io::Error::other)?;
-            let flags = libc::O_RDONLY
-                | libc::O_NOFOLLOW
-                | libc::O_CLOEXEC
-                | if index + 1 == components.len() {
-                    0
-                } else {
-                    libc::O_DIRECTORY
-                };
+            let flags = if index + 1 == components.len() {
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+            } else {
+                ancestor_dir_flags()
+            };
             let fd = unsafe { libc::openat(handle.as_raw_fd(), name.as_ptr(), flags) };
             if fd < 0 {
                 return Err(io::Error::last_os_error());

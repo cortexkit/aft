@@ -82,11 +82,8 @@ const LEGACY_LOOKUP_ENTRY_BYTES: usize = 16;
 
 /// Refusals of a v3 reservation that are a lack of storage, reported as the
 /// plane's named storage gap rather than as an import failure.
-const STORAGE_GAP_REFUSALS: [&str; 3] = [
-    "v3_namespace_budget",
-    "device_free_space_floor",
-    "reservation_ledger_unreadable",
-];
+const STORAGE_GAP_REFUSALS: [&str; 2] =
+    ["device_free_space_floor", "reservation_ledger_unreadable"];
 
 // ---------------------------------------------------------------------------
 // Errors
