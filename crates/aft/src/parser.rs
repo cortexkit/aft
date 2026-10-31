@@ -9435,6 +9435,25 @@ mod tests {
     }
 
     #[test]
+    fn h_header_cpp_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("widget.h");
+        std::fs::write(
+            &path,
+            "namespace api { class Widget { public: int value() { return 42; } }; }\n",
+        )
+        .unwrap();
+        let mut parser = FileParser::new();
+        let (tree, lang) = parser.parse(&path).unwrap();
+        assert_eq!(lang, LangId::Cpp);
+        assert!(!tree.root_node().has_error());
+        assert_eq!(parser.parse(&path).unwrap().1, LangId::Cpp);
+        let symbols = parser.extract_symbols(&path).unwrap();
+        assert!(symbols.iter().any(|symbol| symbol.name == "Widget"));
+        assert!(symbols.iter().any(|symbol| symbol.name == "value"));
+    }
+
+    #[test]
     fn variable_name_membership_is_linear_and_byte_identical() {
         for (lang, count) in [
             (LangId::TypeScript, 4000),
