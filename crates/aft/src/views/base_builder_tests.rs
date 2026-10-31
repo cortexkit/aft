@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::views::base_refs::tests::{publish_test_base, FAMILY};
-use crate::views::eviction::{DiskBudget, V3Refusal, V3_HARD_LIMIT_GAP};
+use crate::views::eviction::{DiskBudget, V3Refusal};
 
 const MIB: u64 = 1 << 20;
 
@@ -205,7 +205,8 @@ fn binders_wait_for_a_live_claim_until_the_ruled_budget_then_go_strict() {
 }
 
 #[test]
-fn v3_admission_refuses_past_the_hard_limit_with_the_named_gap_and_no_fallback() {
+fn v3_admission_has_no_family_byte_limit_and_refuses_only_at_the_device_floor() {
+    const GIB: u64 = 1024 * MIB;
     let _serial = v3::serial_for_test();
     let storage = tempfile::tempdir().unwrap();
     publish_test_base(storage.path(), &[("a.rs", b"alpha")]);
@@ -213,15 +214,32 @@ fn v3_admission_refuses_past_the_hard_limit_with_the_named_gap_and_no_fallback()
     let mut registry = v3::RegistryWriter::open_existing(storage.path(), FAMILY, &lock).unwrap();
     let usage = registry.accounting().unwrap().usage();
     let budget = DiskBudget {
-        family_store_hard: usage + 8 * MIB,
         family_payload: usage + 2 * MIB,
         ..DiskBudget::default()
     };
+    // A 6 GiB request with room on the device is admitted, since only the
+    // device floor refuses; it exceeds the target, so the caller sweeps.
+    let roomy = v3::set_free_space_for_test(storage.path(), 1024 * GIB, 2048 * GIB);
+    let admitted = budget.admit_v3(&mut registry, 6 * GIB).unwrap();
+    assert!(admitted.over_target);
+    budget.extend_v3(&mut registry, &admitted, 3 * GIB).unwrap();
+    assert_eq!(
+        registry.reserved_bytes(&admitted.reservation).unwrap(),
+        9 * GIB
+    );
+    registry.release(admitted.reservation).unwrap();
+    drop(roomy);
+    // A device short of its free-space floor refuses by name and reserves
+    // nothing; growth into the floor is refused before any byte is written.
+    let _tight = v3::set_free_space_for_test(
+        storage.path(),
+        v3::MIN_FREE_BYTES + 8 * MIB,
+        2 * v3::MIN_FREE_BYTES,
+    );
     let before = registry.accounting().unwrap();
     let refused = budget.admit_v3(&mut registry, 9 * MIB).unwrap_err();
-    assert!(matches!(refused, V3Refusal::HardLimit { .. }));
     assert!(
-        refused.to_string().starts_with(V3_HARD_LIMIT_GAP),
+        refused.to_string() == "storage_gap:device_free_space_floor",
         "{refused}"
     );
     assert_eq!(
@@ -230,21 +248,10 @@ fn v3_admission_refuses_past_the_hard_limit_with_the_named_gap_and_no_fallback()
         "a refusal reserves nothing"
     );
     let admitted = budget.admit_v3(&mut registry, 4 * MIB).unwrap();
-    assert!(admitted.over_target);
-    assert_eq!(
-        registry.reserved_bytes(&admitted.reservation).unwrap(),
-        4 * MIB
-    );
-    // Growth past the hard limit is refused before any byte is written.
     assert!(matches!(
         budget.extend_v3(&mut registry, &admitted, 5 * MIB),
-        Err(V3Refusal::HardLimit { .. })
+        Err(V3Refusal::Ledger(_))
     ));
-    budget.extend_v3(&mut registry, &admitted, 2 * MIB).unwrap();
-    assert_eq!(
-        registry.reserved_bytes(&admitted.reservation).unwrap(),
-        6 * MIB
-    );
     registry.release(admitted.reservation).unwrap();
     assert!(!storage.path().join("blobs/v2").exists());
 }
@@ -395,16 +402,20 @@ fn a_refused_admission_sends_the_bind_strict_with_the_named_gap_and_frees_the_cl
     let _serial = v3::serial_for_test();
     let storage = tempfile::tempdir().unwrap();
     let (root, paths) = checkout(FILES);
-    let tiny = DiskBudget {
-        family_store_hard: MIB,
-        ..DiskBudget::default()
+    let tight = v3::set_free_space_for_test(
+        storage.path(),
+        v3::MIN_FREE_BYTES + 1,
+        2 * v3::MIN_FREE_BYTES,
+    );
+    let BaseBuild::Strict(reason) = build_base(
+        input(storage.path(), root.path(), &paths, DiskBudget::default()),
+        None,
+    )
+    .unwrap() else {
+        panic!("short of the device floor");
     };
-    let BaseBuild::Strict(reason) =
-        build_base(input(storage.path(), root.path(), &paths, tiny), None).unwrap()
-    else {
-        panic!("over the hard limit");
-    };
-    assert!(reason.starts_with(V3_HARD_LIMIT_GAP), "{reason}");
+    assert!(reason.contains("device_free_space_floor"), "{reason}");
+    drop(tight);
     assert!(matches!(
         build_base(
             input(storage.path(), root.path(), &paths, DiskBudget::default()),
