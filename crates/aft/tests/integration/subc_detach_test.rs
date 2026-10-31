@@ -1704,8 +1704,14 @@ fn scope_project_case_034(
         std::fs::write(project.path().join("marker.txt"), "scope_project_034_marker\n").unwrap();
         std::fs::write(decoy.path().join("marker.txt"), "wrong_legacy_project\n").unwrap();
         let listener = write_connection_file(conn_dir.path()).await;
-        let mut module = ModuleProcess::spawn(&conn_dir.path().join("subc-connection.json"), config_home.path(), data_home.path());
-        let mut stream = accept_module(&listener).await;
+        let stderr_path = storage.path().join("scope-project-module.stderr");
+        let mut module = ModuleProcess::spawn_with_stderr(
+            &conn_dir.path().join("subc-connection.json"),
+            config_home.path(),
+            data_home.path(),
+            Some(&stderr_path),
+        );
+        let mut stream = accept_module_with_diagnostics(&listener, &mut module.child, &stderr_path).await;
         let bind = make_bind(project.path(), decoy.path());
         send_frame(&mut stream, Frame::build(FrameType::Request, control_flags(), 0, 0, 10, serde_json::to_vec(&bind).unwrap()).unwrap()).await;
         let ack = read_frame_timeout(&mut stream, "scope project bind").await;
