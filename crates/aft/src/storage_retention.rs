@@ -46,6 +46,30 @@ pub(crate) const TREE_ENTRIES: usize = 4096;
 const TRASH_SCAN_HANDLES: usize = 64;
 const HISTORY_ENTRIES: usize = 8192;
 static REPORTED_BINDING_READ_ERRORS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+#[cfg(test)]
+thread_local! {
+    // Counts explicit retention directory listings and JSON opens; the
+    // durable census reports its own directory opens separately.
+    static PASS_IO: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+fn retention_read_dir(path: &Path) -> io::Result<ReadDir> {
+    #[cfg(test)]
+    PASS_IO.with(|count| {
+        let (directories, files) = count.get();
+        count.set((directories + 1, files));
+    });
+    fs::read_dir(path)
+}
+
+fn retention_read(path: &Path) -> io::Result<Vec<u8>> {
+    #[cfg(test)]
+    PASS_IO.with(|count| {
+        let (directories, files) = count.get();
+        count.set((directories, files + 1));
+    });
+    fs::read(path)
+}
 const DOMAINS: [&str; 6] = [
     "views",
     "callgraph",
@@ -1527,7 +1551,7 @@ fn read_binding_record(path: &Path) -> Result<(serde_json::Value, Binding), Bind
             digest: None,
         });
     }
-    let bytes = fs::read(path).map_err(|error| BindingReadError {
+    let bytes = retention_read(path).map_err(|error| BindingReadError {
         error,
         truncated: false,
         digest: None,
@@ -1681,6 +1705,11 @@ fn unreadable_binding_sentinel(storage: &Path, scope: &str) -> Binding {
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {
+    #[cfg(test)]
+    PASS_IO.with(|count| {
+        let (directories, files) = count.get();
+        count.set((directories, files + 1));
+    });
     if fs::metadata(path)?.len() > 8 * 1024 * 1024 {
         return Err(io::Error::other("retention metadata exceeds 8 MiB"));
     }
@@ -1688,7 +1717,7 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {
 }
 
 pub(crate) fn bounded_dirs(directory: &Path, cap: usize) -> io::Result<Vec<fs::DirEntry>> {
-    let entries = match fs::read_dir(directory) {
+    let entries = match retention_read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
@@ -2026,7 +2055,7 @@ fn traversal_batch_filtered(
         }
         let remaining = limit - result.len();
         let mut names = BTreeMap::new();
-        match fs::read_dir(directory) {
+        match retention_read_dir(directory) {
             Ok(entries) => {
                 for entry in entries {
                     let entry = entry?;
@@ -2624,7 +2653,7 @@ fn validate_tree_with_admission(
         if Instant::now() >= deadline {
             return Err(io::Error::new(io::ErrorKind::TimedOut, RetentionDeadline));
         }
-        let mut entries = fs::read_dir(&directory)?;
+        let mut entries = retention_read_dir(&directory)?;
         loop {
             admission()?;
             if Instant::now() >= deadline {
@@ -3132,7 +3161,7 @@ fn reap_trash_with_cursor(
                     Some(scan) => scan,
                     None => TrashScan {
                         identity,
-                        entries: Some(fs::read_dir(trash)?),
+                        entries: Some(retention_read_dir(trash)?),
                         deferred: VecDeque::new(),
                         omitted_prefix: false,
                         touched: Instant::now(),
@@ -3504,7 +3533,7 @@ fn reap_retired_with_budget(
         io::Error::other(error.to_string())
     })?;
     let marker = storage.durable.join("retention/mount-trash-pending");
-    let mount_scan = match fs::read(&marker) {
+    let mount_scan = match retention_read(&marker) {
         Ok(generation) => Some(generation),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
@@ -3524,7 +3553,7 @@ fn reap_retired_with_budget(
         if mount_scan.is_none() {
             continue;
         }
-        let entries = match fs::read_dir(&domain) {
+        let entries = match retention_read_dir(&domain) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
@@ -5994,6 +6023,157 @@ fn record_v3_removal(domain: &mut DomainReport, bytes: Option<u64>) {
 
 #[cfg(test)]
 mod storage_retention_tests {
+    /// Generated metadata-only model, never a copy of open production databases.
+    /// The harness fan-out mirrors session/task/control/io durable storage.
+    #[test]
+    #[ignore = "offline Linux performance fixture; creates about 160k directories"]
+    fn retention_unchanged_offline_shape_benchmark() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StoragePaths::same(&temp.path().join("storage"));
+        fs::create_dir_all(&storage.durable).unwrap();
+        let shapes = [
+            ("views", 43_985, 2_232),
+            ("runner", 38_832, 113_733),
+            ("opencode", 35_647, 107_491),
+            ("rpc", 18_549, 6_064),
+            ("retention/fixture", 11_561, 18_752),
+            ("bash-tasks", 4_659, 10_595),
+            ("blobs/fixture", 1_503, 2_422),
+            ("checkpoints", 931, 1_220),
+            ("pi", 763, 2_262),
+            ("symbols", 647, 662),
+            ("index", 361, 988),
+            ("dsym", 344, 147),
+            ("inspect", 288, 430),
+            ("callgraph", 287, 713),
+            ("artifact-owners/fixture", 280, 286),
+            ("semantic", 146, 135),
+        ];
+        for (name, directories, files) in shapes {
+            let domain = storage.artifacts.join(name);
+            fs::create_dir_all(&domain).unwrap();
+            let sessions = directories.min(200);
+            let mut leaves = Vec::new();
+            for i in 0..directories {
+                let path = if DOMAINS.contains(&name) {
+                    if i < directories.min(1000) {
+                        domain.join(format!("{i:016x}"))
+                    } else {
+                        domain.join(format!("{:016x}/shard-{i}", i % 1000))
+                    }
+                } else if i < sessions {
+                    domain.join(format!("session-{i}"))
+                } else {
+                    let task = (i - sessions) / 3;
+                    let task_dir = domain.join(format!("session-{}/{task:032x}", task % sessions));
+                    match (i - sessions) % 3 {
+                        0 => task_dir,
+                        1 => task_dir.join("control"),
+                        _ => task_dir.join("io"),
+                    }
+                };
+                fs::create_dir_all(&path).unwrap();
+                leaves.push(path);
+            }
+            for i in 0..files {
+                fs::write(
+                    leaves[i % leaves.len()].join(format!("record-{i}")),
+                    b"fixture",
+                )
+                .unwrap();
+            }
+            eprintln!("offline shape: {name} directories={directories} files={files}");
+        }
+        for i in 0..1000 {
+            let root = temp.path().join(format!("checkout-{i}"));
+            fs::create_dir(&root).unwrap();
+            atomic_json(
+                &storage
+                    .durable
+                    .join(format!("retention/roots/{i:016x}.json")),
+                &Binding {
+                    root,
+                    artifact_key: format!("{i:016x}"),
+                    last_bound_ms: crate::pins::now_ms(),
+                    volume: None,
+                    stable_volume: None,
+                    linked_worktree: false,
+                },
+            )
+            .unwrap();
+        }
+        let trash = storage.artifacts.join("symbols/.retention-trash");
+        for i in 0..2 {
+            let retired = trash.join(format!("retired-{i:032x}"));
+            crate::private_storage::create_dir_all(&retired).unwrap();
+            fs::File::create(retired.join("symbols.bin"))
+                .unwrap()
+                .set_len(23 * 1024 * 1024)
+                .unwrap();
+        }
+        // Keep asynchronous work out of the root thread's CPU measurement.
+        states()
+            .lock()
+            .unwrap()
+            .entry(storage.artifacts.clone())
+            .or_default()
+            .reaping = true;
+        for pass in 0..3 {
+            PASS_IO.with(|count| count.set((0, 0)));
+            let started = Instant::now();
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let cpu = thread_cpu_seconds();
+            let report = run_pass_entry_bound(&storage);
+            let io = PASS_IO.with(|count| count.get());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            eprintln!("offline root pass={pass} cpu_ms={:.3} wall_ms={:.3} listings={} file_open_attempts={} timings={:?}",
+                (thread_cpu_seconds() - cpu) * 1000.0, started.elapsed().as_secs_f64() * 1000.0, io.0, io.1, report.timings_ms);
+            PASS_IO.with(|count| count.set((0, 0)));
+            let started = Instant::now();
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let cpu = thread_cpu_seconds();
+            let mut report = TrashReport::default();
+            reap_retired_with_budget(
+                &storage,
+                Instant::now() + Duration::from_secs(60),
+                &mut crate::bash_background::persistence::RepairBudget::new(),
+                &mut report,
+            )
+            .unwrap();
+            let io = PASS_IO.with(|count| count.get());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            eprintln!("offline reaper pass={pass} cpu_ms={:.3} wall_ms={:.3} listings={} file_open_attempts={} report={}",
+                (thread_cpu_seconds() - cpu) * 1000.0, started.elapsed().as_secs_f64() * 1000.0, io.0, io.1, serde_json::to_string(&report).unwrap());
+        }
+        eprintln!("offline cadence: normal root admissions/hour={} startup_grace_s={} (backlog bursts excluded)",
+            3600 / INTERVAL.as_secs(), STARTUP_GRACE.as_secs());
+        for i in 2..130 {
+            let retired = trash.join(format!("retired-{i:032x}"));
+            fs::create_dir_all(retired.join("nested")).unwrap();
+            fs::write(retired.join("nested/notes.txt"), b"not an AFT cache").unwrap();
+        }
+        for pass in 0..3 {
+            PASS_IO.with(|count| count.set((0, 0)));
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let cpu = thread_cpu_seconds();
+            let mut report = TrashReport::default();
+            reap_retired_with_budget(
+                &storage,
+                Instant::now() + Duration::from_secs(60),
+                &mut crate::bash_background::persistence::RepairBudget::new(),
+                &mut report,
+            )
+            .unwrap();
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            eprintln!(
+                "offline large-trash pass={pass} cpu_ms={:.3} io={:?} report={}",
+                (thread_cpu_seconds() - cpu) * 1000.0,
+                PASS_IO.with(|count| count.get()),
+                serde_json::to_string(&report).unwrap()
+            );
+        }
+    }
+
     #[test]
     fn retention_protection_failure_backs_off_and_stays_in_health() {
         let now = Instant::now();
@@ -13179,7 +13359,7 @@ fn prune_bindings(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if !records.contains_key(&storage.artifacts) {
-        match fs::read_dir(storage.durable.join("retention/roots")) {
+        match retention_read_dir(&storage.durable.join("retention/roots")) {
             Ok(entries) => {
                 records.insert(storage.artifacts.clone(), entries);
             }
