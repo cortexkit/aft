@@ -120,7 +120,7 @@ pub type ColdBuildPhaseObserver = dyn Fn(&'static str) + Send + Sync + 'static;
 #[cfg(test)]
 type ColdBuildSliceObserver = dyn Fn(&'static str, usize, usize) + Send + Sync + 'static;
 #[cfg(test)]
-type ColdBuildExtractObserver = dyn Fn(&[PathBuf]) + Send + Sync + 'static;
+pub(crate) type ColdBuildExtractObserver = dyn Fn(&[PathBuf]) + Send + Sync + 'static;
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -170,6 +170,7 @@ pub(crate) mod work_counts {
     use std::sync::{Mutex, OnceLock};
 
     static PARSES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    static FINGERPRINT_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
     static CONFIG_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
     static STAGING_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
     static DIRECTORY_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
@@ -177,6 +178,27 @@ pub(crate) mod work_counts {
     static CANONICAL_PATHS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
     static REALPATHS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
     static WORKSPACE_DIRECTORIES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    static CORPUS_LOOKUPS: OnceLock<Mutex<HashMap<PathBuf, (usize, usize, u128)>>> =
+        OnceLock::new();
+
+    pub(super) fn note_corpus_lookup(path: &Path, realpaths: usize, elapsed_ns: u128) {
+        let mut counts = CORPUS_LOOKUPS.get_or_init(Default::default).lock().unwrap();
+        let entry = counts.entry(path.to_path_buf()).or_default();
+        entry.0 += 1;
+        entry.1 += realpaths;
+        entry.2 += elapsed_ns;
+    }
+
+    pub(super) fn corpus_lookups_under(root: &Path) -> Vec<(usize, usize, u128)> {
+        CORPUS_LOOKUPS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path.starts_with(root))
+            .map(|(_, counts)| *counts)
+            .collect()
+    }
 
     fn note(map: &OnceLock<Mutex<HashMap<PathBuf, usize>>>, path: &Path) {
         *map.get_or_init(Default::default)
@@ -205,6 +227,20 @@ pub(crate) mod work_counts {
 
     pub(crate) fn note_parse(path: &Path) {
         note(&PARSES, path);
+    }
+
+    pub(super) fn note_fingerprint_read(path: &Path) {
+        note(&FINGERPRINT_READS, path);
+    }
+
+    pub(super) fn fingerprint_reads(path: &Path) -> usize {
+        FINGERPRINT_READS
+            .get_or_init(Default::default)
+            .lock()
+            .expect("work counter mutex poisoned")
+            .get(path)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub(crate) fn note_config_read(path: &Path) {
@@ -292,8 +328,14 @@ pub(crate) mod work_counts {
     }
 
     pub(crate) fn reset_under(root: &Path) {
+        CORPUS_LOOKUPS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .retain(|path, _| !path.starts_with(root));
         for map in [
             &PARSES,
+            &FINGERPRINT_READS,
             &CONFIG_READS,
             &STAGING_READS,
             &DIRECTORY_READS,
@@ -1774,7 +1816,7 @@ fn notify_cold_build_slice_observer(stage: &'static str, completed: usize, total
 fn notify_cold_build_slice_observer(_stage: &'static str, _completed: usize, _total: usize) {}
 
 #[cfg(test)]
-fn set_cold_build_extract_observer(observer: Option<Arc<ColdBuildExtractObserver>>) {
+pub(crate) fn set_cold_build_extract_observer(observer: Option<Arc<ColdBuildExtractObserver>>) {
     COLD_BUILD_EXTRACT_OBSERVER.with(|slot| *slot.borrow_mut() = observer);
 }
 
@@ -1815,6 +1857,8 @@ pub fn set_legacy_migration_available_disk_for_test(bytes: Option<u64>) {
 pub(crate) struct CallgraphBackgroundTestHooks {
     available_disk: Option<u64>,
     swap_observer: Option<Arc<ColdBuildSwapObserver>>,
+    #[cfg(test)]
+    extract_observer: Option<Arc<ColdBuildExtractObserver>>,
 }
 
 impl CallgraphBackgroundTestHooks {
@@ -1822,6 +1866,8 @@ impl CallgraphBackgroundTestHooks {
         Self {
             available_disk: MIGRATION_AVAILABLE_DISK_OVERRIDE.with(|slot| *slot.borrow()),
             swap_observer: COLD_BUILD_SWAP_OBSERVER.with(|slot| slot.borrow().clone()),
+            #[cfg(test)]
+            extract_observer: COLD_BUILD_EXTRACT_OBSERVER.with(|slot| slot.borrow().clone()),
         }
     }
 
@@ -1829,6 +1875,8 @@ impl CallgraphBackgroundTestHooks {
         let previous = Self::capture();
         set_legacy_migration_available_disk_for_test(self.available_disk);
         set_cold_build_swap_observer(self.swap_observer);
+        #[cfg(test)]
+        set_cold_build_extract_observer(self.extract_observer);
         CallgraphBackgroundTestHooksGuard(previous)
     }
 }
@@ -2046,10 +2094,16 @@ pub enum CallGraphStoreError {
     },
     Suspended(crate::build_breaker::BuildSuspension),
     Superseded,
+    CorpusSnapshotMissing(PathBuf),
+    CorpusInventoryChanged(Option<PathBuf>),
     StaleFiles(Vec<String>),
 }
 
 impl CallGraphStoreError {
+    pub(crate) fn is_corpus_change(&self) -> bool {
+        matches!(self, Self::CorpusInventoryChanged(_) | Self::StaleFiles(_))
+    }
+
     pub(crate) fn is_unreadable_database(&self) -> bool {
         matches!(
             self,
@@ -2103,6 +2157,21 @@ impl fmt::Display for CallGraphStoreError {
             ),
             Self::Superseded => {
                 write!(formatter, "callgraph store build superseded before publish")
+            }
+            Self::CorpusSnapshotMissing(path) => write!(
+                formatter,
+                "callgraph corpus snapshot lookup invariant failed: {} was not admitted",
+                path.display()
+            ),
+            Self::CorpusInventoryChanged(path) => {
+                write!(
+                    formatter,
+                    "callgraph corpus inventory changed after admission"
+                )?;
+                if let Some(path) = path {
+                    write!(formatter, ": {} was added", path.display())?;
+                }
+                Ok(())
             }
             Self::StaleFiles(files) => {
                 write!(
@@ -7491,27 +7560,27 @@ impl CallGraphStore {
             // staging write: a suspended root is refused before the process
             // spends anything, and a death during enumeration is attributable
             // to an admitted attempt. The breaker key needs the corpus
-            // fingerprint, so that one input is resolved by a standalone
-            // streaming walk first (sanctioned pre-admission work) - the
-            // inventory pass below recomputes it while staging; the staged
-            // value governs resume cursors, while the admission key stays
-            // pinned to the admitted fingerprint so a file racing the walk
-            // cannot detach the attempt from its breaker record.
-            let admission_fingerprint = corpus_fingerprint_for(project_root, files)?;
+            // fingerprint, so hash the sources before admission and retain
+            // their digests, not their bodies. Staging reuses those digests;
+            // extraction checks its actual bytes against them before parsing.
+            // A racing corpus aborts rather than labelling new rows with an
+            // old fingerprint. The attempt stays pinned to its admission key.
+            let corpus = corpus_snapshot_for(project_root, files)?;
             let breaker_key = crate::build_breaker::BreakerKey::new(
                 project_root.display().to_string(),
                 crate::build_breaker::BuildDomain::CallgraphCold,
-                admission_fingerprint,
+                corpus.fingerprint.clone(),
             );
-            match breaker
+            let attempt = match breaker
                 .admit(&breaker_key, 0)
                 .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?
             {
-                crate::build_breaker::BreakerAdmission::Admitted(_) => {
+                crate::build_breaker::BreakerAdmission::Admitted(attempt) => {
                     crate::logging::log_index_event(crate::logging::IndexEvent::from_scope(
                         crate::logging::IndexEventKind::BreakerAdmitted,
                         &scope,
                     ));
+                    attempt
                 }
                 crate::build_breaker::BreakerAdmission::Suspended(suspension) => {
                     crate::logging::log_index_event(
@@ -7524,12 +7593,41 @@ impl CallGraphStore {
                     failure_guard.disarm();
                     return Err(CallGraphStoreError::Suspended(suspension));
                 }
-            }
+            };
             ensure_cold_build_current("inventory", 0, 1)?;
-            let corpus_fingerprint = temp_store.stage_cold_build_file_inventory(files)?;
-            ensure_cold_build_current("inventory", 1, 1)?;
-            let stats = temp_store
-                .cold_build_chunked_from_staged_inventory(chunk_size, &corpus_fingerprint)?;
+            let extraction = (|| {
+                let corpus_fingerprint =
+                    temp_store.stage_cold_build_file_inventory_checked(files, Some(&corpus))?;
+                ensure_cold_build_current("inventory", 1, 1)?;
+                temp_store.cold_build_chunked_from_staged_inventory_with_resolution_memo(
+                    chunk_size,
+                    &corpus_fingerprint,
+                    COLD_BUILD_RESOLVE_WINDOW,
+                    &callgraph::ModuleResolutionMemo::default(),
+                    true,
+                    Some(&corpus),
+                )
+            })();
+            let stats = match extraction {
+                Err(error) if error.is_corpus_change() => {
+                    // File edits cancel an admitted attempt; they are neither
+                    // a process death nor a failed store. Keep prior crash
+                    // history, but retire this attempt before retrying.
+                    breaker
+                        .cancel_attempt(&breaker_key, &attempt.attempt_id)
+                        .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+                    failure_guard.disarm();
+                    crate::logging::log_index_event(
+                        crate::logging::IndexEvent::from_scope(
+                            crate::logging::IndexEventKind::BuildCancelled,
+                            &scope,
+                        )
+                        .field("reason", "corpus_changed"),
+                    );
+                    return Err(error);
+                }
+                result => result?,
+            };
             let _ = temp_store.checkpoint_wal_truncate();
             temp_store.prepare_for_atomic_swap()?;
             (stats, breaker_key)
@@ -7980,17 +8078,30 @@ impl CallGraphStore {
     }
 
     fn stage_cold_build_file_inventory(&self, files: &[PathBuf]) -> Result<String> {
+        self.stage_cold_build_file_inventory_checked(files, None)
+    }
+
+    fn stage_cold_build_file_inventory_checked(
+        &self,
+        files: &[PathBuf],
+        corpus: Option<&CorpusSnapshot>,
+    ) -> Result<String> {
         note_cold_build_phase("enumeration");
         if files.is_empty() {
-            self.stage_cold_build_file_inventory_from(callgraph::walk_project_files(
-                &self.project_root,
-            ))
+            self.stage_cold_build_file_inventory_from(
+                callgraph::walk_project_files(&self.project_root),
+                corpus,
+            )
         } else {
-            self.stage_cold_build_file_inventory_from(files.iter().cloned())
+            self.stage_cold_build_file_inventory_from(files.iter().cloned(), corpus)
         }
     }
 
-    fn stage_cold_build_file_inventory_from<I>(&self, paths: I) -> Result<String>
+    fn stage_cold_build_file_inventory_from<I>(
+        &self,
+        paths: I,
+        corpus: Option<&CorpusSnapshot>,
+    ) -> Result<String>
     where
         I: IntoIterator<Item = PathBuf>,
     {
@@ -8021,7 +8132,11 @@ impl CallGraphStore {
             crate::cold_build_limiter::progress::advance(batch.len());
         }
 
-        staged_corpus_fingerprint(&conn, &self.project_root)
+        let fingerprint = staged_corpus_fingerprint(&conn, &self.project_root, corpus)?;
+        if corpus.is_some_and(|corpus| corpus.fingerprint != fingerprint) {
+            return Err(CallGraphStoreError::CorpusInventoryChanged(None));
+        }
+        Ok(fingerprint)
     }
 
     fn insert_staged_file_inventory_batch(
@@ -8057,6 +8172,7 @@ impl CallGraphStore {
             COLD_BUILD_RESOLVE_WINDOW,
             &module_resolution_memo,
             true,
+            None,
         )
     }
 
@@ -8093,6 +8209,7 @@ impl CallGraphStore {
             resolve_window.max(1),
             module_resolution_memo,
             memoize_resolver_indexes,
+            None,
         )
     }
 
@@ -8103,6 +8220,7 @@ impl CallGraphStore {
         resolve_window: usize,
         module_resolution_memo: &callgraph::ModuleResolutionMemo,
         memoize_resolver_indexes: bool,
+        corpus: Option<&CorpusSnapshot>,
     ) -> Result<ColdBuildStats> {
         let started = Instant::now();
         let batch_files = chunk_size.max(1).min(COLD_BUILD_EXTRACT_BATCH_FILES);
@@ -8186,7 +8304,7 @@ impl CallGraphStore {
 
                 let mut needs_extract = Vec::with_capacity(admitted_files);
                 for path in batch.paths {
-                    if !staged_content_matches(&conn, &self.project_root, &path)? {
+                    if !staged_content_matches(&conn, &self.project_root, &path, corpus)? {
                         needs_extract.push(path);
                     }
                 }
@@ -8209,8 +8327,12 @@ impl CallGraphStore {
                     // drop each bounded parse chunk while keeping one transaction and
                     // statement set for the whole outer batch.
                     for paths in needs_extract.chunks(batch_files.min(COLD_BUILD_PARSE_MAX_FILES)) {
-                        let build =
-                            pool.build_extracts(&self.project_root, paths, &extraction_memo);
+                        let build = pool.build_extracts(
+                            &self.project_root,
+                            paths,
+                            &extraction_memo,
+                            corpus,
+                        )?;
                         for extract in &build.extracts {
                             retained_callers.retain(&extract.rel_path, &extract.data);
                         }
@@ -13473,17 +13595,43 @@ fn increment_staged_extracted_bytes(tx: &Transaction<'_>, bytes: u64) -> Result<
     Ok(())
 }
 
-fn staged_content_matches(conn: &Connection, project_root: &Path, path: &Path) -> Result<bool> {
+fn staged_content_matches(
+    conn: &Connection,
+    project_root: &Path,
+    path: &Path,
+    corpus: Option<&CorpusSnapshot>,
+) -> Result<bool> {
     let rel_path = relative_path(project_root, path);
     let staged_hash = conn
-        .prepare_cached("SELECT content_hash FROM files WHERE path = ?1")?
-        .query_row(params![rel_path], |row| row.get::<_, String>(0))
+        .prepare_cached("SELECT content_hash, size FROM files WHERE path = ?1")?
+        .query_row(params![rel_path], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+        })
         .optional()?;
     // Fresh staging has no row to match. Reading and hashing those sources here
     // duplicates the extraction pass's I/O; only adopted committed rows need it.
-    let Some(staged_hash) = staged_hash else {
+    let Some((staged_hash, staged_size)) = staged_hash else {
         return Ok(false);
     };
+    if let Some(corpus) = corpus {
+        // Staging is only resumed when the fingerprint stored with the staged
+        // build (`STAGED_CORPUS_FINGERPRINT`) equals the current corpus
+        // fingerprint. That fingerprint is built from the full digest of every
+        // source, including those above the freshness hash cap, so a resumed
+        // staging already proves those large sources unchanged. Their persisted
+        // zero hash is only a sentinel, not a digest to compare here.
+        if staged_size > cache_freshness::CONTENT_HASH_SIZE_CAP
+            && staged_hash == hash_to_hex(cache_freshness::zero_hash())
+        {
+            return Ok(true);
+        }
+        return Ok(corpus
+            .required_file(project_root, path)?
+            .hash
+            .as_ref()
+            .ok()
+            .is_some_and(|hash| staged_hash == hash_to_hex(*hash)));
+    }
     #[cfg(test)]
     work_counts::note_staging_read(path);
     let Ok(source) = crate::project_content::read_to_string(path) else {
@@ -13596,14 +13744,30 @@ fn load_staged_file_batch(
     }
 }
 
-fn staged_corpus_fingerprint(conn: &Connection, project_root: &Path) -> Result<String> {
+fn staged_corpus_fingerprint(
+    conn: &Connection,
+    project_root: &Path,
+    corpus: Option<&CorpusSnapshot>,
+) -> Result<String> {
     let mut statement =
         conn.prepare_cached("SELECT path FROM staging_file_inventory ORDER BY path")?;
     let mut rows = statement.query([])?;
     let mut fingerprint = CorpusFingerprint::default();
     while let Some(row) = rows.next()? {
         let rel_path = row.get::<_, String>(0)?;
-        fingerprint.add_path(project_root, &project_root.join(rel_path));
+        let path = project_root.join(rel_path);
+        if let Some(corpus) = corpus {
+            let file = corpus
+                .file(project_root, &path)?
+                .ok_or_else(|| CallGraphStoreError::CorpusInventoryChanged(Some(path.clone())))?;
+            fingerprint.add_hash(
+                project_root,
+                &path,
+                file.hash.as_ref().map_err(String::as_str),
+            );
+        } else {
+            fingerprint.add_path(project_root, &path);
+        }
     }
     Ok(fingerprint.finish(project_root))
 }
@@ -15007,15 +15171,24 @@ impl BuildPool {
         project_root: &Path,
         files: &[PathBuf],
         memo: &callgraph::ModuleResolutionMemo,
-    ) -> BuildExtractsResult {
+        corpus: Option<&CorpusSnapshot>,
+    ) -> Result<BuildExtractsResult> {
         let extract_one =
-            |path: &PathBuf| match build_file_extract_with_memo(project_root, path, memo) {
-                Ok(extract) => Ok(extract),
+            |path: &PathBuf| match build_file_extract_in_corpus(project_root, path, memo, corpus) {
+                Ok(extract) => Ok(Ok(extract)),
+                Err(
+                    error @ (CallGraphStoreError::StaleFiles(_)
+                    | CallGraphStoreError::CorpusSnapshotMissing(_)),
+                ) => Err(error),
                 Err(error) => {
                     let abs_path = normalize_file_path(project_root, path)
                         .unwrap_or_else(|_| path.to_path_buf());
                     let rel_path = relative_path(project_root, &abs_path);
-                    let freshness = cache_freshness::collect(&abs_path).ok();
+                    let freshness = if let Some(corpus) = corpus {
+                        corpus.freshness(project_root, &abs_path)?
+                    } else {
+                        cache_freshness::collect(&abs_path).ok()
+                    };
                     let undecodable = is_undecodable_source(&error);
                     if undecodable {
                         log_undecodable_source(project_root, &rel_path);
@@ -15026,28 +15199,29 @@ impl BuildPool {
                             error
                         );
                     }
-                    Err(ExtractFailure {
+                    Ok(Err(ExtractFailure {
                         rel_path,
                         freshness,
                         undecodable,
-                    })
+                    }))
                 }
             };
-        let results: Vec<std::result::Result<FileExtract, ExtractFailure>> = if files.len() <= 1 {
-            files.iter().map(extract_one).collect()
-        } else {
-            self.install(|| files.par_iter().map(extract_one).collect())
-        };
+        let results: Vec<Result<std::result::Result<FileExtract, ExtractFailure>>> =
+            if files.len() <= 1 {
+                files.iter().map(extract_one).collect()
+            } else {
+                self.install(|| files.par_iter().map(extract_one).collect())
+            };
 
         let mut extracts = Vec::new();
         let mut failures = Vec::new();
         for result in results {
-            match result {
+            match result? {
                 Ok(extract) => extracts.push(extract),
                 Err(failure) => failures.push(failure),
             }
         }
-        BuildExtractsResult { extracts, failures }
+        Ok(BuildExtractsResult { extracts, failures })
     }
 
     /// Resolver inputs of `rel_paths`, parsed in parallel. A file that no
@@ -15245,11 +15419,37 @@ fn build_file_extract_with_memo(
     path: &Path,
     memo: &callgraph::ModuleResolutionMemo,
 ) -> Result<FileExtract> {
+    build_file_extract_in_corpus(project_root, path, memo, None)
+}
+
+fn build_file_extract_in_corpus(
+    project_root: &Path,
+    path: &Path,
+    memo: &callgraph::ModuleResolutionMemo,
+    corpus: Option<&CorpusSnapshot>,
+) -> Result<FileExtract> {
     let abs_path = normalize_file_path(project_root, path)?;
     let rel_path = relative_path(project_root, &abs_path);
     #[cfg(test)]
     work_counts::note_parse(&abs_path);
-    let (source, freshness, source_identity) = source_stat::read_source(&abs_path)?;
+    let read = source_stat::read_source(&abs_path, |bytes| {
+        if let Some(corpus) = corpus {
+            corpus.verify_bytes(project_root, &abs_path, bytes)?;
+        }
+        Ok(())
+    });
+    let (source, freshness, source_identity) = match read {
+        Err(CallGraphStoreError::Io(error))
+            if corpus.is_some() && error.kind() != std::io::ErrorKind::InvalidData =>
+        {
+            let expected = &corpus.unwrap().required_file(project_root, &abs_path)?.hash;
+            if expected.as_ref().err() != Some(&error.to_string()) {
+                return Err(CallGraphStoreError::StaleFiles(vec![rel_path]));
+            }
+            return Err(CallGraphStoreError::Io(error));
+        }
+        result => result?,
+    };
     let mut data = callgraph::build_file_data_from_source(&abs_path, &source)?;
     let lang = data.lang;
     if lang == LangId::Rust {
@@ -24513,25 +24713,257 @@ fn ref_id(parts: &[&str]) -> String {
 }
 
 fn callgraph_corpus_fingerprint(project_root: &Path) -> Result<String> {
-    let mut fingerprint = CorpusFingerprint::default();
-    for path in callgraph::walk_project_files(project_root) {
-        fingerprint.add_path(project_root, &path);
-    }
-    Ok(fingerprint.finish(project_root))
+    corpus_fingerprint_for(project_root, &[])
 }
 
 /// Pre-admission fingerprint over the same source set the staging inventory
-/// will consume: the walk when no explicit list is supplied, the list
-/// otherwise. Streaming accumulator - no staging writes, bounded memory.
+/// will consume. Only digests and change stamps are retained, never source bodies.
 fn corpus_fingerprint_for(project_root: &Path, files: &[PathBuf]) -> Result<String> {
-    if files.is_empty() {
-        return callgraph_corpus_fingerprint(project_root);
+    Ok(corpus_snapshot_for(project_root, files)?
+        .fingerprint
+        .clone())
+}
+
+#[derive(Clone)]
+struct CorpusFile {
+    hash: std::result::Result<blake3::Hash, String>,
+    stamp: Option<crate::views::NativeStat>,
+    observed_ns: u128,
+}
+
+struct CorpusSnapshot {
+    fingerprint: String,
+    files: HashMap<PathBuf, CorpusFile>,
+}
+
+/// One root's reusable digests. The root context owns this slot; background
+/// work receives only a weak reference so it cannot keep a released root warm.
+#[derive(Default)]
+pub(crate) struct CorpusMemo {
+    snapshot: Mutex<Option<(PathBuf, Arc<CorpusSnapshot>)>>,
+}
+
+thread_local! {
+    static CORPUS_MEMO: RefCell<std::sync::Weak<CorpusMemo>> = RefCell::new(std::sync::Weak::new());
+}
+
+pub(crate) fn with_corpus_memo<R>(memo: std::sync::Weak<CorpusMemo>, run: impl FnOnce() -> R) -> R {
+    struct Restore(std::sync::Weak<CorpusMemo>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CORPUS_MEMO.with(|slot| *slot.borrow_mut() = std::mem::take(&mut self.0));
+        }
     }
+    let _restore = Restore(CORPUS_MEMO.with(|slot| slot.replace(memo)));
+    run()
+}
+
+impl CorpusSnapshot {
+    fn file(&self, project_root: &Path, path: &Path) -> Result<Option<&CorpusFile>> {
+        // Admission and lookups must share canonical absolute keys, even when
+        // the root retains a symlink, a Windows short name or a verbatim prefix.
+        #[cfg(test)]
+        let (started, before) = (Instant::now(), CANONICALIZE_CALLS.with(|calls| calls.get()));
+        let key = normalize_file_path(project_root, path)?;
+        #[cfg(test)]
+        work_counts::note_corpus_lookup(
+            &key,
+            CANONICALIZE_CALLS.with(|calls| calls.get()) - before,
+            started.elapsed().as_nanos(),
+        );
+        Ok(self.files.get(&key))
+    }
+
+    fn required_file(&self, project_root: &Path, path: &Path) -> Result<&CorpusFile> {
+        // Inventory changes are refused before extraction. A miss after that
+        // check is a lookup invariant failure, not evidence of changed bytes.
+        self.file(project_root, path)?
+            .ok_or_else(|| CallGraphStoreError::CorpusSnapshotMissing(path.to_path_buf()))
+    }
+
+    fn freshness(&self, project_root: &Path, path: &Path) -> Result<Option<FileFreshness>> {
+        let file = self.required_file(project_root, path)?;
+        let Ok(hash) = file.hash.as_ref() else {
+            return Ok(None);
+        };
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return Ok(None);
+        };
+        let Ok(mtime) = metadata.modified() else {
+            return Ok(None);
+        };
+        Ok(Some(FileFreshness {
+            size: metadata.len(),
+            mtime,
+            content_hash: if metadata.len() > cache_freshness::CONTENT_HASH_SIZE_CAP {
+                cache_freshness::zero_hash()
+            } else {
+                *hash
+            },
+        }))
+    }
+
+    fn verify_bytes(&self, project_root: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+        if self.required_file(project_root, path)?.hash.as_ref().ok() == Some(&blake3::hash(bytes))
+        {
+            return Ok(());
+        }
+        Err(CallGraphStoreError::StaleFiles(vec![path
+            .display()
+            .to_string()]))
+    }
+}
+
+fn corpus_snapshot_for(project_root: &Path, files: &[PathBuf]) -> Result<Arc<CorpusSnapshot>> {
+    let memo = CORPUS_MEMO.with(|slot| slot.borrow().clone());
+    let previous = memo.upgrade().and_then(|memo| {
+        memo.snapshot
+            .lock()
+            .expect("corpus snapshot mutex poisoned")
+            .as_ref()
+            .filter(|(root, _)| root == project_root)
+            .map(|(_, snapshot)| Arc::clone(snapshot))
+    });
+    let mut sources = HashMap::new();
     let mut fingerprint = CorpusFingerprint::default();
-    for path in files {
-        fingerprint.add_path(project_root, path);
+    let paths: Box<dyn Iterator<Item = PathBuf> + '_> = if files.is_empty() {
+        Box::new(callgraph::walk_project_files(project_root))
+    } else {
+        Box::new(files.iter().cloned())
+    };
+    for path in paths {
+        let path = normalize_file_path(project_root, &path)?;
+        // A memo hit reuses a content digest, not a stat-based breaker key.
+        // Native identity and change time catch in-place rewrites that restore
+        // size/mtime. Unsupported filesystems conservatively rehash on probes.
+        let before = crate::views::NativeStat::read(&path).ok();
+        let cached = if let Some(corpus) = &previous {
+            corpus.file(project_root, &path)?
+        } else {
+            None
+        }
+        .filter(|file| {
+            file.stamp
+                .as_ref()
+                .zip(before.as_ref())
+                .is_some_and(|(old, current)| old.reusable(current, file.observed_ns))
+        });
+        let file = if let Some(file) = cached {
+            file.clone()
+        } else {
+            let hash = hash_file_bounded(&path).map_err(|error| error.to_string());
+            let after = crate::views::NativeStat::read(&path).ok();
+            CorpusFile {
+                stamp: (hash.is_ok() && before == after).then_some(after).flatten(),
+                hash,
+                observed_ns: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+            }
+        };
+        fingerprint.add_hash(
+            project_root,
+            &path,
+            file.hash.as_ref().map_err(String::as_str),
+        );
+        sources.insert(path, file);
     }
-    Ok(fingerprint.finish(project_root))
+    let corpus = Arc::new(CorpusSnapshot {
+        fingerprint: fingerprint.finish(project_root),
+        files: sources,
+    });
+    if let Some(memo) = memo.upgrade() {
+        *memo
+            .snapshot
+            .lock()
+            .expect("corpus snapshot mutex poisoned") =
+            Some((project_root.to_path_buf(), Arc::clone(&corpus)));
+    }
+    Ok(corpus)
+}
+
+#[cfg(test)]
+mod corpus_memo_lifecycle_tests {
+    use super::*;
+    use crate::context::AppContext;
+
+    fn context() -> AppContext {
+        AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        )
+    }
+
+    #[test]
+    fn root_teardown_drops_corpus_snapshot_and_rebind_rehashes() {
+        for teardown in ["unbind", "idle", "try-idle", "configure", "root-change"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(dir.path()).unwrap();
+            let source = root.join("main.ts");
+            std::fs::write(&source, "export function marker() {}\n").unwrap();
+            let ctx = context();
+            ctx.set_canonical_cache_root(root.clone());
+            ctx.note_callgraph_build_key("first".to_string());
+            let memo = ctx.callgraph_corpus_memo();
+            let snapshot =
+                with_corpus_memo(memo.clone(), || corpus_snapshot_for(&root, &[]).unwrap());
+            let fingerprint = snapshot.fingerprint.clone();
+            let cached = Arc::downgrade(&snapshot);
+            drop(snapshot);
+            assert!(cached.upgrade().is_some());
+
+            match teardown {
+                "unbind" => ctx.mark_subc_unbound(),
+                "idle" => assert!(ctx.evict_idle_artifacts()),
+                "try-idle" => assert!(ctx.try_evict_idle_artifacts()),
+                "configure" => assert!(!ctx.note_callgraph_build_key("different".to_string())),
+                "root-change" => ctx.set_canonical_cache_root(root.join("different-root")),
+                _ => unreachable!(),
+            }
+            assert!(memo.upgrade().is_none(), "{teardown} retained the memo");
+            assert!(
+                cached.upgrade().is_none(),
+                "{teardown} retained the snapshot"
+            );
+
+            // A worker's old weak scope cannot resurrect the released owner.
+            with_corpus_memo(memo.clone(), || {
+                assert_eq!(callgraph_corpus_fingerprint(&root).unwrap(), fingerprint);
+            });
+            assert!(memo.upgrade().is_none());
+            if teardown == "unbind" {
+                assert!(ctx.callgraph_corpus_memo().upgrade().is_none());
+            }
+            ctx.set_canonical_cache_root(root.clone());
+            ctx.mark_subc_bound();
+            work_counts::reset_under(&root);
+            let rebound = ctx.callgraph_corpus_memo();
+            with_corpus_memo(rebound, || {
+                assert_eq!(callgraph_corpus_fingerprint(&root).unwrap(), fingerprint);
+            });
+            assert_eq!(
+                work_counts::fingerprint_reads(&source),
+                1,
+                "{teardown} rebind"
+            );
+        }
+    }
+
+    #[test]
+    fn dropping_root_context_releases_corpus_snapshot_without_a_global_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("main.ts"), "export function marker() {}\n").unwrap();
+        let ctx = context();
+        let memo = ctx.callgraph_corpus_memo();
+        let snapshot = with_corpus_memo(memo.clone(), || corpus_snapshot_for(&root, &[]).unwrap());
+        let cached = Arc::downgrade(&snapshot);
+        drop(snapshot);
+        drop(ctx);
+        assert!(memo.upgrade().is_none());
+        assert!(cached.upgrade().is_none());
+    }
 }
 
 #[derive(Default)]
@@ -24543,10 +24975,20 @@ struct CorpusFingerprint {
 
 impl CorpusFingerprint {
     fn add_path(&mut self, project_root: &Path, path: &Path) {
+        let hash = hash_file_bounded(path).map_err(|error| error.to_string());
+        self.add_hash(project_root, path, hash.as_ref().map_err(String::as_str));
+    }
+
+    fn add_hash(
+        &mut self,
+        project_root: &Path,
+        path: &Path,
+        hash: std::result::Result<&blake3::Hash, &str>,
+    ) {
         let mut record = blake3::Hasher::new();
         record.update(relative_path(project_root, path).as_bytes());
         record.update(&[0]);
-        match hash_file_bounded(path) {
+        match hash {
             Ok(content_hash) => record.update(content_hash.as_bytes()),
             // Encoding a missing file as a distinct record changes the corpus
             // fingerprint, so breaker state keyed to the previous corpus is not reused.
@@ -24584,6 +25026,8 @@ impl CorpusFingerprint {
 }
 
 fn hash_file_bounded(path: &Path) -> std::io::Result<blake3::Hash> {
+    #[cfg(test)]
+    work_counts::note_fingerprint_read(path);
     let mut file = crate::project_content::open(path)?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0u8; 64 * 1024];
@@ -29270,6 +29714,207 @@ export function leaf() {}
             "backend freshness rows must match apart from updated_at"
         );
         assert_eq!(secondary_indexes(&reference), secondary_indexes(&optimized));
+    }
+
+    #[test]
+    fn cold_build_reads_each_source_once_for_fingerprinting_and_preserves_rows() {
+        let dir = tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let src = root.join("src");
+        fs::create_dir(&src).unwrap();
+        for index in 0..256 {
+            fs::write(
+                src.join(format!("file{index}.ts")),
+                format!(
+                    "import {{ target as next }} from './file{}';\nexport function target() {{ next(); }}\n",
+                    (index + 1) % 256
+                ),
+            )
+            .unwrap();
+        }
+        let files = callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        assert_eq!(files.len(), 256);
+        let reference = CallGraphStore::open(root.join(".reference"), root.clone()).unwrap();
+        reference.cold_build(&files).unwrap();
+        work_counts::reset_under(&root);
+        let opens = crate::project_content::Probe::new(&root);
+        let memo = Arc::new(CorpusMemo::default());
+        let (published, _) = with_corpus_memo(Arc::downgrade(&memo), || {
+            CallGraphStore::cold_build_with_lease_chunked(
+                root.join(".published"),
+                root.clone(),
+                &[],
+                32,
+            )
+            .unwrap()
+        });
+        let reads = files
+            .iter()
+            .map(|path| work_counts::fingerprint_reads(path))
+            .collect::<Vec<_>>();
+        let parses = work_counts::parses_under(&root);
+        let source_opens = opens
+            .paths()
+            .into_iter()
+            .filter(|path| files.contains(path))
+            .count();
+        let mut rows = 0;
+        for (table, excluded) in [
+            ("files", &["indexed_at"][..]),
+            ("nodes", &[][..]),
+            ("refs", &[][..]),
+            ("edges", &[][..]),
+            ("file_dependencies", &[][..]),
+            ("dispatch_hints", &[][..]),
+            ("backend_file_state", &["updated_at"][..]),
+        ] {
+            let expected = graph_table_rows_without(&reference, table, excluded);
+            rows += expected.len();
+            assert_eq!(
+                expected,
+                graph_table_rows_without(&published, table, excluded),
+                "stored rows for {table}"
+            );
+        }
+        incremental_parity::compare(&reference, &published).unwrap();
+        eprintln!(
+            "256-source fixture: fingerprint reads={} (per-file {}..={}), extraction parses={parses}, source opens={source_opens}, identical stored rows={rows}",
+            reads.iter().sum::<usize>(),
+            reads.iter().min().unwrap(),
+            reads.iter().max().unwrap(),
+        );
+        assert_eq!(parses, files.len());
+        assert_eq!(work_counts::max_parses_of_one_file_under(&root), 1);
+        assert_eq!(source_opens, 2 * files.len());
+        assert!(
+            reads.iter().all(|count| *count == 1),
+            "one fingerprint read per source"
+        );
+        #[cfg(any(unix, windows))]
+        {
+            work_counts::reset_under(&root);
+            let probe = crate::project_content::Probe::new(&root);
+            assert!(with_corpus_memo(Arc::downgrade(&memo), || {
+                CallGraphStore::cold_build_suspension(&root.join(".published"), &root)
+                    .unwrap()
+                    .is_none()
+            }));
+            assert!(files
+                .iter()
+                .all(|path| work_counts::fingerprint_reads(path) == 0));
+            assert!(!probe.paths().iter().any(|path| files.contains(path)));
+            eprintln!("256-source suspension probe after build: 0 source opens");
+        }
+    }
+
+    #[test]
+    fn corpus_snapshot_missing_lookup_is_not_a_byte_change() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let admitted = root.join("admitted.ts");
+        let source = b"export function entry() {}\n";
+        fs::write(&admitted, source).unwrap();
+        let corpus = corpus_snapshot_for(root, &[admitted]).unwrap();
+        let unadmitted = root.join("unadmitted.ts");
+        fs::write(&unadmitted, source).unwrap();
+
+        assert!(matches!(
+            corpus.verify_bytes(root, &unadmitted, source),
+            Err(CallGraphStoreError::CorpusSnapshotMissing(_))
+        ));
+        assert!(matches!(
+            corpus.freshness(root, &unadmitted),
+            Err(CallGraphStoreError::CorpusSnapshotMissing(_))
+        ));
+        assert!(matches!(
+            BuildPool::new().build_extracts(
+                root,
+                &[unadmitted],
+                &callgraph::ModuleResolutionMemo::default(),
+                Some(&corpus),
+            ),
+            Err(CallGraphStoreError::CorpusSnapshotMissing(_))
+        ));
+    }
+
+    #[test]
+    fn cold_build_inventory_changes_are_not_byte_changes() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let admitted = root.join("admitted.ts");
+        fs::write(&admitted, "export function entry() {}\n").unwrap();
+        let corpus = corpus_snapshot_for(root, &[]).unwrap();
+        let store = CallGraphStore::open(root.join(".store"), root.to_path_buf()).unwrap();
+        let added = root.join("added.ts");
+        fs::write(&added, "export function leaf() {}\n").unwrap();
+        let error = store
+            .stage_cold_build_file_inventory_checked(&[], Some(&corpus))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CallGraphStoreError::CorpusInventoryChanged(Some(_))
+        ));
+
+        fs::remove_file(added).unwrap();
+        fs::remove_file(admitted).unwrap();
+        let error = store
+            .stage_cold_build_file_inventory_checked(&[], Some(&corpus))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CallGraphStoreError::CorpusInventoryChanged(None)
+        ));
+    }
+
+    #[test]
+    fn cold_build_rejects_bytes_changed_after_admission_and_retries_changed_corpus() {
+        let dir = tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let source = root.join("main.ts");
+        let original = b"export function before() {}\n";
+        let changed = b"export function after_() {}\n";
+        fs::write(&source, original).unwrap();
+        let admitted = callgraph_corpus_fingerprint(&root).unwrap();
+        let edited = source.clone();
+        set_cold_build_extract_observer(Some(Arc::new(move |_| {
+            let mtime =
+                filetime::FileTime::from_last_modification_time(&fs::metadata(&edited).unwrap());
+            fs::write(&edited, changed).unwrap();
+            filetime::set_file_mtime(&edited, mtime).unwrap();
+        })));
+        let store_dir = root.join(".store");
+        let result =
+            CallGraphStore::cold_build_with_lease_chunked(store_dir.clone(), root.clone(), &[], 1);
+        set_cold_build_extract_observer(None);
+        assert!(matches!(result, Err(CallGraphStoreError::StaleFiles(_))));
+        assert!(CallGraphStore::needs_cold_build(&store_dir, &root).unwrap());
+        let staged = Connection::open(staging_path_for_test(&store_dir, &root)).unwrap();
+        assert_eq!(
+            staged_string(&staged, STAGED_CORPUS_FINGERPRINT)
+                .unwrap()
+                .as_deref(),
+            Some(admitted.as_str())
+        );
+        assert!(!database_ready(&staged).unwrap());
+        drop(staged);
+        let fresh = callgraph_corpus_fingerprint(&root).unwrap();
+        assert_ne!(admitted, fresh);
+        let (store, _) =
+            CallGraphStore::cold_build_with_lease_chunked(store_dir, root, &[], 1).unwrap();
+        assert_eq!(store.nodes_matching("after_").unwrap().len(), 1);
+        assert!(store.nodes_matching("before").unwrap().is_empty());
+        assert_eq!(
+            staged_string(&store.conn.lock().unwrap(), STAGED_CORPUS_FINGERPRINT)
+                .unwrap()
+                .as_deref(),
+            Some(fresh.as_str())
+        );
+    }
+
+    fn staging_path_for_test(store: &Path, root: &Path) -> PathBuf {
+        store.join(staging_file_name(
+            &project_key_for_store(store, root).unwrap(),
+        ))
     }
 
     #[test]
@@ -34645,6 +35290,65 @@ mod bounded_build_breaker_tests {
             CallGraphStore::cold_build_with_lease_chunked(fast_store, fast_root, &files, 1)
                 .expect_err("a suspended root must not report a perpetually building worker");
         assert!(matches!(refused, CallGraphStoreError::Suspended(_)));
+    }
+
+    #[test]
+    fn suspension_probe_reuses_content_fingerprint_but_not_a_rewritten_corpus() {
+        let memo = Arc::new(CorpusMemo::default());
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        let store_dir = temp.path().join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("main.ts");
+        std::fs::write(&source, "export function before() {}\n").unwrap();
+        let fingerprint = with_corpus_memo(Arc::downgrade(&memo), || {
+            callgraph_corpus_fingerprint(&root).unwrap()
+        });
+        let mut reference = CorpusFingerprint::default();
+        reference.add_path(&root, &source);
+        assert_eq!(
+            fingerprint,
+            reference.finish(&root),
+            "preserve v2 breaker keys"
+        );
+        let key = BreakerKey::new(
+            root.display().to_string(),
+            BuildDomain::CallgraphCold,
+            fingerprint.clone(),
+        );
+        let breaker = BuildDeathBreaker::open(store_dir.join("build-breaker.sqlite")).unwrap();
+        for _ in 0..3 {
+            let BreakerAdmission::Admitted(attempt) = breaker.admit(&key, 0).unwrap() else {
+                panic!("unexpected early suspension");
+            };
+            breaker
+                .record_attributed_death(&key, &attempt.attempt_id, 0, 0)
+                .unwrap();
+        }
+        work_counts::reset_under(&root);
+        let probe = || {
+            with_corpus_memo(Arc::downgrade(&memo), || {
+                CallGraphStore::cold_build_suspension(&store_dir, &root).unwrap()
+            })
+        };
+        assert!(probe().is_some());
+        assert!(probe().is_some());
+        #[cfg(any(unix, windows))]
+        assert_eq!(work_counts::fingerprint_reads(&source), 0);
+
+        let mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&source).unwrap());
+        std::fs::write(&source, "export function after_() {}\n").unwrap();
+        filetime::set_file_mtime(&source, mtime).unwrap();
+        assert!(probe().is_none());
+        assert_ne!(callgraph_corpus_fingerprint(&root).unwrap(), fingerprint);
+        let (store, _) =
+            CallGraphStore::cold_build_with_lease_chunked(store_dir, root, &[], 1).unwrap();
+        assert_eq!(store.nodes_matching("after_").unwrap().len(), 1);
+        assert!(
+            breaker.suspension(&key).unwrap().is_some(),
+            "a changed corpus must not reset the crashing corpus's history"
+        );
     }
 
     #[test]

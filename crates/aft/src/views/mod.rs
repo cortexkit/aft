@@ -65,6 +65,7 @@ pub mod semantic_runtime;
 mod tree_base;
 pub mod trigram;
 pub(crate) mod verification;
+pub(crate) use verification::NativeStat;
 
 #[cfg(test)]
 mod dispatch_parity_probe;

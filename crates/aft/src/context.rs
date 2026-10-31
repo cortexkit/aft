@@ -4724,6 +4724,7 @@ pub struct AppContext {
     view_disk_limits_next_ms: AtomicU64,
     checkout_query_runtime: RwLock<Option<Arc<crate::views::query_wait::CheckoutQueryRuntime>>>,
     callgraph_store: Arc<RwLock<Option<Arc<ReadonlyCallGraphStore>>>>,
+    callgraph_corpus_memo: parking_lot::Mutex<Option<Arc<crate::callgraph_store::CorpusMemo>>>,
     callgraph_force_demand: Arc<crate::callgraph_maintenance::CallgraphForceDemand>,
     callgraph_reconcile: Arc<crate::callgraph_maintenance::CallgraphReconcileState>,
     #[cfg(test)]
@@ -5128,6 +5129,27 @@ enum CallgraphBuildAdmission {
     Started,
     CapacityDeferred,
     NotStarted,
+}
+
+fn retry_changed_callgraph_corpus<T>(
+    mut build: impl FnMut() -> std::result::Result<T, CallGraphStoreError>,
+) -> std::result::Result<T, CallGraphStoreError> {
+    // A writer may change source files while a cold build is reading them.
+    // Retry immediately with a fresh inventory and content hashes, but release
+    // the worker after three attempts so an edited root cannot monopolize a slot.
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match build() {
+            Err(error) if error.is_corpus_change() && attempts < 3 => {
+                crate::slog_info!(
+                    "callgraph corpus changed during cold build; restarting attempt {} of 3",
+                    attempts + 1
+                );
+            }
+            result => return result,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -5628,6 +5650,7 @@ impl AppContext {
             view_disk_limits_next_ms,
             checkout_query_runtime: RwLock::new(None),
             callgraph_store: Arc::new(RwLock::new(None)),
+            callgraph_corpus_memo: parking_lot::Mutex::new(None),
             callgraph_force_demand: Arc::default(),
             callgraph_reconcile: Arc::default(),
             #[cfg(test)]
@@ -6944,6 +6967,9 @@ impl AppContext {
     pub(crate) fn mark_subc_unbound(&self) {
         self.subc_lifecycle
             .mark_unbound(self.configure_generation.as_ref());
+        let _ = self
+            .subc_lifecycle
+            .run_if_unbound(|| self.callgraph_corpus_memo.lock().take());
         crate::provisional_identity_retry::cancel(self);
         self.release_view_publication_cache();
         crate::callgraph_store::retire_obsolete_callgraph_refresh_waiters();
@@ -7130,6 +7156,9 @@ impl AppContext {
         let mut current = self.callgraph_build_key.lock();
         let equivalent = current.as_deref() == Some(key.as_str());
         *current = Some(key);
+        if !equivalent {
+            self.callgraph_corpus_memo.lock().take();
+        }
         equivalent
     }
 
@@ -9634,6 +9663,7 @@ impl AppContext {
             changed
         };
         if root_changed {
+            self.callgraph_corpus_memo.lock().take();
             let mut tier2 = self
                 .status_bar_tier2
                 .write()
@@ -10469,6 +10499,16 @@ impl AppContext {
         self.callgraph_store.as_ref()
     }
 
+    pub(crate) fn callgraph_corpus_memo(&self) -> Weak<crate::callgraph_store::CorpusMemo> {
+        let mut memo = self.callgraph_corpus_memo.lock();
+        // Work already admitted before unbind may finish, but must not recreate
+        // a memo for a root whose binding has been released.
+        if self.subc_lifecycle.unbound_hint.load(Ordering::Acquire) {
+            return Weak::new();
+        }
+        Arc::downgrade(memo.get_or_insert_with(Default::default))
+    }
+
     /// Whether a refresh the store must apply before answering as current is
     /// still outstanding.
     #[cfg(test)]
@@ -10835,29 +10875,37 @@ impl AppContext {
         };
         // Let the store walk directly into its staging table. Keeping discovery
         // inside the builder prevents a second corpus-sized path inventory here.
-        let (store, _stats) = crate::callgraph_store::with_publish_epoch(
+        let built = crate::callgraph_store::with_publish_epoch(
             persist_epoch_flag.clone(),
             persist_epoch,
             || {
-                if force_token.is_some() {
-                    CallGraphStore::force_cold_build_with_lease_chunked(
-                        callgraph_dir.clone(),
-                        project_root.clone(),
-                        &[],
-                        self.config().callgraph_chunk_size,
-                    )
-                    .map(|(store, _stats)| (store, ()))
-                } else {
-                    CallGraphStore::ensure_built_with_lease_chunked(
-                        callgraph_dir.clone(),
-                        project_root.clone(),
-                        &[],
-                        self.config().callgraph_chunk_size,
-                    )
-                    .map(|(store, _stats)| (store, ()))
-                }
+                crate::callgraph_store::with_corpus_memo(self.callgraph_corpus_memo(), || {
+                    retry_changed_callgraph_corpus(|| {
+                        if force_token.is_some() {
+                            CallGraphStore::force_cold_build_with_lease_chunked(
+                                callgraph_dir.clone(),
+                                project_root.clone(),
+                                &[],
+                                self.config().callgraph_chunk_size,
+                            )
+                            .map(|(store, _stats)| (store, ()))
+                        } else {
+                            CallGraphStore::ensure_built_with_lease_chunked(
+                                callgraph_dir.clone(),
+                                project_root.clone(),
+                                &[],
+                                self.config().callgraph_chunk_size,
+                            )
+                            .map(|(store, _stats)| (store, ()))
+                        }
+                    })
+                })
             },
-        )?;
+        );
+        let (store, _stats) = match built {
+            Err(error) if error.is_corpus_change() => return Ok(None),
+            result => result?,
+        };
         drop(store);
 
         let reopened = CallGraphStore::open_readonly(callgraph_dir, project_root);
@@ -11545,7 +11593,9 @@ impl AppContext {
         }
 
         if !build_in_flight {
-            match CallGraphStore::cold_build_suspension(&callgraph_dir, &project_root) {
+            match crate::callgraph_store::with_corpus_memo(self.callgraph_corpus_memo(), || {
+                CallGraphStore::cold_build_suspension(&callgraph_dir, &project_root)
+            }) {
                 Ok(Some(suspension)) => return CallgraphStoreAccess::Suspended(suspension),
                 Ok(None) => {}
                 Err(error) => return CallgraphStoreAccess::Error(error),
@@ -11979,6 +12029,7 @@ impl AppContext {
         self.callgraph_cold_build_spawn_count
             .fetch_add(1, Ordering::SeqCst);
         let lifecycle = self.subc_lifecycle.clone();
+        let corpus_memo = self.callgraph_corpus_memo();
         let test_hooks = crate::callgraph_store::CallgraphBackgroundTestHooks::capture();
 
         std::thread::spawn(move || {
@@ -12003,35 +12054,35 @@ impl AppContext {
                         crate::callgraph_store::with_publish_epoch(
                             persist_epoch_flag.clone(),
                             persist_epoch,
-                            || match work {
-                                CallgraphBackgroundWork::LegacyMigration => {
-                                    CallGraphStore::migrate_legacy_with_lease(
-                                        callgraph_dir.clone(),
-                                        project_root.clone(),
-                                    )
-                                }
-                                CallgraphBackgroundWork::ForceRebuild(_) => {
-                                    let files = crate::callgraph::walk_project_files(&project_root)
-                                        .collect::<Vec<_>>();
-                                    CallGraphStore::force_cold_build_with_lease_chunked(
-                                        callgraph_dir.clone(),
-                                        project_root.clone(),
-                                        &files,
-                                        chunk_size,
-                                    )
-                                    .map(|(store, _)| Some(store))
-                                }
-                                CallgraphBackgroundWork::Ensure => {
-                                    let files = crate::callgraph::walk_project_files(&project_root)
-                                        .collect::<Vec<_>>();
-                                    CallGraphStore::ensure_built_with_lease_chunked(
-                                        callgraph_dir.clone(),
-                                        project_root.clone(),
-                                        &files,
-                                        chunk_size,
-                                    )
-                                    .map(|(store, _)| Some(store))
-                                }
+                            || {
+                                crate::callgraph_store::with_corpus_memo(corpus_memo, || {
+                                    retry_changed_callgraph_corpus(|| match work {
+                                        CallgraphBackgroundWork::LegacyMigration => {
+                                            CallGraphStore::migrate_legacy_with_lease(
+                                                callgraph_dir.clone(),
+                                                project_root.clone(),
+                                            )
+                                        }
+                                        CallgraphBackgroundWork::ForceRebuild(_) => {
+                                            CallGraphStore::force_cold_build_with_lease_chunked(
+                                                callgraph_dir.clone(),
+                                                project_root.clone(),
+                                                &[],
+                                                chunk_size,
+                                            )
+                                            .map(|(store, _)| Some(store))
+                                        }
+                                        CallgraphBackgroundWork::Ensure => {
+                                            CallGraphStore::ensure_built_with_lease_chunked(
+                                                callgraph_dir.clone(),
+                                                project_root.clone(),
+                                                &[],
+                                                chunk_size,
+                                            )
+                                            .map(|(store, _)| Some(store))
+                                        }
+                                    })
+                                })
                             },
                         )
                     });
@@ -12094,6 +12145,15 @@ impl AppContext {
                             reason
                         );
                         settlement.denied(reason);
+                    }
+                    Err(error) if error.is_corpus_change() => {
+                        // Dropping the worker's settlement sends a Settled
+                        // build event, which query operations report as
+                        // Building. Later demand gets a fresh retry budget
+                        // once the editing burst subsides.
+                        crate::slog_info!(
+                            "callgraph corpus still changing after 3 attempts; build deferred"
+                        );
                     }
                     Err(error) => {
                         crate::slog_warn!("callgraph store background work failed: {}", error);
@@ -14735,6 +14795,8 @@ impl AppContext {
             return false;
         }
 
+        self.callgraph_corpus_memo.lock().take();
+
         if let Some(root) = self.canonical_cache_root_opt() {
             crate::callgraph_store::close_refresh_connections(&root);
         }
@@ -14955,6 +15017,9 @@ impl AppContext {
         let Some(mut callgraph_store) = try_write_unpoisoned(&self.callgraph_store) else {
             return false;
         };
+        let Some(mut corpus_memo) = self.callgraph_corpus_memo.try_lock() else {
+            return false;
+        };
         let Some(mut search_index) = try_write_unpoisoned(&self.search_index) else {
             return false;
         };
@@ -15005,6 +15070,7 @@ impl AppContext {
             return false;
         }
         callgraph_store.take();
+        corpus_memo.take();
         search_index.take();
         semantic_index.take();
         borrowed_index_cache.clear();
@@ -15025,6 +15091,7 @@ impl AppContext {
         self.semantic_refresh_build_epoch.store(0, Ordering::SeqCst);
         self.invalidate_semantic_refresh_probe();
         drop((
+            corpus_memo,
             embedding_model,
             refresh_events,
             refresh_requests,
@@ -20687,6 +20754,133 @@ mod callgraph_store_for_ops_tests {
             CallgraphStoreAccess::Ready(_)
         ));
         query.join().expect("callgraph query thread");
+    }
+
+    #[test]
+    fn callgraph_corpus_retry_restarts_inventory_changes_but_not_lookup_bugs() {
+        let mut attempts = 0;
+        let result = retry_changed_callgraph_corpus(|| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(CallGraphStoreError::CorpusInventoryChanged(None))
+            } else {
+                Ok("fresh inventory")
+            }
+        });
+        assert_eq!(result.unwrap(), "fresh inventory");
+        assert_eq!(attempts, 2);
+
+        let mut attempts = 0;
+        let result: std::result::Result<(), _> = retry_changed_callgraph_corpus(|| {
+            attempts += 1;
+            Err(CallGraphStoreError::CorpusSnapshotMissing(PathBuf::from(
+                "missing.rs",
+            )))
+        });
+        assert!(matches!(
+            result,
+            Err(CallGraphStoreError::CorpusSnapshotMissing(_))
+        ));
+        assert_eq!(attempts, 1);
+    }
+
+    fn assert_callgraph_churn_was_not_charged(ctx: &AppContext, published_attempts: i64) {
+        let connection =
+            rusqlite::Connection::open(ctx.callgraph_store_dir().join("build-breaker.sqlite"))
+                .unwrap();
+        let charges: i64 = connection
+            .query_row(
+                "SELECT COALESCE(SUM(zero_credit_deaths + credited_deaths + in_build_burn_ms), 0)
+                 FROM breaker_records WHERE domain = 'callgraph_cold'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            charges, 0,
+            "ordinary edits must not charge the death breaker"
+        );
+        let attempts: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM breaker_attempts WHERE domain = 'callgraph_cold'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            attempts, published_attempts,
+            "only the existing successful-publication attempt may remain; cancelled attempts must be retired"
+        );
+    }
+
+    #[test]
+    fn scheduled_callgraph_retries_an_edit_with_a_fresh_corpus_without_breaker_deaths() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        crate::callgraph_store::set_cold_build_extract_observer(Some(Arc::new(move |paths| {
+            if let Some(path) = paths
+                .iter()
+                .find(|path| path.file_name().unwrap() == "a.rs")
+            {
+                if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                    std::fs::write(path, "pub fn after_edit_marker() {}\n").unwrap();
+                }
+            }
+        })));
+        let (ctx, _project, _storage, _root, release, events) =
+            gated_callgraph_cold_build(Duration::from_secs(60));
+        crate::callgraph_store::set_cold_build_extract_observer(None);
+        release.send(()).unwrap();
+        let event = events.recv_timeout(Duration::from_secs(30)).unwrap();
+        let store = match event {
+            CallGraphStoreBuildEvent::Ready { store, .. } => store,
+            _ => panic!("the scheduled worker settled without publishing the edited corpus"),
+        };
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(store.nodes_matching("after_edit_marker").unwrap().len(), 1);
+        assert!(store.nodes_matching("a_marker").unwrap().is_empty());
+        assert_callgraph_churn_was_not_charged(&ctx, 1);
+        assert_eq!(ctx.callgraph_cold_build_spawn_count_for_test(), 1);
+        drop(store);
+        assert!(matches!(
+            ctx.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn scheduled_callgraph_churn_budget_settles_as_building_without_breaker_deaths() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        crate::callgraph_store::set_cold_build_extract_observer(Some(Arc::new(move |paths| {
+            if let Some(path) = paths
+                .iter()
+                .find(|path| path.file_name().unwrap() == "a.rs")
+            {
+                let version = observed.fetch_add(1, Ordering::SeqCst);
+                std::fs::write(path, format!("pub fn changing_{version}() {{}}\n")).unwrap();
+            }
+        })));
+        let (ctx, _project, _storage, _root, release, events) =
+            gated_callgraph_cold_build(Duration::from_secs(60));
+        crate::callgraph_store::set_cold_build_extract_observer(None);
+        release.send(()).unwrap();
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(30)).unwrap(),
+            CallGraphStoreBuildEvent::Settled
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_callgraph_churn_was_not_charged(&ctx, 0);
+        let _wait = callgraph_build_wait_ms(&ctx, 10_000);
+        assert!(matches!(
+            ctx.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Building
+        ));
+        assert!(matches!(
+            ctx.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Ready(_)
+        ));
+        assert_callgraph_churn_was_not_charged(&ctx, 1);
     }
 
     /// Schedules a callgraph cold build held at its start gate, with the
