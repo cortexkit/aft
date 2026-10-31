@@ -1,1 +1,1 @@
-- Fixed startup failing with “cannot acquire storage lease … Permission denied” in Linux Landlock sandboxes that allow AFT's storage folder but deny reading `/`. Storage ancestor checks now use lookup-only directory descriptors, preserving symlink and ownership protections without requiring broader filesystem read access.
+- AFT starts again inside Linux sandboxes, such as nono, that allow its storage folder but deny reading `/`. 0.63.4 failed there with "cannot acquire storage lease … Permission denied" (#1245).
