@@ -1550,6 +1550,42 @@ mod tests {
     }
 
     #[test]
+    fn audit_schema25_is_refused_by_schema24_reader_without_row_loss() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+        let conn = open(&path).unwrap();
+        conn.execute("INSERT INTO call_ledger(carrier,call_key,digest,state,event_id) VALUES ('audit','preserved','digest','Prepared','event')", []).unwrap();
+        drop(conn);
+        let mut old_reader = Connection::open(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            run_migrations_supported(&mut old_reader, 24),
+            Err(OpenError::DowngradeRefused {
+                db_version: 25,
+                supported: 24
+            })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            old_reader
+                .query_row("SELECT version FROM schema_version", [], |r| r
+                    .get::<_, u32>(0))
+                .unwrap(),
+            25
+        );
+        assert_eq!(
+            old_reader
+                .query_row(
+                    "SELECT count(*) FROM call_ledger WHERE call_key='preserved'",
+                    [],
+                    |r| r.get::<_, u64>(0)
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn migration_runner_advances_version() {
         let dir = tempdir().unwrap();
         let conn = open(&dir.path().join("aft.db")).unwrap();
