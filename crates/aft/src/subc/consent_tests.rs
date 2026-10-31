@@ -234,7 +234,10 @@ mod program_approvals {
         let f = fixture(FakeCingulate::up());
         let controlled = Controlled::install(f.fake.clone());
         let run = program(&f, false, "run:budget");
-        let path = f.dir.path().join("elsewhere.txt");
+        // AFT names the resolved path (`/private/var/...` on macOS).
+        let path = std::fs::canonicalize(f.dir.path())
+            .unwrap()
+            .join("elsewhere.txt");
         let mut replies = f.send_read(&run, &path, 9011).await;
         held(&mut replies).await;
         let request = controlled.request(0).await;
@@ -467,7 +470,10 @@ mod program_approvals {
         let f = fixture(FakeCingulate::up());
         let controlled = Controlled::install(f.fake.clone());
         let run = program(&f, false, "run:folder");
-        let path = f.dir.path().join("elsewhere.txt");
+        // Grants are stored for the resolved path (`/private/var/...` on macOS).
+        let path = std::fs::canonicalize(f.dir.path())
+            .unwrap()
+            .join("elsewhere.txt");
         let mut replies = f.send_read(&run, &path, 9060).await;
         held(&mut replies).await;
         let request = controlled.request(0).await;

@@ -783,7 +783,10 @@ async fn audit_pending_call_binds_key_operation_path_cwd_and_scope() {
     let f = fixture(FakeCingulate::up());
     let control = Controlled::install(f.fake.clone());
     let run = program(&f, false, "run:audit-binding");
-    let target = f.dir.path().join("elsewhere.txt");
+    // AFT asks about the resolved path (`/private/var/...` on macOS).
+    let target = std::fs::canonicalize(f.dir.path())
+        .unwrap()
+        .join("elsewhere.txt");
     let mut replies = f
         .send_tool(&run, "read", json!({"path":target}), 9410, read_dispatch)
         .await;
