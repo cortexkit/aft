@@ -299,6 +299,9 @@ pub(crate) struct DirectoryTarget {
 /// `known_directory` identifies existing directories copied to the runner. Treat
 /// valid initial `cd` changes as successful, but stop trusting the snapshot after
 /// any non-`cd` command. Keep tracking cwd independently of snapshot trust.
+/// Before a command after `;` or a newline, use an unknown cwd if a speculative
+/// `cd` failure would leave a different folder than success. Directory changes
+/// inside child shells never replace the outer shell's folder.
 #[cfg(any(unix, test))]
 pub(crate) fn top_level_directory_targets(
     command: &str,
@@ -312,6 +315,8 @@ pub(crate) fn top_level_directory_targets(
         cwd: PathBuf,
         physical: Option<bool>,
         snapshot_unchanged: bool,
+        // A possible failure after another command, not a missing snapshot folder.
+        uncertain_cd_failure: bool,
     }
     #[derive(Clone)]
     enum Paths {
@@ -328,6 +333,7 @@ pub(crate) fn top_level_directory_targets(
                 cwd,
                 physical: Some(physical),
                 snapshot_unchanged: true,
+                uncertain_cd_failure: false,
             }])
         }
         fn is_empty(&self) -> bool {
@@ -436,7 +442,21 @@ pub(crate) fn top_level_directory_targets(
             }
         }
         fn all(self) -> Paths {
-            self.success.union(self.failure)
+            let mut paths = self.success.union(self.failure);
+            let mode = paths.mode();
+            if let Paths::Known(states) = &mut paths {
+                let uncertain_failure = states.iter().any(|state| state.uncertain_cd_failure);
+                let different_folders = states
+                    .first()
+                    .is_some_and(|first| states.iter().any(|state| state.cwd != first.cwd));
+                if uncertain_failure && different_folders {
+                    return Paths::Unknown(mode);
+                }
+                for state in states {
+                    state.uncertain_cd_failure = false;
+                }
+            }
+            paths
         }
     }
     enum Operator {
@@ -595,20 +615,15 @@ pub(crate) fn top_level_directory_targets(
             options = false;
         }
         let raw = operand?;
-        let expand_home = raw == "~" || raw.starts_with("~/");
-        // Decode the supported home prefix without allowing other expansions;
-        // quoted or escaped tildes remain ordinary path text.
-        let word = if expand_home {
-            format!("\\{raw}")
-        } else {
-            raw.to_owned()
-        };
-        let text = literal_word(&word)
+        // The runner's home is not the local account's home. Quoted or escaped
+        // tildes remain ordinary path text, but home expansion is unknown.
+        if raw == "~" || raw.starts_with("~/") {
+            return None;
+        }
+        let text = literal_word(raw)
             .filter(|text| text != "-" && !(head == "pushd" && text.starts_with('+')))?;
         let literal_absolute = Path::new(&text).is_absolute();
-        let joined = if expand_home {
-            PathBuf::from(std::env::var_os("HOME")?).join(text.strip_prefix("~/").unwrap_or(""))
-        } else if literal_absolute {
+        let joined = if literal_absolute {
             PathBuf::from(text)
         } else {
             cwd?.join(text)
@@ -677,6 +692,7 @@ pub(crate) fn top_level_directory_targets(
                         cwd: next_cwd,
                         physical: mode,
                         snapshot_unchanged,
+                        uncertain_cd_failure: false,
                     });
                 } else {
                     success = Paths::Unknown(None);
@@ -698,7 +714,9 @@ pub(crate) fn top_level_directory_targets(
                         state.physical,
                         state.snapshot_unchanged,
                     ) {
-                        failure.insert(state.clone());
+                        let mut unchanged = state.clone();
+                        unchanged.uncertain_cd_failure |= !state.snapshot_unchanged;
+                        failure.insert(unchanged);
                     }
                 }
             }
@@ -715,26 +733,31 @@ pub(crate) fn top_level_directory_targets(
     fn inspect_independent_children(
         node: Node<'_>,
         source: &str,
+        incoming: Paths,
         targets: &mut Vec<DirectoryTarget>,
         known_directory: &dyn Fn(&Path) -> bool,
     ) {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            let _ = evaluate(
-                child,
-                source,
-                Paths::Unknown(None),
-                targets,
-                known_directory,
-            );
+            let _ = evaluate(child, source, incoming.clone(), targets, known_directory);
         }
     }
-    fn has_substitution(node: Node<'_>) -> bool {
+    fn inspect_substitutions(
+        node: Node<'_>,
+        source: &str,
+        incoming: &Paths,
+        targets: &mut Vec<DirectoryTarget>,
+        known_directory: &dyn Fn(&Path) -> bool,
+    ) -> bool {
         if matches!(node.kind(), "command_substitution" | "process_substitution") {
+            let _ = evaluate(node, source, incoming.clone(), targets, known_directory);
             return true;
         }
         let mut cursor = node.walk();
-        let found = node.named_children(&mut cursor).any(has_substitution);
+        let mut found = false;
+        for child in node.named_children(&mut cursor) {
+            found |= inspect_substitutions(child, source, incoming, targets, known_directory);
+        }
         found
     }
     fn evaluate(
@@ -748,8 +771,18 @@ pub(crate) fn top_level_directory_targets(
             return Flow::success(incoming);
         }
         match node.kind() {
-            "subshell" => return Flow::either(Paths::Unknown(incoming.mode())),
-            "command_substitution" | "process_substitution" => {
+            "subshell" | "command_substitution" | "process_substitution" => {
+                let _ = evaluate_sequence(node, source, incoming.clone(), targets, known_directory);
+                return Flow::either(incoming.invalidate_snapshot());
+            }
+            "pipeline" => {
+                inspect_independent_children(
+                    node,
+                    source,
+                    incoming.clone(),
+                    targets,
+                    known_directory,
+                );
                 return Flow::either(incoming.invalidate_snapshot());
             }
             "function_definition" => return Flow::success(incoming.invalidate_snapshot()),
@@ -757,11 +790,16 @@ pub(crate) fn top_level_directory_targets(
             | "for_statement"
             | "c_style_for_statement"
             | "while_statement"
-            | "case_statement"
-            | "pipeline" => {
+            | "case_statement" => {
                 // Unsupported control flow loses cwd precision; independently
                 // resolvable targets remain inspectable without choosing a branch.
-                inspect_independent_children(node, source, targets, known_directory);
+                inspect_independent_children(
+                    node,
+                    source,
+                    Paths::Unknown(None),
+                    targets,
+                    known_directory,
+                );
                 return Flow::either(Paths::Unknown(None));
             }
             "negated_command" => {
@@ -791,9 +829,11 @@ pub(crate) fn top_level_directory_targets(
                 };
             }
             "command" => {
+                let has_substitution =
+                    inspect_substitutions(node, source, &incoming, targets, known_directory);
                 let parts = command_parts(source, node);
                 let head = parts.first().and_then(|part| literal_word(&part.text));
-                let incoming = if head.as_deref() == Some("cd") && !has_substitution(node) {
+                let incoming = if head.as_deref() == Some("cd") && !has_substitution {
                     incoming
                 } else {
                     incoming.invalidate_snapshot()
@@ -847,6 +887,15 @@ pub(crate) fn top_level_directory_targets(
             }
             _ => {}
         }
+        evaluate_sequence(node, source, incoming, targets, known_directory)
+    }
+    fn evaluate_sequence(
+        node: Node<'_>,
+        source: &str,
+        incoming: Paths,
+        targets: &mut Vec<DirectoryTarget>,
+        known_directory: &dyn Fn(&Path) -> bool,
+    ) -> Flow {
         let mut flow: Option<Flow> = None;
         let mut operator = Operator::Sequence;
         let mut asynchronous_entry = incoming.clone();
@@ -1502,7 +1551,7 @@ mod tests {
         );
         assert_eq!(
             directory_paths("maybe && cd nested; cd ..", &cwd),
-            vec![cwd.join("nested"), cwd.clone(), parent.clone()]
+            vec![cwd.join("nested")]
         );
         assert_eq!(
             directory_paths("cd nested || cd fallback", &cwd),
@@ -1516,7 +1565,7 @@ mod tests {
         assert!(directory_paths("true || cd ../not-executed", &cwd).is_empty());
         assert_eq!(
             directory_paths("true >/not-writable && cd nested; cd ..", &cwd),
-            vec![cwd.join("nested"), cwd.clone(), parent]
+            vec![cwd.join("nested")]
         );
     }
 
@@ -1529,14 +1578,7 @@ mod tests {
         let known_directory = |path: &Path| path.starts_with(&cwd) && path.is_dir();
         for (command, expected) in [
             ("cd a; cd ../b", vec![cwd.join("a"), cwd.join("b")]),
-            (
-                "maybe && cd a; cd ../b",
-                vec![
-                    cwd.join("a"),
-                    cwd.join("b"),
-                    cwd.parent().unwrap().join("b"),
-                ],
-            ),
+            ("maybe && cd a; cd ../b", vec![cwd.join("a")]),
             (
                 "cd missing; cd ../b",
                 vec![
@@ -1630,7 +1672,10 @@ mod tests {
             "cd -",
             "pushd +1",
             "popd",
-            "(cd nested)",
+            "cd",
+            "cd ~",
+            "cd ~/nested",
+            "cd ../*",
         ] {
             let command = format!("{prefix} && cd ..; cd '{}' && cd nested", cwd.display());
             assert_eq!(
@@ -1837,7 +1882,6 @@ mod tests {
         for command in [
             "if true; then cd nested; fi; cd ..",
             "while false; do cd nested; done; cd ..",
-            "cd nested | cat; cd ..",
         ] {
             assert!(directory_paths(command, &cwd).is_empty(), "{command}");
         }
@@ -1868,7 +1912,7 @@ mod tests {
     }
 
     #[test]
-    fn top_level_directory_targets_ignore_dynamic_and_nested_commands() {
+    fn top_level_directory_targets_ignore_dynamic_and_deferred_commands() {
         let dir = tempfile::tempdir().unwrap();
         for command in [
             "cd $OTHER_CHECKOUT",
@@ -1877,12 +1921,52 @@ mod tests {
             "cd -",
             "pushd +1",
             "cd ../*",
-            "printf '%s' \"$(cd /outside; pwd)\"",
-            "(cd /outside; printf nested)",
             "f() { cd /outside; }; printf defined",
         ] {
             assert!(directory_paths(command, dir.path()).is_empty(), "{command}");
         }
+    }
+
+    #[test]
+    fn directory_targets_child_shell_scopes_keep_outer_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let expected = vec![
+            cwd.join("sub"),
+            cwd.join("child"),
+            cwd.parent().unwrap().join("outside"),
+        ];
+        for command in [
+            "(cd sub && cd ../child); cd ../outside",
+            "cd sub | cd child; cd ../outside",
+            "printf '%s' \"$(cd sub && cd ../child)\"; cd ../outside",
+            "printf '%s' \"$(cd sub)\" \"$(cd child)\"; cd ../outside",
+            "cat <(cd sub && cd ../child); cd ../outside",
+            "cd sub && cd ../child & cd ../outside",
+        ] {
+            assert_eq!(directory_paths(command, &cwd), expected, "{command}");
+        }
+    }
+
+    #[test]
+    fn directory_targets_uncertain_sequence_joins_forget_relative_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        for separator in [";", "\n"] {
+            let command = format!(
+                "printf setup; cd a && bun test{separator} cd ../b; cd '{}' && cd child",
+                cwd.display()
+            );
+            assert_eq!(
+                directory_paths(&command, &cwd),
+                vec![cwd.join("a"), cwd.clone(), cwd.join("child")],
+                "{command}"
+            );
+        }
+        assert_eq!(
+            directory_paths("cd a && cd ../b", &cwd),
+            vec![cwd.join("a"), cwd.join("b")]
+        );
     }
 
     #[test]
