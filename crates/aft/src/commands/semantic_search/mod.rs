@@ -3704,13 +3704,16 @@ fn lexical_candidate_exactness(
     query: &str,
     content_tokens: &[String],
 ) -> (bool, usize, Option<usize>) {
+    let _cost = telemetry::CostPhase::start("lexical_exactness");
     #[cfg(test)]
     crate::search_hot_path_measurements::record_file_read_path(file);
     let Ok(bytes) = fs::read(file) else {
         return (false, 0, None);
     };
     let text = String::from_utf8_lossy(&bytes);
+    let normalize_cost = telemetry::CostPhase::start("lexical_normalize");
     let normalized_text = normalize_exact_phrase(&text);
+    drop(normalize_cost);
     let normalized_phrase = normalize_exact_phrase(exact_phrase(query));
     let phrase_count = if normalized_phrase.is_empty() {
         0
@@ -4696,7 +4699,9 @@ fn matching_line_from_source(
     query: &str,
     symbol_range: Option<SymbolOffsetRange>,
 ) -> Option<(u32, String)> {
+    let read_cost = telemetry::CostPhase::start("matching_read");
     let source = std::fs::read_to_string(file).ok()?;
+    drop(read_cost);
     #[cfg(test)]
     crate::search_hot_path_measurements::record_file_read_path(file);
     matching_line_in_text(&source, query, symbol_range)
@@ -4711,9 +4716,12 @@ fn matching_line_in_text(
 ) -> Option<(u32, String)> {
     let _cost = telemetry::CostPhase::start("matching_line");
     static CACHE: std::sync::OnceLock<MatchingSourceCache> = std::sync::OnceLock::new();
+    let prepare_cost = telemetry::CostPhase::start("matching_prepare");
     let prepared = CACHE
         .get_or_init(|| MatchingSourceCache::new(32 * 1024 * 1024))
         .prepare(source);
+    drop(prepare_cost);
+    let phrase_cost = telemetry::CostPhase::start("matching_phrase");
     let normalized_phrase = exact_lane::normalize_exact_phrase(exact_lane::exact_phrase(query));
     if !normalized_phrase.is_empty() {
         if let Some((line_index, line)) = source.lines().enumerate().find(|(index, _)| {
@@ -4735,6 +4743,7 @@ fn matching_line_in_text(
         }
     }
 
+    drop(phrase_cost);
     let content_tokens = query_shape::extract_content_tokens(query);
     let compact_tokens = content_tokens
         .iter()
@@ -4747,7 +4756,9 @@ fn matching_line_in_text(
         })
         .filter(|token| token.len() >= 3)
         .collect::<Vec<_>>();
+    let best_cost = telemetry::CostPhase::start("matching_best_line");
     let best = prepared.best_line(source, &compact_tokens);
+    drop(best_cost);
     if let Some((_, line_index, line)) = best {
         // Start the shown part of a long line at the earliest query token it
         // contains, so the window covers the region that made the line match.
@@ -6354,8 +6365,11 @@ fn handle_engine_only_search(
     if semantic_status != "ready" {
         warnings.push("Semantic search unavailable; using lexical-only fallback.".to_string());
     }
+    let enrich_cost = telemetry::CostPhase::start("enrich");
     let snippets_incomplete =
         enrich_snippets_from_source_with_context(&mut ranked.results, project_root, Some(ctx));
+    drop(enrich_cost);
+    let format_cost = telemetry::CostPhase::start("format");
     let mut text = format_ranked_text(
         &ranked.results,
         project_root,
@@ -6364,6 +6378,7 @@ fn handle_engine_only_search(
         Some(ctx),
         ranked.literal_absent.as_deref(),
     );
+    drop(format_cost);
     if let Some(answer) = &ranked.not_found {
         text = answer.render(project_root);
     }
