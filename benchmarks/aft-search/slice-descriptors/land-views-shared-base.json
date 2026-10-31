@@ -1,12 +1,12 @@
 {
-  "slice_class": "non_ranking",
+  "slice_class": "engine_unwired",
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
-    "harness-goldens"
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
   ],
   "slices": [
     "views-shared-base"
   ],
-  "note": "Views base identity uses a location-independent ignore-policy digest, so checkouts of one repository at the same commit share a base. No changed path matches RANKING_FENCE_PREFIXES."
+  "note": "Views base identity uses a location-independent ignore-policy digest, so checkouts of one repository at the same commit share a base. The ranking-fenced search_index.rs change stops the project walk from admitting a file named .git (a linked worktree's or submodule's pointer to Git data); benchmark corpora have no such files, so indexed files, candidates, scoring and ordering are unchanged and benchmark rows must remain byte-identical."
 }
