@@ -1742,6 +1742,9 @@ fn scope_project_case_034(
                     assert_eq!(reply.header.ty, FrameType::Response, "{}", frame_body(&reply));
                     assert!(!tool_result_is_error(&reply), "{}", frame_body(&reply));
                     assert!(frame_body(&reply).contains("scope_project_034_marker"), "{}", frame_body(&reply));
+                    if corr == 21 {
+                        assert!(frame_body(&reply).contains("marker.txt"), "{}", frame_body(&reply));
+                    }
                     assert!(!frame_body(&reply).contains("wrong_legacy_project"));
                 }
             }

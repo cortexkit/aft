@@ -453,6 +453,12 @@ async fn tool_provider_subc_e2e_scope_workdir_compatibility_bind_serves_files() 
             String::from_utf8_lossy(&bytes).contains("seed line one"),
             "{reply}"
         );
+        if name == "grep" {
+            assert!(
+                String::from_utf8_lossy(&bytes).contains("seed.txt"),
+                "{reply}"
+            );
+        }
     }
     consumer.close().await;
     drop(daemon);
@@ -580,6 +586,12 @@ async fn legacy_root_case(no_project: bool, scoped_without_workdir: bool) {
                 String::from_utf8_lossy(&reply.body).contains("seed line one"),
                 "{body}"
             );
+            if name == "grep" {
+                assert!(
+                    String::from_utf8_lossy(&reply.body).contains("seed.txt"),
+                    "{body}"
+                );
+            }
         }
     }
     let catalog = legacy_rpc(&mut stream, channel, epoch, 4, json!({"op":"tool.catalog"})).await;
