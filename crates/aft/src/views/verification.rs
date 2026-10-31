@@ -1450,15 +1450,15 @@ mod tests {
         for name in [".ignore", ".gitignore", ".gitattributes", ".aftignore"] {
             let path = root.path().join(name);
             let mut absent = blake3::Hasher::new();
-            assert!(!metadata_source(&path, &mut absent).unwrap());
+            assert!(metadata_source(&path, &mut absent).unwrap().is_none());
             fs::create_dir(&path).unwrap();
             let mut directory = blake3::Hasher::new();
-            assert!(!metadata_source(&path, &mut directory).unwrap());
+            assert!(metadata_source(&path, &mut directory).unwrap().is_none());
             assert_eq!(directory.finalize(), absent.finalize());
             fs::remove_dir(&path).unwrap();
             fs::write(&path, b"ignored.rs\n").unwrap();
             let mut regular = blake3::Hasher::new();
-            assert!(metadata_source(&path, &mut regular).unwrap());
+            assert!(metadata_source(&path, &mut regular).unwrap().is_some());
             assert_ne!(regular.finalize(), absent.finalize());
         }
     }
@@ -1472,16 +1472,16 @@ mod tests {
         let socket = root.path().join(".gitignore");
         let mut absent_fifo = blake3::Hasher::new();
         let mut absent_socket = blake3::Hasher::new();
-        assert!(!metadata_source(&fifo, &mut absent_fifo).unwrap());
-        assert!(!metadata_source(&socket, &mut absent_socket).unwrap());
+        assert!(metadata_source(&fifo, &mut absent_fifo).unwrap().is_none());
+        assert!(metadata_source(&socket, &mut absent_socket).unwrap().is_none());
         let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         // The path is NUL-terminated and the FIFO remains inside the fixture.
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
         let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let mut fifo_hash = blake3::Hasher::new();
         let mut socket_hash = blake3::Hasher::new();
-        assert!(!metadata_source(&fifo, &mut fifo_hash).unwrap());
-        assert!(!metadata_source(&socket, &mut socket_hash).unwrap());
+        assert!(metadata_source(&fifo, &mut fifo_hash).unwrap().is_none());
+        assert!(metadata_source(&socket, &mut socket_hash).unwrap().is_none());
         assert_eq!(fifo_hash.finalize(), absent_fifo.finalize());
         assert_eq!(socket_hash.finalize(), absent_socket.finalize());
     }
@@ -1494,9 +1494,13 @@ mod tests {
         let link = root.path().join(".ignore");
         fs::write(&target, b"ignored.rs\n").unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(metadata_source(&link, &mut blake3::Hasher::new()).unwrap());
+        assert!(metadata_source(&link, &mut blake3::Hasher::new())
+            .unwrap()
+            .is_some());
         fs::remove_file(&target).unwrap();
-        assert!(!metadata_source(&link, &mut blake3::Hasher::new()).unwrap());
+        assert!(metadata_source(&link, &mut blake3::Hasher::new())
+            .unwrap()
+            .is_none());
         fs::create_dir(&target).unwrap();
         let error = metadata_source(&link, &mut blake3::Hasher::new()).unwrap_err();
         assert!(error.to_string().contains("reading policy input"));
