@@ -1252,7 +1252,7 @@ mod tests {
                     super::super::verification::BindGuard::capture(&root, None)
                         .unwrap()
                         .policy
-                        .digest,
+                        .base_digest,
                 ),
                 history: None,
                 budget: DiskBudget::default(),
@@ -1426,6 +1426,123 @@ mod tests {
             .expect("a failed bind must not strand a live claim");
         assert_eq!(callers(&ready, "a.ts", "target").len(), 1);
         assert_eq!(failed.installed_snapshot().generation().name(), "empty");
+    }
+
+    /// Runs a setup Git command with a fixed identity, so commits work on a
+    /// machine without one configured.
+    fn setup_git(root: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(root)
+            .args([
+                "-c",
+                "user.name=aft-test",
+                "-c",
+                "user.email=aft-test@example.invalid",
+                "-c",
+                "init.defaultBranch=main",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A linked worktree at the commit the main checkout already built has the
+    /// same files and the same ignore policy, so it must resolve the main
+    /// checkout's base and clone its sealed donor, parsing nothing. Base
+    /// identity once hashed the policy inputs' absolute paths and Git's
+    /// config origins (`.git/config` in a main checkout, an absolute path in a
+    /// linked worktree), so every checkout built a full base of its own.
+    #[test]
+    fn linked_worktree_at_the_same_commit_shares_the_base_and_its_donor() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let main = checkout(&temp.path().join("main"));
+        std::fs::write(main.join(".gitignore"), "dist/\n").unwrap();
+        setup_git(&main, &["init", "-q"]);
+        setup_git(&main, &["add", "-A"]);
+        setup_git(&main, &["commit", "-q", "-m", "fixture"]);
+        // Shared by every checkout of the repository.
+        std::fs::write(main.join(".git/info/exclude"), "scratch/\n").unwrap();
+        let linked = temp.path().join("linked");
+        setup_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let linked = std::fs::canonicalize(&linked).unwrap();
+
+        let main_view = view(&main, &storage);
+        let main_store = main_view.reader().unwrap();
+        assert_eq!(callers(&main_store, "a.ts", "target").len(), 1);
+        assert_eq!(main_view.extraction_count(), 3, "a.ts, b.ts, package.json");
+
+        let linked_view = view(&linked, &storage);
+        let linked_store = linked_view.reader().unwrap();
+        assert_eq!(
+            callers(&linked_store, "a.ts", "target"),
+            callers(&main_store, "a.ts", "target")
+        );
+        assert_eq!(
+            linked_view.extraction_count(),
+            0,
+            "the linked worktree built its own base instead of sharing the main checkout's"
+        );
+        let producers = super::super::manifest_v2::Producers {
+            trigram: crate::blob_store::v2::TrigramPolicy {
+                max_file_size: 1 << 20,
+            }
+            .fingerprint_hex(),
+            semantic: None,
+            callgraph: PRODUCER.into(),
+        };
+        let base_of = |root: &Path| {
+            super::super::base_refs::open_foreign_v3(
+                &storage,
+                "donor-reuse",
+                &view_scope(root),
+                &producers,
+            )
+            .unwrap()
+            .unwrap()
+            .base_header()
+            .unwrap()
+            .scope
+            .clone()
+        };
+        assert_eq!(base_of(&linked), base_of(&main));
+        assert!(matches!(
+            events(
+                &crate::blob_store::v3::view_dir(&storage, "donor-reuse", &view_scope(&linked))
+                    .unwrap()
+            )
+            .as_slice(),
+            [super::super::donor::DonorEvent::Cloned(_)]
+        ));
+
+        // A different ignore policy in the linked worktree is a different
+        // base, even with the same files.
+        let policy = |root: &Path| {
+            super::super::verification::BindGuard::capture(root, None)
+                .unwrap()
+                .policy
+        };
+        assert_eq!(policy(&main).base_digest, policy(&linked).base_digest);
+        std::fs::write(linked.join(".gitignore"), "dist/\nbuild/\n").unwrap();
+        assert_ne!(policy(&main).base_digest, policy(&linked).base_digest);
     }
 
     #[test]

@@ -305,39 +305,165 @@ impl Evidence {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Policy {
+    /// Names every input by its absolute path, so it also proves that stat
+    /// evidence was recorded in this checkout. Stat-evidence reuse and
+    /// receipts compare against it.
     pub digest: String,
+    /// The same policy named by role instead of location: inputs under the
+    /// checkout by their relative path, Git's info files by name, Git
+    /// configuration by its effective entries. Two checkouts of one
+    /// repository with the same policy get the same value, so base identity
+    /// uses this one and a worktree at a commit another checkout already
+    /// built shares that base instead of building its own.
+    pub base_digest: String,
     /// Missing or unscopable conversion sources forbid stat-based byte reuse.
     pub reusable: bool,
 }
 
-fn metadata_source(path: &Path, hash: &mut blake3::Hasher) -> io::Result<bool> {
-    let name = path.as_os_str().as_encoded_bytes();
-    hash.update(&(name.len() as u64).to_le_bytes());
-    hash.update(name);
-    // A directory or special file with a policy name has no policy bytes. Keep
-    // following symlinks through the existing read path, including its errors.
+/// Reads one policy input. A missing file, or a directory or special file
+/// with a policy name, has no policy bytes. Symlinks are followed through the
+/// normal read path, including its errors.
+fn read_policy_source(path: &Path) -> io::Result<Option<Vec<u8>>> {
     let candidate = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata.is_file() || metadata.file_type().is_symlink(),
         Err(e) if e.kind() == io::ErrorKind::NotFound => false,
         Err(e) => return Err(at("reading policy input metadata", path, e)),
     };
     if !candidate {
-        hash.update(&[0]);
-        return Ok(false);
+        return Ok(None);
     }
     match read_policy_input(path) {
-        Ok(bytes) => {
-            hash.update(&[1]);
-            hash.update(&(bytes.len() as u64).to_le_bytes());
-            hash.update(&bytes);
-            Ok(true)
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            hash.update(&[0]);
-            Ok(false)
-        }
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(at("reading policy input", path, e)),
     }
+}
+
+/// Hashes one input into the location-bound digest: its absolute name, then
+/// its bytes or an absence marker.
+fn metadata_source(path: &Path, hash: &mut blake3::Hasher) -> io::Result<Option<Vec<u8>>> {
+    let name = path.as_os_str().as_encoded_bytes();
+    hash.update(&(name.len() as u64).to_le_bytes());
+    hash.update(name);
+    let source = read_policy_source(path)?;
+    match &source {
+        Some(bytes) => {
+            hash.update(&[1]);
+            hash.update(&(bytes.len() as u64).to_le_bytes());
+            hash.update(bytes);
+        }
+        None => {
+            hash.update(&[0]);
+        }
+    }
+    Ok(source)
+}
+
+/// Where a checkout's Git policy files live, for naming inputs by role.
+struct PolicyLocations {
+    root: PathBuf,
+    /// The `info` directory Git reads: the common directory's for a linked
+    /// worktree, otherwise the checkout's own Git directory's.
+    git_info: Option<PathBuf>,
+    /// A linked worktree's own `info` directory, which Git does not read.
+    worktree_info: Option<PathBuf>,
+    /// A linked worktree's `commondir` marker. Its bytes name a location.
+    commondir: Option<PathBuf>,
+}
+
+impl PolicyLocations {
+    fn of(root: &Path) -> io::Result<Self> {
+        let (git_info, worktree_info, commondir) = match git_policy_dirs(root)? {
+            None => (None, None, None),
+            Some((gitdir, None)) => (Some(gitdir.join("info")), None, None),
+            Some((gitdir, Some(common))) => (
+                Some(common.join("info")),
+                Some(gitdir.join("info")),
+                Some(gitdir.join("commondir")),
+            ),
+        };
+        Ok(Self {
+            root: root.to_path_buf(),
+            git_info,
+            worktree_info,
+            commondir,
+        })
+    }
+
+    /// The location-independent name of `path`, or `None` for an input whose
+    /// bytes only name a location. Paths are built exactly as
+    /// [`policy_inputs`] builds them, so prefix matching is exact.
+    fn logical_name(&self, path: &Path) -> Option<Vec<u8>> {
+        if self.commondir.as_deref() == Some(path) {
+            return None;
+        }
+        let named = |role: &[u8], rest: &Path| {
+            let mut name = role.to_vec();
+            name.extend_from_slice(rest.as_os_str().as_encoded_bytes());
+            name
+        };
+        if let Some(rest) = self
+            .git_info
+            .as_deref()
+            .and_then(|dir| path.strip_prefix(dir).ok())
+        {
+            return Some(named(b"git-info:", rest));
+        }
+        if let Some(rest) = self
+            .worktree_info
+            .as_deref()
+            .and_then(|dir| path.strip_prefix(dir).ok())
+        {
+            return Some(named(b"worktree-git-info:", rest));
+        }
+        if let Ok(rest) = path.strip_prefix(&self.root) {
+            return Some(named(b"tree:", rest));
+        }
+        Some(named(b"absolute:", path))
+    }
+}
+
+/// The checkout's Git directory and, for a linked worktree, its common
+/// directory, spelled as Git's markers give them (not canonicalized).
+fn git_policy_dirs(root: &Path) -> io::Result<Option<(PathBuf, Option<PathBuf>)>> {
+    let marker = root.join(".git");
+    let gitdir = if marker.is_dir() {
+        Some(marker)
+    } else {
+        fs::read(&marker)
+            .ok()
+            .and_then(|bytes| {
+                bytes
+                    .strip_prefix(b"gitdir: ")
+                    .map(|p| p.trim_ascii().to_vec())
+            })
+            .and_then(|p| path_from_bytes(&p).ok())
+            .map(|p| if p.is_absolute() { p } else { root.join(p) })
+    };
+    let Some(gitdir) = gitdir else {
+        return Ok(None);
+    };
+    let common_marker = gitdir.join("commondir");
+    let common = match fs::read(&common_marker) {
+        Ok(bytes) => {
+            let common = path_from_bytes(bytes.trim_ascii())
+                .map_err(|e| at("decoding Git common directory marker", &common_marker, e))?;
+            Some(if common.is_absolute() {
+                common
+            } else {
+                gitdir.join(common)
+            })
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(at(
+                "reading Git common directory marker",
+                &common_marker,
+                error,
+            ))
+        }
+    };
+    Ok(Some((gitdir, common)))
 }
 
 impl Policy {
@@ -384,8 +510,22 @@ impl Policy {
         hash.update(b"aft/views-v3/conversion-policy/1");
         let mut reusable = output.as_ref().is_ok_and(|output| output.status.success());
         hash.update(&[u8::from(reusable)]);
+        let config_read = reusable;
         let config = output.map(|output| output.stdout).unwrap_or_default();
         hash.update(&config);
+        // Inputs for the location-independent digest: present sources by
+        // logical name, and Git configuration by effective entry only. Its
+        // origin records name file locations (Git prints the repository's own
+        // config as `.git/config` in a main checkout and by absolute path in
+        // a linked worktree), and the entries already carry their effect.
+        let locations = PolicyLocations::of(root)?;
+        let mut located = BTreeMap::<Vec<u8>, Vec<u8>>::new();
+        let mut locate = |path: &Path, source: Option<Vec<u8>>| {
+            if let (Some(name), Some(bytes)) = (locations.logical_name(path), source) {
+                located.insert(name, bytes);
+            }
+        };
+        let mut config_entries = Vec::new();
         for output in sources {
             match output {
                 Ok(output) if output.status.success() => {
@@ -402,7 +542,9 @@ impl Policy {
                     } else {
                         root.join(path)
                     };
-                    reusable &= !metadata_source(&path, &mut hash)?;
+                    let source = metadata_source(&path, &mut hash)?;
+                    reusable &= source.is_none();
+                    locate(&path, source);
                 }
                 _ => reusable = false,
             }
@@ -421,6 +563,8 @@ impl Policy {
                     },
                     &mut hash,
                 )?;
+            } else if !is_config_origin(item) && !item.is_empty() {
+                config_entries.push(item.to_vec());
             }
             let lower = String::from_utf8_lossy(item).to_lowercase();
             if lower.starts_with("filter.")
@@ -454,14 +598,15 @@ impl Policy {
                     } else {
                         root.join(path)
                     };
-                    metadata_source(&path, &mut hash)?;
+                    let source = metadata_source(&path, &mut hash)?;
+                    locate(&path, source);
                     reusable &= !conversion;
                 }
             }
         }
         for path in metadata {
-            let present = metadata_source(path, &mut hash)?;
-            if present
+            let source = metadata_source(path, &mut hash)?;
+            if source.is_some()
                 && path
                     .file_name()
                     .is_some_and(|name| name == ".gitattributes" || name == "attributes")
@@ -470,12 +615,45 @@ impl Policy {
                 // attribute source is conservatively an unscopable conversion.
                 reusable = false;
             }
+            locate(path, source);
         }
+        let mut base = blake3::Hasher::new();
+        base.update(b"aft/views-v3/base-policy/1");
+        base.update(&[u8::from(config_read)]);
+        base.update(&(config_entries.len() as u64).to_le_bytes());
+        for entry in &config_entries {
+            base.update(&(entry.len() as u64).to_le_bytes());
+            base.update(entry);
+        }
+        base.update(&(located.len() as u64).to_le_bytes());
+        for (name, bytes) in &located {
+            base.update(&(name.len() as u64).to_le_bytes());
+            base.update(name);
+            base.update(&(bytes.len() as u64).to_le_bytes());
+            base.update(bytes);
+        }
+        base.update(&[u8::from(reusable)]);
         Ok(Self {
             digest: hash.finalize().to_hex().to_string(),
+            base_digest: base.finalize().to_hex().to_string(),
             reusable,
         })
     }
+}
+
+/// Whether a `git config --list --show-origin -z` record is an origin rather
+/// than an entry. Entries begin with a section name, which cannot contain a
+/// colon; every origin type Git prints is a word followed by a colon.
+fn is_config_origin(item: &[u8]) -> bool {
+    [
+        b"file:".as_slice(),
+        b"blob:",
+        b"standard input:",
+        b"submodule-blob:",
+        b"command line:",
+    ]
+    .iter()
+    .any(|prefix| item.starts_with(prefix))
 }
 
 pub(crate) fn path_from_bytes(bytes: &[u8]) -> io::Result<PathBuf> {
@@ -532,46 +710,14 @@ pub(crate) fn policy_inputs(root: &Path) -> io::Result<Vec<PathBuf>> {
             }
         }
     }
-    let marker = root.join(".git");
-    let gitdir = if marker.is_dir() {
-        Some(marker)
-    } else {
-        fs::read(&marker)
-            .ok()
-            .and_then(|bytes| {
-                bytes
-                    .strip_prefix(b"gitdir: ")
-                    .map(|p| p.trim_ascii().to_vec())
-            })
-            .and_then(|p| path_from_bytes(&p).ok())
-            .map(|p| if p.is_absolute() { p } else { root.join(p) })
-    };
-    if let Some(gitdir) = gitdir {
+    if let Some((gitdir, common)) = git_policy_dirs(root)? {
         paths.push(gitdir.join("info/attributes"));
         paths.push(gitdir.join("info/exclude"));
-        let common_marker = gitdir.join("commondir");
-        match fs::read(&common_marker) {
-            Ok(bytes) => {
-                let common = path_from_bytes(bytes.trim_ascii())
-                    .map_err(|e| at("decoding Git common directory marker", &common_marker, e))?;
-                let common = if common.is_absolute() {
-                    common
-                } else {
-                    gitdir.join(common)
-                };
-                paths.push(common.join("info/attributes"));
-                paths.push(common.join("info/exclude"));
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(at(
-                    "reading Git common directory marker",
-                    &common_marker,
-                    error,
-                ))
-            }
+        if let Some(common) = common {
+            paths.push(common.join("info/attributes"));
+            paths.push(common.join("info/exclude"));
         }
-        paths.push(common_marker);
+        paths.push(gitdir.join("commondir"));
     }
     paths.sort();
     Ok(paths)
