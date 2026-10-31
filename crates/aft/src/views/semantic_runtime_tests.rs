@@ -4559,7 +4559,8 @@ fn live_view_holders_match_runtimes_and_planes_have_unique_ids() {
 }
 
 /// A namespace another writer keeps changing no longer makes a load busy: the
-/// ledger records the largest total it saw and leaves the measurement owed.
+/// reservation ledger records the largest family size it measured, and the
+/// next writer to open the family measures it again.
 #[test]
 fn views_changing_namespace_does_not_make_the_semantic_load_busy() {
     let _git_env = crate::test_env::hermetic_git_env_guard();
@@ -4589,8 +4590,9 @@ fn views_changing_namespace_does_not_make_the_semantic_load_busy() {
 }
 
 /// A store that is busy (here another connection holds the family registry
-/// in exclusive locking mode) keeps the semantic lane building, with no
-/// failure counted and no bug line, until a retry loads it.
+/// in exclusive locking mode) keeps the semantic lane building, with no view
+/// load failure counted and no "This is an AFT bug" line in the reply, until
+/// a retry loads it.
 #[test]
 fn views_busy_load_keeps_semantic_building_until_retry_succeeds() {
     use crate::db::file_identity::IdentityConnection;

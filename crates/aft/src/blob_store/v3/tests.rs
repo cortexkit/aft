@@ -650,8 +650,9 @@ fn floor_refusal_before_creation_leaves_no_store_and_no_family_byte_budget_appli
     assert!(!root.path().join("blobs/v3").exists());
     assert!(!root.path().join("reader-floor.json").exists());
     drop(low_space);
-    // With room on the device, a request larger than the 4 GiB a family was
-    // once limited to is admitted, and its reservation is released after.
+    // With room on the device, a request far larger than any one family's
+    // data is admitted (no per-family byte limit), and its reservation is
+    // released after.
     let _space = set_free_space_for_test(root.path(), u64::MAX, u64::MAX / 2);
     publish(root.path(), A, 5 * MIN_FREE_BYTES, None, |_| Ok(())).unwrap();
     let ledger = LedgerReader::open_existing(root.path(), A).unwrap();

@@ -217,8 +217,8 @@ fn v3_admission_has_no_family_byte_limit_and_refuses_only_at_the_device_floor() 
         family_payload: usage + 2 * MIB,
         ..DiskBudget::default()
     };
-    // Far past the 4 GiB the family limit used to allow, with room on the
-    // device: admitted, and over the target so the caller sweeps.
+    // A 6 GiB request with room on the device is admitted, since only the
+    // device floor refuses; it exceeds the target, so the caller sweeps.
     let roomy = v3::set_free_space_for_test(storage.path(), 1024 * GIB, 2048 * GIB);
     let admitted = budget.admit_v3(&mut registry, 6 * GIB).unwrap();
     assert!(admitted.over_target);

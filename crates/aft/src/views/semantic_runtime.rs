@@ -2579,8 +2579,7 @@ where
                     let reason = format!("semantic store: {error}");
                     // Contention (a busy or locked store, a namespace another
                     // process is writing) clears by itself: retry on the
-                    // backoff. Before this, a busy ledger left the checkout
-                    // unavailable until something else woke it.
+                    // backoff rather than waiting for an unrelated wake.
                     if is_transient_reason(&reason) {
                         crate::slog_warn!(
                             "semantic view fill will retry a busy store root={} error={}",

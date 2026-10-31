@@ -14509,7 +14509,7 @@ mod tests {
                 crate::blob_store::v3::publish(&storage, &family, 1024, None, |_| Ok(())).unwrap();
             }
             // Another connection holds the family registry in exclusive
-            // locking mode, so opening the ledger is busy until it goes.
+            // locking mode, so opening it is busy until that connection ends.
             let blocker = crate::db::file_identity::IdentityConnection::open_with_flags(
                 &registry,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
