@@ -127,6 +127,7 @@ pub struct RawAftConfig {
     pub restrict_to_project_root: Option<bool>,
     pub indexes: Option<RawIndexes>,
     pub index: Option<RawIndex>,
+    pub project_detection: Option<crate::folder_admission::ProjectDetectionConfig>,
     pub views: Option<RawViews>,
     #[serde(deserialize_with = "deserialize_opt_usize")]
     pub callgraph_chunk_size: Option<usize>,
@@ -859,6 +860,7 @@ pub fn resolve_config_for_harness(
         };
     }
     config.index = resolve_index_config(merged.index.as_ref(), &mut warnings);
+    config.project_detection = merged.project_detection.clone().unwrap_or_default();
     if let Some(raw) = merged
         .storage
         .as_ref()
@@ -1186,6 +1188,7 @@ fn security_config_section(key: &str, harness: Option<&Harness>) -> bool {
             | "sandbox"
             | "indexes"
             | "index"
+            | "project_detection"
             | "remote_exec"
             | "disabled_tools"
             | "bash"
@@ -1689,6 +1692,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     base.indexes = merge_indexes(base.indexes, override_config.indexes, false);
     if override_config.index.is_some() {
         base.index = override_config.index;
+    }
+    if override_config.project_detection.is_some() {
+        base.project_detection = override_config.project_detection;
     }
     if override_config.views.is_some() {
         base.views = override_config.views;
@@ -2473,6 +2479,9 @@ fn record_resource_loosening(
 }
 
 fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<DroppedKey>) {
+    if raw.project_detection.is_some() {
+        push_drop(dropped, "project_detection", tier, USER_ONLY_REASON);
+    }
     if raw
         .storage
         .as_ref()
@@ -6082,6 +6091,97 @@ mod tests {
                 .map(|dropped| dropped.tier.as_str())
                 .collect::<Vec<_>>(),
             vec!["project", "mcp:untrusted"]
+        );
+    }
+
+    #[test]
+    fn project_detection_is_user_only_including_harness_overrides() {
+        use crate::folder_admission::DetectionMode;
+        let user = tier(
+            "user",
+            r#"{
+            "project_detection": {"mode":"off", "overrides":[{"path":"/source", "mode":"project"}]},
+            "harnesses": {"opencode": {"project_detection": {"mode":"workspace"}}}
+        }"#,
+        );
+        let project = tier(
+            "project",
+            r#"{
+            "project_detection": {"mode":"project"},
+            "harnesses": {"opencode": {"project_detection": {"mode":"project"}}}
+        }"#,
+        );
+        let result = super::resolve_config_for_harness(
+            &[user.clone(), project.clone()],
+            Some(&Harness::Opencode),
+        );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(
+            result.config.project_detection.mode,
+            DetectionMode::Workspace
+        );
+        assert!(result.config.project_detection.overrides.is_empty());
+        assert!(result
+            .dropped
+            .iter()
+            .any(|drop| drop.key == "project_detection" && drop.tier == "project"));
+        let result = resolve_config(&[user, project]);
+        assert_eq!(result.config.project_detection.mode, DetectionMode::Off);
+        assert_eq!(result.config.project_detection.overrides.len(), 1);
+        let result = resolve_config(&[tier(
+            "project",
+            r#"{"project_detection":{"mode":"project"}}"#,
+        )]);
+        assert_eq!(result.config.project_detection.mode, DetectionMode::Auto);
+        assert_eq!(result.dropped[0].key, "project_detection");
+    }
+
+    #[test]
+    fn project_detection_rejects_malformed_security_settings() {
+        for doc in [
+            r#"{"project_detection":{"mode":"unknown"}}"#,
+            r#"{"project_detection":null}"#,
+            r#"{"project_detection":{"overrides":[{"path":"/source"}]}}"#,
+            r#"{"project_detection":{"overrides":[{"path":"/source","mode":"project","extra":true}]}}"#,
+            r#"{"project_detection":{"extra":true}}"#,
+        ] {
+            let result = resolve_config(&[tier("user", doc)]);
+            assert_eq!(
+                result.errors,
+                ["invalid_security_config:project_detection"],
+                "{doc}"
+            );
+        }
+        let result = super::resolve_config_for_harness(
+            &[tier(
+                "user",
+                r#"{
+            "harnesses":{"opencode":{"project_detection":{"mode":"unknown"}}}
+        }"#,
+            )],
+            Some(&Harness::Opencode),
+        );
+        assert_eq!(
+            result.errors,
+            ["invalid_security_config:harnesses.opencode.project_detection"]
+        );
+    }
+
+    #[test]
+    fn project_detection_resets_between_binds() {
+        let mut config = Config::default();
+        super::resolve_config_onto(
+            &[tier("user", r#"{"project_detection":{"mode":"project"}}"#)],
+            &mut config,
+        );
+        assert_eq!(
+            config.project_detection.mode,
+            crate::folder_admission::DetectionMode::Project
+        );
+        super::resolve_config_onto(&[], &mut config);
+        assert_eq!(
+            config.project_detection,
+            crate::folder_admission::ProjectDetectionConfig::default()
         );
     }
 

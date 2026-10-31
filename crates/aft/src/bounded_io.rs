@@ -1311,16 +1311,21 @@ fn run_with_timeout<T: Send + 'static>(
                 let mut at = state.deadline;
                 drop(state);
                 let activity = probe.activity.lock().unwrap_or_else(|e| e.into_inner());
+                let blocked_path = activity.path.clone().unwrap_or_else(|| path.to_path_buf());
                 let access_started = if activity.walking {
                     activity.progress.unwrap_or(started)
                 } else {
                     started
                 };
-                let stalled_at = access_started + access_budget;
+                let blocked_budget = if activity.walking {
+                    self::access_budget(&blocked_path)
+                } else {
+                    access_budget
+                };
+                let stalled_at = access_started + blocked_budget;
                 if activity.walking {
                     at = request_deadline.map_or(stalled_at, |deadline| deadline.min(stalled_at));
                 }
-                let blocked_path = activity.path.clone().unwrap_or_else(|| path.to_path_buf());
                 let walk_deadline = activity.walking
                     && request_deadline.is_some_and(|deadline| deadline <= stalled_at);
                 drop(activity);
@@ -1676,6 +1681,24 @@ pub(crate) fn read(path: &Path, at: Option<Instant>) -> io::Result<Vec<u8>> {
     }
 }
 fn regular_read(path: &Path, _no_follow: bool) -> io::Result<Vec<u8>> {
+    regular_read_with_limit(path, _no_follow, None).map(|(bytes, _)| bytes)
+}
+
+pub(crate) fn read_limited(
+    path: &Path,
+    at: Option<Instant>,
+    limit: usize,
+) -> io::Result<(Vec<u8>, bool)> {
+    run(path, at, move |path| {
+        regular_read_with_limit(&path, false, Some(limit))
+    })
+}
+
+fn regular_read_with_limit(
+    path: &Path,
+    _no_follow: bool,
+    limit: Option<usize>,
+) -> io::Result<(Vec<u8>, bool)> {
     if !_no_follow && !std::fs::metadata(path)?.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1708,13 +1731,26 @@ fn regular_read(path: &Path, _no_follow: bool) -> io::Result<Vec<u8>> {
     }
     let mut bytes = Vec::new();
     bytes
-        .try_reserve(usize::try_from(metadata.len()).map_err(io::Error::other)?)
+        .try_reserve(
+            usize::try_from(metadata.len())
+                .map_err(io::Error::other)?
+                .min(limit.map_or(usize::MAX, |limit| limit.saturating_add(1))),
+        )
         .map_err(io::Error::other)?;
-    file.read_to_end(&mut bytes)?;
+    if let Some(limit) = limit {
+        file.take(limit.saturating_add(1) as u64)
+            .read_to_end(&mut bytes)?;
+    } else {
+        file.read_to_end(&mut bytes)?;
+    }
     crate::views::io::WORK
         .content_read_bytes
         .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    Ok(bytes)
+    let cut = limit.is_some_and(|limit| bytes.len() > limit);
+    if let Some(limit) = limit {
+        bytes.truncate(limit);
+    }
+    Ok((bytes, cut))
 }
 pub(crate) fn read_to_string(path: &Path) -> io::Result<String> {
     String::from_utf8(read(path, None)?)

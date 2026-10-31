@@ -1343,6 +1343,21 @@ fn format_bash_write(data: &Value) -> String {
 }
 
 fn format_error(bare_name: &str, data: &Value, ctx: &FormatContext) -> String {
+    if data.get("code").and_then(Value::as_str) == Some("folder_not_admitted") {
+        return data
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|message| !message.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                format!(
+                    "folder_not_admitted: {}",
+                    data.get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("folder_admission_pending")
+                )
+            });
+    }
     if bare_name == "inspect" {
         if let Some(text) = format_inspect_terminal(data) {
             return text;

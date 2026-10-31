@@ -218,6 +218,7 @@ fn spawn_status(result: &ServerAttemptResult) -> String {
             crate::lsp::manager::START_IN_PROGRESS_STATUS.into()
         }
         ServerAttemptResult::ProjectClosed => "project closed; reopen the project and retry".into(),
+        ServerAttemptResult::FolderNotAdmitted => "folder_not_admitted".into(),
         ServerAttemptResult::Ok { .. } => "ok".to_string(),
         ServerAttemptResult::NoRootMarker { .. } => "no_root_marker".to_string(),
         ServerAttemptResult::BinaryNotInstalled { .. } => "binary_not_installed".to_string(),

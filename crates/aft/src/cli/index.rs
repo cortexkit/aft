@@ -270,6 +270,15 @@ fn prepare_snapshot(config: Config, notices: Vec<String>) -> Result<SnapshotPlan
     let report = roots
         .reconcile(&config)
         .map_err(|error| IndexError::validation(error.to_string()))?;
+    for entry in &report.active_entries {
+        let folder = aft::folder_admission_runtime::standalone(&entry.resolved_target, &config)
+            .map_err(|reason| IndexError::validation(format!("folder_not_admitted: {reason}")))?;
+        if folder.classification != aft::folder_admission::FolderClassification::Project {
+            return Err(IndexError::validation(
+                aft::folder_admission_runtime::OFF_TEXT,
+            ));
+        }
+    }
 
     let cache_root = aft::root_cache::cache_root(&config);
     let storage_dir = cache_root.as_path();
@@ -715,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn search_snapshot_discloses_zero_results_and_clears_shared_strict_state() {
+    fn folder_admission_cli_refuses_an_unmarked_root_before_building() {
         let fixture = tempdir().unwrap();
         let source = fixture.path().join("source");
         std::fs::create_dir(&source).unwrap();
@@ -725,6 +734,30 @@ mod tests {
             &user,
             &format!(
                 r#"{{ "index": {{ "roots": [{{ "path": {:?}, "indexes": ["search"] }}] }} }}"#,
+                source
+            ),
+        );
+        let error = run_with_paths(
+            Vec::new(),
+            paths(fixture.path(), &user, &storage),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), aft::folder_admission_runtime::OFF_TEXT);
+        assert!(!storage.join("index").exists());
+    }
+
+    #[test]
+    fn search_snapshot_discloses_zero_results_and_clears_shared_strict_state() {
+        let fixture = tempdir().unwrap();
+        let source = fixture.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let storage = fixture.path().join("storage");
+        let user = fixture.path().join("user-aft.jsonc");
+        write_user_config(
+            &user,
+            &format!(
+                r#"{{ "project_detection": {{ "mode": "project" }}, "index": {{ "roots": [{{ "path": {:?}, "indexes": ["search"] }}] }} }}"#,
                 source
             ),
         );

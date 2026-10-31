@@ -1,0 +1,11 @@
+{
+  "project_detection": {
+    "mode": "off",
+    "overrides": [
+      {
+        "path": "/source",
+        "mode": "project"
+      }
+    ]
+  }
+}

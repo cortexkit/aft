@@ -88,6 +88,9 @@ function goldenParamsFromMerged(
   if (merged.gh_shim !== undefined) {
     params.gh_shim = merged.gh_shim;
   }
+  if (merged.project_detection !== undefined) {
+    params.project_detection = merged.project_detection;
+  }
   if (merged.storage?.cache_dir !== undefined) {
     params.cache_dir = merged.storage.cache_dir;
   }
@@ -181,6 +184,14 @@ const ABSOLUTE_ROOT = "{ABSOLUTE_ROOT}";
 const USER_CACHE_DIR = `${ABSOLUTE_ROOT}/aft-cache`;
 
 const CASES: ParityCase[] = [
+  { name: "project_detection_user_over_project", user: { project_detection: { mode: "off", overrides: [{ path: "/source", mode: "project" }] } }, project: { project_detection: { mode: "project" } } },
+  { name: "project_detection_project_only", project: { project_detection: { mode: "project" } } },
+  { name: "project_detection_user_harness", user: { project_detection: { mode: "off", overrides: [{ path: "/source", mode: "project" }] }, harnesses: { opencode: { project_detection: { mode: "workspace" } } } }, project: { harnesses: { opencode: { project_detection: { mode: "project" } } } } },
+  { name: "project_detection_malformed", user: { project_detection: { mode: "unknown" } } },
+  { name: "project_detection_malformed_harness", user: { harnesses: { opencode: { project_detection: { mode: "unknown" } } } } },
+  { name: "pi_project_detection_user_over_project", harness: "pi", user: { project_detection: { mode: "off" } }, project: { project_detection: { mode: "project" } } },
+  { name: "pi_project_detection_user_harness", harness: "pi", user: { project_detection: { mode: "off" }, harnesses: { pi: { project_detection: { overrides: [{ path: "/source", mode: "project" }] } } } }, project: { harnesses: { pi: { project_detection: { mode: "project" } } } } },
+  { name: "pi_project_detection_malformed", harness: "pi", user: { project_detection: { mode: "unknown" } } },
   { name: "pi_active_harness_ignored_auto_update_hardening", harness: "pi", user: { harnesses: { pi: { auto_update: "opaque", sandbox: { profile: { worker: "strict" } } } } } },
   { name: "malformed_security_sandbox", user: { sandbox: { profile: { worker: 5 } } } },
   { name: "malformed_security_indexes", project: { indexes: { semantic: "off" } } },

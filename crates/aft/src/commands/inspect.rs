@@ -419,6 +419,9 @@ fn verify_final_root_stats(
 }
 
 pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
+    if let Some(response) = crate::folder_admission_runtime::route_index_command(req, ctx) {
+        return response;
+    }
     if let Some(reason) = ctx.cache_unavailable_reason() {
         return Response::error(&req.id, crate::root_cache::CACHE_DIR_UNAVAILABLE, reason);
     }
@@ -1367,6 +1370,9 @@ fn scope_producer_keys(
 /// channel. Keep payload construction and checks that require newly scanned data
 /// in `handle_inspect_payload` and the scanners that produce those results.
 pub fn handle_inspect_deferred(req: &RawRequest, ctx: Arc<AppContext>) -> DispatchOutcome {
+    if let Some(response) = crate::folder_admission_runtime::route_refusal(req, &ctx) {
+        return DispatchOutcome::Immediate(response);
+    }
     handle_inspect_deferred_with_restriction(req, ctx, false)
 }
 

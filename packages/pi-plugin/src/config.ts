@@ -477,6 +477,11 @@ export interface AftConfig {
   indexes?: RawIndexesConfig;
   /** User-tier standing roots; project config cannot configure this machine state. */
   index?: IndexConfig;
+  /** User-only folder admission policy; harness overrides replace this block. */
+  project_detection?: {
+    mode: "auto" | "project" | "workspace" | "off";
+    overrides: { path: string; mode: "auto" | "project" | "workspace" | "off" }[];
+  };
   /** Only the user config's top level may select this existing directory. Caches live in its `aft` child; an unavailable directory disables caches instead of writing them under the storage root. */
   storage?: { cache_dir?: string | null };
   /** Content-addressed index views. Disabled by default. */
@@ -1133,6 +1138,22 @@ const AftConfigFieldsSchema = z.object({
   indexes: IndexesConfigSchema.optional(),
   /** User-configured filesystem roots for indexed search; project config cannot change them. */
   index: IndexConfigSchema.optional(),
+  project_detection: z
+    .object({
+      mode: z.enum(["auto", "project", "workspace", "off"]).default("auto"),
+      overrides: z
+        .array(
+          z
+            .object({
+              path: z.string(),
+              mode: z.enum(["auto", "project", "workspace", "off"]),
+            })
+            .strict(),
+        )
+        .default([]),
+    })
+    .strict()
+    .optional(),
   storage: z.object({ cache_dir: z.string().nullable().optional() }).optional(),
   views: ViewsConfigSchema.optional(),
   callgraph_chunk_size: z.number().optional(),
@@ -2006,6 +2027,7 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // "inspect"/"worktree" handled separately — deep-merged.
   // "backup" — USER ONLY (project config cannot disable or shrink undo backups).
   // "index" — USER ONLY (a repository must not mint machine standing roots).
+  // "project_detection" — USER ONLY (a repository must not admit its own container).
   // "restrict_to_project_root" — USER ONLY (security boundary).
   // "url_fetch_allow_private" — USER ONLY (SSRF surface).
   // "bridge" — USER ONLY (governs bridge safety/restart + per-machine transport budget).
@@ -2052,6 +2074,7 @@ function getStrippedTopLevelKeys(override: AftConfig, base: AftConfig): string[]
   if (override.backup?.enabled !== undefined || override.backup?.max_depth !== undefined)
     stripped.push("backup");
   if (override.index?.roots !== undefined) stripped.push("index.roots");
+  if (override.project_detection !== undefined) stripped.push("project_detection");
   if (override.storage?.cache_dir !== undefined) stripped.push("storage.cache_dir");
   const order = { off: 0, relaxed: 1, strict: 2 };
   for (const role of ["worker", "head"] as const) {
