@@ -768,9 +768,16 @@ fn translate_event(flags: fs::FSEventStreamEventFlags, path: &Path) -> Vec<Event
         events.push(Event::new(EventKind::Remove(item_remove_kind(flags))));
     }
     if has_flag(flags, fs::kFSEventStreamEventFlagItemRenamed) {
-        events.push(Event::new(EventKind::Modify(ModifyKind::Name(
-            RenameMode::Any,
-        ))));
+        let mut event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Any)));
+        if has_flag(flags, fs::kFSEventStreamEventFlagItemIsDir) {
+            // Moving a populated tree into the root can report only the directory,
+            // not its existing children. A per-file refresh of that path would
+            // silently omit every child, so reconcile the corpus instead.
+            event = event
+                .set_flag(Flag::Rescan)
+                .set_info(crate::watcher_filter::DIRECTORY_RENAME_RESCAN_INFO);
+        }
+        events.push(event);
     }
     if has_flag(flags, fs::kFSEventStreamEventFlagItemInodeMetaMod) {
         events.push(Event::new(EventKind::Modify(ModifyKind::Metadata(
@@ -1143,6 +1150,25 @@ mod tests {
         let wrapped = translate_event(fs::kFSEventStreamEventFlagEventIdsWrapped, path);
         assert!(wrapped[0].need_rescan());
         assert!(translate_event(fs::kFSEventStreamEventFlagHistoryDone, path).is_empty());
+    }
+
+    #[test]
+    fn fsevents_directory_rename_requires_child_reconciliation() {
+        let renamed = fs::kFSEventStreamEventFlagItemRenamed;
+        let directory = translate_event(
+            renamed | fs::kFSEventStreamEventFlagItemIsDir,
+            Path::new("/project/crates/new-crate"),
+        );
+        assert!(directory.iter().any(Event::need_rescan));
+        assert!(directory.iter().any(|event| {
+            event.paths == [PathBuf::from("/project/crates/new-crate")]
+                && matches!(event.kind, EventKind::Modify(ModifyKind::Name(_)))
+        }));
+        let file = translate_event(
+            renamed | fs::kFSEventStreamEventFlagItemIsFile,
+            Path::new("/project/crates/file.rs"),
+        );
+        assert!(file.iter().all(|event| !event.need_rescan()));
     }
 
     #[test]

@@ -155,6 +155,8 @@ pub enum RescanReason {
     Unknown,
 }
 
+pub(crate) const DIRECTORY_RENAME_RESCAN_INFO: &str = "rescan: directory renamed";
+
 impl RescanReason {
     fn from_event_info(info: Option<&str>) -> Self {
         match info {
@@ -2430,6 +2432,26 @@ impl WatcherFilterThread {
                     if let Some(journal) = self.config.counters.bash_changes.get() {
                         journal.event_for_root(&event, &self.config.project_root, &self.matcher);
                     }
+                    if event.need_rescan()
+                        && event.info() == Some(DIRECTORY_RENAME_RESCAN_INFO)
+                        && !event.paths.iter().any(|path| {
+                            let path = canonicalize_watcher_path(path.clone());
+                            path.starts_with(&self.config.project_root)
+                                && !watcher_path_is_infra_skip_under(
+                                    &self.config.project_root,
+                                    &path,
+                                )
+                                && !watcher_directory_is_ignored_by_matcher(
+                                    &self.matcher,
+                                    &path,
+                                    &self.config.project_root,
+                                )
+                        })
+                    {
+                        // Unlike a backend drop, a directory rename names its whole
+                        // affected subtree. Ignored build trees need no corpus scan.
+                        continue;
+                    }
                     if event.need_rescan() {
                         // Delay only this test's overflow notification so its
                         // timeout is exercised against worker scheduling.
@@ -3211,6 +3233,55 @@ pub(crate) fn take_watcher_overflow_logs_for_test() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn watcher_directory_rename_rescans_visible_but_not_ignored_trees() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+        let (tx, rx) = watcher_dispatch_channel();
+        let (raw_tx, raw_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut filter = WatcherFilterThread::new(
+            WatcherFilterConfig::new(root.clone(), None),
+            shared_matcher(&root),
+            Arc::new(AtomicU64::new(0)),
+            tx,
+            Arc::clone(&shutdown),
+        );
+        let worker = thread::spawn(move || filter.run(raw_rx));
+        let rename = |path| {
+            notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::Any,
+            )))
+            .set_flag(notify::event::Flag::Rescan)
+            .set_info(DIRECTORY_RENAME_RESCAN_INFO)
+            .add_path(path)
+        };
+        raw_tx.send(Ok(rename(root.join("ignored")))).unwrap();
+        raw_tx.send(Ok(rename(root.join("target")))).unwrap();
+        let cookie = root.join(".aft-cookie-123-directory-rename");
+        std::fs::write(&cookie, b"").unwrap();
+        raw_tx
+            .send(Ok(notify::Event::new(notify::EventKind::Create(
+                notify::event::CreateKind::File,
+            ))
+            .add_path(cookie.clone())))
+            .unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            WatcherDispatchEvent::CookieObserved(cookie),
+            "ignored directory renames must not request a corpus rebuild"
+        );
+        raw_tx.send(Ok(rename(root.join("crates/new")))).unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            WatcherDispatchEvent::RescanRequired(RescanReason::Unknown)
+        );
+        shutdown.store(true, Ordering::SeqCst);
+        drop(raw_tx);
+        worker.join().unwrap();
+    }
+
     #[test]
     fn watcher_cookie_bypasses_ignore_and_flushes_mixed_paths_before_ack() {
         let temp = tempfile::tempdir().unwrap();

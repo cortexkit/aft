@@ -1,0 +1,1 @@
+- Grep and search now discover files inside directories moved into a watched macOS project without first editing each file through the file tools. While a watcher rescan catches up, text queries stop using the old index to rule out matches.

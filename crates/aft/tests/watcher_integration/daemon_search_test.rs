@@ -214,26 +214,24 @@ async fn assert_visible(daemon: &mut Daemon, relative: &str, marker: &str) {
             .call("grep", json!({"pattern":marker, "path":"crates"}))
             .await;
         let data = &grep["structuredContent"];
-        if data["index_status"] == "Ready" && data["total_matches"] == 1 {
-            break;
+        let search = daemon
+            .call("search", json!({"pattern":marker, "includeTests":true}))
+            .await;
+        let search_found = search["structuredContent"]["results"]
+            .as_array()
+            .is_some_and(|rows| {
+                rows.iter()
+                    .any(|r| r["file"].as_str().is_some_and(|p| p.ends_with(relative)))
+            });
+        if data["index_status"] == "Ready" && data["total_matches"] == 1 && search_found {
+            return;
         }
         assert!(
             Instant::now() < deadline,
-            "indexed directory grep missed {relative}: {grep}"
+            "external file {relative} missing from indexed directory grep or search:\ngrep: {grep}\nsearch: {search}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let search = daemon
-        .call("search", json!({"pattern":marker, "includeTests":true}))
-        .await;
-    assert!(
-        search["structuredContent"]["results"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|r| r["file"].as_str().is_some_and(|p| p.ends_with(relative))),
-        "search missed {relative}: {search}"
-    );
 }
 
 #[tokio::test]
@@ -265,6 +263,12 @@ async fn bound_daemon_external_changes_reach_indexed_grep_and_search() {
         "// git_checkout_marker\n",
     )
     .unwrap();
+    std::fs::create_dir_all(root.join("crates/git-added/test-vectors/empty-claim")).unwrap();
+    std::fs::write(
+        root.join("crates/git-added/test-vectors/empty-claim/README.md"),
+        "git_readme_marker\n",
+    )
+    .unwrap();
     git(root, &["add", "."]);
     git(root, &["commit", "-qm", "add crate"]);
     git(root, &["checkout", "-q", "-"]);
@@ -284,6 +288,8 @@ async fn bound_daemon_external_changes_reach_indexed_grep_and_search() {
         "copied_file_marker",
         "bash_file_marker",
         "moved_directory_marker",
+        "git_readme_marker",
+        "changed_file_marker",
     ] {
         daemon
             .call("search", json!({"pattern":marker,"includeTests":true}))
@@ -306,7 +312,7 @@ async fn bound_daemon_external_changes_reach_indexed_grep_and_search() {
         .status()
         .unwrap();
     assert!(copied.success());
-    let bash = daemon.call("bash", json!({"command":"printf '// bash_file_marker\\n' > crates/old/src/bash.rs", "wait":true})).await;
+    let bash = daemon.call("bash", json!({"command":"printf '// bash_file_marker\\n' > crates/old/src/bash.rs; printf '// changed_file_marker\\n' > crates/old/src/lib.rs", "wait":true})).await;
     assert_ne!(bash["isError"], true, "{bash}");
     let moved = state.path().join("moved");
     std::fs::create_dir_all(moved.join("src")).unwrap();
@@ -318,6 +324,11 @@ async fn bound_daemon_external_changes_reach_indexed_grep_and_search() {
         ("crates/copied/src/lib.rs", "copied_file_marker"),
         ("crates/old/src/bash.rs", "bash_file_marker"),
         ("crates/moved/src/lib.rs", "moved_directory_marker"),
+        (
+            "crates/git-added/test-vectors/empty-claim/README.md",
+            "git_readme_marker",
+        ),
+        ("crates/old/src/lib.rs", "changed_file_marker"),
     ] {
         assert_visible(&mut daemon, file, marker).await;
     }
