@@ -8418,6 +8418,18 @@ pub(crate) fn drain_standalone_configure_unit(
         && !continuation.job.root_too_broad
         && !crate::views::parent::held_by(ctx, &continuation.job.canonical_cache_root)
     {
+        if ctx.views_route_root() {
+            // As on the attached path: every read of a routed root goes through
+            // its v3 checkout views, so the v1 view is neither opened nor
+            // published. Opening it ran `git ls-tree` and `git check-attr` over
+            // every tracked path twice and wrote a pending status row per path
+            // that no publication would ever settle. The lexical view binds on
+            // the first query, as it already did on this transport.
+            ctx.drop_v1_view_runtime();
+            continuation.view_load = None;
+            continuation.stage = ConfigureMaintenanceStage::StorageSweeps;
+            return true;
+        }
         if continuation.view_load.is_none() {
             let (tx, rx) = crossbeam_channel::bounded(1);
             let job = continuation.job.clone();
@@ -15462,6 +15474,49 @@ mod tests {
             .success
         );
         assert!(!off.views_route_root());
+    }
+
+    /// The standalone transport, the plugins' default, drains configure
+    /// maintenance through `drain_standalone_configure_unit` instead of the
+    /// attached path. A routed root opens no v1 view there either: no v1 blob
+    /// stores, no v1 view directory and no pending status rows.
+    #[test]
+    fn views_routed_root_on_the_standalone_drain_opens_no_v1_view() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("a.ts"),
+            "export function target() { return 1; }\n",
+        )
+        .unwrap();
+        git_commit_all(&root, "graph");
+        let root = std::fs::canonicalize(root).unwrap();
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
+                .success
+        );
+        assert!(ctx.views_route_root());
+
+        let mut state = super::ConfigureMaintenanceState::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            super::drain_standalone_configure_prefix(&ctx, &mut state);
+            let worked = super::drain_standalone_configure_unit(&ctx, &mut state);
+            if !worked && !super::standalone_configure_maintenance_pending(&ctx, &mut state) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "standalone configure maintenance never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(legacy_views_on_writes(&storage), Vec::<String>::new());
+        assert!(ctx.view_runtime_snapshot().is_none());
     }
 
     /// Idle eviction releases a routed root's lexical and call-graph views,
