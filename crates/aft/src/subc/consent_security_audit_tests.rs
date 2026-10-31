@@ -572,7 +572,7 @@ async fn audit_shell_approval_cannot_release_a_different_waiting_command() {
         .send_tool(
             &run,
             "bash",
-            json!({"command":command_a,"sandbox":"host"}),
+            json!({"command":command_a,"sandbox":"host","workdir":run.project_root}),
             9411,
             escalation_dispatch,
         )
@@ -583,7 +583,7 @@ async fn audit_shell_approval_cannot_release_a_different_waiting_command() {
         .send_tool(
             &run,
             "bash",
-            json!({"command":command_b,"sandbox":"host"}),
+            json!({"command":command_b,"sandbox":"host","workdir":run.project_root}),
             9412,
             escalation_dispatch,
         )
@@ -608,10 +608,13 @@ async fn audit_shell_approval_cannot_release_a_different_waiting_command() {
     .await;
     audit_assert_call_key_conflict(&changed_cwd);
     control.answer(&request_a, "allow_once");
-    assert!(late(&f, &run, 9411)
-        .await
-        .to_string()
-        .contains(run.project_root.to_str().unwrap()));
+    let result = late(&f, &run, 9411).await;
+    assert!(
+        result
+            .to_string()
+            .contains(run.project_root.to_str().unwrap()),
+        "{result}"
+    );
     assert_eq!(std::fs::read_to_string(approved).unwrap(), "x");
     assert!(
         !unapproved.exists(),
