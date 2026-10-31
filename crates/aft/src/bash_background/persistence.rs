@@ -2795,7 +2795,11 @@ const METADATA_OPEN_ATTEMPTS: u32 = 8;
 /// would then rename a live task's whole bundle away just because its metadata
 /// was being written at that moment.
 fn open_metadata_through_replacement(dir: &PinnedDir, name: &OsStr) -> io::Result<File> {
-    retry_artifact_read(|| dir.open_file(name, false))
+    retry_artifact_read(|| {
+        #[cfg(test)]
+        work_counts::record_metadata_open();
+        dir.open_file(name, false)
+    })
 }
 
 /// Retry a complete read attempt so validation never reuses an unlinked handle.
@@ -2984,6 +2988,8 @@ fn write_task_at_with(
     metadata: &PersistedTask,
     sync: ReplaceSync,
 ) -> io::Result<()> {
+    #[cfg(test)]
+    work_counts::record_metadata_write();
     if metadata.task_id != task.paths.task_id {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -4899,6 +4905,8 @@ pub(crate) mod work_counts {
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub(crate) struct Counts {
         pub opens: usize,
+        pub metadata_opens: usize,
+        pub metadata_writes: usize,
         pub metadata_reads: usize,
         pub parses: usize,
         pub marker_reads: usize,
@@ -4928,6 +4936,12 @@ pub(crate) mod work_counts {
 
     pub(crate) fn record_open() {
         record(|counts| counts.opens += 1);
+    }
+    pub(crate) fn record_metadata_open() {
+        record(|counts| counts.metadata_opens += 1);
+    }
+    pub(crate) fn record_metadata_write() {
+        record(|counts| counts.metadata_writes += 1);
     }
     pub(crate) fn record_sync() {
         record(|counts| counts.syncs += 1);
