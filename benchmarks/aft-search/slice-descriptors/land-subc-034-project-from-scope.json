@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "subc-034-project-from-scope"
+  ],
+  "note": "Subconscious 0.34 protocol move: project folder from the scope stamp. No search ranking code changes."
+}
