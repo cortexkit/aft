@@ -1,0 +1,12 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "trigram-warm-start"
+  ],
+  "note": "The ranking-fenced search_index.rs change persists the trigram index's warm-verification proofs next to cache.bin, so a restart with unchanged files skips rereading them. Which files are indexed, their trigrams, candidate selection, scoring and ordering are unchanged; benchmark rows must remain byte-identical."
+}

@@ -225,35 +225,55 @@ impl PinnedExecutable {
         let _ = std::fs::remove_dir_all(&self.directory);
     }
 
-    #[cfg(unix)]
     fn task_image(&self, task_io: &Path) -> io::Result<PathBuf> {
         let executable = self.path()?;
         let directory = task_io.join(TASK_IMAGE_DIR);
         crate::private_storage::create_dir(&directory)?;
-        let destination = directory.join("aft");
-        let mut source = std::fs::File::open(&executable)?;
-        materialize(&executable, &mut source, &destination, |from, to| {
-            std::fs::hard_link(from, to)
-        })?;
-        let shims = self.directory.join("shims");
-        if shims.join("gh").is_symlink() {
-            let target = std::fs::read_link(shims.join("gh"))?;
-            let target = if target == self.executable {
-                destination
-            } else {
-                target
-            };
-            crate::private_storage::create_dir(&directory.join("shims"))?;
-            std::os::unix::fs::symlink(target, directory.join("shims/gh"))?;
+        let destination = task_executable(task_io);
+        #[cfg(unix)]
+        {
+            let mut source = std::fs::File::open(&executable)?;
+            materialize(&executable, &mut source, &destination, |from, to| {
+                std::fs::hard_link(from, to)
+            })?;
+            let shims = self.directory.join("shims");
+            if shims.join("gh").is_symlink() {
+                let target = std::fs::read_link(shims.join("gh"))?;
+                let target = if target == self.executable {
+                    destination
+                } else {
+                    target
+                };
+                crate::private_storage::create_dir(&directory.join("shims"))?;
+                std::os::unix::fs::symlink(target, directory.join("shims/gh"))?;
+            }
+        }
+        #[cfg(windows)]
+        {
+            // Windows keeps the running deployment image locked, but not the
+            // daemon-owned gh.cmd pathname. Retain both in the task's lifetime.
+            if std::fs::hard_link(&executable, &destination).is_err() {
+                std::fs::copy(&executable, &destination)?;
+            }
+            let shim = self.directory.join("shims/gh.cmd");
+            if shim.is_file() {
+                let contents = std::fs::read(&shim)?;
+                let contents = if contents == crate::agent_child_env::windows_gh_cmd(&executable) {
+                    crate::agent_child_env::windows_gh_cmd(&destination)
+                } else {
+                    contents
+                };
+                crate::private_storage::create_dir(&directory.join("shims"))?;
+                std::fs::write(directory.join("shims/gh.cmd"), contents)?;
+            }
         }
         Ok(directory)
     }
 }
 
 /// Freeze the launcher and shim into the task's own artifact lifetime before
-/// constructing either backend's profile. Detached tasks can outlive a module
-/// restart, including while sandbox-launch is still applying its rules.
-#[cfg(unix)]
+/// constructing a native profile or launching an unconfined shell. Foreground
+/// tasks need the same lifetime because they can be promoted to background.
 pub(crate) fn with_task_image<R>(task_io: &Path, run: impl FnOnce() -> R) -> io::Result<R> {
     let Some(pin) = PINNED.get() else {
         return Ok(run());
@@ -271,6 +291,49 @@ pub(crate) fn with_task_image<R>(task_io: &Path, run: impl FnOnce() -> R) -> io:
     Ok(run())
 }
 
+pub(crate) fn task_executable(task_io: &Path) -> PathBuf {
+    task_io
+        .join(TASK_IMAGE_DIR)
+        .join(if cfg!(windows) { "aft.exe" } else { "aft" })
+}
+
+/// Non-launcher plans have no launcher pathname to carry the retained image.
+/// Redirect their request overrides before either the pipe or PTY adapter runs.
+pub(crate) fn retain_task_environment(
+    task_io: &Path,
+    environment: &mut std::collections::HashMap<String, String>,
+) -> io::Result<()> {
+    with_task_image(task_io, || {
+        let mut values = environment
+            .iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect();
+        task_environment(&task_executable(task_io), &mut values);
+        *environment = values
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+    })
+}
+
+pub(crate) fn is_dead_pin_path(path: &Path) -> bool {
+    path.is_absolute()
+        && path.ancestors().any(|ancestor| {
+            ancestor
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(owner)
+                .is_some()
+                && ancestor.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new("run"))
+        })
+        && matches!(path.try_exists(), Ok(false))
+}
+
 pub(crate) fn task_environment(
     launcher: &Path,
     environment: &mut std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
@@ -285,6 +348,9 @@ pub(crate) fn task_environment(
         return;
     };
     let redirect = |path: &Path| {
+        if path == pin.executable {
+            return launcher.to_path_buf();
+        }
         path.strip_prefix(&pin.directory)
             .map(|suffix| directory.join(suffix))
             .unwrap_or_else(|_| path.to_path_buf())
@@ -300,6 +366,7 @@ pub(crate) fn task_environment(
     if let Some(value) = environment.get_mut(std::ffi::OsStr::new("PATH")) {
         let entries = std::env::split_paths(value)
             .map(|path| redirect(&path))
+            .filter(|path| !is_dead_pin_path(path))
             .collect::<Vec<_>>();
         if let Ok(path) = std::env::join_paths(entries) {
             *value = path;
@@ -402,7 +469,7 @@ pub fn cleanup_at_exit() {
 /// and library-only hosts that have not initialized a pin.
 pub fn path() -> io::Result<PathBuf> {
     if let Some(directory) = TASK_IMAGE.with(|slot| slot.borrow().clone()) {
-        return Ok(directory.join("aft"));
+        return Ok(directory.join(if cfg!(windows) { "aft.exe" } else { "aft" }));
     }
     if let Some(pin) = PINNED.get() {
         return pin.path();
@@ -549,6 +616,263 @@ mod tests {
             .unwrap();
         assert!(output.status.success(), "{output:?}");
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 test"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_executable_unsandboxed_background_shim_outlives_daemon_pin() {
+        use crate::bash_background::{
+            persistence, registry::BgTaskRegistry, BashShell, HardKill, TaskSlot,
+        };
+        use crate::sandbox_spawn::SpawnPlan;
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        const CHILD: &str = "AFT_TEST_PIN_TASK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // PINNED is process-global; exercise the normal task-launch path without
+            // changing executable discovery for other tests in this process.
+            let fixture = tempfile::tempdir().unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args([
+                "--exact",
+                "pinned_executable::tests::pinned_executable_unsandboxed_background_shim_outlives_daemon_pin",
+                "--nocapture",
+            ]);
+            for key in [
+                "HOME",
+                "XDG_DATA_HOME",
+                "XDG_CACHE_HOME",
+                "XDG_CONFIG_HOME",
+                "AFT_STORAGE_DIR",
+            ] {
+                let directory = fixture.path().join(key);
+                std::fs::create_dir(&directory).unwrap();
+                child.env(key, directory);
+            }
+            let output = child.env(CHILD, "1").output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+
+        let storage = PathBuf::from(std::env::var_os("AFT_STORAGE_DIR").unwrap());
+        PINNED
+            .set(prepare(&storage).unwrap())
+            .ok()
+            .expect("isolated pin");
+        let pin = PINNED.get().unwrap();
+        std::fs::create_dir(pin.directory.join("shims")).unwrap();
+        std::os::unix::fs::symlink(&pin.executable, pin.directory.join("shims/gh")).unwrap();
+        let registry = BgTaskRegistry::default();
+        struct Shutdown<'a>(&'a BgTaskRegistry);
+        impl Drop for Shutdown<'_> {
+            fn drop(&mut self) {
+                self.0.shutdown();
+            }
+        }
+        let _shutdown = Shutdown(&registry);
+        let mut tasks = Vec::new();
+        for mode in ["background", "promoted", "pty", "host"] {
+            let environment = HashMap::from([
+                (
+                    "PATH".to_owned(),
+                    std::env::join_paths([
+                        pin.directory.join("shims"),
+                        storage.join("run/aft-pinned-99-99/shims"),
+                        PathBuf::from("/usr/bin"),
+                        PathBuf::from("/bin"),
+                    ])
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                ),
+                (
+                    crate::agent_child_env::GH_SHIMS_DIR_ENV.to_owned(),
+                    pin.directory.join("shims").to_string_lossy().into_owned(),
+                ),
+                (
+                    crate::agent_child_env::GH_SHIM_BINARY_ENV.to_owned(),
+                    pin.executable.to_string_lossy().into_owned(),
+                ),
+            ]);
+            let command = format!(
+                ": > ready-{mode}; while [ ! -f release ]; do /bin/sleep 0.02; done; \
+                 printf '%s\\n' \"$(command -v gh)\" \"$AFT_GH_SHIMS_DIR\" \"$AFT_GH_SHIM_BINARY\" \"$PATH\" > resolved-{mode}; \
+                 gh --list pinned_executable_cleanup_preserves_live_owner > output-{mode} 2>&1; \
+                 shim_status=$?; \"$AFT_GH_SHIM_BINARY\" --list pinned_executable_cleanup_preserves_live_owner > binary-output-{mode} 2>&1; \
+                 printf '%s:%s' \"$shim_status\" \"$?\" > status-{mode}.tmp; /bin/mv status-{mode}.tmp status-{mode}"
+            );
+            let plan = if mode == "host" {
+                use crate::sandbox_spawn::{
+                    AuthenticatedPrincipal, HostEscalationAttempt, RequestedSandboxTier,
+                    SandboxTaskKind,
+                };
+                let mut config = crate::config::Config {
+                    project_root: Some(storage.clone()),
+                    storage_dir: Some(storage.clone()),
+                    ..crate::config::Config::default()
+                };
+                config.sandbox.profile.head = crate::config::SandboxMode::Strict;
+                let ctx = crate::context::AppContext::new(
+                    Box::new(crate::parser::TreeSitterProvider::new()),
+                    config,
+                );
+                let approved = environment
+                    .iter()
+                    .map(|(key, value)| (key.into(), value.into()))
+                    .collect();
+                let attempt = HostEscalationAttempt {
+                    grant_id: crate::sandbox_spawn::mint_host_escalation_grant(
+                        &ctx,
+                        &AuthenticatedPrincipal::FirstParty,
+                        command.as_bytes(),
+                        &storage,
+                        &storage,
+                        Path::new("/bin/bash"),
+                        &approved,
+                        &storage,
+                        "pin-lifetime",
+                    )
+                    .unwrap(),
+                    command: command.as_bytes().to_vec(),
+                    root: storage.clone(),
+                    cwd: storage.clone(),
+                    shell_path: PathBuf::from("/bin/bash"),
+                    environment: approved,
+                };
+                let plan = crate::sandbox_spawn::resolve_sandbox_spawn(
+                    &ctx,
+                    &AuthenticatedPrincipal::FirstParty,
+                    RequestedSandboxTier::Host,
+                    SandboxTaskKind::BashBackground,
+                    &storage,
+                    Some(&attempt),
+                );
+                assert!(
+                    plan.refusal_code().is_none(),
+                    "host grant rejected: {plan:?}"
+                );
+                plan
+            } else {
+                SpawnPlan::Unsandboxed
+            };
+            let task_id = if mode == "pty" {
+                registry.spawn_pty_with_shell(
+                    plan,
+                    &command,
+                    BashShell::Bash,
+                    PathBuf::from("/bin/bash"),
+                    "pin-lifetime".into(),
+                    storage.clone(),
+                    environment,
+                    HardKill::Default,
+                    None,
+                    storage.clone(),
+                    8,
+                    false,
+                    false,
+                    Some(storage.clone()),
+                    24,
+                    80,
+                )
+            } else {
+                registry.spawn_with_shell_in_slot(
+                    plan,
+                    &command,
+                    BashShell::Bash,
+                    PathBuf::from("/bin/bash"),
+                    "pin-lifetime".into(),
+                    storage.clone(),
+                    environment,
+                    HardKill::Default,
+                    None,
+                    storage.clone(),
+                    if mode == "promoted" {
+                        TaskSlot::Foreground
+                    } else {
+                        TaskSlot::Background { max: 8 }
+                    },
+                    false,
+                    false,
+                    Some(storage.clone()),
+                )
+            }
+            .unwrap();
+            if mode == "promoted" {
+                assert!(registry.promote(&task_id, "pin-lifetime").unwrap());
+            }
+            let session = persistence::session_tasks_dir(&storage, "pin-lifetime");
+            let task = persistence::resolve_task_layout(&session, &task_id).unwrap();
+            tasks.push((mode, task.paths.io_dir));
+        }
+        let wait_for_file = |name: &str| {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !storage.join(name).is_file() {
+                assert!(Instant::now() < deadline, "task never wrote {name}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        for (mode, _) in &tasks {
+            wait_for_file(&format!("ready-{mode}"));
+        }
+        pin.cleanup_at_exit();
+        assert!(!pin.directory.exists());
+        std::fs::write(storage.join("release"), b"go").unwrap();
+        for (mode, task_io) in tasks {
+            wait_for_file(&format!("status-{mode}"));
+            assert_eq!(
+                std::fs::read_to_string(storage.join(format!("status-{mode}"))).unwrap(),
+                "0:0",
+                "{mode}: {:?}",
+                std::fs::read_to_string(storage.join(format!("output-{mode}")))
+            );
+            let image = task_io.join(TASK_IMAGE_DIR);
+            assert_eq!(
+                std::fs::read_to_string(storage.join(format!("resolved-{mode}"))).unwrap(),
+                format!(
+                    "{}\n{}\n{}\n{}:/usr/bin:/bin\n",
+                    image.join("shims/gh").display(),
+                    image.join("shims").display(),
+                    image.join("aft").display(),
+                    image.join("shims").display()
+                ),
+                "{mode}",
+            );
+            assert!(
+                std::fs::read_to_string(storage.join(format!("output-{mode}")))
+                    .unwrap()
+                    .contains("1 test"),
+                "{mode} did not execute the retained shim"
+            );
+            assert!(
+                std::fs::read_to_string(storage.join(format!("binary-output-{mode}")))
+                    .unwrap()
+                    .contains("1 test"),
+                "{mode} did not execute the retained hook binary"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pinned_executable_windows_task_wrapper_outlives_daemon_pin() {
+        let storage = tempfile::tempdir().unwrap();
+        let task = tempfile::tempdir().unwrap();
+        let pin = prepare(storage.path()).unwrap();
+        std::fs::create_dir(pin.directory.join("shims")).unwrap();
+        std::fs::write(
+            pin.directory.join("shims/gh.cmd"),
+            crate::agent_child_env::windows_gh_cmd(&pin.executable),
+        )
+        .unwrap();
+        let image = pin.task_image(task.path()).unwrap();
+        pin.cleanup_at_exit();
+        assert!(!pin.directory.exists());
+        assert_eq!(
+            std::fs::read(image.join("shims/gh.cmd")).unwrap(),
+            crate::agent_child_env::windows_gh_cmd(&image.join("aft.exe"))
+        );
+        assert!(image.join("aft.exe").is_file());
     }
 
     #[cfg(unix)]
