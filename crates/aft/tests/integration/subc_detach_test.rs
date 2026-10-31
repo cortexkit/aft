@@ -1737,7 +1737,7 @@ fn scope_project_case_034(
                     assert_eq!(reply.header.ty, FrameType::Error);
                     let error: Value = serde_json::from_slice(&reply.body).unwrap();
                     assert_eq!(error["code"], "project_required");
-                    assert!(error["message"].as_str().unwrap().contains("scope workdir"));
+                    assert!(error["message"].as_str().unwrap().contains("project folder"));
                 } else {
                     assert_eq!(reply.header.ty, FrameType::Response, "{}", frame_body(&reply));
                     assert!(!tool_result_is_error(&reply), "{}", frame_body(&reply));
@@ -1823,7 +1823,7 @@ fn subc_034_project_empty_scope_workdir_is_refused() {
 }
 
 #[test]
-fn subc_034_project_missing_scope_workdir_does_not_use_legacy_root() {
+fn subc_034_project_missing_scope_workdir_uses_daemon_filled_root() {
     scope_project_case_034(
         |project, _| {
             let mut bind = scope_project_bind_034(project);
@@ -1831,7 +1831,7 @@ fn subc_034_project_missing_scope_workdir_does_not_use_legacy_root() {
             bind["identity"]["project_root"] = json!(project);
             bind
         },
-        Some("invalid_workdir"),
+        None,
         false,
     );
 }
@@ -1860,5 +1860,19 @@ fn subc_034_project_unscoped_legacy_root_keeps_serving_files() {
         },
         None,
         false,
+    );
+}
+
+#[test]
+fn subc_034_project_unscoped_slash_refuses_read_and_grep_but_serves_catalog() {
+    scope_project_case_034(
+        |project, _| {
+            let mut bind = scope_project_bind_034(project);
+            bind.as_object_mut().unwrap().remove("scope");
+            bind["identity"]["project_root"] = json!("/");
+            bind
+        },
+        None,
+        true,
     );
 }

@@ -28,16 +28,16 @@ async fn main() {
     let scope = ScopeRecord::new("e2e-project", 1, ScopeKind::Head)
         .with_workdir(Some(project.to_string_lossy().into_owned()))
         .with_carriers(vec![ScopeCarrier::new(Principal::Direct)]);
+    let legacy_scope = ScopeRecord::new("e2e-no-workdir", 1, ScopeKind::Head)
+        .with_carriers(vec![ScopeCarrier::new(Principal::Direct)]);
     let reply = handle
-        .scope_sync(1, vec![scope])
+        .scope_sync(1, vec![scope, legacy_scope])
         .await
         .expect("register test scope");
-    assert_eq!(reply.results.len(), 1, "{reply:?}");
-    assert_ne!(
-        reply.results[0].outcome,
-        ScopeRecordOutcome::Refused,
-        "{reply:?}"
-    );
+    assert_eq!(reply.results.len(), 2, "{reply:?}");
+    for result in &reply.results {
+        assert_ne!(result.outcome, ScopeRecordOutcome::Refused, "{reply:?}");
+    }
     std::fs::write(fixture.join("scope-owner.ready"), b"ready").expect("publish scope readiness");
     serving
         .await

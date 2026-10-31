@@ -5,6 +5,8 @@
 //! The owner registers a workdir; project-free consumers then open scoped
 //! routes through daemon admission, which attaches the registered scope's
 //! workdir to the route bind AFT receives.
+//! AFT keeps compatibility folder fields enabled; an explicit / is a no-project
+//! sentinel, never a project spanning the filesystem.
 //!
 //! Run the opt-in tests with:
 //!
@@ -22,7 +24,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use subc_client_rs::{CallError, CallOptions, ConsumerOptions, RouteHandle, SubcConsumer};
-use subc_protocol::{BindIdentity, RouteTarget};
+use subc_protocol::{BindIdentity, Flags, Frame, FrameType, Priority, RouteTarget};
+use subc_transport::{authenticate_client, read_frame, write_frame};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 
 #[path = "helpers/aft_binary.rs"]
 mod aft_binary;
@@ -183,12 +188,7 @@ fn fixture_logs(directory: &Path) -> String {
     logs
 }
 
-async fn open(
-    consumer: &SubcConsumer,
-    project: &Path,
-    session: &str,
-    role_versions: Option<&[(&str, &str)]>,
-) -> Result<RouteHandle, CallError> {
+async fn wait_for_scope_owner(project: &Path) {
     let ready = project.parent().unwrap().join("scope-owner.ready");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while !ready.exists() {
@@ -199,6 +199,15 @@ async fn open(
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+async fn open(
+    consumer: &SubcConsumer,
+    project: &Path,
+    session: &str,
+    role_versions: Option<&[(&str, &str)]>,
+) -> Result<RouteHandle, CallError> {
+    wait_for_scope_owner(project).await;
     let scope = subc_protocol::scope::ScopeSelector::new(
         subc_protocol::Principal::Reserved {
             module_id: "aft-test-scope-owner".into(),
@@ -413,7 +422,7 @@ async fn tool_provider_subc_e2e_role_versions_select_v1_and_leave_legacy_routes_
 
 #[tokio::test]
 #[ignore = "opt-in daemon 0.39 integration; run with --features test-scope-owner"]
-async fn tool_provider_subc_e2e_project_free_bind_uses_owned_scope_workdir() {
+async fn tool_provider_subc_e2e_scope_workdir_compatibility_bind_serves_files() {
     let (_temp, home, project) = hermetic_home();
     let daemon = HermeticDaemon::start(&home).await;
     let consumer = SubcConsumer::connect(&daemon.connection_file, ConsumerOptions::default())
@@ -447,4 +456,156 @@ async fn tool_provider_subc_e2e_project_free_bind_uses_owned_scope_workdir() {
     }
     consumer.close().await;
     drop(daemon);
+}
+
+async fn legacy_rpc(
+    stream: &mut TcpStream,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    body: Value,
+) -> Frame {
+    let frame = Frame::build(
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        epoch,
+        corr,
+        serde_json::to_vec(&body).unwrap(),
+    )
+    .unwrap();
+    write_frame(stream, &frame).await.unwrap();
+    stream.flush().await.unwrap();
+    loop {
+        let reply = tokio::time::timeout(Duration::from_secs(60), read_frame(stream))
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("legacy client connection closed");
+        if reply.header.ty == FrameType::Push {
+            continue;
+        }
+        assert_eq!((reply.header.channel, reply.header.corr), (channel, corr));
+        return reply;
+    }
+}
+
+async fn open_legacy_root(
+    connection_file: &Path,
+    root: &Path,
+    scope: Option<Value>,
+) -> (TcpStream, u16, u32) {
+    let info = subc_transport::read_for_client(connection_file).unwrap();
+    let endpoint = info.endpoints.first().unwrap();
+    let mut stream = TcpStream::connect((endpoint.host.as_str(), endpoint.port))
+        .await
+        .unwrap();
+    stream.set_nodelay(true).unwrap();
+    authenticate_client(&mut stream, &info, Duration::from_secs(5))
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        // The legacy root is raw JSON because protocol 0.34's BindIdentity no
+        // longer has a project field, while older consumers still send it.
+        let mut request = json!({
+            "op":"route.open",
+            "target":{"kind":"tool_provider", "module_id":"aft"},
+            "identity":{"harness":"opencode", "session":"unscoped-legacy-e2e", "project_root":root},
+        });
+        if let Some(scope) = &scope {
+            request["scope"] = scope.clone();
+        }
+        let reply = legacy_rpc(&mut stream, 0, 0, 1, request).await;
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        if reply.header.ty == FrameType::Response {
+            return (
+                stream,
+                u16::try_from(body["route_channel"].as_u64().unwrap()).unwrap(),
+                u32::try_from(body["route_epoch"].as_u64().unwrap()).unwrap(),
+            );
+        }
+        let code = body["code"].as_str().unwrap_or_default();
+        assert!(
+            subc_protocol::error_codes::is_retryable_route_open(code)
+                && tokio::time::Instant::now() < deadline,
+            "legacy route open: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn legacy_root_case(no_project: bool, scoped_without_workdir: bool) {
+    let (_temp, home, project) = hermetic_home();
+    let daemon = HermeticDaemon::start(&home).await;
+    let root = if no_project {
+        Path::new("/")
+    } else {
+        project.as_path()
+    };
+    let scope = if scoped_without_workdir {
+        wait_for_scope_owner(&project).await;
+        Some(json!({
+            "owner":{"kind":"reserved", "module_id":"aft-test-scope-owner"},
+            "ref":"e2e-no-workdir", "scope_epoch":1,
+        }))
+    } else {
+        None
+    };
+    let (mut stream, channel, epoch) = open_legacy_root(&daemon.connection_file, root, scope).await;
+    for (corr, name, arguments) in [
+        (2, "read", json!({"path":project.join("seed.txt")})),
+        (
+            3,
+            "grep",
+            json!({"pattern":"seed line one", "path":project}),
+        ),
+    ] {
+        let reply = legacy_rpc(
+            &mut stream,
+            channel,
+            epoch,
+            corr,
+            json!({"name":name, "preset":"head", "arguments":arguments}),
+        )
+        .await;
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        if no_project {
+            assert_eq!(reply.header.ty, FrameType::Error, "{body}");
+            assert_eq!(body["code"], "project_required");
+        } else {
+            assert_eq!(reply.header.ty, FrameType::Response, "{body}");
+            assert_ne!(body["isError"], true, "{body}");
+            assert!(
+                String::from_utf8_lossy(&reply.body).contains("seed line one"),
+                "{body}"
+            );
+        }
+    }
+    let catalog = legacy_rpc(&mut stream, channel, epoch, 4, json!({"op":"tool.catalog"})).await;
+    assert_eq!(catalog.header.ty, FrameType::Response);
+    let body: Value = serde_json::from_slice(&catalog.body).unwrap();
+    assert!(body["tools"]
+        .as_array()
+        .is_some_and(|tools| !tools.is_empty()));
+    drop(stream);
+    drop(daemon);
+}
+
+#[tokio::test]
+#[ignore = "opt-in daemon 0.39 integration; run with --features test-scope-owner"]
+async fn tool_provider_subc_e2e_unscoped_legacy_root_serves_files() {
+    legacy_root_case(false, false).await;
+}
+
+#[tokio::test]
+#[ignore = "opt-in daemon 0.39 integration; run with --features test-scope-owner"]
+async fn tool_provider_subc_e2e_unscoped_slash_refuses_files_but_serves_catalog() {
+    legacy_root_case(true, false).await;
+}
+
+#[tokio::test]
+#[ignore = "opt-in daemon 0.39 integration; run with --features test-scope-owner"]
+async fn tool_provider_subc_e2e_scope_without_workdir_uses_filled_legacy_root() {
+    legacy_root_case(false, true).await;
 }

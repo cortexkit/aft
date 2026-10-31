@@ -1581,7 +1581,7 @@ impl RouteIdentity {
 #[derive(Debug)]
 struct RouteIdentityData {
     root: ProjectRootId,
-    /// Resolved scope workdir, or the legacy root on an unscoped bind.
+    /// Resolved scope workdir, or the daemon-filled root when no workdir is stamped.
     /// The daemon's project id is retained alongside it in `scope.project_id`;
     /// persisted state continues to use the root path, not that id.
     project_root: PathBuf,
@@ -8035,23 +8035,31 @@ fn resolve_route_project_root(
     legacy_root: Option<&Path>,
     scope: Option<&subc_protocol::scope::ScopeStamp>,
 ) -> Result<Option<PathBuf>, &'static str> {
-    let root = match scope {
-        Some(stamp) => Some(Path::new(stamp.workdir.as_deref().ok_or(PROJECT_REQUIRED)?)),
-        None => legacy_root,
-    };
+    let stamped_workdir = scope.and_then(|stamp| stamp.workdir.as_deref());
+    let root = stamped_workdir.map(Path::new).or(legacy_root);
     match root {
-        Some(root) if root.is_absolute() => Ok(Some(if scope.is_some() {
-            normalized_scope_workdir(root).unwrap_or_else(|| root.to_path_buf())
-        } else {
-            root.to_path_buf()
-        })),
+        Some(root) if root.as_os_str() == "/" => Ok(None),
+        Some(root) if root.is_absolute() => {
+            let normalized = normalized_scope_workdir(root).unwrap_or_else(|| root.to_path_buf());
+            // The daemon uses / when an opener has no project. Aliases of that
+            // sentinel must not accidentally configure or index the filesystem.
+            if normalized.as_os_str() == "/" {
+                Ok(None)
+            } else {
+                Ok(Some(if stamped_workdir.is_some() {
+                    normalized
+                } else {
+                    root.to_path_buf()
+                }))
+            }
+        }
         Some(_) => Err(PROJECT_REQUIRED),
         None => Ok(None),
     }
 }
 
 const PROJECT_REQUIRED: &str =
-    "AFT cannot serve project tools because this route has no absolute scope workdir or unscoped legacy project root.";
+    "AFT cannot serve project tools because this route has no absolute project folder other than /.";
 const PROJECT_REQUIRED_CODE: &str = "project_required";
 
 fn legacy_route_project_root(frame: &Frame) -> Option<PathBuf> {
@@ -8333,8 +8341,8 @@ async fn handle_control_request(
                 if role_versions.is_some() { "declared" } else { "none" }
             );
             // Protocol 0.34 drops project fields from BindIdentity. Read the
-            // legacy claim separately for unscoped clients and mismatch logging;
-            // it must never supply a scoped route's project.
+            // legacy claim separately for compatibility clients and mismatch
+            // logging; it must never override an explicit stamped workdir.
             let legacy_root = legacy_route_project_root(frame);
             if epoch == 0 {
                 return send_route_bind_error(

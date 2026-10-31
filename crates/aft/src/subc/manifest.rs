@@ -488,7 +488,6 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                 subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
                 subc_protocol::scope::WORKER_RUNS_CAPABILITY.to_string(),
                 subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY.to_string(),
-                subc_protocol::scope::BIND_NO_PROJECT_CAPABILITY.to_string(),
                 crate::page_collect::CAPABILITY.to_string(),
             ],
             requires: Vec::new(),
@@ -869,7 +868,6 @@ mod tests {
                 "flow-scopes/v1".to_string(),
                 "worker-runs/v1".to_string(),
                 "scope-workdir/v1".to_string(),
-                "bind-no-project/v1".to_string(),
                 "page-collect/v1".to_string(),
             ]
         );
@@ -883,7 +881,6 @@ mod tests {
                 "flow-scopes/v1",
                 "worker-runs/v1",
                 "scope-workdir/v1",
-                "bind-no-project/v1",
                 "page-collect/v1"
             ]))
         );
@@ -1180,7 +1177,7 @@ mod tests {
         assert_eq!(
             top.insert(
                 "capabilities".to_string(),
-                json!({"provides": ["tool-provider/v1", "call-modes/v1", "flow-scopes/v1", "worker-runs/v1", "scope-workdir/v1", "bind-no-project/v1", "page-collect/v1"], "requires": [], "must_never_reach": []}),
+                json!({"provides": ["tool-provider/v1", "call-modes/v1", "flow-scopes/v1", "worker-runs/v1", "scope-workdir/v1", "page-collect/v1"], "requires": [], "must_never_reach": []}),
             ),
             None
         );

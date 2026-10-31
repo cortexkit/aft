@@ -177,10 +177,14 @@ fn bind_observed(
                     }
                     Response::success(request.id, request.params)
                 },
-                // The bind identity folder may not exist (stamp-only binds), so the
-                // user config file goes in the project folder the route resolves to.
+                // Exercise config loading in the selected project, but keep
+                // rootless fixture files in temporary storage rather than /.
                 Some(&test_support::bind_config_without_indexes(
-                    expected_project_root,
+                    if expected_project_root.as_os_str() == "/" {
+                        storage.path()
+                    } else {
+                        expected_project_root
+                    },
                 )),
                 usize::MAX,
                 None,
@@ -188,6 +192,17 @@ fn bind_observed(
             )
             .await
             .unwrap();
+            if expected_project_root.as_os_str() == "/" {
+                // No actor means no configured context or index can own /.
+                assert_eq!(executor.actor_count(), 0);
+                assert!(executor.actor_entries().is_empty());
+                assert_eq!(app.watcher_count(), 0);
+                assert!(completion_rx.try_recv().is_err());
+                let ack = writer_rx.recv().await.expect("project-free bind ACK");
+                assert_eq!(ack.header.ty, FrameType::Response);
+                assert_eq!((ack.header.channel, ack.header.corr), (0, 91));
+                return ack.body.clone();
+            }
             let completion = tokio::time::timeout(Duration::from_secs(30), completion_rx.recv())
                 .await
                 .unwrap()
@@ -604,7 +619,7 @@ fn scope_workdir_mismatch_logs_once_and_binds_stamped_project() {
 }
 
 #[test]
-fn scope_workdir_old_stamp_refuses_legacy_root_fallback() {
+fn scope_workdir_old_stamp_preserves_daemon_filled_project_root() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let root = canonical_root(dir.path());
@@ -614,10 +629,8 @@ fn scope_workdir_old_stamp_refuses_legacy_root_fallback() {
     assert!(old_stamp.workdir.is_none());
     assert!(old_stamp.project_id.is_none());
     assert_eq!(serde_json::to_vec(&old_stamp).unwrap(), br#"{"owner":{"kind":"direct"},"ref":"session-scope","scope_epoch":4,"kind":"head","owner_authorized":false}"#);
-    assert_eq!(
-        resolve_route_project_root(Some(&root), Some(&old_stamp)),
-        Err(PROJECT_REQUIRED)
-    );
+    let (lines, _) = bind(&root, Some(old_stamp), &root);
+    assert!(lines.is_empty(), "{lines:?}");
     let (unscoped_lines, _) = bind(&root, None, &root);
     assert!(unscoped_lines.is_empty(), "{unscoped_lines:?}");
     let literal_root = root.join(".");
@@ -735,6 +748,7 @@ fn scope_workdir_bind_reply_is_byte_for_byte_unchanged() {
     std::fs::create_dir(&other).unwrap();
     for (scope, expected) in [
         (None, &root),
+        (Some(stamp()), &root),
         (
             Some(stamp().with_workdir(Some(root.to_string_lossy().into_owned()))),
             &root,
@@ -751,4 +765,21 @@ fn scope_workdir_bind_reply_is_byte_for_byte_unchanged() {
         let (_, reply) = bind(&root, scope, expected);
         assert_eq!(reply, br#"{"op":"route.bind"}"#);
     }
+}
+
+#[test]
+fn scope_workdir_slash_bind_creates_no_project_actor_index_or_watcher() {
+    let _serial = serial();
+    let (lines, reply) = bind(Path::new("/"), None, Path::new("/"));
+    assert!(lines.is_empty(), "{lines:?}");
+    assert_eq!(reply, br#"{"op":"route.bind"}"#);
+}
+
+#[cfg(unix)]
+#[test]
+fn scope_workdir_alias_of_slash_is_not_a_project() {
+    assert_eq!(
+        resolve_route_project_root(Some(Path::new("/.")), None).unwrap(),
+        None
+    );
 }
