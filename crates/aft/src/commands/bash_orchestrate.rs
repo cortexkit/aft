@@ -2031,6 +2031,8 @@ mod tests {
             let source = match case.source.as_str() {
                 "default" => HardKillSource::Default,
                 "timeout" => HardKillSource::Timeout,
+                "scope" => HardKillSource::Scope,
+                "scoped_default" => HardKillSource::ScopedDefault,
                 other => panic!("unknown hard-kill source: {other}"),
             };
             let actual = kill_deadline_sentence_at(
