@@ -2089,20 +2089,22 @@ fn sweep_view_generations(
     cancelled: &dyn Fn() -> bool,
     report: &mut SweepReport,
 ) -> io::Result<()> {
-    let batch = traversal_batch_filtered(
-        storage,
-        &[
-            (storage.artifacts.join("views"), false),
-            (storage.artifacts.join("views/v2"), false),
-        ],
-        "generations",
-        64,
-        &|entry| {
-            (key_valid(&entry.file_name().to_string_lossy()) || directory_is_v2_view(&entry.path()))
-                && entry.file_type().is_ok_and(|kind| kind.is_dir())
-                && entry.path().join("pointer.sqlite").is_file()
-        },
-    )?;
+    let mut domains = vec![
+        (storage.artifacts.join("views"), false),
+        (storage.artifacts.join("views/v2"), false),
+    ];
+    // V3 views live under each family. Their superseded generations are
+    // otherwise swept only right after the next publication, so a sweep that
+    // a restart interrupted, or a view that never publishes again, would keep
+    // a superseded derived database for good.
+    domains.extend(v3_view_domains(storage, report));
+    let batch = traversal_batch_filtered(storage, &domains, "generations", 64, &|entry| {
+        (key_valid(&entry.file_name().to_string_lossy())
+            || directory_is_v2_view(&entry.path())
+            || directory_is_v3_view(&entry.path()))
+            && entry.file_type().is_ok_and(|kind| kind.is_dir())
+            && entry.path().join("pointer.sqlite").is_file()
+    })?;
     if batch.entries.is_empty() && !batch.cursor_path.exists() {
         return Ok(());
     }
@@ -2203,6 +2205,46 @@ fn sweep_view_generations(
 fn directory_is_v2_view(path: &Path) -> bool {
     path.parent()
         .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "v2"))
+}
+
+/// A V3 view directory: `blobs/v3/<family>/views/<scope>`.
+fn directory_is_v3_view(path: &Path) -> bool {
+    let Some(views) = path.parent() else {
+        return false;
+    };
+    views.file_name().is_some_and(|name| name == "views")
+        && views.parent().and_then(Path::parent).is_some_and(|v3| {
+            v3.file_name().is_some_and(|name| name == "v3")
+                && v3
+                    .parent()
+                    .is_some_and(|blobs| blobs.file_name().is_some_and(|name| name == "blobs"))
+        })
+}
+
+/// The `views` directory of every V3 family, in a stable order so the
+/// generation cursor can resume across passes. Listing is bounded. A family
+/// root that can't be listed, or is too large to list, is reported and adds
+/// no domains this pass; the V1 and V2 generation sweep still runs.
+fn v3_view_domains(storage: &StoragePaths, report: &mut SweepReport) -> Vec<(PathBuf, bool)> {
+    let root = storage.artifacts.join("blobs/v3");
+    let families = match bounded_dirs(&root, HISTORY_ENTRIES) {
+        Ok(families) => families,
+        Err(error) => {
+            if report.errors.len() < 16 {
+                report.errors.push(format!("{}: {error}", root.display()));
+            }
+            return Vec::new();
+        }
+    };
+    let mut domains: Vec<_> = families
+        .into_iter()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path().join("views"))
+        .filter(|views| views.is_dir())
+        .map(|views| (views, false))
+        .collect();
+    domains.sort();
+    domains
 }
 
 /// Resolve owners once for the batch, not once per view. Existing registries
@@ -10250,6 +10292,62 @@ mod storage_retention_tests {
         );
         assert_eq!(report.domains["views/generations"].removed_bytes, 49);
         assert!(view.view_dir().join("unrelated").exists());
+    }
+
+    /// V3 views live under `blobs/v3/<family>/views`. A superseded generation
+    /// there must be reclaimed by retention, not only by the sweep that runs
+    /// right after the next publication.
+    #[test]
+    fn storage_retention_generation_lane_reclaims_v3_view_generations() {
+        let storage = tempfile::tempdir().unwrap();
+        let view_dir = storage
+            .path()
+            .join("blobs/v3/0123456789abcdef/views/base-m1-0123456789abcdef");
+        fs::create_dir_all(&view_dir).unwrap();
+        let view = crate::views::ViewStore::open_dir(view_dir.clone()).unwrap();
+        assert!(view_dir.join("pointer.sqlite").is_file());
+        for (name, bytes) in [
+            ("derived-old.sqlite", 17),
+            ("derived-old.sqlite-wal", 5),
+            ("derived-old.sqlite-shm", 3),
+            ("manifest-old.json", 11),
+            ("trigram-old.bin", 13),
+        ] {
+            fs::write(view.view_dir().join(name), vec![b'x'; bytes]).unwrap();
+        }
+        fs::write(view.view_dir().join("unrelated"), vec![b'x'; 101]).unwrap();
+        // A family directory without views and a stray file are not domains.
+        fs::create_dir_all(storage.path().join("blobs/v3/fedcba9876543210")).unwrap();
+        fs::write(storage.path().join("blobs/v3/stray"), b"x").unwrap();
+        let report = run_pass_with_budget(
+            storage.path(),
+            &|| false,
+            &|| Instant::now() + Duration::from_secs(60),
+            Duration::ZERO,
+        );
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.removed_generations, 1, "{report:?}");
+        assert_eq!(report.domains["views/generations"].removed_bytes, 49);
+        assert!(!view_dir.join("derived-old.sqlite").exists());
+        assert!(!view_dir.join("manifest-old.json").exists());
+        assert!(view_dir.join("unrelated").exists());
+        assert!(view_dir.join("pointer.sqlite").is_file());
+    }
+
+    #[test]
+    fn directory_is_v3_view_requires_the_family_views_layout() {
+        assert!(super::directory_is_v3_view(Path::new(
+            "/s/blobs/v3/0123456789abcdef/views/base-m1-x"
+        )));
+        assert!(!super::directory_is_v3_view(Path::new(
+            "/s/blobs/v2/0123456789abcdef/views/base-m1-x"
+        )));
+        assert!(!super::directory_is_v3_view(Path::new(
+            "/s/views/0123456789abcdef"
+        )));
+        assert!(!super::directory_is_v3_view(Path::new(
+            "/s/other/v3/0123456789abcdef/views/x"
+        )));
     }
 
     #[test]
