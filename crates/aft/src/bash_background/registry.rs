@@ -10176,6 +10176,12 @@ impl BgTaskRegistry {
             .filter_map(|task| {
                 let terminal_group = {
                     let state = task.lock_state().ok()?;
+                    // The first sampler may still be discovering owned group
+                    // members after the leader exited. Let it save identities
+                    // before deciding that the task no longer owns the group.
+                    if state.metadata.status.is_terminal() && state.descendant_sample_pending {
+                        return None;
+                    }
                     (cfg!(unix)
                         && state.metadata.status.is_terminal()
                         && state.metadata.pgid.is_some())

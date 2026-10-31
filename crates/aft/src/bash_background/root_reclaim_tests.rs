@@ -127,6 +127,46 @@ impl Drop for OwnedGroup {
 }
 
 #[test]
+fn root_reclaim_waits_for_the_initial_descendant_sample() {
+    let registry = BgTaskRegistry::default();
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let root_id = crate::path_identity::ProjectRootId::from_path(root.path()).unwrap();
+    let mut group = OwnedGroup::spawn();
+    let id = "bash-0000000000000094";
+    register_task(
+        &registry,
+        storage.path(),
+        root.path(),
+        id,
+        BgTaskStatus::Completed,
+        Some(group.0.id()),
+    );
+    let task = registry.task_for_session(id, "reclaim").unwrap();
+    {
+        let mut state = task.lock_state().unwrap();
+        state.descendant_sampling_started = true;
+        state.descendant_sample_pending = true;
+        state.metadata.live_descendants = None;
+    }
+    assert_eq!(registry.kill_running_tasks_for_root(root.path()), 0);
+    assert!(group.0.try_wait().unwrap().is_none());
+    assert_eq!(completion_attempts(&registry), 0);
+    assert_eq!(
+        registry.try_has_reclaimable_tasks_for_root(&root_id),
+        Some(true)
+    );
+
+    registry.sample_task_process_group(&task).unwrap();
+    assert_eq!(registry.kill_running_tasks_for_root(root.path()), 1);
+    assert_eq!(
+        registry.try_has_reclaimable_tasks_for_root(&root_id),
+        Some(false)
+    );
+    assert_eq!(completion_attempts(&registry), 1);
+}
+
+#[test]
 fn root_reclaim_probe_ignores_foreign_tasks_and_terminal_history() {
     let registry = BgTaskRegistry::default();
     let storage = tempfile::tempdir().unwrap();
