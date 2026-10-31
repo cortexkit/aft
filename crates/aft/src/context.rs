@@ -12651,11 +12651,10 @@ impl AppContext {
     {
         use crate::views::callgraph_copies::{self, Admission};
         let now = Instant::now();
-        let readmit = self
-            .callgraph_borrow
-            .lock()
-            .as_ref()
-            .is_none_or(|borrow| now.duration_since(borrow.decided_at) >= CALLGRAPH_READMIT_AFTER);
+        let readmit =
+            self.callgraph_borrow.lock().as_ref().is_none_or(|borrow| {
+                now.duration_since(borrow.decided_at) >= CALLGRAPH_READMIT_AFTER
+            });
         if readmit {
             let admission = callgraph_copies::admit(
                 &storage.artifacts,
@@ -12671,7 +12670,10 @@ impl AppContext {
                     borrow.take();
                     return None;
                 }
-                Ok(Admission::Borrow { root: target_root, scope }) => {
+                Ok(Admission::Borrow {
+                    root: target_root,
+                    scope,
+                }) => {
                     let reader = borrow
                         .take()
                         .filter(|current| current.scope == scope)

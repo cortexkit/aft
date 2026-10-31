@@ -1711,7 +1711,7 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.index.is_some() {
         base.index = override_config.index;
     }
-    base.views = merge_views(base.views, override_config.views);
+    base.views = merge_views(base.views.take(), override_config.views);
     if override_config.callgraph_chunk_size.is_some() {
         base.callgraph_chunk_size = override_config.callgraph_chunk_size;
     }
@@ -1824,7 +1824,7 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     }
     // A project may switch an index off but never back on.
     base.indexes = merge_indexes(base.indexes, project.indexes, true);
-    base.views = merge_views(base.views, project.views);
+    base.views = merge_views(base.views.take(), project.views);
     if project.callgraph_chunk_size.is_some() {
         base.callgraph_chunk_size = project.callgraph_chunk_size;
     }

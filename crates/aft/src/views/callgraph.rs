@@ -1473,7 +1473,14 @@ mod tests {
             let path = temp.path().join(name);
             setup_git(
                 &main,
-                &["worktree", "add", "-q", "--detach", path.to_str().unwrap(), "HEAD"],
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "--detach",
+                    path.to_str().unwrap(),
+                    "HEAD",
+                ],
             );
             let path = std::fs::canonicalize(&path).unwrap();
             if edit {
@@ -1503,11 +1510,19 @@ mod tests {
 
         let main_view = view(&main, &storage);
         main_view.reader().unwrap();
-        assert_eq!(admit(&main, 0), Admission::Own, "the main checkout always owns");
+        assert_eq!(
+            admit(&main, 0),
+            Admission::Own,
+            "the main checkout always owns"
+        );
         assert_eq!(admit(&first, 1), Admission::Own);
         let first_view = view(&first, &storage);
         first_view.reader().unwrap();
-        assert_eq!(admit(&first, 1), Admission::Own, "a copy already held stays owned");
+        assert_eq!(
+            admit(&first, 1),
+            Admission::Own,
+            "a copy already held stays owned"
+        );
 
         // `first` holds the one copy and is in use: `second` borrows.
         assert_eq!(admit(&second, 1), borrow_main);
@@ -1529,7 +1544,10 @@ mod tests {
                     .map(|(name, text)| {
                         (
                             (*name).to_owned(),
-                            (text.len() as u64, crate::views::io::source_hash(text.as_bytes())),
+                            (
+                                text.len() as u64,
+                                crate::views::io::source_hash(text.as_bytes()),
+                            ),
                         )
                     })
                     .collect(),
@@ -1553,7 +1571,10 @@ mod tests {
             admission = admit(&second, 1);
         }
         assert_eq!(admission, Admission::Own, "the idle copy was not evicted");
-        assert!(!first_dir.exists(), "the evicted copy's view directory remains");
+        assert!(
+            !first_dir.exists(),
+            "the evicted copy's view directory remains"
+        );
     }
 
     /// A linked worktree at the commit the main checkout already built has the

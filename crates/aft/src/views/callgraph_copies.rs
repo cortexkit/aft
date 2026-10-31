@@ -175,7 +175,12 @@ pub(crate) fn open_published(
     };
     let generation = match super::base_refs::open_foreign_v3(storage, family, scope, &producers) {
         Ok(Some(generation)) => generation,
-        Ok(None) => return Err(("the main checkout's call graph is not published yet".into(), true)),
+        Ok(None) => {
+            return Err((
+                "the main checkout's call graph is not published yet".into(),
+                true,
+            ))
+        }
         Err(super::base_refs::BaseRefError::Unavailable(reason)) => return Err((reason, true)),
         Err(error) => return Err((error.to_string(), false)),
     };
@@ -190,7 +195,9 @@ pub(crate) fn open_published(
         &name,
     ) {
         Ok(store) => Ok((store.retain_generation(generation), name)),
-        Err(crate::callgraph_store::CallGraphStoreError::Unavailable(reason)) => Err((reason, true)),
+        Err(crate::callgraph_store::CallGraphStoreError::Unavailable(reason)) => {
+            Err((reason, true))
+        }
         Err(error) => Err((error.to_string(), false)),
     }
 }
