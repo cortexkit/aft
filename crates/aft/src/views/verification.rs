@@ -311,15 +311,39 @@ pub(crate) struct Policy {
     /// that record which policy a published generation was verified under.
     /// Both are only valid in the checkout that recorded them.
     pub digest: String,
-    /// The same policy named by role instead of location: inputs under the
-    /// checkout by their relative path, Git's info files by name, Git
-    /// configuration by its effective entries. Two checkouts of one
-    /// repository with the same policy get the same value, so base identity
-    /// uses this one and a worktree at a commit another checkout already
-    /// built shares that base instead of building its own.
+    /// The policy that decides how a member's bytes are interpreted, named by
+    /// role instead of location: attribute sources under the checkout by
+    /// their relative path, Git's info files by name, Git configuration by
+    /// its effective entries. Base identity uses this one, so a worktree at a
+    /// commit another checkout already built shares that base instead of
+    /// building its own.
+    ///
+    /// Ignore rules are left out. They only decide which files are members,
+    /// and base identity already covers the membership digest: every member's
+    /// path, mode, content and size, computed by each checkout under its own
+    /// rules before it looks a base up. Two checkouts with the same members
+    /// hold the same base content whatever rules produced that set. Leaving
+    /// them in split bases on files tools write for themselves, such as a
+    /// self-ignoring `.opencode/.gitignore` that only the main checkout has.
     pub base_digest: String,
     /// Missing or unscopable conversion sources forbid stat-based byte reuse.
     pub reusable: bool,
+}
+
+/// Whether a policy input only holds ignore rules: per-directory ignore
+/// files and Git's `info/exclude`. These decide membership, which base
+/// identity covers through the membership digest, so `Policy::base_digest`
+/// leaves them out. The location-bound `Policy::digest` keeps them, because
+/// saved file stats must stop being reused when the rules change.
+fn is_ignore_rule_source(path: &Path) -> bool {
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some(".gitignore" | ".ignore" | ".aftignore") => true,
+        Some("exclude") => path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|parent| parent == "info"),
+        _ => false,
+    }
 }
 
 /// Reads one policy input. A missing file, or a directory or special file
@@ -601,7 +625,11 @@ impl Policy {
                         root.join(path)
                     };
                     let source = metadata_source(&path, &mut hash)?;
-                    locate(&path, source);
+                    // core.excludesFile holds ignore rules, which base
+                    // identity leaves out (see `Policy::base_digest`).
+                    if conversion {
+                        locate(&path, source);
+                    }
                     reusable &= !conversion;
                 }
             }
@@ -617,7 +645,9 @@ impl Policy {
                 // attribute source is conservatively an unscopable conversion.
                 reusable = false;
             }
-            locate(path, source);
+            if !is_ignore_rule_source(path) {
+                locate(path, source);
+            }
         }
         let mut base = blake3::Hasher::new();
         base.update(b"aft/views-v3/base-policy/1");

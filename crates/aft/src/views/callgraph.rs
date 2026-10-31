@@ -1454,11 +1454,13 @@ mod tests {
     }
 
     /// A linked worktree at the commit the main checkout already built has the
-    /// same files and the same ignore policy, so it must resolve the main
-    /// checkout's base and clone its sealed donor, parsing nothing. Base
-    /// identity once hashed the policy inputs' absolute paths and Git's
-    /// config origins (`.git/config` in a main checkout, an absolute path in a
-    /// linked worktree), so every checkout built a full base of its own.
+    /// same files, so it must resolve the main checkout's base and clone its
+    /// sealed donor, parsing nothing. Base identity once hashed the policy
+    /// inputs' absolute paths and Git's config origins (`.git/config` in a
+    /// main checkout, an absolute path in a linked worktree), so every
+    /// checkout built a full base of its own. It also once hashed ignore
+    /// files, so a self-ignoring file a tool writes into the main checkout
+    /// only (OpenCode's `.opencode/.gitignore` is one) split the bases too.
     #[test]
     fn linked_worktree_at_the_same_commit_shares_the_base_and_its_donor() {
         let _serial = crate::blob_store::v3::serial_for_test();
@@ -1475,6 +1477,10 @@ mod tests {
         setup_git(&main, &["commit", "-q", "-m", "fixture"]);
         // Shared by every checkout of the repository.
         std::fs::write(main.join(".git/info/exclude"), "scratch/\n").unwrap();
+        // A tool's folder that ignores itself, present in the main checkout
+        // only. It changes no member, so it must not change the base.
+        std::fs::create_dir(main.join(".tool")).unwrap();
+        std::fs::write(main.join(".tool/.gitignore"), "*\n").unwrap();
         let linked = temp.path().join("linked");
         setup_git(
             &main,
@@ -1540,16 +1546,24 @@ mod tests {
             [super::super::donor::DonorEvent::Cloned(_)]
         ));
 
-        // A different ignore policy in the linked worktree is a different
-        // base, even with the same files.
+        // Ignore rules stay out of the base policy, but they still change the
+        // checkout's own location-bound digest that saved file stats check.
+        // Attribute sources still change the base policy: they can change
+        // how a member's bytes are interpreted without changing its content.
         let policy = |root: &Path| {
             super::super::verification::BindGuard::capture(root, None)
                 .unwrap()
                 .policy
         };
         assert_eq!(policy(&main).base_digest, policy(&linked).base_digest);
-        std::fs::write(linked.join(".gitignore"), "dist/\nbuild/\n").unwrap();
-        assert_ne!(policy(&main).base_digest, policy(&linked).base_digest);
+        let before = policy(&linked);
+        std::fs::create_dir(linked.join(".tool")).unwrap();
+        std::fs::write(linked.join(".tool/.gitignore"), "other\n").unwrap();
+        let ignored = policy(&linked);
+        assert_eq!(ignored.base_digest, before.base_digest);
+        assert_ne!(ignored.digest, before.digest);
+        std::fs::write(linked.join(".gitattributes"), "*.ts text eol=crlf\n").unwrap();
+        assert_ne!(policy(&linked).base_digest, before.base_digest);
     }
 
     #[test]
