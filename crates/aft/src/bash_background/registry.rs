@@ -222,7 +222,6 @@ pub(crate) fn scope_end_label(reason: Option<&str>) -> Option<&'static str> {
 pub(crate) mod remote;
 #[path = "return_files.rs"]
 pub(crate) mod return_files;
-#[cfg(target_os = "linux")]
 pub(crate) const LINUX_SCOPE_ENV: &str = "AFT_INTERNAL_LINUX_SCOPE";
 
 #[cfg(test)]
@@ -829,6 +828,8 @@ pub enum HardKillSource {
     Default,
     /// The caller's explicit `timeout`.
     Timeout,
+    Scope,
+    ScopedDefault,
 }
 
 /// A task's own kill deadline: it is killed once it has run `limit_ms`.
@@ -840,6 +841,26 @@ pub struct HardKillDeadline {
 }
 
 impl HardKillDeadline {
+    fn reported(metadata: &PersistedTask, renewable: bool) -> Option<Self> {
+        let deadline = Self::from_metadata(metadata.timeout_ms, renewable);
+        match metadata.task_scope_runtime_ms {
+            Some(limit_ms) if deadline.is_none_or(|deadline| limit_ms <= deadline.limit_ms) => {
+                Some(Self {
+                    limit_ms,
+                    source: HardKillSource::Scope,
+                })
+            }
+            Some(_) => deadline.map(|mut deadline| {
+                if deadline.source == HardKillSource::Default {
+                    deadline.source = HardKillSource::ScopedDefault;
+                }
+                deadline
+            }),
+            // Old records have no saved scope runtime. Report only their task deadline.
+            None => deadline,
+        }
+    }
+
     /// The deadline a task record carries. `renewable` is the record's
     /// `default_hard_kill`; for a record written before AFT stored it, a
     /// limit equal to the default is taken to be the default.
@@ -1339,6 +1360,7 @@ pub(crate) struct RegistryInner {
     #[cfg(unix)]
     revoked_secret_authorizations: Mutex<HashSet<(String, String, u64)>>,
     memory_monitors: Mutex<HashMap<String, super::memory_limit::Monitor>>,
+    task_scopes: super::task_scope::TaskScopes,
     #[cfg(unix)]
     db_hint_jobs:
         Mutex<HashMap<String, (std::sync::Weak<BgTask>, Arc<crate::bash_db_hints::HintJob>)>>,
@@ -1522,7 +1544,7 @@ pub(crate) struct BashDrainReplyState {
 impl BashDrainReplyCache {
     fn publish_metadata(&self, metadata: &PersistedTask, renewable: bool) {
         let note = rendered_execution_note(metadata);
-        let deadline = HardKillDeadline::from_metadata(metadata.timeout_ms, renewable)
+        let deadline = HardKillDeadline::reported(metadata, renewable)
             .map(|deadline| (deadline, metadata.started_at));
         let inputs_captured = metadata
             .remote
@@ -1977,6 +1999,200 @@ impl BgTaskRegistry {
             .and_then(|map| map.get(task_id).copied())
     }
 
+    pub(crate) fn configure_task_scope_runtime(&self, daemon_mode: bool, max_runtime: Duration) {
+        self.inner
+            .task_scopes
+            .configure_runtime(daemon_mode, max_runtime);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cleanup_recorded_task_scopes(
+        &self,
+        storage_dir: &Path,
+        terminal_only: bool,
+    ) -> Result<usize, String> {
+        let mut cursor = match super::persistence::StorageTaskRecordCursor::new(storage_dir) {
+            Ok(cursor) => cursor,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error.to_string()),
+        };
+        let mut records = HashMap::new();
+        let mut skipped_oversized = 0;
+        loop {
+            let batch = super::persistence::discover_storage_task_records(storage_dir, &mut cursor)
+                .map_err(|error| error.to_string())?;
+            skipped_oversized += batch.skipped_oversized;
+            for record in batch.records {
+                records.insert(record.task_id.clone(), record);
+            }
+            if batch.finished {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        records.retain(|id, _| !cursor.rejected_task_ids.contains(id));
+        if skipped_oversized > 0 {
+            crate::slog_info!(
+                "bash task scope cleanup skipped {skipped_oversized} oversized records"
+            );
+        }
+        if records.is_empty() {
+            return Ok(0);
+        }
+        let scope_records = records
+            .values()
+            .map(|record| super::task_scope::ScopeRecord {
+                task_id: record.task_id.clone(),
+                terminal: record.terminal,
+            })
+            .collect::<Vec<_>>();
+        self.inner
+            .task_scopes
+            .cleanup_owned(&scope_records, terminal_only, |id, description| {
+                records
+                    .get(id)
+                    .filter(|record| {
+                        super::persistence::task_store_root(&record.session_dir).is_some_and(
+                            |store| super::task_scope::scope_description(id, store) == description,
+                        )
+                    })
+                    .and_then(|record| super::persistence::reread_storage_task_record(record).ok())
+                    .is_some_and(|metadata| !terminal_only || metadata.is_terminal())
+            })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn cleanup_terminal_task_scopes(&self, storage_dir: &Path) -> Result<usize, String> {
+        self.cleanup_recorded_task_scopes(storage_dir, true)
+    }
+
+    /// The maintainer can call `ctx.bash_background().end_all_task_scopes(&ctx.storage_dir())`.
+    /// Do not call this from the frame loop or with the scheduler lock. It reads storage and waits for systemctl.
+    pub fn end_all_task_scopes(&self, storage_dir: &Path) -> Result<usize, String> {
+        #[cfg(target_os = "linux")]
+        {
+            self.cleanup_recorded_task_scopes(storage_dir, false)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = storage_dir;
+            Ok(0)
+        }
+    }
+
+    pub(crate) fn start_task_scope_cleanup(&self, storage_dir: &Path) {
+        #[cfg(target_os = "linux")]
+        {
+            if !self.inner.task_scopes.is_daemon() {
+                return;
+            }
+            let key = canonicalized_path(storage_dir);
+            {
+                let mut slots = task_scope_cleanup_slots()
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let slot = slots.entry(key.clone()).or_default();
+                if slot.running
+                    || slot.done
+                    || slot.retry_at.is_some_and(|when| Instant::now() < when)
+                {
+                    return;
+                }
+                slot.running = true;
+                #[cfg(test)]
+                {
+                    slot.runs += 1;
+                }
+            }
+            let registry = self.clone();
+            let root = key.clone();
+            let spawned = std::thread::Builder::new()
+                .name("aft-task-scope-cleanup".into())
+                .spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        registry.cleanup_terminal_task_scopes(&root)
+                    }))
+                    .unwrap_or_else(|_| Err("task scope cleanup worker panicked".into()));
+                    {
+                        let mut slots = task_scope_cleanup_slots()
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        let slot = slots.entry(root.clone()).or_default();
+                        slot.running = false;
+                        slot.done = result.is_ok();
+                        slot.retry_at = result
+                            .as_ref()
+                            .err()
+                            .map(|_| Instant::now() + CLEANUP_RETRY_BACKOFF);
+                    }
+                    match result {
+                        Ok(_) => registry.request_persisted_gc(&root),
+                        Err(error) => crate::slog_warn!("task scope cleanup failed: {error}"),
+                    }
+                });
+            if let Err(error) = spawned {
+                let mut slots = task_scope_cleanup_slots()
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let slot = slots.entry(key).or_default();
+                slot.running = false;
+                slot.retry_at = Some(Instant::now() + CLEANUP_RETRY_BACKOFF);
+                crate::slog_warn!("task scope cleanup worker could not start: {error}");
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = storage_dir;
+    }
+
+    #[cfg(unix)]
+    fn cleanup_failed_scope_spawn(
+        &self,
+        task_id: &str,
+        child: &mut Child,
+        scope: Option<&super::task_scope::ScopeLaunch>,
+    ) -> Result<(), String> {
+        let result = self.kill_task_scope(task_id);
+        if let Some(scope) = scope {
+            // The scope's RuntimeMaxSec backstop and the next startup cleanup still end it.
+            let _ = scope.stop();
+        }
+        let _ = child.wait();
+        result
+    }
+
+    #[cfg(unix)]
+    fn place_task_scope(
+        &self,
+        child: &mut Child,
+        scope: &super::task_scope::ScopeLaunch,
+    ) -> Result<bool, String> {
+        // Keep the identity gate closed until placement. An open gate can cause a retry to run the payload two times.
+        match scope.await_placement(child.id(), Duration::from_secs(1)) {
+            Ok(handle) => {
+                self.inner.task_scopes.register(handle);
+                Ok(false)
+            }
+            Err(error) => {
+                let exited = child.try_wait().map_err(|e| e.to_string())?.is_some();
+                let gate_held = child.stdin.take().is_some();
+                if !exited {
+                    super::process::terminate_pgid(child.id() as i32, None);
+                }
+                let _ = scope.stop();
+                let _ = child.wait();
+                if exited && gate_held {
+                    static LOGGED: std::sync::Once = std::sync::Once::new();
+                    LOGGED.call_once(|| {
+                        crate::slog_info!("task scope creation failed before payload release; spawning without a scope: {error}");
+                    });
+                    Ok(true)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
     pub fn new(progress_sender: SharedProgressSender) -> Self {
         #[cfg(unix)]
         crate::posix_spawn::initialize();
@@ -1984,6 +2200,7 @@ impl BgTaskRegistry {
         Self {
             inner: Arc::new(RegistryInner {
                 memory_monitors: Mutex::new(HashMap::new()),
+                task_scopes: super::task_scope::TaskScopes::default(),
                 #[cfg(unix)]
                 secret_proxies: Mutex::new(HashMap::new()),
                 #[cfg(unix)]
@@ -4908,6 +5125,35 @@ impl BgTaskRegistry {
         self.enqueue_completion_if_needed(metadata, Some(paths), true);
     }
 
+    #[cfg(target_os = "linux")]
+    fn scoped_memory_limit(
+        &self,
+        mib: Option<u64>,
+        task_id: &str,
+    ) -> Result<Option<super::memory_limit::Monitor>, String> {
+        if let Some(mib) = mib.filter(|mib| *mib > 0) {
+            let scope = self
+                .inner
+                .task_scopes
+                .get(task_id)
+                .ok_or("task memory scope is absent")?;
+            return super::memory_limit::Monitor::from_task_scope(mib, &scope).map(Some);
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn kill_task_scope(&self, task_id: &str) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.task_scopes.kill(task_id)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = task_id;
+            Ok(())
+        }
+    }
+
     pub(crate) fn memory_limit_exceeded(&self, task: &Arc<BgTask>) -> Option<String> {
         let mut state = task.lock_state().ok()?;
         if (state.metadata.remote.is_some() && !state.metadata.local_fallback_started)
@@ -4923,10 +5169,16 @@ impl BgTaskRegistry {
         if !monitors.contains_key(&task.task_id) {
             let policy = state.metadata.memory_policy.clone()?;
             match super::memory_limit::Monitor::recover(policy, &task.task_id) {
-                Ok(monitor) => {
+                Ok(Some(monitor)) => {
                     monitors.insert(task.task_id.clone(), monitor);
                 }
-                Err(error) => return Some(error),
+                Ok(None) => return None,
+                Err(_) => {
+                    let reason = "Command stopped: memory monitor recovery failed.".to_string();
+                    state.pending_terminal_override = Some(BgTaskStatus::Failed);
+                    state.metadata.status_reason = Some(reason.clone());
+                    return Some(reason);
+                }
             }
         }
         let monitor = monitors.get_mut(&task.task_id)?;
@@ -4951,7 +5203,9 @@ impl BgTaskRegistry {
         }
         if let Ok(monitors) = self.inner.memory_monitors.lock() {
             if let Some(monitor) = monitors.get(&task.task_id) {
-                monitor.terminate();
+                if !monitor.is_task_scope() {
+                    monitor.terminate();
+                }
             }
         }
         let _ = self.kill_with_status_reason(
@@ -4982,8 +5236,13 @@ impl BgTaskRegistry {
             .or(state.metadata.child_pid.map(|pid| pid as i32))
             .unwrap_or(0);
         let mut updated = false;
+        let mut kill_scope = false;
         if monitor.exceeded(pgid) {
-            monitor.terminate();
+            if monitor.is_task_scope() {
+                kill_scope = true;
+            } else {
+                monitor.terminate();
+            }
             state
                 .metadata
                 .mark_terminal(BgTaskStatus::Failed, Some(137), Some(monitor.reason()));
@@ -5010,6 +5269,11 @@ impl BgTaskRegistry {
             } else {
                 task.terminal_persist_dirty.store(false, Ordering::SeqCst);
             }
+        }
+        drop(monitors);
+        drop(state);
+        if kill_scope {
+            self.kill_task_scope(&task.task_id)?;
         }
         Ok(())
     }
@@ -5121,6 +5385,7 @@ impl BgTaskRegistry {
             notify_on_completion,
             compressed,
             project_root,
+            false,
         )
         .map_err(|error| error.to_string())
     }
@@ -5178,7 +5443,7 @@ impl BgTaskRegistry {
         shell_path: PathBuf,
         session_id: String,
         workdir: PathBuf,
-        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))] mut env: HashMap<String, String>,
+        mut env: HashMap<String, String>,
         hard_kill: super::HardKill,
         memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
@@ -5186,15 +5451,13 @@ impl BgTaskRegistry {
         notify_on_completion: bool,
         compressed: bool,
         project_root: Option<PathBuf>,
+        linux_scope: bool,
     ) -> Result<String, RegistryError> {
         let canonical_project_root =
             canonicalized_path(project_root.as_deref().unwrap_or(&workdir));
         self.start_watchdog();
 
-        #[cfg(target_os = "linux")]
-        let linux_scope = env.remove(LINUX_SCOPE_ENV).as_deref() == Some("1");
-        #[cfg(not(target_os = "linux"))]
-        let linux_scope = false;
+        env.remove(LINUX_SCOPE_ENV);
 
         let _admission = self.background_admission_guard(slot);
         if let Err(refusal) = self.check_background_slot_typed(slot, &session_id) {
@@ -5300,8 +5563,28 @@ impl BgTaskRegistry {
             Some(completion_secrets.has_non_ticket_secrets);
         metadata.completion_ticket_digest = completion_secrets.ticket_digest.clone();
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
+        let mut scope = self
+            .inner
+            .task_scopes
+            .policy(linux_scope, None, spawn_plan.is_native_launcher())
+            .map(|policy| {
+                self.inner.task_scopes.prepare(
+                    policy,
+                    &task_id,
+                    hard_kill,
+                    memory_limit_mib,
+                    super::persistence::task_store_root(&paths.session_dir)
+                        .ok_or("task store root is unavailable")?,
+                )
+            })
+            .transpose()?
+            .flatten();
         super::enter_bash_startup_step(super::BashStartupStep::ControlFiles);
-        let mut memory_monitor = Self::prepare_memory_limit(memory_limit_mib, &task_id)?;
+        let mut memory_monitor = if scope.is_some() {
+            None
+        } else {
+            Self::prepare_memory_limit(memory_limit_mib, &task_id)?
+        };
         metadata.memory_policy = memory_monitor
             .as_ref()
             .map(|monitor| monitor.policy.clone());
@@ -5323,20 +5606,33 @@ impl BgTaskRegistry {
         }
         layout_cleanup.disarm();
         self.dual_write_task(&paths, &metadata);
-        let mut child = match spawn_detached_child(
-            &spawn_plan,
-            command,
-            shell,
-            &shell_path,
-            &paths,
-            &workdir,
-            &env,
-            &mut io_handles,
-            capture_pipeline_status,
-            memory_monitor.is_some(),
-            linux_scope,
-            LocalIdentityGate::Required,
-        ) {
+        let mut spawn_child = |scope: Option<&super::task_scope::ScopeLaunch>| {
+            spawn_detached_child(
+                &spawn_plan,
+                command,
+                shell,
+                &shell_path,
+                &paths,
+                &workdir,
+                &env,
+                &mut io_handles,
+                capture_pipeline_status,
+                memory_limit_mib.is_some(),
+                scope,
+                LocalIdentityGate::Required,
+            )
+        };
+        let child_result = spawn_child(scope.as_ref()).and_then(|mut child| {
+            if let Some(launch) = scope.as_ref() {
+                if self.place_task_scope(&mut child, launch)? {
+                    scope = None;
+                    memory_monitor = Self::prepare_memory_limit(memory_limit_mib, &task_id)?;
+                    return spawn_child(None);
+                }
+            }
+            Ok(child)
+        });
+        let mut child = match child_result {
             Ok(child) => child,
             Err(error) => {
                 crate::slog_warn!("failed to spawn background bash task {task_id}: {error}");
@@ -5360,15 +5656,38 @@ impl BgTaskRegistry {
         };
 
         let child_pid = child.id();
+        #[cfg(target_os = "linux")]
+        if scope.is_some() {
+            match self.scoped_memory_limit(memory_limit_mib, &task_id) {
+                Ok(monitor) => memory_monitor = monitor,
+                Err(error) => {
+                    drop(child.stdin.take());
+                    if let Some(scope) = scope.as_ref() {
+                        let _ = scope.stop();
+                    }
+                    let _ = child.wait();
+                    self.fail_memory_spawn(&mut metadata, &paths, &error, canonical_project_root);
+                    return Err(error.into());
+                }
+            }
+        }
         if let Err(error) = self.arm_secret_proxy(&spawn_plan, &task_id, child_pid) {
             super::process::terminate_pgid(child_pid as i32, None);
-            let _ = child.wait();
+            if let Err(kill_error) =
+                self.cleanup_failed_scope_spawn(&task_id, &mut child, scope.as_ref())
+            {
+                crate::slog_warn!("failed spawn scope cleanup: {kill_error}");
+            }
             return Err(error.into());
         }
         if let Some(mut monitor) = memory_monitor.take() {
             if let Err(error) = monitor.attach(child_pid) {
                 super::process::terminate_pgid(child_pid as i32, None);
-                let _ = child.wait();
+                if let Err(kill_error) =
+                    self.cleanup_failed_scope_spawn(&task_id, &mut child, scope.as_ref())
+                {
+                    crate::slog_warn!("failed spawn scope cleanup: {kill_error}");
+                }
                 self.fail_memory_spawn(&mut metadata, &paths, &error, canonical_project_root);
                 return Err(error.into());
             }
@@ -5385,8 +5704,15 @@ impl BgTaskRegistry {
         metadata.child_pid = Some(child_pid);
         metadata.pgid = Some(child_pid as i32);
         metadata.child_start_time_ms = crate::root_cache::process_start_time_ms(child_pid);
+        #[cfg(target_os = "linux")]
+        {
+            metadata.task_scope_runtime_ms = scope.as_ref().map(|scope| scope.runtime_ms());
+        }
         if let Err(error) = self.persist_task(&paths, &metadata) {
             drop(child.stdin.take());
+            if let Some(scope) = scope.as_ref() {
+                let _ = scope.stop();
+            }
             let _ = child.wait();
             metadata.mark_terminal(
                 BgTaskStatus::Failed,
@@ -6094,6 +6420,7 @@ impl BgTaskRegistry {
         notify_on_completion: bool,
         compressed: bool,
         project_root: Option<PathBuf>,
+        _linux_scope: bool,
     ) -> Result<String, RegistryError> {
         let canonical_project_root =
             canonicalized_path(project_root.as_deref().unwrap_or(&workdir));
@@ -6159,7 +6486,7 @@ impl BgTaskRegistry {
             &mut io_handles,
             false,
             memory_monitor.is_some(),
-            false,
+            None,
         ) {
             Ok(child) => child,
             Err(error) => {
@@ -6426,6 +6753,18 @@ impl BgTaskRegistry {
         // own harness and checks recorded processes under every harness, so
         // the harness that configured this root has no bearing on it.
         let key = canonicalized_path(storage_dir);
+        // Scope cleanup uses durable records. GC must not remove them before cleanup.
+        #[cfg(target_os = "linux")]
+        if self.inner.task_scopes.is_daemon()
+            && !task_scope_cleanup_slots()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(&key)
+                .is_some_and(|slot| slot.done)
+        {
+            self.start_task_scope_cleanup(storage_dir);
+            return;
+        }
         {
             let mut slots = persisted_gc_slots()
                 .lock()
@@ -6823,6 +7162,7 @@ impl BgTaskRegistry {
             self.retire_orphaned_watch_tombstones(session_id)?;
             self.start_watchdog();
         }
+        self.start_task_scope_cleanup(storage_dir);
         if !self.inner.persisted_gc_started.swap(true, Ordering::SeqCst) {
             // The persisted GC walks every session under the shared storage root
             // (liveness probes, row deletes, quarantines) and scales with the
@@ -7495,6 +7835,50 @@ impl BgTaskRegistry {
                 && (metadata.status == BgTaskStatus::Starting || metadata.mode != BgMode::Pty)
             {
                 let alive = process_is_alive(&metadata);
+                #[cfg(target_os = "linux")]
+                let alive = if alive && metadata.mode == BgMode::Pipes && metadata.remote.is_none()
+                {
+                    let recovered = (|| -> Result<(), String> {
+                        if let Some(pid) = metadata.child_pid {
+                            let answer = if let Some(start) = metadata.child_start_time_ms {
+                                self.inner
+                                    .task_scopes
+                                    .adopt(&metadata.task_id, pid, start)?
+                            } else {
+                                match super::task_scope::lookup_state(&metadata.task_id)? {
+                                    super::task_scope::ScopeLookup::Present(_) => {
+                                        return Err(
+                                            "task scope replay has no exact child identity".into()
+                                        )
+                                    }
+                                    other => other,
+                                }
+                            };
+                            if let super::task_scope::ScopeLookup::Present(scope) = answer {
+                                if let Some(policy) = metadata.memory_policy.as_mut() {
+                                    let monitor = super::memory_limit::Monitor::recover_task_scope(
+                                        policy.mib, &scope,
+                                    );
+                                    *policy = monitor.policy.clone();
+                                    self.inner
+                                        .memory_monitors
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner())
+                                        .insert(metadata.task_id.clone(), monitor);
+                                }
+                            }
+                        }
+                        Ok(())
+                    })();
+                    if recovered.is_err() {
+                        super::task_scope::log_unconfirmed_scope();
+                        false
+                    } else {
+                        alive
+                    }
+                } else {
+                    alive
+                };
                 if !alive {
                     // The wrapper writes its exit marker before exiting. It may
                     // have done both since our first read, so observe the marker
@@ -7587,6 +7971,7 @@ impl BgTaskRegistry {
                             metadata.child_pid,
                             None,
                         );
+                        self.kill_task_scope(&metadata.task_id)?;
                         settle_killed_process_group(&metadata.task_id, metadata.pgid);
                     }
                     let recovered = "recovered from inconsistent killing state on replay";
@@ -10487,7 +10872,7 @@ impl BgTaskRegistry {
         if state.metadata.remote.is_some() {
             return None;
         }
-        HardKillDeadline::from_metadata(state.metadata.timeout_ms, task.hard_kill_renewable)
+        HardKillDeadline::reported(&state.metadata, task.hard_kill_renewable)
     }
 
     /// Time left until the task's own hard kill, measured from its monotonic
@@ -10512,7 +10897,7 @@ impl BgTaskRegistry {
         let task = self.task_for_session(task_id, session_id)?;
         let state = task.lock_state().ok()?;
         Some((
-            HardKillDeadline::from_metadata(state.metadata.timeout_ms, task.hard_kill_renewable)?,
+            HardKillDeadline::reported(&state.metadata, task.hard_kill_renewable)?,
             state.metadata.started_at,
         ))
     }
@@ -13405,6 +13790,7 @@ impl BgTaskRegistry {
             }
         };
 
+        let mut scope_killed = false;
         match plan {
             KillSignalPlan::Nothing => {}
             #[cfg(any(windows, test))]
@@ -13456,6 +13842,8 @@ impl BgTaskRegistry {
                     crate::slog_info!("scope diagnostic phase=signal_started task={task_id} child_pid={child_pid:?} elapsed_ms={}", diagnostic_start.elapsed().as_millis());
                 }
                 terminate_piped_task(&task.task_id, pgid, child_pid, child.as_mut());
+                let scope_result = self.kill_task_scope(&task.task_id);
+                scope_killed = true;
                 #[cfg(feature = "test-timing-hooks")]
                 if scope_diagnostic {
                     crate::slog_info!(
@@ -13478,6 +13866,7 @@ impl BgTaskRegistry {
                 state.kill_in_flight = false;
                 state.child_exit_observed |= child_exit_observed;
                 task.kill_settled.notify_all();
+                scope_result?;
                 // A terminal state published while the signal was in flight
                 // (the task's own exit marker, read by the watchdog) stands.
                 if !state.metadata.status.is_terminal() {
@@ -13570,6 +13959,9 @@ impl BgTaskRegistry {
             }
         }
 
+        if !scope_killed {
+            self.kill_task_scope(&task.task_id)?;
+        }
         if terminalized {
             #[cfg(test)]
             wait_on_kill_signal_gate_for_test(&format!("{task_id}:terminal-published"));
@@ -13611,6 +14003,7 @@ impl BgTaskRegistry {
     #[cfg(unix)]
     fn terminate_terminal_survivors(&self, task: &Arc<BgTask>, pgid: i32) -> Result<(), String> {
         terminate_pgid(pgid, None);
+        self.kill_task_scope(&task.task_id)?;
         settle_killed_process_group(&task.task_id, Some(pgid));
         let sample = live_process_group_members(pgid);
         let mut db = DeferredDbWrites::new(self, task);
@@ -16070,6 +16463,26 @@ fn persisted_gc_slots() -> &'static Mutex<PersistedGcSlots> {
     SLOTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(target_os = "linux")]
+const CLEANUP_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct TaskScopeCleanupSlot {
+    running: bool,
+    done: bool,
+    retry_at: Option<Instant>,
+    #[cfg(test)]
+    runs: usize,
+}
+
+#[cfg(target_os = "linux")]
+fn task_scope_cleanup_slots() -> &'static Mutex<HashMap<PathBuf, TaskScopeCleanupSlot>> {
+    static SLOTS: std::sync::OnceLock<Mutex<HashMap<PathBuf, TaskScopeCleanupSlot>>> =
+        std::sync::OnceLock::new();
+    SLOTS.get_or_init(Default::default)
+}
+
 /// The remote cancellation outcome `bash.kill_scope` reports for a stopped
 /// task, or `None` for a local one.
 fn scope_remote_cancel(task: &BgTask) -> Option<ScopeRemoteCancel> {
@@ -16396,11 +16809,7 @@ fn gc_batches(root: &Path, key: PathBuf) -> GcWalk {
 fn is_harness_store(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            matches!(name, "opencode" | "pi" | "runner")
-                || name.starts_with("mcp--")
-                || name.starts_with("fed--")
-        })
+        .is_some_and(super::persistence::is_harness_store_name)
 }
 
 /// One bounded, resumable namespace discovery per storage base per minute,
@@ -16520,6 +16929,10 @@ pub(crate) fn hard_kill_reason(deadline: HardKillDeadline) -> String {
         HardKillSource::Timeout => {
             format!("killed by the `timeout` of {limit} you passed (exit 124)")
         }
+        // This path enforces task timeouts. Scope deadlines are report-only.
+        HardKillSource::Scope | HardKillSource::ScopedDefault => {
+            format!("killed by AFT's task time limit of {limit} (exit 124)")
+        }
     }
 }
 
@@ -16547,8 +16960,7 @@ fn terminal_metadata_snapshot(metadata: PersistedTask) -> BgTaskSnapshot {
     });
     let live_descendants_summary = live_descendants_summary(&metadata);
     let live_descendants_unavailable = live_descendants_unavailable(&metadata);
-    let hard_kill =
-        HardKillDeadline::from_metadata(metadata.timeout_ms, metadata.default_hard_kill);
+    let hard_kill = HardKillDeadline::reported(&metadata, metadata.default_hard_kill);
     let remote_refusal = remote::remote_refusal(&metadata);
     let remote_inputs_captured = metadata
         .remote
@@ -16786,7 +17198,7 @@ impl BgTask {
             kill_reached: 0,
             remote_cancel: None,
             hard_kill: if metadata.remote.is_none() {
-                HardKillDeadline::from_metadata(metadata.timeout_ms, self.hard_kill_renewable)
+                HardKillDeadline::reported(metadata, self.hard_kill_renewable)
             } else {
                 None
             },
@@ -17281,7 +17693,7 @@ fn spawn_detached_child(
     io_handles: &mut TaskIoHandles,
     capture_pipeline_status: bool,
     memory_gated: bool,
-    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] linux_scope: bool,
+    scope: Option<&super::task_scope::ScopeLaunch>,
     #[cfg(unix)] identity_gate: LocalIdentityGate,
 ) -> Result<Child, String> {
     #[cfg(windows)]
@@ -17333,27 +17745,9 @@ fn spawn_detached_child(
                 LocalIdentityGate::CommittedFallback => "",
             }),
         ];
-        #[cfg(target_os = "linux")]
-        let (executable, args) = if linux_scope && !memory_gated {
-            if spawn_plan.is_native_launcher() {
-                crate::slog_info!(
-                    "bash.linux_scope requested but native sandbox launch cannot reach the user manager; spawning without a systemd scope"
-                );
-                (base_executable, base_args)
-            } else if let Some(launcher) = super::process::select_systemd_scope_launcher() {
-                super::process::systemd_scope_argv(&launcher, &base_executable, &base_args)
-            } else {
-                crate::slog_info!(
-                    "bash.linux_scope requested but systemd-run or the user manager is unavailable; spawning without a systemd scope"
-                );
-                (base_executable, base_args)
-            }
+        let (executable, args) = if let Some(scope) = scope {
+            scope.argv(&base_executable, &base_args)
         } else {
-            (base_executable, base_args)
-        };
-        #[cfg(not(target_os = "linux"))]
-        let (executable, args) = {
-            let _ = linux_scope;
             (base_executable, base_args)
         };
         let (mut child_command, profile_handle) = crate::sandbox_spawn::detached_command_for_plan(
@@ -17392,7 +17786,7 @@ fn spawn_detached_child(
     }
     #[cfg(windows)]
     {
-        let _ = shell_path;
+        let _ = (shell_path, scope);
         use crate::windows_shell::shell_candidates;
         match spawn_plan {
             SpawnPlan::Unsandboxed | SpawnPlan::RelaxedUnenforced | SpawnPlan::Host { .. } => {}
@@ -17621,6 +18015,10 @@ fn append_remote_report(output: &mut String, metadata: &PersistedTask) {
 #[cfg(all(test, unix))]
 #[path = "spawn_tests.rs"]
 mod spawn_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "task_scope_tests.rs"]
+mod task_scope_tests;
 
 #[cfg(test)]
 #[path = "default_kill_test.rs"]
@@ -25271,6 +25669,7 @@ mod tests {
                         true,
                         false,
                         Some(dir.path().into()),
+                        false,
                     )
                     .unwrap();
                 let task = registry.task_for_test(&id).unwrap();
@@ -25900,6 +26299,7 @@ mod tests {
                     true,
                     false,
                     Some(dir.path().into()),
+                    false,
                 )
                 .unwrap();
             let paths = original.task(&task_id).unwrap().paths.clone();

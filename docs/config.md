@@ -33,11 +33,23 @@ The list covers a time window, so changes made by other processes in that window
 
 Per-call `env` entries and the command's own `export` both override configured values, and config changes apply to future commands without a restart. The first bash reply in each session lists the applied names with their tier, never their values, and says when a project map was ignored as untrusted or shadowed by a user value. When a command starts while the same trimmed command is already running in the same project and canonical working directory, AFT adds a warning with its task ID, age, and whether it belongs to this session; the command still runs.
 
-On Linux, user config may set `bash.linux_scope: true` to launch non-PTY tool shells through `systemd-run --user --scope --collect --quiet`. The default is `false`. AFT uses the scope only when `systemd-run` exists and the user manager is reachable; otherwise it falls back to the normal process-group-isolated spawn and writes one informational log line. Native-sandbox launches also use the normal spawn because their launcher cannot contact the user manager. Project config cannot enable or disable this host-level containment option.
+On Linux, daemon mode puts non-PTY bash tasks in systemd user scopes by default (`bash.linux_scope: true`). Tasks can continue to run through an AFT module restart while the same systemd user manager is active.
+
+Use user config to set `bash.linux_scope: false` and disable these scopes. Projects cannot change this option or its ceiling. Changes apply to future tasks only. Standalone mode, PTY tasks, and native-sandbox launches do not use these scopes. If `systemd-run`, the user manager, or the unified cgroup view is unavailable, AFT uses its usual process-group launch path.
+
+`bash.linux_scope_max_runtime_secs` is a user-only integer from `1` through `4294967295`. Its default is `86400` (24 hours). With no explicit `timeout`, a new worker wait does not extend the scope ceiling. With an explicit `timeout`, the scope limit is that timeout plus 60 seconds. AFT also applies its usual timeouts.
+
+A same-user command can move processes with `systemd-run --user` to a different cgroup, where the memory limit, scope kill, and time limit do not apply.
+
+After replay, AFT uses the wrapper's `io/exit` marker for the command's exit code. If the exit marker is missing and the recorded process has exited, AFT reports an unknown outcome (`FateUnknown`). An unreachable user manager does not change a live task's `Running` status. Systemd unit results do not prove a shell exit code. Logout, a host restart, or a user-manager stop can end the tasks.
+
+To stop all task scopes for your user, run `systemctl --user stop aft.slice`. WARNING: This command stops tasks from all AFT instances for that user.
+
+The daemon maintainer must supply the `module.draining` handler independently. Task scopes do not install that handler.
 
 `bash.memory_limit_mib` optionally caps aggregate memory for each local command, including foreground, background, and PTY commands. It is off by default; set a positive integer in MiB (for example, `4096` for 4 GiB; maximum `4294967295`) in user config. Projects may tighten the cap, never raise or remove it. Changes affect future commands; there is no per-call override. Remote `runon` jobs use the build server's own limits and are not covered.
 
-- **Linux:** cgroup v2 `memory.max` (using a delegated transient systemd user scope when needed); if unavailable, the result explicitly names the process-group RSS watcher fallback.
+- **Linux:** cgroup v2 `memory.max` in the task's own scope when daemon scopes apply. This limit includes descendants in different process groups. The `memory.swap.max` and `memory.oom.group` controls apply to that cgroup. AFT refuses a scoped launch if it cannot set the necessary memory controls. Other local tasks use a delegated cgroup when available. If the delegated cgroup is unavailable, the result names the process-group RSS watcher fallback.
 - **Windows:** a job-object aggregate memory limit refuses allocations; AFT stops the job when a limit notification or peak accounting confirms the cap was hit.
 - **macOS:** a physical-footprint process-group watcher samples every 500 ms. Fast allocations can overshoot for a fraction of a second, and processes that leave the group are not counted. The Linux watcher has the same limits. Watcher scans are bounded to 4096 processes and stop the command explicitly if accounting cannot complete.
 
@@ -454,9 +466,13 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     // 1800000 (30 minutes); values below 60000 are a config error.
     "worker_wait_max_ms": 1800000,
 
-    // Linux-only and user-tier only. Put non-PTY tool shells in transient
-    // systemd user scopes when the user manager is reachable. Default false.
-    "linux_scope": false
+    // Linux daemon scopes are on by default. User config can disable them.
+    // Standalone mode, PTY tasks, and native-sandbox launches do not use them.
+    "linux_scope": true,
+    // User-only scope ceiling without an explicit timeout (seconds).
+    // Range: 1 through 4294967295. Default 86400 (24 hours).
+    // A new worker wait does not extend it.
+    "linux_scope_max_runtime_secs": 86400
   },
 
   // aft_inspect codebase-health scanner (recommended/all tiers).

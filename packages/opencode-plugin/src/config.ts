@@ -395,8 +395,10 @@ const BashFeaturesSchema = z.object({
     })
     .optional(),
   memory_limit_mib: z.number().int().min(1).max(4_294_967_295).optional(),
-  /** Linux-only user-tier opt-in for transient systemd user scopes. Default false. */
+  /** Linux daemon scopes are on by default. Projects cannot change this containment. */
   linux_scope: z.boolean().optional(),
+  /** User-only scope ceiling without an explicit timeout, in seconds. Default 86400. */
+  linux_scope_max_runtime_secs: z.number().int().min(1).max(4_294_967_295).optional(),
   /** macOS agent commands do not inherit the supervisor's privacy grants. Default false. */
   disclaim_privacy: z.boolean().optional(),
   // Pi-only registration fallback. OpenCode accepts this shared config key but
@@ -2005,6 +2007,11 @@ function getStrippedTopLevelKeys(override: AftConfig, base: AftConfig): string[]
     stripped.push("bash.disclaim_privacy");
   if (typeof override.bash === "object" && override.bash.runon_env !== undefined)
     stripped.push("bash.runon_env");
+  if (typeof override.bash === "object") {
+    for (const key of ["linux_scope", "linux_scope_max_runtime_secs"] as const) {
+      if (override.bash[key] !== undefined) stripped.push(`bash.${key}`);
+    }
+  }
   if (override.sandbox?.write_allow !== undefined) stripped.push("sandbox.write_allow");
   if (override.subc !== undefined) stripped.push("subc");
   if (override.pi?.external_access_ask === false) stripped.push("pi.external_access_ask");
@@ -2085,6 +2092,8 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     if (projectBash.changed_files !== "off") delete projectBash.changed_files;
     delete projectBash.runon_enabled;
     delete projectBash.runon_env;
+    delete projectBash.linux_scope;
+    delete projectBash.linux_scope_max_runtime_secs;
     delete projectBash.env;
   }
   const bash = mergeBashConfig(base.bash, projectBash, "project");

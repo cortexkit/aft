@@ -5556,6 +5556,10 @@ impl AppContext {
         // so the documented `lsp.diagnostic_cache_size` knob takes effect.
         lsp_manager.set_diagnostic_capacity(config.diagnostic_cache_size);
         let bash_background = BgTaskRegistry::new(Arc::clone(&progress_sender));
+        bash_background.configure_task_scope_runtime(
+            app.subc_connection_file().is_some(),
+            Duration::from_secs(config.bash.linux_scope_max_runtime_secs),
+        );
         let compression_aggregates = bash_background.compression_aggregate_cache();
         let view_disk_limits_next_ms = AtomicU64::new(if config.views.enabled {
             0
@@ -6847,6 +6851,10 @@ impl AppContext {
 
     pub fn app(&self) -> Arc<App> {
         Arc::clone(&self.app)
+    }
+
+    pub fn is_daemon_mode(&self) -> bool {
+        self.app().subc_connection_file().is_some()
     }
 
     /// Clone the LSP child registry handle. Used by main.rs to give the
