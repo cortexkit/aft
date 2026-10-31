@@ -48,6 +48,26 @@ async fn audit_scope_end_ledger_failure_must_still_prevent_late_approval() {
         )
         .unwrap();
     audit_confirm_scope_end(&f, &run).await;
+    {
+        let db = f.ctx.db().unwrap();
+        let conn = db.lock().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT ended FROM access_scopes WHERE scope_ref=?1",
+                [&run.scope.as_ref().unwrap().scope_ref],
+                |r| r.get::<_, u64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            ledger::get(&conn, &tool_provider::LedgerEdge::key(&run, "program-9401"))
+                .unwrap()
+                .unwrap()
+                .state,
+            ledger::State::Prepared
+        );
+    }
     run.run_scope.get().unwrap().end_for_test();
     f.ctx
         .db()
@@ -87,6 +107,30 @@ async fn audit_confirm_scope_end(f: &Fixture, run: &RouteIdentity) {
         HELLO_CORR + 1,
     ));
     let scopes = Arc::new(run_scope::RunScopes::new(control.clone()));
+    // The fixture's active RunScope is not registered in this worker. A parked
+    // copy of its ask makes production discovery track the run's owner/ref/epoch.
+    let mut watched = identity(&run.project_root, run.scope.clone());
+    Arc::get_mut(&mut watched.0).unwrap().call_mode = subc_protocol::call_mode::CallMode::Codemode;
+    let watched_scope = scopes.bind(&watched).unwrap();
+    let db = f.ctx.db().unwrap();
+    let ask = {
+        let conn = db.lock().unwrap();
+        let mut rows = asks::for_scope(&conn, &access_grants::scope_key(run)).unwrap();
+        assert_eq!(rows.len(), 1);
+        rows.pop().unwrap()
+    };
+    watched_scope.park_ask(ParkedAsk {
+        call: ConsentCall {
+            scope: serde_json::from_value(ask.selector).unwrap(),
+            project_root: run.project_root.clone(),
+            session: run.session.clone(),
+            method: "consent.withdraw",
+            params: json!({"elicitation_id":ask.elicitation_id.unwrap()}),
+            timeout: UNARY_TIMEOUT,
+        },
+        key: ask.key,
+        db,
+    });
     let (describes, mut ended, worker) = scope_describe::start(control, f.executor.clone(), scopes);
     describes.goodbye(run.scope.clone().unwrap());
     let request = tokio::time::timeout(Duration::from_secs(10), frames.recv())
@@ -471,28 +515,33 @@ async fn audit_pending_call_binds_key_operation_path_cwd_and_scope() {
         "run:audit-binding"
     );
     let args = json!({"path":target});
-    let replay = audit_keyed_reply(&f, &run, "read", args.clone(), "program-9410").await;
-    assert_eq!(replay["held"]["reason"], "consent");
-    for (name, changed) in [
-        ("read", json!({"path":f.head_root.join("shared.txt")})),
-        ("write", json!({"path":target,"content":"not approved"})),
-        (
-            "bash",
-            json!({"command":"printf not-approved","workdir":f.head_root}),
-        ),
-    ] {
-        let reply = audit_keyed_reply(&f, &run, name, changed, "program-9410").await;
+    // An in-flight repeat attaches until the original terminal answer; it does
+    // not receive another initial held reply or dispatch a second execution.
+    let replay = audit_keyed_reply(&f, &run, "read", args.clone(), "program-9410");
+    let finish_original = async {
+        for (name, changed) in [
+            ("read", json!({"path":f.head_root.join("shared.txt")})),
+            ("write", json!({"path":target,"content":"not approved"})),
+            (
+                "bash",
+                json!({"command":"printf not-approved","workdir":f.head_root}),
+            ),
+        ] {
+            let reply = audit_keyed_reply(&f, &run, name, changed, "program-9410").await;
+            assert!(reply.to_string().contains("call_key_conflict"), "{reply}");
+        }
+        let other = program(&f, false, "run:audit-other-binding");
+        let reply = audit_keyed_reply(&f, &other, "read", args, "program-9410").await;
         assert!(reply.to_string().contains("call_key_conflict"), "{reply}");
-    }
-    let other = program(&f, false, "run:audit-other-binding");
-    let reply = audit_keyed_reply(&f, &other, "read", args, "program-9410").await;
-    assert!(reply.to_string().contains("call_key_conflict"), "{reply}");
-    assert_eq!(f.fake.calls("consent.request").len(), 1);
-    control.answer(&request, "allow_once");
-    assert!(late(&f, &run, 9410)
-        .await
-        .to_string()
-        .contains("unheld contents"));
+        assert_eq!(f.fake.calls("consent.request").len(), 1);
+        control.answer(&request, "allow_once");
+        assert!(late(&f, &run, 9410)
+            .await
+            .to_string()
+            .contains("unheld contents"));
+    };
+    let (replay, ()) = tokio::join!(replay, finish_original);
+    assert!(replay.to_string().contains("unheld contents"), "{replay}");
     assert_eq!(
         std::fs::read_to_string(target).unwrap(),
         "unheld contents\n"
