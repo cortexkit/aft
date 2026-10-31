@@ -6461,6 +6461,7 @@ mod storage_retention_tests {
 
     /// Generated metadata-only model, never a copy of open production databases.
     /// The harness fan-out mirrors session/task/control/io durable storage.
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "offline Linux performance fixture; creates about 160k directories"]
     fn retention_unchanged_offline_shape_benchmark() {
