@@ -24657,6 +24657,28 @@ struct CorpusSnapshot {
     files: HashMap<PathBuf, CorpusFile>,
 }
 
+/// One root's reusable digests. The root context owns this slot; background
+/// work receives only a weak reference so it cannot keep a released root warm.
+#[derive(Default)]
+pub(crate) struct CorpusMemo {
+    snapshot: Mutex<Option<(PathBuf, Arc<CorpusSnapshot>)>>,
+}
+
+thread_local! {
+    static CORPUS_MEMO: RefCell<std::sync::Weak<CorpusMemo>> = RefCell::new(std::sync::Weak::new());
+}
+
+pub(crate) fn with_corpus_memo<R>(memo: std::sync::Weak<CorpusMemo>, run: impl FnOnce() -> R) -> R {
+    struct Restore(std::sync::Weak<CorpusMemo>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CORPUS_MEMO.with(|slot| *slot.borrow_mut() = std::mem::take(&mut self.0));
+        }
+    }
+    let _restore = Restore(CORPUS_MEMO.with(|slot| slot.replace(memo)));
+    run()
+}
+
 impl CorpusSnapshot {
     fn freshness(&self, path: &Path) -> Option<FileFreshness> {
         let hash = *self.files.get(path)?.hash.as_ref().ok()?;
@@ -24688,13 +24710,15 @@ impl CorpusSnapshot {
 }
 
 fn corpus_snapshot_for(project_root: &Path, files: &[PathBuf]) -> Result<Arc<CorpusSnapshot>> {
-    static SNAPSHOTS: OnceLock<Mutex<HashMap<PathBuf, Arc<CorpusSnapshot>>>> = OnceLock::new();
-    let snapshots = SNAPSHOTS.get_or_init(Default::default);
-    let previous = snapshots
-        .lock()
-        .expect("corpus snapshot mutex poisoned")
-        .get(project_root)
-        .cloned();
+    let memo = CORPUS_MEMO.with(|slot| slot.borrow().clone());
+    let previous = memo.upgrade().and_then(|memo| {
+        memo.snapshot
+            .lock()
+            .expect("corpus snapshot mutex poisoned")
+            .as_ref()
+            .filter(|(root, _)| root == project_root)
+            .map(|(_, snapshot)| Arc::clone(snapshot))
+    });
     let mut sources = HashMap::new();
     let mut fingerprint = CorpusFingerprint::default();
     let paths: Box<dyn Iterator<Item = PathBuf> + '_> = if files.is_empty() {
@@ -24742,11 +24766,97 @@ fn corpus_snapshot_for(project_root: &Path, files: &[PathBuf]) -> Result<Arc<Cor
         fingerprint: fingerprint.finish(project_root),
         files: sources,
     });
-    snapshots
-        .lock()
-        .expect("corpus snapshot mutex poisoned")
-        .insert(project_root.to_path_buf(), Arc::clone(&corpus));
+    if let Some(memo) = memo.upgrade() {
+        *memo
+            .snapshot
+            .lock()
+            .expect("corpus snapshot mutex poisoned") =
+            Some((project_root.to_path_buf(), Arc::clone(&corpus)));
+    }
     Ok(corpus)
+}
+
+#[cfg(test)]
+mod corpus_memo_lifecycle_tests {
+    use super::*;
+    use crate::context::AppContext;
+
+    fn context() -> AppContext {
+        AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        )
+    }
+
+    #[test]
+    fn root_teardown_drops_corpus_snapshot_and_rebind_rehashes() {
+        for teardown in ["unbind", "idle", "try-idle", "configure", "root-change"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(dir.path()).unwrap();
+            let source = root.join("main.ts");
+            std::fs::write(&source, "export function marker() {}\n").unwrap();
+            let ctx = context();
+            ctx.set_canonical_cache_root(root.clone());
+            ctx.note_callgraph_build_key("first".to_string());
+            let memo = ctx.callgraph_corpus_memo();
+            let snapshot =
+                with_corpus_memo(memo.clone(), || corpus_snapshot_for(&root, &[]).unwrap());
+            let fingerprint = snapshot.fingerprint.clone();
+            let cached = Arc::downgrade(&snapshot);
+            drop(snapshot);
+            assert!(cached.upgrade().is_some());
+
+            match teardown {
+                "unbind" => ctx.mark_subc_unbound(),
+                "idle" => assert!(ctx.evict_idle_artifacts()),
+                "try-idle" => assert!(ctx.try_evict_idle_artifacts()),
+                "configure" => assert!(!ctx.note_callgraph_build_key("different".to_string())),
+                "root-change" => ctx.set_canonical_cache_root(root.join("different-root")),
+                _ => unreachable!(),
+            }
+            assert!(memo.upgrade().is_none(), "{teardown} retained the memo");
+            assert!(
+                cached.upgrade().is_none(),
+                "{teardown} retained the snapshot"
+            );
+
+            // A worker's old weak scope cannot resurrect the released owner.
+            with_corpus_memo(memo.clone(), || {
+                assert_eq!(callgraph_corpus_fingerprint(&root).unwrap(), fingerprint);
+            });
+            assert!(memo.upgrade().is_none());
+            if teardown == "unbind" {
+                assert!(ctx.callgraph_corpus_memo().upgrade().is_none());
+            }
+            ctx.set_canonical_cache_root(root.clone());
+            ctx.mark_subc_bound();
+            work_counts::reset_under(&root);
+            let rebound = ctx.callgraph_corpus_memo();
+            with_corpus_memo(rebound, || {
+                assert_eq!(callgraph_corpus_fingerprint(&root).unwrap(), fingerprint);
+            });
+            assert_eq!(
+                work_counts::fingerprint_reads(&source),
+                1,
+                "{teardown} rebind"
+            );
+        }
+    }
+
+    #[test]
+    fn dropping_root_context_releases_corpus_snapshot_without_a_global_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("main.ts"), "export function marker() {}\n").unwrap();
+        let ctx = context();
+        let memo = ctx.callgraph_corpus_memo();
+        let snapshot = with_corpus_memo(memo.clone(), || corpus_snapshot_for(&root, &[]).unwrap());
+        let cached = Arc::downgrade(&snapshot);
+        drop(snapshot);
+        drop(ctx);
+        assert!(memo.upgrade().is_none());
+        assert!(cached.upgrade().is_none());
+    }
 }
 
 #[derive(Default)]
@@ -29521,13 +29631,16 @@ export function leaf() {}
         reference.cold_build(&files).unwrap();
         work_counts::reset_under(&root);
         let opens = crate::project_content::Probe::new(&root);
-        let (published, _) = CallGraphStore::cold_build_with_lease_chunked(
-            root.join(".published"),
-            root.clone(),
-            &[],
-            32,
-        )
-        .unwrap();
+        let memo = Arc::new(CorpusMemo::default());
+        let (published, _) = with_corpus_memo(Arc::downgrade(&memo), || {
+            CallGraphStore::cold_build_with_lease_chunked(
+                root.join(".published"),
+                root.clone(),
+                &[],
+                32,
+            )
+            .unwrap()
+        });
         let reads = files
             .iter()
             .map(|path| work_counts::fingerprint_reads(path))
@@ -29574,11 +29687,11 @@ export function leaf() {}
         {
             work_counts::reset_under(&root);
             let probe = crate::project_content::Probe::new(&root);
-            assert!(
+            assert!(with_corpus_memo(Arc::downgrade(&memo), || {
                 CallGraphStore::cold_build_suspension(&root.join(".published"), &root)
                     .unwrap()
                     .is_none()
-            );
+            }));
             assert!(files
                 .iter()
                 .all(|path| work_counts::fingerprint_reads(path) == 0));
@@ -35015,13 +35128,16 @@ mod bounded_build_breaker_tests {
 
     #[test]
     fn suspension_probe_reuses_content_fingerprint_but_not_a_rewritten_corpus() {
+        let memo = Arc::new(CorpusMemo::default());
         let temp = tempdir().unwrap();
         let root = temp.path().join("root");
         let store_dir = temp.path().join("store");
         std::fs::create_dir_all(&root).unwrap();
         let source = root.join("main.ts");
         std::fs::write(&source, "export function before() {}\n").unwrap();
-        let fingerprint = callgraph_corpus_fingerprint(&root).unwrap();
+        let fingerprint = with_corpus_memo(Arc::downgrade(&memo), || {
+            callgraph_corpus_fingerprint(&root).unwrap()
+        });
         let mut reference = CorpusFingerprint::default();
         reference.add_path(&root, &source);
         assert_eq!(
@@ -35044,12 +35160,13 @@ mod bounded_build_breaker_tests {
                 .unwrap();
         }
         work_counts::reset_under(&root);
-        assert!(CallGraphStore::cold_build_suspension(&store_dir, &root)
-            .unwrap()
-            .is_some());
-        assert!(CallGraphStore::cold_build_suspension(&store_dir, &root)
-            .unwrap()
-            .is_some());
+        let probe = || {
+            with_corpus_memo(Arc::downgrade(&memo), || {
+                CallGraphStore::cold_build_suspension(&store_dir, &root).unwrap()
+            })
+        };
+        assert!(probe().is_some());
+        assert!(probe().is_some());
         #[cfg(any(unix, windows))]
         assert_eq!(work_counts::fingerprint_reads(&source), 0);
 
@@ -35057,9 +35174,7 @@ mod bounded_build_breaker_tests {
             filetime::FileTime::from_last_modification_time(&std::fs::metadata(&source).unwrap());
         std::fs::write(&source, "export function after_() {}\n").unwrap();
         filetime::set_file_mtime(&source, mtime).unwrap();
-        assert!(CallGraphStore::cold_build_suspension(&store_dir, &root)
-            .unwrap()
-            .is_none());
+        assert!(probe().is_none());
         assert_ne!(callgraph_corpus_fingerprint(&root).unwrap(), fingerprint);
         let (store, _) =
             CallGraphStore::cold_build_with_lease_chunked(store_dir, root, &[], 1).unwrap();

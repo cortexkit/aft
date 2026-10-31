@@ -4724,6 +4724,7 @@ pub struct AppContext {
     view_disk_limits_next_ms: AtomicU64,
     checkout_query_runtime: RwLock<Option<Arc<crate::views::query_wait::CheckoutQueryRuntime>>>,
     callgraph_store: Arc<RwLock<Option<Arc<ReadonlyCallGraphStore>>>>,
+    callgraph_corpus_memo: parking_lot::Mutex<Option<Arc<crate::callgraph_store::CorpusMemo>>>,
     callgraph_force_demand: Arc<crate::callgraph_maintenance::CallgraphForceDemand>,
     callgraph_reconcile: Arc<crate::callgraph_maintenance::CallgraphReconcileState>,
     #[cfg(test)]
@@ -5628,6 +5629,7 @@ impl AppContext {
             view_disk_limits_next_ms,
             checkout_query_runtime: RwLock::new(None),
             callgraph_store: Arc::new(RwLock::new(None)),
+            callgraph_corpus_memo: parking_lot::Mutex::new(None),
             callgraph_force_demand: Arc::default(),
             callgraph_reconcile: Arc::default(),
             #[cfg(test)]
@@ -6944,6 +6946,9 @@ impl AppContext {
     pub(crate) fn mark_subc_unbound(&self) {
         self.subc_lifecycle
             .mark_unbound(self.configure_generation.as_ref());
+        let _ = self
+            .subc_lifecycle
+            .run_if_unbound(|| self.callgraph_corpus_memo.lock().take());
         crate::provisional_identity_retry::cancel(self);
         self.release_view_publication_cache();
         crate::callgraph_store::retire_obsolete_callgraph_refresh_waiters();
@@ -7130,6 +7135,9 @@ impl AppContext {
         let mut current = self.callgraph_build_key.lock();
         let equivalent = current.as_deref() == Some(key.as_str());
         *current = Some(key);
+        if !equivalent {
+            self.callgraph_corpus_memo.lock().take();
+        }
         equivalent
     }
 
@@ -9634,6 +9642,7 @@ impl AppContext {
             changed
         };
         if root_changed {
+            self.callgraph_corpus_memo.lock().take();
             let mut tier2 = self
                 .status_bar_tier2
                 .write()
@@ -10469,6 +10478,16 @@ impl AppContext {
         self.callgraph_store.as_ref()
     }
 
+    pub(crate) fn callgraph_corpus_memo(&self) -> Weak<crate::callgraph_store::CorpusMemo> {
+        let mut memo = self.callgraph_corpus_memo.lock();
+        // Work already admitted before unbind may finish, but must not recreate
+        // a memo for a root whose binding has been released.
+        if self.subc_lifecycle.unbound_hint.load(Ordering::Acquire) {
+            return Weak::new();
+        }
+        Arc::downgrade(memo.get_or_insert_with(Default::default))
+    }
+
     /// Whether a refresh the store must apply before answering as current is
     /// still outstanding.
     #[cfg(test)]
@@ -10839,23 +10858,25 @@ impl AppContext {
             persist_epoch_flag.clone(),
             persist_epoch,
             || {
-                if force_token.is_some() {
-                    CallGraphStore::force_cold_build_with_lease_chunked(
-                        callgraph_dir.clone(),
-                        project_root.clone(),
-                        &[],
-                        self.config().callgraph_chunk_size,
-                    )
-                    .map(|(store, _stats)| (store, ()))
-                } else {
-                    CallGraphStore::ensure_built_with_lease_chunked(
-                        callgraph_dir.clone(),
-                        project_root.clone(),
-                        &[],
-                        self.config().callgraph_chunk_size,
-                    )
-                    .map(|(store, _stats)| (store, ()))
-                }
+                crate::callgraph_store::with_corpus_memo(self.callgraph_corpus_memo(), || {
+                    if force_token.is_some() {
+                        CallGraphStore::force_cold_build_with_lease_chunked(
+                            callgraph_dir.clone(),
+                            project_root.clone(),
+                            &[],
+                            self.config().callgraph_chunk_size,
+                        )
+                        .map(|(store, _stats)| (store, ()))
+                    } else {
+                        CallGraphStore::ensure_built_with_lease_chunked(
+                            callgraph_dir.clone(),
+                            project_root.clone(),
+                            &[],
+                            self.config().callgraph_chunk_size,
+                        )
+                        .map(|(store, _stats)| (store, ()))
+                    }
+                })
             },
         )?;
         drop(store);
@@ -11545,7 +11566,9 @@ impl AppContext {
         }
 
         if !build_in_flight {
-            match CallGraphStore::cold_build_suspension(&callgraph_dir, &project_root) {
+            match crate::callgraph_store::with_corpus_memo(self.callgraph_corpus_memo(), || {
+                CallGraphStore::cold_build_suspension(&callgraph_dir, &project_root)
+            }) {
                 Ok(Some(suspension)) => return CallgraphStoreAccess::Suspended(suspension),
                 Ok(None) => {}
                 Err(error) => return CallgraphStoreAccess::Error(error),
@@ -11979,6 +12002,7 @@ impl AppContext {
         self.callgraph_cold_build_spawn_count
             .fetch_add(1, Ordering::SeqCst);
         let lifecycle = self.subc_lifecycle.clone();
+        let corpus_memo = self.callgraph_corpus_memo();
         let test_hooks = crate::callgraph_store::CallgraphBackgroundTestHooks::capture();
 
         std::thread::spawn(move || {
@@ -12003,35 +12027,40 @@ impl AppContext {
                         crate::callgraph_store::with_publish_epoch(
                             persist_epoch_flag.clone(),
                             persist_epoch,
-                            || match work {
-                                CallgraphBackgroundWork::LegacyMigration => {
-                                    CallGraphStore::migrate_legacy_with_lease(
-                                        callgraph_dir.clone(),
-                                        project_root.clone(),
-                                    )
-                                }
-                                CallgraphBackgroundWork::ForceRebuild(_) => {
-                                    let files = crate::callgraph::walk_project_files(&project_root)
-                                        .collect::<Vec<_>>();
-                                    CallGraphStore::force_cold_build_with_lease_chunked(
-                                        callgraph_dir.clone(),
-                                        project_root.clone(),
-                                        &files,
-                                        chunk_size,
-                                    )
-                                    .map(|(store, _)| Some(store))
-                                }
-                                CallgraphBackgroundWork::Ensure => {
-                                    let files = crate::callgraph::walk_project_files(&project_root)
-                                        .collect::<Vec<_>>();
-                                    CallGraphStore::ensure_built_with_lease_chunked(
-                                        callgraph_dir.clone(),
-                                        project_root.clone(),
-                                        &files,
-                                        chunk_size,
-                                    )
-                                    .map(|(store, _)| Some(store))
-                                }
+                            || {
+                                crate::callgraph_store::with_corpus_memo(corpus_memo, || match work
+                                {
+                                    CallgraphBackgroundWork::LegacyMigration => {
+                                        CallGraphStore::migrate_legacy_with_lease(
+                                            callgraph_dir.clone(),
+                                            project_root.clone(),
+                                        )
+                                    }
+                                    CallgraphBackgroundWork::ForceRebuild(_) => {
+                                        let files =
+                                            crate::callgraph::walk_project_files(&project_root)
+                                                .collect::<Vec<_>>();
+                                        CallGraphStore::force_cold_build_with_lease_chunked(
+                                            callgraph_dir.clone(),
+                                            project_root.clone(),
+                                            &files,
+                                            chunk_size,
+                                        )
+                                        .map(|(store, _)| Some(store))
+                                    }
+                                    CallgraphBackgroundWork::Ensure => {
+                                        let files =
+                                            crate::callgraph::walk_project_files(&project_root)
+                                                .collect::<Vec<_>>();
+                                        CallGraphStore::ensure_built_with_lease_chunked(
+                                            callgraph_dir.clone(),
+                                            project_root.clone(),
+                                            &files,
+                                            chunk_size,
+                                        )
+                                        .map(|(store, _)| Some(store))
+                                    }
+                                })
                             },
                         )
                     });
@@ -14735,6 +14764,8 @@ impl AppContext {
             return false;
         }
 
+        self.callgraph_corpus_memo.lock().take();
+
         if let Some(root) = self.canonical_cache_root_opt() {
             crate::callgraph_store::close_refresh_connections(&root);
         }
@@ -14955,6 +14986,9 @@ impl AppContext {
         let Some(mut callgraph_store) = try_write_unpoisoned(&self.callgraph_store) else {
             return false;
         };
+        let Some(mut corpus_memo) = self.callgraph_corpus_memo.try_lock() else {
+            return false;
+        };
         let Some(mut search_index) = try_write_unpoisoned(&self.search_index) else {
             return false;
         };
@@ -15005,6 +15039,7 @@ impl AppContext {
             return false;
         }
         callgraph_store.take();
+        corpus_memo.take();
         search_index.take();
         semantic_index.take();
         borrowed_index_cache.clear();
@@ -15025,6 +15060,7 @@ impl AppContext {
         self.semantic_refresh_build_epoch.store(0, Ordering::SeqCst);
         self.invalidate_semantic_refresh_probe();
         drop((
+            corpus_memo,
             embedding_model,
             refresh_events,
             refresh_requests,
