@@ -22869,14 +22869,14 @@ mod tests {
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let (slot, _) = fixture.ctx.database_open_slot();
         let locked = slot.lock();
-        // The diagnostics read the scheduler without blocking and report its
-        // jobs as None when the scheduler lock is held at that instant. Read
-        // again until one read gets through; every assertion below still
-        // applies to that read.
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // The job snapshot is a non-blocking read; while the scheduler holds
+        // its lock it reports None, by design. Retry while the slot stays
+        // held, so the assertions below check what the snapshot names rather
+        // than lock timing.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let diagnostic = loop {
             let diagnostic = rebind_wait_diagnostics(&executor, &fixture);
-            if diagnostic.contains("held-rebind-writer") || Instant::now() >= deadline {
+            if diagnostic.contains("held-rebind-writer") || std::time::Instant::now() >= deadline {
                 break diagnostic;
             }
             std::thread::sleep(Duration::from_millis(10));

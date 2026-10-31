@@ -1,0 +1,24 @@
+{
+  "expect": {
+    "refused": "request_field_forbidden{field: expected_head_sha}"
+  },
+  "name": "refused-nonhex-sha-pr-enqueue",
+  "request": {
+    "action": "pr enqueue",
+    "body": {
+      "expected_head_sha": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+    },
+    "gh_route_schema": 1,
+    "manifest_version": 22,
+    "metadata": {
+      "agent_id": "alfonso-aft",
+      "pid": 4242
+    },
+    "operation": "gh.route",
+    "repository": "org/repo",
+    "rung_as_of_unix_secs": 1793066213,
+    "target": {
+      "number": 7
+    }
+  }
+}

@@ -497,6 +497,19 @@ const V3_BASE_COMPLETION_BUSY: &str = "v3 base plane completion is owned elsewhe
 /// never substitute another store when acquisition fails.
 pub(crate) trait CallgraphReaderSource: Send + Sync {
     fn acquire(&self) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError>;
+    /// `acquire`, plus the source revision the reader's cut belongs to when
+    /// the source tracks one. The view keeps the reader under it.
+    fn acquire_with_revision(
+        &self,
+    ) -> Result<(Arc<ReadonlyCallGraphStore>, Option<u64>), CallgraphViewError> {
+        Ok((self.acquire()?, None))
+    }
+    /// The source revision when the cut last acquired is still current: see
+    /// `CheckoutDriver::steady_installed_revision`. `None` makes the next query
+    /// acquire a freshly verified reader.
+    fn steady_revision(&self) -> Option<u64> {
+        None
+    }
     fn record_change(&self, path: &Path);
     fn record_overflow(&self) {}
     fn record_cookie(&self, _: &Path) {}
@@ -530,6 +543,16 @@ pub(super) fn has_unpublished_changes(snapshot: &Snapshot) -> bool {
 
 impl CallgraphReaderSource for CheckoutCallgraphSource {
     fn acquire(&self) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError> {
+        self.acquire_with_revision().map(|(store, _)| store)
+    }
+
+    fn steady_revision(&self) -> Option<u64> {
+        self.driver.steady_installed_revision()
+    }
+
+    fn acquire_with_revision(
+        &self,
+    ) -> Result<(Arc<ReadonlyCallGraphStore>, Option<u64>), CallgraphViewError> {
         use super::first_load::FirstLoadDriver;
         let installed = self.driver.installed_snapshot();
         // After a restart, start from this checkout's own published worker
@@ -596,8 +619,9 @@ impl CallgraphReaderSource for CheckoutCallgraphSource {
         // Read the installed cut directly: `installed_snapshot` would mark a
         // checkout without a steady watcher subscription overflowed at once.
         // That mark only decides how the next bind reconciles; this cut was
-        // just verified against the disk.
-        let (snapshot, _) = self.driver.installed_cut();
+        // just verified against the disk. The cut and its revision are read
+        // together under the driver's install lock.
+        let (snapshot, revision) = self.driver.installed_cut();
         if snapshot.pending_intent().next().is_some()
             || snapshot.watcher() != super::snapshot::WatcherState::Healthy
             || has_unpublished_changes(&snapshot)
@@ -635,7 +659,7 @@ impl CallgraphReaderSource for CheckoutCallgraphSource {
                     .map_err(|error| error.to_string())?
             }
         };
-        Ok(reader.store.clone())
+        Ok((reader.store.clone(), Some(revision)))
     }
 
     fn record_change(&self, path: &Path) {
@@ -663,6 +687,13 @@ pub(crate) struct CallgraphView {
     policy: crate::blob_store::v2::TrigramPolicy,
     source: Arc<dyn CallgraphReaderSource>,
     query: std::sync::Mutex<super::contracts::LoadRetry<CallgraphViewError>>,
+    /// The last reader with the source revision of the cut it reads. Taken
+    /// only under `query`. A query whose source still reports that revision
+    /// as steady reuses the reader instead of binding again.
+    steady: std::sync::Mutex<Option<(u64, Arc<ReadonlyCallGraphStore>)>>,
+    /// Verified acquisitions made, so tests can tell reuse from a new bind.
+    #[cfg(test)]
+    acquisitions: std::sync::atomic::AtomicUsize,
     ready: std::sync::atomic::AtomicBool,
     legacy_import: Option<Arc<crate::migration::views_background::BackgroundImport>>,
     current: crate::migration::v3_ledger::ImportControl,
@@ -786,6 +817,9 @@ impl CallgraphView {
             policy,
             source,
             query: std::sync::Mutex::new(super::contracts::LoadRetry::default()),
+            steady: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            acquisitions: Default::default(),
             ready: std::sync::atomic::AtomicBool::new(false),
             legacy_import: None,
             current: Arc::new(|| true),
@@ -857,7 +891,33 @@ impl CallgraphView {
             .query
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let result = retry.run(now, |error| error.busy, || self.source.acquire());
+        let mut steady = self
+            .steady
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let (Some((revision, store)), Some(current)) =
+            (steady.as_ref(), self.source.steady_revision())
+        {
+            if *revision == current {
+                self.ready.store(true, std::sync::atomic::Ordering::Release);
+                return Ok(store.clone());
+            }
+        }
+        let result = retry.run(
+            now,
+            |error| error.busy,
+            || {
+                #[cfg(test)]
+                self.acquisitions
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.source.acquire_with_revision()
+            },
+        );
+        *steady = match &result {
+            Ok((store, Some(revision))) => Some((*revision, store.clone())),
+            _ => None,
+        };
+        let result = result.map(|(store, _)| store);
         self.ready
             .store(result.is_ok(), std::sync::atomic::Ordering::Release);
         result
@@ -952,6 +1012,55 @@ mod tests {
 
     fn events(dir: &Path) -> Vec<super::super::donor::DonorEvent> {
         super::super::donor::events_under(dir)
+    }
+
+    /// With a steady watcher subscription and nothing recorded since the last
+    /// verified bind, a query reuses that bind's reader instead of binding
+    /// again. A recorded change, or a watcher gap that hides an edit, makes
+    /// the next query bind, and the gap's bind finds the unreported edit.
+    #[test]
+    fn steady_checkout_reuses_its_reader_until_a_change_or_gap() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let root = checkout(&temp.path().join("checkout"));
+        let _watcher = crate::watcher_backend::subscription::start(
+            &root,
+            crate::watcher_backend::InitialCoverage::Complete,
+        );
+        let graph = view(&root, &storage);
+        assert_eq!(callers(&graph.reader().unwrap(), "a.ts", "target").len(), 1);
+        assert_eq!(callers(&graph.reader().unwrap(), "a.ts", "target").len(), 1);
+        assert_eq!(
+            graph.acquisitions.load(Relaxed),
+            1,
+            "an unchanged steady checkout must not bind again"
+        );
+
+        let added = root.join("c.ts");
+        std::fs::write(
+            &added,
+            "import { caller } from './b';\nexport function top() { return caller(); }\n",
+        )
+        .unwrap();
+        graph.record_change(&added);
+        assert_eq!(callers(&graph.reader().unwrap(), "b.ts", "caller").len(), 1);
+        assert_eq!(
+            graph.acquisitions.load(Relaxed),
+            2,
+            "a recorded change binds"
+        );
+
+        // Nobody reports this edit; only the gap's strict bind can find it.
+        std::fs::write(
+            root.join("d.ts"),
+            "import { top } from './c';\nexport function deeper() { return top(); }\n",
+        )
+        .unwrap();
+        crate::watcher_backend::subscription::gap(&root);
+        assert_eq!(callers(&graph.reader().unwrap(), "c.ts", "top").len(), 1);
+        assert_eq!(graph.acquisitions.load(Relaxed), 3, "a watcher gap binds");
     }
 
     #[test]

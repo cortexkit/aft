@@ -418,6 +418,7 @@ impl<'a> ApplicabilityTopologyCheck<'a> {
 #[derive(Clone, Debug)]
 pub enum ApplicabilityResolutionError {
     RootUnreadable { root: PathBuf, reason: String },
+    EntryLimitReached { root: PathBuf, entries: usize },
     RequestDeadline { root: PathBuf },
 }
 
@@ -9837,9 +9838,9 @@ fn walk_applicable_area_uncached(
             });
         }
         if visited >= entry_limit {
-            return Err(ApplicabilityResolutionError::RootUnreadable {
+            return Err(ApplicabilityResolutionError::EntryLimitReached {
                 root: project_root.to_path_buf(),
-                reason: format!("applicability walk incomplete: entry limit {entry_limit} reached"),
+                entries: visited,
             });
         }
         let entry = entry.map_err(|error| ApplicabilityResolutionError::RootUnreadable {

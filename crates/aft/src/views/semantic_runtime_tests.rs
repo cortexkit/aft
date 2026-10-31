@@ -2258,10 +2258,19 @@ fn large_semantic_materialization_batches_pins_and_touches() {
 /// independent cold index, not to another copy of the fast path.
 #[test]
 fn large_checkout_edit_counts_source_work_and_preserves_outputs() {
+    // The assertions (one edit embeds one text; answers match a strict and a
+    // cold index) hold at any size. 512 files keep the default run short on
+    // loaded Windows runners, where 2048 took over 7 minutes in a CI shard;
+    // AFT_STRESS=1 keeps the full size.
+    let files = if std::env::var("AFT_STRESS").as_deref() == Ok("1") {
+        2048
+    } else {
+        512
+    };
     let storage = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(root.path()).unwrap();
-    for i in 0..2048 {
+    for i in 0..files {
         let path = root.join(format!("file_{i:04}.rs"));
         std::fs::write(&path, format!("pub fn item_{i:04}() -> u32 {{ {i} }}\n")).unwrap();
         // Windows refuses to change times through a read-only handle.
@@ -2361,7 +2370,8 @@ fn large_checkout_edit_counts_source_work_and_preserves_outputs() {
         // graph) for the one file read.
         assert_eq!(work.attachments, 3);
         assert_eq!(
-            work.stats, 2049,
+            work.stats,
+            files + 1,
             "one stat per member plus a post-read stability stat"
         );
     }
@@ -2788,9 +2798,10 @@ fn multi_round_fill_yields_to_a_queued_waiter_between_rounds() {
     );
 }
 
-/// Waits for the fill to queue for a cold slot the test is holding. Every caller
-/// expects it to queue, so the deadline only bounds the failure case; 3 s was
-/// too short for a fill finishing its model call on a loaded Windows runner.
+/// Waits for a fill to queue on the cold-build limiter. Every caller expects
+/// it to queue, so the bound only matters on failure; it returns as soon as
+/// the fill is queued. Saving chunks before readmission took over 3 s on a
+/// loaded Windows runner, so the bound is generous.
 fn wait_for_fill_queue(limiter: &crate::cold_build_limiter::ColdBuildLimiter) -> bool {
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {

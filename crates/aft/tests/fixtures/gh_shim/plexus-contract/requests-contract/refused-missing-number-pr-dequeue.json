@@ -1,0 +1,19 @@
+{
+  "expect": {
+    "refused": "request_field_forbidden{field: number}"
+  },
+  "name": "refused-missing-number-pr-dequeue",
+  "request": {
+    "action": "pr dequeue",
+    "gh_route_schema": 1,
+    "manifest_version": 22,
+    "metadata": {
+      "agent_id": "alfonso-aft",
+      "pid": 4242
+    },
+    "operation": "gh.route",
+    "repository": "org/repo",
+    "rung_as_of_unix_secs": 1793066213,
+    "target": {}
+  }
+}

@@ -6222,6 +6222,36 @@ impl CheckoutDriver {
         (installed.snapshot.clone(), installed.revision)
     }
 
+    /// The installed revision when the installed cut is still current, so a
+    /// query can be served from it without another verified bind: the watcher
+    /// is healthy under the same subscription the cut was verified with, no
+    /// AFT write is pending or in progress, and the cut's verification proved
+    /// steady watcher coverage. Every recorded change, directory write,
+    /// overflow and subscription gap moves the revision, so a caller that saw
+    /// this revision at its last bind knows nothing has changed since.
+    /// `None` means the next query must bind.
+    pub(crate) fn steady_installed_revision(&self) -> Option<u64> {
+        // Marks the cut overflowed when the subscription moved since it was
+        // verified, which also moves the revision.
+        self.check_subscription();
+        if super::intent::active(self.owner.root()) {
+            return None;
+        }
+        let installed = self
+            .installed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snapshot = &installed.snapshot;
+        let steady = snapshot.watcher() == super::snapshot::WatcherState::Healthy
+            && snapshot.pending_intent().next().is_none()
+            && installed.uncertain_paths.is_empty()
+            && snapshot
+                .install_cut()
+                .and_then(|cut| cut.verification.as_ref())
+                .is_some_and(|guard| guard.steady_supported && guard.subscription.is_some());
+        steady.then_some(installed.revision)
+    }
+
     #[cfg(test)]
     pub(crate) fn take_reconcile_work(&self) -> ReconcileWork {
         std::mem::take(&mut *self.work.lock().unwrap())

@@ -555,6 +555,23 @@ pub(crate) mod pause_test_support {
         refusal: impl Fn(u64) -> Value + Send + 'static,
         run: impl FnOnce(SemanticBackendConfig, Requests) -> T,
     ) -> T {
+        with_fake_synapse_model(
+            json!({"model":MODEL,"fingerprint":"pinned","table_epoch":1,"dims":2,
+                "recommended_batch":{"rows":100,"token_budget":8192}}),
+            clock,
+            ready_at,
+            refusal,
+            run,
+        )
+    }
+
+    pub(crate) fn with_fake_synapse_model<T>(
+        model: Value,
+        clock: Arc<AtomicU64>,
+        ready_at: u64,
+        refusal: impl Fn(u64) -> Value + Send + 'static,
+        run: impl FnOnce(SemanticBackendConfig, Requests) -> T,
+    ) -> T {
         use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("connection.json");
@@ -605,8 +622,7 @@ pub(crate) mod pause_test_support {
                         drop(requests);
                         let params = &value["params"];
                         let reply = if value["method"] == MODELS_LIST_OPERATION {
-                            json!({"models":[{"model":MODEL,"fingerprint":"pinned","table_epoch":1,"dims":2,
-                                "recommended_batch":{"rows":100,"token_budget":8192}}]})
+                            json!({"models":[model]})
                         } else if now < ready_at {
                             refusal(now)
                         } else {
@@ -688,12 +704,44 @@ impl SynapseIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelServability {
+    Servable,
+    Refused(Option<String>),
+}
+
+impl ModelServability {
+    fn log_catalog_refusal_transition(&self, connection_file: &Path, model: &str) {
+        // Discovery is retried with a new client after a refusal, so remember
+        // the last catalog refusal across clients until admission changes.
+        static REFUSALS: OnceLock<Mutex<HashMap<(PathBuf, String), String>>> = OnceLock::new();
+        let changed = {
+            let mut refusals = REFUSALS
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let key = (connection_file.to_path_buf(), model.to_string());
+            if let Self::Refused(Some(reason)) = self {
+                refusals.insert(key, reason.clone()).as_ref() != Some(reason)
+            } else {
+                refusals.remove(&key);
+                false
+            }
+        };
+        if changed {
+            if let Self::Refused(Some(reason)) = self {
+                crate::slog_warn!("[synapse-model-admission] model={model} {reason}");
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SynapseModelMetadata {
     pub model: String,
     pub dims: Option<usize>,
     pub recommended_rows: usize,
     pub recommended_token_budget: usize,
-    pub certified: bool,
+    servability: ModelServability,
     pub identity: SynapseIdentity,
 }
 
@@ -1257,7 +1305,10 @@ impl SynapseState {
         let raw = self.call(MODELS_LIST_OPERATION, json!({}), timeout).await?;
         let models = parse_models_list(&raw)?;
         if let Some(model) = models.iter().find(|model| model.model == self.model) {
-            if !model.certified {
+            model
+                .servability
+                .log_catalog_refusal_transition(&self.connection_file, &self.model);
+            if matches!(model.servability, ModelServability::Refused(_)) {
                 return Err(SynapseEmbeddingError::ModelNotCertified(self.model.clone()));
             }
             if model.recommended_rows == 0 || model.recommended_token_budget == 0 {
@@ -1682,8 +1733,32 @@ fn parse_models_list(raw: &[u8]) -> Result<Vec<SynapseModelMetadata>, SynapseEmb
         let model = string_field(entry, &["model", "model_id"]).ok_or_else(|| {
             SynapseEmbeddingError::InvalidEnvelope("model entry has no id".to_string())
         })?;
-        let certified = entry.get("certified").and_then(Value::as_bool) != Some(false)
-            && string_field(entry, &["status", "state"]).as_deref() != Some("not_certified");
+        // Catalog lanes gate on serving_admission, not certification: a pending
+        // self-check runs only on the first request, so refusing it here would
+        // prevent it from ever running. Legacy lanes have no self_check object
+        // and still require certification. Unknown catalog admission fails closed.
+        let servability =
+            if let Some(self_check) = entry.get("self_check").and_then(Value::as_object) {
+                let self_check_state = self_check.get("state").and_then(Value::as_str);
+                match entry.get("serving_admission").and_then(Value::as_str) {
+                    Some("enabled") => ModelServability::Servable,
+                    admission => ModelServability::Refused(Some(format!(
+                        "serving_admission: {}; reason: {}; self_check.state: {}",
+                        admission.unwrap_or("missing or invalid"),
+                        entry
+                            .get("serving_admission_reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unspecified"),
+                        self_check_state.unwrap_or("unknown"),
+                    ))),
+                }
+            } else if entry.get("certified").and_then(Value::as_bool) == Some(false)
+                || string_field(entry, &["status", "state"]).as_deref() == Some("not_certified")
+            {
+                ModelServability::Refused(None)
+            } else {
+                ModelServability::Servable
+            };
         let fingerprint = string_field(entry, &["fingerprint"])
             .or_else(|| {
                 entry
@@ -1713,7 +1788,7 @@ fn parse_models_list(raw: &[u8]) -> Result<Vec<SynapseModelMetadata>, SynapseEmb
             dims,
             recommended_rows,
             recommended_token_budget,
-            certified,
+            servability,
             identity: SynapseIdentity {
                 fingerprint,
                 table_epoch: model_epoch,
@@ -2627,6 +2702,159 @@ mod tests {
         assert_eq!(selected.dims, None);
         assert_eq!(selected.recommended_rows, 8);
         assert_eq!(selected.recommended_token_budget, 4096);
+    }
+
+    fn discover_model_with_fields(
+        fields: Value,
+    ) -> Result<SynapseModelMetadata, SynapseEmbeddingError> {
+        use super::pause_test_support::*;
+        let mut model = json!({
+            "model": MODEL, "fingerprint": "pinned", "table_epoch": 1, "dims": 2,
+            "recommended_batch": {"rows": 100, "token_budget": 8192},
+        });
+        model
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        with_fake_synapse_model(
+            model,
+            Arc::new(std::sync::atomic::AtomicU64::new(START)),
+            START,
+            |_| unreachable!("discovery does not embed"),
+            |config, requests| {
+                let result = SynapseEmbeddingClient::from_config(&config)
+                    .map(|client| client.metadata().clone());
+                let requests = requests.lock().unwrap();
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0].1["method"], MODELS_LIST_OPERATION);
+                result
+            },
+        )
+    }
+
+    #[test]
+    fn catalog_pending_self_check_allows_discovery() {
+        let model = discover_model_with_fields(json!({
+            "certified": false, "state": "unloaded",
+            "self_check": {"state": "pending"}, "serving_admission": "enabled",
+        }))
+        .unwrap();
+        assert_eq!(model.servability, ModelServability::Servable);
+    }
+
+    #[test]
+    fn catalog_running_self_check_allows_discovery() {
+        let model = discover_model_with_fields(json!({
+            "certified": false, "state": "not_certified",
+            "self_check": {"state": "running"}, "serving_admission": "enabled",
+        }))
+        .unwrap();
+        assert_eq!(model.servability, ModelServability::Servable);
+    }
+
+    #[test]
+    fn catalog_disabled_admission_refuses_discovery_with_reason() {
+        use super::pause_test_support::MODEL;
+        for certified in [false, true] {
+            let (error, logs) = crate::logging::capture_log_lines(|| {
+                discover_model_with_fields(json!({
+                    "certified": certified, "state": "ready",
+                    "self_check": {"state": "failed"}, "serving_admission": "disabled",
+                    "serving_admission_reason": "self_check_failed",
+                }))
+                .unwrap_err()
+            });
+            assert_eq!(
+                error,
+                SynapseEmbeddingError::ModelNotCertified(MODEL.into())
+            );
+            assert_eq!(
+                error.to_string(),
+                format!("synapse_model_not_certified: {MODEL}")
+            );
+            assert_eq!(logs, vec![format!(
+                "WARN [synapse-model-admission] model={MODEL} serving_admission: disabled; reason: self_check_failed; self_check.state: failed"
+            )]);
+        }
+    }
+
+    #[test]
+    fn catalog_refusal_warns_only_when_admission_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let connection_file = directory.path().join("connection.json");
+        let refusal = ModelServability::Refused(Some(
+            "serving_admission: disabled; reason: self_check_failed; self_check.state: failed"
+                .into(),
+        ));
+        let (_, logs) = crate::logging::capture_log_lines(|| {
+            for _ in 0..3 {
+                refusal.log_catalog_refusal_transition(&connection_file, "model");
+            }
+            ModelServability::Servable.log_catalog_refusal_transition(&connection_file, "model");
+            refusal.log_catalog_refusal_transition(&connection_file, "model");
+            refusal.log_catalog_refusal_transition(&connection_file, "model");
+        });
+        assert_eq!(logs.len(), 2, "{logs:?}");
+        assert_eq!(logs[0], logs[1]);
+        assert!(logs[0].starts_with("WARN [synapse-model-admission] model=model "));
+    }
+
+    #[test]
+    fn legacy_uncertified_lane_refuses_discovery() {
+        use super::pause_test_support::MODEL;
+        for fields in [
+            json!({"certified": false}),
+            json!({"status": "not_certified"}),
+            json!({"state": "not_certified"}),
+        ] {
+            let error = discover_model_with_fields(fields).unwrap_err();
+            assert_eq!(
+                error,
+                SynapseEmbeddingError::ModelNotCertified(MODEL.into())
+            );
+            assert_eq!(
+                error.to_string(),
+                format!("synapse_model_not_certified: {MODEL}")
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_certified_lane_allows_discovery() {
+        let model = discover_model_with_fields(json!({"certified": true})).unwrap();
+        assert_eq!(model.servability, ModelServability::Servable);
+    }
+
+    #[test]
+    fn catalog_ready_self_check_allows_discovery() {
+        let model = discover_model_with_fields(json!({
+            "certified": true, "state": "ready",
+            "self_check": {"state": "passed"}, "serving_admission": "enabled",
+        }))
+        .unwrap();
+        assert_eq!(model.servability, ModelServability::Servable);
+    }
+
+    #[test]
+    fn catalog_unknown_admission_refuses_discovery() {
+        use super::pause_test_support::MODEL;
+        let (error, logs) = crate::logging::capture_log_lines(|| {
+            discover_model_with_fields(json!({
+                "certified": true, "self_check": {"state": "passed"},
+                "serving_admission": "future_admission",
+            }))
+            .unwrap_err()
+        });
+        assert_eq!(
+            error,
+            SynapseEmbeddingError::ModelNotCertified(MODEL.into())
+        );
+        assert_eq!(
+            error.to_string(),
+            format!("synapse_model_not_certified: {MODEL}")
+        );
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].contains("serving_admission: future_admission"));
     }
 
     #[test]
