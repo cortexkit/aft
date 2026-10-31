@@ -1,4 +1,4 @@
-//! Cingulate consent client for stamped Alfonso workers.
+//! Cingulate consent client for authenticated Alfonso tool calls.
 //!
 //! When the access policy says `ask` for a worker's in-process tool call, the
 //! call is held while the question goes to Cingulate (`consent.request`,
@@ -6,14 +6,21 @@
 //! head and, if escalated, to the user in the Alfonso apps. AFT never shows a
 //! host prompt for these calls and never falls back to one: if Cingulate
 //! cannot be reached the call ends with `access_unavailable`.
+//! An agent's scripted tool calls (codemode) use the same machinery under
+//! their run scope, without `head_policy`. A worker's scripted calls still
+//! refuse permission asks with `permission_ask_unavailable`.
 //!
-//! An ask never expires. The call is held for at most the route's reply budget
+//! A direct ask never expires. Its call is held for at most the route's reply budget
 //! (never more than 100 s); an ask still open then ends the call with
 //! `access_pending`, and the persisted ask (see [`crate::db::access_asks`]) lets
 //! the retried call pick up the same Cingulate ask by its original call key.
 //! Once an answer arrives, local application gets a separate bounded wait;
 //! exhausting that wait asks for an immediate retry, not another notification
 //! from Cingulate.
+//! Program calls instead publish a held-reply/v1 consent result and retain the
+//! real terminal result in the call ledger. Their permission waits share one
+//! ten-minute allowance per run; expiry withdraws the ask and refuses the call.
+//! Receiving an answer stops that call's allowance accounting before execution.
 //!
 //! Wire contract (Cingulate's requester contract, `tool_permission` asks): a
 //! management-surface route to the `cingulate` module, opened by AFT's own

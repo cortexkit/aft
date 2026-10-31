@@ -906,9 +906,8 @@ async fn running_hold_frame(
             let task = target.task_id.clone();
             let session = target.session_id.clone();
             let _ = tokio::task::spawn_blocking(move || registry.kill(&task, &session)).await;
-            Err(SubcError::Io(std::io::Error::other(format!(
-                "call ledger running hold failed: {error:?}"
-            ))))
+            log::warn!("call ledger running hold failed: {error:?}");
+            Err(SubcError::WriterClosed)
         }
     }
 }

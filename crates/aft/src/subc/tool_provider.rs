@@ -2876,13 +2876,14 @@ impl LedgerEdge {
                 if permission_hold {
                     let running = serde_json::from_slice::<Value>(&outgoing.body)
                         .is_ok_and(|body| body["held"]["reason"] == "running");
-                    let mut calls = edge.calls.lock().unwrap();
-                    if running {
-                        calls.remove(&(route, outgoing.header.corr));
-                    } else if let Some(call) = calls.get_mut(&(route, outgoing.header.corr)) {
-                        call.detached = true;
+                    {
+                        let mut calls = edge.calls.lock().unwrap();
+                        if running {
+                            calls.remove(&(route, outgoing.header.corr));
+                        } else if let Some(call) = calls.get_mut(&(route, outgoing.header.corr)) {
+                            call.detached = true;
+                        }
                     }
-                    drop(calls);
                     if actual.send(outgoing).await.is_err() {
                         break;
                     }
