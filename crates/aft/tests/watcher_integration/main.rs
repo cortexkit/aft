@@ -29,6 +29,7 @@ mod callgraph_atomic_save_test;
 mod callgraph_watcher_test;
 mod config_live_reload_test;
 mod configure_watcher_test;
+mod daemon_search_test;
 mod idle_root_watcher_test;
 mod semantic_refresh_watcher_test;
 mod watcher_search_semantic_regression_test;
