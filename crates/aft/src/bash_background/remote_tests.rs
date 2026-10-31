@@ -4737,10 +4737,17 @@ fn persist_accepted_with_snapshot_scope(
     let layout = allocate_task_layout(dir, "session").unwrap();
     let task_id = layout.paths.task_id.clone();
     let shell = resolve_posix_shell();
-    let environment = BTreeMap::from([(
+    let mut environment = BTreeMap::from([(
         std::ffi::OsString::from("ORIGINAL_PLAN"),
         std::ffi::OsString::from("host-proof"),
     )]);
+    if linux_scope {
+        for key in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
+            if let Some(value) = std::env::var_os(key) {
+                environment.insert(key.into(), value);
+            }
+        }
+    }
     let prepared = crate::sandbox_spawn::prepare_task_payload(
         &layout,
         command.as_bytes(),
@@ -5341,6 +5348,66 @@ async fn runon_restart_executor_refusal_never_restores_local_launch() {
         assert_runon_refusal(&refusal_response(done), "future_refusal");
         assert!(!marker.exists());
     }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires a systemd user manager"]
+async fn task_scope_remote_fallback_deadline_survives_reload() {
+    super::super::super::task_scope::probe_user_manager(Duration::from_secs(1))
+        .expect("requires a systemd user manager");
+    let dir = tempfile::tempdir().unwrap();
+    let (original, task_id, paths) = persist_accepted_with_snapshot_scope(
+        dir.path(),
+        dir.path().join("unused-connection"),
+        "sleep 60",
+        None,
+        true,
+        60,
+    );
+    original.configure_task_scope_runtime(true, Duration::from_secs(60));
+    struct Stop(BgTaskRegistry, String);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            let _ = self.0.kill_task_scope(&self.1);
+        }
+    }
+    let _stop = Stop(original.clone(), task_id.clone());
+    let task = original.task(&task_id).unwrap();
+    let remote = {
+        let mut state = task.state.lock().unwrap();
+        state.metadata.default_hard_kill = true;
+        state.metadata.timeout_ms = Some(DEFAULT_BG_TIMEOUT.as_millis() as u64);
+        write_task(&paths.json, &state.metadata).unwrap();
+        state.metadata.remote.clone().unwrap()
+    };
+    let (_, logs) = crate::logging::capture_log_lines(|| {
+        original
+            .restored_remote_fallback(&task, &remote, "capacity", None)
+            .unwrap();
+    });
+    assert!(
+        original.inner.task_scopes.get(&task_id).is_some(),
+        "fallback did not enter a scope: {:?}; {logs:?}",
+        task.state.lock().unwrap().metadata.execution_note
+    );
+    let saved = read_task(&paths.json).unwrap();
+    assert!(saved.local_fallback_started);
+    assert!(saved.remote.is_none());
+    let recovered = registry();
+    recovered.inner.shutdown.store(true, Ordering::SeqCst);
+    recovered
+        .insert_rehydrated_task(saved, paths, true)
+        .unwrap();
+    assert_eq!(
+        recovered
+            .hard_kill_deadline(&task_id, "session")
+            .unwrap()
+            .limit_ms,
+        60000,
+        "reloaded local fallback lost the earlier scope deadline"
+    );
+    original.kill(&task_id, "session").unwrap();
 }
 
 #[cfg(target_os = "linux")]

@@ -4022,6 +4022,12 @@ impl BgTaskRegistry {
             })
             .transpose()?
             .flatten();
+        #[cfg(target_os = "linux")]
+        {
+            state.metadata.task_scope_runtime_ms = scope.as_ref().map(|scope| scope.runtime_ms());
+            self.persist_task_locked(task, &state.metadata, &mut db)
+                .map_err(|error| error.to_string())?;
+        }
         let mut memory_monitor = if scope.is_some() {
             None
         } else {
@@ -4059,6 +4065,9 @@ impl BgTaskRegistry {
             }
             Ok(child)
         })?;
+        if scope.is_none() {
+            state.metadata.task_scope_runtime_ms = None;
+        }
         #[cfg(target_os = "linux")]
         if scope.is_some() {
             match self.scoped_memory_limit(local.memory_limit_mib, &task.task_id) {
