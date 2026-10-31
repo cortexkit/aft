@@ -2738,33 +2738,38 @@ mod tests {
     #[test]
     fn progressing_walk_is_not_a_stalled_access() {
         let dir = tempfile::tempdir().unwrap();
-        // 80 entries at 60 ms each need at least 4.8 s, so the 3 s walk budget
+        // 150 entries at 60 ms each need at least 9 s, so the 6 s walk budget
         // always runs out before the walk finishes, on any runner.
-        for index in 0..80 {
+        for index in 0..150 {
             std::fs::write(dir.path().join(format!("{index}.rs")), "needle\n").unwrap();
         }
-        // Each entry takes 60 ms and one access may take 300 ms, so a walk
-        // that mistook steady progress for one stalled access would stop at
-        // about five entries. The walk's own budget must leave room for well
-        // over five entries even on a loaded runner, where a macOS run managed
-        // only five entries (about 180 ms each) in a 900 ms budget.
-        let budget = crate::bounded_io::Budget::after(Duration::from_secs(8))
-            .with_access_budget(Duration::from_millis(300));
+        // Each entry takes 60 ms and one access may take 1 s. A walk that
+        // charged its steady progress to one access would stop within that
+        // second: about 16 entries, or 5 at a loaded runner's 180 ms per
+        // entry. A correct walk runs to its own 6 s budget, which leaves 33
+        // entries even at 180 ms each. The access budget stays well above one
+        // entry's time: at 300 ms, a single entry on a loaded macOS runner
+        // exceeded it and was rightly reported as a stalled access.
+        let budget = crate::bounded_io::Budget::after(Duration::from_secs(12))
+            .with_access_budget(Duration::from_secs(1));
         let response = crate::bounded_io::with_budget(Some(budget), || {
             let walked = with_fallback_walk_entry_delay_for_test(Duration::from_millis(60), || {
                 bounded_fallback_walk_files_with_limits(
                     dir.path(),
                     dir.path(),
                     &PathFilters::default(),
-                    100,
-                    Duration::from_millis(3000),
+                    200,
+                    Duration::from_secs(6),
                 )
             });
             assert!(
-                walked.files.len() > 5,
+                walked.files.len() > 20,
                 "walk stopped at one access cap: {walked:?}"
             );
-            assert!(walked.walk_time_limit_reached);
+            assert!(
+                walked.walk_time_limit_reached,
+                "walk did not end on its own time budget: {walked:?}"
+            );
             crate::bounded_io::finish_response(Response::success(
                 "progressing-walk",
                 serde_json::json!({"complete": false}),

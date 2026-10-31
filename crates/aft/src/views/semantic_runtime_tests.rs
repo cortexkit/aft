@@ -1623,6 +1623,15 @@ fn semantic_states(
         .collect()
 }
 
+/// Gives a fixture checkout a base of its own. Bases are content-keyed, so two
+/// checkouts with the same files and ignore policy share one base. Some tests
+/// race two checkouts' fills on the same embedded chunks, which are stored
+/// once per repository family, and need each checkout on its own base. Each
+/// gets an `.aftignore` that differs only by a comment.
+fn separate_base(root: &Path, tag: &str) {
+    std::fs::write(root.join(".aftignore"), format!("# {tag}\n")).unwrap();
+}
+
 #[test]
 fn family_fill_rechecks_completed_work_after_acquiring_claim() {
     let storage = tempfile::tempdir().unwrap();
@@ -1631,6 +1640,8 @@ fn family_fill_rechecks_completed_work_after_acquiring_claim() {
     let files = [("src/file.rs", "pub fn one_chunk() -> u8 { 1 }\n")];
     write_tree(first.path(), &files);
     write_tree(second.path(), &files);
+    separate_base(first.path(), "first");
+    separate_base(second.path(), "second");
     let a = open(storage.path(), "a", first.path());
     let b = Arc::new(open(storage.path(), "b", second.path()));
     let model = Arc::new(Model::default());
@@ -1668,8 +1679,14 @@ fn family_fill_rechecks_completed_work_after_acquiring_claim() {
     assert_eq!(usage.rows, ROWS_PER_ONE_CHUNK_FILE);
     // Both checkouts name the same content with the same semantic key. Their
     // manifests differ only in what is checkout-specific (the base each one
-    // composes and its own publication frontier).
-    assert_eq!(semantic_states(&a), semantic_states(&b));
+    // composes and how far its own publications have progressed) and in the
+    // `.aftignore` that keeps their bases apart.
+    let source_states = |runtime: &CheckoutSemantic| {
+        let mut states = semantic_states(runtime);
+        states.retain(|(path, ..)| path.as_bytes() != b".aftignore");
+        states
+    };
+    assert_eq!(source_states(&a), source_states(b.as_ref()));
     assert_eq!(
         rows(first.path(), &query(&a, "one chunk").results),
         rows(second.path(), &query(&b, "one chunk").results)
@@ -2244,11 +2261,11 @@ fn large_semantic_materialization_batches_pins_and_touches() {
     for (key, payload) in blobs {
         assert_eq!(store.get(&key).unwrap().unwrap(), payload);
     }
-    // One key-list write each for the trigram and semantic planes.
-    assert_eq!((after.0 - writes, after.1 - syncs), (2, 0));
-    // The semantic plane's file and chunk-vector keys plus the trigram
-    // plane's keys for the same 2048 entries, each plane in one write.
-    assert_eq!(written_bytes, 2048 * 65 * 3);
+    // The fold pins the trigram keys of the 2048 entries in one key-list
+    // write. The semantic keys were pinned as they were stored, and this
+    // member has no call-graph plane, so there is nothing else to pin.
+    assert_eq!((after.0 - writes, after.1 - syncs), (1, 0));
+    assert_eq!(written_bytes, 2048 * 65);
     // Every key was just stored in this epoch, so folding needs no writer.
     assert_eq!(transactions, 0);
 }
@@ -2366,9 +2383,9 @@ fn large_checkout_edit_counts_source_work_and_preserves_outputs() {
             "unchanged files should cost a stat, not a source read"
         );
         assert_eq!(work.content_hash_bytes, changed.len());
-        // One attachment per registered plane (trigram, semantic and call
-        // graph) for the one file read.
-        assert_eq!(work.attachments, 3);
+        // One attachment per registered plane (trigram and semantic; the
+        // semantic member has no call-graph plane) for the one file read.
+        assert_eq!(work.attachments, 2);
         assert_eq!(
             work.stats,
             files + 1,
@@ -2889,8 +2906,9 @@ fn semantic_batch_lease_durable_chunks_reused_during_cold_readmission() {
     let storage = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let sibling_root = tempfile::tempdir().unwrap();
-    for root in [root.path(), sibling_root.path()] {
+    for (tag, root) in [("owner", root.path()), ("sibling", sibling_root.path())] {
         write_tree(root, &[("file.rs", "pub fn readmission_chunk() {}\n")]);
+        separate_base(root, tag);
     }
     let (slot, epoch, _wake, runtime) = served_lane(storage.path(), root.path());
     let schedule = fast_schedule(root.path());
@@ -3257,6 +3275,7 @@ fn semantic_fill_waiter_yields_cold_slot(shared_content: bool) {
                 )],
             );
         }
+        separate_base(root.path(), &format!("sibling-{i}"));
         let slot = Arc::new(CheckoutSemanticSlot::default());
         let (epoch, wake) = slot.begin();
         let runtime = Arc::new(open(storage.path(), &format!("sibling-{i}"), root.path()));
@@ -4802,7 +4821,7 @@ fn superseded_lane_cannot_publish_over_its_replacement() {
         }
         .fingerprint_hex(),
         semantic: Some(SemanticProducer::current(model, EmbedTextCaps::default()).id()),
-        callgraph: super::super::callgraph::PRODUCER.into(),
+        callgraph: super::UNREGISTERED_PRODUCER.into(),
     };
     let member = super::view_scope("scope");
     assert!(super::super::base_refs::open_foreign_v3(

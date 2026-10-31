@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::fs_lock;
 use crate::pattern_compile::{self, CompileOpts, CompileResult, CompiledPattern, LiteralSearch};
+use crate::views::verification::{now_ns, NativeStat};
 
 pub use crate::commands::semantic_search::{exact_lane, memo};
 
@@ -70,6 +71,8 @@ const LOOKUP_MAGIC: &[u8; 8] = b"AFTLKP01";
 const SPILL_MAGIC: &[u8; 8] = b"AFTSPI01";
 const FILE_TRIGRAM_COUNT_MAGIC: &[u8; 8] = b"AFTFTC01";
 const INDEX_VERSION: u32 = 4;
+const VERIFY_RECORD_MAGIC: &[u8; 8] = b"AFTVRF01";
+const VERIFY_RECORD_FILE: &str = "cache.verified";
 /// Highest trigram cache format this build reads (and the one it writes).
 pub const INDEX_FORMAT_VERSION: u32 = INDEX_VERSION;
 const SPIMI_SOFT_LIMIT_BYTES: usize = 128 * 1024 * 1024;
@@ -558,6 +561,30 @@ struct PublishedCache {
     git_head: String,
     ignore_fingerprint: String,
     max_file_size: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct VerifiedFile {
+    stat: NativeStat,
+    observed_ns: u128,
+    content_hash: [u8; 32],
+}
+
+/// Content proofs collected during verification, not a later metadata sweep.
+#[derive(Default, Deserialize, Serialize)]
+pub(crate) struct WarmVerification {
+    files: BTreeMap<PathBuf, VerifiedFile>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct WarmVerifyRecord {
+    index_version: u32,
+    cache_generation: NativeStat,
+    root: PathBuf,
+    git_head: Option<String>,
+    ignore_fingerprint: String,
+    max_file_size: u64,
+    verification: WarmVerification,
 }
 
 // A query must observe postings and superseded base files from one version;
@@ -3131,17 +3158,93 @@ impl SearchIndex {
     pub(crate) fn verify_against_disk_with_warm_budget(
         &mut self,
         current_head: Option<String>,
-        verify_strategy: cache_freshness::VerifyStrategy,
-    ) -> Option<bool> {
+        cache_dir: &Path,
+    ) -> Option<(bool, WarmVerification)> {
+        let mut verification = self
+            .read_warm_verification(cache_dir, current_head.as_deref())
+            .unwrap_or_default();
         let changed = verify_file_mtimes_with_budget(
             self,
-            verify_strategy,
+            cache_freshness::VerifyStrategy::Strict,
             HashSet::new(),
             WARM_GIT_DIFF_PATH_LIMIT,
+            Some(&mut verification),
         )?;
         self.git_head = current_head;
         self.ready = true;
-        Some(changed)
+        Some((changed, verification))
+    }
+
+    fn read_warm_verification(
+        &self,
+        cache_dir: &Path,
+        current_head: Option<&str>,
+    ) -> Option<WarmVerification> {
+        let _filesystem_guard = crate::db::file_identity::filesystem_guard();
+        let path = cache_dir.join(VERIFY_RECORD_FILE);
+        if crate::db::file_identity::has_open_connections_under(cache_dir)
+            || crate::db::file_identity::is_live_sqlite_file(&path)
+        {
+            return None;
+        }
+        let bytes = fs::read(path).ok()?;
+        let (payload, checksum) = bytes.split_at_checked(bytes.len().checked_sub(32)?)?;
+        if !payload.starts_with(VERIFY_RECORD_MAGIC) || blake3::hash(payload).as_bytes() != checksum
+        {
+            return None;
+        }
+        let record: WarmVerifyRecord =
+            serde_json::from_slice(&payload[VERIFY_RECORD_MAGIC.len()..]).ok()?;
+        if record.index_version != INDEX_VERSION
+            || record.root != self.project_root
+            || record.git_head.as_deref() != current_head
+            || record.git_head != self.git_head
+            || record.ignore_fingerprint != self.ignore_rules_fingerprint
+            || record.max_file_size != self.max_file_size
+            || record.cache_generation != NativeStat::read(&cache_dir.join("cache.bin")).ok()?
+        {
+            return None;
+        }
+        Some(record.verification)
+    }
+
+    pub(crate) fn persist_warm_verification(
+        &self,
+        cache_dir: &Path,
+        verification: WarmVerification,
+    ) -> std::io::Result<()> {
+        let path = cache_dir.join(VERIFY_RECORD_FILE);
+        if !artifact_write_allowed(&self.project_root, cache_dir, &path) {
+            return Ok(());
+        }
+        let record = WarmVerifyRecord {
+            index_version: INDEX_VERSION,
+            cache_generation: NativeStat::read(&cache_dir.join("cache.bin"))?,
+            root: self.project_root.clone(),
+            git_head: self.git_head.clone(),
+            ignore_fingerprint: self.ignore_rules_fingerprint.clone(),
+            max_file_size: self.max_file_size,
+            verification,
+        };
+        let mut bytes = VERIFY_RECORD_MAGIC.to_vec();
+        serde_json::to_writer(&mut bytes, &record)?;
+        let checksum = blake3::hash(&bytes);
+        bytes.extend_from_slice(checksum.as_bytes());
+        publish_legacy_search_cache(|| {
+            let _filesystem_guard = crate::db::file_identity::filesystem_guard();
+            if crate::db::file_identity::has_open_connections_under(cache_dir)
+                || crate::db::file_identity::is_live_sqlite_file(&path)
+            {
+                return Err(std::io::Error::other(
+                    "search verification cannot replace a live SQLite file set",
+                ));
+            }
+            crate::durability::atomic_write(
+                &path,
+                &bytes,
+                crate::durability::AtomicWriteDurability::FileAndDirectory,
+            )
+        })
     }
 
     /// Bring a borrowed (read-only) snapshot in line with the files that are
@@ -3391,7 +3494,13 @@ impl SearchIndex {
                     Some(limit),
                 )?
             };
-            verify_file_mtimes_with_budget(&mut baseline, verify_strategy, diff_paths, limit)?;
+            verify_file_mtimes_with_budget(
+                &mut baseline,
+                verify_strategy,
+                diff_paths,
+                limit,
+                None,
+            )?;
             baseline.git_head = current_head;
             baseline.ready = true;
             return Some(baseline);
@@ -6996,6 +7105,13 @@ fn project_walk_admits_entry(
         return false;
     }
     let name = entry.file_name().to_string_lossy();
+    // Git never tracks a path named `.git`. As a directory it is a repository's
+    // own data; as a file it is a linked worktree's or submodule's pointer to
+    // that data, holding an absolute path that differs per checkout. Neither is
+    // project content, so both are skipped whatever their type.
+    if name == ".git" {
+        return false;
+    }
     if file_type.as_ref().is_some_and(std::fs::FileType::is_dir) {
         return !matches!(
             name.as_ref(),
@@ -10378,7 +10494,9 @@ fn verify_file_mtimes_with_budget(
     verify_strategy: cache_freshness::VerifyStrategy,
     mut changed_paths: HashSet<PathBuf>,
     limit: usize,
+    mut verification: Option<&mut WarmVerification>,
 ) -> Option<bool> {
+    let observed_ns = now_ns();
     let current_files = walk_project_files_from_inner(
         &index.project_root,
         &index.project_root,
@@ -10433,19 +10551,41 @@ fn verify_file_mtimes_with_budget(
         Update(PreparedSearchUpdate),
     }
 
-    // Strict verification also detects edits with restored size and mtime.
-    // Keep its reads in the bounded pool even when the stat pass found no changes.
+    // A persisted proof may replace a strict read only when the native identity
+    // is unchanged and NativeStat::reusable places the mtime before the original
+    // observation's whole-second boundary. Keep that observation time on hits:
+    // moving it would certify timestamps too recent to prove unchanged bytes.
+    let mut proven = BTreeMap::new();
     let to_read = stats
         .into_iter()
-        .filter(|(_, path, _, _)| {
-            verify_strategy == cache_freshness::VerifyStrategy::Strict
-                || changed_paths.contains(path)
+        .filter_map(|(file_id, path, cached, metadata)| {
+            let native = verification
+                .as_ref()
+                .and_then(|_| NativeStat::read(&path).ok());
+            if let Some(proof) = verification
+                .as_ref()
+                .and_then(|verification| verification.files.get(&path))
+                .filter(|proof| {
+                    proof.content_hash == *cached.content_hash.as_bytes()
+                        && !changed_paths.contains(&path)
+                        && native
+                            .as_ref()
+                            .is_some_and(|current| proof.stat.reusable(current, proof.observed_ns))
+                })
+            {
+                proven.insert(path, proof.clone());
+                return None;
+            }
+            (verification.is_some()
+                || verify_strategy == cache_freshness::VerifyStrategy::Strict
+                || changed_paths.contains(&path))
+            .then_some(((file_id, native), path, cached, metadata))
         })
         .collect();
     let max_file_size = index.max_file_size;
     let verified = cache_freshness::verify_statted_files_bounded(
         to_read,
-        |file_id, path, cached, metadata| {
+        |(file_id, native), path, cached, metadata| {
             let file = match metadata {
                 Some(metadata) => read_search_corpus_file_with_metadata(
                     &path,
@@ -10455,24 +10595,51 @@ fn verify_file_mtimes_with_budget(
                 ),
                 None => SearchCorpusEligibility::Skipped,
             };
-            let file = match file {
+            let content_hash = match &file {
                 SearchCorpusEligibility::Eligible(file) => {
-                    let content_hash = cache_freshness::hash_bytes(&file.bytes);
-                    if content_hash == cached.content_hash {
-                        return VerifiedPath::ContentFresh(file_id, file.metadata);
-                    }
-                    PreparedSearchPath::Indexed(PreparedIndexedFile {
-                        metadata: file.metadata,
-                        content_hash,
-                        trigram_map: trigram_filter_map(&file.bytes, true),
+                    Some(cache_freshness::hash_bytes(&file.bytes))
+                }
+                _ => None,
+            };
+            let proof = content_hash.and_then(|hash| {
+                native.and_then(|before| {
+                    let after = NativeStat::read(&path).ok()?;
+                    // A change during the read cannot become reusable evidence.
+                    (before == after).then(|| VerifiedFile {
+                        stat: before,
+                        observed_ns,
+                        content_hash: *hash.as_bytes(),
                     })
+                })
+            });
+            let result = match file {
+                SearchCorpusEligibility::Eligible(file) => {
+                    let content_hash = content_hash.expect("eligible files have a content hash");
+                    if content_hash == cached.content_hash {
+                        VerifiedPath::ContentFresh(file_id, file.metadata)
+                    } else {
+                        VerifiedPath::Update(PreparedSearchUpdate {
+                            path: path.clone(),
+                            file: PreparedSearchPath::Indexed(PreparedIndexedFile {
+                                metadata: file.metadata,
+                                content_hash,
+                                trigram_map: trigram_filter_map(&file.bytes, true),
+                            }),
+                        })
+                    }
                 }
                 SearchCorpusEligibility::Unindexed(metadata) => {
-                    PreparedSearchPath::Unindexed(metadata)
+                    VerifiedPath::Update(PreparedSearchUpdate {
+                        path: path.clone(),
+                        file: PreparedSearchPath::Unindexed(metadata),
+                    })
                 }
-                SearchCorpusEligibility::Skipped => PreparedSearchPath::Skipped,
+                SearchCorpusEligibility::Skipped => VerifiedPath::Update(PreparedSearchUpdate {
+                    path: path.clone(),
+                    file: PreparedSearchPath::Skipped,
+                }),
             };
-            VerifiedPath::Update(PreparedSearchUpdate { path, file })
+            (path, result, proof)
         },
     );
 
@@ -10482,7 +10649,10 @@ fn verify_file_mtimes_with_budget(
         index.remove_file_with_canonicalization_memo(&path, &mut canonical_parents);
         changed = true;
     }
-    for result in verified {
+    for (path, result, proof) in verified {
+        if let Some(proof) = proof {
+            proven.insert(path, proof);
+        }
         match result {
             VerifiedPath::ContentFresh(file_id, metadata) => {
                 let entry = &index.files[file_id];
@@ -10500,8 +10670,31 @@ fn verify_file_mtimes_with_budget(
         }
     }
     for path in new_paths {
+        let native = verification
+            .as_ref()
+            .and_then(|_| NativeStat::read(&path).ok());
         index.update_file_with_canonicalization_memo(&path, &mut canonical_parents);
+        if let Some(before) = native {
+            if NativeStat::read(&path).ok().as_ref() == Some(&before) {
+                if let Some(id) = index.path_to_id.get(&path) {
+                    let entry = &index.files[*id as usize];
+                    if entry.content_hash != cache_freshness::zero_hash() {
+                        proven.insert(
+                            path,
+                            VerifiedFile {
+                                stat: before,
+                                observed_ns,
+                                content_hash: *entry.content_hash.as_bytes(),
+                            },
+                        );
+                    }
+                }
+            }
+        }
         changed = true;
+    }
+    if let Some(verification) = verification.as_mut() {
+        verification.files = proven;
     }
     Some(changed)
 }
@@ -18646,6 +18839,239 @@ mod warm_reload_verification_tests {
                 1
             );
         }
+    }
+
+    fn restart_fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(project.path()).unwrap();
+        for n in 0..4 {
+            let path = root.join(format!("file-{n}.rs"));
+            fs::write(&path, "fn before_marker() {}\n").unwrap();
+            filetime::set_file_mtime(
+                &path,
+                filetime::FileTime::from_unix_time(1_700_000_000, 123),
+            )
+            .unwrap();
+        }
+        let mut index = SearchIndex::build(&root);
+        assert!(index.write_to_disk(storage.path(), None));
+        (project, storage, root)
+    }
+
+    fn restart_verify(root: &Path, cache_dir: &Path) -> (SearchIndex, usize) {
+        let mut index = SearchIndex::read_from_disk(cache_dir, root).unwrap();
+        let watch = cache_freshness::watch_verify_stats(
+            root,
+            cache_freshness::VerifyScheduleForTest::SingleWorkerDrain,
+        );
+        let (changed, proof) = index
+            .verify_against_disk_with_warm_budget(None, cache_dir)
+            .unwrap();
+        let stats = watch.take_stats();
+        assert!(stats.hash_reads.is_empty(), "no separate hashing reads");
+        if changed || index.has_pending_disk_changes() {
+            assert!(index.write_to_disk(cache_dir, None));
+        }
+        index.persist_warm_verification(cache_dir, proof).unwrap();
+        (index, stats.corpus_reads.len())
+    }
+
+    #[test]
+    fn restart_verification_reads_zero_unchanged_files_without_a_process_memo() {
+        let (_project, storage, root) = restart_fixture();
+        let generation = cache_freshness::artifact_generation(&storage.path().join("cache.bin"));
+        assert_eq!(
+            cache_freshness::warm_verify_plan(
+                &root,
+                cache_freshness::VerifyArtifact::Search,
+                generation
+            ),
+            cache_freshness::WarmVerifyPlan::Strict
+        );
+        let (_, first) = restart_verify(&root, storage.path());
+        let (_, second) = restart_verify(&root, storage.path());
+        eprintln!("restart indexed content reads: before={first}, after={second}");
+        assert_eq!(first, 4, "an unverified cache needs a full strict pass");
+        assert_eq!(second, 0, "a fresh process can reuse the persisted proofs");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(storage.path().join(VERIFY_RECORD_FILE))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn restart_verification_racy_same_size_rewrite_is_read_and_reindexed() {
+        let (_project, storage, root) = restart_fixture();
+        restart_verify(&root, storage.path());
+        let path = root.join("file-0.rs");
+        fs::write(&path, "fn latest_marker() {}\n").unwrap();
+        let boundary = now_ns();
+        filetime::set_file_mtime(
+            &path,
+            filetime::FileTime::from_unix_time((boundary / 1_000_000_000) as i64, 0),
+        )
+        .unwrap();
+        let mut index = SearchIndex::read_from_disk(storage.path(), &root).unwrap();
+        let mut proof = index.read_warm_verification(storage.path(), None).unwrap();
+        let cached = proof.files.get_mut(&path).unwrap();
+        // Equal native stamps isolate the timestamp fence from inode/change-time
+        // detection. The content digest still describes the old cache bytes.
+        cached.stat = NativeStat::read(&path).unwrap();
+        cached.observed_ns = boundary;
+        let file_id = index.path_to_id[&path] as usize;
+        Arc::make_mut(&mut index.files)[file_id].modified =
+            fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(index.write_to_disk(storage.path(), None));
+        index
+            .persist_warm_verification(storage.path(), proof)
+            .unwrap();
+        let (index, reads) = restart_verify(&root, storage.path());
+        assert_eq!(
+            reads, 1,
+            "a matching stamp at the verify boundary is not proof"
+        );
+        assert_eq!(
+            index
+                .candidates(&decompose_regex("latest_marker"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            index
+                .candidates(&decompose_regex("before_marker"))
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            index
+                .grep("latest_marker", true, &[], &[], &root, 10)
+                .unwrap()
+                .matches
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn restart_verification_absent_truncated_and_garbage_records_are_strict() {
+        let (_project, storage, root) = restart_fixture();
+        restart_verify(&root, storage.path());
+        let path = storage.path().join(VERIFY_RECORD_FILE);
+        let valid = fs::read(&path).unwrap();
+        for corrupt in [
+            None,
+            Some(valid[..valid.len() / 2].to_vec()),
+            Some(b"garbage".to_vec()),
+        ] {
+            match corrupt {
+                Some(bytes) => fs::write(&path, bytes).unwrap(),
+                None => fs::remove_file(&path).unwrap(),
+            }
+            let (_, reads) = restart_verify(&root, storage.path());
+            assert_eq!(
+                reads, 4,
+                "a broken record cannot authorize any stat-only hits"
+            );
+        }
+    }
+
+    #[test]
+    fn restart_verification_detects_preserved_mtime_edits_and_refreshes_search() {
+        let (_project, storage, root) = restart_fixture();
+        restart_verify(&root, storage.path());
+        let path = root.join("file-0.rs");
+        let mtime = filetime::FileTime::from_last_modification_time(&fs::metadata(&path).unwrap());
+        fs::write(&path, "fn latest_marker() {}\n").unwrap();
+        filetime::set_file_mtime(&path, mtime).unwrap();
+        let (index, reads) = restart_verify(&root, storage.path());
+        assert_eq!(
+            reads, 1,
+            "change-time catches edits preserving size and mtime"
+        );
+        assert_eq!(
+            index
+                .candidates(&decompose_regex("latest_marker"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            index
+                .grep("latest_marker", true, &[], &[], &root, 10)
+                .unwrap()
+                .matches
+                .len(),
+            1
+        );
+        let (_, reads) = restart_verify(&root, storage.path());
+        assert_eq!(reads, 0, "proofs follow the rewritten cache generation");
+    }
+
+    #[test]
+    fn restart_verification_rejects_old_cache_generations_and_missing_file_proofs() {
+        let (_project, storage, root) = restart_fixture();
+        restart_verify(&root, storage.path());
+        let mut index = SearchIndex::read_from_disk(storage.path(), &root).unwrap();
+        let mut proof = index.read_warm_verification(storage.path(), None).unwrap();
+        proof.files.remove(&root.join("file-0.rs"));
+        index
+            .persist_warm_verification(storage.path(), proof)
+            .unwrap();
+        assert_eq!(restart_verify(&root, storage.path()).1, 1);
+        assert!(index.write_to_disk(storage.path(), None));
+        assert_eq!(restart_verify(&root, storage.path()).1, 4);
+    }
+
+    #[test]
+    fn restart_verification_binds_format_root_head_and_ignore_policy() {
+        let (_project, storage, root) = restart_fixture();
+        restart_verify(&root, storage.path());
+        let path = storage.path().join(VERIFY_RECORD_FILE);
+        let valid = fs::read(&path).unwrap();
+        for field in ["format", "root", "head", "ignore", "size"] {
+            let mut record: WarmVerifyRecord =
+                serde_json::from_slice(&valid[VERIFY_RECORD_MAGIC.len()..valid.len() - 32])
+                    .unwrap();
+            match field {
+                "format" => record.index_version += 1,
+                "root" => record.root = root.join("other-checkout"),
+                "head" => record.git_head = Some("another-head".into()),
+                "ignore" => record.ignore_fingerprint.push_str("changed"),
+                "size" => record.max_file_size += 1,
+                _ => unreachable!(),
+            }
+            let mut bytes = VERIFY_RECORD_MAGIC.to_vec();
+            serde_json::to_writer(&mut bytes, &record).unwrap();
+            let checksum = blake3::hash(&bytes);
+            bytes.extend_from_slice(checksum.as_bytes());
+            fs::write(&path, bytes).unwrap();
+            assert_eq!(restart_verify(&root, storage.path()).1, 4, "{field}");
+        }
+    }
+
+    #[test]
+    fn restart_verification_never_writes_under_a_live_sqlite_file_set() {
+        let (_project, storage, root) = restart_fixture();
+        let mut index = SearchIndex::read_from_disk(storage.path(), &root).unwrap();
+        let (_, proof) = index
+            .verify_against_disk_with_warm_budget(None, storage.path())
+            .unwrap();
+        let _database = crate::db::open(&storage.path().join("live.db")).unwrap();
+        assert!(index
+            .persist_warm_verification(storage.path(), proof)
+            .is_err());
+        assert!(!storage.path().join(VERIFY_RECORD_FILE).exists());
     }
 
     #[test]

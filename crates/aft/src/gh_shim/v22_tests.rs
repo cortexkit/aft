@@ -1,7 +1,7 @@
 use super::*;
 use std::io::Cursor;
 
-fn args(raw: &[&str]) -> Vec<OsString> {
+pub(super) fn args(raw: &[&str]) -> Vec<OsString> {
     raw.iter().map(OsString::from).collect()
 }
 
@@ -71,14 +71,14 @@ fn v22_rows_at_v21() -> Manifest {
     manifest
 }
 
-fn binding() -> AgentBinding {
+pub(super) fn binding() -> AgentBinding {
     AgentBinding {
         repo: "cortexkit/aft".into(),
         agent_id: "alfonso-aft".into(),
     }
 }
 
-fn rung() -> RungRecord {
+pub(super) fn rung() -> RungRecord {
     RungDetermination::r3(
         1_700_000_000,
         22,
@@ -91,10 +91,10 @@ fn rung() -> RungRecord {
     .record
 }
 
-struct EnvGuard(&'static str, Option<OsString>);
+pub(super) struct EnvGuard(&'static str, Option<OsString>);
 
 impl EnvGuard {
-    fn set(key: &'static str, value: Option<&str>) -> Self {
+    pub(super) fn set(key: &'static str, value: Option<&str>) -> Self {
         let previous = std::env::var_os(key);
         match value {
             Some(value) => std::env::set_var(key, value),

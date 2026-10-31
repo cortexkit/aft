@@ -6259,6 +6259,7 @@ fn schedule_artifact_loads_admitted(
                 let baseline = SearchIndex::read_from_disk(&cache_dir, &root_for_search);
                 let mut persist_to_disk = true;
                 let mut record_completed_verify = true;
+                let mut warm_verification = None;
                 let refreshed = match baseline {
                     Some(mut index)
                         if index.stored_git_head() == current_head.as_deref()
@@ -6272,23 +6273,17 @@ fn schedule_artifact_loads_admitted(
                                 record_completed_verify = false;
                                 Some(index)
                             }
-                            WarmVerifyPlan::StatFirst | WarmVerifyPlan::Strict => {
-                                let strategy = match verify_plan {
-                                    WarmVerifyPlan::StatFirst => VerifyStrategy::StatFirst,
-                                    WarmVerifyPlan::Strict => VerifyStrategy::Strict,
-                                    WarmVerifyPlan::Skip => unreachable!(),
-                                };
-                                index
-                                    .verify_against_disk_with_warm_budget(
-                                        current_head.clone(),
-                                        strategy,
-                                    )
-                                    .map(|disk_changed| {
-                                        persist_to_disk =
-                                            disk_changed || index.has_pending_disk_changes();
-                                        index
-                                    })
-                            }
+                            WarmVerifyPlan::StatFirst | WarmVerifyPlan::Strict => index
+                                .verify_against_disk_with_warm_budget(
+                                    current_head.clone(),
+                                    &cache_dir,
+                                )
+                                .map(|(disk_changed, verification)| {
+                                    warm_verification = Some(verification);
+                                    persist_to_disk =
+                                        disk_changed || index.has_pending_disk_changes();
+                                    index
+                                }),
                         }
                     }
                     baseline => {
@@ -6371,12 +6366,23 @@ fn schedule_artifact_loads_admitted(
                     }
                 }
                 if generation_current() && record_completed_verify && persistence_succeeded {
-                    let _ = cache_freshness::record_verify_completed_if_unchanged(
+                    let verified = cache_freshness::record_verify_completed_if_unchanged(
                         &root_for_search,
                         VerifyArtifact::Search,
                         cache_freshness::artifact_generation(&cache_path),
                         verify_ticket,
                     );
+                    if verified && !is_worktree_bridge_for_search {
+                        if let Some(verification) = warm_verification {
+                            search_persist_epoch_flag.run_if_current(search_persist_epoch, || {
+                                if let Err(error) =
+                                    index.persist_warm_verification(&cache_dir, verification)
+                                {
+                                    slog_warn!("failed to persist search verification: {}", error);
+                                }
+                            });
+                        }
+                    }
                 }
                 let symbol_files = search_index_symbol_files(&index);
                 let prewarm_stop = SymbolPrewarmStop {
@@ -8418,6 +8424,20 @@ pub(crate) fn drain_standalone_configure_unit(
         && !continuation.job.root_too_broad
         && !crate::views::parent::held_by(ctx, &continuation.job.canonical_cache_root)
     {
+        if ctx.views_route_root() {
+            // As on the attached path: every read of a routed root goes through
+            // its v3 checkout views, so the v1 view is neither opened nor
+            // published. Opening it ran `git ls-tree` and `git check-attr` over
+            // every tracked path twice and wrote a pending status row per path
+            // that no publication would ever settle. Skipping it loses
+            // nothing: the checkout's v3 text view, which grep and aft_search
+            // read, is opened and attached on the first query, as it already
+            // was on this transport.
+            ctx.drop_v1_view_runtime();
+            continuation.view_load = None;
+            continuation.stage = ConfigureMaintenanceStage::StorageSweeps;
+            return true;
+        }
         if continuation.view_load.is_none() {
             let (tx, rx) = crossbeam_channel::bounded(1);
             let job = continuation.job.clone();
@@ -15462,6 +15482,51 @@ mod tests {
             .success
         );
         assert!(!off.views_route_root());
+    }
+
+    /// The standalone transport, the plugins' default, drains configure
+    /// maintenance through `drain_standalone_configure_unit` instead of the
+    /// attached path. A routed root opens no v1 view there either: no v1 blob
+    /// stores, no v1 view directory and no pending status rows.
+    #[test]
+    fn views_routed_root_on_the_standalone_drain_opens_no_v1_view() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("a.ts"),
+            "export function target() { return 1; }\n",
+        )
+        .unwrap();
+        git_commit_all(&root, "graph");
+        let root = std::fs::canonicalize(root).unwrap();
+        let storage = temp.path().join("storage");
+        // The standalone drain takes the shared context the standalone loop owns.
+        let TestContext { context, _storage } = test_context();
+        let ctx = Arc::new(context);
+        assert!(
+            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
+                .success
+        );
+        assert!(ctx.views_route_root());
+
+        let mut state = super::ConfigureMaintenanceState::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            super::drain_standalone_configure_prefix(&ctx, &mut state);
+            let worked = super::drain_standalone_configure_unit(&ctx, &mut state);
+            if !worked && !super::standalone_configure_maintenance_pending(&ctx, &mut state) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "standalone configure maintenance never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(legacy_views_on_writes(&storage), Vec::<String>::new());
+        assert!(ctx.view_runtime_snapshot().is_none());
     }
 
     /// Idle eviction releases a routed root's lexical and call-graph views,

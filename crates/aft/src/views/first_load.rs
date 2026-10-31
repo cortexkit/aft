@@ -2010,10 +2010,13 @@ impl CheckoutDriver {
             ));
         }
         let route = self.owner.v3_route();
+        // Base identity takes the location-independent policy digest, so a
+        // checkout of the same commit with the same policy resolves the base
+        // another checkout of the repository already built.
         let ignore_fingerprint = checkout
             .install_cut()
             .and_then(|cut| cut.verification.as_ref())
-            .map(|g| g.policy.digest.clone());
+            .map(|g| g.policy.base_digest.clone());
         let header = super::manifest_v2::ManifestHeader {
             producers: self.producers.clone(),
             head_tree: None,

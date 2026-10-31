@@ -1417,7 +1417,7 @@ pub(crate) struct RegistryInner {
     /// check that a held foreground bash call's periodic task checks build none.
     #[cfg(test)]
     pub(crate) snapshots_built: AtomicU64,
-    /// Name of the thread the once-per-process persisted GC ran on. Lets the
+    /// Name of the thread the per-storage-root persisted GC ran on. Lets the
     /// integration suite pin that the GC stays off the configure/replay thread
     /// (the replay caller is the standalone request loop).
     persisted_gc_thread: Mutex<Option<String>>,
@@ -5178,7 +5178,7 @@ impl BgTaskRegistry {
         shell_path: PathBuf,
         session_id: String,
         workdir: PathBuf,
-        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))] mut env: HashMap<String, String>,
+        mut env: HashMap<String, String>,
         hard_kill: super::HardKill,
         memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
@@ -5235,6 +5235,10 @@ impl BgTaskRegistry {
             (spawn_plan.with_prepared_task(prepared), task)
         };
         let layout_cleanup = UncommittedLayout::new(&task_layout);
+        if !spawn_plan.is_native_launcher() {
+            crate::pinned_executable::retain_task_environment(&task_layout.paths.io_dir, &mut env)
+                .map_err(|error| format!("failed to retain task startup image: {error}"))?;
+        }
         let task_id = task_layout.paths.task_id.clone();
         let paths = task_layout.paths.clone();
         let spawn_log_root = project_root.as_deref().unwrap_or(&workdir).to_path_buf();
@@ -5625,7 +5629,7 @@ impl BgTaskRegistry {
         shell_path: PathBuf,
         session_id: String,
         workdir: PathBuf,
-        env: HashMap<String, String>,
+        mut env: HashMap<String, String>,
         hard_kill: super::HardKill,
         memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
@@ -5688,6 +5692,10 @@ impl BgTaskRegistry {
         let task_layout = allocate_task_layout(&storage_dir, &session_id)
             .map_err(|error| format!("failed to create PTY task layout: {error}"))?;
         let layout_cleanup = UncommittedLayout::new(&task_layout);
+        if !spawn_plan.is_native_launcher() {
+            crate::pinned_executable::retain_task_environment(&task_layout.paths.io_dir, &mut env)
+                .map_err(|error| format!("failed to retain task startup image: {error}"))?;
+        }
         let task_id = task_layout.paths.task_id.clone();
         let paths = task_layout.paths.clone();
         let spawn_log_root = project_root.as_deref().unwrap_or(&workdir).to_path_buf();
@@ -6086,7 +6094,7 @@ impl BgTaskRegistry {
         shell_path: PathBuf,
         session_id: String,
         workdir: PathBuf,
-        env: HashMap<String, String>,
+        mut env: HashMap<String, String>,
         hard_kill: super::HardKill,
         memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
@@ -6106,6 +6114,8 @@ impl BgTaskRegistry {
         let task_layout = allocate_task_layout(&storage_dir, &session_id)
             .map_err(|error| format!("failed to create background task layout: {error}"))?;
         let layout_cleanup = UncommittedLayout::new(&task_layout);
+        crate::pinned_executable::retain_task_environment(&task_layout.paths.io_dir, &mut env)
+            .map_err(|error| format!("failed to retain task startup image: {error}"))?;
         let task_id = task_layout.paths.task_id.clone();
         let paths = task_layout.paths.clone();
         let spawn_log_root = project_root.as_deref().unwrap_or(&workdir).to_path_buf();
@@ -11650,11 +11660,19 @@ impl BgTaskRegistry {
         if !task.terminal_persist_dirty.load(Ordering::SeqCst) {
             return Ok(());
         }
+        #[cfg(test)]
+        TERMINAL_PERSIST_AFTER_DIRTY_CHECK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().take() {
+                hook();
+            }
+        });
         let mut db = DeferredDbWrites::new(self, task);
         let state = task
             .lock_state()
             .unwrap_or_else(|poison| poison.into_inner());
-        if state.metadata.is_terminal() {
+        // Another retry or scratch-cleanup write may have succeeded after
+        // the fast check above. Dirty state is changed under this same lock.
+        if task.terminal_persist_dirty.load(Ordering::SeqCst) && state.metadata.is_terminal() {
             self.persist_task_locked(task, &state.metadata, &mut db)?;
             task.terminal_persist_dirty.store(false, Ordering::SeqCst);
         }
@@ -16068,6 +16086,11 @@ type PersistedGcSlots = HashMap<PathBuf, PersistedGcSlot>;
 fn persisted_gc_slots() -> &'static Mutex<PersistedGcSlots> {
     static SLOTS: std::sync::OnceLock<Mutex<PersistedGcSlots>> = std::sync::OnceLock::new();
     SLOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TERMINAL_PERSIST_AFTER_DIRTY_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// The remote cancellation outcome `bash.kill_scope` reports for a stopped
