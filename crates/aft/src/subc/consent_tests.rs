@@ -333,7 +333,8 @@ mod program_approvals {
     async fn program_bash_escalation_is_held_until_allowed_and_direct_head_keeps_prompt() {
         let _lock = CONSENT_TEST_LOCK.lock().await;
         let f = fixture(FakeCingulate::up());
-        f.ctx.update_config(|config| config.sandbox.enabled = false);
+        f.ctx
+            .update_config(|config| config.sandbox.profile.head = crate::config::SandboxMode::Off);
         let controlled = Controlled::install(f.fake.clone());
         let run = program(&f, false, "run:shell");
         let arguments = json!({"command":"printf codemode-approved", "sandbox":"host"});
@@ -1319,7 +1320,7 @@ async fn consent_nonhost_carrier_cannot_save_agent_scope_grants() {
             &prep.key,
             &prep.call_key,
             "carrier",
-            &grant,
+            &Permission::File(grant.clone()),
             true,
             true,
         )
@@ -1413,7 +1414,7 @@ async fn consent_qualifying_hosts_and_codemode_runs_can_save_scope_grants() {
             &prep.key,
             &prep.call_key,
             &asks::new_holder(),
-            &grant,
+            &Permission::File(grant.clone()),
             true,
             true,
         )
@@ -3195,7 +3196,7 @@ async fn consent_scope_stalled_prepare_probe_is_bounded_and_releases_database() 
         let owner = SettlementOwner::new(&running_call);
         hold(
             &running_call,
-            grant,
+            Permission::File(grant),
             Instant::now() + Duration::from_millis(100),
             &route,
             None,
@@ -3256,7 +3257,14 @@ async fn consent_stalled_home_scope_probe_is_single_flight_and_file_only() {
             let owner = SettlementOwner::new(&call);
             let result = tokio::time::timeout(
                 HANG_GUARD,
-                hold(&call, grant, Instant::now(), &route, None, &owner.0),
+                hold(
+                    &call,
+                    Permission::File(grant),
+                    Instant::now(),
+                    &route,
+                    None,
+                    &owner.0,
+                ),
             )
             .await
             .expect("concurrent stalled probes must finish before the hang guard");
