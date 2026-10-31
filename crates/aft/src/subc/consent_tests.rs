@@ -1,5 +1,499 @@
 use super::*;
 
+#[cfg(unix)]
+mod program_approvals {
+    use super::*;
+    use crate::db::call_ledger as ledger;
+    use crate::subc::codemode::{self, Admission};
+    include!("consent_running_tests.rs");
+    include!("consent_held_update_tests.rs");
+    include!("consent_security_audit_tests.rs");
+    include!("consent_speech_end_tests.rs");
+
+    struct Controlled {
+        fake: Arc<FakeCingulate>,
+        filed: Notify,
+        changed: Arc<Notify>,
+        scopes: StdMutex<Vec<ScopeSelector>>,
+    }
+
+    impl Controlled {
+        fn install(fake: Arc<FakeCingulate>) -> Arc<Self> {
+            let control = Arc::new(Self {
+                fake,
+                filed: Notify::new(),
+                changed: Arc::new(Notify::new()),
+                scopes: StdMutex::new(Vec::new()),
+            });
+            install_test_transport(Some(control.clone()));
+            control
+        }
+
+        async fn request(&self, index: usize) -> Value {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let ready = self.filed.notified();
+                    if let Some(request) = self.fake.calls("consent.request").get(index) {
+                        return request.clone();
+                    }
+                    ready.await;
+                }
+            })
+            .await
+            .expect("consent request is sent")
+        }
+
+        fn answer(&self, request: &Value, outcome: &str) {
+            self.fake.answer(
+                request["call_key"].as_str().unwrap(),
+                json!({"state":"settled", "outcome":outcome, "answered_by":"user"}),
+            );
+            self.changed.notify_waiters();
+        }
+    }
+
+    impl ConsentTransport for Controlled {
+        fn call(&self, call: ConsentCall) -> ConsentFuture {
+            let mut wake = Box::pin(self.changed.clone().notified_owned());
+            wake.as_mut().enable();
+            if call.method == "consent.request" {
+                self.scopes.lock().unwrap().push(call.scope.clone());
+            }
+            let first = self.fake.reply(call.method, &call.params);
+            if call.method == "consent.request" {
+                self.filed.notify_one();
+            }
+            let fake = self.fake.clone();
+            // Register before the answer can arrive, like a long-polling service.
+            Box::pin(async move {
+                let reply = match first? {
+                    Some(reply) => reply,
+                    None => {
+                        wake.await;
+                        fake.reply(call.method, &call.params)?
+                            .unwrap_or_else(|| json!({"state":"pending:user"}))
+                    }
+                };
+                decode_result(&serde_json::to_vec(&json!({"result":reply})).unwrap())
+            })
+        }
+    }
+
+    fn program(f: &Fixture, worker: bool, name: &str) -> RouteIdentity {
+        f.ctx.bash_background().set_db_pool(f.ctx.db().unwrap());
+        let base = if worker { &f.worker } else { &f.head };
+        let mut stamp = serde_json::to_value(base.scope.as_ref().unwrap()).unwrap();
+        stamp["attributes"] = if worker {
+            json!({})
+        } else {
+            json!({"agent_id":"agent"})
+        };
+        let owner = identity(
+            &base.project_root,
+            Some(serde_json::from_value(stamp).unwrap()),
+        );
+        let parent = owner.scope.as_ref().unwrap().scope_ref.clone();
+        let mut stamp = serde_json::to_value(stamp_scope(name, &parent)).unwrap();
+        stamp["attributes"] = if worker {
+            json!({"on_behalf_of_agent":"agent", "run_id":name})
+        } else {
+            json!({"agent_id":"agent", "run_id":name})
+        };
+        let mut run = identity(
+            &owner.project_root,
+            Some(serde_json::from_value(stamp).unwrap()),
+        );
+        let data = Arc::get_mut(&mut run.0).unwrap();
+        data.call_mode = subc_protocol::call_mode::CallMode::Codemode;
+        data.held_reply = true;
+        data.tool_result_body = true;
+        if let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut data.spawn_principal {
+            *principal_id = Some("reserved:basal".into());
+        }
+        data.run_scope
+            .set(run_scope::RunScope::for_test(None))
+            .unwrap();
+        access_grants::register(&run, &f.ctx).unwrap();
+        let route = route_key(41, 1);
+        let routes = HashMap::from([(route_key(40, 1), owner), (route, run)]);
+        match codemode::admit(
+            &routes,
+            route,
+            Some(
+                &json!({"name":"read", "preset":if worker {"worker"} else {"head"}, "arguments":{"path":"x"}}),
+            ),
+            |_| Some(Ok(codemode::EffectiveSavedPolicy::default())),
+        ) {
+            Admission::Owner(identity) => identity,
+            Admission::Refused(error) => panic!(
+                "program admission failed: {} {:?}",
+                error.code, error.detail
+            ),
+            _ => panic!("program must resolve its owner"),
+        }
+    }
+
+    fn stamp_scope(name: &str, parent: &str) -> subc_protocol::scope::ScopeStamp {
+        serde_json::from_value(json!({
+            "owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":name,"scope_epoch":7,
+            "kind":"ephemeral","owner_authorized":true,"parent_state":"linked",
+            "parent":{"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":parent,"scope_epoch":7}
+        })).unwrap()
+    }
+
+    async fn held(replies: &mut mpsc::Receiver<WriterFrame>) {
+        let reply = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.header.ty, FrameType::Response);
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        let typed: cortexkit_role_tool_provider::result::ToolResult =
+            serde_json::from_value(body.clone()).unwrap();
+        cortexkit_role_tool_provider::result::validate(&typed).unwrap();
+        assert_eq!(
+            body,
+            json!({"content":[{"type":"text","text":""}],"held":{"reason":"consent"}})
+        );
+    }
+
+    async fn late(f: &Fixture, identity: &RouteIdentity, corr: u64) -> Value {
+        let key = tool_provider::LedgerEdge::key(identity, &format!("program-{corr}"));
+        let entry = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let entry = {
+                    let db = f.ctx.db().unwrap();
+                    let conn = db.lock().unwrap();
+                    ledger::get(&conn, &key)
+                        .unwrap()
+                        .and_then(|row| row.late_entry)
+                };
+                if let Some(entry) = entry {
+                    break serde_json::from_str::<Value>(&entry).unwrap();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            let db = f.ctx.db().unwrap();
+            let row = ledger::get(&db.lock().unwrap(), &key).unwrap();
+            panic!(
+                "one terminal late result is retained: row={:?}, tasks={:?}",
+                row,
+                f.ctx.bash_background().list(100)
+            );
+        });
+        assert_eq!(entry["kind"], "result", "{entry}");
+        assert_eq!(entry["call_key"], format!("program-{corr}"));
+        assert!(entry["result"].get("held").is_none());
+        entry["result"].clone()
+    }
+
+    #[tokio::test]
+    async fn head_program_read_held_allow_once_and_deny_are_terminal_late_results() {
+        let _lock = CONSENT_TEST_LOCK.lock().await;
+        let f = fixture(FakeCingulate::up());
+        let controlled = Controlled::install(f.fake.clone());
+        let run = program(&f, false, "run:allow");
+        let path = f.dir.path().join("elsewhere.txt");
+        let mut replies = f.send_read(&run, &path, 9001).await;
+        held(&mut replies).await;
+        let request = controlled.request(0).await;
+        assert!(request.get("head_policy").is_none());
+        assert_eq!(controlled.scopes.lock().unwrap()[0].scope_ref, "run:allow");
+        controlled.answer(&request, "allow_once");
+        let result = late(&f, &run, 9001).await;
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("unheld contents"),
+            "{result}"
+        );
+        assert_ne!(result["isError"], true);
+        let mut replies = f.send_read(&run, &path, 9002).await;
+        held(&mut replies).await;
+        let request = controlled.request(1).await;
+        controlled.answer(&request, "deny");
+        let result = late(&f, &run, 9002).await;
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["errorCode"], "access_declined");
+        let db = f.ctx.db().unwrap();
+        let conn = db.lock().unwrap();
+        assert!(
+            crate::db::access_grants::list(&conn, &access_grants::policy_scope_key(&run))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn head_program_budget_is_shared_across_calls_but_not_runs() {
+        let _lock = CONSENT_TEST_LOCK.lock().await;
+        let f = fixture(FakeCingulate::up());
+        let controlled = Controlled::install(f.fake.clone());
+        let run = program(&f, false, "run:budget");
+        // AFT names the resolved path (`/private/var/...` on macOS).
+        let path = std::fs::canonicalize(f.dir.path())
+            .unwrap()
+            .join("elsewhere.txt");
+        let mut replies = f.send_read(&run, &path, 9011).await;
+        held(&mut replies).await;
+        let request = controlled.request(0).await;
+        run.run_scope
+            .get()
+            .unwrap()
+            .permission_budget
+            .advance(Duration::from_secs(400));
+        controlled.answer(&request, "deny");
+        assert_eq!(late(&f, &run, 9011).await["errorCode"], "access_declined");
+        let mut replies = f.send_read(&run, &path, 9012).await;
+        held(&mut replies).await;
+        controlled.request(1).await;
+        run.run_scope
+            .get()
+            .unwrap()
+            .permission_budget
+            .advance(Duration::from_secs(201));
+        controlled.changed.notify_waiters();
+        let timeout = late(&f, &run, 9012).await;
+        assert_eq!(timeout["errorCode"], "access_timeout");
+        assert!(timeout["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(&format!(
+                "Outside access denied (access_timeout) for read {}.",
+                path.display()
+            )));
+        let mut replies = f.send_read(&run, &path, 9013).await;
+        held(&mut replies).await;
+        assert_eq!(late(&f, &run, 9013).await["errorCode"], "access_timeout");
+        let other = program(&f, false, "run:independent");
+        let mut replies = f.send_read(&other, &path, 9014).await;
+        held(&mut replies).await;
+        let request = controlled.request(3).await;
+        assert!(
+            other.run_scope.get().unwrap().permission_budget.remaining() > Duration::from_secs(599)
+        );
+        controlled.answer(&request, "allow_once");
+        assert_ne!(late(&f, &other, 9014).await["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn worker_program_and_route_without_held_reply_stay_unavailable() {
+        let _lock = CONSENT_TEST_LOCK.lock().await;
+        let f = fixture(FakeCingulate::up());
+        for (index, mut run) in [
+            program(&f, true, "run:worker"),
+            program(&f, false, "run:legacy"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if index == 1 {
+                Arc::get_mut(&mut run.0).unwrap().held_reply = false;
+            }
+            assert_eq!(access_grants::ask_route(&run), AskRoute::Unavailable);
+            let result = f
+                .read(
+                    &run,
+                    &f.dir.path().join("elsewhere.txt"),
+                    9020 + index as u64,
+                )
+                .await;
+            assert!(
+                result.to_string().contains("permission_ask_unavailable"),
+                "{result}"
+            );
+        }
+        assert!(f.fake.calls("consent.request").is_empty());
+    }
+
+    #[tokio::test]
+    async fn ended_program_resends_original_key_settles_answer_and_runs_nothing() {
+        let _lock = CONSENT_TEST_LOCK.lock().await;
+        let f = fixture(FakeCingulate::up());
+        let controlled = Controlled::install(f.fake.clone());
+        let run = program(&f, false, "run:ended");
+        let mut replies = f
+            .send_read(&run, &f.dir.path().join("elsewhere.txt"), 9030)
+            .await;
+        held(&mut replies).await;
+        let request = controlled.request(0).await;
+        run.run_scope.get().unwrap().end_for_test();
+        controlled.answer(&request, "allow_scope");
+        assert_eq!(late(&f, &run, 9030).await["errorCode"], "access_withdrawn");
+        let replay = controlled.request(1).await;
+        assert_eq!(replay["call_key"], request["call_key"]);
+        assert_eq!(f.fake.calls("consent.withdraw").len(), 1);
+        let db = f.ctx.db().unwrap();
+        let conn = db.lock().unwrap();
+        assert!(asks::for_scope(&conn, &access_grants::scope_key(&run))
+            .unwrap()
+            .is_empty());
+        assert!(
+            crate::db::access_grants::list(&conn, &access_grants::policy_scope_key(&run))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    fn escalation_dispatch(mut request: RawRequest, ctx: &AppContext) -> Response {
+        if request.params["permissions_granted"]
+            .as_array()
+            .is_some_and(|ids| ids.contains(&json!("esc_test")))
+        {
+            // Only the host escalation boundary is simulated. The approved
+            // retry uses the real shell handler and captures actual output.
+            request.params.as_object_mut().unwrap().remove("sandbox");
+            crate::commands::bash::handle(&request, ctx)
+        } else {
+            Response::error_with_data(
+                &request.id,
+                crate::protocol::ERROR_PERMISSION_REQUIRED,
+                "bash command requires host escalation approval",
+                json!({"asks":[{
+                    "kind":"escalation", "command":"printf codemode-approved", "grant_id":"esc_test"
+                }]}),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn program_bash_escalation_is_held_until_allowed_and_direct_head_keeps_prompt() {
+        let _lock = CONSENT_TEST_LOCK.lock().await;
+        let f = fixture(FakeCingulate::up());
+        f.ctx
+            .update_config(|config| config.sandbox.profile.head = crate::config::SandboxMode::Off);
+        let controlled = Controlled::install(f.fake.clone());
+        let run = program(&f, false, "run:shell");
+        let arguments = json!({"command":"printf codemode-approved", "sandbox":"host"});
+        let mut replies = f
+            .send_tool(&run, "bash", arguments.clone(), 9040, escalation_dispatch)
+            .await;
+        held(&mut replies).await;
+        let request = controlled.request(0).await;
+        assert_eq!(request["operation"], "exec");
+        assert_eq!(request["command"], "printf codemode-approved");
+        assert!(request.get("head_policy").is_none());
+        controlled.answer(&request, "allow_scope");
+        let result = late(&f, &run, 9040).await;
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("codemode-approved"),
+            "{result}"
+        );
+        assert_ne!(result["isError"], true);
+        let mut replies = f
+            .send_tool(&f.head, "bash", arguments, 9041, escalation_dispatch)
+            .await;
+        let reply = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(
+            body["structuredContent"]["code"],
+            crate::protocol::ERROR_PERMISSION_REQUIRED,
+            "{body}"
+        );
+        assert_eq!(f.fake.calls("consent.request").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn program_consent_failures_are_held_then_refused_without_running() {
+        let _lock = CONSENT_TEST_LOCK.lock().await;
+        for case in ["unreachable", "malformed", "refused"] {
+            let f = fixture(FakeCingulate::up());
+            let controlled = Controlled::install(f.fake.clone());
+            let run = program(&f, false, &format!("run:{case}"));
+            if case == "unreachable" {
+                f.fake.state.lock().unwrap().up = false;
+            }
+            let mut replies = f
+                .send_read(&run, &f.dir.path().join("elsewhere.txt"), 9050)
+                .await;
+            held(&mut replies).await;
+            if case != "unreachable" {
+                let request = controlled.request(0).await;
+                let answer = if case == "malformed" {
+                    json!({"state":"settled", "outcome":"allow_once", "answered_by":false})
+                } else {
+                    json!({"state":"refused:access_not_placed", "outcome":"access_not_placed"})
+                };
+                f.fake.answer(request["call_key"].as_str().unwrap(), answer);
+                controlled.changed.notify_waiters();
+            }
+            let result = late(&f, &run, 9050).await;
+            assert_eq!(result["isError"], true, "{case}: {result}");
+            assert!(
+                matches!(
+                    result["errorCode"].as_str(),
+                    Some("access_unavailable" | "access_not_placed")
+                ),
+                "{case}: {result}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn program_timeout_sentences_are_pinned_for_read_and_bash() {
+        let _lock = CONSENT_TEST_LOCK.lock().await;
+        let f = fixture(FakeCingulate::up());
+        let call = scope_probe_call(&f, Path::new("/outside/file"));
+        let file = Permission::File(AccessGrant {
+            path: "/outside/file".into(),
+            kind: GrantKind::File,
+            operation: AccessOperation::Read,
+        });
+        let shell = Permission::Shell {
+            command: "printf test".into(),
+            cwd: "/project".into(),
+            permissions: vec!["printf test".into()],
+        };
+        assert_eq!(
+            refused_answer(&call, &file, ACCESS_TIMEOUT, None).data["message"],
+            "Outside access denied (access_timeout) for read /outside/file."
+        );
+        assert_eq!(
+            refused_answer(&call, &shell, ACCESS_TIMEOUT, None).data["message"],
+            "Outside access denied (access_timeout) for exec /project."
+        );
+    }
+
+    #[tokio::test]
+    async fn program_folder_answer_persists_on_the_head_not_the_run() {
+        let _lock = CONSENT_TEST_LOCK.lock().await;
+        let f = fixture(FakeCingulate::up());
+        let controlled = Controlled::install(f.fake.clone());
+        let run = program(&f, false, "run:folder");
+        // Grants are stored for the resolved path (`/private/var/...` on macOS).
+        let path = std::fs::canonicalize(f.dir.path())
+            .unwrap()
+            .join("elsewhere.txt");
+        let mut replies = f.send_read(&run, &path, 9060).await;
+        held(&mut replies).await;
+        let request = controlled.request(0).await;
+        controlled.answer(&request, "allow_scope");
+        assert_ne!(late(&f, &run, 9060).await["isError"], true);
+        let db = f.ctx.db().unwrap();
+        let conn = db.lock().unwrap();
+        assert!(
+            crate::db::access_grants::list(&conn, &access_grants::scope_key(&run))
+                .unwrap()
+                .is_empty()
+        );
+        let grants =
+            crate::db::access_grants::list(&conn, &access_grants::scope_key(&f.head)).unwrap();
+        assert!(grants
+            .iter()
+            .any(|grant| grant.covers(AccessOperation::Read, &path)));
+    }
+}
+
 // Consent workflow/vector cases use the consent service's '/'-rooted path
 // contract on Unix, pinned to Cingulate 6bb5f4d. Windows drive and UNC paths
 // have no agreed representation; fail-closed tests below check zero traffic.
@@ -362,6 +856,8 @@ fn identity(root: &Path, scope: Option<subc_protocol::scope::ScopeStamp>) -> Rou
             principal_id: Some("reserved:broca".into()),
         },
         consumer_elicitation_capable: false,
+        held_reply: false,
+        held_update: false,
         tool_result_body: false,
         disabled_tools: Arc::new(vec![]),
         scope,
@@ -382,6 +878,8 @@ struct Fixture {
     active: ActiveToolCalls,
     connection_cancel: PersistentCancelSignal,
     fake: Arc<FakeCingulate>,
+    metrics: StdMutex<HashMap<u64, Arc<DispatchPathMetrics>>>,
+    deadlines: StdMutex<HashMap<u64, u64>>,
 }
 
 fn fixture(fake: Arc<FakeCingulate>) -> Fixture {
@@ -437,6 +935,8 @@ fn fixture_with_executor(
         active: Arc::default(),
         connection_cancel: PersistentCancelSignal::new(),
         fake,
+        metrics: StdMutex::default(),
+        deadlines: StdMutex::default(),
     }
 }
 
@@ -594,11 +1094,19 @@ impl Fixture {
         let routes = HashMap::from([(route_key(41, 1), identity.clone())]);
         let mut body = json!({
             "name": name,
-            "preset": if identity.scope.as_ref().is_some_and(|s| s.kind == subc_protocol::scope::ScopeKind::Head) { "head" } else { "worker" },
+            "preset": if identity.run_owner.as_ref().is_some_and(|owner| matches!(owner.kind, super::super::codemode::RunKind::Agent { .. })) || identity.scope.as_ref().is_some_and(|s| s.kind == subc_protocol::scope::ScopeKind::Head) { "head" } else { "worker" },
             "arguments": arguments,
         });
         if preview {
             body["preview"] = json!(true);
+        }
+        if let Some(deadline) = self.deadlines.lock().unwrap().get(&corr) {
+            body["deadline_ms"] = json!(deadline);
+        }
+        if identity.run_owner.is_some()
+            && !matches!(name, "tool.withdraw" | "late_results" | "late_results.ack")
+        {
+            body["call_key"] = json!(format!("program-{corr}"));
         }
         let frame = Frame::build(
             FrameType::Request,
@@ -632,8 +1140,28 @@ impl Fixture {
             Ok(()) => waits.next().await,
             Err(decoded) => decoded,
         };
-        let frame = decoded.frame;
         let metrics = Arc::new(DispatchPathMetrics::new());
+        self.metrics.lock().unwrap().insert(corr, metrics.clone());
+        let (edge, mut ready) = tool_provider::LedgerEdge::new();
+        let writer = if identity.run_owner.is_some() {
+            edge.proxy(writer, self.executor.clone(), metrics.clone()).0
+        } else {
+            writer
+        };
+        let decoded = if identity.run_owner.is_some() {
+            match edge.defer(decoded, &routes, &self.executor, &writer, &metrics) {
+                Ok(()) => {
+                    if matches!(name, "tool.withdraw" | "late_results" | "late_results.ack") {
+                        return (writer, replies);
+                    }
+                    ready.recv().await.expect("keyed program is admitted")
+                }
+                Err(decoded) => decoded,
+            }
+        } else {
+            decoded
+        };
+        let frame = decoded.frame;
         let shutdown = Arc::new(Notify::new());
         let mut live_roots = HashMap::new();
         let mut route_bash_cancels = HashMap::new();
@@ -859,6 +1387,8 @@ async fn consent_nonhost_carrier_cannot_save_agent_scope_grants() {
             active: f.active.clone(),
             connection_cancel: f.connection_cancel.clone(),
             drain: drain::ModuleDrainWindow::default(),
+            ledger_key: None,
+            shell_claim: None,
         };
         let mut first = Response::error(
             "nonhost-consent",
@@ -868,7 +1398,7 @@ async fn consent_nonhost_carrier_cannot_save_agent_scope_grants() {
         first.data["ask"] = serde_json::to_value(&grant).unwrap();
         let (refusal, _) = tokio::time::timeout(
             Duration::from_secs(2),
-            run_with_consent(call, (first, String::new()), |_| async {
+            run_with_consent(call, (first, String::new()), |_, _| async {
                 panic!("carrier must not rerun")
             }),
         )
@@ -893,7 +1423,8 @@ async fn consent_nonhost_carrier_cannot_save_agent_scope_grants() {
             &prep.key,
             &prep.call_key,
             "carrier",
-            &grant,
+            &Permission::File(grant.clone()),
+            None,
             true,
             true,
         )
@@ -987,7 +1518,8 @@ async fn consent_qualifying_hosts_and_codemode_runs_can_save_scope_grants() {
             &prep.key,
             &prep.call_key,
             &asks::new_holder(),
-            &grant,
+            &Permission::File(grant.clone()),
+            None,
             true,
             true,
         )
@@ -2505,7 +3037,7 @@ async fn consent_scope_old_pending_file_is_not_widened() {
     let mut old_request = record.request.unwrap();
     old_request["pattern"] = json!(target);
     old_request["reason"] = json!("read needs to read a path outside this route's roots");
-    let old_grant = record.pending.unwrap();
+    let old_grant = record.pending.unwrap().file().unwrap().clone();
     {
         let db = f.ctx.db().unwrap();
         asks::open(
@@ -2563,7 +3095,7 @@ async fn consent_scope_persisted_non_parent_pattern_is_refused() {
                 record.call_key.as_deref().unwrap(),
                 &record.selector,
                 &request,
-                &record.pending.unwrap(),
+                record.pending.as_ref().unwrap().file().unwrap(),
                 crate::db::call_ledger::now_ms(),
             )
             .unwrap();
@@ -2717,6 +3249,8 @@ fn scope_probe_call(f: &Fixture, target: &Path) -> HeldCall {
         active: Arc::clone(&f.active),
         connection_cancel: f.connection_cancel.clone(),
         drain: drain::ModuleDrainWindow::default(),
+        ledger_key: None,
+        shell_claim: None,
     }
 }
 
@@ -2769,7 +3303,7 @@ async fn consent_scope_stalled_prepare_probe_is_bounded_and_releases_database() 
         let owner = SettlementOwner::new(&running_call);
         hold(
             &running_call,
-            grant,
+            Permission::File(grant),
             Instant::now() + Duration::from_millis(100),
             &route,
             None,
@@ -2830,7 +3364,14 @@ async fn consent_stalled_home_scope_probe_is_single_flight_and_file_only() {
             let owner = SettlementOwner::new(&call);
             let result = tokio::time::timeout(
                 HANG_GUARD,
-                hold(&call, grant, Instant::now(), &route, None, &owner.0),
+                hold(
+                    &call,
+                    Permission::File(grant),
+                    Instant::now(),
+                    &route,
+                    None,
+                    &owner.0,
+                ),
             )
             .await
             .expect("concurrent stalled probes must finish before the hang guard");
@@ -3741,7 +4282,10 @@ async fn consent_scope_reconstruction_checks_kind_and_operation() {
     // A write file card may advertise its directory too, and settling it
     // stores a write directory grant, never a read one.
     let mut write = prep.clone();
-    write.grant.operation = AccessOperation::Write;
+    let Permission::File(ref mut grant) = write.grant else {
+        panic!("file card")
+    };
+    grant.operation = AccessOperation::Write;
     write.request["operation"] = json!("write");
     assert_eq!(
         advertised_scope(&write),
@@ -3751,7 +4295,10 @@ async fn consent_scope_reconstruction_checks_kind_and_operation() {
         })
     );
     let mut mismatched = prep;
-    mismatched.grant.kind = GrantKind::Subtree;
+    let Permission::File(ref mut grant) = mismatched.grant else {
+        panic!("file card")
+    };
+    grant.kind = GrantKind::Subtree;
     assert_eq!(advertised_scope(&mismatched), None);
 }
 
@@ -4762,6 +5309,8 @@ async fn access_pending_renderer_wire_matches_golden_vector_without_consent() {
         active: Arc::clone(&f.active),
         connection_cancel: f.connection_cancel.clone(),
         drain: drain::ModuleDrainWindow::default(),
+        ledger_key: None,
+        shell_claim: None,
     };
     let grant = AccessGrant {
         path: outside.clone(),
@@ -4771,7 +5320,7 @@ async fn access_pending_renderer_wire_matches_golden_vector_without_consent() {
     let result = finish_tool_call_response(
         "read",
         &crate::subc_format::FormatContext::default(),
-        pending_answer(&call, &grant),
+        pending_answer(&call, &Permission::File(grant.clone())),
         false,
         None,
         None,
@@ -5674,8 +6223,10 @@ async fn assert_unrepresentable_paths_send_nothing(paths: Vec<PathBuf>) {
             active: Arc::clone(&f.active),
             connection_cancel: f.connection_cancel.clone(),
             drain: drain::ModuleDrainWindow::default(),
+            ledger_key: None,
+            shell_claim: None,
         };
-        let (response, _) = run_with_consent(call, (first, String::new()), |_| async {
+        let (response, _) = run_with_consent(call, (first, String::new()), |_, _| async {
             panic!("an unrepresentable consent path must never execute");
         })
         .await
@@ -5785,6 +6336,7 @@ async fn consent_head_policy_resolves_with_database_unlocked() {
             &prep.call_key,
             &asks::new_holder(),
             &prep.grant,
+            None,
             true,
             false,
         )
@@ -5898,6 +6450,7 @@ async fn consent_head_revocation_during_resolution_is_judged_by_the_new_policy()
         &prep.call_key,
         &asks::new_holder(),
         &prep.grant,
+        None,
         true,
         false,
     )

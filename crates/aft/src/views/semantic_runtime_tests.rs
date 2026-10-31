@@ -4610,7 +4610,10 @@ fn views_busy_load_keeps_semantic_building_until_retry_succeeds() {
         crate::config::Config {
             project_root: Some(root.path().to_path_buf()),
             storage_dir: Some(storage.path().to_path_buf()),
-            views: crate::config::ViewsConfig { enabled: true },
+            views: crate::config::ViewsConfig {
+                enabled: true,
+                ..Default::default()
+            },
             ..Default::default()
         },
     );

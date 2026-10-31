@@ -355,6 +355,18 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "db/call_ledger.rs",
+        enclosing_item: "late_results_for_consumer",
+        location_or_primitive: "LATE_RESULTS_PAGE_MAX (256), SQL LIMIT cap + 1, take(cap), max_body",
+        reason: "tool-provider protocol feed pagination uses entries, cursor and more, not an AFT ListEnvelope; the existing 256-entry limit and encoded reply-byte bound retain continuation through the shared cursor",
+    },
+    ExclusionEntry {
+        file: "db/call_ledger.rs",
+        enclosing_item: "enforce_retention_bounds",
+        location_or_primitive: "UNACKED_RESULTS_MAX (1000), EXPIRED_ENTRIES_MAX (1000), SQL OFFSET",
+        reason: "durable protocol retention quotas bound stored terminal answers and non-terminal update payloads rather than shortening a command result list; acknowledged updates keep deduplication keys until their admitted call is removed",
+    },
+    ExclusionEntry {
         file: "bash_background/remote.rs",
         enclosing_item: "admission_progress_detail",
         location_or_primitive: "MAX_DETAIL_CHARS character preview",
@@ -543,8 +555,8 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
         file: "subc/health.rs",
         enclosing_item: "budget_health_metrics, abbreviate_health_root, abbreviated_health_path, abbreviated_health_refusal",
-        location_or_primitive: "root row removal, optional root subfield removal, path/refusal character caps, storage_retention map removal and v2_family_sweeps pop under HEALTH_METRICS_BUDGET_BYTES",
-        reason: "management health detail, not an agent result list; ancillary telemetry yields before root diagnostics and ordinary ready roots yield before standing, refused or unhealthy roots; the last actionable row is abbreviated with a full identity digest, status and refusal code instead of omitted; omitted root, sweep, cache and retention rows are counted exactly and aggregate counters remain present",
+        location_or_primitive: "root row removal, optional root subfield removal, cache/root path and refusal character caps, storage_retention map removal and v2_family_sweeps pop under HEALTH_METRICS_BUDGET_BYTES",
+        reason: "management health detail, not an agent result list; ancillary telemetry yields before root diagnostics and ordinary ready roots yield before standing, refused or unhealthy roots; the last cache path and root row (including ready roots) are abbreviated with full identity digests and root status instead of omitted; omitted root, sweep, cache and retention rows are counted exactly and aggregate counters remain present",
     },
     ExclusionEntry {
         file: "subc/route_census.rs",
@@ -716,9 +728,9 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "storage_retention.rs",
-        enclosing_item: "bounded_dirs, traversal_batch_filtered, next_batch, sweep_view_generations, generation_registries, report_generation_registry_error, validate_tree, validate_tree_with_admission, report_candidate_error, reap_trash, reap_trash_with_snapshot_budget, reap_trash_with_cursor, trash_scans, reap_retired_with_budget, due_first, orphan_first, run_pass_with_budget, prune_bindings, retirement_members, retirement_members_with_budget, write_retirement_witness, verify_retirement_witness, collect_v3_idle, report_v3_idle_unknown",
+        enclosing_item: "bounded_dirs, traversal_batch_filtered, next_batch, sweep_view_generations, generation_registries, report_generation_registry_error, validate_tree, validate_tree_with_admission, validate_tree_observed, TreeObservation::unchanged, report_candidate_error, reap_trash, reap_trash_with_snapshot_budget, reap_trash_with_cursor, trash_scans, reap_retired_with_budget, due_first, orphan_first, run_pass_with_budget, prune_bindings, retirement_members, retirement_members_with_budget, write_retirement_witness, verify_retirement_witness, collect_v3_idle, report_v3_idle_unknown",
         location_or_primitive: "DUE_FIRST_ENTRIES, PASS_ENTRIES, TREE_ENTRIES, HISTORY_ENTRIES, TRASH_SCAN_HANDLES, reaper deadline and 10ms mount-snapshot admission budget, 64-view generation batch, 16 diagnostic errors, take, v3 idle SQL LIMIT 1 and member/deadline window",
-        reason: "internal disk-maintenance walks, not tool-result lists; bounded lexical batches persist only processed names, incomplete protection snapshots refuse deletion, and health reports remaining views, trash estimates, kept reasons and incomplete censuses",
+        reason: "internal disk-maintenance walks, not tool-result lists; bounded lexical batches persist only processed names, retained-tree metadata probes honor the repair budget, TRASH_SCAN_HANDLES counts active iterators rather than completed refusal memos, incomplete protection snapshots refuse deletion, and health reports remaining views, trash estimates, kept reasons and incomplete censuses",
     },
     ExclusionEntry {
         file: "views/registry.rs",

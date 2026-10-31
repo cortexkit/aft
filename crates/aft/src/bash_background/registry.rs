@@ -3576,6 +3576,45 @@ impl BgTaskRegistry {
         }
     }
 
+    /// Persist the result of a program's shell call in the call ledger after
+    /// its initial tool reply hands off the still-running task. Flush an
+    /// already-terminal task as well, so a racing completion cannot be lost.
+    pub(crate) fn hold_running_call(
+        &self,
+        task_id: &str,
+        body: &[u8],
+        include_structured: bool,
+    ) -> Result<bool, String> {
+        let key = self
+            .task_call_key(task_id)
+            .ok_or_else(|| "Call ledger is unavailable".to_owned())?;
+        let pool = self
+            .inner
+            .db_pool
+            .read()
+            .map_err(|_| "Call ledger database mutex is poisoned".to_owned())?
+            .clone()
+            .ok_or_else(|| "Call ledger is unavailable".to_owned())?;
+        let publish = {
+            let conn = pool
+                .lock()
+                .map_err(|_| "Call ledger database mutex is poisoned".to_owned())?;
+            crate::db::call_ledger::hold_running(
+                &conn,
+                &crate::db::call_ledger::Key {
+                    carrier: key.requester,
+                    call_key: key.key,
+                },
+                task_id,
+                body,
+                include_structured,
+            )
+            .map_err(|error| error.to_string())?
+        };
+        self.settle_detached_call(task_id);
+        Ok(publish)
+    }
+
     fn delete_gc_task_from_db(&self, metadata: &PersistedTask) {
         let pool = self.inner.db_pool.read().ok().and_then(|slot| slot.clone());
         let Some(pool) = pool else {
@@ -11887,9 +11926,8 @@ impl BgTaskRegistry {
             .collect()
     }
 
-    pub(crate) fn kill_scope(&self, scope: &subc_protocol::scope::ScopeStamp) {
-        // Remember the end before taking the task snapshot. A dispatch already
-        // queued on another thread may register its process after this pass.
+    /// Fence approvals before asynchronous scope cleanup can block or fail.
+    pub(crate) fn fence_scope_end(&self, scope: &subc_protocol::scope::ScopeStamp) {
         self.inner
             .revoked_scopes
             .lock()
@@ -11899,6 +11937,36 @@ impl BgTaskRegistry {
                 scope.scope_ref.clone(),
                 scope.scope_epoch,
             ));
+    }
+
+    /// Serialize the final approval/dispatch check with confirmed scope ends.
+    /// Callers hold the owning database lock first; the closure must not take
+    /// task-state locks. Scope-end insertion itself never takes the database lock.
+    pub(crate) fn with_live_scope<T>(
+        &self,
+        scope: &subc_protocol::scope::ScopeStamp,
+        run: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let revoked = self
+            .inner
+            .revoked_scopes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if revoked.contains(&(
+            serde_json::to_string(&scope.owner).expect("principal is JSON"),
+            scope.scope_ref.clone(),
+            scope.scope_epoch,
+        )) {
+            None
+        } else {
+            Some(run())
+        }
+    }
+
+    pub(crate) fn kill_scope(&self, scope: &subc_protocol::scope::ScopeStamp) {
+        // Remember the end before taking the task snapshot. A dispatch already
+        // queued on another thread may register its process after this pass.
+        self.fence_scope_end(scope);
         #[cfg(unix)]
         {
             let mut proxies = self

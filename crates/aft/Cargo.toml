@@ -252,7 +252,7 @@ markup5ever_rcdom = "0.38"
 # Keep protocol and transport pinned in lockstep: the transport Frame codec and
 # the protocol's control bodies must agree on the wire-v2 epoch envelope. Tokio
 # runs only at the --subc transport edge; AFT's command core stays synchronous.
-cortexkit-role-tool-provider = "=0.14.0"
+cortexkit-role-tool-provider = "=0.14.1"
 cortexkit-role-agent-data = "=0.2.4"
 cortexkit-project-identity = "=0.1.4"
 cortexkit-agent-identity = "=0.1.1"
@@ -297,7 +297,7 @@ windows-sys = { version = "0.61", features = [
 # Enable the launcher seam only in test builds, not ordinary aft binaries.
 agent-file-tools = { path = ".", features = ["test-sandbox-launcher", "test-conformance-result-inputs"] }
 graphql-parser = "0.4.1"
-cortexkit-role-tool-provider-conformance = "=0.14.0"
+cortexkit-role-tool-provider-conformance = "=0.14.1"
 cortexkit-role-agent-data = { version = "=0.2.4", features = ["test-vectors"] }
 cortexkit-role-harness = "=0.1.0"
 async-trait = "0.1"

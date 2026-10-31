@@ -830,6 +830,8 @@ mod preset_writer_tests {
                 principal_id: Some(principal.into()),
             },
             consumer_elicitation_capable: false,
+            held_reply: false,
+            held_update: false,
             tool_result_body: false,
             disabled_tools: Arc::new(vec![]),
             run_scope: OnceLock::new(),

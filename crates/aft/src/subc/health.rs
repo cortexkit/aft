@@ -2078,6 +2078,7 @@ fn abbreviate_health_root(root: &mut Value) -> bool {
             key.as_str(),
             "project_root"
                 | "root_id"
+                | "actor_count"
                 | "state"
                 | "status"
                 | "standing"
@@ -2088,6 +2089,7 @@ fn abbreviate_health_root(root: &mut Value) -> bool {
                 | "semantic_index"
                 | "callgraph_store"
                 | "tier2"
+                | "bash"
         )
     });
     for field in ["project_root", "root_id", "standing_entry"] {
@@ -2102,6 +2104,9 @@ fn abbreviate_health_root(root: &mut Value) -> bool {
         if let Some(Value::Object(component)) = row.get_mut(component) {
             component.retain(|key, _| key == "status");
         }
+    }
+    if let Some(Value::Object(bash)) = row.get_mut("bash") {
+        bash.retain(|key, _| matches!(key.as_str(), "running" | "pending_completions"));
     }
     row.insert("abbreviated".into(), Value::Bool(true));
     true
@@ -2152,12 +2157,27 @@ fn budget_health_metrics(metrics: &mut serde_json::Map<String, Value>) {
         }
         // Cache-root paths are user-chosen and may be long. Their detail yields
         // before root health, unavailable entries first because their paths
-        // repeat ones listed in cache_roots, counting each one dropped.
+        // repeat ones listed in cache_roots, counting each one dropped. Keep
+        // the last cache identity, abbreviating its path instead of omitting it.
         let mut trimmed_cache_path = false;
         for (field, omitted_field) in [
             ("cache_unavailable", "cache_unavailable_omitted"),
             ("cache_roots", "cache_roots_omitted"),
         ] {
+            if field == "cache_roots" {
+                if let Some(entries) = metrics.get_mut(field).and_then(Value::as_array_mut) {
+                    if entries.len() == 1 {
+                        if let Some(Value::String(path)) = entries.first_mut() {
+                            let abbreviated = abbreviated_health_path(path);
+                            if *path != abbreviated {
+                                *path = abbreviated;
+                                trimmed_cache_path = true;
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
             let removed = match metrics.get_mut(field) {
                 Some(Value::Object(entries)) => {
                     let last = entries.keys().next_back().cloned();
@@ -2185,13 +2205,15 @@ fn budget_health_metrics(metrics: &mut serde_json::Map<String, Value>) {
         // roots first; keep the original order among the surviving rows.
         if let Some(roots) = metrics.get_mut("roots").and_then(Value::as_array_mut) {
             if !roots.is_empty() {
-                let index = roots
-                    .iter()
-                    .rposition(ordinary_ready_health_root)
-                    .or_else(|| (roots.len() > 1).then(|| roots.len() - 1));
+                let index = (roots.len() > 1).then(|| {
+                    roots
+                        .iter()
+                        .rposition(ordinary_ready_health_root)
+                        .unwrap_or(roots.len() - 1)
+                });
                 let Some(index) = index else {
-                    // A degraded headline without its last actionable root is
-                    // misleading. Abbreviating that row does not omit a root.
+                    // Keep an identifiable status even when the last root is ready.
+                    // Abbreviating the last row does not omit a root.
                     if abbreviate_health_root(&mut roots[0]) {
                         continue;
                     }
@@ -4579,14 +4601,15 @@ mod tests {
         super::budget_health_metrics(&mut cached);
         assert_eq!(cached["roots"].as_array().unwrap().len(), 1);
         cached.insert("fresh_liveness".into(), json!("f".repeat(1000)));
-        let mut expected = cached.clone();
-        legacy_health_budget(&mut expected);
         super::budget_health_metrics(&mut cached);
+        assert_eq!(cached["roots"].as_array().unwrap().len(), 1);
+        assert_eq!(cached["roots"][0]["abbreviated"], true);
+        assert_eq!(cached["roots"][0]["project_root"], "ordinary");
         assert_eq!(
-            serde_json::to_vec(&cached).unwrap(),
-            serde_json::to_vec(&expected).unwrap()
+            cached["metrics_bytes"],
+            serde_json::to_vec(&cached).unwrap().len()
         );
-        assert_eq!(cached["roots"].as_array().unwrap().len(), 0);
+        assert!(cached["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
     }
 
     #[test]
@@ -4698,7 +4721,8 @@ mod tests {
         assert_eq!(metrics["root_details_omitted"], 0);
         assert_eq!(metrics["write_ledger_top_10m"][0]["root_id"], "project");
         assert_eq!(metrics["storage_retention_reports_omitted"], 1);
-        assert_eq!(metrics["cache_roots_omitted"], 1);
+        assert_eq!(metrics["cache_roots_omitted"], 0);
+        assert_eq!(metrics["cache_roots"].as_array().unwrap().len(), 1);
         assert_eq!(metrics["cache_unavailable_omitted"], 1);
         assert!(metrics["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
     }
@@ -4743,6 +4767,73 @@ mod tests {
             serde_json::to_vec(&metrics).unwrap().len()
         );
         assert!(metrics["metrics_bytes"].as_u64().unwrap() <= HEALTH_METRICS_BUDGET_BYTES as u64);
+    }
+
+    #[test]
+    fn health_budget_preserves_last_ready_root_and_cache_with_long_temp_paths() {
+        let parent = tempfile::tempdir().expect("health fixture parent");
+        let mut base = parent.path().to_path_buf();
+        // Force byte-budget pressure even when TMPDIR is short. Components stay
+        // below NAME_MAX and the complete paths stay below macOS's PATH_MAX.
+        while base.as_os_str().len() < 700 {
+            base.push("health-budget-long-directory-".repeat(2));
+        }
+        std::fs::create_dir_all(&base).expect("long health fixture parent");
+        let root_path = base.join("project").to_string_lossy().into_owned();
+        let cache_path = base.join("cache").to_string_lossy().into_owned();
+        let root = json!({
+            "project_root": root_path, "actor_count": 1, "state": "ready",
+            "search_index": {"status": "disabled"},
+            "semantic_index": {"status": "disabled"},
+            "callgraph_store": {"status": "disabled"},
+            "tier2": {"status": "disabled"},
+            "bash": {"running": 0, "pending_completions": 0},
+            "detail": "optional root telemetry".repeat(100)
+        });
+        assert!(ordinary_ready_health_root(&root));
+        // Leave room for compact identities and status, but not the full paths
+        // and optional root telemetry. Fresh liveness counters must not yield.
+        let mut metrics = json!({
+            "root_count": 1, "root_details_omitted": 0, "roots": [root],
+            "cache_roots": [cache_path], "cache_roots_omitted": 0,
+            "fresh_liveness": "x".repeat(11000)
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(refresh_metrics_bytes(&mut metrics) > HEALTH_METRICS_BUDGET_BYTES);
+        budget_health_metrics(&mut metrics);
+        assert_eq!(metrics["roots"].as_array().unwrap().len(), 1);
+        assert_eq!(metrics["cache_roots"].as_array().unwrap().len(), 1);
+        let root = &metrics["roots"][0];
+        assert_eq!(root["abbreviated"], true);
+        assert_eq!(root["state"], "ready");
+        assert_eq!(root["actor_count"], 1);
+        assert_eq!(
+            root["bash"],
+            json!({"running": 0, "pending_completions": 0})
+        );
+        for component in ["search_index", "semantic_index", "callgraph_store", "tier2"] {
+            assert_eq!(root[component]["status"], "disabled");
+        }
+        for (identity, path, basename) in [
+            (&root["project_root"], &root_path, "/project"),
+            (&metrics["cache_roots"][0], &cache_path, "/cache"),
+        ] {
+            let identity = identity.as_str().unwrap();
+            assert!(identity.contains(blake3::hash(path.as_bytes()).to_hex().as_str()));
+            assert!(identity.ends_with(basename));
+        }
+        assert_eq!(metrics["root_count"], 1);
+        assert_eq!(metrics["root_details_omitted"], 0);
+        assert_eq!(metrics["cache_roots_omitted"], 0);
+        assert_eq!(metrics["fresh_liveness"].as_str().unwrap().len(), 11000);
+        let bytes = serde_json::to_vec(&metrics).unwrap().len();
+        assert_eq!(metrics["metrics_bytes"], bytes);
+        assert!(bytes <= HEALTH_METRICS_BUDGET_BYTES, "{bytes}");
+        let once = metrics.clone();
+        budget_health_metrics(&mut metrics);
+        assert_eq!(metrics, once, "abbreviation must survive rebudgeting");
     }
 
     #[test]
@@ -9676,8 +9767,10 @@ mod tests {
             });
         assert_eq!(root_row["standing"], true);
         if root_row["abbreviated"] == true {
+            // An abbreviated row keeps a path of up to 160 bytes as it is and
+            // replaces a longer one with its digest plus basename.
             let identity = root_row["standing_entry"].as_str().unwrap();
-            assert!(identity.contains(blake3::hash(literal_path.as_bytes()).to_hex().as_str()));
+            assert_eq!(identity, abbreviated_health_path(&literal_path));
             assert!(identity.ends_with("/standing-link"));
         } else {
             assert_eq!(root_row["standing_entry"], literal_path);

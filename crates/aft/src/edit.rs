@@ -19,8 +19,7 @@ mod windows_replace;
 /// How [`atomic_write_source`] stored the new bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SourceWriteMode {
-    /// A synced sibling file replaced the target by rename or `ReplaceFileW`,
-    /// or created it.
+    /// A synced sibling file replaced the target by rename, or created it.
     Replaced,
     /// The existing file was rewritten and synced in place, because a
     /// replacement file could not be created or could not keep its hard links,
@@ -33,7 +32,8 @@ pub(crate) enum SourceWriteMode {
 pub(crate) struct SourceWriteOutcome {
     pub(crate) mode: SourceWriteMode,
     /// Each warning starts with a stable code and a colon:
-    /// `recovery_copy_found`, `no_recovery_copy` or `mode_not_restored`.
+    /// `recovery_copy_found`, `no_recovery_copy`, `mode_not_restored` or
+    /// `non_atomic_windows_write`.
     pub(crate) warnings: Vec<String>,
 }
 
@@ -49,10 +49,11 @@ pub(crate) struct SourceWriteOutcome {
 ///   were copied onto the replacement and read back equal (on Linux the ACL
 ///   is an extended attribute; on macOS it is copied by `fcopyfile` and read
 ///   back with `acl_get_fd_np`);
-/// - on Windows, a single-link file replaced by POSIX rename when its owner,
-///   streams and metadata permit it, or by `ReplaceFileW` otherwise. The
+/// - on Windows, a single-link file replaced by POSIX or MoveFileExW rename
+///   only when its owner, streams and metadata permit it. The
 ///   temporary gets the file's own protected DACL before any content is
-///   written, so it is never readable by more users than the file.
+///   written, so it is never readable by more users than the file. Named
+///   streams are copied and synced before rename; Windows regenerates short names.
 ///
 /// Any other existing file is rewritten in place, as editors do when a
 /// backup-and-rename would alter the file, so access is never silently
@@ -158,13 +159,14 @@ fn atomic_write_source_with(
     cleanup.file.take();
     #[cfg(windows)]
     if let Some(metadata) = original.as_ref() {
-        if source_replacement::replace_keeping_identity(&destination, &temporary, parent)? {
+        if source_replacement::replace_keeping_identity(&destination, &temporary)? {
             return Ok(SourceWriteOutcome {
                 mode: SourceWriteMode::Replaced,
                 warnings,
             });
         }
         drop(cleanup);
+        warnings.push("non_atomic_windows_write: atomic replacement is unavailable for this file; saved in place without removing its name. Concurrent readers may see incomplete contents.".to_owned());
         return write_source_in_place(&destination, metadata, bytes, &mut writer, warnings);
     }
     crate::fs_lock::rename_over(&temporary, &destination)?;
@@ -336,9 +338,8 @@ mod source_replacement {
         metadata.is_file() && metadata.nlink() == 1 && metadata.uid() == euid
     }
 
-    /// `ReplaceFileW` keeps the replaced file's security descriptor and
-    /// attributes, but it replaces only one name, so a file with more than
-    /// one hard link would be split from its other names.
+    /// A replacement changes only one name, so a file with more than one hard
+    /// link must be written in place to retain its other names.
     #[cfg(windows)]
     pub(super) fn may_keep_access(destination: &Path, metadata: &Metadata) -> bool {
         metadata.is_file() && super::windows_replace::link_count(destination) == Some(1)
@@ -401,10 +402,8 @@ mod source_replacement {
             && xattrs::platform_acls_match(&source, replacement)
     }
 
-    /// `ReplaceFileW` moves the replaced file's security descriptor onto the
-    /// replacement only when it commits. Until then the temporary would carry
-    /// the folder's inherited ACL, which can admit users the file does not,
-    /// so it gets the file's own protected DACL before any content is written.
+    /// Give the temporary the file's own protected DACL before any content is
+    /// written. The folder's inherited ACL can admit users the file does not.
     #[cfg(windows)]
     pub(super) fn copy_access(
         destination: &Path,
@@ -428,16 +427,15 @@ mod source_replacement {
     }
 
     /// Replace `destination` with the synced `replacement` through a guarded
-    /// POSIX rename or `ReplaceFileW`. Returns `Ok(false)` when it could not,
-    /// after making sure the original is back under its own name, so the
-    /// caller can rewrite the file in place instead.
+    /// POSIX or MoveFileExW rename. Returns `Ok(false)` without removing
+    /// the original name when neither is safe, so the caller can report the
+    /// loss of atomicity and rewrite the file in place instead.
     #[cfg(windows)]
     pub(super) fn replace_keeping_identity(
         destination: &Path,
         replacement: &Path,
-        parent: &Path,
     ) -> std::io::Result<bool> {
-        super::windows_replace::replace(destination, replacement, parent)
+        super::windows_replace::replace(destination, replacement)
     }
 
     /// Extended attributes read and written through open file descriptors.
@@ -1263,6 +1261,22 @@ impl<'a> SourceLineIndex<'a> {
 pub(crate) struct EditObservation {
     capture: Option<crate::backup::CapturedRegularFile>,
     version: Option<crate::backup::DiskFileVersion>,
+    expected: mutation::Version,
+}
+
+pub(crate) mod mutation;
+
+impl EditObservation {
+    pub(crate) fn check(&self, path: &Path) -> Result<(), AftError> {
+        self.expected.check(path)
+    }
+    pub(crate) fn missing(path: &Path) -> Self {
+        Self {
+            capture: None,
+            version: None,
+            expected: mutation::Version::missing(path),
+        }
+    }
 }
 
 pub(crate) fn read_edit_source(path: &Path) -> std::io::Result<(String, EditObservation)> {
@@ -1281,6 +1295,7 @@ pub(crate) fn read_edit_source(path: &Path) -> std::io::Result<(String, EditObse
 pub(crate) fn read_edit_bytes(
     path: &Path,
 ) -> std::io::Result<(std::sync::Arc<[u8]>, EditObservation)> {
+    let mut expected = mutation::Version::existing(path, std::sync::Arc::from([]));
     let before = crate::backup::DiskFileVersion::of_path(path);
     let (bytes, capture) = match crate::backup::CapturedRegularFile::read(path)? {
         Some(capture) => (capture.shared_bytes(), Some(capture)),
@@ -1292,7 +1307,15 @@ pub(crate) fn read_edit_bytes(
     };
     let version =
         before.filter(|version| Some(*version) == crate::backup::DiskFileVersion::of_path(path));
-    Ok((bytes, EditObservation { capture, version }))
+    expected.set_bytes(std::sync::Arc::clone(&bytes));
+    Ok((
+        bytes,
+        EditObservation {
+            capture,
+            version,
+            expected,
+        },
+    ))
 }
 
 pub(crate) fn auto_backup_observed(
@@ -1303,29 +1326,18 @@ pub(crate) fn auto_backup_observed(
     op_id: Option<&str>,
     observation: &EditObservation,
 ) -> Result<Option<String>, AftError> {
+    mutation::before_check(path);
+    let _locks = mutation::lock_files(&[path]);
+    observation.expected.check(path)?;
     let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Backup);
-    if let (Some(capture), Some(version)) = (observation.capture.as_ref(), observation.version) {
-        if std::fs::symlink_metadata(path).is_err() {
-            return Ok(None);
-        }
-        let mut store = ctx.backup().lock();
-        // Validate under the backup mutex immediately before storing. A capture
-        // predating a replacement or an external save must not become undo data.
-        if crate::backup::DiskFileVersion::of_path(path) == Some(version) {
-            let mut capture = capture.clone();
-            if capture.refresh_if_stale(path).is_ok() {
-                return store.snapshot_with_op_from_capture(
-                    session,
-                    path,
-                    description,
-                    op_id,
-                    &capture,
-                );
-            }
-        }
-        store.snapshot_with_op(session, path, description, op_id)
+    let mut store = ctx.backup().lock();
+    // Recheck after waiting for the backup store. Never replace the observed
+    // baseline with a newer file: that would bless a stale edit's undo data.
+    observation.expected.check(path)?;
+    if let Some(capture) = observation.capture.as_ref() {
+        store.snapshot_with_op_from_capture(session, path, description, op_id, capture)
     } else {
-        auto_backup(ctx, session, path, description, op_id)
+        store.snapshot_with_op(session, path, description, op_id)
     }
 }
 
@@ -2036,6 +2048,8 @@ pub fn write_format_validate(
         false,
         None,
         false,
+        None,
+        None,
     )
 }
 
@@ -2049,12 +2063,35 @@ pub(crate) fn write_format_validate_observed(
     original: &str,
     observation: &EditObservation,
 ) -> Result<WriteResult, AftError> {
+    write_format_validate_bytes_observed(
+        tool_policy,
+        path,
+        content,
+        config,
+        params,
+        Some(original),
+        observation,
+    )
+}
+
+pub(crate) fn write_format_validate_bytes_observed(
+    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
+    path: &Path,
+    content: &str,
+    config: &Config,
+    params: &serde_json::Value,
+    original: Option<&str>,
+    observation: &EditObservation,
+) -> Result<WriteResult, AftError> {
+    mutation::before_check(path);
+    let locks = mutation::lock_files(&[path]);
+    observation.expected.check(path)?;
     let pre = observation
         .capture
         .as_ref()
         .and(observation.version)
         .filter(|version| Some(*version) == crate::backup::DiskFileVersion::of_path(path))
-        .map(|_| original);
+        .and(original);
     write_format_validate_impl(
         tool_policy,
         path,
@@ -2064,17 +2101,21 @@ pub(crate) fn write_format_validate_observed(
         false,
         pre,
         false,
+        Some(locks),
+        None,
     )
 }
 
-/// Write, format and syntax-check now; the caller checks the completed project
-/// with `validate_written_files` after every file has been written successfully.
-pub(crate) fn write_format_validate_deferred(
+/// The caller owns admission for all affected files. Release a completed file
+/// immediately after its write, before invoking formatters or language servers.
+pub(crate) fn write_format_validate_admitted(
     tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
     path: &Path,
     content: &str,
     config: &Config,
     params: &serde_json::Value,
+    created: bool,
+    after_write: &dyn Fn(),
 ) -> Result<WriteResult, AftError> {
     write_format_validate_impl(
         tool_policy,
@@ -2084,24 +2125,10 @@ pub(crate) fn write_format_validate_deferred(
         params,
         true,
         None,
-        false,
+        created,
+        None,
+        Some(after_write),
     )
-}
-
-/// Write and format a file that did not exist before the caller's
-/// multi-step operation started, even if an earlier step of that operation
-/// already wrote it. There is no earlier content to protect, so an invalid
-/// result is never rolled back, and no syntax check runs here: the caller
-/// checks the file's final content once with [`check_created_file_syntax`]
-/// after its last step. `syntax_valid` and `syntax_error_line` are `None`.
-pub(crate) fn write_format_deferred_created(
-    tool_policy: &crate::sandbox_spawn::ToolLaunchPolicy,
-    path: &Path,
-    content: &str,
-    config: &Config,
-    params: &serde_json::Value,
-) -> Result<WriteResult, AftError> {
-    write_format_validate_impl(tool_policy, path, content, config, params, true, None, true)
 }
 
 mod bash;
@@ -2117,6 +2144,8 @@ fn write_format_validate_impl(
     defer_full_validation: bool,
     captured_original: Option<&str>,
     syntax_checked_by_caller: bool,
+    file_locks: Option<Vec<mutation::FileLock>>,
+    after_write: Option<&dyn Fn()>,
 ) -> Result<WriteResult, AftError> {
     // A file this call creates has no prior content: it cannot be rolled back
     // to anything, so an invalid result is kept and reported through
@@ -2148,6 +2177,10 @@ fn write_format_validate_impl(
             message: format!("failed to write file: {}", e),
         })?
         .warnings;
+    drop(file_locks);
+    if let Some(after_write) = after_write {
+        after_write();
+    }
     drop(write_phase);
 
     // Step 2: Format (before validate so we validate the formatted content)
@@ -2737,7 +2770,7 @@ mod tests {
         let replacement = temp.path().join("replacement.txt");
         std::fs::write(&replacement, "external\n").unwrap();
         std::fs::rename(&replacement, &path).unwrap();
-        auto_backup_observed(
+        let error = auto_backup_observed(
             &ctx,
             "freshness",
             &path,
@@ -2745,14 +2778,10 @@ mod tests {
             Some("freshness-op"),
             &observation,
         )
-        .unwrap();
-        assert_eq!(
-            ctx.backup().lock().history("freshness", &path)[0]
-                .content_bytes()
-                .unwrap()
-                .as_ref(),
-            b"external\n"
-        );
+        .unwrap_err();
+        assert_eq!(error.code(), "file_changed_since_read");
+        assert!(ctx.backup().lock().history("freshness", &path).is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), b"external\n");
     }
 
     #[test]
@@ -2779,7 +2808,7 @@ mod tests {
         assert_eq!(result.final_content(&path), Some("const external = 8;\n"));
         // A stale valid source must not cause rollback against a now-invalid file.
         std::fs::write(&path, "function { external-invalid").unwrap();
-        let mut result = write_format_validate_observed(
+        let error = write_format_validate_observed(
             &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
             &path,
             "function { new-invalid",
@@ -2788,9 +2817,13 @@ mod tests {
             &source,
             &observation,
         )
-        .unwrap();
-        assert!(!result.rolled_back);
-        assert_eq!(result.final_content(&path), Some("function { new-invalid"));
+        .err()
+        .expect("stale edit must be refused");
+        assert_eq!(error.code(), "file_changed_since_read");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "function { external-invalid"
+        );
         std::fs::write(&path, [0xff, 0xfe]).unwrap();
         assert_eq!(
             read_edit_source(&path).err().unwrap().to_string(),

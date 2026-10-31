@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/search_index.rs"
+  ],
+  "slices": [
+    "views-callgraph-copies"
+  ],
+  "note": "The ranking fence hit is crates/aft/src/search_index.rs, which gains a read-only accessor listing a lexical snapshot's file sizes and content hashes for the views call-graph copy limit. No search, ranking, query routing or index build changes; ranked rows must remain byte-identical to the committed reference. Views are off by default."
+}

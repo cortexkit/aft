@@ -181,6 +181,8 @@ fn effective_identity(
         call_mode: carrier.call_mode.clone(),
         tool_result_body: carrier.tool_result_body,
         consumer_elicitation_capable: false,
+        held_reply: false,
+        held_update: false,
         run_owner: None,
         run_scope: OnceLock::new(),
         made_tool_call: AtomicBool::new(true),

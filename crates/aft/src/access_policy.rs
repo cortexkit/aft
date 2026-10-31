@@ -187,7 +187,9 @@ pub(crate) enum AskRoute {
     Elicitation { once: Vec<AccessGrant> },
     /// No permission UI is available on this route.
     Deny,
-    /// A stamped Alfonso worker: an `ask` refuses with `access_ask_required`
+    /// An Alfonso agent or its codemode program, identified by a scope stamp
+    /// authenticated by prefrontal-core:
+    /// an `ask` refuses with `access_ask_required`
     /// so the subc layer can put the question to Cingulate. `once` holds the
     /// capabilities an `allow_once` answer approved for this one dispatch.
     Consent {
@@ -196,8 +198,8 @@ pub(crate) enum AskRoute {
         /// restored, those grants may explain refusals but cannot authorize access.
         launch: Option<crate::db::remote_exec::PolicyKey>,
     },
-    /// A codemode program's call: nobody can be asked on its head agent's
-    /// behalf yet, so an `ask` refuses with [`PERMISSION_ASK_UNAVAILABLE`],
+    /// A worker program's call: its run cannot request consent, so an `ask`
+    /// refuses with [`PERMISSION_ASK_UNAVAILABLE`],
     /// naming the permission and the path. Allow and deny decisions are
     /// unaffected.
     Unavailable,
