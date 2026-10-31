@@ -3114,6 +3114,74 @@ struct GitPolicyCacheKey {
 }
 
 #[cfg(unix)]
+static GIT_POLICY_COUNTERS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+#[cfg(unix)]
+#[derive(Default)]
+struct GitPolicyReport {
+    counters: [u64; 4],
+    last_at: Option<Instant>,
+}
+
+#[cfg(unix)]
+impl GitPolicyReport {
+    fn changed(&mut self, now: Instant, counters: [u64; 4]) -> bool {
+        if counters == self.counters
+            || self
+                .last_at
+                .is_some_and(|last| now.duration_since(last) < Duration::from_secs(60))
+        {
+            return false;
+        }
+        self.counters = counters;
+        self.last_at = Some(now);
+        true
+    }
+}
+
+#[cfg(unix)]
+fn git_policy_counters() -> [u64; 4] {
+    GIT_POLICY_COUNTERS
+        .each_ref()
+        .map(|counter| counter.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+#[cfg(unix)]
+fn log_git_policy_summary() {
+    static REPORT: OnceLock<Mutex<GitPolicyReport>> = OnceLock::new();
+    let Ok(mut report) = REPORT
+        .get_or_init(|| Mutex::new(GitPolicyReport::default()))
+        .try_lock()
+    else {
+        return;
+    };
+    let counters = git_policy_counters();
+    if report.changed(Instant::now(), counters) {
+        let [hits, misses, uncached, helpers] = counters;
+        crate::slog_info!("git policy cache cumulative: hits={hits} misses={misses} uncached_key_none={uncached} git_helpers={helpers}");
+    }
+}
+
+#[cfg(unix)]
+enum GitPolicyResolution {
+    Hit = 0,
+    Miss = 1,
+    Uncached = 2,
+}
+
+#[cfg(unix)]
+fn note_git_policy_resolution(_project_root: &Path, resolution: GitPolicyResolution) {
+    #[cfg(test)]
+    with_git_policy_test_state(_project_root, |state| match resolution {
+        GitPolicyResolution::Hit => state.hits += 1,
+        GitPolicyResolution::Miss => state.misses += 1,
+        GitPolicyResolution::Uncached => state.uncached += 1,
+    });
+    GIT_POLICY_COUNTERS[resolution as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(unix)]
 const GIT_POLICY_CACHE_CAPACITY: usize = 256;
 
 #[cfg(unix)]
@@ -3226,6 +3294,9 @@ struct GitPolicyTestUncachedGate {
 struct GitPolicyTestState {
     environment: Vec<(OsString, OsString)>,
     calls: usize,
+    hits: usize,
+    misses: usize,
+    uncached: usize,
     delay_ms: u64,
     uncached_gate: Option<GitPolicyTestUncachedGate>,
     waiter_signal: Option<std::sync::mpsc::Sender<()>>,
@@ -3785,7 +3856,11 @@ fn git_policy_output(project_root: &Path, args: &[&str]) -> std::io::Result<std:
     };
     #[cfg(not(test))]
     let mut command = command.build();
-    command.arg("-C").arg(project_root).args(args).output()
+    let output = command.arg("-C").arg(project_root).args(args).output();
+    if output.is_ok() {
+        GIT_POLICY_COUNTERS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    output
 }
 
 #[cfg(unix)]
@@ -3794,6 +3869,7 @@ fn resolve_git_policy(project_root: &Path) -> Result<GitPolicy, String> {
         crate::bash_background::BashStartupStep::GitPolicy,
     );
     let result = resolve_git_policy_inner(project_root);
+    log_git_policy_summary();
     crate::bash_background::enter_bash_startup_step(
         crate::bash_background::BashStartupStep::Profile,
     );
@@ -3805,6 +3881,7 @@ fn resolve_git_policy_inner(project_root: &Path) -> Result<GitPolicy, String> {
     let environment = git_policy_environment(project_root);
     let worker = worker_jail_active();
     let Some(key) = git_policy_cache_key(project_root, &environment, worker) else {
+        note_git_policy_resolution(project_root, GitPolicyResolution::Uncached);
         return resolve_git_policy_uncached(project_root, environment, worker)
             .map(|(policy, _)| policy);
     };
@@ -3830,6 +3907,7 @@ fn resolve_git_policy_inner(project_root: &Path) -> Result<GitPolicy, String> {
                 let remaining = git_policy_wait_remaining(project_root, wait_deadline);
                 if remaining.is_zero() {
                     drop(cache);
+                    note_git_policy_resolution(project_root, GitPolicyResolution::Miss);
                     return resolve_git_policy_uncached(project_root, environment, worker)
                         .map(|(policy, _)| policy);
                 }
@@ -3844,6 +3922,7 @@ fn resolve_git_policy_inner(project_root: &Path) -> Result<GitPolicy, String> {
 
         if let Some(cached) = cached {
             if cached.inputs.unchanged(project_root) {
+                note_git_policy_resolution(project_root, GitPolicyResolution::Hit);
                 return Ok(cached.policy.clone());
             }
             git_policy_cache()
@@ -3859,6 +3938,7 @@ fn resolve_git_policy_inner(project_root: &Path) -> Result<GitPolicy, String> {
         // The in-flight marker serializes misses for this exact worktree and
         // input environment until a waiter's deadline. Filesystem checks and
         // Git subprocesses stay unlocked.
+        note_git_policy_resolution(project_root, GitPolicyResolution::Miss);
         let result = resolve_git_policy_uncached(project_root, environment.clone(), worker);
         let entry = result.as_ref().ok().and_then(|(policy, inputs)| {
             let current_key = git_policy_cache_key(project_root, &environment, worker);
@@ -7874,6 +7954,141 @@ mod git_policy_cache_tests {
         let (second, warm) = fixture.resolve();
         assert_eq!(second.hooks, first.hooks);
         assert_eq!(warm, 0, "unchanged policy must not spawn git");
+    }
+
+    #[test]
+    fn git_policy_cache_cold_worker_batches_scope_queries() {
+        let fixture = Fixture::new();
+        let (_, cold) = fixture.resolve();
+        assert!(cold <= 10, "cold worker policy used {cold} Git helpers");
+        assert_eq!(fixture.resolve().1, 0);
+        assert_eq!(
+            fixture.state(|state| (state.hits, state.misses, state.uncached)),
+            (1, 1, 0)
+        );
+        fixture.hooks("changed-hooks");
+        let (policy, changed) = fixture.resolve();
+        assert!(changed > 0);
+        assert_eq!(policy.hooks, vec![fixture.root.join("changed-hooks")]);
+        assert_eq!(
+            fixture.state(|state| (state.hits, state.misses, state.uncached)),
+            (1, 2, 0)
+        );
+    }
+
+    #[test]
+    fn git_policy_cache_summary_is_changed_only_and_minute_limited() {
+        let mut report = GitPolicyReport::default();
+        let now = Instant::now();
+        assert!(!report.changed(now, [0; 4]));
+        assert!(report.changed(now, [1, 0, 0, 0]));
+        assert!(!report.changed(now + Duration::from_secs(59), [1, 1, 0, 12]));
+        assert!(report.changed(now + Duration::from_secs(60), [1, 1, 0, 12]));
+        assert!(!report.changed(now + Duration::from_secs(120), [1, 1, 0, 12]));
+        assert!(report.changed(now + Duration::from_secs(120), [1, 1, 1, 24]));
+    }
+
+    /// Measure real, strict worker bash starts using a separately built aft
+    /// launcher. All repositories, linked worktrees and task storage are disposable.
+    #[test]
+    #[ignore = "manual Linux measurement; AFT_GIT_POLICY_BENCH_LAUNCHER names the aft binary"]
+    #[cfg(target_os = "linux")]
+    fn worker_bash_git_policy_cost() {
+        crate::effective_path::initialize_process_path();
+        let launcher = PathBuf::from(std::env::var_os("AFT_GIT_POLICY_BENCH_LAUNCHER").unwrap())
+            .canonicalize()
+            .unwrap();
+        let fixture = Fixture::new();
+        let storage = tempfile::tempdir().unwrap();
+        let account = tempfile::tempdir().unwrap();
+        let commit = git_policy_output(
+            &fixture.root,
+            &[
+                "-c",
+                "user.name=Policy Bench",
+                "-c",
+                "user.email=bench@example.invalid",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        assert!(commit.status.success(), "{commit:?}");
+        let linked = tempfile::tempdir().unwrap();
+        let mut roots = vec![(fixture.root.clone(), 10)];
+        for index in 0..4 {
+            let root = linked.path().join(format!("worker-{index}"));
+            let output = git_policy_output(
+                &fixture.root,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "--detach",
+                    root.to_str().unwrap(),
+                    "HEAD",
+                ],
+            )
+            .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            roots.push((root, 2));
+        }
+        for (root_index, (root, starts)) in roots.iter().enumerate() {
+            fixture.register_root(root);
+            let mut config = crate::config::Config::default();
+            config.project_root = Some(root.clone());
+            config.storage_dir = Some(storage.path().join(format!("store-{root_index}")));
+            config.github.shim = false;
+            config.git.co_author = "off".into();
+            config.bash.linux_scope = false;
+            config.sandbox.profile.head = SandboxMode::Strict;
+            config.sandbox.profile.worker = SandboxMode::Strict;
+            let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+            let _launcher = install_sandbox_launcher_for_test(root, launcher.clone());
+            for start in 0..*starts {
+                let before = with_git_policy_test_state(root, |state| {
+                    [state.hits, state.misses, state.uncached, state.calls]
+                })
+                .unwrap();
+                let request: crate::protocol::RawRequest =
+                    serde_json::from_value(serde_json::json!({
+                        "id": "policy-cost", "command": "bash", "session_id": "policy-cost",
+                        "params": {"command": "printf git-policy-bench", "compressed": false}
+                    }))
+                    .unwrap();
+                let began = Instant::now();
+                let response = crate::worker_jail_canary::with_test_preparation_home(
+                    account.path(),
+                    2,
+                    || with_worker_jail(true, || crate::commands::bash::handle(&request, &ctx)),
+                );
+                let elapsed = began.elapsed();
+                assert!(response.success, "{response:?}");
+                let id = response.data["task_id"].as_str().unwrap();
+                while !ctx.bash_background().is_task_terminal(id) {
+                    let task = ctx.bash_background().task(id).unwrap();
+                    ctx.bash_background().poll_task(&task).unwrap();
+                    assert!(began.elapsed() < Duration::from_secs(15));
+                    std::thread::yield_now();
+                }
+                assert_eq!(
+                    ctx.bash_background()
+                        .status(id, "policy-cost", None, None, 1024)
+                        .unwrap()
+                        .exit_code,
+                    Some(0)
+                );
+                let after = with_git_policy_test_state(root, |state| {
+                    [state.hits, state.misses, state.uncached, state.calls]
+                })
+                .unwrap();
+                let delta = std::array::from_fn::<_, 4, _>(|index| after[index] - before[index]);
+                eprintln!("worker_bash root={root_index} start={start} hits={} misses={} key_none={} git_helpers={} startup_ms={:.3}", delta[0], delta[1], delta[2], delta[3], elapsed.as_secs_f64() * 1000.0);
+            }
+        }
     }
 
     #[test]
