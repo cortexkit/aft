@@ -6959,6 +6959,11 @@ pub(in crate::subc) mod route_tests {
                 let data = Arc::get_mut(&mut identity.0).unwrap();
                 data.role = RouteRole::ToolProviderV1;
                 data.tool_result_body = tool_result_body;
+                data.scope = Some(serde_json::from_value(json!({
+                    "owner": {"kind":"reserved", "module_id":principal.strip_prefix("reserved:").unwrap()},
+                    "ref":scope.scope_ref, "scope_epoch":scope.scope_epoch,
+                    "kind":"head", "owner_authorized":true,
+                })).unwrap());
                 let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
                     &mut data.spawn_principal
                 else {
