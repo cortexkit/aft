@@ -13561,8 +13561,11 @@ mod h_header_invalidation_tests {
     fn h_header_legacy_migration_is_targeted_atomic_and_once() {
         assert_eq!(BUILD_OUTPUT_VERSION, "v22-python-import-bindings");
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("root");
-        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(temp.path().join("root")).unwrap();
+        // Parse counters key files by the canonical path the store reads them
+        // through (`\\?\C:\...` with long names on Windows, `/private/var` on
+        // macOS), so the root they are counted under must be canonical too.
+        let root = std::fs::canonicalize(temp.path().join("root")).unwrap();
         let files = [
             root.join("plain.h"),
             root.join("widget.h"),
