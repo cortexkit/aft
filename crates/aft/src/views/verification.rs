@@ -305,9 +305,11 @@ impl Evidence {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Policy {
-    /// Names every input by its absolute path, so it also proves that stat
-    /// evidence was recorded in this checkout. Stat-evidence reuse and
-    /// receipts compare against it.
+    /// Names every input by its absolute path, so it is specific to this
+    /// checkout. Two things compare against it: the saved file stats that let
+    /// a later bind skip rereading unchanged files, and the bind receipts
+    /// that record which policy a published generation was verified under.
+    /// Both are only valid in the checkout that recorded them.
     pub digest: String,
     /// The same policy named by role instead of location: inputs under the
     /// checkout by their relative path, Git's info files by name, Git

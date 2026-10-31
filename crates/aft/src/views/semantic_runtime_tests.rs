@@ -1624,9 +1624,10 @@ fn semantic_states(
 }
 
 /// Gives a fixture checkout a base of its own. Bases are content-keyed, so two
-/// checkouts with the same files and ignore policy share one base. Tests about
-/// separate checkouts racing on the same family chunks need separate bases,
-/// so each gets an `.aftignore` that differs only by a comment.
+/// checkouts with the same files and ignore policy share one base. Some tests
+/// race two checkouts' fills on the same embedded chunks, which are stored
+/// once per repository family, and need each checkout on its own base. Each
+/// gets an `.aftignore` that differs only by a comment.
 fn separate_base(root: &Path, tag: &str) {
     std::fs::write(root.join(".aftignore"), format!("# {tag}\n")).unwrap();
 }
@@ -1678,8 +1679,8 @@ fn family_fill_rechecks_completed_work_after_acquiring_claim() {
     assert_eq!(usage.rows, ROWS_PER_ONE_CHUNK_FILE);
     // Both checkouts name the same content with the same semantic key. Their
     // manifests differ only in what is checkout-specific (the base each one
-    // composes and its own publication frontier) and in the `.aftignore`
-    // that keeps their bases apart.
+    // composes and how far its own publications have progressed) and in the
+    // `.aftignore` that keeps their bases apart.
     let source_states = |runtime: &CheckoutSemantic| {
         let mut states = semantic_states(runtime);
         states.retain(|(path, ..)| path.as_bytes() != b".aftignore");
