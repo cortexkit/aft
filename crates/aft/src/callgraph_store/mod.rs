@@ -13530,15 +13530,25 @@ fn staged_content_matches(
 ) -> Result<bool> {
     let rel_path = relative_path(project_root, path);
     let staged_hash = conn
-        .prepare_cached("SELECT content_hash FROM files WHERE path = ?1")?
-        .query_row(params![rel_path], |row| row.get::<_, String>(0))
+        .prepare_cached("SELECT content_hash, size FROM files WHERE path = ?1")?
+        .query_row(params![rel_path], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+        })
         .optional()?;
     // Fresh staging has no row to match. Reading and hashing those sources here
     // duplicates the extraction pass's I/O; only adopted committed rows need it.
-    let Some(staged_hash) = staged_hash else {
+    let Some((staged_hash, staged_size)) = staged_hash else {
         return Ok(false);
     };
     if let Some(corpus) = corpus {
+        // A matching staged corpus fingerprint already compared full digests,
+        // including sources above the freshness hash cap. Their persisted zero
+        // hash is a sentinel, not a digest to compare with the corpus file's hash.
+        if staged_size > cache_freshness::CONTENT_HASH_SIZE_CAP
+            && staged_hash == hash_to_hex(cache_freshness::zero_hash())
+        {
+            return Ok(true);
+        }
         return Ok(corpus
             .files
             .get(path)
@@ -15095,7 +15105,11 @@ impl BuildPool {
                     let abs_path = normalize_file_path(project_root, path)
                         .unwrap_or_else(|_| path.to_path_buf());
                     let rel_path = relative_path(project_root, &abs_path);
-                    let freshness = cache_freshness::collect(&abs_path).ok();
+                    let freshness = if let Some(corpus) = corpus {
+                        corpus.freshness(&abs_path)
+                    } else {
+                        cache_freshness::collect(&abs_path).ok()
+                    };
                     let undecodable = is_undecodable_source(&error);
                     if undecodable {
                         log_undecodable_source(project_root, &rel_path);
@@ -24644,6 +24658,20 @@ struct CorpusSnapshot {
 }
 
 impl CorpusSnapshot {
+    fn freshness(&self, path: &Path) -> Option<FileFreshness> {
+        let hash = *self.files.get(path)?.hash.as_ref().ok()?;
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(FileFreshness {
+            size: metadata.len(),
+            mtime: metadata.modified().ok()?,
+            content_hash: if metadata.len() > cache_freshness::CONTENT_HASH_SIZE_CAP {
+                cache_freshness::zero_hash()
+            } else {
+                hash
+            },
+        })
+    }
+
     fn verify_bytes(&self, path: &Path, bytes: &[u8]) -> Result<()> {
         if self
             .files
@@ -29528,6 +29556,7 @@ export function leaf() {}
                 "stored rows for {table}"
             );
         }
+        incremental_parity::compare(&reference, &published).unwrap();
         eprintln!(
             "256-source fixture: fingerprint reads={} (per-file {}..={}), extraction parses={parses}, source opens={source_opens}, identical stored rows={rows}",
             reads.iter().sum::<usize>(),
