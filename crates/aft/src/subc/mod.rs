@@ -1439,6 +1439,7 @@ pub(crate) fn recovered_bash_frame(
         wire::ToolResponsePolicy {
             trust: BindTrust::FirstParty,
             tool_result_body: true,
+            model_only: false,
         },
     )
     .ok()?;
