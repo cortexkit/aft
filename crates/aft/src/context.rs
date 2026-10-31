@@ -1863,6 +1863,10 @@ pub(crate) struct WatcherCountersSnapshot {
     pub(crate) paths_after_gitignore_since_last_rescan: u64,
     pub(crate) paths_dispatched_total: u64,
     pub(crate) paths_dispatched_since_last_rescan: u64,
+    pub(crate) directory_arrivals_total: u64,
+    pub(crate) directory_subtree_walks_total: u64,
+    pub(crate) directory_empty_total: u64,
+    pub(crate) directory_walk_fallbacks_total: u64,
     pub(crate) overflows_total: u64,
     pub(crate) watch_lost_races_total: u64,
     pub(crate) overflows_during_rescan: u64,
@@ -1900,6 +1904,10 @@ pub(crate) struct WatcherCounters {
     paths_after_gitignore_since_last_rescan: AtomicU64,
     paths_dispatched_total: AtomicU64,
     paths_dispatched_since_last_rescan: AtomicU64,
+    directory_arrivals_total: AtomicU64,
+    directory_subtree_walks_total: AtomicU64,
+    directory_empty_total: AtomicU64,
+    directory_walk_fallbacks_total: AtomicU64,
     overflows_total: AtomicU64,
     watch_lost_races_total: AtomicU64,
     overflows_during_rescan: AtomicU64,
@@ -1931,6 +1939,11 @@ pub(crate) struct WatcherRescanInterval {
 }
 
 impl WatcherCounters {
+    pub(crate) fn note_directory_arrival(&self) {
+        self.directory_arrivals_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn note_overflow_ignore_relevance(&self, relevant: bool) {
         self.overflow_ignore_evidence
             .fetch_or(if relevant { 3 } else { 1 }, Ordering::AcqRel);
@@ -2240,6 +2253,14 @@ impl WatcherCounters {
                 .paths_after_gitignore_since_last_rescan
                 .load(Ordering::Relaxed),
             paths_dispatched_total: self.paths_dispatched_total.load(Ordering::Relaxed),
+            directory_arrivals_total: self.directory_arrivals_total.load(Ordering::Relaxed),
+            directory_subtree_walks_total: self
+                .directory_subtree_walks_total
+                .load(Ordering::Relaxed),
+            directory_empty_total: self.directory_empty_total.load(Ordering::Relaxed),
+            directory_walk_fallbacks_total: self
+                .directory_walk_fallbacks_total
+                .load(Ordering::Relaxed),
             paths_dispatched_since_last_rescan: self
                 .paths_dispatched_since_last_rescan
                 .load(Ordering::Relaxed),

@@ -2451,6 +2451,9 @@ impl WatcherFilterThread {
                         // affected subtree. Ignored build trees need no corpus scan.
                         continue;
                     }
+                    if event.need_rescan() && event.info() == Some(DIRECTORY_RENAME_RESCAN_INFO) {
+                        self.config.counters.note_directory_arrival();
+                    }
                     if event.need_rescan() {
                         // Delay only this test's overflow notification so its
                         // timeout is exercised against worker scheduling.
