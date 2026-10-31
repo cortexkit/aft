@@ -3598,6 +3598,168 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
     restart_uses_persisted_seq_without_duplicates_or_gaps(false).await;
 }
 
+fn runon_restart_context(project: &Path, storage: &Path) -> Arc<crate::context::AppContext> {
+    Arc::new(crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            project_root: Some(project.into()),
+            storage_dir: Some(storage.into()),
+            harness: Some(crate::harness::Harness::Runner),
+            experimental_bash_background: true,
+            ..Default::default()
+        },
+    ))
+}
+
+#[tokio::test]
+async fn runon_restart_reattach_drain_child() {
+    let Some(root) = std::env::var_os("AFT_RUNON_RESTART_FIXTURE") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let project = root.join("project");
+    let ctx = runon_restart_context(&project, &root.join("storage"));
+    ctx.bash_background()
+        .set_harness(crate::harness::Harness::Runner);
+    let storage = crate::bash_background::task_storage_dir(&ctx);
+    let mut launch = launch(PathBuf::from(
+        std::env::var_os("AFT_RUNON_RESTART_CONNECTION").unwrap(),
+    ));
+    launch.explicit_runon = true;
+    launch.harness = "runner".into();
+    let task_id = ctx
+        .bash_background()
+        .spawn_remote(
+            launch,
+            SpawnPlan::Unsandboxed,
+            "printf remote-restart-proof",
+            resolve_posix_shell(),
+            "session".into(),
+            project.clone(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(60)),
+            None,
+            storage,
+            crate::bash_background::TaskSlot::Background { max: 10 },
+            true,
+            false,
+            Some(project),
+        )
+        .unwrap();
+    wait_for(
+        "the remote job must be accepted and started before drain",
+        || {
+            let task = ctx.bash_background().task(&task_id).unwrap();
+            let state = task.state.lock().unwrap();
+            state.metadata.remote.as_ref().and_then(|remote| {
+                (remote.accepted && remote.started.is_some() && remote.last_seq == Some(0))
+                    .then_some(())
+            })
+        },
+    )
+    .await;
+    // Module drain detaches, not cancels, accepted jobs. Exiting this child
+    // also removes its worker threads and in-memory task ownership, so the
+    // replacement must recover from disk rather than share the old task.
+    ctx.bash_background().detach();
+    fs::write(root.join("task-id"), task_id).unwrap();
+}
+
+async fn runon_restart_first_watch_reattaches(watch_before_replay: bool) {
+    let daemon =
+        crate::exec_remote::wire_tests::daemon_with_clients(Script::Started, "exec-remote/v1", 2)
+            .await;
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    fs::create_dir(&project).unwrap();
+    ensure_git_fixture(&project);
+    let child = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "bash_background::registry::remote::tests::runon_restart_reattach_drain_child",
+            "--nocapture",
+        ])
+        .env("AFT_RUNON_RESTART_FIXTURE", root.path())
+        .env("AFT_RUNON_RESTART_CONNECTION", &daemon.connection)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+            .await
+            .expect("draining AFT fixture must exit")
+            .unwrap()
+            .status
+            .success()
+    );
+    let task_id = fs::read_to_string(root.path().join("task-id")).unwrap();
+    let ctx = runon_restart_context(&project, &root.path().join("storage"));
+    ctx.bash_background()
+        .set_harness(crate::harness::Harness::Runner);
+    let storage = crate::bash_background::task_storage_dir(&ctx);
+    let replay = || {
+        ctx.bash_background()
+            .replay_session_for_project(&storage, "session", &project)
+            .unwrap();
+    };
+    if !watch_before_replay {
+        replay();
+    }
+    let request = serde_json::from_value(serde_json::json!({
+        "id": "first-watch-after-drain",
+        "command": "bash_watch",
+        "session_id": "session",
+        "worker_session": true,
+        "task_id": task_id,
+        "timeout_ms": 30_000,
+    }))
+    .unwrap();
+    let outcome = crate::commands::bash_watch::handle_deferred(&request, ctx.clone());
+    daemon.wait_for_requests("exec.attach", 1).await;
+    if watch_before_replay {
+        replay();
+    }
+    let response = match outcome {
+        crate::response_finalize::DispatchOutcome::Immediate(response) => response,
+        crate::response_finalize::DispatchOutcome::Deferred(mut pending) => {
+            wait_for("the first watch must return the recovered result", || {
+                (pending.poll)(&ctx)
+            })
+            .await
+        }
+    };
+    assert_eq!(response.data["status"], "completed", "{response:?}");
+    assert_eq!(response.data["exit_code"], 0, "{response:?}");
+    assert_eq!(response.data["waited"]["reason"], "exited", "{response:?}");
+    remote_worker_exited(&task_id).await;
+    assert_eq!(remote_workers(&task_id), (1, 1));
+    let log = daemon.log.lock().unwrap();
+    let attaches: Vec<_> = log
+        .iter()
+        .filter(|(_, body)| body["method"] == "exec.attach")
+        .collect();
+    assert_eq!(attaches.len(), 1);
+    assert_eq!(attaches[0].1["params"]["job_id"], id().to_string());
+    assert_eq!(attaches[0].1["params"]["from_seq"], 1);
+    assert_eq!(
+        log.iter()
+            .filter(|(_, body)| body["method"] == "exec.run")
+            .count(),
+        1
+    );
+    assert!(!log.iter().any(|(_, body)| body["method"] == "exec.cancel"));
+}
+
+#[tokio::test]
+async fn runon_restart_reattach_first_watch_before_replay() {
+    runon_restart_first_watch_reattaches(true).await;
+}
+
+#[tokio::test]
+async fn runon_restart_reattach_first_watch_after_replay() {
+    runon_restart_first_watch_reattaches(false).await;
+}
+
 #[tokio::test]
 async fn exec_remote_bash_keyed_restart_attaches_by_id_without_duplicates_or_gaps() {
     restart_uses_persisted_seq_without_duplicates_or_gaps(true).await;
