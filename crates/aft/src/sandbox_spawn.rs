@@ -8185,6 +8185,96 @@ mod git_policy_cache_tests {
     }
 
     #[test]
+    fn git_policy_cache_consumer_sees_created_optional_hooks_target() {
+        let fixture = Fixture::new();
+        let target = fixture.root.join("later-hooks");
+        let config = fixture.root.join(".git/config");
+        let mut contents = std::fs::read_to_string(&config).unwrap();
+        contents.push_str(&format!(
+            "[mason]\noriginalHooksPath = :(optional){}\n",
+            target.display()
+        ));
+        std::fs::write(config, contents).unwrap();
+        let (policy, _) = fixture.resolve();
+        assert!(!policy
+            .configured_paths
+            .iter()
+            .any(|(key, _)| key == "mason.originalHooksPath"));
+        assert_eq!(fixture.resolve().1, 0);
+
+        std::fs::create_dir(&target).unwrap();
+        let (cached, calls) = fixture.resolve();
+        assert_eq!(
+            calls, 0,
+            "optional-target existence is not tracked by the existing cache"
+        );
+        let fresh = configured_git_paths_with_inputs(
+            &fixture.root,
+            &["mason.originalHooksPath"],
+            &mut Vec::new(),
+            &mut None,
+        )
+        .unwrap();
+        assert!(fresh.iter().any(|(_, _, path)| path == &target));
+        let denies = checkout_control_denies(&fixture.root, &cached).unwrap();
+        assert!(
+            denies.contains(&target),
+            "a late read must protect a newly present optional target"
+        );
+    }
+
+    #[test]
+    fn git_policy_cache_consumer_sees_created_lf_global_candidate() {
+        let fixture = Fixture::new();
+        let parent = fixture.root.join("account\nfragment");
+        std::fs::create_dir(&parent).unwrap();
+        let global = parent.join("policy");
+        fixture.state(|state| {
+            state
+                .environment
+                .iter_mut()
+                .find(|(key, _)| key == "GIT_CONFIG_GLOBAL")
+                .unwrap()
+                .1 = global.clone().into_os_string();
+        });
+        fixture.resolve();
+        assert_eq!(fixture.resolve().1, 0);
+
+        std::fs::write(&global, "[mason]\noriginalHooksPath = newline-protected\n").unwrap();
+        let (cached, calls) = fixture.resolve();
+        assert_eq!(
+            calls, 0,
+            "the existing LF candidate discovery gap must not bypass the late read"
+        );
+        let target = fixture.root.join("newline-protected");
+        let fresh = configured_git_paths_with_inputs(
+            &fixture.root,
+            &["mason.originalHooksPath"],
+            &mut Vec::new(),
+            &mut None,
+        )
+        .unwrap();
+        assert!(fresh.iter().any(|(_, _, path)| path == &target));
+        let denies = checkout_control_denies(&fixture.root, &cached).unwrap();
+        assert!(
+            denies.contains(&target),
+            "a late read must protect a newly created configuration source"
+        );
+    }
+
+    #[test]
+    fn git_policy_cache_consumer_sees_config_edit_after_resolution() {
+        let fixture = Fixture::new();
+        let (policy, _) = fixture.resolve();
+        let config = fixture.root.join(".git/config");
+        let mut contents = std::fs::read_to_string(&config).unwrap();
+        contents.push_str("[mason]\noriginalHooksPath = late-protected\n");
+        std::fs::write(config, contents).unwrap();
+        let denies = checkout_control_denies(&fixture.root, &policy).unwrap();
+        assert!(denies.contains(&fixture.root.join("late-protected")));
+    }
+
+    #[test]
     fn git_policy_cache_summary_is_changed_only_and_minute_limited() {
         let mut report = GitPolicyReport::default();
         let now = Instant::now();
