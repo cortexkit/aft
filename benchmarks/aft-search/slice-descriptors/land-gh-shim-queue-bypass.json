@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "gh-shim-queue-bypass"
+  ],
+  "note": "gh shim: under GH_SHIM_BYPASS=operator a queue-shaped gh pr merge stays the operator's audited pr merge instead of the bot's v23 enqueue. No changed path matches RANKING_FENCE_PREFIXES."
+}
