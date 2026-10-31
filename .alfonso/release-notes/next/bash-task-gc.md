@@ -1,1 +1,1 @@
-- Lower idle CPU when collecting background-task history in active sessions, and avoid duplicate writes when terminal persistence retries overlap.
+- AFT uses less CPU cleaning up old background-command records in sessions that keep starting new commands.
