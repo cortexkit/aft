@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "health-last-root"
+  ],
+  "note": "AFT's health report shortens its last project row and cache path under the byte budget instead of dropping them. No search, ranking or query routing changes."
+}
