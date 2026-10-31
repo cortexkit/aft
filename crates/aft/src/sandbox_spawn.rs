@@ -8358,8 +8358,10 @@ mod git_policy_cache_tests {
         );
     }
 
-    /// Measure real, strict worker bash starts using a separately built aft
-    /// launcher. All repositories, linked worktrees and task storage are disposable.
+    /// Measures real worker bash starts under the strict sandbox profile. That
+    /// profile launches each command through the aft binary, so the test needs
+    /// a separately built one. All repositories, linked worktrees and task
+    /// storage are disposable.
     #[test]
     #[ignore = "manual Linux measurement; AFT_GIT_POLICY_BENCH_LAUNCHER names the aft binary"]
     #[cfg(target_os = "linux")]
@@ -8372,7 +8374,8 @@ mod git_policy_cache_tests {
         let storage = tempfile::tempdir().unwrap();
         let account = tempfile::tempdir().unwrap();
         let hooks = tempfile::tempdir().unwrap();
-        // Landlock cannot subtract immutable hooks from a writable worktree.
+        // Landlock rules only add access, so a hooks folder inside a worktree
+        // the command may write cannot be made read-only. Keep hooks outside.
         fixture.hooks(hooks.path().to_str().unwrap());
         let commit = git_policy_output(
             &fixture.root,
