@@ -1678,8 +1678,14 @@ fn family_fill_rechecks_completed_work_after_acquiring_claim() {
     assert_eq!(usage.rows, ROWS_PER_ONE_CHUNK_FILE);
     // Both checkouts name the same content with the same semantic key. Their
     // manifests differ only in what is checkout-specific (the base each one
-    // composes and its own publication frontier).
-    assert_eq!(semantic_states(&a), semantic_states(&b));
+    // composes and its own publication frontier) and in the `.aftignore`
+    // that keeps their bases apart.
+    let source_states = |runtime: &CheckoutSemantic| {
+        let mut states = semantic_states(runtime);
+        states.retain(|(path, ..)| path.as_bytes() != b".aftignore");
+        states
+    };
+    assert_eq!(source_states(&a), source_states(b.as_ref()));
     assert_eq!(
         rows(first.path(), &query(&a, "one chunk").results),
         rows(second.path(), &query(&b, "one chunk").results)
