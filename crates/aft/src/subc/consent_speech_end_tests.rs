@@ -172,7 +172,7 @@ impl Drop for SpeechEndWriteFault {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn audit_failed_speech_end_write_fences_received_approval_before_actor_admission() {
-    use crate::gh_shim_speech::{Code, LaunchAuthority};
+    use crate::gh_shim_speech::{model::LaunchAuthority, Code};
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture(FakeCingulate::up());
     let consent = Controlled::install(f.fake.clone());
@@ -183,14 +183,7 @@ async fn audit_failed_speech_end_write_fences_received_approval_before_actor_adm
     let service = crate::gh_shim_speech::service::start(
         &f.ctx.storage_dir(),
         &relay,
-        Arc::new(|_| {
-            Box::pin(async {
-                Err(crate::gh_shim_speech::Refusal::new(
-                    Code::AuthorityUnavailable,
-                    "describe_unavailable",
-                ))
-            })
-        }),
+        Arc::new(|_| Box::pin(async { Err("describe_unavailable".into()) })),
         "speech-end-test-generation".into(),
         true,
     );
