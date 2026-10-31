@@ -86,10 +86,24 @@ pub(crate) fn source_language(path: &Path) -> Option<crate::parser::LangId> {
 /// Whether a member needs a callgraph blob: a source file in a callgraph
 /// language, or resolver configuration such as `package.json`.
 pub(crate) fn applies_to(path: &RelPath) -> bool {
-    super::assembly::is_resolution_input(path.as_bytes())
-        || std::str::from_utf8(path.as_bytes())
+    applies_to_relative(path.as_bytes())
+}
+
+/// [`applies_to`] for a root-relative path with `/` separators.
+pub(crate) fn applies_to_relative(path: &[u8]) -> bool {
+    super::assembly::is_resolution_input(path)
+        || std::str::from_utf8(path)
             .ok()
             .is_some_and(|p| source_language(Path::new(p)).is_some())
+}
+
+/// The subset of a checkout's file identities a call graph is built from, so
+/// documents a call graph never holds do not count as files that differ.
+pub(crate) fn callgraph_inputs(
+    mut identities: std::collections::HashMap<String, (u64, blake3::Hash)>,
+) -> std::collections::HashMap<String, (u64, blake3::Hash)> {
+    identities.retain(|path, _| applies_to_relative(path.as_bytes()));
+    identities
 }
 
 /// Attach evidence computed from exactly the caller's already-read byte buffer.

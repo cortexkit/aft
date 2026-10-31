@@ -339,7 +339,7 @@ fn view_borrowed_callgraph(ctx: &AppContext) -> Option<BorrowedCallgraph> {
     let checkout_root = canonical(&ctx.config().project_root.clone()?);
     let owner = canonical(&owner);
     let differing = store.file_identities().ok().and_then(|graph| {
-        let checkout = ctx.lexical_file_identities()?;
+        let checkout = crate::views::callgraph::callgraph_inputs(ctx.lexical_file_identities()?);
         Some(compare_with_graph(
             &graph,
             checkout,

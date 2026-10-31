@@ -148,7 +148,7 @@ fn matches_target(
     };
     let differing = crate::commands::callgraph_borrowed::compare_with_graph(
         &graph,
-        checkout,
+        super::callgraph::callgraph_inputs(checkout),
         root,
         None,
         MATCH_DISK_READS,
