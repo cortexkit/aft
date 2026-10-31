@@ -1467,6 +1467,10 @@ mod tests {
         let main = checkout(&temp.path().join("main"));
         std::fs::write(main.join(".gitignore"), "dist/\n").unwrap();
         setup_git(&main, &["init", "-q"]);
+        // Windows runners set core.autocrlf, which would check the linked
+        // worktree out with CRLF line endings: different bytes, so not the
+        // same commit's content as the main checkout's LF files.
+        setup_git(&main, &["config", "core.autocrlf", "false"]);
         setup_git(&main, &["add", "-A"]);
         setup_git(&main, &["commit", "-q", "-m", "fixture"]);
         // Shared by every checkout of the repository.
