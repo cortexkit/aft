@@ -20784,7 +20784,7 @@ mod callgraph_store_for_ops_tests {
         assert_eq!(attempts, 1);
     }
 
-    fn assert_callgraph_churn_was_not_charged(ctx: &AppContext) {
+    fn assert_callgraph_churn_was_not_charged(ctx: &AppContext, published_attempts: i64) {
         let connection =
             rusqlite::Connection::open(ctx.callgraph_store_dir().join("build-breaker.sqlite"))
                 .unwrap();
@@ -20808,8 +20808,8 @@ mod callgraph_store_for_ops_tests {
             )
             .unwrap();
         assert_eq!(
-            attempts, 0,
-            "cancelled attempts cannot be attributed as deaths later"
+            attempts, published_attempts,
+            "only the existing successful-publication attempt may remain; cancelled attempts must be retired"
         );
     }
 
@@ -20839,7 +20839,7 @@ mod callgraph_store_for_ops_tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert_eq!(store.nodes_matching("after_edit_marker").unwrap().len(), 1);
         assert!(store.nodes_matching("a_marker").unwrap().is_empty());
-        assert_callgraph_churn_was_not_charged(&ctx);
+        assert_callgraph_churn_was_not_charged(&ctx, 1);
         assert_eq!(ctx.callgraph_cold_build_spawn_count_for_test(), 1);
         drop(store);
         assert!(matches!(
@@ -20870,7 +20870,7 @@ mod callgraph_store_for_ops_tests {
             CallGraphStoreBuildEvent::Settled
         ));
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
-        assert_callgraph_churn_was_not_charged(&ctx);
+        assert_callgraph_churn_was_not_charged(&ctx, 0);
         let _wait = callgraph_build_wait_ms(&ctx, 10_000);
         assert!(matches!(
             ctx.callgraph_store_for_ops(),
@@ -20880,7 +20880,7 @@ mod callgraph_store_for_ops_tests {
             ctx.callgraph_store_for_ops(),
             CallgraphStoreAccess::Ready(_)
         ));
-        assert_callgraph_churn_was_not_charged(&ctx);
+        assert_callgraph_churn_was_not_charged(&ctx, 1);
     }
 
     /// Schedules a callgraph cold build held at its start gate, with the
