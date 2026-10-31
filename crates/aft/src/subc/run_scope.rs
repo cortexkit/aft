@@ -495,6 +495,7 @@ impl RunBudget {
 
 #[cfg(test)]
 impl RunScope {
+    #[cfg(unix)]
     pub(super) fn end_for_test(&self) {
         self.revoked.store(true, Ordering::Release);
         self.withdraw_parked_asks();

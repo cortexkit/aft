@@ -35,7 +35,7 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod wal_credit_probe;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 24;
+pub const CURRENT_SCHEMA_VERSION: u32 = 25;
 
 const MIGRATION_VERSIONS: &[u32] = &[
     1,
@@ -62,6 +62,7 @@ const MIGRATION_VERSIONS: &[u32] = &[
     22,
     23,
     24,
+    25,
 ];
 
 // Performance-only indexes do not change the table format or reader floor.
@@ -997,6 +998,7 @@ fn migration_already_applied(conn: &Connection, version: u32) -> rusqlite::Resul
             .map(|object_count| object_count == 1),
         14 => conn.query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('remote_exec_policies','idx_remote_exec_policies_used')", [], |r| r.get::<_,u32>(0)).map(|n| n == 2),
         24 => conn.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('bash_watch_delivery_acks','bash_watch_delivery_gaps')", [], |row| row.get::<_, u32>(0)).map(|count| count == 2),
+        25 => conn.query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('call_ledger_updates','idx_call_ledger_updates_cursor')", [], |row| row.get::<_, u32>(0)).map(|count| count == 2),
         _ => Ok(false),
     }
 }
@@ -1036,6 +1038,7 @@ fn apply_migration_statements(conn: &Connection, version: u32) -> rusqlite::Resu
             harness TEXT NOT NULL, session_id TEXT NOT NULL, task_id TEXT NOT NULL, watch_id TEXT NOT NULL,
             batch TEXT NOT NULL, PRIMARY KEY (harness, session_id, task_id, watch_id)
         )"),
+        25 => conn.execute_batch(call_ledger::HELD_UPDATES_MIGRATION),
         _ => Ok(()),
     }
 }

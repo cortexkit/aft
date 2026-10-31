@@ -1682,6 +1682,7 @@ fn run_custody(
     custodian: &str,
     stamp: Option<&crate::db::call_ledger::ScopeIdentity>,
     request_id: &str,
+    held_updates: bool,
 ) -> Result<CustodyReply, ErrorBody> {
     use crate::db::call_ledger::{self as ledger, Withdrawal};
     use cortexkit_role_tool_provider::withdraw::{CallerProblem, WithdrawAnswer};
@@ -1763,7 +1764,7 @@ fn run_custody(
             let conn = db
                 .lock()
                 .map_err(|_| unavailable("call ledger database mutex is poisoned".into()))?;
-            ledger::late_results(
+            ledger::late_results_for_consumer(
                 &conn,
                 custodian,
                 incarnation,
@@ -1771,6 +1772,7 @@ fn run_custody(
                 request.limit,
                 now,
                 ROLE_REPLY_BODY_LIMIT,
+                held_updates,
             )
             .map_err(|error| unavailable(error.to_string()))?
             .map(|body| CustodyReply {
@@ -2425,6 +2427,7 @@ impl LedgerEdge {
         let custodian = route_principal(&identity);
         let stamp = identity.scope.as_ref().map(ledger_scope);
         let request_id = format!("{op}-{}-{}", request.header.channel, request.header.corr);
+        let held_updates = identity.held_update;
         let (result_tx, result_rx) = oneshot::channel();
         let rx = executor.submit_async(
             identity.root.clone(),
@@ -2437,6 +2440,7 @@ impl LedgerEdge {
                     &custodian,
                     stamp.as_ref(),
                     &request_id,
+                    held_updates,
                 ));
                 Response::success(request_id, json!({}))
             }),
@@ -5227,6 +5231,7 @@ pub(in crate::subc) mod route_tests {
             spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,
             held_reply: false,
+            held_update: false,
             tool_result_body: false,
             disabled_tools: Arc::new(disabled),
             scope,
@@ -6518,6 +6523,7 @@ pub(in crate::subc) mod route_tests {
             spawn_principal: runner_restore_principal(&project),
             consumer_elicitation_capable: false,
             held_reply: false,
+            held_update: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             scope: None,
@@ -7011,6 +7017,7 @@ pub(in crate::subc) mod route_tests {
             },
             consumer_elicitation_capable: false,
             held_reply: false,
+            held_update: false,
             tool_result_body: false,
             disabled_tools: Arc::new(vec![]),
             scope: Some(stamp("worker")),

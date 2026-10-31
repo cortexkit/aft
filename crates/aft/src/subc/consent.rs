@@ -21,6 +21,8 @@
 //! real terminal result in the call ledger. Their permission waits share one
 //! ten-minute allowance per run; expiry withdraws the ask and refuses the call.
 //! Receiving an answer stops that call's allowance accounting before execution.
+//! Readers declaring held-update/v1 also receive a durable non-terminal
+//! running update at approval, before the call's terminal late result.
 //!
 //! Wire contract (Cingulate's requester contract, `tool_permission` asks): a
 //! management-surface route to the `cingulate` module, opened by AFT's own
@@ -61,6 +63,8 @@ pub(super) const RERUN_MARGIN: Duration = Duration::from_secs(5);
 const MAX_HOLD: Duration = Duration::from_secs(100);
 /// Mirrors the Basal codemode runner's ten-minute person-wait allowance;
 /// keep this provider-side backstop in step with the runner's allowance.
+/// Basal's authoritative accounting survives restarts. This allowance resets
+/// with a fresh RunScope; pending calls fail closed as not_started on restart.
 const RUN_PERMISSION_ALLOWANCE: Duration = Duration::from_secs(10 * 60);
 const ACCESS_TIMEOUT: &str = "access_timeout";
 
@@ -75,14 +79,36 @@ pub(super) fn held_frame(
     flags: Flags,
 ) -> Result<Frame, SubcError> {
     use cortexkit_role_tool_provider::result::held_reasons;
-    // The permission hold has no tool output yet. An empty content list avoids
-    // suggesting a retry while the codemode runner waits for the late result.
+    // The permission hold has no tool output yet. Empty text keeps a valid
+    // content part without giving the runner instructions to retry the call.
     wire::build_held_frame(ver, route, corr, flags, held_reasons::CONSENT, None)
 }
 
-fn approved_command_started(_call: &HeldCall) {
-    // The runner currently has no consent-to-running transition. Keep the
-    // already-published consent hold until the terminal late result arrives.
+async fn approved_command_started(call: &HeldCall, approval_key: &str) -> Result<(), String> {
+    // Older consumers may mistake any late entry for the answer. Only the
+    // capabilities negotiated on the call identity can enable a non-terminal
+    // reason update.
+    if !call.identity.held_update || !call.identity.held_reply || !call.identity.tool_result_body {
+        return Ok(());
+    }
+    let Some(key) = call
+        .ledger_key
+        .clone()
+        .filter(|_| call.identity.run_owner.is_some())
+    else {
+        return Ok(());
+    };
+    let approval_key = approval_key.to_owned();
+    with_db(call, move |conn, _| {
+        crate::db::call_ledger::record_running_update(
+            conn,
+            &key,
+            &approval_key,
+            crate::db::call_ledger::now_ms(),
+        )
+        .map(|_| ())
+    })
+    .await
 }
 
 #[derive(Default)]
@@ -150,7 +176,7 @@ impl RunPermissionBudget {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn advance(&self, elapsed: Duration) {
         let mut clock = self.0.lock().unwrap();
         let now = clock.now.unwrap_or_else(Instant::now);
@@ -1053,7 +1079,11 @@ async fn try_apply_covering_grant(
         original: None,
         elicitation: elicitation.to_owned(),
     });
-    Some(Hold::Run { once, claim })
+    Some(Hold::Run {
+        once,
+        claim,
+        approval_key: prep.call_key.clone(),
+    })
 }
 
 /// The parts of a held call the consent flow reads.
@@ -1099,6 +1129,7 @@ enum Hold {
     Run {
         once: Vec<Permission>,
         claim: Arc<ClaimedAsk>,
+        approval_key: String,
     },
     /// End the call with this response.
     Answer(Response),
@@ -1450,9 +1481,17 @@ where
         let held = hold(call, grant, deadline, &route_hold, own, flight).await;
         drop(waiting);
         match held {
-            Hold::Run { once, claim } => {
+            Hold::Run {
+                once,
+                claim,
+                approval_key,
+            } => {
                 claim.retry_after_deadline.store(false, Ordering::SeqCst);
                 holder = Some(claim);
+                let approved = once
+                    .last()
+                    .cloned()
+                    .expect("an approval contains its requested capability");
                 let shell: Vec<String> = once
                     .iter()
                     .flat_map(|permission| match permission {
@@ -1460,8 +1499,11 @@ where
                         Permission::File(_) => Vec::new(),
                     })
                     .collect();
-                if !shell.is_empty() {
-                    approved_command_started(call);
+                if let Err(error) = approved_command_started(call, &approval_key).await {
+                    if let Some(claim) = holder.take() {
+                        claim.clear().await;
+                    }
+                    return Some((unavailable_answer(call, &approved, &error), None));
                 }
                 let once = once
                     .into_iter()
@@ -3016,7 +3058,11 @@ async fn finish(
                     if let Some(grant) = covering_grant.file().filter(|_| scope) {
                         settle_covered_asks(call, grant, &covering_key, elicitation).await;
                     }
-                    Hold::Run { once, claim }
+                    Hold::Run {
+                        once,
+                        claim,
+                        approval_key: prep.call_key.clone(),
+                    }
                 }
                 Ok(Applied::HeadNotHeld) => Hold::Answer(refused_answer(
                     call,

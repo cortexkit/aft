@@ -1619,6 +1619,7 @@ struct RouteIdentityData {
     spawn_principal: AuthenticatedPrincipal,
     consumer_elicitation_capable: bool,
     held_reply: bool,
+    held_update: bool,
     tool_result_body: bool,
     /// `disabled_tools` resolved from the config files when this route bound.
     /// Every tool call on the route is checked against this snapshot, so a
@@ -8626,6 +8627,9 @@ async fn handle_control_request(
                 .as_ref()
                 .is_some_and(|capabilities| capabilities.iter().any(|c| c == "elicitation"));
             let tool_result_body = result_body::accepts(consumer_capabilities.as_deref());
+            let held_update = cortexkit_role_tool_provider::consumer_reads_held_update_v1(
+                consumer_capabilities.as_deref(),
+            );
             let held_reply = consumer_capabilities
                 .as_ref()
                 .is_some_and(|caps| caps.iter().any(|cap| cap == "held-reply/v1"));
@@ -8720,6 +8724,7 @@ async fn handle_control_request(
                 consumer_elicitation_capable,
                 tool_result_body,
                 held_reply,
+                held_update,
                 disabled_tools: bind_disabled_tools,
                 run_scope: OnceLock::new(),
                 call_mode: call_mode.unwrap_or(subc_protocol::call_mode::CallMode::Classic),
@@ -13585,6 +13590,7 @@ pub(crate) mod test_support {
             },
             consumer_elicitation_capable: false,
             held_reply: false,
+            held_update: false,
             tool_result_body: false,
             disabled_tools: Arc::new(vec![]),
             run_scope: OnceLock::new(),
@@ -14865,6 +14871,7 @@ pub(crate) mod test_support {
             },
             consumer_elicitation_capable: false,
             held_reply: false,
+            held_update: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),
@@ -19981,6 +19988,7 @@ mod tests {
             spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,
             held_reply: false,
+            held_update: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),
@@ -20114,6 +20122,7 @@ mod tests {
             spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,
             held_reply: false,
+            held_update: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),

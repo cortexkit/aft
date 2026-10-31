@@ -355,6 +355,18 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "db/call_ledger.rs",
+        enclosing_item: "late_results_for_consumer",
+        location_or_primitive: "LATE_RESULTS_PAGE_MAX (256), SQL LIMIT cap + 1, take(cap), max_body",
+        reason: "tool-provider protocol feed pagination uses entries, cursor and more, not an AFT ListEnvelope; the existing 256-entry limit and encoded reply-byte bound retain continuation through the shared cursor",
+    },
+    ExclusionEntry {
+        file: "db/call_ledger.rs",
+        enclosing_item: "enforce_retention_bounds",
+        location_or_primitive: "UNACKED_RESULTS_MAX (1000), EXPIRED_ENTRIES_MAX (1000), SQL OFFSET",
+        reason: "durable protocol retention quotas bound stored terminal answers and non-terminal update payloads rather than shortening a command result list; acknowledged updates keep deduplication keys until their admitted call is removed",
+    },
+    ExclusionEntry {
         file: "bash_background/remote.rs",
         enclosing_item: "admission_progress_detail",
         location_or_primitive: "MAX_DETAIL_CHARS character preview",

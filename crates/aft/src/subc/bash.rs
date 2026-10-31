@@ -1692,8 +1692,8 @@ mod unanswered_deadline_tests {
 
 /// Preserve the unavailable refusal for worker programs and run routes that
 /// cannot receive held replies. Capable agent programs use Cingulate instead.
-fn refuse_run_permission_ask(response: Response, run_scoped: bool) -> Response {
-    if !run_scoped
+fn refuse_run_permission_ask(response: Response, unavailable: bool) -> Response {
+    if !unavailable
         || response.success
         || response.data.get("code").and_then(Value::as_str)
             != Some(crate::protocol::ERROR_PERMISSION_REQUIRED)

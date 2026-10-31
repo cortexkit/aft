@@ -1406,13 +1406,21 @@ pub(super) fn build_held_frame(
     reason: &str,
     detail: Option<Value>,
 ) -> Result<Frame, SubcError> {
-    use cortexkit_role_tool_provider::result::{HeldReply, ToolResult};
+    use cortexkit_role_tool_provider::result::{ContentPart, HeldReply, ToolResult};
     let mut held = serde_json::to_value(HeldReply::new(reason)).map_err(SubcError::Json)?;
     if let Some(detail) = detail {
         held["detail"] = detail;
     }
     let held = serde_json::from_value(held).map_err(SubcError::Json)?;
-    let body = ToolResult::new(Vec::new()).with_held(held);
+    let body = ToolResult::new(vec![ContentPart::Text {
+        text: String::new(),
+    }])
+    .with_held(held);
+    cortexkit_role_tool_provider::result::validate(&body).map_err(|error| {
+        SubcError::Json(<serde_json::Error as serde::ser::Error>::custom(
+            error.to_string(),
+        ))
+    })?;
     Frame::build_with_version(
         ver,
         FrameType::Response,

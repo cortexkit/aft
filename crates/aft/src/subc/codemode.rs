@@ -650,6 +650,7 @@ fn effective_identity(
         // consumer to display a prompt.
         consumer_elicitation_capable: owner.consumer_elicitation_capable,
         held_reply: run.held_reply,
+        held_update: run.held_update,
         // Format negotiation belongs to the consumer receiving this reply.
         tool_result_body: run.tool_result_body,
         disabled_tools: Arc::clone(&owner.disabled_tools),

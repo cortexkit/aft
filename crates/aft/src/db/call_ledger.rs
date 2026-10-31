@@ -33,6 +33,76 @@ ALTER TABLE call_ledger ADD COLUMN tool_result_source BLOB
             AND length(tool_result_source) < 3145728));
 "#;
 
+/// Non-terminal feed entries have their own cursor positions without changing
+/// the admitted call or consuming its later terminal answer. Acked rows retain
+/// their deduplication key until the call is removed.
+pub(super) const HELD_UPDATES_MIGRATION: &str = r#"
+CREATE TABLE IF NOT EXISTS call_ledger_updates (
+    carrier TEXT NOT NULL, call_key TEXT NOT NULL, approval_key TEXT NOT NULL,
+    ordinal INTEGER NOT NULL, custodian TEXT NOT NULL, seq INTEGER NOT NULL,
+    event_id TEXT NOT NULL UNIQUE, settled_at INTEGER NOT NULL, entry TEXT,
+    PRIMARY KEY(carrier,call_key,approval_key), UNIQUE(carrier,call_key,ordinal),
+    FOREIGN KEY(carrier,call_key) REFERENCES call_ledger(carrier,call_key) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_call_ledger_updates_cursor ON call_ledger_updates(custodian,seq);
+"#;
+
+pub(crate) fn record_running_update(
+    conn: &Connection,
+    key: &Key,
+    approval_key: &str,
+    now: i64,
+) -> rusqlite::Result<bool> {
+    use cortexkit_role_tool_provider::{
+        late_results::LateEntry,
+        result::{held_reasons, HeldReply},
+    };
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM call_ledger_updates WHERE carrier=?1 AND call_key=?2 AND approval_key=?3)", params![key.carrier,key.call_key,approval_key], |row| row.get(0))?;
+    if exists {
+        return Ok(false);
+    }
+    let row = get(&tx, key)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let first_held = row.frame.as_ref().is_some_and(|frame| {
+        serde_json::from_slice::<Value>(&frame.body)
+            .is_ok_and(|body| body["held"]["reason"] == held_reasons::CONSENT)
+    });
+    if !first_held || row.state != State::Prepared {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    let scope = row.scope.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let ordinal: u64 = tx.query_row("SELECT COALESCE(MAX(ordinal),0)+1 FROM call_ledger_updates WHERE carrier=?1 AND call_key=?2", params![key.carrier,key.call_key], |row| row.get(0))?;
+    let event_id = cortexkit_role_tool_provider::catalog::composition_digest(&json!([
+        key.carrier,
+        key.call_key,
+        scope.owner,
+        scope.scope_ref,
+        scope.scope_epoch,
+        held_reasons::RUNNING,
+        ordinal
+    ]))
+    .expect("held event identity is canonical JSON");
+    let entry = LateEntry::new_held(
+        &scope.owner,
+        &scope.scope_ref,
+        scope.scope_epoch,
+        &scope.owner,
+        &key.call_key,
+        format!("held-{event_id}"),
+        now.max(0) as u64,
+        HeldReply::new(held_reasons::RUNNING),
+    );
+    entry
+        .validate()
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    tx.execute("INSERT INTO call_ledger_ack(custodian,last_seq) VALUES (?1,1) ON CONFLICT(custodian) DO UPDATE SET last_seq=last_seq+1", [&scope.owner])?;
+    let seq = head_seq(&tx, &scope.owner)?;
+    tx.execute("INSERT INTO call_ledger_updates(carrier,call_key,approval_key,ordinal,custodian,seq,event_id,settled_at,entry) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![key.carrier,key.call_key,approval_key,ordinal,scope.owner,seq,entry.event_id,now,serde_json::to_string(&entry).expect("held entry is JSON")])?;
+    enforce_retention_bounds(&tx, &scope.owner)?;
+    tx.commit()?;
+    Ok(true)
+}
+
 pub(super) fn migrate_result_source(conn: &Connection) -> rusqlite::Result<()> {
     let present: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('call_ledger') WHERE name='tool_result_source')", [], |row| row.get(0),
@@ -305,8 +375,8 @@ pub(crate) fn begin_approved(conn: &Connection, key: &Key) -> rusqlite::Result<b
     Ok(changed)
 }
 
-/// Retain a task-backed hold before replying. A prior consent hold is kept:
-/// the protocol cannot yet change a held call's reason before its terminal entry.
+/// Retain a task-backed hold before replying. Keep a prior consent hold marker:
+/// reason transitions use separate non-terminal entries, not another initial reply.
 pub(crate) fn hold_running(
     conn: &Connection,
     key: &Key,
@@ -345,7 +415,7 @@ fn unknown_held_result() -> RecordedFrame {
     RecordedFrame {
         ty: FrameType::Response,
         body: serde_json::to_vec(
-            &json!({"content":[],"isError":true,"errorCode":"outcome_unknown"}),
+            &json!({"content":[{"type":"text","text":""}],"isError":true,"errorCode":"outcome_unknown"}),
         )
         .expect("unknown outcome is JSON"),
     }
@@ -622,8 +692,9 @@ pub fn ack(conn: &Connection, custodian: &str, through: u64) -> rusqlite::Result
         "DELETE FROM call_ledger WHERE custodian=?1 AND seq<=?2",
         params![custodian, through],
     )?;
+    let updates = tx.execute("UPDATE call_ledger_updates SET entry=NULL WHERE custodian=?1 AND seq<=?2 AND entry IS NOT NULL", params![custodian,through])?;
     tx.commit()?;
-    Ok(deleted)
+    Ok(deleted + updates)
 }
 
 /// Drops one custodian's oldest late entries beyond [`UNACKED_RESULTS_MAX`]
@@ -640,6 +711,7 @@ fn enforce_retention_bounds(conn: &Connection, custodian: &str) -> rusqlite::Res
             params![custodian, expired, max as i64],
         )?;
     }
+    conn.execute("UPDATE call_ledger_updates SET entry=NULL WHERE rowid IN (SELECT rowid FROM call_ledger_updates WHERE custodian=?1 AND entry IS NOT NULL ORDER BY seq DESC LIMIT -1 OFFSET ?2)", params![custodian,UNACKED_RESULTS_MAX as i64])?;
     Ok(())
 }
 
@@ -878,6 +950,29 @@ pub fn late_results(
     now: i64,
     max_body: usize,
 ) -> rusqlite::Result<Result<Vec<u8>, ErrorBody>> {
+    late_results_for_consumer(
+        conn,
+        custodian,
+        incarnation,
+        since,
+        limit,
+        now,
+        max_body,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn late_results_for_consumer(
+    conn: &Connection,
+    custodian: &str,
+    incarnation: &str,
+    since: Option<&Cursor>,
+    limit: Option<u32>,
+    now: i64,
+    max_body: usize,
+    held_updates: bool,
+) -> rusqlite::Result<Result<Vec<u8>, ErrorBody>> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let head = head_seq(&tx, custodian)?;
     if let Err(error) = check_since(incarnation, head, since) {
@@ -890,19 +985,25 @@ pub fn late_results(
         .min(LATE_RESULTS_PAGE_MAX) as usize;
     let rows = {
         let mut stmt = tx.prepare(
-            "SELECT carrier,call_key,seq FROM call_ledger
-             WHERE custodian=?1 AND seq>?2 AND late_entry IS NOT NULL ORDER BY seq LIMIT ?3",
+            "SELECT carrier,call_key,seq,0 FROM call_ledger
+             WHERE custodian=?1 AND seq>?2 AND late_entry IS NOT NULL
+             UNION ALL SELECT carrier,call_key,seq,1 FROM call_ledger_updates
+             WHERE ?4 AND custodian=?1 AND seq>?2 AND entry IS NOT NULL ORDER BY seq LIMIT ?3",
         )?;
         let rows = stmt
-            .query_map(params![custodian, since_seq, cap as i64 + 1], |r| {
-                Ok((
-                    Key {
-                        carrier: r.get(0)?,
-                        call_key: r.get(1)?,
-                    },
-                    r.get::<_, u64>(2)?,
-                ))
-            })?
+            .query_map(
+                params![custodian, since_seq, cap as i64 + 1, held_updates],
+                |r| {
+                    Ok((
+                        Key {
+                            carrier: r.get(0)?,
+                            call_key: r.get(1)?,
+                        },
+                        r.get::<_, u64>(2)?,
+                        r.get::<_, bool>(3)?,
+                    ))
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
@@ -918,7 +1019,34 @@ pub fn late_results(
     let mut size = overhead;
     let mut last = since_seq;
     let mut entries = Vec::new();
-    for (key, seq) in rows.into_iter().take(cap) {
+    for (key, seq, update) in rows.into_iter().take(cap) {
+        if update {
+            let (raw, effective_at): (String, i64) = tx.query_row("SELECT entry,settled_at FROM call_ledger_updates WHERE carrier=?1 AND call_key=?2 AND seq=?3", params![key.carrier,key.call_key,seq], |row| Ok((row.get(0)?,row.get(1)?)))?;
+            let update: cortexkit_role_tool_provider::late_results::LateEntry =
+                serde_json::from_str(&raw)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            update
+                .validate()
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            let entry = serde_json::to_value(update).expect("validated held update is JSON");
+            let len = serde_json::to_vec(&entry)
+                .expect("held entry is JSON")
+                .len();
+            if effective_at.saturating_add(RETENTION_MS) <= now || overhead + len > max_body {
+                tx.execute("UPDATE call_ledger_updates SET entry=NULL WHERE carrier=?1 AND call_key=?2 AND seq=?3", params![key.carrier,key.call_key,seq])?;
+                last = seq;
+                continue;
+            }
+            let added = len + usize::from(!entries.is_empty());
+            if size + added > max_body {
+                more = true;
+                break;
+            }
+            size += added;
+            last = seq;
+            entries.push(entry);
+            continue;
+        }
         let Some(mut row) = get(&tx, &key)? else {
             continue;
         };

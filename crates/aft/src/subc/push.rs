@@ -1968,6 +1968,7 @@ mod tests {
                 spawn_principal: AuthenticatedPrincipal::FirstParty,
                 consumer_elicitation_capable: false,
                 held_reply: false,
+                held_update: false,
                 tool_result_body: false,
                 disabled_tools: Arc::default(),
                 run_scope: OnceLock::new(),

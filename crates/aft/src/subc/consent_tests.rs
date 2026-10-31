@@ -6,6 +6,7 @@ mod program_approvals {
     use crate::db::call_ledger as ledger;
     use crate::subc::codemode::{self, Admission};
     include!("consent_running_tests.rs");
+    include!("consent_held_update_tests.rs");
 
     struct Controlled {
         fake: Arc<FakeCingulate>,
@@ -145,7 +146,13 @@ mod program_approvals {
             .unwrap();
         assert_eq!(reply.header.ty, FrameType::Response);
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
-        assert_eq!(body, json!({"content":[],"held":{"reason":"consent"}}));
+        let typed: cortexkit_role_tool_provider::result::ToolResult =
+            serde_json::from_value(body.clone()).unwrap();
+        cortexkit_role_tool_provider::result::validate(&typed).unwrap();
+        assert_eq!(
+            body,
+            json!({"content":[{"type":"text","text":""}],"held":{"reason":"consent"}})
+        );
     }
 
     async fn late(f: &Fixture, identity: &RouteIdentity, corr: u64) -> Value {
@@ -168,10 +175,10 @@ mod program_approvals {
         .await
         .unwrap_or_else(|_| {
             let db = f.ctx.db().unwrap();
-            let conn = db.lock().unwrap();
+            let row = ledger::get(&db.lock().unwrap(), &key).unwrap();
             panic!(
                 "one terminal late result is retained: row={:?}, tasks={:?}",
-                ledger::get(&conn, &key).unwrap(),
+                row,
                 f.ctx.bash_background().list(100)
             );
         });
@@ -842,6 +849,7 @@ fn identity(root: &Path, scope: Option<subc_protocol::scope::ScopeStamp>) -> Rou
         },
         consumer_elicitation_capable: false,
         held_reply: false,
+        held_update: false,
         tool_result_body: false,
         disabled_tools: Arc::new(vec![]),
         scope,
@@ -1087,7 +1095,9 @@ impl Fixture {
         if let Some(deadline) = self.deadlines.lock().unwrap().get(&corr) {
             body["deadline_ms"] = json!(deadline);
         }
-        if identity.run_owner.is_some() {
+        if identity.run_owner.is_some()
+            && !matches!(name, "tool.withdraw" | "late_results" | "late_results.ack")
+        {
             body["call_key"] = json!(format!("program-{corr}"));
         }
         let frame = Frame::build(

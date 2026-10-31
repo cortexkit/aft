@@ -1,5 +1,8 @@
 fn shell_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
-    crate::commands::bash::handle(&request, ctx)
+    // The lib-test executable cannot act as the external sandbox launcher.
+    // Exercise real process output delivered to scripted calls as late results,
+    // not OS confinement.
+    crate::sandbox_spawn::with_worker_jail(false, || crate::commands::bash::handle(&request, ctx))
 }
 
 async fn task_for(f: &Fixture, run: &RouteIdentity, corr: u64) -> String {
@@ -92,7 +95,7 @@ async fn program_reply_window_hands_off_running_output_to_one_late_result() {
     let body: Value = serde_json::from_slice(&reply.body).unwrap();
     assert_eq!(
         body,
-        json!({"content":[],"held":{"reason":"running","detail":{"task_id":task}}})
+        json!({"content":[{"type":"text","text":""}],"held":{"reason":"running","detail":{"task_id":task}}})
     );
     std::fs::write(release, "go").unwrap();
     let result = late(&f, &run, 9090).await;
@@ -149,7 +152,7 @@ async fn program_running_hold_survives_drain_and_finishes_once_for_head_and_work
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(
             body,
-            json!({"content":[],"held":{"reason":"running","detail":{"task_id":task}}})
+            json!({"content":[{"type":"text","text":""}],"held":{"reason":"running","detail":{"task_id":task}}})
         );
         let key = tool_provider::LedgerEdge::key(&run, "program-9100");
         let db = f.ctx.db().unwrap();
@@ -247,7 +250,7 @@ async fn running_hold_restart_unknown_and_withdraw_are_honest() {
     assert_eq!(entry["kind"], "result");
     assert_eq!(
         entry["result"],
-        json!({"content":[],"isError":true,"errorCode":"outcome_unknown"})
+        json!({"content":[{"type":"text","text":""}],"isError":true,"errorCode":"outcome_unknown"})
     );
     let answer = f
         .checkout_tool(
@@ -267,7 +270,9 @@ async fn running_hold_restart_unknown_and_withdraw_are_honest() {
         .info
         .status
         .is_terminal());
-    assert_eq!(late(&f, &run, 9110).await["isError"], true);
+    let terminal = late(&f, &run, 9110).await;
+    assert_ne!(terminal["structuredContent"]["status"], "running");
+    assert_ne!(terminal["structuredContent"]["exit_code"], 0);
 }
 
 #[tokio::test]
@@ -318,7 +323,8 @@ async fn approved_running_command_does_not_spend_the_permission_allowance() {
     f.ctx
         .update_config(|config| config.sandbox.profile.head = crate::config::SandboxMode::Off);
     let controlled = Controlled::install(f.fake.clone());
-    let run = program(&f, false, "run:approved-long");
+    let mut run = program(&f, false, "run:approved-long");
+    Arc::get_mut(&mut run.0).unwrap().held_update = true;
     let (command, release) = gated_command(&run.project_root);
     let (writer, mut replies) = f
         .send_tool_with_writer(
@@ -333,6 +339,8 @@ async fn approved_running_command_does_not_spend_the_permission_allowance() {
     let request = controlled.request(0).await;
     controlled.answer(&request, "allow_once");
     let task = task_for(&f, &run, 9130).await;
+    let updates: u64 = f.ctx.db().unwrap().lock().unwrap().query_row("SELECT count(*) FROM call_ledger_updates WHERE call_key='program-9130' AND json_extract(entry,'$.held.reason')='running'", [], |row| row.get(0)).unwrap();
+    assert_eq!(updates, 1);
     let _kill = KillTask(f.ctx.bash_background().clone(), task, run.session.clone());
     run.run_scope
         .get()
