@@ -8,9 +8,10 @@
 //! and the family limit then refused a second checkout at the same commit.
 //!
 //! Only macOS can say what a file holds alone without opening it. Linux
-//! reports shared extents only through `FIEMAP`, which needs a descriptor, and
-//! opening then closing a descriptor on a database this process has open
-//! releases SQLite's locks on it. So elsewhere the `stat` charge stands.
+//! reports which of a file's extents are shared only through the `FIEMAP`
+//! ioctl, an extent-map query issued on an open file descriptor, and opening
+//! then closing a descriptor on a database this process has open releases
+//! SQLite's locks on it. So elsewhere the `stat` charge stands.
 
 use std::path::Path;
 
