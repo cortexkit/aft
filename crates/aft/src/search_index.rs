@@ -7105,6 +7105,13 @@ fn project_walk_admits_entry(
         return false;
     }
     let name = entry.file_name().to_string_lossy();
+    // Git never tracks a path named `.git`. As a directory it is a repository's
+    // own data; as a file it is a linked worktree's or submodule's pointer to
+    // that data, holding an absolute path that differs per checkout. Neither is
+    // project content, so both are skipped whatever their type.
+    if name == ".git" {
+        return false;
+    }
     if file_type.as_ref().is_some_and(std::fs::FileType::is_dir) {
         return !matches!(
             name.as_ref(),
