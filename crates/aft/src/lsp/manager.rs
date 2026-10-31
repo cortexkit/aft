@@ -23,7 +23,7 @@ use crate::lsp::client::{
 use crate::lsp::diagnostics::{
     from_lsp_diagnostics, DiagnosticEntry, DiagnosticsStore, StoredDiagnostic,
 };
-use crate::lsp::document::{DiskSnapshot, DocumentEntry, DocumentStore};
+use crate::lsp::document::{file_content_hash, DiskSnapshot, DocumentEntry, DocumentStore};
 use crate::lsp::position::{uri_for_path, uri_to_path};
 use crate::lsp::pull_params::{
     AftDocumentDiagnosticParams, AftWorkspaceDiagnosticParams, AftWorkspaceDiagnosticRequest,
@@ -418,6 +418,7 @@ impl<'a> ApplicabilityTopologyCheck<'a> {
 #[derive(Clone, Debug)]
 pub enum ApplicabilityResolutionError {
     RootUnreadable { root: PathBuf, reason: String },
+    EntryLimitReached { root: PathBuf, entries: usize },
     RequestDeadline { root: PathBuf },
 }
 
@@ -445,6 +446,8 @@ pub struct ApplicableServerStartOutcomes {
 
 pub const START_IN_PROGRESS_STATUS: &str = "start_in_progress";
 pub const START_IN_PROGRESS_REASON: &str = "server startup is in progress; retry shortly";
+
+const FILE_SERVER_RESTART_ATTEMPTS: usize = 3;
 pub const STARTUP_NOTIFICATION_PATH_CAP: usize = 8_192;
 pub const STARTUP_NOTIFICATION_QUEUE_FULL: &str =
     "language-server startup notification queue is full; retry the file change";
@@ -507,12 +510,12 @@ impl EnsureServerOutcomes {
 /// `diagnostics` only contains entries from servers that proved freshness.
 /// `accepted_snapshots` preserves that same result per producer and document
 /// version so alert consumers never infer a partition from flattened output.
-/// Pre-edit cached entries and unversioned reports are NEVER included.
+/// Pre-edit cached entries and reports without a current-content proof are never included.
 #[derive(Debug, Clone, Default)]
 pub struct PostEditWaitOutcome {
     /// Complete, per-producer accepted snapshots. This includes a snapshot
     /// with an empty diagnostics list when a live server authoritatively found
-    /// the edited document clean; pending, exited, warming, and unversioned
+    /// the edited document clean; pending, exited, warming, and uncertified
     /// producers do not appear here.
     pub accepted_snapshots: Vec<AcceptedDiagnosticSnapshot>,
     /// Authoritative diagnostics flattened only for the legacy response body.
@@ -556,10 +559,9 @@ pub fn post_edit_entry_is_fresh(
 
     match entry.version {
         Some(version) => version >= target_version,
-        // Unversioned publishDiagnostics payloads cannot prove which document
-        // state they describe. Epoch advancement only proves arrival order; an
-        // old analysis result can still arrive after our pre-snapshot. Treat as
-        // pending/partial rather than fresh.
+        // Ingestion has not bound this report to a synchronized version.
+        // Advancing a store epoch while draining a queued publication cannot
+        // substitute for a reader-ordered content proof.
         None => false,
     }
 }
@@ -691,8 +693,21 @@ where
     let deadline = timeout.map(|timeout| Instant::now() + timeout);
     // Start any missing server without the lock; the pulls below then only
     // open the document and send the requests under it.
-    start_servers_for_file_unlocked(&lock, file_path, config);
-    let pulls = lock().begin_file_pulls(file_path, config, deadline)?;
+    let mut pulls = None;
+    for _ in 0..FILE_SERVER_RESTART_ATTEMPTS {
+        let opened = ensure_file_open_unlocked(&lock, file_path, config)?;
+        let mut manager = lock();
+        if opened
+            .server_keys
+            .iter()
+            .any(|key| !manager.clients.contains_key(key))
+        {
+            continue;
+        }
+        pulls = Some(manager.begin_file_pulls(file_path, config, deadline)?);
+        break;
+    }
+    let pulls = pulls.ok_or_else(|| LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()))?;
     // All requests are in flight at once; wait for each without the lock.
     let replies = pulls
         .into_iter()
@@ -751,7 +766,8 @@ where
 }
 
 /// Send an interactive request (hover, definition, references, rename) to the
-/// running server that owns `file_path` and wait for its reply.
+/// server that owns `file_path` and wait for its reply, restarting it if idle
+/// reaping detached it after the caller's startup check.
 ///
 /// The manager lock is held only to find the client and write the request.
 /// The wait for the reply, up to eight seconds on a busy server, runs without
@@ -773,6 +789,13 @@ where
 {
     let started = {
         let mut lsp = lock();
+        if lsp.client_for_file(file_path, config).is_none() {
+            drop(lsp);
+            if let Err(err) = ensure_file_open_unlocked(&lock, file_path, config) {
+                return Some(Err(err));
+            }
+            lsp = lock();
+        }
         let client = lsp.client_for_file_mut(file_path, config)?;
         client.start_request::<R>(params)
     };
@@ -1107,6 +1130,7 @@ pub struct LspManager {
     /// notifications are skipped because the capability is absent.
     watched_file_skip_logged: HashSet<ServerKey>,
     pending_watched_changes: HashMap<ServerKey, PendingWatchedChanges>,
+    watched_lifecycle: HashMap<ServerKey, WatchedLifecycleCache>,
     /// rust-analyzer instances with a workspace reload running on a helper
     /// thread because the file watcher saw a Cargo manifest change (see
     /// [`spawn_watcher_rust_workspace_reload`]). The value collects the
@@ -1340,7 +1364,7 @@ fn next_transient_backoff(previous: Option<Duration>) -> Duration {
 
 /// A retry delay in whole seconds, rounded up so a pending retry never reads
 /// as "after 0s": `45s`, `2m`, `4m 30s`.
-fn format_retry_delay(delay: Duration) -> String {
+pub(crate) fn format_retry_delay(delay: Duration) -> String {
     let seconds = delay.as_secs() + u64::from(delay.subsec_nanos() > 0);
     match (seconds / 60, seconds % 60) {
         (0, seconds) => format!("{seconds}s"),
@@ -1387,6 +1411,7 @@ impl LspManager {
             transient_backoff: HashMap::new(),
             watched_file_skip_logged: HashSet::new(),
             pending_watched_changes: HashMap::new(),
+            watched_lifecycle: HashMap::new(),
             watcher_rust_reloads: HashMap::new(),
             #[cfg(windows)]
             last_watched_file_notification_trace: "no watched-file notification attempted"
@@ -1509,6 +1534,7 @@ impl LspManager {
         }
         let _ = self.event_tx.send(ReceivedLspEvent {
             instance: self.clients.get(key).map(|client| client.instance),
+            receive_order: None,
             event: LspEvent::DocumentDiagnosticsPulled {
                 server_kind: key.kind.clone(),
                 root: key.root.clone(),
@@ -2213,7 +2239,7 @@ impl LspManager {
         key: &ServerKey,
         path: &Path,
     ) -> Result<i32, LspError> {
-        self.mark_pulled_report_stale(key, path);
+        self.invalidate_diagnostic_content(key, path);
         let reservation = self
             .starting
             .get_mut(key)
@@ -2414,11 +2440,10 @@ impl LspManager {
         key: &ServerKey,
         failure: StartFailure,
     ) -> ServerAttemptResult {
-        slog_error!("failed to spawn {}: {}", def.name, failure.error);
+        log_spawn_failure(def, key, &failure.error, self.retry_clock.now());
         let result = classify_spawn_error(&def.binary, &failure.error);
-        // Remember the failure so subsequent file events skip this
-        // (kind, root) pair instead of producing a fresh spawn attempt +
-        // ERROR log per request.
+        // Remember executable failures so subsequent file events skip this
+        // (kind, root) pair. Capacity refusals remain eligible on the next request.
         self.record_failed_spawn(key, result, failure.durability)
     }
 
@@ -2637,26 +2662,34 @@ impl LspManager {
                 .is_some_and(|store| store.is_open(&canonical_path));
 
             if !already_open {
+                self.invalidate_diagnostic_content(key, &canonical_path);
+                let version = self
+                    .documents
+                    .get(key)
+                    .map_or(0, DocumentStore::next_open_version);
                 let content = initial_content
                     .as_ref()
                     .expect("content is loaded when any server needs didOpen");
                 let (send_result, sent) = if let Some(client) = self.clients.get_mut(key) {
                     (
-                        client.send_notification::<DidOpenTextDocument>(
-                            DidOpenTextDocumentParams {
-                                text_document: TextDocumentItem::new(
-                                    uri.clone(),
-                                    language_id.clone(),
-                                    0,
-                                    content.clone(),
-                                ),
-                            },
-                        ),
+                        client
+                            .send_notification_ordered::<DidOpenTextDocument>(
+                                DidOpenTextDocumentParams {
+                                    text_document: TextDocumentItem::new(
+                                        uri.clone(),
+                                        language_id.clone(),
+                                        version,
+                                        content.clone(),
+                                    ),
+                                },
+                            )
+                            .map(Some),
                         true,
                     )
                 } else {
-                    (Ok(()), false)
+                    (Ok(None), false)
                 };
+                let sync_order = send_result.as_ref().ok().copied().flatten();
                 if let Err(err) = send_result {
                     if matches!(err, LspError::Timeout(_)) {
                         // The writer owns the queued frame and can finish it
@@ -2670,12 +2703,13 @@ impl LspManager {
                     return Err(err);
                 }
                 if sent {
-                    log_did_open_sent(key, &canonical_path, &language_id);
+                    log_did_open_sent(key, &canonical_path, &language_id, version);
                 }
-                self.documents
-                    .entry(key.clone())
-                    .or_default()
-                    .open_with(canonical_path.clone(), &disk);
+                self.documents.entry(key.clone()).or_default().open_with(
+                    canonical_path.clone(),
+                    &DiskSnapshot::for_content(&canonical_path, content)
+                        .with_sync_order(sync_order),
+                );
                 newly_opened.push(key.clone());
                 continue;
             }
@@ -2694,6 +2728,7 @@ impl LspManager {
                 .get(key)
                 .is_some_and(|store| store.is_stale_against(&canonical_path, &disk));
             if drifted {
+                self.invalidate_diagnostic_content(key, &canonical_path);
                 if drift_content.is_none() {
                     match std::fs::read_to_string(&canonical_path) {
                         Ok(content) => drift_content = Some(content),
@@ -2716,11 +2751,14 @@ impl LspManager {
                     // `didSave`, so without it the compiler errors it
                     // reports keep describing the old contents.
                     client
-                        .send_full_did_change(&uri, next_version, content)
-                        .and_then(|()| send_did_save(client, &uri, content))
+                        .send_full_did_change_ordered(&uri, next_version, content)
+                        .and_then(|order| {
+                            send_did_save(client, &uri, content).map(|()| Some(order))
+                        })
                 } else {
-                    Ok(())
+                    Ok(None)
                 };
+                let sync_order = send_result.as_ref().ok().copied().flatten();
                 if let Err(err) = send_result {
                     if let Some(store) = self.documents.get_mut(key) {
                         // A timed-out write may arrive later. Reserve its
@@ -2731,7 +2769,11 @@ impl LspManager {
                     return Err(err);
                 }
                 if let Some(store) = self.documents.get_mut(key) {
-                    store.bump_version_with(&canonical_path, &disk);
+                    store.bump_version_with(
+                        &canonical_path,
+                        &DiskSnapshot::for_content(&canonical_path, content)
+                            .with_sync_order(sync_order),
+                    );
                 }
             }
         }
@@ -2850,7 +2892,7 @@ impl LspManager {
 
         let mut versions: Vec<(ServerKey, i32)> = Vec::with_capacity(server_keys.len());
         // Read once for every server's store (see `ensure_file_open`).
-        let disk = DiskSnapshot::read(&canonical_path);
+        let disk = DiskSnapshot::for_content(&canonical_path, content);
 
         for key in server_keys {
             if self.starting.contains_key(&key) {
@@ -2858,12 +2900,8 @@ impl LspManager {
                 versions.push((key, version));
                 continue;
             }
-            // The server is about to hold text its pulled report may not
-            // describe. A pull-only server publishes nothing after the
-            // change, so without this a scoped inspect would keep certifying
-            // the old report for a document that is open (see
-            // `sweep_scoped_files`).
-            self.mark_pulled_report_stale(&key, &canonical_path);
+            // Both pushed and pulled reports lose authority before text sync.
+            self.invalidate_diagnostic_content(&key, &canonical_path);
             let current_version = self
                 .documents
                 .get(&key)
@@ -2871,13 +2909,15 @@ impl LspManager {
 
             if let Some(version) = current_version {
                 let next_version = version + 1;
+                let mut sync_order = None;
                 if let Some(client) = self.clients.get_mut(&key) {
-                    let send = client.send_full_did_change(&uri, next_version, content)
+                    let send = client.send_full_did_change_ordered(&uri, next_version, content)
                     // AFT has written this content to disk: tell the server
                     // it was saved. rust-analyzer re-runs `cargo check` only
                     // on `didSave`, so without it the compiler errors it
                     // reports keep describing the file before the edit.
-                        .and_then(|()| send_did_save(client, &uri, content));
+                        .and_then(|order| send_did_save(client, &uri, content).map(|()| order));
+                    sync_order = send.as_ref().ok().copied();
                     if let Err(err) = send {
                         if let Some(store) = self.documents.get_mut(&key) {
                             store.bump_version_with(&canonical_path, &DiskSnapshot::default());
@@ -2886,23 +2926,33 @@ impl LspManager {
                     }
                 }
                 if let Some(store) = self.documents.get_mut(&key) {
-                    store.bump_version_with(&canonical_path, &disk);
+                    store.bump_version_with(
+                        &canonical_path,
+                        &disk.clone().with_sync_order(sync_order),
+                    );
                 }
                 self.queue_background_document_pull(&key, &canonical_path);
                 versions.push((key, next_version));
                 continue;
             }
 
+            let version = self
+                .documents
+                .get(&key)
+                .map_or(0, DocumentStore::next_open_version);
+            let mut sync_order = None;
             if let Some(client) = self.clients.get_mut(&key) {
-                let send =
-                    client.send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+                let send = client.send_notification_ordered::<DidOpenTextDocument>(
+                    DidOpenTextDocumentParams {
                         text_document: TextDocumentItem::new(
                             uri.clone(),
                             language_id.clone(),
-                            0,
+                            version,
                             content.to_string(),
                         ),
-                    });
+                    },
+                );
+                sync_order = send.as_ref().ok().copied();
                 if let Err(err) = send {
                     if matches!(err, LspError::Timeout(_)) {
                         self.documents
@@ -2912,7 +2962,7 @@ impl LspManager {
                     }
                     return Err(err);
                 }
-                log_did_open_sent(&key, &canonical_path, &language_id);
+                log_did_open_sent(&key, &canonical_path, &language_id, version);
                 // The content was just written to disk: tell the server it
                 // was saved, so rust-analyzer re-runs `cargo check`.
                 if let Err(err) = send_did_save(client, &uri, content) {
@@ -2923,31 +2973,15 @@ impl LspManager {
                     return Err(err);
                 }
             }
-            self.documents
-                .entry(key.clone())
-                .or_default()
-                .open_with(canonical_path.clone(), &disk);
-            // didOpen carries version 0 — that's the version the server
-            // will echo on its first publishDiagnostics for this document.
+            self.documents.entry(key.clone()).or_default().open_with(
+                canonical_path.clone(),
+                &disk.clone().with_sync_order(sync_order),
+            );
             self.queue_background_document_pull(&key, &canonical_path);
-            versions.push((key, 0));
+            versions.push((key, version));
         }
 
         Ok(versions)
-    }
-
-    /// Mark `key`'s stored report for `file` stale when it came from a
-    /// document pull. Pushed reports are left alone: their server publishes
-    /// again after the change and replaces them.
-    fn mark_pulled_report_stale(&mut self, key: &ServerKey, file: &Path) {
-        let pulled = self
-            .diagnostics
-            .entries_for_file(file)
-            .into_iter()
-            .any(|(stored_key, entry)| stored_key == key && entry.from_document_pull);
-        if pulled {
-            self.diagnostics.mark_stale_for_server_file(key, file);
-        }
     }
 
     /// Bring a document that is open in `server_keys` up to date with the file
@@ -2987,8 +3021,7 @@ impl LspManager {
         // (`mark_diagnostics_stale_for_file`). A push server publishes again
         // after the change below; a pull server is asked again.
         for key in &drifted {
-            self.diagnostics
-                .mark_stale_for_server_file(key, &canonical_path);
+            self.invalidate_diagnostic_content(key, &canonical_path);
         }
         std::fs::read_to_string(&canonical_path)
             .map_err(LspError::Io)
@@ -3051,6 +3084,7 @@ impl LspManager {
         kind: FileChangeType,
         raw: Option<PathBuf>,
         extra_config_markers: Vec<String>,
+        stamp: Option<WatchedFileStamp>,
     ) -> Result<(), LspError> {
         let pid = self.clients.get(key).map(LspClient::child_pid);
         let pending = self
@@ -3083,6 +3117,7 @@ impl LspManager {
                 kind,
                 raw,
                 extra_config_markers,
+                stamp,
             },
         );
         Ok(())
@@ -3119,21 +3154,28 @@ impl LspManager {
                 continue;
             }
             let mut direct = Vec::new();
+            let mut stamps = WatchedFileStamps::new();
             let mut forwarded: HashMap<Vec<String>, Vec<(PathBuf, FileChangeType)>> =
                 HashMap::new();
             for (path, change) in pending.changes {
                 if let Some(raw) = change.raw {
+                    if let Some(stamp) = change.stamp {
+                        stamps.insert(raw.clone(), stamp);
+                    }
                     forwarded
                         .entry(change.extra_config_markers)
                         .or_default()
                         .push((raw, change.kind));
                 } else {
+                    if let Some(stamp) = change.stamp {
+                        stamps.insert(path.clone(), stamp);
+                    }
                     direct.push((path, change.kind));
                 }
             }
             if !direct.is_empty() {
                 if let Err(error) =
-                    self.notify_files_watched_changed_for_server(&direct, Some(&key))
+                    self.notify_files_watched_changed_for_server(&direct, Some(&key), &stamps)
                 {
                     crate::slog_warn!("queued watched-file sync failed for {key:?}: {error}");
                 }
@@ -3143,6 +3185,7 @@ impl LspManager {
                     &changes,
                     &markers,
                     Some(&key),
+                    &stamps,
                 ));
             }
         }
@@ -3158,13 +3201,22 @@ impl LspManager {
         paths: &[(PathBuf, FileChangeType)],
         _config: &Config,
     ) -> Result<(), LspError> {
-        self.notify_files_watched_changed_for_server(paths, None)
+        self.notify_files_watched_changed_with_stamps(paths, &WatchedFileStamps::new())
+    }
+
+    pub(crate) fn notify_files_watched_changed_with_stamps(
+        &mut self,
+        paths: &[(PathBuf, FileChangeType)],
+        stamps: &WatchedFileStamps,
+    ) -> Result<(), LspError> {
+        self.notify_files_watched_changed_for_server(paths, None, stamps)
     }
 
     fn notify_files_watched_changed_for_server(
         &mut self,
         paths: &[(PathBuf, FileChangeType)],
         only_server: Option<&ServerKey>,
+        stamps: &WatchedFileStamps,
     ) -> Result<(), LspError> {
         if self.is_quiesced() {
             return Err(LspError::ProjectClosed);
@@ -3185,8 +3237,12 @@ impl LspManager {
         }
 
         let mut canonical_events = Vec::with_capacity(paths.len());
+        let mut canonical_stamps = WatchedFileStamps::new();
         for (path, typ) in paths {
             let canonical_path = resolve_for_lsp_uri(path);
+            if let Some(stamp) = stamps.get(path) {
+                canonical_stamps.insert(canonical_path.clone(), *stamp);
+            }
             canonical_events.push((canonical_path, *typ));
         }
         #[cfg(windows)]
@@ -3215,9 +3271,14 @@ impl LspManager {
             {
                 for (path, typ) in &canonical_events {
                     if path.starts_with(&key.root) {
-                        if let Err(error) =
-                            self.queue_watched_change(&key, path.clone(), *typ, None, Vec::new())
-                        {
+                        if let Err(error) = self.queue_watched_change(
+                            &key,
+                            path.clone(),
+                            *typ,
+                            None,
+                            Vec::new(),
+                            canonical_stamps.get(path).copied(),
+                        ) {
                             first_error.get_or_insert(error);
                         }
                     }
@@ -3283,6 +3344,18 @@ impl LspManager {
                 if let Err(error) = send_result {
                     log::warn!("watched-file notification failed for {key:?}: {error}");
                     first_error.get_or_insert(error);
+                } else {
+                    let delivered = self.watched_lifecycle.entry(key.clone()).or_default();
+                    for (path, kind) in &canonical_events {
+                        if path.starts_with(&key.root) && *kind != FileChangeType::CHANGED {
+                            delivered.remember(
+                                path.clone(),
+                                *kind,
+                                canonical_stamps.get(path).copied(),
+                                Instant::now(),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -3330,7 +3403,20 @@ impl LspManager {
         events: &[(PathBuf, FileChangeType)],
         extra_config_markers: &[String],
     ) -> Vec<(ServerKey, Vec<PathBuf>)> {
-        self.forward_watcher_file_events_for_server(events, extra_config_markers, None)
+        self.forward_watcher_file_events_with_stamps(
+            events,
+            extra_config_markers,
+            &WatchedFileStamps::new(),
+        )
+    }
+
+    pub(crate) fn forward_watcher_file_events_with_stamps(
+        &mut self,
+        events: &[(PathBuf, FileChangeType)],
+        extra_config_markers: &[String],
+        stamps: &WatchedFileStamps,
+    ) -> Vec<(ServerKey, Vec<PathBuf>)> {
+        self.forward_watcher_file_events_for_server(events, extra_config_markers, None, stamps)
     }
 
     fn forward_watcher_file_events_for_server(
@@ -3338,6 +3424,7 @@ impl LspManager {
         events: &[(PathBuf, FileChangeType)],
         extra_config_markers: &[String],
         only_server: Option<&ServerKey>,
+        stamps: &WatchedFileStamps,
     ) -> Vec<(ServerKey, Vec<PathBuf>)> {
         let mut rust_manifest_changes = Vec::new();
         if self.is_quiesced() {
@@ -3367,10 +3454,38 @@ impl LspManager {
             .into_iter()
             .collect();
         for key in keys {
+            // A create after a delete, or a delete after a create, clears the
+            // earlier event even when the server subscribed to only one kind.
+            if let Some(previous) = self.watched_lifecycle.get_mut(&key) {
+                for (raw, path, kind) in &events {
+                    if *kind != FileChangeType::CHANGED
+                        && (path.starts_with(&key.root) || raw.starts_with(&key.root))
+                        && previous
+                            .entries
+                            .get(path)
+                            .is_some_and(|last| last.kind != *kind)
+                    {
+                        previous.remove(path);
+                    }
+                }
+            }
             let in_root: Vec<&(&Path, PathBuf, FileChangeType)> = events
                 .iter()
                 .filter(|(raw, resolved, _)| {
                     resolved.starts_with(&key.root) || raw.starts_with(&key.root)
+                })
+                .filter(|(raw, resolved, kind)| {
+                    !self
+                        .watched_lifecycle
+                        .get_mut(&key)
+                        .is_some_and(|previous| {
+                            previous.absorb_echo(
+                                resolved,
+                                *kind,
+                                stamps.get(*raw).copied(),
+                                Instant::now(),
+                            )
+                        })
                 })
                 .collect();
             if in_root.is_empty() {
@@ -3401,6 +3516,7 @@ impl LspManager {
                         *typ,
                         Some(raw.to_path_buf()),
                         extra_config_markers.to_vec(),
+                        stamps.get(*raw).copied(),
                     ) {
                         crate::slog_warn!(
                             "queued watched-file forward failed for {key:?}: {error}"
@@ -3463,11 +3579,25 @@ impl LspManager {
                             )
                         });
                         match sent {
-                            Some(Ok(())) if watchers.is_some() => {
-                                sent_to_registered_watcher = selected
-                                    .iter()
-                                    .map(|(_, resolved, _)| resolved.clone())
-                                    .collect();
+                            Some(Ok(())) => {
+                                let delivered =
+                                    self.watched_lifecycle.entry(key.clone()).or_default();
+                                for (raw, path, kind) in &selected {
+                                    if *kind != FileChangeType::CHANGED {
+                                        delivered.remember(
+                                            path.clone(),
+                                            *kind,
+                                            stamps.get(*raw).copied(),
+                                            Instant::now(),
+                                        );
+                                    }
+                                }
+                                if watchers.is_some() {
+                                    sent_to_registered_watcher = selected
+                                        .iter()
+                                        .map(|(_, resolved, _)| resolved.clone())
+                                        .collect();
+                                }
                             }
                             Some(Err(error)) => {
                                 crate::slog_warn!(
@@ -3705,28 +3835,36 @@ impl LspManager {
         let content = std::fs::read_to_string(&canonical_path).map_err(LspError::Io)?;
         let mut opened = Vec::with_capacity(targets.len());
         for key in targets {
+            self.invalidate_diagnostic_content(&key, &canonical_path);
+            let version = self
+                .documents
+                .get(&key)
+                .map_or(0, DocumentStore::next_open_version);
             let Some(client) = self.clients.get_mut(&key) else {
                 continue;
             };
-            let sent = client.send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-                text_document: TextDocumentItem::new(
-                    uri.clone(),
-                    language_id.clone(),
-                    0,
-                    content.clone(),
-                ),
-            });
+            let sent = client.send_notification_ordered::<DidOpenTextDocument>(
+                DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem::new(
+                        uri.clone(),
+                        language_id.clone(),
+                        version,
+                        content.clone(),
+                    ),
+                },
+            );
+            let sync_order = sent.as_ref().ok().copied();
             if let Err(err) = sent {
                 // Leave no half-opened set behind: the caller only closes what
                 // this call reports as opened.
                 let _ = self.close_inspect_documents(&canonical_path, &opened);
                 return Err(err);
             }
-            log_did_open_sent(&key, &canonical_path, &language_id);
-            self.documents
-                .entry(key.clone())
-                .or_default()
-                .open(canonical_path.clone());
+            log_did_open_sent(&key, &canonical_path, &language_id, version);
+            self.documents.entry(key.clone()).or_default().open_with(
+                canonical_path.clone(),
+                &DiskSnapshot::for_content(&canonical_path, &content).with_sync_order(sync_order),
+            );
             self.reopen_inspect_closed_document(&key, &canonical_path);
             opened.push(key);
         }
@@ -3866,14 +4004,15 @@ impl LspManager {
             .get(&(server_key.clone(), lookup_path.clone()))
             .cloned()
             .unwrap_or_default();
-        let (result_id, version) = self
+        let (result_id, version, content_hash) = self
             .diagnostics
             .entries_for_file(&lookup_path)
             .into_iter()
             .find_map(|(key, entry)| {
-                (key == server_key).then(|| (entry.result_id.clone(), entry.version))
+                (key == server_key)
+                    .then(|| (entry.result_id.clone(), entry.version, entry.content_hash))
             })
-            .unwrap_or((None, None));
+            .unwrap_or((None, None, None));
         let merged = union_of_diagnostics(pulled.clone(), pushed);
         self.latest_pull_for_rust
             .insert((server_key.clone(), lookup_path.clone()), pulled);
@@ -3883,12 +4022,20 @@ impl LspManager {
             .is_some_and(|client| client.diagnostics_are_provisional());
         self.diagnostics.publish_full_with_provisional(
             server_key.clone(),
-            lookup_path,
+            lookup_path.clone(),
             merged,
             result_id,
             version,
             provisional,
         );
+        self.diagnostics
+            .certify_content(server_key, &lookup_path, content_hash);
+        self.diagnostics
+            .mark_document_pull(server_key, &lookup_path);
+        if content_hash.is_none() {
+            self.diagnostics
+                .mark_stale_for_server_file(server_key, &lookup_path);
+        }
     }
 
     /// Whether a document is open in this server's document store.
@@ -4138,6 +4285,10 @@ impl LspManager {
         max_events: usize,
         preserve_pull_observations: bool,
     ) -> DrainedLspEvents {
+        let now = Instant::now();
+        for cache in self.watched_lifecycle.values_mut() {
+            cache.expire(now);
+        }
         self.publish_completed_starts();
         let mut events = Vec::new();
         let mut instances = Vec::new();
@@ -4337,6 +4488,35 @@ impl LspManager {
         &mut self.diagnostics
     }
 
+    #[cfg(test)]
+    pub(crate) fn sync_document_version_for_test(
+        &mut self,
+        key: &ServerKey,
+        file: &Path,
+        version: i32,
+    ) {
+        self.documents
+            .entry(key.clone())
+            .or_default()
+            .sync_at_version(file.to_path_buf(), version, &DiskSnapshot::read(file));
+    }
+
+    /// Certify a synthetic test report against fixture content. Real reports
+    /// must instead prove their synchronized version at ingestion.
+    #[doc(hidden)]
+    pub fn certify_diagnostic_content_for_test(&mut self, file: &Path) {
+        let keys = self
+            .diagnostics
+            .entries_for_file(file)
+            .into_iter()
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.diagnostics
+                .certify_content(&key, file, file_content_hash(file));
+        }
+    }
+
     /// Test-only: record that server discovery found no applicable language
     /// servers for the project. Fixtures that publish reports straight into the
     /// diagnostics store, without configure's discovery walk, use this so their
@@ -4517,8 +4697,9 @@ impl LspManager {
     ///
     /// File-mode `lsp_diagnostics` uses this for push-only fallback after it
     /// has synced/opened the document. Versioned publishes are accepted when
-    /// they match the current document version; unversioned publishes are not
-    /// accepted as fresh because epoch/wall-clock ordering alone is racy.
+    /// they match the current document version. Unversioned pushes need the
+    /// reader-order and content-hash proof established at ingestion; store
+    /// epochs and wall-clock ordering alone are insufficient.
     pub fn diagnostic_entry_is_fresh_for_document(
         &self,
         file_path: &Path,
@@ -4535,7 +4716,7 @@ impl LspManager {
             return false;
         };
 
-        if entry.stale {
+        if !self.report_matches_current_content(server_key, &lookup_path, entry) {
             return false;
         }
 
@@ -4601,9 +4782,10 @@ impl LspManager {
         }
 
         for (key, target_version) in &wait.expected_versions {
-            if wait.fresh.contains_key(key) || wait.exited.contains(key) {
+            if wait.exited.contains(key) {
                 continue;
             }
+            wait.fresh.remove(key);
             if !self.clients.contains_key(key) {
                 // A start still in flight has no client yet. It is pending,
                 // not exited; releasing its reservation wakes this waiter.
@@ -4626,6 +4808,9 @@ impl LspManager {
                 .find_map(|(stored_key, entry)| (stored_key == key).then_some(entry))
             {
                 let pre = wait.pre_snapshot.get(key).copied().unwrap_or_default();
+                if !self.report_matches_current_content(key, &wait.lookup_path, entry) {
+                    continue;
+                }
                 if let Some(diagnostics) =
                     Self::authoritative_post_edit_diagnostics(entry, *target_version, pre)
                 {
@@ -4653,9 +4838,19 @@ impl LspManager {
 
     pub(crate) fn finish_post_edit_diagnostics_wait(
         &mut self,
-        wait: PostEditDiagnosticsWait,
+        mut wait: PostEditDiagnosticsWait,
     ) -> PostEditWaitOutcome {
         self.post_edit_waiters.remove(&wait.waiter_id);
+        wait.fresh.retain(|key, diagnostics| {
+            self.diagnostics
+                .entries_for_file(&wait.lookup_path)
+                .into_iter()
+                .any(|(stored, entry)| {
+                    stored == key
+                        && self.report_matches_current_content(key, &wait.lookup_path, entry)
+                        && entry.diagnostics == *diagnostics
+                })
+        });
         for (key, _) in &wait.expected_versions {
             if wait.fresh.contains_key(key) || wait.exited.contains(key) {
                 continue;
@@ -5139,7 +5334,10 @@ impl LspManager {
     pub(crate) fn finish_scoped_typescript_diagnostics(
         &self,
         reply: super::typescript_diagnostics::TypescriptDiagnosticsReply,
-    ) -> Result<Vec<StoredDiagnostic>, super::typescript_diagnostics::CertificationFailure> {
+    ) -> Result<
+        ([u8; 32], Vec<StoredDiagnostic>),
+        super::typescript_diagnostics::CertificationFailure,
+    > {
         let current = self.documents.get(&reply.key).is_some_and(|store| {
             reply.version.is_some()
                 && store.version(&reply.file) == reply.version
@@ -5148,7 +5346,13 @@ impl LspManager {
         if !current {
             return Err(super::typescript_diagnostics::CertificationFailure::DocumentChanged);
         }
-        reply.result
+        let hash = self
+            .documents
+            .get(&reply.key)
+            .and_then(|store| store.entry(&reply.file))
+            .and_then(|entry| entry.content_hash)
+            .ok_or(super::typescript_diagnostics::CertificationFailure::DocumentChanged)?;
+        reply.result.map(|diagnostics| (hash, diagnostics))
     }
 
     /// Store the reply of a pull started by [`Self::begin_file_pulls`] or
@@ -5177,6 +5381,14 @@ impl LspManager {
                 .get(&key)
                 .and_then(|store| store.entry(&canonical_path))
                 != document_snapshot.as_ref()
+            || document_snapshot
+                .as_ref()
+                .and_then(|document| document.content_hash)
+                .is_none()
+            || document_snapshot
+                .as_ref()
+                .and_then(|document| document.content_hash)
+                != file_content_hash(&canonical_path)
         {
             return PullFileOutcome::RequestFailed {
                 reason: "document_changed_while_pulling".into(),
@@ -5561,6 +5773,7 @@ impl LspManager {
                     self.diagnostics.mark_document_pull(key, canonical_path);
                     self.note_document_pull_completed(key, canonical_path);
                 }
+                self.certify_report_content(key, canonical_path, document_version);
                 PullFileOutcome::Full {
                     diagnostic_count: count,
                 }
@@ -5588,6 +5801,7 @@ impl LspManager {
                         self.diagnostics.mark_document_pull(key, canonical_path);
                         self.note_document_pull_completed(key, canonical_path);
                     }
+                    self.certify_report_content(key, canonical_path, document_version);
                     PullFileOutcome::Unchanged
                 } else {
                     PullFileOutcome::RequestFailed {
@@ -5612,6 +5826,54 @@ impl LspManager {
         clients
     }
 
+    /// Detach idle clients while holding the manager lock, before stopping them.
+    /// Requests either reserve a pending response first or find the key absent
+    /// and start a replacement; they cannot acquire a half-stopped client.
+    pub(crate) fn take_idle_clients(
+        &mut self,
+        now: Instant,
+        ttl: Duration,
+        root_idle: bool,
+    ) -> Vec<(ServerKey, LspClient)> {
+        let keys: Vec<_> = self
+            .clients
+            .iter()
+            .filter_map(|(key, client)| {
+                // Startup document replay writes through a cloned writer while
+                // its reservation exists, so it is not idle work to interrupt.
+                if self.starting.contains_key(key) {
+                    return None;
+                }
+                let idle = now.saturating_duration_since(client.last_used_at());
+                ((root_idle || idle >= ttl) && !client.has_pending_requests()).then(|| key.clone())
+            })
+            .collect();
+        let mut clients = Vec::with_capacity(keys.len());
+        for key in keys {
+            let client = self.clients.remove(&key).expect("selected idle client");
+            let idle = now.saturating_duration_since(client.last_used_at());
+            let package = key
+                .root
+                .file_name()
+                .unwrap_or(key.root.as_os_str())
+                .to_string_lossy();
+            slog_info!(
+                "idle lsp reap {} {package}: after {}m (ttl {}m)",
+                key.kind.id_str(),
+                idle.as_secs() / 60,
+                ttl.as_secs() / 60
+            );
+            self.forget_server_state(Some(&key));
+            self.pending_diagnostic_observations
+                .retain(|observation| observation.server_key != key);
+            clients.push((key, client));
+        }
+        if !clients.is_empty() {
+            self.clients_generation = self.clients_generation.wrapping_add(1);
+        }
+        clients
+    }
+
     /// Forget instance-owned state without changing start reservations or
     /// failure backoff. Those have their own generation and retry lifecycles.
     fn forget_server_state(&mut self, key: Option<&ServerKey>) {
@@ -5622,6 +5884,7 @@ impl LspManager {
         self.watched_file_skip_logged.retain(keep);
         self.pending_watched_changes
             .retain(|server, _| keep(server));
+        self.watched_lifecycle.retain(|server, _| keep(server));
         self.latest_push_for_pull_servers
             .retain(|(server, _), _| keep(server));
         self.latest_pull_for_rust
@@ -6010,7 +6273,9 @@ impl LspManager {
     pub(crate) fn authoritative_diagnostic_reports(
         &self,
     ) -> impl Iterator<Item = (&ServerKey, &Path, &[StoredDiagnostic])> {
-        self.diagnostics.authoritative_reports()
+        self.current_diagnostic_reports()
+            .filter(|(_, _, entry)| !entry.provisional)
+            .map(|(key, file, entry)| (key, file, entry.diagnostics.as_slice()))
     }
 
     pub fn get_all_diagnostics(&self) -> Vec<&StoredDiagnostic> {
@@ -6024,7 +6289,124 @@ impl LspManager {
     pub(crate) fn current_diagnostic_reports(
         &self,
     ) -> impl Iterator<Item = (&ServerKey, &Path, &DiagnosticEntry)> {
-        self.diagnostics.current_reports()
+        self.diagnostics
+            .current_reports()
+            .filter(|(key, file, entry)| self.report_matches_current_content(key, file, entry))
+    }
+
+    fn report_matches_current_content(
+        &self,
+        key: &ServerKey,
+        file: &Path,
+        entry: &DiagnosticEntry,
+    ) -> bool {
+        !entry.stale
+            && (!entry.from_receive_order || !self.server_supports_pull_for_file(key, file))
+            && entry.content_hash.is_some()
+            && entry.content_hash == file_content_hash(file)
+            && self
+                .documents
+                .get(key)
+                .and_then(|store| store.version(file))
+                .is_none_or(|version| entry.version == Some(version))
+    }
+
+    fn invalidate_diagnostic_content(&mut self, key: &ServerKey, file: &Path) {
+        self.diagnostics.mark_stale_for_server_file(key, file);
+        // A later pull must not lend its content proof to cached rows from
+        // before the change when Rust's pushed and pulled results are merged.
+        self.latest_pull_for_rust
+            .remove(&(key.clone(), file.to_path_buf()));
+        self.latest_push_for_pull_servers
+            .remove(&(key.clone(), file.to_path_buf()));
+    }
+
+    fn confirmed_document_hash(
+        &self,
+        key: &ServerKey,
+        file: &Path,
+        version: Option<i32>,
+    ) -> Option<[u8; 32]> {
+        self.documents
+            .get(key)
+            .and_then(|store| store.entry(file))
+            .filter(|document| Some(document.version) == version)
+            .and_then(|document| document.content_hash)
+    }
+
+    fn version_for_unversioned_push(
+        &self,
+        key: &ServerKey,
+        file: &Path,
+        receive_order: Option<u64>,
+    ) -> Option<i32> {
+        let client = self.clients.get(key)?;
+        // Pull-capable files retain the stronger diagnostic-request barrier.
+        // This is capability-based, including dynamic registrations and pull
+        // disabled by configuration, rather than a language-server allowlist.
+        if client
+            .diagnostic_capabilities_for_file(file)?
+            .pull_diagnostics
+        {
+            return None;
+        }
+        let document = self.documents.get(key)?.entry(file)?;
+        if receive_order? <= document.sync_order?
+            || document.content_hash.is_none()
+            || document.content_hash != file_content_hash(file)
+        {
+            return None;
+        }
+        Some(document.version)
+    }
+
+    fn certify_report_content(&mut self, key: &ServerKey, file: &Path, version: Option<i32>) {
+        let hash = self.confirmed_document_hash(key, file, version);
+        self.diagnostics.certify_content(key, file, hash);
+        if hash.is_none() {
+            self.diagnostics.mark_stale_for_server_file(key, file);
+        }
+    }
+
+    pub(crate) fn report_content_hash(&self, key: &ServerKey, file: &Path) -> Option<[u8; 32]> {
+        self.diagnostics
+            .entries_for_file(file)
+            .into_iter()
+            .find(|(stored, entry)| {
+                *stored == key && self.report_matches_current_content(stored, file, entry)
+            })
+            .and_then(|(_, entry)| entry.content_hash)
+    }
+
+    /// Include stale and empty reports: neither means a changed file is clean.
+    pub(crate) fn diagnostic_working_files(&self) -> Vec<PathBuf> {
+        self.diagnostics
+            .reports()
+            .map(|(_, file, _)| file.to_path_buf())
+            .chain(
+                self.documents
+                    .values()
+                    .flat_map(|store| store.open_documents().into_iter().cloned()),
+            )
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    pub(crate) fn unverified_diagnostic_files(&self) -> Vec<(ServerKey, PathBuf)> {
+        self.diagnostics
+            .reports()
+            .filter(|(key, file, entry)| !self.report_matches_current_content(key, file, entry))
+            .map(|(key, file, _)| (key.clone(), file.to_path_buf()))
+            .collect()
+    }
+
+    pub(crate) fn unverified_diagnostic_file(&self, file: &Path) -> Option<ServerKey> {
+        self.diagnostics
+            .entries_for_file(file)
+            .into_iter()
+            .find(|(key, entry)| !self.report_matches_current_content(key, file, entry))
+            .map(|(key, _)| key.clone())
     }
 
     /// True if any LSP server has a current diagnostic report, including an
@@ -6032,7 +6414,7 @@ impl LspManager {
     /// treating an empty flattened diagnostic list as trustworthy when no server
     /// has actually run or every report was marked stale after an external edit.
     pub fn has_any_diagnostic_reports(&self) -> bool {
-        self.diagnostics.has_any_fresh_report()
+        self.current_diagnostic_reports().next().is_some()
     }
 
     /// True if any server has a current report for this file, including an
@@ -6040,7 +6422,10 @@ impl LspManager {
     /// they predate an external edit.
     pub fn has_diagnostic_report_for_file(&self, file: &Path) -> bool {
         let normalized = normalize_lookup_path(file);
-        self.diagnostics.has_any_fresh_report_for_file(&normalized)
+        self.diagnostics
+            .entries_for_file(&normalized)
+            .into_iter()
+            .any(|(key, entry)| self.report_matches_current_content(key, &normalized, entry))
     }
 
     /// True if this exact server/file pair has a current diagnostic report,
@@ -6049,29 +6434,19 @@ impl LspManager {
     pub fn has_diagnostic_report_for_server_file(&self, server: &ServerKey, file: &Path) -> bool {
         let normalized = normalize_lookup_path(file);
         self.diagnostics
-            .has_fresh_report_for_server_file(server, &normalized)
-    }
-
-    /// True if this server/file pair has a current report that describes the
-    /// text the server now holds for the open document: a document pull
-    /// produced it, or a push carried the open document's version. An
-    /// unversioned push (a late clearing reply to an earlier close, for
-    /// example) proves neither.
-    pub(crate) fn has_report_for_open_document(&self, server: &ServerKey, file: &Path) -> bool {
-        let normalized = normalize_lookup_path(file);
-        let open_version = self
-            .documents
-            .get(server)
-            .and_then(|documents| documents.version(&normalized));
-        self.diagnostics
             .entries_for_file(&normalized)
             .into_iter()
             .any(|(key, entry)| {
-                key == server
-                    && !entry.stale
-                    && (entry.from_document_pull
-                        || (entry.version.is_some() && entry.version == open_version))
+                key == server && self.report_matches_current_content(key, &normalized, entry)
             })
+    }
+
+    /// True if this server/file pair has a current report that describes the
+    /// text the server now holds for the open document. Pull-capable pairs
+    /// require a pulled or versioned report. Push-only pairs can instead use
+    /// the reader-order/hash proof for an unversioned publication.
+    pub(crate) fn has_report_for_open_document(&self, server: &ServerKey, file: &Path) -> bool {
+        self.has_diagnostic_report_for_server_file(server, file)
     }
 
     /// True if any server has an authoritative report for this file: neither
@@ -6086,6 +6461,7 @@ impl LspManager {
             .any(|(key, entry)| {
                 !entry.stale
                     && !entry.provisional
+                    && self.report_matches_current_content(key, &normalized, entry)
                     && self.clients.get(key).is_none_or(|client| {
                         !client.uses_analysis_progress()
                             || ((if client.uses_document_pull(Some(&normalized)) {
@@ -6108,7 +6484,8 @@ impl LspManager {
     /// empty checked-clean report. Needed by the blocking quiescence wait, which
     /// settles per producer rather than per file.
     pub fn has_authoritative_report_for_server(&self, server: &ServerKey) -> bool {
-        self.diagnostics.has_authoritative_report_for_server(server)
+        self.authoritative_diagnostic_reports()
+            .any(|(key, _, _)| key == server)
     }
 
     /// True if this server instance is still warming: its reports stay
@@ -6130,6 +6507,9 @@ impl LspManager {
     }
 
     pub(crate) fn analysis_progress_certifies_file(&self, server: &ServerKey, file: &Path) -> bool {
+        if !self.has_diagnostic_report_for_server_file(server, file) {
+            return false;
+        }
         if self.clients.get(server).is_some_and(|client| {
             client.uses_analysis_progress() && client.uses_document_pull(Some(file))
         }) {
@@ -6338,6 +6718,9 @@ impl LspManager {
         if entry.provisional {
             return Some("report-provisional");
         }
+        if !self.report_matches_current_content(key, file, entry) {
+            return Some("current-content-unverified");
+        }
         match entry.version {
             None => Some("missing-version"),
             Some(version) if version != document_version => Some("version-mismatch"),
@@ -6502,9 +6885,13 @@ impl LspManager {
                 root,
                 method,
                 params: Some(params),
-            } if method == "textDocument/publishDiagnostics" => {
-                self.handle_publish_diagnostics(server_kind.clone(), root.clone(), params)
-            }
+            } if method == "textDocument/publishDiagnostics" => self
+                .handle_publish_diagnostics_ordered(
+                    server_kind.clone(),
+                    root.clone(),
+                    params,
+                    receipt.receive_order,
+                ),
             LspEvent::Notification {
                 server_kind,
                 root,
@@ -6610,11 +6997,22 @@ impl LspManager {
         });
     }
 
+    #[cfg(test)]
     fn handle_publish_diagnostics(
         &mut self,
         server: ServerKind,
         root: PathBuf,
         params: &serde_json::Value,
+    ) -> Option<PathBuf> {
+        self.handle_publish_diagnostics_ordered(server, root, params, None)
+    }
+
+    fn handle_publish_diagnostics_ordered(
+        &mut self,
+        server: ServerKind,
+        root: PathBuf,
+        params: &serde_json::Value,
+        receive_order: Option<u64>,
     ) -> Option<PathBuf> {
         #[cfg(test)]
         PUBLISH_DIAGNOSTICS_PARSES.with(|count| count.set(count.get() + 1));
@@ -6656,6 +7054,9 @@ impl LspManager {
         );
         let stored = from_lsp_diagnostics(file.clone(), publish_params.diagnostics, &server);
         let key = ServerKey { kind: server, root };
+        let from_receive_order = version.is_none();
+        let proven_version =
+            version.or_else(|| self.version_for_unversioned_push(&key, &file, receive_order));
         // Preserve the full compiler result independently of the working-set
         // LRU and document-close exceptions, which must not turn errors clean.
         if let Some(cache) = self
@@ -6672,7 +7073,10 @@ impl LspManager {
             // An empty push is kept as no entry: a missing entry already
             // reads as "no pushed diagnostics", and storing empty lists kept
             // one entry for every file rust-analyzer ever published.
-            if stored.is_empty() {
+            // Compiler-check results are stored separately. An unversioned push
+            // does not identify the document state it analyzed, so it cannot
+            // borrow a later document pull's content proof.
+            if stored.is_empty() || self.confirmed_document_hash(&key, &file, version).is_none() {
                 self.latest_push_for_pull_servers
                     .remove(&(key.clone(), file.clone()));
             } else {
@@ -6722,9 +7126,13 @@ impl LspManager {
             file.clone(),
             stored,
             None,
-            version,
+            proven_version,
             provisional,
         );
+        self.certify_report_content(&key, &file, proven_version);
+        if from_receive_order && proven_version.is_some() {
+            self.diagnostics.mark_receive_order(&key, &file);
+        }
         let epoch = self.diagnostics.current_epoch();
         let published_at = self.diagnostics.publication_time(&key, &file);
         if let Some(client) = self.clients.get_mut(&key) {
@@ -6740,7 +7148,7 @@ impl LspManager {
         self.queue_background_document_pull(&key, &file);
         if let Some(reason) = self.live_publish_drop_reason(&key, &file) {
             slog_info!(
-                "lsp_protocol server={} root={} method=textDocument/publishDiagnostics event=dropped-because-{} file={} version={}",
+                "lsp_protocol server={} root={} method=textDocument/publishDiagnostics event=uncertified-because-{} file={} version={}",
                 key.kind.id_str(),
                 key.root.display(),
                 reason,
@@ -7898,13 +8306,14 @@ pub(crate) fn language_id_for_extension(ext: &str) -> &'static str {
     }
 }
 
-fn log_did_open_sent(key: &ServerKey, file: &Path, language_id: &str) {
+fn log_did_open_sent(key: &ServerKey, file: &Path, language_id: &str, version: i32) {
     slog_info!(
-        "lsp_protocol server={} root={} method=textDocument/didOpen event=sent file={} language_id={} version=0",
+        "lsp_protocol server={} root={} method=textDocument/didOpen event=sent file={} language_id={} version={}",
         key.kind.id_str(),
         key.root.display(),
         file.display(),
-        language_id
+        language_id,
+        version
     );
 }
 
@@ -8308,8 +8717,8 @@ fn replay_startup_notifications(
         let mut write_attempted = false;
         let mut document_written = false;
         let sent = (|| -> Result<(DiskSnapshot, Option<(Instant, u64)>), LspError> {
-            let disk = DiskSnapshot::read(&path);
             let content = std::fs::read_to_string(&path)?;
+            let disk = DiskSnapshot::for_content(&path, &content);
             let uri = uri_for_path(&path)?;
             #[cfg(test)]
             if let Some(hook) = signal.replay_hook.lock().clone() {
@@ -8332,7 +8741,7 @@ fn replay_startup_notifications(
                 super::client::full_did_change_message(&uri, version, &content)?
             };
             write_attempted = true;
-            writer.send(payload)?;
+            let sync_order = writer.send_ordered(payload)?;
             document_written = true;
             let saved = if let Some(save) = save {
                 writer.send(super::client::did_save_message(
@@ -8346,7 +8755,7 @@ fn replay_startup_notifications(
             } else {
                 None
             };
-            Ok((disk, saved))
+            Ok((disk.with_sync_order(Some(sync_order)), saved))
         })();
         match sent {
             Ok((disk, saved)) => result.documents.push(StartupReplayDocument {
@@ -8476,6 +8885,103 @@ struct PendingWatchedChange {
     kind: FileChangeType,
     raw: Option<PathBuf>,
     extra_config_markers: Vec<String>,
+    stamp: Option<WatchedFileStamp>,
+}
+
+pub(crate) type WatchedFileStamp = (u64, Option<std::time::SystemTime>);
+pub(crate) type WatchedFileStamps = HashMap<PathBuf, WatchedFileStamp>;
+
+/// Capture disk observations before taking the LSP manager lock. Queued changes
+/// carry these observations through delivery and startup replay without new I/O.
+pub(crate) fn capture_watched_file_stamps<'a>(
+    paths: impl IntoIterator<Item = &'a PathBuf>,
+) -> WatchedFileStamps {
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let metadata = std::fs::metadata(path).ok()?;
+            Some((path.clone(), (metadata.len(), metadata.modified().ok())))
+        })
+        .collect()
+}
+
+/// Retain created/deleted file events just beyond the watcher's debounce window.
+const WATCHED_LIFECYCLE_TTL: Duration = Duration::from_secs(10);
+const WATCHED_LIFECYCLE_CAP: usize = 4_096;
+
+struct WatchedLifecycle {
+    kind: FileChangeType,
+    stamp: Option<WatchedFileStamp>,
+    order: (Instant, u64),
+}
+
+/// Keep both indexes bounded: replacing or consuming a path removes its age key.
+#[derive(Default)]
+struct WatchedLifecycleCache {
+    entries: HashMap<PathBuf, WatchedLifecycle>,
+    oldest: std::collections::BTreeMap<(Instant, u64), PathBuf>,
+    sequence: u64,
+}
+
+impl WatchedLifecycleCache {
+    fn remove(&mut self, path: &Path) {
+        if let Some(previous) = self.entries.remove(path) {
+            self.oldest.remove(&previous.order);
+        }
+    }
+
+    fn expire(&mut self, now: Instant) {
+        while self
+            .oldest
+            .first_key_value()
+            .is_some_and(|((at, _), _)| now.saturating_duration_since(*at) >= WATCHED_LIFECYCLE_TTL)
+        {
+            let (_, path) = self.oldest.pop_first().expect("oldest entry exists");
+            self.entries.remove(&path);
+        }
+    }
+
+    fn remember(
+        &mut self,
+        path: PathBuf,
+        kind: FileChangeType,
+        stamp: Option<WatchedFileStamp>,
+        now: Instant,
+    ) {
+        self.expire(now);
+        self.remove(&path);
+        if self.entries.len() >= WATCHED_LIFECYCLE_CAP {
+            if let Some((_, path)) = self.oldest.pop_first() {
+                self.entries.remove(&path);
+            }
+        }
+        self.sequence = self.sequence.wrapping_add(1);
+        let order = (now, self.sequence);
+        self.oldest.insert(order, path.clone());
+        self.entries
+            .insert(path, WatchedLifecycle { kind, stamp, order });
+    }
+
+    fn absorb_echo(
+        &mut self,
+        path: &Path,
+        kind: FileChangeType,
+        stamp: Option<WatchedFileStamp>,
+        now: Instant,
+    ) -> bool {
+        self.expire(now);
+        let echo = self.entries.get(path).is_some_and(|previous| {
+            kind == previous.kind
+                || (kind == FileChangeType::CHANGED
+                    && previous.kind == FileChangeType::CREATED
+                    && stamp.is_some()
+                    && previous.stamp == stamp)
+        });
+        if echo {
+            self.remove(path);
+        }
+        echo
+    }
 }
 
 /// Wait through spawn and replay until a final startup outcome or the deadline.
@@ -8741,17 +9247,28 @@ where
     G: std::ops::DerefMut<Target = LspManager>,
 {
     let canonical_path = canonicalize_for_lsp(file_path)?;
-    let outcomes = ensure_server_for_file_detailed_unlocked(&lock, &canonical_path, config);
-    if outcomes
-        .attempts
-        .iter()
-        .any(|attempt| matches!(attempt.result, ServerAttemptResult::InProgress { .. }))
-    {
-        return Err(LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()));
+    for _ in 0..FILE_SERVER_RESTART_ATTEMPTS {
+        let outcomes = ensure_server_for_file_detailed_unlocked(&lock, &canonical_path, config);
+        if outcomes
+            .attempts
+            .iter()
+            .any(|attempt| matches!(attempt.result, ServerAttemptResult::InProgress { .. }))
+        {
+            return Err(LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()));
+        }
+        let mut manager = lock();
+        // An idle sweep can detach a server after startup resolves. Restart
+        // outside the lock rather than returning an empty document-open result.
+        if outcomes
+            .successful
+            .iter()
+            .any(|key| !manager.clients.contains_key(key))
+        {
+            continue;
+        }
+        return manager.ensure_file_open(&canonical_path, config);
     }
-    // Every server is now running or has a remembered failure, so this
-    // starts nothing under the lock unless a client vanished in between.
-    lock().ensure_file_open(&canonical_path, config)
+    Err(LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()))
 }
 
 /// rust-analyzer's own LSP request (not part of the LSP specification) that
@@ -8867,6 +9384,7 @@ pub type WatcherForwardSlot = Arc<parking_lot::Mutex<Option<WatcherForwardBacklo
 pub struct WatcherForwardBacklog {
     paths: Vec<PathBuf>,
     seen: HashSet<PathBuf>,
+    stamps: WatchedFileStamps,
     /// Paths were dropped, so rust-analyzer must check its manifests itself.
     overflowed: bool,
     /// The watcher lost events; same consequence as `overflowed`.
@@ -8877,17 +9395,38 @@ pub struct WatcherForwardBacklog {
 impl WatcherForwardBacklog {
     /// Add one drain's changes. `extra_config_markers` replaces the previous
     /// value, so the latest configuration decides what counts as config.
+    #[cfg(test)]
     pub(crate) fn merge(
         &mut self,
         paths: &[PathBuf],
         reload_all_rust: bool,
         extra_config_markers: Vec<String>,
     ) {
+        self.merge_with_stamps(
+            paths,
+            reload_all_rust,
+            extra_config_markers,
+            &WatchedFileStamps::new(),
+        );
+    }
+
+    pub(crate) fn merge_with_stamps(
+        &mut self,
+        paths: &[PathBuf],
+        reload_all_rust: bool,
+        extra_config_markers: Vec<String>,
+        stamps: &WatchedFileStamps,
+    ) {
         self.extra_config_markers = extra_config_markers;
         self.reload_all_rust |= reload_all_rust;
         for path in paths {
             if self.overflowed && !self.is_config(path) {
                 continue;
+            }
+            if let Some(stamp) = stamps.get(path) {
+                self.stamps.insert(path.clone(), *stamp);
+            } else {
+                self.stamps.remove(path);
             }
             if !self.seen.insert(path.clone()) {
                 continue;
@@ -8913,6 +9452,7 @@ impl WatcherForwardBacklog {
             self.paths.clear();
         }
         self.seen = self.paths.iter().cloned().collect();
+        self.stamps.retain(|path, _| self.seen.contains(path));
     }
 
     fn is_empty(&self) -> bool {
@@ -8943,7 +9483,11 @@ impl WatcherForwardBacklog {
                 (path, typ)
             })
             .collect();
-        let mut reloads = lsp.forward_watcher_file_events(&events, &self.extra_config_markers);
+        let mut reloads = lsp.forward_watcher_file_events_with_stamps(
+            &events,
+            &self.extra_config_markers,
+            &self.stamps,
+        );
         if self.overflowed || self.reload_all_rust {
             for key in lsp.rust_server_keys() {
                 if !reloads.iter().any(|(known, _)| known == &key) {
@@ -9294,9 +9838,9 @@ fn walk_applicable_area_uncached(
             });
         }
         if visited >= entry_limit {
-            return Err(ApplicabilityResolutionError::RootUnreadable {
+            return Err(ApplicabilityResolutionError::EntryLimitReached {
                 root: project_root.to_path_buf(),
-                reason: format!("applicability walk incomplete: entry limit {entry_limit} reached"),
+                entries: visited,
             });
         }
         let entry = entry.map_err(|error| ApplicabilityResolutionError::RootUnreadable {
@@ -9461,6 +10005,37 @@ fn process_start_durability(error: &LspError) -> FailureDurability {
     }
 }
 
+fn log_spawn_failure(def: &ServerDef, key: &ServerKey, error: &LspError, now: Instant) {
+    let capacity = match error {
+        LspError::Io(io) => io
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<super::client::RustAnalyzerCapacityExhausted>()),
+        _ => None,
+    };
+    if let Some(capacity) = capacity {
+        // Admission is daemon-wide, so separate managers for the same root
+        // must share the log limit. Expire quiet roots instead of retaining
+        // every checkout the daemon has ever seen.
+        static LAST_LOG: std::sync::OnceLock<parking_lot::Mutex<HashMap<PathBuf, Instant>>> =
+            std::sync::OnceLock::new();
+        let mut last_log = LAST_LOG.get_or_init(Default::default).lock();
+        last_log.retain(|_, at| now.saturating_duration_since(*at) < Duration::from_secs(3600));
+        if last_log.contains_key(&key.root) {
+            return;
+        }
+        last_log.insert(key.root.clone(), now);
+        drop(last_log);
+        slog_info!(
+            "rust-analyzer admission deferred root={} cap={} current={}; retry after another worker analyzer stops",
+            key.root.display(),
+            capacity.cap,
+            capacity.current
+        );
+    } else {
+        slog_error!("failed to spawn {}: {}", def.name, error);
+    }
+}
+
 /// Classify a server that died or failed during or after `initialize` from
 /// its failure text and stderr. Only configuration errors AFT recognises are
 /// permanent: typescript-language-server finding no usable TypeScript SDK,
@@ -9503,7 +10078,7 @@ fn env_binary_override_from(
 
 #[cfg(test)]
 #[path = "manager_regression_tests.rs"]
-mod regression_tests;
+pub(crate) mod regression_tests;
 
 #[cfg(all(test, unix))]
 #[path = "startup_regression_tests.rs"]
@@ -9516,6 +10091,10 @@ pub(crate) mod instance_regression_tests;
 #[cfg(test)]
 #[path = "watcher_work_tests.rs"]
 mod watcher_work_tests;
+
+#[cfg(test)]
+#[path = "lifecycle_tests.rs"]
+mod lifecycle_tests;
 
 #[cfg(test)]
 mod env_binary_override_tests {
@@ -9613,6 +10192,7 @@ mod project_applicability_tests {
         manager
             .diagnostics
             .publish(ts.clone(), root.join("main.ts"), Vec::new());
+        manager.certify_diagnostic_content_for_test(&root.join("main.ts"));
         (dir, manager, config, ts)
     }
 
@@ -9978,6 +10558,68 @@ mod transient_retry_tests {
     }
 
     #[test]
+    fn rust_capacity_logs_info_once_per_root_per_hour_across_managers() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = ServerKey {
+            kind: ServerKind::Rust,
+            root: dir.path().join("first"),
+        };
+        let other = ServerKey {
+            root: dir.path().join("second"),
+            ..key.clone()
+        };
+        let def = crate::lsp::registry::builtin_servers()
+            .into_iter()
+            .find(|def| def.kind == ServerKind::Rust)
+            .unwrap();
+        let failure = || {
+            let error = LspError::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                super::super::client::RustAnalyzerCapacityExhausted { cap: 2, current: 3 },
+            ));
+            let durability = process_start_durability(&error);
+            assert_eq!(durability, FailureDurability::Capacity);
+            StartFailure { error, durability }
+        };
+        let (mut first, offset) = manager_with_clock();
+        let mut second = LspManager::new();
+        second.set_retry_clock(first.retry_clock.clone());
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            first.record_file_start_failure(&def, &key, failure());
+            second.record_file_start_failure(&def, &key, failure());
+            offset.store(3_599_999, Ordering::SeqCst);
+            first.record_file_start_failure(&def, &key, failure());
+            second.record_file_start_failure(&def, &other, failure());
+            offset.store(3_600_000, Ordering::SeqCst);
+            second.record_file_start_failure(&def, &key, failure());
+        });
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        for line in &lines {
+            assert!(line.starts_with("INFO "), "{line}");
+            assert!(line.contains("cap=2 current=3"), "{line}");
+        }
+        assert!(lines[0].contains(&key.root.display().to_string()));
+        assert!(lines[1].contains(&other.root.display().to_string()));
+        assert!(lines[2].contains(&key.root.display().to_string()));
+
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            for kind in [std::io::ErrorKind::WouldBlock, std::io::ErrorKind::NotFound] {
+                let error = LspError::Io(std::io::Error::from(kind));
+                let durability = process_start_durability(&error);
+                first.record_file_start_failure(&def, &key, StartFailure { error, durability });
+            }
+        });
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("ERROR "))
+                .count(),
+            2,
+            "real spawn failures must still log ERROR: {lines:?}"
+        );
+    }
+
+    #[test]
     fn failure_durability_classification() {
         use FailureDurability::{Permanent, Transient};
 
@@ -10088,14 +10730,22 @@ mod diagnostic_capacity_tests {
                 keys.clone(),
             )
             .unwrap();
-        assert_eq!(reads() - before, 1, "opening in three stores");
+        assert_eq!(
+            reads() - before,
+            0,
+            "hash the sent text without rereading disk"
+        );
 
         std::fs::write(&file, "export const x = 2;\n").unwrap();
         let before = reads();
         manager
             .notify_file_changed_for_server_keys(file, "export const x = 2;\n", keys)
             .unwrap();
-        assert_eq!(reads() - before, 1, "changing in three stores");
+        assert_eq!(
+            reads() - before,
+            0,
+            "hash the sent text without rereading disk"
+        );
     }
 
     // Documents closed by scoped inspects are remembered only up to a cap,
@@ -10456,7 +11106,7 @@ mod clear_diagnostics_tests {
     #[test]
     fn drain_events_reports_publish_diagnostics_updates() {
         let dir = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let root = super::canonicalize_for_lsp(dir.path()).unwrap();
         let file = root.join("main.ts");
         std::fs::write(&file, "const x: number = 'nope';").unwrap();
 
@@ -10487,6 +11137,14 @@ mod clear_diagnostics_tests {
             version: Some(1),
         })
         .unwrap();
+        manager.sync_document_version_for_test(
+            &ServerKey {
+                kind: ServerKind::TypeScript,
+                root: root.clone(),
+            },
+            &file,
+            1,
+        );
         manager
             .event_tx
             .send(
@@ -11520,6 +12178,155 @@ mod document_pull_certificate_tests {
         let entry = manager.diagnostics.entries_for_file(&file)[0].1;
         assert!(entry.from_document_pull);
         assert_eq!(entry.diagnostics[0].message, "checked error");
+    }
+}
+
+#[cfg(test)]
+mod current_content_diagnostics_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fixture() -> (tempfile::TempDir, LspManager, ServerKey, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let file = canonicalize_for_lsp(temp.path()).unwrap().join("a.ts");
+        std::fs::write(&file, "broken\n").unwrap();
+        let key = ServerKey {
+            kind: ServerKind::TypeScript,
+            root: file.parent().unwrap().to_path_buf(),
+        };
+        let mut manager = LspManager::new();
+        manager
+            .documents
+            .entry(key.clone())
+            .or_default()
+            .open(file.clone());
+        publish(&mut manager, &key, &file, Some(0));
+        assert_eq!(manager.authoritative_diagnostic_reports().count(), 1);
+        (temp, manager, key, file)
+    }
+
+    fn publish(manager: &mut LspManager, key: &ServerKey, file: &Path, version: Option<i32>) {
+        manager.handle_publish_diagnostics(
+            key.kind.clone(),
+            key.root.clone(),
+            &json!({
+                "uri": uri_for_path(file).unwrap(), "version": version, "diagnostics": []
+            }),
+        );
+    }
+
+    #[test]
+    fn diagnostics_late_and_unversioned_reports_do_not_certify_current_content() {
+        for version in [Some(0), None] {
+            let (_temp, mut manager, key, file) = fixture();
+            std::fs::write(&file, "fixed!\n").unwrap();
+            manager.documents.get_mut(&key).unwrap().bump_version(&file);
+            publish(&mut manager, &key, &file, version);
+            assert_eq!(
+                manager.authoritative_diagnostic_reports().count(),
+                0,
+                "version={version:?}"
+            );
+            assert!(!manager.has_authoritative_report_for_file(&file));
+            assert_eq!(manager.unverified_diagnostic_files(), vec![(key, file)]);
+        }
+    }
+
+    #[test]
+    fn diagnostics_matching_version_and_content_remain_authoritative() {
+        let (_temp, mut manager, key, file) = fixture();
+        std::fs::write(&file, "fixed!\n").unwrap();
+        manager.documents.get_mut(&key).unwrap().bump_version(&file);
+        publish(&mut manager, &key, &file, Some(1));
+        assert_eq!(manager.authoritative_diagnostic_reports().count(), 1);
+        assert!(manager.has_authoritative_report_for_file(&file));
+    }
+
+    #[test]
+    fn diagnostics_check_disk_content_even_before_a_watcher_event() {
+        let (_temp, manager, key, file) = fixture();
+        assert!(manager.diagnostic_entry_is_fresh_for_document(
+            &file,
+            &key,
+            PreEditSnapshot::default()
+        ));
+        let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
+        std::fs::write(&file, "fixed!\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(manager.authoritative_diagnostic_reports().count(), 0);
+        assert!(!manager.has_authoritative_report_for_file(&file));
+        assert!(!manager.diagnostic_entry_is_fresh_for_document(
+            &file,
+            &key,
+            PreEditSnapshot::default()
+        ));
+    }
+
+    #[test]
+    fn diagnostics_reopen_does_not_accept_an_earlier_open_version() {
+        let (_temp, mut manager, key, file) = fixture();
+        let store = manager.documents.get_mut(&key).unwrap();
+        store.close(&file);
+        assert_eq!(store.open(file.clone()), 1);
+        publish(&mut manager, &key, &file, Some(0));
+        assert_eq!(manager.authoritative_diagnostic_reports().count(), 0);
+        publish(&mut manager, &key, &file, Some(1));
+        assert_eq!(manager.authoritative_diagnostic_reports().count(), 1);
+    }
+
+    #[test]
+    fn diagnostics_text_sync_cannot_recertify_earlier_push_or_pull_rows() {
+        let (_temp, mut manager, previous, file) = fixture();
+        let key = ServerKey {
+            kind: ServerKind::Rust,
+            root: previous.root,
+        };
+        manager.sync_document_version_for_test(&key, &file, 0);
+        let old = vec![StoredDiagnostic {
+            file: file.clone(),
+            line: 1,
+            column: 1,
+            end_line: 1,
+            end_column: 2,
+            severity: crate::lsp::diagnostics::DiagnosticSeverity::Error,
+            message: "earlier analysis".into(),
+            code: None,
+            source: None,
+        }];
+        manager
+            .latest_push_for_pull_servers
+            .insert((key.clone(), file.clone()), old.clone());
+        manager
+            .latest_pull_for_rust
+            .insert((key.clone(), file.clone()), old);
+        std::fs::write(&file, "fixed!\n").unwrap();
+        manager
+            .notify_file_changed_for_server_keys(file.clone(), "fixed!\n", vec![key.clone()])
+            .unwrap();
+        assert!(!manager
+            .latest_push_for_pull_servers
+            .contains_key(&(key.clone(), file.clone())));
+        assert!(!manager
+            .latest_pull_for_rust
+            .contains_key(&(key.clone(), file.clone())));
+        manager.ingest_document_report(
+            &key,
+            &file,
+            Some(1),
+            None,
+            serde_json::from_value(json!({"kind":"full", "items":[]})).unwrap(),
+        );
+        manager.store_pull_push_union(&key, &file, Vec::new());
+        assert!(manager.has_authoritative_report_for_file(&file));
+        assert!(manager
+            .server_file_diagnostics(&key, &file)
+            .unwrap()
+            .is_empty());
     }
 }
 

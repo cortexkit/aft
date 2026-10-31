@@ -138,6 +138,7 @@ impl FileFacts {
             default_export_symbol: self.default_export_symbol.clone(),
             exported_symbols: Vec::new(),
             callable_symbols: Vec::new(),
+            python_bindings: Vec::new(),
             imports: self
                 .imports
                 .iter()
@@ -401,11 +402,39 @@ fn load_sites<'p>(
     Ok(())
 }
 
+#[derive(Default)]
+pub(super) struct DecodedFiles(BTreeMap<String, FileRow>);
+
+impl DecodedFiles {
+    pub(super) fn insert(&mut self, path: String, parse: &ParseBlob) -> Result<()> {
+        self.0
+            .insert(path, FileRow::decoded(parse, FileFacts::new(parse))?);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 pub(super) fn emit(
     transaction: &Transaction<'_>,
     manifest: &Manifest,
     reader: &impl ManifestBlobReader,
     scope: &EmitScope<'_>,
+) -> Result<DispatchWork> {
+    emit_from_decoded(
+        transaction,
+        manifest,
+        reader,
+        scope,
+        DecodedFiles::default(),
+    )
+}
+
+pub(super) fn emit_from_decoded(
+    transaction: &Transaction<'_>,
+    manifest: &Manifest,
+    reader: &impl ManifestBlobReader,
+    scope: &EmitScope<'_>,
+    mut decoded_inputs: DecodedFiles,
 ) -> Result<DispatchWork> {
     // With `AFT_VIEW_PROFILE` set, each stage of this pass prints its wall
     // time to stderr; without it nothing is timed or printed.
@@ -494,11 +523,7 @@ pub(super) fn emit(
         .filter(|(path, _)| !incremental || changed.contains(*path))
         .copied()
         .collect::<Vec<_>>();
-    let blobs = reader
-        .read_callgraph_blobs_decoded(&decode.iter().map(|(_, key)| *key).collect::<Vec<_>>())
-        .map_err(|e| CallGraphStoreError::Unavailable(e.to_string()))?;
     work.decoded_blobs = decode.len();
-    stage.finish("decode_blobs", format_args!("files={}", decode.len()));
     let import_files = incremental.then(|| {
         changed
             .iter()
@@ -507,24 +532,32 @@ pub(super) fn emit(
             .collect::<BTreeSet<_>>()
     });
     let mut imports = import_targets(transaction, import_files.as_ref())?;
-    for ((path, key), blob) in decode.iter().zip(blobs) {
-        let blob = blob.ok_or_else(|| {
-            CallGraphStoreError::Unavailable(format!("missing dispatch blob {key}"))
-        })?;
-        let Some(parse) = blob.parse() else {
-            continue;
+    for (path, key) in &decode {
+        let mut row = if let Some(row) = decoded_inputs.0.remove(*path) {
+            row
+        } else {
+            let blob = reader
+                .read_callgraph_blob_decoded(key)
+                .map_err(|e| CallGraphStoreError::Unavailable(e.to_string()))?
+                .ok_or_else(|| {
+                    CallGraphStoreError::Unavailable(format!("missing dispatch blob {key}"))
+                })?;
+            let Some(parse) = blob.parse() else {
+                continue;
+            };
+            FileRow::decoded(parse, FileFacts::new(parse))?
         };
-        let mut facts = FileFacts::new(parse);
+        let mut facts = row.facts.clone();
         facts.import_targets = imports.remove(*path).unwrap_or_default();
-        let mut row = FileRow::decoded(parse, facts)?;
         if let Some(targets) = scope.type_targets.get(*path) {
-            let mut facts = row.facts.clone();
             facts.type_targets = targets.targets.clone();
-            row.set_facts(facts)?;
             row.trace = Some(targets.trace.clone());
         }
+        row.set_facts(facts)?;
         rows.insert((*path).to_string(), row);
     }
+    drop(decoded_inputs);
+    stage.finish("decode_blobs", format_args!("files={}", decode.len()));
     if incremental {
         // An unchanged file keeps its stored facts, except for the import
         // targets of its rewritten references and the type targets the join

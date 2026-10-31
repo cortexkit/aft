@@ -171,3 +171,26 @@ describe("the sidebar at its real width", () => {
     TEST_TIMEOUT_MS,
   );
 });
+
+describe("operator coordination lines in the visible sidebar", () => {
+  for (const line of [
+    "Waiting for another AFT process that is embedding the same new code; results will follow.",
+    "Can't coordinate embedding with other AFT processes: permission denied. Retrying in 1m 20s.",
+  ]) {
+    test(
+      `wraps the approved line without losing text: ${line}`,
+      async () => {
+        const frame = await renderFrame(
+          snapshot({
+            degraded: false,
+            degraded_reasons: [],
+            semantic_index: { status: "ready", refreshing_count: 0, pending_reason: line },
+          }),
+        );
+        expect(frame.join(" ").replace(/\s+/g, " ")).toContain(line);
+        for (const row of frame) expect(row.length).toBeLessThanOrEqual(SIDEBAR_WIDTH);
+      },
+      TEST_TIMEOUT_MS,
+    );
+  }
+});

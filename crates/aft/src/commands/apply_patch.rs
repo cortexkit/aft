@@ -26,6 +26,56 @@ struct ResolvedPath {
     rel: String,
 }
 
+#[derive(Default)]
+struct PatchAdmission {
+    locks: std::cell::RefCell<HashMap<PathBuf, edit::mutation::FileLock>>,
+    last: HashMap<PathBuf, usize>,
+    index: std::cell::Cell<usize>,
+}
+
+impl PatchAdmission {
+    fn acquire(resolved: &[ResolvedHunk]) -> Result<Self, crate::error::AftError> {
+        let mut last = HashMap::new();
+        for (index, hunk) in resolved.iter().enumerate() {
+            last.insert(hunk.source.abs.clone(), index);
+            if let Some(dest) = &hunk.move_dest {
+                last.insert(dest.abs.clone(), index);
+            }
+        }
+        let mut paths: Vec<_> = last.keys().cloned().collect();
+        paths.sort();
+        let versions: Vec<_> = paths
+            .iter()
+            .map(|path| edit::mutation::Version::read(path))
+            .collect();
+        for path in &paths {
+            edit::mutation::before_check(path);
+        }
+        let refs: Vec<_> = paths.iter().map(PathBuf::as_path).collect();
+        let locks = edit::mutation::lock_files(&refs);
+        for (path, version) in paths.iter().zip(versions) {
+            version.check(path)?;
+        }
+        Ok(Self {
+            locks: std::cell::RefCell::new(paths.into_iter().zip(locks).collect()),
+            last,
+            index: std::cell::Cell::new(0),
+        })
+    }
+
+    fn written(&self, path: &Path) {
+        if self.last.get(path) == Some(&self.index.get()) {
+            self.locks.borrow_mut().remove(path);
+        }
+    }
+
+    fn finish_hunk(&self) {
+        self.locks
+            .borrow_mut()
+            .retain(|path, _| self.last[path] != self.index.get());
+    }
+}
+
 struct AppliedHunkResult {
     index: usize,
     kind: &'static str,
@@ -342,6 +392,7 @@ fn write_patched_file(
     backed_paths: &mut HashSet<PathBuf>,
     created_in_call: bool,
     write_warnings: &mut Vec<String>,
+    admission: &PatchAdmission,
 ) -> Result<PatchedFile, String> {
     let existed = path.exists();
     let original = if existed {
@@ -367,11 +418,15 @@ fn write_patched_file(
     // A file this patch created has nothing from before the call to protect:
     // it is never rolled back, and its final content is syntax-checked once
     // after every hunk has run (see `created_file_syntax_checks`).
-    let written = if created_in_call {
-        edit::write_format_deferred_created(tool_policy, path, content, &ctx.config(), params)
-    } else {
-        edit::write_format_validate_deferred(tool_policy, path, content, &ctx.config(), params)
-    };
+    let written = edit::write_format_validate_admitted(
+        tool_policy,
+        path,
+        content,
+        &ctx.config(),
+        params,
+        created_in_call,
+        &|| admission.written(path),
+    );
     let mut write_result = match written {
         Ok(result) => result,
         Err(error) => {
@@ -663,6 +718,7 @@ fn apply_add(
     op_id: &str,
     backed_paths: &mut HashSet<PathBuf>,
     write_warnings: &mut Vec<String>,
+    admission: &PatchAdmission,
 ) -> Result<AppliedHunkResult, String> {
     if resolved.source.abs.exists() {
         return Err(
@@ -683,6 +739,7 @@ fn apply_add(
         backed_paths,
         true,
         write_warnings,
+        admission,
     )?;
     Ok(AppliedHunkResult {
         index: 0,
@@ -703,6 +760,7 @@ fn apply_delete(
     _path: &str,
     op_id: &str,
     backed_paths: &mut HashSet<PathBuf>,
+    admission: &PatchAdmission,
 ) -> Result<AppliedHunkResult, String> {
     if !resolved.source.abs.exists() {
         return Err("file not found".to_string());
@@ -715,6 +773,7 @@ fn apply_delete(
         .map_err(|error| format!("failed to read before delete: {error}"))?;
     let deletions = line_count(&before);
     delete_file_with_backup(req, ctx, &resolved.source.abs, op_id, backed_paths)?;
+    admission.written(&resolved.source.abs);
     Ok(AppliedHunkResult {
         index: 0,
         kind: "delete",
@@ -740,6 +799,7 @@ fn apply_update(
     backed_paths: &mut HashSet<PathBuf>,
     target_created_in_call: bool,
     write_warnings: &mut Vec<String>,
+    admission: &PatchAdmission,
 ) -> Result<AppliedHunkResult, String> {
     let original = fs::read_to_string(&resolved.source.abs)
         .map_err(|error| format!("failed to read file: {error}"))?;
@@ -758,6 +818,7 @@ fn apply_update(
             backed_paths,
             target_created_in_call,
             write_warnings,
+            admission,
         )
     } else {
         let written = write_patched_file(
@@ -771,6 +832,7 @@ fn apply_update(
             backed_paths,
             target_created_in_call,
             write_warnings,
+            admission,
         )?;
         Ok(AppliedHunkResult {
             index: 0,
@@ -797,6 +859,7 @@ fn apply_move_update(
     backed_paths: &mut HashSet<PathBuf>,
     dest_created_in_call: bool,
     write_warnings: &mut Vec<String>,
+    admission: &PatchAdmission,
 ) -> Result<AppliedHunkResult, String> {
     let dest_existed = dest.abs.exists();
     let dest_snapshot = if dest_existed {
@@ -819,6 +882,7 @@ fn apply_move_update(
         backed_paths,
         dest_created_in_call,
         write_warnings,
+        admission,
     ) {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -884,6 +948,7 @@ fn apply_move_update(
             }
         });
     }
+    admission.written(&resolved.source.abs);
     ctx.lsp_notify_watched_config_file(&resolved.source.abs, FileChangeType::DELETED);
 
     Ok(AppliedHunkResult {
@@ -973,7 +1038,8 @@ mod audit_regressions {
                 "failed-move",
                 &mut backed,
                 false,
-                &mut Vec::new()
+                &mut Vec::new(),
+                &PatchAdmission::default()
             )
             .is_err());
             if existed {
@@ -1113,6 +1179,10 @@ fn metadata_files(
 }
 
 fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) -> Response {
+    let admission = match PatchAdmission::acquire(resolved) {
+        Ok(admission) => admission,
+        Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
+    };
     let tool_policy = &crate::sandbox_spawn::ToolLaunchPolicy::for_request(ctx);
 
     let op_id = crate::backup::new_op_id();
@@ -1129,6 +1199,7 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
     let mut created: HashMap<PathBuf, usize> = HashMap::new();
 
     for (index, resolved_hunk) in resolved.iter().enumerate() {
+        admission.index.set(index);
         match &resolved_hunk.hunk {
             Hunk::Add { path, contents } => {
                 match apply_add(
@@ -1141,6 +1212,7 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
                     &op_id,
                     &mut backed_paths,
                     &mut write_warnings,
+                    &admission,
                 ) {
                     Ok(mut result) => {
                         result.index = index;
@@ -1155,7 +1227,15 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
                 }
             }
             Hunk::Delete { path } => {
-                match apply_delete(req, ctx, resolved_hunk, path, &op_id, &mut backed_paths) {
+                match apply_delete(
+                    req,
+                    ctx,
+                    resolved_hunk,
+                    path,
+                    &op_id,
+                    &mut backed_paths,
+                    &admission,
+                ) {
                     Ok(mut result) => {
                         result.index = index;
                         created.remove(&resolved_hunk.source.abs);
@@ -1187,6 +1267,7 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
                     &mut backed_paths,
                     target_created_in_call,
                     &mut write_warnings,
+                    &admission,
                 ) {
                     Ok(mut result) => {
                         result.index = index;
@@ -1209,8 +1290,10 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
                 }
             }
         }
+        admission.finish_hunk();
     }
 
+    drop(admission);
     let created_checks = created_file_syntax_checks(tool_policy, &created);
     insert_created_syntax_notices(&mut output_lines, &created, &created_checks);
 

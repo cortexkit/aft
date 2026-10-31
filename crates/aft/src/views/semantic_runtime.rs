@@ -34,13 +34,33 @@ use super::intent::{WriteIntent, WriteIntentListener, WritePhase};
 use super::manifest_v2::Producers;
 use super::registry::ViewRegistration;
 use super::semantic::{
-    FillAdmission, FillBudget, FillReport, SemanticPlane, SemanticProducer, SemanticQuery,
+    FillAdmission, FillBudget, FillReport, LeaseError, SemanticPlane, SemanticProducer,
+    SemanticQuery,
 };
 use super::snapshot::{DiskState, LiveDelta, Snapshot};
 
 /// Producer written into a manifest header for a plane its view does not
 /// register (for example the call graph of a lexical-only view).
 pub const UNREGISTERED_PRODUCER: &str = "unregistered";
+
+/// The producers of a checkout's semantic member, for building it and for
+/// opening it by producers (the parent folder worker does).
+///
+/// The call graph is unregistered, as for lexical-only views: the checkout's
+/// call graph is its own member (`<scope>.callgraph`), and nothing reads one
+/// from this member. A registered call-graph producer made this member's base
+/// and every publication extract call-graph facts and write a resolved
+/// call-graph database of their own (a clone where the filesystem supports
+/// clones, a full copy elsewhere), rebuilt whenever only embeddings changed.
+/// Unregistered, the base keeps its call-graph entries pending and builds no
+/// database.
+pub(crate) fn member_producers(trigram: String, semantic: String) -> Producers {
+    Producers {
+        trigram,
+        semantic: Some(semantic),
+        callgraph: UNREGISTERED_PRODUCER.into(),
+    }
+}
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -88,6 +108,19 @@ pub(crate) fn view_scope(scope: &str) -> String {
     format!("{scope}.semantic")
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CoordinationState {
+    Contended,
+    BaseBusy {
+        owner_pid: u32,
+        attempt: i64,
+    },
+    Error {
+        failure: LeaseError,
+        retry_in: Option<Duration>,
+    },
+}
+
 /// One checkout's semantic view: registration, driver and plane.
 pub struct CheckoutSemantic {
     root: PathBuf,
@@ -109,6 +142,7 @@ pub struct CheckoutSemantic {
     /// the scheduled deadline when a transient refresh is being retried. Searches
     /// report it as `semantic: unavailable: <reason>`.
     unavailable: Mutex<Option<String>>,
+    coordination: Mutex<Option<CoordinationState>>,
     /// Semantic searches answered from this view.
     searches: AtomicU64,
     /// Readiness successors this view published as its base's owner.
@@ -148,9 +182,9 @@ impl CheckoutSemantic {
     }
 
     /// [`Self::new`] for a root whose lexical views use `policy`. The view is a
-    /// v3 member (`<scope>.semantic`) with all three planes registered, so its
-    /// base carries trigram and call-graph rows too and its publications go
-    /// to the v3 namespace only.
+    /// v3 member (`<scope>.semantic`) with the trigram and semantic planes
+    /// registered; its publications go to the v3 namespace only. It has no
+    /// call-graph plane: the checkout's call graph is its own member.
     pub fn with_trigram_policy(
         storage: &crate::root_cache::StoragePaths,
         family: &str,
@@ -161,18 +195,13 @@ impl CheckoutSemantic {
         wake: Weak<CheckoutSemanticSlot>,
     ) -> Result<Self, String> {
         let plane = shared_plane(&storage.artifacts, producer);
-        let producers = Producers {
-            trigram: policy.fingerprint_hex(),
-            semantic: Some(plane.semantic_producer().id()),
-            callgraph: super::callgraph::PRODUCER.into(),
-        };
+        let producers = member_producers(policy.fingerprint_hex(), plane.semantic_producer().id());
         let composite: Arc<dyn CompositePlane> = plane.clone();
         let adapter: Arc<dyn PlaneAdapter> = plane.clone();
         let trigram = Arc::new(super::first_load::TrigramBridge::new(
             storage.artifacts.clone(),
             policy,
         ));
-        let callgraph = Arc::new(super::first_load::CallgraphBridge::default());
         let member_scope = view_scope(scope);
         let driver = Arc::new(
             CheckoutDriver::new_v3(
@@ -182,7 +211,7 @@ impl CheckoutSemantic {
                 root,
                 producers.clone(),
                 Arc::new(ConfiguredMembershipWalker),
-                vec![trigram, composite, callgraph],
+                vec![trigram, composite],
             )
             .map_err(|error| error.to_string())?
             .with_adapters(vec![adapter]),
@@ -210,6 +239,7 @@ impl CheckoutSemantic {
             unfolded: AtomicBool::new(false),
             refresh_attempts: AtomicUsize::new(0),
             unavailable: Mutex::new(None),
+            coordination: Mutex::new(None),
             searches: AtomicU64::new(0),
             base_successors: AtomicU64::new(0),
             #[cfg(test)]
@@ -438,6 +468,14 @@ impl CheckoutSemantic {
             None,
         ) {
             Ok(super::base_builder::ClaimOutcome::Claimed(claim)) => claim,
+            Ok(super::base_builder::ClaimOutcome::Busy { owner_pid, attempt }) => {
+                let mut report = FillReport::default();
+                report.queued = pending.len();
+                report.deferred = pending.len();
+                report.pending =
+                    Some(super::semantic::FillPending::BaseBusy { owner_pid, attempt });
+                return Ok(report);
+            }
             Ok(outcome) => {
                 crate::slog_debug!(
                     "semantic base fill left to its owner root={} base={} outcome={:?}",
@@ -494,6 +532,9 @@ impl CheckoutSemantic {
                     true,
                 )
                 .map_err(|error| RefreshError::classify(error.to_string()))?;
+            if report.pending.is_some() {
+                return Ok((report, false));
+            }
             let keys = self
                 .plane
                 .completed_keys(&self.owner, &draft, &pending)
@@ -595,7 +636,9 @@ impl CheckoutSemantic {
         self.refresh_with_admission(budget, embed, &mut |phase| match phase {
             FillAdmission::Preparation => admit(true),
             FillAdmission::Cold => admit(false),
-            FillAdmission::SuspendCold | FillAdmission::ResumeCold => Ok(()),
+            FillAdmission::SuspendCold
+            | FillAdmission::ResumeCold
+            | FillAdmission::CheckCurrent => Ok(()),
         })
     }
 
@@ -639,11 +682,27 @@ impl CheckoutSemantic {
             } else {
                 self.bind().map_err(RefreshError::classify)?
             };
+        } else if matches!(
+            self.coordination_state(),
+            Some(CoordinationState::BaseBusy { .. })
+        ) {
+            // Another process publishes base successors without waking this
+            // checkout's channel. Poll the binding before trying its claim again.
+            snapshot = self
+                .bind_with_subscription_check(false)
+                .map_err(RefreshError::classify)?;
         }
         let reconcile = reconcile_started.elapsed();
         // Inherited base entries first: once their successor is published,
         // every checkout of the base serves them, not only this one.
         let base_report = self.fill_base(budget, embed, admit)?;
+        let base_busy = matches!(
+            base_report.pending,
+            Some(super::semantic::FillPending::BaseBusy { .. })
+        );
+        if base_report.pending.is_some() && !base_busy {
+            return Ok(base_report);
+        }
         if base_report != FillReport::default() {
             snapshot = self.installed();
         }
@@ -707,6 +766,9 @@ impl CheckoutSemantic {
         report.failed += base_report.failed;
         report.errors.extend(base_report.errors);
         report.store_errors.extend(base_report.store_errors);
+        if report.pending.is_none() && report.errors.is_empty() && report.store_errors.is_empty() {
+            report.pending = base_report.pending;
+        }
         if own_progress {
             self.unfolded.store(true, Ordering::SeqCst);
         }
@@ -731,6 +793,22 @@ impl CheckoutSemantic {
     /// How many times `refresh` has run, successful or not.
     pub fn refresh_attempts(&self) -> usize {
         self.refresh_attempts.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn coordination_state(&self) -> Option<CoordinationState> {
+        lock(&self.coordination).clone()
+    }
+
+    fn set_coordination(&self, state: Option<CoordinationState>) {
+        *lock(&self.coordination) = state;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn coordination_pending(&self) -> bool {
+        matches!(
+            self.coordination_state(),
+            Some(CoordinationState::Contended | CoordinationState::BaseBusy { .. })
+        )
     }
 
     /// Why the checkout's vectors cannot be brought up to date, including a
@@ -1189,6 +1267,8 @@ impl CheckoutSemanticSlot {
     /// replaced, so status observers that must never block can report the
     /// lane as changing.
     pub fn try_state(&self) -> Option<Option<CheckoutSemanticState>> {
+        #[cfg(test)]
+        TEST_TRY_STATE_READS.with(|reads| reads.set(reads.get() + 1));
         match self.state.try_read() {
             Ok(state) => Some(state.clone()),
             Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner().clone()),
@@ -1279,6 +1359,11 @@ impl CheckoutSemanticSlot {
         retry.due = now;
         true
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_TRY_STATE_READS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Everything the fill worker needs besides the slot.
@@ -1513,6 +1598,7 @@ fn retry_activation<T>(
                 return Ok(value);
             }
             Err(RefreshError::Transient(reason)) => {
+                let store_busy = super::trigram::bind_is_busy(&reason);
                 let reason = schedule_retry(
                     slot,
                     epoch,
@@ -1521,15 +1607,28 @@ fn retry_activation<T>(
                     config.schedule.retry_initial,
                 );
                 if let Some(slot) = slot.upgrade() {
-                    slot.fail(epoch, reason.clone());
+                    if store_busy {
+                        slot.set(epoch, CheckoutSemanticState::Loading);
+                    } else {
+                        slot.fail(epoch, reason.clone());
+                    }
                 }
                 set_status(
                     slot,
                     epoch,
                     &config.status,
-                    crate::context::SemanticIndexStatus::Failed(format!(
-                        "semantic: unavailable: {reason}"
-                    )),
+                    if store_busy {
+                        crate::context::SemanticIndexStatus::Building {
+                            stage: CHECKOUT_VIEW_LOADING_STAGE.into(),
+                            files: None,
+                            entries_done: None,
+                            entries_total: None,
+                        }
+                    } else {
+                        crate::context::SemanticIndexStatus::Failed(format!(
+                            "semantic: unavailable: {reason}"
+                        ))
+                    },
                 );
                 crate::slog_warn!(
                     "semantic view unavailable root={} reason={}",
@@ -1659,16 +1758,22 @@ pub(crate) fn run_worker(
     if !is_current(&slot, epoch) {
         return;
     }
-    let runtime = match CheckoutSemantic::with_trigram_policy(
-        &config.storage,
-        &config.family,
-        &config.scope,
-        &config.root,
-        producer,
-        config.trigram_policy,
-        slot.clone(),
-    ) {
+    let runtime = match retry_activation(&slot, epoch, &wake, &config, "view registration", || {
+        CheckoutSemantic::with_trigram_policy(
+            &config.storage,
+            &config.family,
+            &config.scope,
+            &config.root,
+            producer.clone(),
+            config.trigram_policy,
+            slot.clone(),
+        )
+    }) {
         Ok(runtime) => Arc::new(runtime),
+        Err(RefreshError::Superseded) => {
+            release_lane(&slot, epoch);
+            return;
+        }
         Err(error) => return fail(format!("view registration: {error}")),
     };
     if !is_current(&slot, epoch) {
@@ -1697,8 +1802,15 @@ pub(crate) fn run_worker(
         return;
     }
     // Build the index queries score before the lane is served, so neither
-    // the first query nor a readiness sample has to build it.
-    let _ = runtime.index();
+    // the first query nor a readiness sample has to build it. A failure here
+    // is retried by the first query, which also counts it in health.
+    if let Err(error) = runtime.index() {
+        crate::slog_warn!(
+            "semantic view index build failed root={} error={}",
+            config.root.display(),
+            error
+        );
+    }
     crate::slog_info!(
         "semantic view loaded root={} family={} scope={} load_ms={}",
         config.root.display(),
@@ -1758,6 +1870,12 @@ enum FillOutcome {
         progress: bool,
         reason: Option<String>,
     },
+    /// Coordination is pending, not a failed/unavailable semantic backend.
+    Contended,
+    /// Retry outside refresh and poll the base owner's published successor.
+    BasePending,
+    /// A lease failed, distinct from an owner that can finish pending work.
+    LeaseError(LeaseError),
     /// The lane is no longer this worker's.
     Stop,
     /// The lane is still this worker's, but its root lost its route while the
@@ -1926,6 +2044,10 @@ fn serve_fills_with_status<F>(
     let mut backoff = schedule.retry_initial;
     let mut retry_after = None;
     let mut first = true;
+    let mut contention_started = None;
+    let mut contention_attempts = 0u64;
+    let mut lease_error_attempts = 0u32;
+    const LEASE_ERROR_RETRIES: u32 = 4;
     loop {
         if !first {
             let woke = match retry_after {
@@ -1947,6 +2069,9 @@ fn serve_fills_with_status<F>(
                     Err(_) => return,
                 },
             };
+            if woke {
+                lease_error_attempts = 0;
+            }
             #[cfg(test)]
             if woke {
                 observe_fill(&schedule.root, "wake");
@@ -1982,12 +2107,118 @@ fn serve_fills_with_status<F>(
         };
         match outcome {
             FillOutcome::Stop => return,
+            pending @ (FillOutcome::Contended | FillOutcome::BasePending) => {
+                let base_pending = matches!(pending, FillOutcome::BasePending);
+                lease_error_attempts = 0;
+                let started = *contention_started.get_or_insert_with(Instant::now);
+                contention_attempts += 1;
+                // Capped, non-FIFO jitter avoids synchronized process convoys.
+                let salt = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos() as u64
+                    ^ u64::from(std::process::id())
+                    ^ contention_attempts;
+                let half = backoff / 2;
+                let jitter =
+                    Duration::from_nanos(salt % (half.as_nanos().min(u64::MAX as u128) as u64 + 1));
+                let wait = (half + jitter).min(schedule.retry_max);
+                schedule_retry(
+                    slot,
+                    epoch,
+                    super::semantic_batch_lease::PENDING_CONTROL,
+                    wait,
+                    schedule.retry_initial,
+                );
+                retry_after = Some((wait, true));
+                if let Some(runtime) = slot.upgrade().and_then(|slot| {
+                    let runtime = slot.runtime()?;
+                    slot.is_current(epoch).then_some(runtime)
+                }) {
+                    runtime.clear_unavailable();
+                }
+                if let Some(status) = status {
+                    set_status(
+                        slot,
+                        epoch,
+                        status,
+                        crate::context::SemanticIndexStatus::ready(),
+                    );
+                }
+                crate::slog_info!(
+                    "semantic batch pending base_pending={} retry_count={} wait_age_ms={} retry_ms={}",
+                    base_pending,
+                    contention_attempts,
+                    started.elapsed().as_millis(),
+                    wait.as_millis()
+                );
+                #[cfg(test)]
+                observe_fill(
+                    &schedule.root,
+                    if base_pending {
+                        "base_pending"
+                    } else {
+                        "contended"
+                    },
+                );
+                backoff = (backoff * 2).min(schedule.retry_max);
+            }
+            FillOutcome::LeaseError(failure) => {
+                lease_error_attempts += 1;
+                let retry_in = (failure.retryable && lease_error_attempts <= LEASE_ERROR_RETRIES)
+                    .then_some(backoff);
+                if let Some(wait) = retry_in {
+                    schedule_retry(
+                        slot,
+                        epoch,
+                        super::semantic_batch_lease::ERROR_CONTROL,
+                        wait,
+                        schedule.retry_initial,
+                    );
+                    retry_after = Some((wait, true));
+                    backoff = (backoff * 2).min(schedule.retry_max);
+                } else {
+                    clear_retry(slot, epoch);
+                    retry_after = None;
+                }
+                if let Some(runtime) = slot.upgrade().and_then(|slot| {
+                    let runtime = slot.runtime()?;
+                    slot.is_current(epoch).then_some(runtime)
+                }) {
+                    runtime.clear_unavailable();
+                    runtime.set_coordination(Some(CoordinationState::Error {
+                        failure: failure.clone(),
+                        retry_in,
+                    }));
+                }
+                // The loaded vectors remain usable. Only coordination failed;
+                // do not turn this into an unavailable embedding backend.
+                if let Some(status) = status {
+                    set_status(
+                        slot,
+                        epoch,
+                        status,
+                        crate::context::SemanticIndexStatus::ready(),
+                    );
+                }
+                crate::slog_warn!(
+                    "semantic batch lease error retry_count={} retry_scheduled={} error={}",
+                    lease_error_attempts,
+                    retry_in.is_some(),
+                    failure
+                );
+                #[cfg(test)]
+                observe_fill(&schedule.root, "lease_error");
+            }
             FillOutcome::Parked => {
                 #[cfg(test)]
                 observe_fill(&schedule.root, "parked");
                 retry_after = None;
             }
             FillOutcome::Settled => {
+                lease_error_attempts = 0;
+                contention_started = None;
+                contention_attempts = 0;
                 clear_retry(slot, epoch);
                 if let Some(status) = status {
                     let value = match slot
@@ -2008,6 +2239,7 @@ fn serve_fills_with_status<F>(
                 retry_after = None;
             }
             FillOutcome::Retry { progress, reason } => {
+                lease_error_attempts = 0;
                 if progress {
                     backoff = schedule.retry_initial;
                 }
@@ -2116,6 +2348,9 @@ where
 {
     let mut progress = false;
     let mut telemetry = None;
+    let mut local_backoff = schedule.retry_initial;
+    let mut local_attempts = 0u64;
+    let local_started = Instant::now();
     loop {
         if !is_current(slot, epoch) {
             return FillOutcome::Stop;
@@ -2143,17 +2378,24 @@ where
                     permit.ok_or_else(|| "semantic lane superseded".to_owned())
                 };
                 let mut embedding = |texts| {
+                    // Inflight memory stays admitted, but HTTP must not occupy
+                    // cold CPU capacity. Chunk persistence holds the semantic
+                    // batch lease and local gate but no cold slot; the fill
+                    // releases both and all claims before cold readmission.
                     cold_permit.borrow_mut().take();
                     crate::cold_build_limiter::progress::stage("waiting for embedding backend");
                     let result = embed(texts);
-                    // Chunk-gate waiters release cold admission before blocking,
-                    // so they cannot keep cold slots while the gate owner resumes.
-                    *cold_permit.borrow_mut() = Some(acquire(&schedule.limiter, LIMITER_KIND)?);
                     crate::cold_build_limiter::progress::stage("storing embeddings");
                     result
                 };
                 let report = runtime
                     .refresh_with_admission(budget, &mut embedding, &mut |phase| {
+                        if !is_current(slot, epoch) {
+                            return Err("semantic lane superseded".into());
+                        }
+                        if phase == FillAdmission::CheckCurrent {
+                            return Ok(());
+                        }
                         if phase == FillAdmission::SuspendCold {
                             cold_permit.borrow_mut().take();
                             crate::cold_build_limiter::progress::stage(
@@ -2220,8 +2462,74 @@ where
         if !is_current(slot, epoch) {
             return FillOutcome::Stop;
         }
+        if refresh.is_err() {
+            runtime.set_coordination(None);
+        }
         match refresh {
             Ok(report) => {
+                runtime.set_coordination(report.pending.as_ref().map(|pending| match pending {
+                    super::semantic::FillPending::LeaseError(failure) => CoordinationState::Error {
+                        failure: failure.clone(),
+                        retry_in: None,
+                    },
+                    super::semantic::FillPending::BaseBusy { owner_pid, attempt } => {
+                        CoordinationState::BaseBusy {
+                            owner_pid: *owner_pid,
+                            attempt: *attempt,
+                        }
+                    }
+                    _ => CoordinationState::Contended,
+                }));
+                if let Some(super::semantic::FillPending::LeaseError(failure)) = &report.pending {
+                    return FillOutcome::LeaseError(failure.clone());
+                }
+                if matches!(
+                    report.pending,
+                    Some(super::semantic::FillPending::BaseBusy { .. })
+                ) {
+                    return FillOutcome::BasePending;
+                }
+                if report.pending == Some(super::semantic::FillPending::LocalContention) {
+                    // refresh, its file claims and all scoped permits have
+                    // returned. Park only this background worker, checking lane
+                    // cancellation at a bounded interval, outside refresh and
+                    // both semantic exclusion guards.
+                    local_attempts += 1;
+                    let salt = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .subsec_nanos() as u64
+                        ^ local_attempts;
+                    let half = local_backoff / 2;
+                    let jitter = Duration::from_nanos(
+                        salt % (half.as_nanos().min(u64::MAX as u128) as u64 + 1),
+                    );
+                    let deadline = Instant::now() + (half + jitter).min(schedule.retry_max);
+                    crate::slog_debug!(
+                        "semantic local batch pending retry_count={} wait_age_ms={}",
+                        local_attempts,
+                        local_started.elapsed().as_millis()
+                    );
+                    while Instant::now() < deadline {
+                        if !is_current(slot, epoch) {
+                            return FillOutcome::Stop;
+                        }
+                        std::thread::park_timeout(
+                            deadline
+                                .saturating_duration_since(Instant::now())
+                                .min(Duration::from_millis(100)),
+                        );
+                    }
+                    local_backoff = (local_backoff * 2).min(schedule.retry_max);
+                    continue;
+                }
+                if let Some(pending) = &report.pending {
+                    crate::slog_debug!(
+                        "semantic batch refresh pending root={} outcome={pending:?}",
+                        schedule.root.display()
+                    );
+                    return FillOutcome::Contended;
+                }
                 if report.model_calls > 0
                     || report.installed > 0
                     || !report.errors.is_empty()
@@ -2267,11 +2575,27 @@ where
                 }
                 let advanced = report.installed > 0 || report.failed > 0;
                 progress |= advanced;
-                // A store that refuses what was embedded will refuse it again
-                // on a timer: record it as the checkout's unavailable reason
-                // and wait for the next wake.
                 if let Some(error) = report.store_errors.first() {
-                    mark_unavailable(runtime, schedule, format!("semantic store: {error}"));
+                    let reason = format!("semantic store: {error}");
+                    // Contention (a busy or locked store, a namespace another
+                    // process is writing) clears by itself: retry on the
+                    // backoff rather than waiting for an unrelated wake.
+                    if is_transient_reason(&reason) {
+                        crate::slog_warn!(
+                            "semantic view fill will retry a busy store root={} error={}",
+                            schedule.root.display(),
+                            reason
+                        );
+                        warm_index(runtime);
+                        return FillOutcome::Retry {
+                            progress,
+                            reason: Some(reason),
+                        };
+                    }
+                    // A store that refuses what was embedded will refuse it
+                    // again on a timer: record it as the checkout's
+                    // unavailable reason and wait for the next wake.
+                    mark_unavailable(runtime, schedule, reason);
                     warm_index(runtime);
                     return FillOutcome::Settled;
                 }
@@ -2380,14 +2704,14 @@ impl std::fmt::Display for RefreshError {
 }
 
 /// Whether a model, load or store failure clears by itself. Embedding errors
-/// carry the backend's authoritative transient marker. The only store failure
-/// retried is SQLite's busy/locked
-/// (another connection holds the database for a moment); every other store
-/// error is surfaced as the checkout's named gap.
+/// carry the backend's authoritative transient marker. Store contention includes
+/// SQLite's busy/locked and a namespace inventory changed by another writer;
+/// every other store error is surfaced as the checkout's named gap.
 /// A publication or installation that may already have committed carries the
 /// checkout-change marker so the worker revalidates a fresh job before serving it.
 pub fn is_transient_reason(reason: &str) -> bool {
     crate::semantic_index::embedding_failure_is_transient(reason)
+        || super::trigram::bind_is_busy(reason)
         || [
             super::first_load::CHECKOUT_CHANGED_DURING_RECONCILE,
             super::first_load::CHECKOUT_WRITE_ACTIVE,
@@ -2402,9 +2726,16 @@ pub fn is_transient_reason(reason: &str) -> bool {
 }
 
 /// Rebuilds the scored index after a fill, on the worker rather than on the
-/// next query.
+/// next query. A failure is retried by the next query, which also counts it
+/// in health; the log names it here so it is not lost when no query follows.
 fn warm_index(runtime: &CheckoutSemantic) {
-    let _ = runtime.index();
+    if let Err(error) = runtime.index() {
+        crate::slog_warn!(
+            "semantic view index rebuild failed root={} error={}",
+            runtime.root.display(),
+            error
+        );
+    }
 }
 
 #[cfg(test)]

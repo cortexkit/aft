@@ -13664,6 +13664,41 @@ async fn drive_management_surface_daemon(input: FakeDaemonInput) {
     assert!(census_io["available"].is_boolean());
     assert!(census_io["sampled_at_ms"].is_u64());
 
+    let ownership = &census["data"]["route_ownership"];
+    assert_eq!(ownership["summary"]["bound_routes"], 1);
+    assert_eq!(
+        ownership["summary"]["unscoped"],
+        json!({"routes": 1, "roots": 1})
+    );
+    let route = &ownership["roots"][0]["routes"][0];
+    assert_eq!(route["channel"], 1);
+    assert_eq!(route["harness"], "opencode");
+    assert_eq!(route["session_id"], "session-1");
+    assert_eq!(route["principal"], "direct");
+    assert_eq!(route["scope"], "none");
+    assert!(route["last_tool_call_age_ms"].is_null());
+    send_control_request(&mut stream, 330, ModuleControlRequest::HealthCheck {}).await;
+    let health = expect_health_check_report(&mut stream, 330).await;
+    assert_eq!(
+        health.metrics.unwrap()["route_ownership_summary"]["bound_routes"],
+        1
+    );
+    send_management_request(&mut stream, 2, 331, json!({"op":"memory.census"})).await;
+    let polled = read_management_response(&mut stream, 2, 331, "memory.census").await;
+    assert!(
+        polled["data"]["route_ownership"]["roots"][0]["routes"][0]["last_tool_call_age_ms"]
+            .is_null(),
+        "health and census polling must not count as admitted tools"
+    );
+    expect_manifest_tool_success(&mut stream, 332, "glob", json!({"pattern":"*"})).await;
+    send_management_request(&mut stream, 2, 333, json!({"op":"memory.census"})).await;
+    let called = read_management_response(&mut stream, 2, 333, "memory.census").await;
+    assert!(
+        called["data"]["route_ownership"]["roots"][0]["routes"][0]["last_tool_call_age_ms"]
+            .is_u64()
+    );
+    assert!(called["data"]["route_ownership"]["roots"][0]["last_tool_call_age_ms"].is_u64());
+
     send_management_request(
         &mut stream,
         2,
@@ -13745,6 +13780,79 @@ async fn drive_management_surface_daemon(input: FakeDaemonInput) {
     assert_eq!(executor.actor_count(), actor_count);
     assert_eq!(state.configure_count(), configure_count);
     assert_eq!(app.watcher_count(), watcher_count);
+
+    let owner = Principal::Reserved {
+        module_id: "prefrontal-core".into(),
+    };
+    let stamp = subc_protocol::scope::ScopeStamp::new(
+        owner.clone(),
+        "census-scope",
+        7,
+        subc_protocol::scope::ScopeKind::Head,
+    );
+    send_control_request(
+        &mut stream,
+        340,
+        ModuleControlRequest::RouteBind {
+            route_channel: 6,
+            epoch: 1,
+            target: RouteTarget::ToolProvider {
+                module_id: "aft".into(),
+            },
+            identity: BindIdentity::new(root1.clone(), "opencode", "census-scoped"),
+            principal: Some(owner),
+            scope: Some(stamp),
+            consumer_capabilities: None,
+            admission_facts: Default::default(),
+            role_versions: None,
+            call_mode: None,
+        },
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 340).await;
+    send_management_request(&mut stream, 2, 341, json!({"op":"memory.census"})).await;
+    let paired = read_management_response(&mut stream, 2, 341, "memory.census").await;
+    let ownership = &paired["data"]["route_ownership"];
+    assert_eq!(ownership["summary"]["bound_routes"], 2);
+    assert_eq!(ownership["summary"]["bound_roots"], 1);
+    assert_eq!(
+        ownership["summary"]["scoped"],
+        json!({"routes":1,"roots":1})
+    );
+    assert_eq!(
+        ownership["summary"]["unscoped"],
+        json!({"routes":1,"roots":1})
+    );
+    assert_eq!(
+        ownership["roots"][0]["routes"][1]["scope"],
+        json!({"owner":"reserved:prefrontal-core","ref":"census-scope","epoch":7})
+    );
+    assert_eq!(
+        ownership["roots"][0]["routes"][1]["principal"],
+        "reserved:prefrontal-core"
+    );
+    send_route_goodbye(&mut stream, 6, 342).await;
+    send_management_request(&mut stream, 2, 343, json!({"op":"memory.census"})).await;
+    let detached = read_management_response(&mut stream, 2, 343, "memory.census").await;
+    assert_eq!(
+        detached["data"]["route_ownership"]["summary"]["bound_routes"],
+        1
+    );
+    assert_eq!(
+        detached["data"]["route_ownership"]["summary"]["scoped"]["routes"],
+        0
+    );
+    send_route_goodbye(&mut stream, 1, 344).await;
+    send_management_request(&mut stream, 2, 345, json!({"op":"memory.census"})).await;
+    let unbound = read_management_response(&mut stream, 2, 345, "memory.census").await;
+    assert_eq!(
+        unbound["data"]["route_ownership"]["summary"]["bound_roots"],
+        0
+    );
+    assert_eq!(
+        unbound["data"]["route_ownership"]["summary"]["bound_routes"],
+        0
+    );
 
     send_connection_goodbye(&mut stream).await;
 }

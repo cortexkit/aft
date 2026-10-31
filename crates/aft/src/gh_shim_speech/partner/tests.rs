@@ -1,5 +1,71 @@
 use super::*;
 
+#[test]
+fn invalid_bot_request_warns_without_logging_nonce_or_payload() {
+    for (nonce, handle, check) in [
+        ("", "app-a", "nonce_empty"),
+        ("secret-nonce", "", "app_handle_empty"),
+    ] {
+        crate::gh_shim_speech::tests::assert_snapshot_warning(
+            || {
+                BotRequest::new(
+                    json!({"body": "secret-payload"}),
+                    nonce,
+                    Binding {
+                        app_handle_id: handle.into(),
+                        repo_binding_generation: 7,
+                    },
+                    None,
+                )
+                .err()
+                .expect("invalid request must refuse")
+            },
+            "gh_shim_speech::partner::BotRequest::new",
+            check,
+            json!({"binding_generation": 7}),
+        );
+    }
+}
+
+#[test]
+fn partner_snapshot_refusal_warns_with_only_closed_code_and_scope_roles() {
+    for code in ["invalid_request", "nonce_payload_mismatch"] {
+        crate::gh_shim_speech::tests::assert_snapshot_warning(
+            || {
+                map_refusal(
+                    &json!({
+                        "status": "refused", "code": code, "transmission": "not_sent",
+                        "message": "secret-provider-message", "request_nonce": "secret-nonce",
+                    }),
+                    ScopeRole::Head,
+                )
+                .expect("known pre-write refusal")
+            },
+            "gh_shim_speech::partner::map_refusal",
+            code,
+            json!({"route_role": "head", "scope_role": "head", "field": null}),
+        );
+    }
+    for (field, safe_field) in [
+        (
+            "expect.repo_binding_generation",
+            "expect.repo_binding_generation",
+        ),
+        ("secret-provider-field", "unrecognized"),
+    ] {
+        crate::gh_shim_speech::tests::assert_snapshot_warning(
+            || {
+                map_refusal(&json!({
+                "status": "refused", "code": "invalid_request", "transmission": "not_sent", "field": field,
+            }), ScopeRole::Head).unwrap()
+            },
+            "gh_shim_speech::partner::map_refusal",
+            "invalid_request",
+            json!({"route_role": "head", "scope_role": "head", "field": safe_field}),
+        );
+    }
+}
+
 fn run(reference: &str, epoch: u64) -> ScopeStamp {
     ScopeStamp::new(
         subc_protocol::Principal::Reserved {

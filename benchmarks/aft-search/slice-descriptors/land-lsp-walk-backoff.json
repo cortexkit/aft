@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "lsp-walk-backoff"
+  ],
+  "note": "Language-server applicability cache backoff for walks that hit the entry limit, plus a typed error for that case. No changed path matches RANKING_FENCE_PREFIXES."
+}

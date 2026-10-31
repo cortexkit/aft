@@ -1,0 +1,9 @@
+{
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "kind": "readiness",
+  "note": "Views: base identity hashes only the Git config keys that can change how a member is read (line endings, filters, attributes file, symlinks, case and Unicode folding). Branch, remote and user settings no longer split bases. Views are off by default. No search, ranking or query routing changes.",
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none"
+}

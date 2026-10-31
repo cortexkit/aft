@@ -2569,6 +2569,8 @@ fn post_edit_wait_rejects_stale_pre_edit_publish() {
 
     let file = PathBuf::from("/tmp/aft-stale.rs");
     let stale = DiagnosticEntry {
+        from_receive_order: false,
+        content_hash: None,
         diagnostics: vec![StoredDiagnostic {
             file,
             line: 1,
@@ -2606,6 +2608,8 @@ fn post_edit_wait_rejects_unversioned_epoch_only_publish() {
 
     let file = PathBuf::from("/tmp/aft-unversioned.rs");
     let unversioned = DiagnosticEntry {
+        from_receive_order: false,
+        content_hash: None,
         diagnostics: vec![StoredDiagnostic {
             file,
             line: 1,
@@ -2922,6 +2926,8 @@ fn edit_diagnostics_reports_warming_publish_as_pending_until_quiescent() {
         root: PathBuf::from("/workspace"),
     };
     let entry = DiagnosticEntry {
+        from_receive_order: false,
+        content_hash: None,
         diagnostics: vec![StoredDiagnostic {
             file,
             line: 1,
@@ -3409,6 +3415,289 @@ fn forwarded_changes(root: &std::path::Path, params: &serde_json::Value) -> Vec<
         .collect();
     changes.sort();
     changes
+}
+
+mod mutation_events {
+    use super::*;
+
+    fn check(command: &str, operation: &str, expected: &[(&str, i64)]) {
+        check_subscribed(command, operation, expected, None);
+    }
+
+    fn check_subscribed(
+        command: &str,
+        operation: &str,
+        expected: &[(&str, i64)],
+        watchers: Option<serde_json::Value>,
+    ) {
+        let (_temp, root, files) = typescript_workspace_with_files(&["importer.ts", "before.ts"]);
+        let importer = &files[0];
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config {
+                project_root: Some(root.clone()),
+                format_on_edit: false,
+                ..Config::default()
+            }),
+        )
+        .with_test_checkpoint_store();
+        ctx.lsp()
+            .override_binary(ServerKind::TypeScript, fake_server_path());
+        if let Some(watchers) = watchers {
+            ctx.lsp()
+                .set_extra_env("AFT_FAKE_LSP_WATCHED_GLOBS", &watchers.to_string());
+        }
+        if operation == "ignored write" {
+            fs::write(root.join(".gitignore"), "src/after.ts\n").unwrap();
+            ctx.rebuild_gitignore();
+        }
+        let outcome = ctx.lsp_notify_and_collect_diagnostics(
+            importer,
+            "export const importer = 1;\n",
+            Duration::from_secs(15),
+        );
+        assert!(outcome.complete(), "fake server startup: {outcome:?}");
+        ctx.lsp().drain_events();
+
+        let (_other_temp, other_root, other_files) = typescript_workspace_with_files(&["other.ts"]);
+        let outcome = ctx.lsp_notify_and_collect_diagnostics(
+            &other_files[0],
+            "export const other = 1;\n",
+            Duration::from_secs(15),
+        );
+        assert!(
+            outcome.complete(),
+            "sibling fake server startup: {outcome:?}"
+        );
+        assert_eq!(
+            ctx.lsp().active_server_keys().len(),
+            2,
+            "two independent server roots"
+        );
+        ctx.lsp().drain_events();
+
+        let before = root.join("src/before.ts");
+        let after = root.join("src/after.ts");
+        let params = match operation {
+            "write" | "queued write" | "ignored write" | "recreate" => {
+                serde_json::json!({"file": after, "content": "export const added = 1;\n"})
+            }
+            "edit" => serde_json::json!({"file": before, "content": "export const value = 2;\n"}),
+            "delete" => serde_json::json!({"file": before}),
+            "move" => serde_json::json!({"file": before, "destination": after}),
+            "add hunk" => serde_json::json!({"patch_text": format!(
+                "*** Begin Patch\n*** Add File: {}\n+export const added = 1;\n*** End Patch", after.display())}),
+            "delete hunk" => serde_json::json!({"patch_text": format!(
+                "*** Begin Patch\n*** Delete File: {}\n*** End Patch", before.display())}),
+            "move hunk" => serde_json::json!({"patch_text": format!(
+                "*** Begin Patch\n*** Update File: {}\n*** Move to: {}\n@@\n-export const value = 1;\n+export const value = 2;\n*** End Patch", before.display(), after.display())}),
+            _ => panic!("unknown operation"),
+        };
+        let req = RawRequest {
+            id: operation.into(),
+            command: command.into(),
+            params,
+            lsp_hints: None,
+            session_id: None,
+        };
+        let held = (operation == "queued write").then(|| ctx.lsp());
+        let response = match command {
+            "write" => handle_write(&req, &ctx),
+            "delete_file" => handle_delete_file(&req, &ctx),
+            "move_file" => handle_move_file(&req, &ctx),
+            "apply_patch" => aft::commands::apply_patch::handle_apply_patch(&req, &ctx),
+            _ => panic!("unknown command"),
+        };
+        drop(held);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while ctx.lsp_pending_changes_for_test() {
+            assert!(
+                Instant::now() < deadline,
+                "mutation events did not drain after contention"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let response = serde_json::to_value(response).unwrap();
+        assert_eq!(response["success"], true, "{operation}: {response:#}");
+
+        if operation == "recreate" {
+            let req: RawRequest = serde_json::from_value(
+                serde_json::json!({"id": "delete-again", "command": "delete_file", "file": after}),
+            )
+            .unwrap();
+            assert!(handle_delete_file(&req, &ctx).success);
+            let req: RawRequest = serde_json::from_value(serde_json::json!({"id": "create-again", "command": "write", "file": after, "content": "export const added = 1;\n"})).unwrap();
+            assert!(handle_write(&req, &ctx).success);
+        }
+
+        // A single watcher echo is coalesced, then its bookkeeping is released.
+        // Exercise path-only OS events and a typed create delayed past an edit.
+        let final_events = expected
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let echoes = final_events
+            .iter()
+            .map(|(path, kind)| {
+                (
+                    root.join(path),
+                    if *kind == 1 {
+                        FileChangeType::CREATED
+                    } else {
+                        FileChangeType::DELETED
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        if operation == "write" {
+            let req: RawRequest = serde_json::from_value(serde_json::json!({"id": "edit-created", "command": "write", "file": after, "content": "export const added = 123456;\n"})).unwrap();
+            assert!(handle_write(&req, &ctx).success);
+            // An old create event can arrive after a later content edit. It
+            // still describes the same creation, not another new module.
+            ctx.lsp().forward_watcher_file_events(&echoes, &[]);
+        } else {
+            ctx.lsp_forward_watcher_file_events(
+                &echoes
+                    .iter()
+                    .map(|(path, _)| path.clone())
+                    .collect::<Vec<_>>(),
+            );
+        }
+
+        // The importer is untouched by the mutation. Its acknowledgement is a
+        // protocol barrier: every earlier watched-file event has been echoed.
+        // AFT sends the resolved path (macOS temp dirs resolve /var to
+        // /private/var), so the barrier must compare against that spelling.
+        let importer_uri =
+            aft::lsp::position::uri_for_path(&crate::helpers::canonicalize_like_product(importer))
+                .unwrap();
+        ctx.lsp()
+            .notify_file_changed(importer, "export const importer = 2;\n", &ctx.config())
+            .unwrap();
+        let mut actual = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        'wait: loop {
+            assert!(Instant::now() < deadline, "missing importer barrier");
+            for event in ctx.lsp().drain_events() {
+                if let LspEvent::Notification {
+                    method,
+                    params: Some(params),
+                    ..
+                } = event
+                {
+                    if method == "custom/watchedFilesChanged" {
+                        actual.extend(forwarded_changes(&root, &params));
+                    } else if method == "custom/documentChanged"
+                        && params["uri"] == importer_uri.as_str()
+                    {
+                        break 'wait;
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        actual.sort();
+        let (other_events, _) =
+            server_reports_before_barrier(&ctx, &other_files[0], "export const other = 2;\n");
+        assert!(
+            other_events.is_empty(),
+            "server rooted at {} received another root's mutation: {other_events:?}",
+            other_root.display()
+        );
+        let mut expected = expected
+            .iter()
+            .map(|(path, kind)| (path.to_string(), *kind))
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(
+            actual, expected,
+            "{operation} must report exact lifecycle events"
+        );
+    }
+
+    #[test]
+    fn lsp_mutation_write_created() {
+        check("write", "write", &[("src/after.ts", 1)]);
+    }
+    #[test]
+    fn lsp_mutation_delete_deleted() {
+        check("delete_file", "delete", &[("src/before.ts", 3)]);
+    }
+    #[test]
+    fn lsp_mutation_move_deleted_created() {
+        check(
+            "move_file",
+            "move",
+            &[("src/after.ts", 1), ("src/before.ts", 3)],
+        );
+    }
+    #[test]
+    fn lsp_mutation_patch_add_created() {
+        check("apply_patch", "add hunk", &[("src/after.ts", 1)]);
+    }
+    #[test]
+    fn lsp_mutation_patch_delete_deleted() {
+        check("apply_patch", "delete hunk", &[("src/before.ts", 3)]);
+    }
+    #[test]
+    fn lsp_mutation_patch_move_deleted_created() {
+        check(
+            "apply_patch",
+            "move hunk",
+            &[("src/after.ts", 1), ("src/before.ts", 3)],
+        );
+    }
+    #[test]
+    fn lsp_mutation_existing_content_keeps_document_notifications_only() {
+        check("write", "edit", &[]);
+    }
+    #[test]
+    fn lsp_mutation_create_survives_busy_manager() {
+        check("write", "queued write", &[("src/after.ts", 1)]);
+    }
+    #[test]
+    fn lsp_mutation_create_ignored_source_still_notifies_server() {
+        check("write", "ignored write", &[("src/after.ts", 1)]);
+    }
+    #[test]
+    fn lsp_mutation_create_respects_registered_glob() {
+        check_subscribed(
+            "write",
+            "write",
+            &[],
+            Some(serde_json::json!([{"globPattern": "**/*.js"}])),
+        );
+    }
+    #[test]
+    fn lsp_mutation_create_respects_registered_kind() {
+        check_subscribed(
+            "write",
+            "write",
+            &[],
+            Some(serde_json::json!([{"globPattern": "**/*.ts", "kind": 4}])),
+        );
+    }
+    #[test]
+    fn lsp_mutation_delete_then_recreate_reports_each_transition() {
+        check(
+            "write",
+            "recreate",
+            &[
+                ("src/after.ts", 1),
+                ("src/after.ts", 3),
+                ("src/after.ts", 1),
+            ],
+        );
+    }
+    #[test]
+    fn lsp_mutation_recreate_with_creation_only_subscription() {
+        check_subscribed(
+            "write",
+            "recreate",
+            &[("src/after.ts", 1), ("src/after.ts", 1)],
+            Some(serde_json::json!([{"globPattern": "**/*.ts", "kind": 1}])),
+        );
+    }
 }
 
 #[test]

@@ -1615,6 +1615,21 @@ pub fn parse_file_imports(
     Ok((source, tree, block))
 }
 
+/// Capture the mutation baseline together with the text used to parse imports.
+pub(crate) fn parse_file_imports_observed(
+    path: &std::path::Path,
+    lang: LangId,
+) -> Result<(String, Tree, ImportBlock, crate::edit::EditObservation), crate::error::AftError> {
+    let (source, observation) = crate::edit::read_edit_source(path).map_err(|error| {
+        crate::error::AftError::FileNotFound {
+            path: format!("{}: {error}", path.display()),
+        }
+    })?;
+    let tree = crate::parser::parse_source_with_cached_parser(path, &source, lang)?;
+    let block = parse_imports(&source, &tree, lang);
+    Ok((source, tree, block, observation))
+}
+
 // ---------------------------------------------------------------------------
 // TS/JS/TSX implementation
 // ---------------------------------------------------------------------------
@@ -2425,6 +2440,17 @@ fn parse_py_imports(source: &str, tree: &Tree) -> ImportBlock {
     ImportBlock {
         imports,
         byte_range,
+    }
+}
+
+/// Parse one Python import without imposing the import editor's top-level boundary.
+pub(crate) fn parse_py_import_node(source: &str, node: &Node) -> Option<ImportStatement> {
+    match node.kind() {
+        "import_statement" => parse_py_import_statement(source, node),
+        "import_from_statement" | "future_import_statement" => {
+            parse_py_import_from_statement(source, node)
+        }
+        _ => None,
     }
 }
 

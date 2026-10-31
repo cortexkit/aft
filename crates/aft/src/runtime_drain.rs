@@ -3001,6 +3001,7 @@ pub(crate) struct FileMutationGuard<'a> {
     ctx: &'a AppContext,
     revisit: Vec<PathBuf>,
     paths: std::collections::BTreeSet<PathBuf>,
+    files_before: std::collections::BTreeMap<PathBuf, bool>,
     before: MutationRefreshBudget,
     overflowed: bool,
     _view_intent: crate::views::intent::IntentGuard,
@@ -3097,10 +3098,18 @@ pub(crate) fn record_file_mutation<'a, 'p>(
     let mut before = MutationRefreshBudget::new();
     let overflowed =
         !collect_mutation_paths(ctx, &roots, &mut paths, Some(&mut revisit), &mut before);
+    // Explicit targets also matter when ignored by the search index: a language
+    // server can still watch and import a file that an agent writes there.
+    let files_before = roots
+        .iter()
+        .chain(paths.iter())
+        .map(|path| (path.clone(), path.is_file()))
+        .collect();
     FileMutationGuard {
         ctx,
         revisit,
         paths,
+        files_before,
         before,
         overflowed,
         _view_intent: view_intent,
@@ -3130,6 +3139,7 @@ impl Drop for FileMutationGuard<'_> {
                 &mut budget,
             );
             for path in discovered.difference(&self.paths) {
+                self.files_before.entry(path.clone()).or_insert(false);
                 if budget.exhausted() {
                     overflowed = true;
                     break;
@@ -3139,6 +3149,24 @@ impl Drop for FileMutationGuard<'_> {
                 budget.refreshed += 1;
             }
         }
+        let events = self
+            .files_before
+            .iter()
+            .filter_map(|(path, existed)| {
+                let exists = path.is_file();
+                (exists != *existed).then(|| {
+                    (
+                        path.clone(),
+                        if exists {
+                            lsp_types::FileChangeType::CREATED
+                        } else {
+                            lsp_types::FileChangeType::DELETED
+                        },
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        self.ctx.lsp_notify_mutation_file_events(&events);
         let root = self.ctx.canonical_cache_root_opt();
         if overflowed
             && self.ctx.heavy_root_work_allowed()
@@ -4259,9 +4287,9 @@ pub fn drain_lsp_events(ctx: &AppContext) {
     let _ = drain_lsp_events_bounded(ctx, usize::MAX);
 }
 
-/// Shut down language servers for a standalone runtime whose last request is
-/// older than `lsp.idle_minutes`. Subc uses the same helper with its own
-/// per-root activity stamp.
+/// Reap individually idle language servers, also releasing all unused clients
+/// when the standalone runtime is idle. The daemon supplies each root's last
+/// tool-call activity timestamp.
 pub fn shutdown_idle_lsp(ctx: &AppContext) {
     shutdown_idle_lsp_at(ctx, Instant::now(), ctx.last_request_at());
 }
@@ -4271,36 +4299,17 @@ pub fn shutdown_idle_lsp_at(ctx: &AppContext, now: Instant, last_activity: Insta
         return;
     };
     let idle = now.saturating_duration_since(last_activity);
-    if idle < ttl {
-        return;
-    }
     let clients = {
         // The subc frame loop runs this sweep, so it must not wait for the
-        // manager. A held manager is in use, which means the root is not
-        // idle in the way that matters here; the next sweep retries.
+        // manager. A held manager may be sending a request; the next sweep retries.
         let Some(mut lsp) = ctx.try_lsp() else {
             return;
         };
         if lsp.server_count() == 0 {
             return;
         }
-        lsp.take_all_clients()
+        lsp.take_idle_clients(now, ttl, idle >= ttl)
     };
-    let n = clients.len();
-    if n == 0 {
-        return;
-    }
-    let root = ctx
-        .config()
-        .project_root
-        .as_ref()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "standalone".to_string());
-    aft::slog_info!(
-        "idle lsp reap {root}: shut down {n} server(s) after {}m (ttl {}m)",
-        idle.as_secs() / 60,
-        ttl.as_secs() / 60
-    );
     crate::lsp::manager::LspManager::spawn_idle_lsp_reap(clients);
 }
 
@@ -9803,6 +9812,18 @@ mod idle_lsp_tests {
     use std::collections::HashMap;
     use std::path::Path;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn idle_lsp_standalone_reaps_unused_package_while_requests_keep_root_busy() {
+        let fixture = crate::lsp::manager::regression_tests::IdleLspFixture::new();
+        let busy_pid = fixture.pid(&fixture.busy).unwrap();
+        for _ in 0..3 {
+            fixture.hover(&fixture.busy);
+            super::shutdown_idle_lsp(&fixture.ctx);
+        }
+        fixture.assert_only_busy();
+        assert_eq!(fixture.pid(&fixture.busy), Some(busy_pid));
+    }
 
     #[cfg(unix)]
     fn spawn_sleep_client(ctx: &AppContext, root: std::path::PathBuf) -> u32 {

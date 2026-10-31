@@ -26,9 +26,10 @@ use serde_json::{json, Value};
 
 const DEADLINE: Duration = Duration::from_secs(90);
 const FINGERPRINT_PROBE: &str = "semantic index fingerprint probe";
+const COMPLETION_QUERY: &str = "single-flight-readiness-probe";
 
-/// Deterministic embeddings over HTTP, counting texts other than the
-/// fingerprint probe the model sends once at startup.
+/// Deterministic embeddings over HTTP, counting texts other than the known
+/// fingerprint and readiness-query probes (neither is chunk-vector work).
 struct MockEmbedder {
     base_url: String,
     addr: SocketAddr,
@@ -99,10 +100,10 @@ impl EmbeddingGate {
         }
     }
 
-    fn wait_for_two(&self) -> Vec<Vec<String>> {
+    fn wait_for_first(&self) -> Vec<Vec<String>> {
         let mut state = self.state.lock().unwrap();
         let deadline = Instant::now() + DEADLINE;
-        while state.0.len() < 2 {
+        while state.0.is_empty() {
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(
                 !remaining.is_zero(),
@@ -193,7 +194,7 @@ fn serve(
     texts.fetch_add(
         inputs
             .iter()
-            .filter(|input| *input != FINGERPRINT_PROBE)
+            .filter(|input| *input != FINGERPRINT_PROBE && !input.contains(COMPLETION_QUERY))
             .count(),
         Ordering::SeqCst,
     );
@@ -602,11 +603,174 @@ fn views_on_worktrees_and_sessions_embed_each_chunk_once() {
     );
 }
 
-/// Holds both HTTP responses so neither process can publish the new chunk
-/// before the other process has sent it to the paid-provider boundary.
+/// The checkout's call graph lives in its own `<scope>.callgraph` member, so
+/// the semantic member must not resolve and store a second copy of it. A
+/// callers query first builds the base's call graph and the call-graph member.
+/// An uncommitted edit then makes the semantic member publish a generation
+/// over that ready base, which is when a call-graph plane in the semantic
+/// driver would clone and patch the base's database. The semantic member must
+/// hold no derived call-graph database, while the call-graph member holds one.
 #[test]
-#[ignore = "known cross-process duplicate embedding; durable claim design must be reviewed before fixing"]
-fn views_on_two_processes_reproduce_duplicate_checkout_chunk() {
+fn views_on_semantic_member_stores_no_call_graph_database() {
+    let _settings = crate::test_helpers::without_storage_override();
+    let server = MockEmbedder::start();
+    let repo = repository();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = Arc::new(
+        AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config::default()),
+        )
+        .with_test_checkpoint_store(),
+    );
+    let mut payload = configure_payload(&repo.main, storage.path(), &server, true, MODEL, 5_000);
+    payload["config"] = crate::helpers::user_config(json!({
+        "indexes": { "trigram": true, "semantic": true, "callgraph": true },
+        "views": { "enabled": true },
+        "semantic": {
+            "backend": "openai_compatible",
+            "model": MODEL,
+            "base_url": server.base_url,
+            "timeout_ms": 5_000,
+            "max_batch_size": 64,
+            "max_files": 2_000
+        }
+    }));
+    let configured = aft::commands::configure::handle_configure(&request(payload), &ctx);
+    assert!(configured.success, "configure failed: {configured:?}");
+    aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+    wait_views_filled(&ctx);
+
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        drain(&ctx);
+        let answer = aft::commands::callers::handle_callers(
+            &request(json!({
+                "id": "semantic-member-callers",
+                "command": "callers",
+                "file": repo.main.join("src/parse.rs"),
+                "symbol": "trim_comment",
+            })),
+            &ctx,
+        );
+        if answer.success {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the call-graph view never answered: {:?}",
+            answer.data
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    // An edit through AFT's own write command wakes the semantic member, as an
+    // agent's edit does, so it publishes the edit without watcher delivery.
+    let written = aft::commands::write::handle_write(
+        &request(json!({
+            "id": "semantic-member-edit",
+            "command": "write",
+            "file": repo.main.join("src/uncommitted.rs"),
+            "content": "pub fn uncommitted_helper() -> u64 { 7 }\n",
+        })),
+        &ctx,
+    );
+    assert!(written.success, "write failed: {written:?}");
+
+    // What the v3 member directories hold: whether a semantic manifest names
+    // the edited file, the semantic members' derived databases, and how many
+    // derived databases the call-graph members hold.
+    let scan = || {
+        let mut edit_published = false;
+        let mut semantic_derived = Vec::new();
+        let mut callgraph_derived = 0;
+        for family in std::fs::read_dir(storage.path().join("blobs/v3")).unwrap() {
+            let views = family.unwrap().path().join("views");
+            let Ok(members) = std::fs::read_dir(&views) else {
+                continue;
+            };
+            for member in members {
+                let member = member.unwrap().path();
+                let name = member.file_name().unwrap().to_string_lossy().into_owned();
+                let Ok(files) = std::fs::read_dir(&member) else {
+                    continue;
+                };
+                for file in files {
+                    let file = file.unwrap().file_name().to_string_lossy().into_owned();
+                    let derived = file.starts_with("derived-") && file.ends_with(".sqlite");
+                    if name.ends_with(".semantic") {
+                        if file.starts_with("manifest-") && file.ends_with(".json") {
+                            edit_published |= std::fs::read_to_string(member.join(&file))
+                                .is_ok_and(|text| text.contains("src/uncommitted.rs"));
+                        }
+                        if derived {
+                            semantic_derived.push(member.join(&file));
+                        }
+                    } else if name.ends_with(".callgraph") && derived {
+                        callgraph_derived += 1;
+                    }
+                }
+            }
+        }
+        (edit_published, semantic_derived, callgraph_derived)
+    };
+    // Until the semantic member has published a generation that holds the
+    // edit, an empty result proves nothing.
+    let deadline = Instant::now() + DEADLINE;
+    let (semantic_derived, callgraph_derived) = loop {
+        drain(&ctx);
+        let (edit_published, semantic_derived, callgraph_derived) = scan();
+        if edit_published {
+            break (semantic_derived, callgraph_derived);
+        }
+        if Instant::now() >= deadline {
+            let mut members = Vec::new();
+            for family in std::fs::read_dir(storage.path().join("blobs/v3")).unwrap() {
+                let views = family.unwrap().path().join("views");
+                for member in std::fs::read_dir(&views).into_iter().flatten() {
+                    let member = member.unwrap().path();
+                    let files: Vec<_> = std::fs::read_dir(&member)
+                        .into_iter()
+                        .flatten()
+                        .map(|file| file.unwrap().file_name().to_string_lossy().into_owned())
+                        .collect();
+                    members.push((member.file_name().unwrap().to_owned(), files));
+                }
+            }
+            panic!(
+                "the semantic member never published a generation with the edit; status={:?}; members={members:?}",
+                ctx.semantic_index_status().read().unwrap()
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        semantic_derived.is_empty(),
+        "the semantic member stored its own call graph: {semantic_derived:?}"
+    );
+    assert!(
+        callgraph_derived > 0,
+        "the call-graph member must still hold the checkout's call graph"
+    );
+}
+
+/// Holds the owner's response until the other process acknowledges contention.
+/// A second provider arrival is a failure, never a condition for releasing it.
+#[test]
+fn views_on_two_processes_single_flight_checkout_chunk() {
+    two_process_single_flight(false, false);
+}
+
+#[test]
+fn views_on_two_processes_single_flight_separate_base_scopes() {
+    two_process_single_flight(true, true);
+}
+
+#[test]
+fn views_on_two_processes_single_flight_inherited_and_checkout_chunk() {
+    two_process_single_flight(true, false);
+}
+
+fn two_process_single_flight(commit_main: bool, commit_linked: bool) {
     let _settings = crate::test_helpers::without_storage_override();
     let gate = Arc::new(EmbeddingGate::default());
     let server = MockEmbedder::with_gate(Some(Arc::clone(&gate)));
@@ -618,13 +782,28 @@ fn views_on_two_processes_reproduce_duplicate_checkout_chunk() {
         wait_views_filled(&warm);
         assert_eq!(server.texts(), chunks);
     }
-    // The committed base is already filled. Identical uncommitted files belong
-    // to each checkout's own fill, which does not take the shared base claim.
+    // Keep the new files uncommitted by default. The scenarios below optionally
+    // commit one or both, testing the same chunk in uncommitted and committed files.
     for root in [&repo.main, &repo.linked] {
         write(
             root,
             "src/concurrent.rs",
             "pub fn concurrent_paid_chunk() -> u64 { 424242 }\n",
+        );
+    }
+    if commit_main {
+        git(&repo.main, &["add", "src/concurrent.rs"]);
+        git(&repo.main, &["commit", "-m", "new inherited chunk"]);
+    }
+    if commit_linked {
+        // Different commit trees get independent base-build ownership, but the
+        // new function is identical. Both fills must coordinate on that shared
+        // chunk instead of embedding it twice.
+        write(&repo.linked, ".gitignore", "# distinct base tree\n");
+        git(&repo.linked, &["add", "src/concurrent.rs", ".gitignore"]);
+        git(
+            &repo.linked,
+            &["commit", "-m", "different base with shared chunk"],
         );
     }
     let mut main = crate::helpers::AftProcess::spawn_with_semantic_env(&[(
@@ -642,29 +821,104 @@ fn views_on_two_processes_reproduce_duplicate_checkout_chunk() {
         linked.pid(),
         storage.path().display()
     );
-    for (process, root) in [(&mut main, &repo.main), (&mut linked, &repo.linked)] {
-        let configured = process.send(
-            &configure_payload(root, storage.path(), &server, true, MODEL, 120_000).to_string(),
-        );
-        assert_eq!(configured["success"], true, "{configured:?}");
-    }
-    let requests = gate.wait_for_two();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(
-        requests[0], requests[1],
-        "processes must request identical text"
+    let configured = main.send(
+        &configure_payload(&repo.main, storage.path(), &server, true, MODEL, 120_000).to_string(),
     );
+    assert_eq!(configured["success"], true, "{configured:?}");
+    let requests = gate.wait_for_first();
     assert_eq!(requests[0].len(), 1, "one new function is one chunk");
-    assert_eq!(
-        server.texts() - chunks,
-        2,
-        "known bug: both processes embedded the same chunk"
+    let configured = linked.send(
+        &configure_payload(&repo.linked, storage.path(), &server, true, MODEL, 120_000).to_string(),
     );
-    eprintln!(
-        "two-process duplicate: baseline={chunks} total={} new_inputs=2 unique_new_inputs=1",
-        server.texts()
+    assert_eq!(configured["success"], true, "{configured:?}");
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let status = linked.send(r#"{"id":"contention","command":"status"}"#);
+        assert_eq!(
+            server.texts() - chunks,
+            1,
+            "contender duplicated provider work"
+        );
+        // An unusable coordinator is not acknowledgement of a live owner.
+        if status["semantic_index"]["pending_reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty())
+            && status["semantic_index"]["coordination_error"].is_null()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no positive contention acknowledgement: {status}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(gate.state.lock().unwrap().0.len(), 1);
+    // Contention is not a backend outage: completed base vectors still serve,
+    // while the new file remains an explicitly incomplete path.
+    let pending = linked.send(&json!({"id":"pending-query", "command":"semantic_search", "query":COMPLETION_QUERY, "top_k":100}).to_string());
+    assert_eq!(pending["complete"], false, "{pending}");
+    assert!(
+        pending["results"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()),
+        "saved base vectors disappeared during contention: {pending}"
     );
     gate.release();
+    for process in [&mut main, &mut linked] {
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let answer = process.send(&json!({"id":"ready-query", "command":"semantic_search", "query":COMPLETION_QUERY, "top_k":100}).to_string());
+            if answer["complete"] == true {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "semantic worker never became ready: {answer}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    drop(main);
+    drop(linked);
+    let reopened_main = configure(&repo.main, storage.path(), &server, true);
+    wait_views_filled(&reopened_main);
+    let reopened_linked = configure(&repo.linked, storage.path(), &server, true);
+    wait_views_filled(&reopened_linked);
+    let query = vector(&format!("{MODEL}\u{0}{}", requests[0][0]));
+    let left = reopened_main
+        .checkout_semantic_runtime()
+        .unwrap()
+        .search(&query, 100, &|_| true)
+        .unwrap();
+    let right = reopened_linked
+        .checkout_semantic_runtime()
+        .unwrap()
+        .search(&query, 100, &|_| true)
+        .unwrap();
+    assert!(left.complete() && right.complete());
+    let rows = |root: &Path, results: Vec<aft::semantic_index::SemanticResult>| {
+        results
+            .into_iter()
+            .map(|row| {
+                (
+                    row.file.strip_prefix(root).unwrap().to_path_buf(),
+                    row.name,
+                    row.start_line,
+                    row.score,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        rows(&repo.main, left.results),
+        rows(&repo.linked, right.results)
+    );
+    assert_eq!(
+        server.texts() - chunks,
+        1,
+        "reopen must reuse durable chunks"
+    );
 }
 
 /// The model fingerprint of the root's served semantic view, if any.

@@ -46,14 +46,15 @@ const RUST_ANALYZER_WORKER_PROCESS_CAP: usize = 2;
 
 #[derive(Debug)]
 pub(crate) struct RustAnalyzerCapacityExhausted {
-    cap: usize,
+    pub(super) cap: usize,
+    pub(super) current: usize,
 }
 
 impl std::fmt::Display for RustAnalyzerCapacityExhausted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f,
-            "rust_analyzer_capacity_exhausted: daemon-wide worker-policy rust-analyzer process cap={} reached; retry after another worker analyzer stops",
-            self.cap)
+            "rust_analyzer_capacity_exhausted: daemon-wide worker-policy rust-analyzer process cap={} reached (current={}); retry after another worker analyzer stops",
+            self.cap, self.current)
     }
 }
 
@@ -72,7 +73,10 @@ impl RustAnalyzerCapacity {
         if *active >= self.cap {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                RustAnalyzerCapacityExhausted { cap: self.cap },
+                RustAnalyzerCapacityExhausted {
+                    cap: self.cap,
+                    current: *active,
+                },
             ));
         }
         *active += 1;
@@ -452,6 +456,9 @@ impl ServerInstanceId {
 pub(crate) struct ReceivedLspEvent {
     pub(crate) event: LspEvent,
     pub(crate) instance: Option<ServerInstanceId>,
+    /// Stamped by the reader before enqueueing or startup deferral, on the
+    /// same clock as the FIFO writer's dispatch fences.
+    pub(crate) receive_order: Option<u64>,
 }
 
 impl From<LspEvent> for ReceivedLspEvent {
@@ -459,6 +466,7 @@ impl From<LspEvent> for ReceivedLspEvent {
         Self {
             event,
             instance: None,
+            receive_order: None,
         }
     }
 }
@@ -473,6 +481,10 @@ pub(crate) enum LspEventSender {
 
 impl LspEventSender {
     fn send(&self, event: LspEvent) -> Result<(), ()> {
+        self.send_ordered(event, None)
+    }
+
+    fn send_ordered(&self, event: LspEvent, receive_order: Option<u64>) -> Result<(), ()> {
         match self {
             Self::Standalone(sender) => sender.send(event).map_err(|_| ()),
             Self::Managed { sender, instance } => {
@@ -482,6 +494,7 @@ impl LspEventSender {
                     .send(ReceivedLspEvent {
                         event,
                         instance: Some(*instance),
+                        receive_order,
                     })
                     .map_err(|_| ())
             }
@@ -987,6 +1000,8 @@ pub struct LspClient {
 
     /// Pending request responses, keyed by request ID.
     pending: Arc<Mutex<PendingMap>>,
+    /// Last outbound request or document open/change/save, not server-pushed traffic.
+    last_used_at: Instant,
     /// Next request ID counter.
     next_id: AtomicI64,
     /// Diagnostic capabilities reported by the server in its initialize response.
@@ -1317,22 +1332,25 @@ impl LspClient {
                         }
                     }
                     Ok(Some(ServerMessage::Notification { method, params })) => {
-                        reader_writer.note_received();
+                        let receive_order = reader_writer.note_received();
                         if method == "$/progress" && is_rust_check_begin(params.as_ref()) {
                             let ordinal = reader_check_begins.fetch_add(1, Ordering::SeqCst) + 1;
                             if let Ok(mut times) = reader_check_begin_times.lock() {
                                 times.insert(ordinal, SystemTime::now());
                             }
                         }
-                        let _ = event_tx.send(LspEvent::Notification {
-                            server_kind: reader_kind.clone(),
-                            root: reader_root.clone(),
-                            method,
-                            params,
-                        });
+                        let _ = event_tx.send_ordered(
+                            LspEvent::Notification {
+                                server_kind: reader_kind.clone(),
+                                root: reader_root.clone(),
+                                method,
+                                params,
+                            },
+                            Some(receive_order),
+                        );
                     }
                     Ok(Some(ServerMessage::Request { id, method, params })) => {
-                        reader_writer.note_received();
+                        let receive_order = reader_writer.note_received();
                         record_watched_file_registration(
                             &reader_watched_file_registrations,
                             &method,
@@ -1371,13 +1389,16 @@ impl LspClient {
                             }
                         }
                         // Also forward as event for any interested handlers
-                        let _ = event_tx.send(LspEvent::ServerRequest {
-                            server_kind: reader_kind.clone(),
-                            root: reader_root.clone(),
-                            id,
-                            method,
-                            params,
-                        });
+                        let _ = event_tx.send_ordered(
+                            LspEvent::ServerRequest {
+                                server_kind: reader_kind.clone(),
+                                root: reader_root.clone(),
+                                id,
+                                method,
+                                params,
+                            },
+                            Some(receive_order),
+                        );
                     }
                     Err(error) if transport::is_message_parse_error(&error) => {
                         // The complete body was consumed, so the next frame is
@@ -1416,6 +1437,7 @@ impl LspClient {
             child_pid,
             writer,
             pending,
+            last_used_at: Instant::now(),
             next_id: AtomicI64::new(1),
             diagnostic_caps: None,
             diagnostic_registrations,
@@ -1645,6 +1667,22 @@ impl LspClient {
     pub(crate) fn uses_document_pull(&self, file: Option<&Path>) -> bool {
         self.diagnostic_capabilities_inner(file)
             .is_some_and(|caps| caps.pull_diagnostics)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_diagnostic_capabilities_for_test(
+        &mut self,
+        caps: ServerDiagnosticCapabilities,
+    ) {
+        self.diagnostic_caps = Some(caps);
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn register_diagnostics_for_test(&mut self, params: &Value) {
+        self.diagnostic_registrations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .record("client/registerCapability", Some(params));
     }
 
     pub(crate) fn start_document_diagnostic_request(
@@ -2294,6 +2332,7 @@ impl LspClient {
             self.remove_pending(&id);
             return Err(err);
         }
+        self.last_used_at = Instant::now();
         Ok(PendingLspRequest {
             id,
             method,
@@ -2324,6 +2363,7 @@ impl LspClient {
         opened: bool,
         saved: Option<(Instant, u64)>,
     ) {
+        self.last_used_at = Instant::now();
         self.note_analysis_document(
             if opened {
                 "textDocument/didOpen"
@@ -2343,36 +2383,90 @@ impl LspClient {
         N: lsp_types::notification::Notification,
         N::Params: serde::Serialize,
     {
+        self.send_notification_ordered::<N>(params).map(|_| ())
+    }
+
+    pub(crate) fn send_notification_ordered<N>(
+        &mut self,
+        params: N::Params,
+    ) -> Result<u64, LspError>
+    where
+        N: lsp_types::notification::Notification,
+        N::Params: serde::Serialize,
+    {
         self.ensure_can_send()?;
         let params = serde_json::to_value(params)?;
         let notification = Notification::new(N::METHOD, Some(params));
-        self.writer.send(serde_json::to_string(&notification)?)?;
+        let order = self
+            .writer
+            .send_ordered(serde_json::to_string(&notification)?)?;
+        if matches!(
+            N::METHOD,
+            "textDocument/didOpen" | "textDocument/didChange" | "textDocument/didSave"
+        ) {
+            self.last_used_at = Instant::now();
+        }
         self.note_analysis_document(N::METHOD, notification.params.as_ref().unwrap());
-        Ok(())
+        Ok(order)
     }
 
     /// Write an already serialized notification.
     fn send_serialized_notification(&mut self, json: &str) -> Result<(), LspError> {
         self.ensure_can_send()?;
-        self.writer.send(json.to_string())
+        self.writer.send(json.to_string())?;
+        self.last_used_at = Instant::now();
+        Ok(())
+    }
+
+    pub(crate) fn last_used_at(&self) -> Instant {
+        self.last_used_at
+    }
+
+    pub(crate) fn has_pending_requests(&self) -> bool {
+        self.pending
+            .lock()
+            .map_or(true, |pending| !pending.is_empty())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_last_used_at_for_test(&mut self, at: Instant) {
+        self.last_used_at = at;
     }
 
     /// Send `textDocument/didChange` carrying the whole document (see
-    /// [`full_did_change_message`]).
+    /// [`full_did_change_message`]). Production senders need the order and
+    /// call [`Self::send_full_did_change_ordered`]; tests that only need the
+    /// send use this.
+    #[cfg(test)]
     pub(crate) fn send_full_did_change(
         &mut self,
         uri: &lsp_types::Uri,
         version: i32,
         text: &str,
     ) -> Result<(), LspError> {
+        self.send_full_did_change_ordered(uri, version, text)
+            .map(|_| ())
+    }
+
+    /// [`Self::send_full_did_change`], returning the send's position in the
+    /// writer's order so diagnostics can be matched to this exact content.
+    pub(crate) fn send_full_did_change_ordered(
+        &mut self,
+        uri: &lsp_types::Uri,
+        version: i32,
+        text: &str,
+    ) -> Result<u64, LspError> {
         self.ensure_can_send()?;
         let json = full_did_change_message(uri, version, text)?;
-        self.send_serialized_notification(&json)?;
+        let order = self.writer.send_ordered(json)?;
+        // A document change is use: it keeps this server from the per-server
+        // idle stop, like every other didOpen/didChange/didSave sender.
+        self.last_used_at = Instant::now();
         self.note_analysis_document(
             "textDocument/didChange",
             &json!({"textDocument": {"uri": uri.as_str()}}),
         );
-        Ok(())
+        Ok(order)
     }
 
     /// Send `textDocument/didSave`, with the borrowed text when given (see
@@ -3050,6 +3144,26 @@ fn parse_diagnostic_capabilities(value: &Value) -> ServerDiagnosticCapabilities 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_capacity_refusal_reports_cap_and_current_count() {
+        let capacity = Arc::new(RustAnalyzerCapacity {
+            cap: 1,
+            active: Mutex::new(0),
+        });
+        let permit = capacity.acquire().unwrap();
+        let error = capacity.acquire().err().unwrap();
+        let refused = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<RustAnalyzerCapacityExhausted>()
+            .unwrap();
+        assert_eq!(refused.cap, 1);
+        assert_eq!(refused.current, 1);
+        assert!(error.to_string().contains("cap=1 reached (current=1)"));
+        drop(permit);
+        assert!(capacity.acquire().is_ok());
+    }
 
     #[test]
     fn server_instance_allocator_preserves_the_exhaustion_boundary() {

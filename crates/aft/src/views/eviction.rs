@@ -78,34 +78,17 @@ const MAX_WALK_ENTRIES: usize = 200_000;
 /// `pins/` and `readers/`, then the generation directories under `readers/`.
 const MAX_WALK_DEPTH: usize = 3;
 
-/// The G4c storage gap a refused v3 admission reports. A refusal has no
-/// legacy fallback: the caller serves what v3 already holds and names the gap.
-pub const V3_HARD_LIMIT_GAP: &str = "storage_gap:v3_family_hard_limit";
-
-/// Why a v3 reservation was refused.
+/// Why a v3 reservation was refused. A refusal has no legacy fallback: the
+/// caller serves what v3 already holds and names the gap.
 #[derive(Debug)]
 pub enum V3Refusal {
-    /// Committed usage plus the request would cross the family hard limit.
-    HardLimit {
-        usage: u64,
-        request: u64,
-        limit: u64,
-    },
-    /// The ledger refused it (device floor, namespace budget) or failed.
+    /// The ledger refused it (the device free-space floor) or failed.
     Ledger(crate::blob_store::v3::Error),
 }
 
 impl fmt::Display for V3Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::HardLimit {
-                usage,
-                request,
-                limit,
-            } => write!(
-                f,
-                "{V3_HARD_LIMIT_GAP}: {usage} used + {request} requested > {limit}"
-            ),
             Self::Ledger(error) => write!(f, "storage_gap:{error}"),
         }
     }
@@ -124,24 +107,18 @@ pub struct V3Admission {
 }
 
 impl DiskBudget {
-    /// Admits a v3 reservation of `request` bytes against this family's
-    /// limits: the hard limit refuses, the target (the payload budget) only
-    /// asks for a sweep. Usage is the ledger's committed usage (last covering
-    /// measurement, committed charges since, and every outstanding
-    /// reservation), so concurrent builds are charged before they write.
+    /// Admits a v3 reservation of `request` bytes. Only the ledger's device
+    /// free-space floor refuses: v3 sets no byte limit per family, since a
+    /// clone-sharing store's file sizes say little about the disk it uses.
+    /// Usage over the target (the payload budget) asks for a sweep. Usage is
+    /// the ledger's committed usage (last covering measurement, committed
+    /// charges since, and every outstanding reservation).
     pub fn admit_v3(
         &self,
         registry: &mut crate::blob_store::v3::RegistryWriter<'_>,
         request: u64,
     ) -> Result<V3Admission, V3Refusal> {
         let usage = registry.accounting().map_err(V3Refusal::Ledger)?.usage();
-        if usage.saturating_add(request) > self.family_store_hard {
-            return Err(V3Refusal::HardLimit {
-                usage,
-                request,
-                limit: self.family_store_hard,
-            });
-        }
         let reservation = registry.reserve(request).map_err(V3Refusal::Ledger)?;
         Ok(V3Admission {
             reservation,
@@ -150,21 +127,13 @@ impl DiskBudget {
     }
 
     /// Extends an admitted reservation before writing past it, under the same
-    /// hard limit.
+    /// device floor.
     pub fn extend_v3(
         &self,
         registry: &mut crate::blob_store::v3::RegistryWriter<'_>,
         admission: &V3Admission,
         additional: u64,
     ) -> Result<(), V3Refusal> {
-        let usage = registry.accounting().map_err(V3Refusal::Ledger)?.usage();
-        if usage.saturating_add(additional) > self.family_store_hard {
-            return Err(V3Refusal::HardLimit {
-                usage,
-                request: additional,
-                limit: self.family_store_hard,
-            });
-        }
         registry
             .extend(&admission.reservation, additional)
             .map_err(V3Refusal::Ledger)
@@ -439,12 +408,22 @@ thread_local! {
     /// its budget, so tests read it here.
     static LAST_SWEEP_BUDGET: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static TREE_LISTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    #[cfg(windows)]
+    static TREE_BEFORE_STAT: std::cell::RefCell<Option<Box<dyn FnMut(&Path)>>> = const { std::cell::RefCell::new(None) };
 }
 
-fn measured_metadata(path: &Path) -> std::io::Result<fs::Metadata> {
+fn measured_metadata(path: &Path, entry: Option<&fs::DirEntry>) -> std::io::Result<fs::Metadata> {
     #[cfg(test)]
     TREE_STATS.with(|stats| stats.set(stats.get() + 1));
-    fs::symlink_metadata(path)
+    #[cfg(all(test, windows))]
+    TREE_BEFORE_STAT.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(path);
+        }
+    });
+    // Windows can charge a listed entry without reopening a delete-pending
+    // name. Cached paths (used only with Unix directory identities) still stat.
+    entry.map_or_else(|| fs::symlink_metadata(path), fs::DirEntry::metadata)
 }
 
 /// Published v1 and v2 generation artifacts are reconciled even if an
@@ -542,7 +521,7 @@ fn view_tree_bytes(
     deadline: Option<Instant>,
     cache: &mut ViewSizeCache,
 ) -> std::io::Result<(u64, bool)> {
-    let identity = measured_metadata(dir)
+    let identity = measured_metadata(dir, None)
         .ok()
         .as_ref()
         .and_then(directory_identity);
@@ -566,7 +545,7 @@ fn view_tree_bytes(
     cache.directory = identity;
     let reused_snapshot = cache.snapshot.is_some();
     let result = tree_bytes_inner(dir, deadline, Some(cache), None);
-    let after = measured_metadata(dir)
+    let after = measured_metadata(dir, None)
         .ok()
         .as_ref()
         .and_then(directory_identity);
@@ -649,9 +628,10 @@ fn tree_bytes_inner(
                     .map(|(_, paths)| paths.clone())
             })
             .flatten();
-        let entries: Box<dyn Iterator<Item = std::io::Result<(PathBuf, Option<u64>)>>> =
+        type SizeEntry = (PathBuf, Option<u64>, Option<fs::DirEntry>);
+        let entries: Box<dyn Iterator<Item = std::io::Result<SizeEntry>>> =
             if let Some(paths) = cached_paths {
-                Box::new(paths.into_iter().map(|path| Ok((path, None))))
+                Box::new(paths.into_iter().map(|path| Ok((path, None, None))))
             } else {
                 if depth == 0 {
                     if let Some(cache) = cache.as_mut() {
@@ -670,7 +650,7 @@ fn tree_bytes_inner(
                             };
                             #[cfg(not(unix))]
                             let inode = None;
-                            (entry.path(), inode)
+                            (entry.path(), inode, Some(entry))
                         })
                     })),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -687,7 +667,7 @@ fn tree_bytes_inner(
                 break;
             }
             read += 1;
-            let (path, inode) = match entry {
+            let (path, inode, entry) = match entry {
                 Ok(entry) => entry,
                 // Removed while listed: nothing to count.
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -713,7 +693,7 @@ fn tree_bytes_inner(
                     cache.files.remove(&path);
                 }
             }
-            let metadata = match measured_metadata(&path) {
+            let metadata = match measured_metadata(&path, entry.as_ref()) {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
@@ -1308,7 +1288,7 @@ fn enforce_with_schedule(
     options: EnforceOptions<'_>,
     scheduled: Option<bool>,
 ) -> Result<EnforcementReport, EvictionError> {
-    // V3 members and their namespace budget are collected by storage retention.
+    // V3 members are collected by storage retention.
     // A v3-only owner has no legacy registry connection to measure or evict.
     if registry.is_v3_only() {
         return Ok(EnforcementReport {
@@ -2360,6 +2340,86 @@ mod tests {
         );
         let reopened = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
         assert!(reopened.view_size_caches().lock().unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tree_bytes_uses_listed_metadata_for_a_delete_pending_file() {
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileDispositionInfo, SetFileInformationByHandle, DELETE, FILE_DISPOSITION_INFO,
+            FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let pending = root.path().join(".lock.tmp");
+        let payload = b"delete-pending view lock";
+        fs::write(&pending, payload).unwrap();
+        let handle = fs::OpenOptions::new()
+            .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&pending)
+            .unwrap();
+        let denied = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let hook_denied = std::rc::Rc::clone(&denied);
+        TREE_BEFORE_STAT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |path| {
+                if path == pending && hook_denied.borrow().is_none() {
+                    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+                    assert_ne!(
+                        unsafe {
+                            SetFileInformationByHandle(
+                                handle.as_raw_handle(),
+                                FileDispositionInfo,
+                                (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                                std::mem::size_of_val(&disposition) as u32,
+                            )
+                        },
+                        0,
+                        "{}",
+                        std::io::Error::last_os_error()
+                    );
+                    // A disappearing pending name makes std's metadata open
+                    // and fallback fail. Deny listing after enumeration to make
+                    // the fallback failure deterministic instead of timing it.
+                    let (guard, enforced) = crate::blob_store::v3::deny_read_for_test(
+                        path.parent().unwrap(),
+                        "stat of a delete-pending file",
+                        || fs::symlink_metadata(path),
+                    );
+                    *hook_denied.borrow_mut() = Some(guard);
+                    if enforced {
+                        assert_eq!(
+                            fs::symlink_metadata(path).unwrap_err().raw_os_error(),
+                            Some(5)
+                        );
+                    }
+                    eprintln!("pathname-stat race modelled: {enforced}");
+                }
+            }));
+        });
+        let result = tree_bytes(root.path(), None);
+        TREE_BEFORE_STAT.with(|hook| *hook.borrow_mut() = None);
+        assert!(
+            denied.borrow_mut().take().is_some(),
+            "file was not measured"
+        );
+        assert_eq!(result.unwrap(), (payload.len() as u64, true));
+
+        let (denied, enforced) =
+            crate::blob_store::v3::deny_read_for_test(root.path(), "directory listing", || {
+                fs::read_dir(root.path())
+            });
+        let result = tree_bytes(root.path(), None);
+        drop(denied);
+        if enforced {
+            assert_eq!(
+                result.unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        } else {
+            assert_eq!(result.unwrap(), (0, true));
+        }
     }
 
     #[cfg(unix)]

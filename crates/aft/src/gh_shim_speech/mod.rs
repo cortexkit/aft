@@ -80,6 +80,23 @@ pub(crate) struct Refusal {
     pub(crate) reason: String,
     pub(crate) role: Option<ScopeRole>,
     pub(crate) detail: Option<String>,
+    // Internal transport provenance, never part of the public refusal.
+    pub(crate) retry_before_send: bool,
+}
+
+/// Keep diagnostics out of the agent-facing refusal. Callers must supply only
+/// safe identifiers or metadata, never tickets, nonces, payloads or raw errors.
+pub(crate) fn snapshot_invalid(site: &str, check: &str, identifiers: Value) -> Refusal {
+    let message = format!(
+        "gh speech snapshot invalid: {}",
+        json!({"site": site, "check": check, "identifiers": identifiers})
+    );
+    if log::max_level() == log::LevelFilter::Off && !crate::logging::capture_active() {
+        let _ = crate::logging::write_preinit_warning(&message);
+    } else {
+        crate::slog_warn!("{message}");
+    }
+    Refusal::new(Code::AuthorityUnavailable, "snapshot_invalid")
 }
 
 impl Refusal {
@@ -89,6 +106,7 @@ impl Refusal {
             reason: reason.into(),
             role: None,
             detail: None,
+            retry_before_send: false,
         }
     }
 
@@ -98,6 +116,7 @@ impl Refusal {
             reason: reason.into(),
             role: Some(role),
             detail: None,
+            retry_before_send: false,
         }
     }
 
@@ -146,4 +165,4 @@ impl Refusal {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

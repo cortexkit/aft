@@ -53,9 +53,11 @@ pub struct DiagnosticEntry {
     pub result_id: Option<String>,
     /// Document version this report was proven against. Versioned
     /// `publishDiagnostics` payloads provide it directly; a synchronous pull
-    /// response is tagged with the client's current document version. Post-edit
-    /// waiters use it to reject stale publishes deterministically instead of
-    /// relying on epoch ordering, which has a race when an old-version publish
+    /// response is tagged with the client's current document version.
+    /// Push-only servers without versions can instead be bound to the sent
+    /// version by reader ordering plus the synchronized content hash. Post-edit
+    /// waiters use this proof instead of store-epoch ordering, which has a race
+    /// when an old-version publish
     /// arrives after the pre-edit drain. `None` means no version proof exists.
     pub version: Option<i32>,
     /// True after the filesystem watcher sees this file change outside AFT's
@@ -70,6 +72,13 @@ pub struct DiagnosticEntry {
     pub provisional: bool,
     /// A document pull, rather than an asynchronous push, certified this entry.
     pub from_document_pull: bool,
+    /// Hash of the exact synchronized text certified by this report. Arrival
+    /// order alone cannot certify an unversioned or delayed publication.
+    pub content_hash: Option<[u8; 32]>,
+    /// A push-only server omitted its version; reader ordering after a
+    /// successful text sync supplied the version proof instead. This proof is
+    /// no longer sufficient if that server later registers document pulls.
+    pub from_receive_order: bool,
 }
 
 /// Stores diagnostics from all LSP servers, keyed per `(ServerKey, file)`.
@@ -119,6 +128,28 @@ thread_local! {
 }
 
 impl DiagnosticsStore {
+    pub(crate) fn mark_receive_order(&mut self, server: &ServerKey, file: &Path) {
+        if let Some(entry) = self.entries.get_mut(&(server.clone(), file.to_path_buf())) {
+            entry.from_receive_order = true;
+        }
+    }
+    pub(crate) fn certify_content(
+        &mut self,
+        server: &ServerKey,
+        file: &Path,
+        hash: Option<[u8; 32]>,
+    ) {
+        if let Some(entry) = self.entries.get_mut(&(server.clone(), file.to_path_buf())) {
+            entry.content_hash = hash;
+        }
+    }
+
+    pub(crate) fn reports(&self) -> impl Iterator<Item = (&ServerKey, &Path, &DiagnosticEntry)> {
+        self.entries
+            .iter()
+            .map(|((server, file), entry)| (server, file.as_path(), entry))
+    }
+
     pub fn new() -> Self {
         Self::with_capacity(5000)
     }
@@ -326,6 +357,8 @@ impl DiagnosticsStore {
             stale: false,
             provisional,
             from_document_pull,
+            content_hash: None,
+            from_receive_order: false,
         };
 
         self.last_publish_at_for_file
@@ -569,16 +602,6 @@ impl DiagnosticsStore {
             .iter()
             .filter(|(_, entry)| !entry.stale)
             .map(|((server, file), entry)| (server, file.as_path(), entry))
-    }
-
-    /// Current authoritative reports retain producer identity, including empty reports.
-    pub(crate) fn authoritative_reports(
-        &self,
-    ) -> impl Iterator<Item = (&ServerKey, &Path, &[StoredDiagnostic])> {
-        self.entries
-            .iter()
-            .filter(|(_, entry)| !entry.stale && !entry.provisional)
-            .map(|((server, file), entry)| (server, file.as_path(), entry.diagnostics.as_slice()))
     }
 
     /// All current diagnostics with the entry-level readiness marker.

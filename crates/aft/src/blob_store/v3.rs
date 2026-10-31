@@ -23,7 +23,11 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const LAYOUT_TAG: u32 = 2;
 pub const REGISTRY_APPLICATION_ID: i64 = 0x41465452;
 pub const PLANE_APPLICATION_ID: i64 = 0x41465450;
-pub const NAMESPACE_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
+/// Free bytes a v3 reservation must leave on the device, or 5% of its
+/// capacity when that is larger. v3 sets no byte budget per family: how many
+/// copies a repository keeps is a matter of count and age, and this floor is
+/// what keeps the device from filling.
+pub const MIN_FREE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Sweep epochs a symbol-plane row survives without being touched. Symbol
 /// rows are a reusable cache that no manifest names, so the plane-row sweep
 /// ages them out by epoch instead of by marking.
@@ -43,6 +47,7 @@ mod open_tests;
 mod read_audit;
 #[cfg(test)]
 mod replay;
+mod unshared;
 #[doc(hidden)]
 pub use copy::{copy_on_first_use, CopyOutcome, CopySource, SWEEP_LEASE_WAIT};
 
@@ -270,13 +275,94 @@ pub fn view_dir(storage: &Path, family: &str, scope: &str) -> Result<PathBuf> {
     Ok(family_dir(storage, family)?.join("views").join(scope))
 }
 
-static FREE_SPACE: Mutex<Option<(u64, u64)>> = Mutex::new(None);
-/// Process-local probe override for integration children. Production never calls it.
+struct FreeSpaceOverrides {
+    storage: std::collections::BTreeMap<PathBuf, FreeSpaceOverride>,
+    unlimited: usize,
+}
+struct FreeSpaceOverride {
+    canonical: Option<PathBuf>,
+    value: (u64, u64),
+}
+static FREE_SPACE: Mutex<FreeSpaceOverrides> = Mutex::new(FreeSpaceOverrides {
+    storage: std::collections::BTreeMap::new(),
+    unlimited: 0,
+});
+
+/// Restores a storage root's previous test probe when dropped, including on unwind.
 #[doc(hidden)]
-pub fn set_free_space_for_test(free: u64, capacity: u64) {
-    *FREE_SPACE
+#[must_use]
+pub struct FreeSpaceTestGuard {
+    storage: PathBuf,
+    previous: Option<FreeSpaceOverride>,
+}
+impl Drop for FreeSpaceTestGuard {
+    fn drop(&mut self) {
+        let mut overrides = FREE_SPACE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(previous) = self.previous.take() {
+            overrides.storage.insert(self.storage.clone(), previous);
+        } else {
+            overrides.storage.remove(&self.storage);
+        }
+    }
+}
+
+/// Overrides probes under `storage` on every thread until the guard drops.
+/// Raw and canonical spellings both match; the most specific root wins.
+/// Production never calls this setter.
+#[doc(hidden)]
+pub fn set_free_space_for_test(storage: &Path, free: u64, capacity: u64) -> FreeSpaceTestGuard {
+    let storage = storage.to_path_buf();
+    let entry = FreeSpaceOverride {
+        canonical: canonical_free_space_path(&storage),
+        value: (free, capacity),
+    };
+    let previous = FREE_SPACE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((free, capacity));
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .storage
+        .insert(storage.clone(), entry);
+    FreeSpaceTestGuard { storage, previous }
+}
+
+/// Admission can run before a storage root or its descendants exist. Resolve
+/// the existing ancestor, preserving missing components only for comparison.
+fn canonical_free_space_path(path: &Path) -> Option<PathBuf> {
+    for ancestor in path.ancestors() {
+        let existing = if ancestor.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            ancestor
+        };
+        if let Ok(canonical) = fs::canonicalize(existing) {
+            return Some(canonical.join(path.strip_prefix(ancestor).ok()?));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+pub(crate) struct UnlimitedFreeSpaceForTestProcess;
+#[cfg(test)]
+impl Drop for UnlimitedFreeSpaceForTestProcess {
+    fn drop(&mut self) {
+        FREE_SPACE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unlimited -= 1;
+    }
+}
+/// Existing shared fixtures acquire their guard before creating one or more
+/// storage roots. Their fallback can only allow admission; refusal simulations
+/// must name a storage root and always take precedence over this fallback.
+#[cfg(test)]
+fn unlimited_free_space_for_test_process() -> UnlimitedFreeSpaceForTestProcess {
+    FREE_SPACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unlimited += 1;
+    UnlimitedFreeSpaceForTestProcess
 }
 /// The platform probe itself, bypassing the test override.
 #[cfg(test)]
@@ -284,10 +370,35 @@ pub(crate) fn probe_free_space_for_test(path: &Path) -> Option<(u64, u64)> {
     probe_free_space(path)
 }
 fn free_space(path: &Path) -> Option<(u64, u64)> {
-    if let Some(value) = *FREE_SPACE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-    {
+    let value = {
+        let overrides = FREE_SPACE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let canonical = if overrides.storage.is_empty() {
+            None
+        } else {
+            canonical_free_space_path(path)
+        };
+        overrides
+            .storage
+            .iter()
+            .filter_map(|(root, entry)| {
+                let canonical_depth = canonical.as_ref().and_then(|path| {
+                    entry
+                        .canonical
+                        .as_ref()
+                        .filter(|root| path.starts_with(root))
+                        .map(|root| root.components().count())
+                });
+                let depth = canonical_depth
+                    .or_else(|| path.starts_with(root).then(|| root.components().count()))?;
+                Some((depth, entry.value))
+            })
+            .max_by_key(|(depth, _)| *depth)
+            .map(|(_, value)| value)
+            .or_else(|| (overrides.unlimited > 0).then_some((u64::MAX, u64::MAX / 2)))
+    };
+    if let Some(value) = value {
         return Some(value);
     }
     probe_free_space(path)
@@ -362,8 +473,47 @@ pub fn allocated_bytes(path: &Path) -> Result<u64> {
 
 /// [`allocated_bytes`], stopping at `deadline`. The deadline is checked before
 /// each directory entry is read, and a walk that reaches it returns `None`:
-/// its partial sum is never a total.
+/// its partial sum is never a total. `path` is a family directory.
 pub fn allocated_bytes_until(path: &Path, deadline: Option<Instant>) -> Result<Option<u64>> {
+    walk_allocated(path, deadline, Level::Family)
+}
+
+/// Where a walk is inside a family directory.
+///
+/// Files under a member view (`views/<scope>` whose scope is not a base) are
+/// charged the bytes they hold alone. A member's derived database is a clone
+/// of its base's, and the base, charged in full, already counts the blocks
+/// they share. Everything else is charged its `stat` bytes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Level {
+    Family,
+    Views,
+    Base,
+    Member,
+    Other,
+}
+
+impl Level {
+    fn child(self, name: &std::ffi::OsStr) -> Self {
+        match self {
+            Self::Family if name == "views" => Self::Views,
+            Self::Family => Self::Other,
+            Self::Views => {
+                let name = name.to_string_lossy();
+                if name.starts_with(crate::views::base_refs::BASE_SCOPE_PREFIX)
+                    || name.starts_with(crate::views::base_refs::TREE_BASE_SCOPE_PREFIX)
+                {
+                    Self::Base
+                } else {
+                    Self::Member
+                }
+            }
+            level => level,
+        }
+    }
+}
+
+fn walk_allocated(path: &Path, deadline: Option<Instant>, level: Level) -> Result<Option<u64>> {
     let mut total = 0u64;
     for entry in fs::read_dir(path)
         .map_err(|e| crate::views::io::at("listing v3 accounting directory", path, e))?
@@ -386,10 +536,12 @@ pub fn allocated_bytes_until(path: &Path, deadline: Option<Instant>) -> Result<O
                 hook(&path);
             }
         });
-        // SQLite can remove sidecars while the namespace is being measured,
-        // even under the publication lock. A vanished entry occupies no bytes;
-        // other stat errors still leave accounting unknown and must refuse it.
-        let meta = match fs::symlink_metadata(&path) {
+        // Windows directory entries already contain size and type. Reopening a
+        // name here can fail with access denied while it is being deleted; use
+        // the listed size as a conservative charge until the next measurement.
+        // On Unix this still stats without following symlinks. Vanished entries
+        // occupy no bytes; other errors must leave accounting unknown.
+        let meta = match entry.metadata() {
             Ok(meta) => meta,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
@@ -399,10 +551,13 @@ pub fn allocated_bytes_until(path: &Path, deadline: Option<Instant>) -> Result<O
             }
         };
         if meta.is_dir() {
-            let Some(bytes) = allocated_bytes_until(&entry.path(), deadline)? else {
+            let child = level.child(&entry.file_name());
+            let Some(bytes) = walk_allocated(&entry.path(), deadline, child)? else {
                 return Ok(None);
             };
             total = total.saturating_add(bytes);
+        } else if level == Level::Member && meta.is_file() {
+            total = total.saturating_add(unshared::charge(&path, file_allocated(&meta)));
         } else {
             total = total.saturating_add(file_allocated(&meta));
         }
@@ -930,7 +1085,7 @@ fn for_each_registry(
 }
 fn check_space(storage: &Path, request: u64, reserved: u64) -> Result<()> {
     let (free, capacity) = free_space(storage).ok_or(Error::Refused("device_free_space_floor"))?;
-    let floor = NAMESPACE_BUDGET.max(capacity / 20);
+    let floor = MIN_FREE_BYTES.max(capacity / 20);
     if free
         .checked_sub(request)
         .and_then(|bytes| bytes.checked_sub(reserved))
@@ -1031,7 +1186,7 @@ fn check_floor(storage: &Path, request: u64, own: Option<(&Path, &Connection)>) 
                 .ok_or(Error::Refused("device_free_space_floor"))?;
         }
     }
-    let floor = NAMESPACE_BUDGET.max(capacity / 20);
+    let floor = MIN_FREE_BYTES.max(capacity / 20);
     if free
         .checked_sub(request)
         .and_then(|v| v.checked_sub(reserved))
@@ -1189,10 +1344,12 @@ impl<'a> RegistryWriter<'a> {
     }
     /// After deleting namespace files, call this to refresh accounting. It releases dead rows
     /// in the same barrier transaction as the measurement, retaining plane data.
+    /// Returns the recorded total: the confirmed walk, or, when concurrent
+    /// writers kept the namespace changing, the largest total a walk saw.
     pub fn covering_measurement(&mut self) -> Result<u64> {
         match self.measure_and_release(None, None)? {
             Measurement::Recorded(bytes) => Ok(bytes),
-            Measurement::Owed => unreachable!("a measurement without a deadline completes"),
+            Measurement::Owed => Ok(self.accounting()?.measured_bytes),
         }
     }
     /// [`Self::covering_measurement`] that stops at `deadline`, recording
@@ -1213,6 +1370,10 @@ impl<'a> RegistryWriter<'a> {
         // The last total this call committed, with the registry-file bytes the
         // walk behind it counted.
         let mut committed: Option<(u64, u64)> = None;
+        // The largest total any walk of this call saw, and the registry-file
+        // bytes counted before the latest one.
+        let mut largest = 0u64;
+        let mut last_counted = 0u64;
         for _ in 0..8 {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             // Nothing writes the registry files between this stat and the
@@ -1296,15 +1457,30 @@ impl<'a> RegistryWriter<'a> {
             tests::measurement_recheck_hook()?;
             match allocated_bytes_until(&self.dir, deadline)? {
                 Some(again) if again == bytes => return Ok(Measurement::Recorded(bytes)),
-                Some(_) => {}
+                Some(again) => {
+                    largest = largest.max(bytes).max(again);
+                    last_counted = counted;
+                }
                 None => return settle_registry_growth(&mut connection, &self.dir, bytes, counted),
             }
         }
-        Err(Error::ledger(
-            &self.dir,
-            "measure registry",
-            Error::Busy("namespace size did not stabilize after 8 measurements"),
-        ))
+        // Writers outside the reservation lock (derived databases commit
+        // without it) kept changing the namespace through every recheck. The
+        // first committed pass already released `release` and the dead
+        // reservations, so the work this call was asked to settle is done;
+        // what failed is only the confirmation of the total. Record the
+        // largest total seen, raised by the registry's own growth since, so
+        // it overstates rather than understates, and leave the measurement
+        // owed: the next writer open measures again. v3 sets no family byte
+        // limit, so the total only paces retention.
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE accounting SET measured_bytes=MAX(measured_bytes,?1) WHERE singleton=1",
+            [largest],
+        )?;
+        tx.commit()?;
+        checkpoint(&connection)?;
+        settle_registry_growth(&mut connection, &self.dir, largest, last_counted)
     }
     pub fn with_barrier<T>(
         &mut self,
@@ -1362,9 +1538,6 @@ impl<'a> RegistryWriter<'a> {
             // The current barrier already borrows this owner's connection.
             // Use that borrow rather than re-entering its connection mutex.
             check_floor(&storage,request,Some((&path,tx)))?;
-            if accounting(tx)?.usage().checked_add(request).is_none_or(|n|n>NAMESPACE_BUDGET) {
-                return Err(Error::Refused("v3_namespace_budget"));
-            }
             #[cfg(test)]
             if request == 100 { tests::admission_hook(); }
             tx.execute("INSERT INTO reservations(owner_pid,owner_start,state,reserved_bytes,charge_bytes) VALUES(?1,?2,'reserved',?3,0)",params![std::process::id(),owner_start,request])?;
@@ -1377,9 +1550,8 @@ impl<'a> RegistryWriter<'a> {
         })
     }
     /// Grows a live reservation by `additional` bytes under the same
-    /// admission checks as [`Self::reserve`]: the device floor and the
-    /// namespace budget. An owner extends before it writes past its
-    /// reservation, never after.
+    /// admission check as [`Self::reserve`]: the device floor. An owner
+    /// extends before it writes past its reservation, never after.
     pub fn extend(&mut self, reservation: &Reservation, additional: u64) -> Result<()> {
         if reservation.registry != self.registry_identity()? {
             return Err(Error::ReservationRegistryMismatch);
@@ -1389,13 +1561,6 @@ impl<'a> RegistryWriter<'a> {
         let id = reservation.id;
         self.with_barrier(|tx| {
             check_floor(&storage, additional, Some((&path, tx)))?;
-            if accounting(tx)?
-                .usage()
-                .checked_add(additional)
-                .is_none_or(|n| n > NAMESPACE_BUDGET)
-            {
-                return Err(Error::Refused("v3_namespace_budget"));
-            }
             let updated = tx.execute(
                 "UPDATE reservations SET reserved_bytes=reserved_bytes+?1 WHERE id=?2 AND state='reserved'",
                 params![additional, id],
@@ -2185,12 +2350,22 @@ impl PlaneReader {
     }
 }
 
-/// Serializes tests that depend on the process-wide free-space override and
-/// sets it to unlimited, so admission in other modules' tests never races the
-/// refusal cases in `tests`.
+/// Retains the shared v3 test lock and an unlimited process fallback. Explicit
+/// storage-scoped probes take precedence, even on a different thread.
 #[cfg(test)]
-pub(crate) fn serial_for_test() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn serial_for_test() -> tests::SerialTestGuard {
     tests::serial()
+}
+
+/// Runs load code while a separate graph-database writer changes the namespace
+/// between every measurement and its confirmation. The hook is thread-local.
+#[cfg(test)]
+pub(crate) fn with_changing_namespace_for_test<T>(
+    storage: &Path,
+    family: &str,
+    run: impl FnOnce(&std::sync::atomic::AtomicUsize) -> T,
+) -> (T, usize) {
+    tests::with_changing_namespace(storage, family, run)
 }
 
 #[cfg(test)]
@@ -2201,3 +2376,5 @@ mod replay_tests;
 mod source_guard;
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, windows))]
+pub(crate) use tests::deny_read_for_test;

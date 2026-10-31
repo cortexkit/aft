@@ -35,14 +35,20 @@ class MergeQueueWorkflowTests(unittest.TestCase):
         self.assertNotIn("paths-ignore", events["pull_request"])
 
     def test_queue_concurrency_is_sha_scoped_and_never_cancels_groups(self) -> None:
+        # Merge-queue, main and release-branch runs are release evidence for an
+        # exact SHA, so each SHA gets its own group and is never cancelled.
         concurrency = self.workflow["concurrency"]
         self.assertEqual(
             concurrency["group"],
-            "tests-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ (github.event_name == 'merge_group' || github.ref == 'refs/heads/main') && github.sha || 'latest' }}",
+            "tests-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ (github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && github.sha || 'latest' }}",
         )
         self.assertEqual(
-            concurrency["cancel-in-progress"], "${{ github.event_name != 'merge_group' && github.ref != 'refs/heads/main' }}"
+            concurrency["cancel-in-progress"],
+            "${{ github.event_name != 'merge_group' && github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/release/') }}",
         )
+
+    def test_release_branches_get_full_push_ci(self) -> None:
+        self.assertIn("release/**", self.workflow["on"]["push"]["branches"])
 
     def test_required_reusable_suites_skip_pr_leaf_jobs_not_callers(self) -> None:
         jobs = self.workflow["jobs"]

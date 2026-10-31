@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "windows-edit-atomicity"
+  ],
+  "note": "Windows file replacement after an edit publishes through a rename that never removes the destination name; short-named files take the rename and named data streams are copied first. No search, ranking or query routing changes."
+}

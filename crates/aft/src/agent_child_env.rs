@@ -57,8 +57,8 @@ const MANAGED_GIT_HOOK_NAMES: &[&str] = &[
     "post-index-change",
     "reference-transaction",
 ];
-const GH_SHIMS_DIR_ENV: &str = "AFT_GH_SHIMS_DIR";
-const GH_SHIM_BINARY_ENV: &str = "AFT_GH_SHIM_BINARY";
+pub(crate) const GH_SHIMS_DIR_ENV: &str = "AFT_GH_SHIMS_DIR";
+pub(crate) const GH_SHIM_BINARY_ENV: &str = "AFT_GH_SHIM_BINARY";
 const GIT_CO_AUTHOR_ENV: &str = "AFT_GIT_CO_AUTHOR";
 const STORAGE_DIR_ENV: &str = "AFT_STORAGE_DIR";
 const GH_SHIM_STATE_DIR_ENV: &str = "AFT_GH_SHIM_STATE_DIR";
@@ -819,6 +819,7 @@ pub fn inject(
     // daemon connection. Remove them only from the child snapshot so the module
     // process retains the credentials it needs.
     environment.retain(|key, _| !is_subc_credential_env_key(key));
+    remove_dead_pin_paths(environment);
     // This control belongs to the pinned config, never a caller or outer daemon.
     environment.remove(crate::privacy_spawn::CONTROL_ENV);
     if config.bash.disclaim_privacy {
@@ -929,6 +930,26 @@ pub fn inject(
     }
 
     Ok(())
+}
+
+fn remove_dead_pin_paths(environment: &mut HashMap<String, String>) {
+    // Inherited client PATHs and the cached effective PATH can both contain
+    // prefixes from earlier daemons. Exact deduplication of the new prefix
+    // cannot remove those differently named, now-deleted pin directories.
+    let inherited = environment
+        .get("PATH")
+        .map(OsString::from)
+        .unwrap_or_else(|| crate::effective_path::effective_path().to_os_string());
+    let entries: Vec<_> = std::env::split_paths(&inherited).collect();
+    let cleaned: Vec<_> = entries
+        .iter()
+        .filter(|entry| !crate::pinned_executable::is_dead_pin_path(entry))
+        .collect();
+    if cleaned.len() != entries.len() {
+        if let Ok(path) = std::env::join_paths(cleaned) {
+            environment.insert("PATH".to_string(), path.to_string_lossy().into_owned());
+        }
+    }
 }
 
 pub fn shim_binary(config: &Config) -> Result<PathBuf, String> {
@@ -1993,6 +2014,82 @@ pub(crate) fn write_storage_permission_fixture(root: &Path) {
 mod tests {
     use super::*;
     use crate::config::{Config, GitConfig};
+
+    #[test]
+    fn child_path_drops_dead_daemon_pins_without_reordering_other_entries() {
+        let storage = tempfile::tempdir().unwrap();
+        let dead = storage.path().join("run/aft-pinned-100-200/shims");
+        let live = storage.path().join("run/aft-pinned-101-201/shims");
+        fs::create_dir_all(&live).unwrap();
+        let unrelated = storage.path().join("tools/aft-pinned-100-200/shims");
+        let ordinary_missing = storage.path().join("missing-tools");
+        let mut environment = HashMap::from([(
+            "PATH".to_owned(),
+            std::env::join_paths([
+                unrelated.clone(),
+                dead,
+                ordinary_missing.clone(),
+                live.clone(),
+                unrelated.clone(),
+            ])
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        )]);
+        let mut config = Config::default();
+        config.github.shim = false;
+        config.git.co_author = "off".to_owned();
+        inject(&config, storage.path(), &mut environment, None).unwrap();
+        assert_eq!(
+            std::env::split_paths(&OsString::from(&environment["PATH"])).collect::<Vec<_>>(),
+            vec![unrelated.clone(), ordinary_missing, live, unrelated],
+        );
+        let once = environment.clone();
+        inject(&config, storage.path(), &mut environment, None).unwrap();
+        assert_eq!(environment, once);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enabled_shim_reinjection_does_not_accumulate_dead_pin_prefixes() {
+        let storage = tempfile::tempdir().unwrap();
+        let binary = storage.path().join("aft");
+        write_self_reporting_shim(&binary);
+        let dead = storage.path().join("run/aft-pinned-100-200/shims");
+        let mut environment = HashMap::from([
+            (
+                "PATH".to_owned(),
+                std::env::join_paths([
+                    dead.clone(),
+                    PathBuf::from("/usr/bin"),
+                    PathBuf::from("/bin"),
+                ])
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            ),
+            (
+                GH_SHIMS_DIR_ENV.to_owned(),
+                dead.to_string_lossy().into_owned(),
+            ),
+        ]);
+        let mut config = Config::default();
+        config.github.shim = true;
+        config.gh_shim.binary_path = Some(binary);
+        config.git.co_author = "off".to_owned();
+        inject(&config, storage.path(), &mut environment, None).unwrap();
+        assert_eq!(
+            std::env::split_paths(&OsString::from(&environment["PATH"])).collect::<Vec<_>>(),
+            vec![
+                storage.path().join("shims"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/bin")
+            ],
+        );
+        let once = environment.clone();
+        inject(&config, storage.path(), &mut environment, None).unwrap();
+        assert_eq!(environment, once);
+    }
 
     fn test_thread_file(root: &Path, contents: Option<&[u8]>) {
         let path = root

@@ -33,7 +33,7 @@ fn accepted_021_vector_and_single_locked_contract_are_pinned() {
         .filter(|p| p["name"].as_str() == Some("cortexkit-exec-remote-types"))
         .collect();
     assert_eq!(packages.len(), 1);
-    assert_eq!(packages[0]["version"].as_str(), Some("0.2.14"));
+    assert_eq!(packages[0]["version"].as_str(), Some("0.2.15"));
 }
 
 fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
@@ -54,7 +54,7 @@ fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
         .filter(|package| package["name"].as_str() == Some("cortexkit-exec-remote-types"))
         .map(|package| package["version"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(versions, ["0.2.14"], "exactly one caller contract version");
+    assert_eq!(versions, ["0.2.15"], "exactly one caller contract version");
     let vectors: serde_json::Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/exec-remote/published-v0.2.0.json"
     ))
@@ -360,7 +360,7 @@ pub(super) struct MemorySink {
     pub(super) stdout: Vec<u8>,
     pub(super) stderr: Vec<u8>,
     pub(super) seqs: Vec<u64>,
-    terminals: Vec<Verdict>,
+    pub(super) terminals: Vec<Verdict>,
     pub(super) truncations: Vec<u64>,
     unknown: Vec<(u64, Vec<u8>)>,
     started: Vec<Started>,

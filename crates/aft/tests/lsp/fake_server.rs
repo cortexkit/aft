@@ -155,7 +155,11 @@ fn write_publish_diagnostics_versioned(
     diagnostics: Value,
     version: Value,
 ) -> io::Result<()> {
-    let effective_version = if std::env::var("AFT_FAKE_LSP_STALE_VERSION").is_ok() {
+    let effective_version = if std::env::var_os("AFT_FAKE_LSP_UNVERSIONED_PUSH").is_some() {
+        // Model push-only servers such as kotlin-language-server, whose
+        // PublishDiagnosticsParams(uri, diagnostics) omits the version.
+        Value::Null
+    } else if std::env::var("AFT_FAKE_LSP_STALE_VERSION").is_ok() {
         match &version {
             Value::Number(n) if n.is_i64() => Value::Number((n.as_i64().unwrap() - 1).into()),
             _ => version.clone(),
@@ -918,6 +922,9 @@ pub(crate) fn main() -> io::Result<()> {
                     )?;
                 }
                 "shutdown" => {
+                    if std::env::var("AFT_FAKE_LSP_REPORT_SHUTDOWN").as_deref() == Ok("1") {
+                        write_custom_notification(&mut writer, "aft-test/shutdownReceived", Value::Null, Value::Null)?;
+                    }
                     if !ignore_shutdown {
                         write_response(&mut writer, id, Value::Null)?;
                     }
@@ -1133,7 +1140,13 @@ pub(crate) fn main() -> io::Result<()> {
                         .ok()
                         .and_then(|value| value.parse::<u64>().ok())
                     {
-                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        // A file gate lets a test obtain an initial report, then
+                        // hold subsequent pulls by creating the configured file.
+                        let delay_enabled = std::env::var_os("AFT_FAKE_LSP_PULL_DELAY_WHEN_FILE_EXISTS")
+                            .is_none_or(|path| std::path::Path::new(&path).exists());
+                        if delay_enabled {
+                            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        }
                     }
                     let force_unchanged =
                         std::env::var("AFT_FAKE_LSP_PULL_UNCHANGED").ok().as_deref() == Some("1");

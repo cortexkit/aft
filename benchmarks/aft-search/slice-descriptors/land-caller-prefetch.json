@@ -1,0 +1,8 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "slices": ["caller-prefetch-sql"],
+  "note": "Only the callgraph store caller query changes: indexed target probes replace a materialized target relation, preserving nullable targets and row order. No changed path is inside the ranking fence. Semantic search ranking and formatting code are unchanged."
+}

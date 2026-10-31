@@ -7,6 +7,8 @@ use super::{
     MODULE_CONTROL_OP_HEALTH_CHECK, PROTOCOL_VERSION,
 };
 
+pub(super) const FLOW_OPERATIONS: &[&str] = &[super::diagnostics_findings::OPERATION];
+
 pub(super) fn is_bash_family_tool(name: &str) -> bool {
     name == "bash" || name == "powershell" || name.starts_with("bash_")
 }
@@ -634,7 +636,7 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
             },
         ])
         .flow_operations(Some(
-            vec![super::diagnostics_findings::OPERATION.to_owned()],
+            FLOW_OPERATIONS.iter().map(|op| (*op).to_owned()).collect(),
         ))
         .bindings(Some(Bindings {
             storage: StorageBinding {

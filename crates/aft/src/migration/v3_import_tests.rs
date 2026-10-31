@@ -142,6 +142,7 @@ pub(super) fn input<'a>(
         trigram: &POLICY,
         semantic,
         working_set: DEFAULT_WORKING_SET,
+        keep_going: std::sync::Arc::new(|| true),
     }
 }
 
@@ -363,6 +364,7 @@ fn imported_trigram_rows_equal_a_cold_build_and_read_no_checkout_file() {
         &staged.path,
         &staged.hash,
         &mut |_| {},
+        &|| true,
     )
     .unwrap()
     .unwrap();
@@ -419,6 +421,7 @@ fn imported_trigram_rows_equal_a_cold_build_and_read_no_checkout_file() {
         &staged.path,
         &staged.hash,
         &mut |_| {},
+        &|| true,
     )
     .unwrap()
     .unwrap();
@@ -444,7 +447,7 @@ fn a_refused_reservation_is_a_named_storage_gap() {
     let staging = staging_dir(&storage, FAMILY, KEY);
     let input = input(&storage, &root, &staging, None);
     let staged = stage(LegacyArtifact::Trigram, &input).unwrap().unwrap();
-    v3::set_free_space_for_test(1 << 20, 1 << 40);
+    let _low_space = v3::set_free_space_for_test(&storage, 1 << 20, 1 << 40);
     let outcome = register_staged(
         &storage,
         FAMILY,
@@ -452,8 +455,9 @@ fn a_refused_reservation_is_a_named_storage_gap() {
         &staged.path,
         &staged.hash,
         &mut |_| {},
+        &|| true,
     );
-    v3::set_free_space_for_test(u64::MAX, u64::MAX / 2);
+    let _space = v3::set_free_space_for_test(&storage, u64::MAX, u64::MAX / 2);
     assert_eq!(
         outcome.unwrap().unwrap(),
         RegisterOutcome::StorageGap("storage_gap:device_free_space_floor".to_owned())

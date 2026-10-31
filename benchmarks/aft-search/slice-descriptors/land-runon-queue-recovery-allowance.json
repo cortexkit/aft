@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "runon-queue-recovery-allowance"
+  ],
+  "note": "Remote job recovery allows a queue wait of max(300 s, the run timeout) before declaring a job's outcome unknown. No search or indexing code changes."
+}

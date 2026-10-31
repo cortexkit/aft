@@ -34,6 +34,10 @@ impl Drop for AdvisoryLockGuard {
 }
 
 pub const HEARTBEAT_INTERVAL_MS: u64 = 5_000;
+/// Successful refreshes need not rewrite every wake. Foreign hosts allow 75s
+/// of silence, leaving 50s of scheduling/I/O headroom after a normal refresh.
+/// Same-host readers use process identity, never heartbeat age, for takeover.
+pub const HEARTBEAT_REFRESH_INTERVAL_MS: u64 = 25_000;
 pub const STALE_HEARTBEAT_MS: u64 = 15_000;
 pub const LIVE_OWNER_WARN_MS: u64 = 600_000;
 pub const POLL_INTERVAL_MS: u64 = 100;
@@ -190,16 +194,33 @@ fn is_transient_create_contention(error: &io::Error) -> bool {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub(crate) enum MalformedOwnerPolicy {
+    RecoverAfterGrace,
+    FailClosed,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct LockConfig {
     heartbeat_interval_ms: u64,
+    heartbeat_refresh_interval_ms: u64,
     stale_heartbeat_ms: u64,
     live_owner_warn_ms: u64,
     poll_interval_ms: u64,
+    malformed_owner: MalformedOwnerPolicy,
 }
 
 impl LockConfig {
     fn cross_host_stale_heartbeat_ms(self) -> u64 {
         self.stale_heartbeat_ms.saturating_mul(5)
+    }
+
+    fn live_owner_warning_age_ms(self) -> u64 {
+        // A healthy lease can now be older than the old warning window. Allow
+        // one wake of jitter without changing the foreign-host takeover bound.
+        self.stale_heartbeat_ms.max(
+            self.heartbeat_refresh_interval_ms
+                .saturating_add(self.heartbeat_interval_ms),
+        )
     }
 }
 
@@ -207,9 +228,11 @@ impl Default for LockConfig {
     fn default() -> Self {
         Self {
             heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
+            heartbeat_refresh_interval_ms: HEARTBEAT_REFRESH_INTERVAL_MS,
             stale_heartbeat_ms: STALE_HEARTBEAT_MS,
             live_owner_warn_ms: LIVE_OWNER_WARN_MS,
             poll_interval_ms: POLL_INTERVAL_MS,
+            malformed_owner: MalformedOwnerPolicy::RecoverAfterGrace,
         }
     }
 }
@@ -274,6 +297,22 @@ pub(crate) fn try_acquire_until(path: &Path, deadline: Instant) -> Result<LockGu
 /// the existing guarded reclaim path is tried.
 pub fn try_acquire_once(path: &Path) -> Result<LockGuard, AcquireError> {
     try_acquire(path, Duration::ZERO)
+}
+
+/// Select malformed-owner recovery per lease. Paid external work must not infer
+/// that an owner exited from damaged metadata, even after a stable grace read.
+pub(crate) fn try_acquire_once_with_policy(
+    path: &Path,
+    malformed_owner: MalformedOwnerPolicy,
+) -> Result<LockGuard, AcquireError> {
+    acquire_with_config(
+        path,
+        Some(Duration::ZERO),
+        LockConfig {
+            malformed_owner,
+            ..LockConfig::default()
+        },
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -654,6 +693,10 @@ fn acquire_with_deadline(
                     Err(ReadLockError::Io(error)) => return Err(error.into()),
                     Err(ReadLockError::Malformed(_)) => {}
                 }
+                if matches!(config.malformed_owner, MalformedOwnerPolicy::FailClosed) {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData,
+                        format!("filesystem lease owner metadata is malformed; cannot prove the owner exited: {error}")).into());
+                }
                 slog_warn!(
                     "removing malformed filesystem lock at {}: {}",
                     path.display(),
@@ -733,7 +776,7 @@ fn acquire_with_deadline(
         }
         dead_reclaim_blocked_attempts = 0;
 
-        if since_heartbeat > config.stale_heartbeat_ms && live_owner_log.first_stale() {
+        if since_heartbeat > config.live_owner_warning_age_ms() && live_owner_log.first_stale() {
             // Same-host PID plus start-time identity is authoritative. A
             // SIGSTOP'd process, suspended VM, or sleeping laptop can miss
             // heartbeats and later resume inside the critical section. Breaking
@@ -777,6 +820,10 @@ fn acquire_with_deadline(
 }
 
 fn create_new_lock(path: &Path, hostname: &str, config: LockConfig) -> io::Result<LockGuard> {
+    // Anchor the first deadline before publication, not when the new thread
+    // eventually gets CPU time. A late-starting thread must refresh immediately.
+    let first_refresh =
+        Instant::now() + Duration::from_millis(config.heartbeat_refresh_interval_ms);
     let now = now_ms();
     let pid = std::process::id();
     let process_identity = process_identity(pid);
@@ -814,6 +861,7 @@ fn create_new_lock(path: &Path, hostname: &str, config: LockConfig) -> io::Resul
                 &heartbeat_pump_for_thread,
                 heartbeat_shutdown_for_run,
                 config,
+                first_refresh,
             );
         }));
         if result.is_err() || !heartbeat_shutdown.load(Ordering::Acquire) {
@@ -877,9 +925,10 @@ fn run_heartbeat(
     pump: &HeartbeatPump,
     shutdown: Arc<AtomicBool>,
     config: LockConfig,
+    mut next_refresh: Instant,
 ) {
-    // Number of consecutive heartbeat intervals that can be missed before the
-    // same-host stale window elapses and another process may reclaim the lock.
+    // Number of consecutive retry intervals before the warning window elapses.
+    // Local takeover still requires proof of a dead or recycled process.
     // Beyond this point a sustained failure is genuinely dangerous, so we
     // escalate the log from warn to error — but we still keep retrying.
     let stale_intervals = config
@@ -888,15 +937,16 @@ fn run_heartbeat(
         .unwrap_or(3)
         .max(1);
     let mut consecutive_transient_failures: u64 = 0;
+    let refresh_interval = Duration::from_millis(config.heartbeat_refresh_interval_ms);
 
     loop {
-        thread::park_timeout(Duration::from_millis(config.heartbeat_interval_ms));
         if shutdown.load(Ordering::Acquire) {
             return;
         }
 
-        match pump.heartbeat_once() {
-            Ok(()) => {
+        match refresh_heartbeat_if_due(pump, &mut next_refresh, refresh_interval, Instant::now()) {
+            Ok(false) => {}
+            Ok(true) => {
                 if consecutive_transient_failures > 0 {
                     slog_info!(
                         "filesystem lock at {} heartbeat recovered after {} transient failure(s)",
@@ -938,7 +988,24 @@ fn run_heartbeat(
                 );
             }
         }
+        thread::park_timeout(Duration::from_millis(config.heartbeat_interval_ms));
     }
+}
+
+fn refresh_heartbeat_if_due(
+    pump: &HeartbeatPump,
+    next_refresh: &mut Instant,
+    interval: Duration,
+    now: Instant,
+) -> Result<bool, HeartbeatError> {
+    if now < *next_refresh {
+        return Ok(false);
+    }
+    // A delayed wake refreshes immediately. Only success advances the deadline,
+    // so transient failures retry at the short wake cadence, not another 25s.
+    pump.heartbeat_once()?;
+    *next_refresh = now + interval;
+    Ok(true)
 }
 
 /// A heartbeat failure is terminal when the lock is provably no longer ours to
@@ -2405,10 +2472,16 @@ fn lock_owner_is_alive(metadata: &LockMetadata) -> bool {
         return false;
     }
 
+    let identity = process_identity(metadata.pid);
+    // An exited process cannot execute protected work, even while its parent
+    // leaves it waitable. Missing or inconclusive identity still fails closed.
+    if identity.as_ref().is_some_and(|identity| identity.exited) {
+        return false;
+    }
     let Some(recorded_start_time) = metadata.process_start_time else {
         return true;
     };
-    let Some(current_identity) = process_identity(metadata.pid) else {
+    let Some(current_identity) = identity else {
         return true;
     };
 
@@ -2426,17 +2499,26 @@ fn lock_owner_is_alive(metadata: &LockMetadata) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn linux_process_stat_identity(stat: &str) -> Option<(u64, bool)> {
+    // Fields 20 and 22 are num_threads and starttime. Split after the final ')'
+    // because the command can contain spaces and parentheses. pthread_exit can
+    // leave a zombie leader while other threads still execute protected work.
+    // Z (zombie) or X (dead) proves exit only with one reported thread. Malformed
+    // fields give no identity, so owner liveness remains conservative.
+    let fields = stat.rsplit_once(") ")?.1.split_ascii_whitespace();
+    let state = fields.clone().next()?;
+    if state.len() != 1 {
+        return None;
+    }
+    let num_threads = fields.clone().nth(17)?.parse::<u64>().ok()?;
+    let start_time = fields.clone().nth(19)?.parse::<u64>().ok()?;
+    Some((start_time, matches!(state, "Z" | "X") && num_threads == 1))
+}
+
+#[cfg(target_os = "linux")]
 fn process_identity(pid: u32) -> Option<ProcessIdentity> {
-    // Field 22 is starttime. Split after the final ')' because a process name is
-    // allowed to contain spaces and parentheses.
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let start_time = stat
-        .rsplit_once(") ")?
-        .1
-        .split_ascii_whitespace()
-        .nth(19)?
-        .parse()
-        .ok()?;
+    let (start_time, exited) = linux_process_stat_identity(&stat)?;
     let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .ok()?
         .trim()
@@ -2448,47 +2530,145 @@ fn process_identity(pid: u32) -> Option<ProcessIdentity> {
     Some(ProcessIdentity {
         start_time,
         boot_id: Some(boot_id),
-        exited: matches!(
-            stat.rsplit_once(") ")?.1.split_ascii_whitespace().next()?,
-            "Z" | "X"
-        ),
+        exited,
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+const MACOS_KINFO_SIZE: usize = 648;
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const SZOMB: u8 = 5;
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const P_WEXIT: u32 = 0x0000_2000;
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MacosExitState {
+    NotExiting,
+    Exiting,
+    Zombie,
+}
+
+/// One kernel snapshot supplies both incarnation and exit evidence. libproc's
+/// PROC_PIDTBSDINFO can fail for a zombie, which is not evidence of liveness.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Debug)]
+pub(crate) struct MacosKinfo {
+    pub(crate) comm: String,
+    pub(crate) ruid: u32,
+    pub(crate) pgid: i32,
+    pub(crate) state: u8,
+    pub(crate) flags: u32,
+    pub(crate) started_at_us: Option<u64>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl MacosKinfo {
+    pub(crate) fn exit_state(&self) -> MacosExitState {
+        if self.state == SZOMB {
+            MacosExitState::Zombie
+        } else if self.flags & P_WEXIT != 0 {
+            MacosExitState::Exiting
+        } else {
+            MacosExitState::NotExiting
+        }
+    }
+
+    /// The kernel exposes exit-started (P_WEXIT) before the process reaches the
+    /// zombie state (SZOMB). Both count as exited for lease ownership and for
+    /// deciding when a killed background task has finished.
+    pub(crate) fn has_exited(&self) -> bool {
+        self.exit_state() != MacosExitState::NotExiting
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn decode_macos_kinfo(bytes: &[u8]) -> Option<MacosKinfo> {
+    // Darwin's kinfo_proc ABI is 648 bytes on arm64 and x86_64. libc does not
+    // declare it for Apple targets; reject any other layout rather than guess.
+    const P_FLAG_OFFSET: usize = 32;
+    const P_STAT_OFFSET: usize = 36;
+    const P_COMM_OFFSET: usize = 243;
+    const P_COMM_LEN: usize = 17;
+    const P_RUID_OFFSET: usize = 392;
+    const E_PGID_OFFSET: usize = 564;
+    if bytes.len() != MACOS_KINFO_SIZE {
+        return None;
+    }
+    let read_u32 = |offset: usize| {
+        u32::from_ne_bytes(bytes[offset..offset + 4].try_into().expect("four bytes"))
+    };
+    // extern_proc begins with p_un.p_starttime (timeval): 64-bit seconds and
+    // 32-bit microseconds. Keep microsecond identity distinct from ms callers.
+    let seconds = i64::from_ne_bytes(bytes[0..8].try_into().ok()?);
+    let micros = i32::from_ne_bytes(bytes[8..12].try_into().ok()?);
+    let started_at_us = if seconds > 0 && (0..1_000_000).contains(&micros) {
+        (seconds as u64)
+            .checked_mul(1_000_000)?
+            .checked_add(micros as u64)
+    } else {
+        None
+    };
+    let comm = &bytes[P_COMM_OFFSET..P_COMM_OFFSET + P_COMM_LEN];
+    let end = comm
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(comm.len());
+    Some(MacosKinfo {
+        comm: String::from_utf8_lossy(&comm[..end]).into_owned(),
+        ruid: read_u32(P_RUID_OFFSET),
+        pgid: read_u32(E_PGID_OFFSET) as i32,
+        state: bytes[P_STAT_OFFSET],
+        flags: read_u32(P_FLAG_OFFSET),
+        started_at_us,
+    })
+}
+
+/// kern.proc.pid also answers for other users and unreaped processes. A failed
+/// or partial read is inconclusive, never a fabricated live/dead identity.
+#[cfg(target_os = "macos")]
+pub(crate) fn macos_kinfo(pid: u32) -> Option<MacosKinfo> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return None;
+    }
+    let mut mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PID,
+        pid as i32,
+    ];
+    let mut bytes = [0_u8; MACOS_KINFO_SIZE];
+    let mut size = bytes.len();
+    // SAFETY: sysctl receives the real buffer size and may write at most it.
+    let status = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            bytes.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status != 0 || size != bytes.len() {
+        return None;
+    }
+    decode_macos_kinfo(&bytes)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_process_identity(snapshot: Option<MacosKinfo>) -> Option<ProcessIdentity> {
+    let info = snapshot?;
+    Some(ProcessIdentity {
+        start_time: info.started_at_us?,
+        boot_id: None,
+        exited: info.has_exited(),
     })
 }
 
 #[cfg(target_os = "macos")]
 fn process_identity(pid: u32) -> Option<ProcessIdentity> {
-    if pid == 0 || pid > i32::MAX as u32 {
-        return None;
-    }
-
-    // PROC_PIDTBSDINFO supplies the kernel-recorded process birth time without
-    // spawning a command or trusting user-controlled process metadata.
-    const PROC_PIDTBSDINFO: libc::c_int = 3;
-    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    let written = unsafe {
-        proc_pidinfo(
-            pid as libc::c_int,
-            PROC_PIDTBSDINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            size,
-        )
-    };
-    if written != size {
-        return None;
-    }
-    let info = unsafe { info.assume_init() };
-    let start_time = info
-        .pbi_start_tvsec
-        .checked_mul(1_000_000)?
-        .checked_add(info.pbi_start_tvusec)?;
-
-    Some(ProcessIdentity {
-        start_time,
-        boot_id: None,
-        exited: info.pbi_status == 5,
-    })
+    macos_process_identity(macos_kinfo(pid))
 }
 
 #[cfg(windows)]
@@ -2569,7 +2749,7 @@ fn process_identity(_pid: u32) -> Option<ProcessIdentity> {
     None
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(test, target_os = "macos"))]
 unsafe extern "C" {
     fn proc_pidinfo(
         pid: libc::c_int,
@@ -2681,6 +2861,70 @@ pub(crate) fn process_alive(_pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn macos_snapshot_bytes(state: u8, flags: u32) -> [u8; 648] {
+        let mut bytes = [0; 648];
+        bytes[0..8].copy_from_slice(&1_700_000_000_i64.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&123_456_i32.to_ne_bytes());
+        bytes[32..36].copy_from_slice(&flags.to_ne_bytes());
+        bytes[36] = state;
+        bytes[243..248].copy_from_slice(b"owner");
+        bytes[392..396].copy_from_slice(&42_u32.to_ne_bytes());
+        bytes[564..568].copy_from_slice(&123_i32.to_ne_bytes());
+        bytes
+    }
+
+    #[test]
+    fn semantic_batch_lease_macos_snapshot_keeps_birth_and_exit_phase() {
+        let info = decode_macos_kinfo(&macos_snapshot_bytes(SZOMB, P_WEXIT)).unwrap();
+        assert_eq!(info.comm, "owner");
+        assert_eq!((info.ruid, info.pgid), (42, 123));
+        assert_eq!(info.exit_state(), MacosExitState::Zombie);
+        let identity = macos_process_identity(Some(info)).unwrap();
+        assert_eq!(identity.start_time, 1_700_000_000_123_456);
+        assert!(identity.exited);
+        assert!(identity.boot_id.is_none());
+
+        let exiting = decode_macos_kinfo(&macos_snapshot_bytes(2, P_WEXIT)).unwrap();
+        assert_eq!(exiting.exit_state(), MacosExitState::Exiting);
+        assert!(macos_process_identity(Some(exiting)).unwrap().exited);
+        let running = decode_macos_kinfo(&macos_snapshot_bytes(2, 0)).unwrap();
+        assert_eq!(running.exit_state(), MacosExitState::NotExiting);
+        assert!(!macos_process_identity(Some(running)).unwrap().exited);
+    }
+
+    #[test]
+    fn semantic_batch_lease_macos_missing_identity_stays_inconclusive() {
+        assert!(macos_process_identity(None).is_none());
+        let mut bytes = macos_snapshot_bytes(SZOMB, P_WEXIT);
+        assert!(decode_macos_kinfo(&bytes[..16]).is_none());
+        bytes[8..12].copy_from_slice(&1_000_000_i32.to_ne_bytes());
+        assert!(macos_process_identity(decode_macos_kinfo(&bytes)).is_none());
+        bytes[8..12].copy_from_slice(&0_i32.to_ne_bytes());
+        bytes[0..8].copy_from_slice(&0_i64.to_ne_bytes());
+        assert!(macos_process_identity(decode_macos_kinfo(&bytes)).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn semantic_batch_lease_macos_birth_matches_live_libproc() {
+        let pid = std::process::id();
+        let identity = process_identity(pid).expect("kernel identity for this process");
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        let written = unsafe { proc_pidinfo(pid as i32, 3, 0, info.as_mut_ptr().cast(), size) };
+        assert_eq!(written, size, "libproc must answer for this live process");
+        let info = unsafe { info.assume_init() };
+        assert_eq!(
+            identity.start_time,
+            info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec
+        );
+        assert!(!identity.exited);
+        assert_eq!(
+            crate::root_cache::process_start_time_ms(pid),
+            Some(identity.start_time / 1_000)
+        );
+    }
     use std::io::{BufRead, Write};
     use std::process::{Child, ChildStdin, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2864,9 +3108,11 @@ mod tests {
     fn test_config() -> LockConfig {
         LockConfig {
             heartbeat_interval_ms: 25,
+            heartbeat_refresh_interval_ms: 25,
             stale_heartbeat_ms: 2_000,
             live_owner_warn_ms: LIVE_OWNER_WARN_MS,
             poll_interval_ms: 10,
+            malformed_owner: MalformedOwnerPolicy::RecoverAfterGrace,
         }
     }
 
@@ -3234,7 +3480,110 @@ mod tests {
         fs::metadata(path).expect("lock metadata").ino()
     }
 
-    /// Sixty seconds of heartbeats on several leases must not fsync anything
+    #[test]
+    fn healthy_refresh_cadence_does_not_trigger_stale_warning() {
+        let config = LockConfig::default();
+        assert_eq!(config.live_owner_warning_age_ms(), 30_000);
+        assert_eq!(config.cross_host_stale_heartbeat_ms(), 75_000);
+        assert_eq!(test_config().live_owner_warning_age_ms(), 2_000);
+    }
+
+    #[test]
+    fn idle_writer_lease_writes_twice_in_sixty_seconds() {
+        let (_dir, path) = test_lock_path();
+        let owner = create_owned_lock(&path);
+        let (pump, _handle) = HeartbeatPump::attach(&path, &owner).unwrap();
+        let config = LockConfig::default();
+        let start = Instant::now();
+        let interval = Duration::from_millis(config.heartbeat_refresh_interval_ms);
+        let mut next = start + interval;
+        let bytes = fs::metadata(&path).unwrap().len();
+        let _ = io_ledger::take();
+        let mut writes = 0;
+        // Drive the production scheduler with a virtual minute; actual lease
+        // writes still go through the kept descriptor and I/O ledger.
+        for seconds in (5..=60).step_by(5) {
+            writes += usize::from(
+                refresh_heartbeat_if_due(
+                    &pump,
+                    &mut next,
+                    interval,
+                    start + Duration::from_secs(seconds),
+                )
+                .unwrap(),
+            );
+        }
+        let ledger = io_ledger::take();
+        assert_eq!(writes, 2, "one idle lease must write at 25s and 50s only");
+        assert_eq!(ledger.bytes_written, bytes * 2);
+        assert_eq!(
+            (ledger.file_syncs, ledger.dir_syncs, ledger.new_files),
+            (0, 0, 0)
+        );
+        eprintln!("idle writer lease / virtual 60s: before=12 after={writes} {ledger:?}");
+        unregister_lease_slot(pump.slot, &path);
+    }
+
+    #[test]
+    fn delayed_refresh_preserves_live_owner_and_foreign_freshness() {
+        let (_dir, path) = test_lock_path();
+        let mut owner = create_owned_lock(&path);
+        let now = now_ms();
+        // A wake delayed 40s beyond the 25s target is still inside the unchanged
+        // 75s foreign-host window. Local identity remains protected even later.
+        owner.heartbeat_at_ms = now - 65_000;
+        fs::write(&path, lock_metadata_bytes(&owner).unwrap()).unwrap();
+        let config = LockConfig::default();
+        assert_eq!(config.cross_host_stale_heartbeat_ms(), 75_000);
+        assert!(metadata_blocks_acquisition(
+            &owner,
+            "foreign-observer",
+            config,
+            now
+        ));
+        assert!(metadata_blocks_acquisition(
+            &owner,
+            &owner.hostname,
+            config,
+            now + 3_600_000
+        ));
+        let (pump, _handle) = HeartbeatPump::attach(&path, &owner).unwrap();
+        let wake = Instant::now();
+        let mut next = wake - Duration::from_secs(40);
+        assert!(refresh_heartbeat_if_due(&pump, &mut next, Duration::from_secs(25), wake).unwrap());
+        let refreshed = read_lock_metadata(&path).unwrap();
+        assert!(refreshed.heartbeat_at_ms >= now);
+        assert!(metadata_blocks_acquisition(
+            &refreshed,
+            "foreign-observer",
+            config,
+            now + 70_000
+        ));
+        unregister_lease_slot(pump.slot, &path);
+    }
+
+    #[test]
+    fn failed_refresh_retries_on_next_short_wake() {
+        let (_dir, path) = test_lock_path();
+        let owner = create_owned_lock(&path);
+        let (pump, _handle) = HeartbeatPump::attach(&path, &owner).unwrap();
+        let wake = Instant::now();
+        let mut next = wake;
+        fs::write(&path, b"partial").unwrap();
+        assert!(refresh_heartbeat_if_due(&pump, &mut next, Duration::from_secs(25), wake).is_err());
+        assert_eq!(next, wake, "a failed write must not postpone the retry");
+        fs::write(&path, lock_metadata_bytes(&owner).unwrap()).unwrap();
+        assert!(refresh_heartbeat_if_due(
+            &pump,
+            &mut next,
+            Duration::from_secs(25),
+            wake + Duration::from_secs(5)
+        )
+        .unwrap());
+        unregister_lease_slot(pump.slot, &path);
+    }
+
+    /// Sixty seconds of forced heartbeats on several leases must not fsync anything
     /// and must not create a new file per beat. The ledger totals are printed
     /// so the cost can be compared across changes.
     #[test]
@@ -3944,6 +4293,90 @@ mod tests {
         assert!(matches!(result, Err(AcquireError::Timeout)));
 
         remove_lock_file(&path).expect("cleanup synthetic lock");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn semantic_batch_lease_exited_unreaped_owner_is_dead() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        for legacy in [false, true] {
+            let (_root, path) = test_lock_path();
+            let mut child = Command::new("sh")
+                .args(["-c", "read gate; exit 0"])
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let identity = process_identity(child.id()).unwrap();
+            let mut metadata = synthetic_metadata(child.id(), current_hostname(), now_ms());
+            metadata.process_start_time = Some(identity.start_time);
+            metadata.boot_id = identity.boot_id;
+            if legacy {
+                write_legacy_lock(&path, &metadata);
+            } else {
+                write_synthetic_lock(&path, &metadata);
+            }
+            writeln!(child.stdin.take().unwrap(), "exit").unwrap();
+            // WNOWAIT proves exit without reaping: kill(pid, 0) can still see
+            // this PID, but the process can no longer execute protected work.
+            let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+            let observed = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    libc::id_t::try_from(child.id()).unwrap(),
+                    info.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            let wait_error = io::Error::last_os_error();
+            let exited = process_identity(child.id()).is_some_and(|identity| identity.exited);
+            let recovered = try_acquire_once(&path);
+            child.wait().unwrap();
+            assert_eq!(observed, 0, "waitid failed: {wait_error}");
+            assert!(exited, "the native identity probe did not observe exit");
+            assert!(
+                recovered.is_ok(),
+                "an exited unreaped owner blocked recovery (legacy={legacy})"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn semantic_batch_lease_linux_stat_requires_quiescent_zombie() {
+        let one =
+            "4242 (worker (lease owner)) Z 1 1 1 0 -1 4194304 10 0 0 0 0 0 0 0 20 0 1 0 1234 0";
+        assert_eq!(linux_process_stat_identity(one), Some((1234, true)));
+        let live_threads = one.replace(" 1 0 1234 ", " 2 0 1234 ");
+        assert_eq!(
+            linux_process_stat_identity(&live_threads),
+            Some((1234, false)),
+            "a zombie leader does not prove its worker threads exited"
+        );
+        assert_eq!(
+            linux_process_stat_identity(&one.replace(" 1 0 1234 ", " 0 0 1234 ")),
+            Some((1234, false))
+        );
+        assert_eq!(
+            linux_process_stat_identity(&one.replace(") Z ", ") X ")),
+            Some((1234, true))
+        );
+        assert_eq!(
+            linux_process_stat_identity(&one.replace(") Z ", ") S ")),
+            Some((1234, false))
+        );
+        assert_eq!(
+            linux_process_stat_identity(&one.replace(" 1 0 1234 ", " bad 0 1234 ")),
+            None
+        );
+        assert_eq!(
+            linux_process_stat_identity(&one.replace("1234", "bad")),
+            None
+        );
+        assert_eq!(
+            linux_process_stat_identity(&one.replace(") Z ", ") bad ")),
+            None
+        );
     }
 
     #[test]

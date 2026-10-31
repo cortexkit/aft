@@ -223,6 +223,7 @@ fn refresh_trigram(session: &ParentSession, child: &Child) {
     let family = match child.family(&session.storage) {
         Ok(family) => family,
         Err(error) => {
+            session.note_child_failure(child, "parent_trigram", &error);
             *write(&child.trigram) = Plane::Gap(error);
             return;
         }
@@ -236,7 +237,9 @@ fn refresh_trigram(session: &ParentSession, child: &Child) {
             return;
         }
         Err(error) => {
-            *write(&child.trigram) = Plane::Gap(format!("lexical view unavailable: {error}"));
+            let error = format!("lexical view unavailable: {error}");
+            session.note_child_failure(child, "parent_trigram", &error);
+            *write(&child.trigram) = Plane::Gap(error);
             return;
         }
     }
@@ -272,10 +275,12 @@ fn refresh_trigram(session: &ParentSession, child: &Child) {
         ReadOnlyArtifact::Fresh(index) => index,
         ReadOnlyArtifact::Stale(stale) => stale.index,
         ReadOnlyArtifact::Degraded(degradation) => {
-            *write(&child.trigram) = Plane::Gap(format!(
+            let error = format!(
                 "the trigram index could not be read ({})",
                 degradation.reason
-            ));
+            );
+            session.note_child_failure(child, "parent_trigram", &error);
+            *write(&child.trigram) = Plane::Gap(error);
             return;
         }
         ReadOnlyArtifact::Absent => {
@@ -360,7 +365,9 @@ fn install_view_trigram(
             );
         }
         Err(error) => {
-            *write(&child.trigram) = Plane::Gap(format!("lexical view unreadable: {error}"));
+            let error = format!("lexical view unreadable: {error}");
+            session.note_child_failure(child, "parent_trigram", &error);
+            *write(&child.trigram) = Plane::Gap(error);
         }
     }
 }
@@ -564,6 +571,7 @@ fn refresh_callgraph(session: &ParentSession, child: &Child) {
     let family = match child.family(&session.storage) {
         Ok(family) => family,
         Err(error) => {
+            session.note_child_failure(child, "parent_callgraph", &error);
             *write(&child.callgraph) = Plane::Gap(error);
             return;
         }
@@ -587,7 +595,9 @@ fn refresh_callgraph(session: &ParentSession, child: &Child) {
             return;
         }
         Err(error) => {
-            *write(&child.callgraph) = Plane::Gap(format!("call graph view unavailable: {error}"));
+            let error = format!("call graph view unavailable: {error}");
+            session.note_child_failure(child, "parent_callgraph", &error);
+            *write(&child.callgraph) = Plane::Gap(error);
             return;
         }
     };
@@ -619,8 +629,14 @@ fn refresh_callgraph(session: &ParentSession, child: &Child) {
         }
         Err(error) => {
             *write(&child.callgraph) = Plane::Gap(match error {
+                // Unavailable names a state the store reports (building,
+                // busy), which the next round retries.
                 crate::callgraph_store::CallGraphStoreError::Unavailable(reason) => reason,
-                other => format!("call graph view unreadable: {other}"),
+                other => {
+                    let error = format!("call graph view unreadable: {other}");
+                    session.note_child_failure(child, "parent_callgraph", &error);
+                    error
+                }
             });
         }
     }
@@ -632,13 +648,23 @@ fn refresh_inspect(session: &ParentSession, child: &Child) {
     }
     // Opening read-only creates nothing in the child's inspect directory but
     // a read marker; `None` means the child's sessions never stored
-    // project-wide inspect results.
-    if let Ok(Some(cache)) = crate::inspect::cache::InspectCache::open_readonly(
+    // project-wide inspect results. An open error is a failure, not absence.
+    match crate::inspect::cache::InspectCache::open_readonly(
         session.storage.join("inspect"),
         child.root.clone(),
     ) {
-        child.loads.fetch_add(1, Ordering::SeqCst);
-        *write(&child.inspect) = Some(Arc::new(cache));
+        Ok(Some(cache)) => {
+            child.loads.fetch_add(1, Ordering::SeqCst);
+            *write(&child.inspect) = Some(Arc::new(cache));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            session.note_child_failure(
+                child,
+                "parent_inspect",
+                &format!("inspect cache unreadable: {error}"),
+            );
+        }
     }
 }
 
@@ -659,7 +685,14 @@ fn start_semantic(session: &ParentSession) {
     })();
     *write(&session.semantic) = match started {
         Ok(semantic) => Plane::Ready(Arc::new(semantic)),
-        Err(error) => Plane::Gap(format!("embedding model unavailable: {error}")),
+        Err(error) => {
+            crate::slog_warn!(
+                "parent folder embedding model unavailable root={} error={}",
+                session.root.display(),
+                error
+            );
+            Plane::Gap(format!("embedding model unavailable: {error}"))
+        }
     };
 }
 
@@ -678,16 +711,16 @@ fn refresh_semantic(session: &ParentSession, child: &Child) {
     let family = match child.family(&session.storage) {
         Ok(family) => family,
         Err(error) => {
+            session.note_child_failure(child, "parent_semantic", &error);
             *write(&child.semantic) = Plane::Gap(error);
             return;
         }
     };
     let scope = super::super::semantic_runtime::view_scope(&child.scope);
-    let producers = Producers {
-        trigram: session.trigram_policy.fingerprint_hex(),
-        semantic: Some(semantic.producer_id.clone()),
-        callgraph: super::super::callgraph::PRODUCER.into(),
-    };
+    let producers = super::super::semantic_runtime::member_producers(
+        session.trigram_policy.fingerprint_hex(),
+        semantic.producer_id.clone(),
+    );
     let generation = match super::super::base_refs::open_foreign_v3(
         &session.storage,
         family,
@@ -701,7 +734,9 @@ fn refresh_semantic(session: &ParentSession, child: &Child) {
             return;
         }
         Err(error) => {
-            *write(&child.semantic) = Plane::Gap(format!("semantic view unavailable: {error}"));
+            let error = format!("semantic view unavailable: {error}");
+            session.note_child_failure(child, "parent_semantic", &error);
+            *write(&child.semantic) = Plane::Gap(error);
             return;
         }
     };
@@ -720,7 +755,9 @@ fn refresh_semantic(session: &ParentSession, child: &Child) {
     ) {
         Ok(reader) => Arc::new(reader),
         Err(error) => {
-            *write(&child.semantic) = Plane::Gap(format!("semantic view unreadable: {error}"));
+            let error = format!("semantic view unreadable: {error}");
+            session.note_child_failure(child, "parent_semantic", &error);
+            *write(&child.semantic) = Plane::Gap(error);
             return;
         }
     };
@@ -733,7 +770,9 @@ fn refresh_semantic(session: &ParentSession, child: &Child) {
     // shared vector arena. There is no size cap: a large child is served like
     // a small one.
     if let Err(error) = semantic.plane.open_generation(&access, &generation) {
-        *write(&child.semantic) = Plane::Gap(format!("semantic view unavailable: {error}"));
+        let error = format!("semantic view unavailable: {error}");
+        session.note_child_failure(child, "parent_semantic", &error);
+        *write(&child.semantic) = Plane::Gap(error);
         return;
     }
     let snapshot = LiveDelta::new(Arc::clone(&generation)).snapshot();

@@ -52,6 +52,7 @@ pub mod symbol_store;
 // Plane and runtime modules of the per-checkout views. Each starts as a
 // documented empty module that its plane fills in.
 pub mod callgraph;
+pub(crate) mod callgraph_copies;
 pub mod first_load;
 pub mod intent;
 pub mod live_delta;
@@ -60,10 +61,12 @@ pub mod parent;
 pub mod query_wait;
 pub mod semantic;
 pub mod semantic_arena;
+pub(crate) mod semantic_batch_lease;
 pub mod semantic_runtime;
 mod tree_base;
 pub mod trigram;
-mod verification;
+pub(crate) mod verification;
+pub(crate) use verification::NativeStat;
 
 #[cfg(test)]
 mod dispatch_parity_probe;

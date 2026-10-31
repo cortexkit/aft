@@ -1,6 +1,25 @@
 use super::*;
 use sha2::Digest;
 
+#[test]
+fn invalid_signed_speech_manifest_warns_without_envelope_contents() {
+    crate::gh_shim_speech::tests::assert_snapshot_warning(
+        || verified_speech_manifest(b"secret-invalid-envelope").unwrap_err(),
+        "gh_shim::verified_speech_manifest",
+        "envelope_json",
+        json!({"envelope_bytes": 23}),
+    );
+    let mut envelope = super::tests::signed(&super::tests::fixture_manifest(), unix_seconds());
+    envelope.envelope_version += 1;
+    let bytes = serde_json::to_vec(&envelope).unwrap();
+    crate::gh_shim_speech::tests::assert_snapshot_warning(
+        || verified_speech_manifest(&bytes).unwrap_err(),
+        "gh_shim::verified_speech_manifest",
+        "envelope_version",
+        json!({"envelope_bytes": bytes.len()}),
+    );
+}
+
 fn snapshot(manifest: &Manifest) -> crate::gh_shim_speech::model::PolicySnapshot {
     let bytes = serde_json::to_vec(&super::tests::signed(manifest, unix_seconds())).unwrap();
     crate::gh_shim_speech::model::PolicySnapshot {
@@ -498,7 +517,72 @@ impl RunWithFixture {
 }
 
 fn exact_policy_refusal(reason: &str) -> String {
-    format!("gh-shim: gh_shim_seam_refusal: task_gh_policy_denied: this GitHub write is not allowed by the routing policy the command started under, or by the current one ({reason}); use a permitted operation, or ask the operator to update the policy and start the command again.")
+    let mut text = format!("gh-shim: gh_shim_seam_refusal: task_gh_policy_denied: this GitHub write is not allowed by the routing policy the command started under, or by the current one ({reason}); use a permitted operation, or ask the operator to update the policy and start the command again.");
+    if reason == "not_governed" {
+        text.push_str(" This GitHub command is not a bot operation. If it should run as the operator, run it again with GH_SHIM_BYPASS=operator; the shim records that use.");
+    }
+    text
+}
+
+#[test]
+fn provisioned_head_run_rerun_names_the_audited_operator_bypass() {
+    let _lock = crate::test_env::process_env_lock();
+    let manifest: Manifest = serde_json::from_str(include_str!(
+        "../../tests/fixtures/gh_shim/v10-manifest.json"
+    ))
+    .unwrap();
+    let _fixture = RunWithFixture::new(&manifest);
+    let _provisioned = Env::set(
+        crate::gh_shim_speech::start_view::PROVISIONED_ENV,
+        Some(OsStr::new("1")),
+    );
+    let args: Vec<OsString> = ["run", "rerun", "123", "--failed", "--repo", "cortexkit/aft"]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    let (_capture, lines) = capture_refusals_for_test();
+    let exit = run_with(
+        &args,
+        |_| panic!("head write delegated without bypass"),
+        |_, _, _, _| panic!("head refusal must not need a probe"),
+    );
+    assert_eq!(exit, REFUSAL_EXIT_STATUS);
+    assert_eq!(*lines.lock().unwrap(), vec!["gh-shim: gh_shim_seam_refusal: task_gh_policy_denied: this GitHub write is not allowed by the routing policy the command started under, or by the current one (not_governed); use a permitted operation, or ask the operator to update the policy and start the command again. This GitHub command is not a bot operation. If it should run as the operator, run it again with GH_SHIM_BYPASS=operator; the shim records that use.".to_string()]);
+}
+
+#[test]
+fn provisioned_worker_run_rerun_never_suggests_the_operator_bypass() {
+    let _lock = crate::test_env::process_env_lock();
+    let manifest: Manifest = serde_json::from_str(include_str!(
+        "../../tests/fixtures/gh_shim/v10-manifest.json"
+    ))
+    .unwrap();
+    let _fixture = RunWithFixture::new(&manifest);
+    let _provisioned = Env::set(
+        crate::gh_shim_speech::start_view::PROVISIONED_ENV,
+        Some(OsStr::new("1")),
+    );
+    let _worker = Env::set(
+        crate::gh_shim_speech::start_view::WORKER_POLICY_ENV,
+        Some(OsStr::new("1")),
+    );
+    let args: Vec<OsString> = ["run", "rerun", "123", "--failed", "--repo", "cortexkit/aft"]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    for bypass in [None, Some(OsStr::new("operator"))] {
+        let _bypass = Env::set("GH_SHIM_BYPASS", bypass);
+        let (_capture, lines) = capture_refusals_for_test();
+        let exit = run_with(
+            &args,
+            |_| panic!("worker write delegated"),
+            |_, _, _, _| panic!("worker refusal must not need a probe"),
+        );
+        assert_eq!(exit, REFUSAL_EXIT_STATUS);
+        let lines = lines.lock().unwrap();
+        assert_eq!(*lines, vec!["gh-shim: gh_shim_worker_write_refused: workers cannot write to GitHub; report what should be posted to your parent instead".to_string()]);
+        assert!(!lines[0].contains("GH_SHIM_BYPASS"));
+    }
 }
 
 #[test]
@@ -506,6 +590,40 @@ fn audited_operator_write_rechecks_manifest_before_native_delegation() {
     let _lock = crate::test_env::process_env_lock();
     let manifest = super::tests::fixture_manifest();
     let fixture = RunWithFixture::new(&manifest);
+    // Unsupported platforms classify using the checkout's Git origin. Give the
+    // test an origin named in the signed manifest even in snapshots without .git.
+    let checkout = tempfile::tempdir().unwrap();
+    let git_dir = checkout.path().join(".git");
+    let git_config = checkout.path().join("empty-gitconfig");
+    std::fs::write(&git_config, "").unwrap();
+    let _git_env = [
+        Env::set("GIT_DIR", Some(git_dir.as_os_str())),
+        Env::set("GIT_WORK_TREE", Some(checkout.path().as_os_str())),
+        Env::set("GIT_COMMON_DIR", None),
+        Env::set("GIT_CONFIG_COUNT", None),
+        Env::set("GIT_CONFIG_GLOBAL", Some(git_config.as_os_str())),
+        Env::set("GIT_CONFIG_NOSYSTEM", Some(OsStr::new("1"))),
+    ];
+    for args in [
+        vec!["init", "--quiet"],
+        vec![
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/cortexkit/aft.git",
+        ],
+    ] {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(checkout.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git fixture failed: {output:?}");
+    }
+    assert_eq!(
+        origin_remote(&std::env::current_dir().unwrap()).as_deref(),
+        Some("https://github.com/cortexkit/aft.git")
+    );
     let _bypass = Env::set("GH_SHIM_BYPASS", Some(OsStr::new("operator")));
     let args = [
         "issue",

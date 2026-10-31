@@ -418,7 +418,7 @@ fn checkout_diverged(project_root: &std::path::Path) -> bool {
 /// The main worktree of the repository `project_root` belongs to: the first
 /// entry `git worktree list` reports. Cached per root once found; a failed
 /// probe is retried on the next call rather than remembered.
-fn main_checkout_root(project_root: &std::path::Path) -> Option<PathBuf> {
+pub(crate) fn main_checkout_root(project_root: &std::path::Path) -> Option<PathBuf> {
     type Roots = std::collections::HashMap<PathBuf, PathBuf>;
     static ROOTS: std::sync::OnceLock<std::sync::Mutex<Roots>> = std::sync::OnceLock::new();
     let roots = ROOTS.get_or_init(Default::default);

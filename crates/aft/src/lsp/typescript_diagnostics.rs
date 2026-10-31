@@ -329,7 +329,7 @@ mod tests {
                 Instant::now() + Duration::from_secs(15),
             )
             .unwrap();
-        let mut certified = manager
+        let (_, mut certified) = manager
             .finish_scoped_typescript_diagnostics(request.wait())
             .unwrap();
         assert!(

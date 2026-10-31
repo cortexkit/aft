@@ -48,7 +48,15 @@ pub const READ_REQUEST_OPERATION: &str = "gh_shim.read_request";
 pub(crate) const PLEXUS_MODULE_ID: &str = "plexus";
 const AGENT_BINDINGS_READ_OPERATION: &str = "bindings.read_for_agent";
 const RELAY_CALL_TIMEOUT: Duration = Duration::from_secs(20);
+// Plexus admits writes for a 120 s receipt claim lease. A write begun just
+// before that lease expires can use its full 30 s vendor HTTP timeout, so
+// allow 120 + 30 + 10 s of margin, starting at send rather than preflight.
+const WRITE_REPLY_TIMEOUT: Duration = Duration::from_secs(160);
 const RELAY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const PRE_SEND_RETRY_DELAY: Duration = Duration::from_secs(4);
+// Surface a warming route's last typed refusal before the one-second
+// repository binding read expires, leaving room for the delayed pre-send retry.
+const PRE_SEND_ROUTE_RETRY_TIMEOUT: Duration = Duration::from_millis(500);
 static RELAY_OPERATIONS: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(64)));
 
@@ -109,8 +117,82 @@ pub enum TransportError {
     RefusedRetryable { code: String, message: String },
     /// Nothing was sent: no connection, no route, or the module is absent.
     Unavailable(String),
+    /// Nothing was sent, but a local failure or a real route refusal is not
+    /// expected to clear when Plexus becomes reachable.
+    UnavailableNoRetry(String),
     /// The request was sent but no reply arrived; it may have executed.
     OutcomeUnknown(String),
+}
+
+impl TransportError {
+    pub(crate) fn unreachable_before_send(&self) -> bool {
+        matches!(self, Self::Unavailable(_))
+            || matches!(self, Self::Refused { code, .. } if plexus_unreachable_code(code))
+    }
+}
+
+fn plexus_unreachable_code(code: &str) -> bool {
+    matches!(
+        code,
+        "module_warming" | "module_reloading" | "target_unavailable"
+    )
+}
+
+pub(crate) struct PreSendRetry {
+    deadline: tokio::time::Instant,
+    delay: Duration,
+    used: bool,
+}
+
+impl PreSendRetry {
+    pub(crate) fn new(deadline: tokio::time::Instant) -> Self {
+        Self {
+            deadline,
+            delay: PRE_SEND_RETRY_DELAY,
+            used: false,
+        }
+    }
+
+    // Only preparation may use this budget. A queued write, even one without
+    // a reply, must never be sent again by this retry loop.
+    pub(crate) async fn run<T, F, Fut>(
+        &mut self,
+        mut call: F,
+    ) -> Result<T, crate::gh_shim_speech::Refusal>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, crate::gh_shim_speech::Refusal>>,
+    {
+        let timeout = || {
+            crate::gh_shim_speech::Refusal::new(
+                crate::gh_shim_speech::Code::AuthorityUnavailable,
+                "reservation_timeout",
+            )
+        };
+        let error = match tokio::time::timeout_at(self.deadline, call())
+            .await
+            .map_err(|_| timeout())?
+        {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        if !self.wait(error.retry_before_send).await {
+            return Err(error);
+        }
+        tokio::time::timeout_at(self.deadline, call())
+            .await
+            .map_err(|_| timeout())?
+    }
+
+    async fn wait(&mut self, unreachable: bool) -> bool {
+        let retry_at = tokio::time::Instant::now() + self.delay;
+        if self.used || !unreachable || retry_at >= self.deadline {
+            return false;
+        }
+        self.used = true;
+        tokio::time::sleep_until(retry_at).await;
+        true
+    }
 }
 
 /// The daemon scope stamped on a route at bind.
@@ -734,10 +816,28 @@ async fn bindings_read<T: RelayTransport>(
         }
     };
     let body = agent_bindings_call(agent);
-    match transport
-        .plexus(&redeemed.project_root, &redeemed.session_id, None, body)
-        .await
-    {
+    let deadline = tokio::time::Instant::now() + RELAY_CALL_TIMEOUT;
+    let mut retry = PreSendRetry::new(deadline);
+    let attempt = || {
+        transport.plexus(
+            &redeemed.project_root,
+            &redeemed.session_id,
+            None,
+            body.clone(),
+        )
+    };
+    let result = tokio::time::timeout_at(deadline, async {
+        let first = attempt().await;
+        if let Err(error) = &first {
+            if retry.wait(error.unreachable_before_send()).await {
+                return attempt().await;
+            }
+        }
+        first
+    })
+    .await
+    .unwrap_or_else(|_| Err(TransportError::Unavailable("binding read timed out".into())));
+    match result {
         Ok(reply) => RelayReply::relayed(reply),
         Err(error) => transport_refusal("plexus", error),
     }
@@ -944,11 +1044,43 @@ async fn post_captured(
     nonce: &str,
     request: &Value,
 ) -> Result<RelayReply, crate::gh_shim_speech::Refusal> {
+    let ended = async {
+        loop {
+            if let (Some(service), Some(launch)) = (&routes.speech, &redeemed.launch) {
+                service.check_pending(None, launch, &redeemed.session_id, &redeemed.task_id)?;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    tokio::select! {
+        biased;
+        result = post_captured_inner(redeemed, params, routes, nonce, request) => result,
+        result = ended => result,
+    }
+}
+
+async fn post_captured_inner(
+    redeemed: &crate::gh_shim_ticket::Redeemed,
+    params: &Value,
+    routes: &RouteScopes,
+    nonce: &str,
+    request: &Value,
+) -> Result<RelayReply, crate::gh_shim_speech::Refusal> {
     use crate::gh_shim_speech::partner;
     use crate::gh_shim_speech::{Code, Refusal, ScopeRole};
     let probe_deadline = tokio::time::Instant::now() + Duration::from_millis(9_750);
-    let invalid = || Refusal::new(Code::AuthorityUnavailable, "snapshot_invalid");
-    let launch = redeemed.launch.as_ref().ok_or_else(invalid)?;
+    let mut retry = PreSendRetry::new(probe_deadline);
+    let invalid = |check| {
+        crate::gh_shim_speech::snapshot_invalid(
+            "gh_shim_relay::post_captured",
+            check,
+            json!({"session_id": redeemed.session_id, "task_id": redeemed.task_id}),
+        )
+    };
+    let launch = redeemed
+        .launch
+        .as_ref()
+        .ok_or_else(|| invalid("launch_missing"))?;
     launch.validate()?;
     let service = routes
         .speech
@@ -966,9 +1098,13 @@ async fn post_captured(
     let ticket = params
         .get("ticket")
         .and_then(Value::as_str)
-        .ok_or_else(invalid)?;
+        .ok_or_else(|| invalid("ticket_not_string"))?;
     let warm = crate::gh_shim_ticket::speech_for_ticket(ticket);
-    let stored = if let Some(warm) = &warm {
+    let (stored, foreground) = if let Some(warm) = &warm {
+        let _local = service
+            .admission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if let Some(error) = warm
             .failure
             .lock()
@@ -984,21 +1120,25 @@ async fn post_captured(
             ));
         }
         if warm.prepared.context.service.store.path() != service.store.path() {
-            return Err(invalid());
+            return Err(invalid("store_path_mismatch"));
         }
-        service.store.get(&warm.incarnation)?
+        (
+            service.store.get(&warm.incarnation)?,
+            !warm.background.load(std::sync::atomic::Ordering::SeqCst),
+        )
     } else {
-        service.store.find_digest(
-            &crate::gh_shim_ticket::speech_digest(ticket).ok_or_else(invalid)?,
-            crate::gh_shim_speech::service::run_nonce().unwrap_or_default(),
-        )?
+        (
+            service.store.find_digest(
+                &crate::gh_shim_ticket::speech_digest(ticket)
+                    .ok_or_else(|| invalid("ticket_digest"))?,
+                crate::gh_shim_speech::service::run_nonce().unwrap_or_default(),
+            )?,
+            false,
+        )
     };
     if &stored.record.launch != launch {
-        return Err(invalid());
+        return Err(invalid("launch_mismatch"));
     }
-    let foreground = warm
-        .as_ref()
-        .is_some_and(|warm| !warm.background.load(std::sync::atomic::Ordering::SeqCst));
     if foreground
         && !routes.origin_live(
             launch.origin.as_ref(),
@@ -1033,27 +1173,35 @@ async fn post_captured(
         .register_accepted_policy()?
         .ok_or_else(|| Refusal::new(Code::AuthorityUnavailable, "current_manifest_unverifiable"))?;
     let policy_generation = service.store.advance_policy(&current)?;
-    let invocation: crate::gh_shim_speech::invocation::Invocation =
-        serde_json::from_value(params.get("invocation").cloned().ok_or_else(invalid)?)
-            .map_err(|_| invalid())?;
+    let invocation: crate::gh_shim_speech::invocation::Invocation = serde_json::from_value(
+        params
+            .get("invocation")
+            .cloned()
+            .ok_or_else(|| invalid("invocation_missing"))?,
+    )
+    .map_err(|_| invalid("invocation_decode"))?;
     crate::gh_shim::validate_speech_policy(start, &current, request, &invocation)?;
     let repo = request
         .get("repository")
         .and_then(Value::as_str)
-        .ok_or_else(invalid)?
+        .ok_or_else(|| invalid("repository_not_string"))?
         .to_ascii_lowercase();
     let initial = stored
         .record
         .bindings
         .get(&repo)
         .ok_or_else(|| Refusal::new(Code::PolicyDenied, "repository_denied"))?;
-    let reply = bindings_read_for_service(
-        service,
-        &redeemed.project_root,
-        &redeemed.session_id,
-        launch.agent()?,
-    )
-    .await?;
+    let launch_agent = launch.agent()?;
+    let reply = retry
+        .run(|| {
+            bindings_read_for_service(
+                service,
+                &redeemed.project_root,
+                &redeemed.session_id,
+                launch_agent,
+            )
+        })
+        .await?;
     service.check_pending(
         Some(&stored.record.incarnation),
         launch,
@@ -1087,14 +1235,16 @@ async fn post_captured(
         ScopeRole::Authority
     };
     let reserve_generation = service.generation();
-    let slot = match service
-        .reserve(
-            &redeemed.project_root,
-            &redeemed.session_id,
-            &launch.authority,
-            github_call(body.value()),
-            probe_deadline,
-        )
+    let slot = match retry
+        .run(|| {
+            service.reserve(
+                &redeemed.project_root,
+                &redeemed.session_id,
+                &launch.authority,
+                github_call(body.value()),
+                probe_deadline,
+            )
+        })
         .await
     {
         Ok(slot) => slot,
@@ -1137,6 +1287,8 @@ async fn post_captured(
         &body.expect_json(),
     )?;
     let dispatch_generation = service.generation();
+    #[cfg(test)]
+    service.test_before_final_gate();
     let queued = {
         let _local = service
             .admission
@@ -1147,6 +1299,12 @@ async fn post_captured(
             launch,
             &redeemed.session_id,
             &redeemed.task_id,
+        )?;
+        let stored = service.store.revalidate_authority(
+            &stored,
+            &crate::gh_shim_ticket::speech_digest(ticket)
+                .ok_or_else(|| invalid("ticket_digest"))?,
+            foreground,
         )?;
         let send = || {
             for (role, scope) in launch.required_scopes() {
@@ -1164,8 +1322,6 @@ async fn post_captured(
             }
             slot.send()
         };
-        #[cfg(test)]
-        service.test_before_final_gate();
         let queued = if foreground {
             service.store.final_foreground_gate(
                 &stored.record.incarnation,
@@ -1309,7 +1465,7 @@ fn transport_refusal(stage: &str, error: TransportError) -> RelayReply {
             reply.data["retryable"] = Value::Bool(true);
             reply
         }
-        TransportError::Unavailable(message) => {
+        TransportError::Unavailable(message) | TransportError::UnavailableNoRetry(message) => {
             RelayReply::refused("relay_unavailable", stage, message)
         }
         TransportError::OutcomeUnknown(message) => {
@@ -1519,6 +1675,7 @@ impl Drop for RequestCancellation {
 /// scoped open. A refused scoped open is returned as it is and never retried
 /// as an unscoped open: that would send the write without the stamp that
 /// names its agent.
+#[allow(clippy::too_many_arguments)]
 async fn route_request(
     consumer: &Arc<subc_client_rs::SubcConsumer>,
     leases: &Arc<RouteLeases>,
@@ -1526,22 +1683,23 @@ async fn route_request(
     identity: subc_protocol::BindIdentity,
     scope: Option<&ScopeSelector>,
     mut options: subc_client_rs::CallOptions,
+    reply_timeout: Duration,
     body: &Value,
 ) -> Result<Value, CallFailure> {
     let bytes = serde_json::to_vec(body).map_err(|error| CallFailure {
-        error: TransportError::Unavailable(error.to_string()),
+        error: TransportError::UnavailableNoRetry(error.to_string()),
         reconnect: false,
     })?;
     let key =
         route_lease_key(consumer, &target, &identity, scope).map_err(|error| CallFailure {
-            error: TransportError::Unavailable(error.to_string()),
+            error: TransportError::UnavailableNoRetry(error.to_string()),
             reconnect: false,
         })?;
     let permit = RELAY_OPERATIONS
         .clone()
         .try_acquire_owned()
         .map_err(|_| CallFailure {
-            error: TransportError::Unavailable("the relay operation budget is busy".into()),
+            error: TransportError::UnavailableNoRetry("the relay operation budget is busy".into()),
             reconnect: false,
         })?;
     let consumer = Arc::clone(consumer);
@@ -1583,6 +1741,7 @@ async fn route_request(
                 identity,
                 scope.as_ref(),
                 options,
+                reply_timeout,
                 bytes,
                 &mut opened,
                 &mut canceled,
@@ -1616,6 +1775,7 @@ async fn open_and_send(
     identity: subc_protocol::BindIdentity,
     scope: Option<&ScopeSelector>,
     options: subc_client_rs::CallOptions,
+    reply_timeout: Duration,
     bytes: Vec<u8>,
     opened_handles: &mut Vec<subc_client_rs::RouteHandle>,
     canceled: &mut tokio::sync::watch::Receiver<bool>,
@@ -1635,6 +1795,16 @@ async fn open_and_send(
             if let Some(refusal) = scope.and_then(|selector| scope_open_refusal(&error, selector)) {
                 return Err(CallFailure {
                     error: refusal,
+                    reconnect: false,
+                });
+            }
+            if let Some(body) = error.route_open_refusal() {
+                return Err(CallFailure {
+                    error: if plexus_unreachable_code(&body.code) {
+                        TransportError::Unavailable(error.to_string())
+                    } else {
+                        TransportError::UnavailableNoRetry(error.to_string())
+                    },
                     reconnect: false,
                 });
             }
@@ -1665,7 +1835,7 @@ async fn open_and_send(
     let reply = tokio::select! {
         biased;
         _ = canceled.changed() => return Err(CallFailure { error:TransportError::Unavailable("relay requester canceled".into()), reconnect:false }),
-        reply = consumer.request(&route, bytes, CallOptions { timeout:RELAY_CALL_TIMEOUT, ..CallOptions::default() }) => reply,
+        reply = consumer.request(&route, bytes, CallOptions { timeout:reply_timeout, ..CallOptions::default() }) => reply,
     };
     match reply {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| CallFailure {
@@ -1700,6 +1870,7 @@ pub struct SubcRelayTransport {
     /// up to 90 s) when set. Production leaves it unset; tests shorten it so a
     /// retried refusal runs out quickly.
     route_open_deadline: Option<Duration>,
+    write_reply_timeout: Duration,
 }
 
 impl SubcRelayTransport {
@@ -1709,6 +1880,7 @@ impl SubcRelayTransport {
             consumer: Arc::new(tokio::sync::Mutex::new(None)),
             leases: Arc::new(RouteLeases::default()),
             route_open_deadline: None,
+            write_reply_timeout: WRITE_REPLY_TIMEOUT,
         }
     }
 
@@ -1740,7 +1912,7 @@ impl SubcRelayTransport {
         // The identity is fixed for the life of the process, so checking it
         // before each new connection is the same as checking it on every call.
         if !Self::identity_available() {
-            return Err(TransportError::Unavailable(
+            return Err(TransportError::UnavailableNoRetry(
                 "the daemon has no subc module identity to relay with".to_string(),
             ));
         }
@@ -1783,6 +1955,13 @@ impl SubcRelayTransport {
             options.timeout = deadline;
             options.route_retry_deadline = deadline;
         }
+        if body.pointer("/arguments/op").and_then(Value::as_str)
+            == Some(AGENT_BINDINGS_READ_OPERATION)
+        {
+            options.route_retry_deadline = options
+                .route_retry_deadline
+                .min(PRE_SEND_ROUTE_RETRY_TIMEOUT);
+        }
         match route_request(
             &consumer,
             &self.leases,
@@ -1790,6 +1969,11 @@ impl SubcRelayTransport {
             identity,
             scope,
             options,
+            if body.pointer("/arguments/op").and_then(Value::as_str) == Some("bot_request") {
+                self.write_reply_timeout
+            } else {
+                RELAY_CALL_TIMEOUT
+            },
             &body,
         )
         .await

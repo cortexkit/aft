@@ -4,6 +4,37 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use crate::blob_store::v2::{ContentHash, FamilyKey, TrigramKey};
+
+#[test]
+fn views_import_cancellation_inside_bounded_reads_releases_and_resumes() {
+    let _serial = v3::serial_for_test();
+    let dir = tempfile::tempdir().unwrap();
+    let root = checkout(dir.path());
+    let storage = dir.path().join("storage");
+    legacy_trigram(&storage, &root);
+    let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = checks.clone();
+    // The first checks admit the claim; the reader then loses its binding
+    // partway through the donor, before it can publish a complete payload.
+    let control: ImportControl =
+        Arc::new(move || observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12);
+    assert!(matches!(
+        run_v3_import_while(&request(&storage, &root, None), None, control),
+        Err(V3ImportError::Cancelled)
+    ));
+    let row = row_of(&storage, LegacyArtifact::Trigram);
+    assert!(!row.state.is_terminal());
+    assert!(row.owner.is_none());
+    assert!(
+        checks.load(std::sync::atomic::Ordering::Relaxed) <= 16,
+        "iteration must stop at the first observed cancellation"
+    );
+    let report = run_v3_import(&request(&storage, &root, None), None).unwrap();
+    assert!(matches!(
+        outcome(&report, LegacyArtifact::Trigram),
+        ArtifactOutcome::Done { .. }
+    ));
+}
 use crate::migration::v3_import::tests::{
     checkout, deterministic, legacy_semantic, legacy_trigram, producer, snapshot_tree, FAMILY, KEY,
     POLICY,
@@ -268,9 +299,9 @@ fn a_storage_gap_releases_the_row_and_a_later_run_resumes_it() {
     let storage = dir.path().join("storage");
     legacy_trigram(&storage, &root);
     // Room for a 64 KiB ledger write above the 4 GiB floor, not for a batch.
-    v3::set_free_space_for_test((4 << 30) + (512 << 10), 1 << 30);
+    let _low_space = v3::set_free_space_for_test(&storage, (4 << 30) + (512 << 10), 1 << 30);
     let report = run_v3_import(&request(&storage, &root, None), None);
-    v3::set_free_space_for_test(u64::MAX, u64::MAX / 2);
+    let _space = v3::set_free_space_for_test(&storage, u64::MAX, u64::MAX / 2);
     let report = report.unwrap();
     assert_eq!(
         outcome(&report, LegacyArtifact::Trigram),
@@ -486,7 +517,7 @@ fn v3_import_kill_child() {
     };
     let at = std::env::var(KILL_AT).unwrap();
     let subject = PathBuf::from(subject);
-    v3::set_free_space_for_test(u64::MAX, u64::MAX / 2);
+    let _space = v3::set_free_space_for_test(&subject.join("storage"), u64::MAX, u64::MAX / 2);
     let park = Park {
         at,
         ready: subject.join("ready"),

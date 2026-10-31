@@ -1,4 +1,4 @@
-//! Document and configuration-file changes that wait for the LSP manager
+//! Document and watched-file changes that wait for the LSP manager
 //! lock instead of being dropped.
 //!
 //! An edit tells the language servers about the new file contents
@@ -15,7 +15,7 @@ use std::sync::Arc;
 use lsp_types::FileChangeType;
 
 use crate::config::Config;
-use crate::lsp::manager::{start_servers_for_file_unlocked, LspManager};
+use crate::lsp::manager::{start_servers_for_file_unlocked, LspManager, WatchedFileStamps};
 
 /// How many distinct documents may wait for the manager lock. Past this the
 /// backlog stops listing documents and instead resyncs every open document
@@ -23,8 +23,8 @@ use crate::lsp::manager::{start_servers_for_file_unlocked, LspManager};
 /// [`LspManager::resync_drifted_open_documents`]).
 pub const PENDING_LSP_DOCUMENTS_CAP: usize = 1_024;
 
-/// How many distinct configuration-file events may wait for the manager
-/// lock. Configuration files are few; further events are logged and dropped.
+/// How many distinct watched-file events may wait for the manager lock.
+/// Further events are logged and dropped.
 pub const PENDING_LSP_WATCHED_CAP: usize = 1_024;
 
 /// The per-context slot holding changes queued for the LSP manager. `Some`
@@ -43,8 +43,12 @@ pub struct PendingLspChanges {
     /// Documents whose change may start a server (a resync after a change
     /// outside AFT); the others go to servers already running.
     start_servers: HashSet<PathBuf>,
-    /// Configuration-file events, one per path, the latest kind winning.
+    /// Watched-file events, one per path, the latest kind winning.
     watched: Vec<(PathBuf, FileChangeType)>,
+    /// Mutation events must match each server's registered file globs and kinds;
+    /// configuration notifications otherwise retain their existing send behavior.
+    mutation_watched: HashSet<PathBuf>,
+    watched_stamps: WatchedFileStamps,
     /// Documents were dropped past [`PENDING_LSP_DOCUMENTS_CAP`].
     overflowed: bool,
     /// The latest configuration seen by a queuing caller.
@@ -71,7 +75,7 @@ impl PendingLspChanges {
         }
     }
 
-    /// Queue configuration-file events.
+    /// Queue watched-file events, including source-file creation and deletion.
     pub(crate) fn queue_watched(&mut self, events: &[(PathBuf, FileChangeType)]) {
         for (path, typ) in events {
             if let Some(existing) = self.watched.iter_mut().find(|(known, _)| known == path) {
@@ -86,6 +90,38 @@ impl PendingLspChanges {
                 );
             }
         }
+    }
+
+    pub(crate) fn queue_watched_with_stamps(
+        &mut self,
+        events: &[(PathBuf, FileChangeType)],
+        stamps: &WatchedFileStamps,
+    ) {
+        self.queue_watched(events);
+        for (path, _) in &self.watched {
+            if events.iter().any(|(event_path, _)| event_path == path) {
+                if let Some(stamp) = stamps.get(path) {
+                    self.watched_stamps.insert(path.clone(), *stamp);
+                } else {
+                    self.watched_stamps.remove(path);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn queue_mutation_watched(
+        &mut self,
+        events: &[(PathBuf, FileChangeType)],
+        stamps: &WatchedFileStamps,
+    ) {
+        self.queue_watched_with_stamps(events, stamps);
+        self.mutation_watched
+            .extend(self.watched.iter().filter_map(|(path, _)| {
+                events
+                    .iter()
+                    .any(|(event_path, _)| event_path == path)
+                    .then(|| path.clone())
+            }));
     }
 
     fn set_config(&mut self, config: Arc<Config>) {
@@ -108,8 +144,20 @@ impl PendingLspChanges {
     /// then each document's current contents.
     pub(crate) fn apply(self, lsp: &mut LspManager) {
         let config = self.config.unwrap_or_default();
-        if !self.watched.is_empty() {
-            if let Err(error) = lsp.notify_files_watched_changed(&self.watched, &config) {
+        let (mutations, watched): (Vec<_>, Vec<_>) = self
+            .watched
+            .into_iter()
+            .partition(|(path, _)| self.mutation_watched.contains(path));
+        let markers = config
+            .lsp_servers
+            .iter()
+            .flat_map(|server| server.root_markers.iter().cloned())
+            .collect::<Vec<_>>();
+        lsp.forward_watcher_file_events_with_stamps(&mutations, &markers, &self.watched_stamps);
+        if !watched.is_empty() {
+            if let Err(error) =
+                lsp.notify_files_watched_changed_with_stamps(&watched, &self.watched_stamps)
+            {
                 crate::slog_warn!("queued watched-file sync error: {error}");
             }
         }

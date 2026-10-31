@@ -109,6 +109,8 @@ mod is_semantic_indexed_extension_test;
 // (issue #824).
 mod issue_824_edit_indentation_test;
 mod issue_827_828_repro_test;
+#[cfg(target_os = "linux")]
+mod landlock_storage_test;
 mod lexical_rank_test;
 mod lexical_score_test;
 mod locks_test;

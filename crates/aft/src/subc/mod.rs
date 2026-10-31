@@ -232,6 +232,7 @@ mod idle_reap_frame_loop_tests;
 #[cfg(test)]
 mod idle_root_retention_tests;
 mod perf_sweep;
+mod route_census;
 mod secret_consent;
 #[cfg(all(test, unix))]
 pub(crate) use secret_consent::with_secret_bound_identity_for_test;
@@ -1463,6 +1464,35 @@ pub(crate) fn recovered_bash_frame(
     ))
 }
 
+pub(crate) fn project_held_ledger_result(
+    frame: &crate::db::call_ledger::RecordedFrame,
+    source: Option<&[u8]>,
+    include_structured: bool,
+) -> Result<crate::db::call_ledger::RecordedFrame, String> {
+    let frame = Frame::build(frame.ty, control_flags(), 1, 1, 1, frame.body.clone())
+        .map_err(|error| error.to_string())?;
+    let mut outgoing = WriterFrame::retained_tool_response_with_source(
+        frame,
+        wire::ToolResponsePolicy {
+            trust: if include_structured {
+                BindTrust::FirstParty
+            } else {
+                BindTrust::Untrusted
+            },
+            tool_result_body: true,
+        },
+        None,
+        source.map(|source| source.to_vec()),
+    );
+    outgoing
+        .project_tool_result()
+        .map_err(|error| error.to_string())?;
+    Ok(crate::db::call_ledger::RecordedFrame {
+        ty: outgoing.header.ty,
+        body: outgoing.frame.body,
+    })
+}
+
 #[derive(Debug)]
 /// Per-root route metadata owned by the subc loop. The `active_bash_waits` field
 /// counts detached bash processes that are still being observed for this root.
@@ -1476,6 +1506,9 @@ struct RootMeta {
     maintenance_last_submitted: Option<Instant>,
     maintenance_poisoned: bool,
     last_touched: Instant,
+    /// Diagnostic demand clocks; unlike last_touched, polling and teardown do not reset them.
+    last_tool_call: Option<Instant>,
+    route_activity: HashMap<RouteChannel, route_census::RouteActivity>,
     diagnostics_on_edit: bool,
     active_bash_waits: usize,
     idle_artifacts_evicted: bool,
@@ -1556,6 +1589,14 @@ struct RouteIdentity(Arc<RouteIdentityData>);
 struct ManagementIdentity {
     principal: Option<Principal>,
     scope: Option<subc_protocol::scope::ScopeStamp>,
+    admission: ManagementAdmission,
+}
+
+#[derive(Default, PartialEq, Eq)]
+enum ManagementAdmission {
+    #[default]
+    FirstParty,
+    FlowOnly,
 }
 
 impl RouteIdentity {
@@ -1577,6 +1618,8 @@ struct RouteIdentityData {
     trust: BindTrust,
     spawn_principal: AuthenticatedPrincipal,
     consumer_elicitation_capable: bool,
+    held_reply: bool,
+    held_update: bool,
     tool_result_body: bool,
     /// `disabled_tools` resolved from the config files when this route bound.
     /// Every tool call on the route is checked against this snapshot, so a
@@ -1798,6 +1841,8 @@ impl RootMeta {
             maintenance_last_submitted: None,
             maintenance_poisoned: false,
             last_touched: now,
+            last_tool_call: None,
+            route_activity: HashMap::new(),
             diagnostics_on_edit: false,
             active_bash_waits: 0,
             idle_artifacts_evicted: false,
@@ -2890,13 +2935,12 @@ fn note_reap_lock_contended(
     }
 }
 
-/// Shut down language servers for roots that have had no request for the
-/// configured LSP idle window. This is independent of artifact eviction and
-/// runs even while the root is still bound.
+/// Shut down individually idle language servers, independently of artifact
+/// eviction and even while their root is bound and serving other packages.
 ///
 /// `meta.last_touched` moves on every inbound tool call for a bound root
 /// (`reactivate_bound` in the route-request handler) and on response delivery,
-/// so an active harness does not look idle.
+/// so whole-root idle shutdown does not mistake an active harness for idle.
 fn reap_idle_lsp_servers(
     now: Instant,
     live_roots: &HashMap<ProjectRootId, RootMeta>,
@@ -4118,6 +4162,7 @@ async fn teardown_installed_route(
             );
         }
         if let Some(meta) = live_roots.get_mut(&identity.root) {
+            meta.route_activity.remove(&channel);
             let idle_for = meta.last_touched.elapsed();
             meta.note_activity();
             log::debug!(
@@ -5408,6 +5453,7 @@ where
     let mut next_bash_ask_corr: u64 = 1;
     let mut route_bash_cancels: HashMap<RouteChannel, bash::RouteBashCancel> = HashMap::new();
     let active_tool_calls: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
+    let gh_relay_requests = gh_relay_wait::Requests::default();
     let pending_deferred_setups = Arc::new(PendingDeferredSetups::default());
     let mut pending_responses = PendingSubcResponses::default();
     let mut database_waits = persistence::DatabaseWaits::default();
@@ -5964,25 +6010,17 @@ where
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
                         let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement, launch_restore, codemode_policies };
-                        // A flow has a non-empty flow_id in its bound scope. On a
-                        // management route it may call only diagnostics.findings;
-                        // refuse every other management op before it can read
-                        // stores. Flow-scoped tool routes are governed by the
-                        // call-mode contract instead (reads served, writes
-                        // refused), so they are not checked here.
-                        let scope = management_routes.get(&route).and_then(|identity| identity.scope.as_ref());
-                        if let Some(error) = flow_scope_refusal(scope) {
-                            let result = match decoded.body() {
-                                Ok(body) if diagnostics_findings::is_request(body) => diagnostics_findings::dispatch(
-                                    &writer_tx, &dispatch_path_metrics, &decoded.frame,
-                                    scope, body, &health_rollup_cache, &executor,
-                                ).await,
-                                _ => send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await,
-                            };
-                            if let Err(error) = result {
-                                break Err(error);
+                        // Bind admission, not request-supplied scope data, limits
+                        // flow management routes to the manifest's flow operations
+                        // before any store, provider, or general tool dispatch.
+                        // Tool routes retain their separate call-mode contract.
+                        if let Some(identity) = management_routes.get(&route) {
+                            if let Err(error) = admit_management_flow_request(identity, decoded.body().ok()) {
+                                if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await {
+                                    break Err(error);
+                                }
+                                continue;
                             }
-                            continue;
                         }
                         if let (Some(identity), Ok(body)) = (routes.get(&route), decoded.body()) {
                             // Rich-UI chunk queries are provider reads that name no
@@ -6156,9 +6194,8 @@ where
                         let result = if management_routes.contains_key(&route)
                             && gh_relay_operation(&frame).is_some()
                         {
-                            // Management routes are bound only for first-party
-                            // principals (see the RouteBind arm), so the route
-                            // being here is the admission fact passed on.
+                            // Flow-only management routes were refused above;
+                            // reaching the relay requires first-party admission.
                             spawn_gh_relay(
                                 &writer_tx,
                                 &frame,
@@ -6166,6 +6203,8 @@ where
                                 &dispatch_path_metrics,
                                 true,
                                 gh_relay_route_scopes(&routes,&speech),
+                                &gh_relay_requests,
+                                module_drain.is_active(),
                             );
                             Ok(())
                         } else if management_routes.contains_key(&route) {
@@ -6177,6 +6216,7 @@ where
                                 &live_roots,
                                 &root_channels,
                                 &routes,
+                                &active_tool_calls,
                                 &health_rollup_cache,
                                 &dispatch_path_metrics,
                                 management_routes.get(&route).and_then(|identity| identity.principal.as_ref()),
@@ -6258,6 +6298,9 @@ where
                     FrameType::Cancel => {
                         let channel = route_key(frame.header.channel, frame.header.epoch);
                         let corr = frame.header.corr;
+                        if gh_relay_requests.cancel(channel, corr) {
+                            continue;
+                        }
                         if ledger_edge.cancel(channel, corr) {
                             continue;
                         }
@@ -6376,6 +6419,7 @@ where
                                 // bash waits: each checks it on its next poll.
                                  scope_describe_task.abort();
                                  module_drain.begin(until);
+                                 gh_relay_requests.drain();
                                 drain_progress = Some(drain::DrainProgress {
                                     until,
                                     quiesced_reported: false,
@@ -7786,6 +7830,8 @@ async fn handle_route_bind_completion(
         })
         .or_insert_with(|| RootMeta::new(Instant::now()));
     if let Some(meta) = live_roots.get_mut(&completion.bind_root_id) {
+        meta.route_activity
+            .insert(route_id, route_census::RouteActivity::new(Instant::now()));
         meta.diagnostics_on_edit = completion.diagnostics_on_edit;
         meta.maintenance_poisoned = false;
     }
@@ -7963,14 +8009,16 @@ async fn send_cached_health_response(
     pending_binds: &HashMap<RouteChannel, PendingBind>,
     metrics: &DispatchPathMetrics,
     health_rollup_cache: &HealthRollupCache,
+    ownership_summary: Value,
 ) -> Result<(), SubcError> {
-    let report = build_health_report(
+    let mut report = build_health_report(
         health_rollup_cache,
         executor,
         pending_binds,
         metrics,
         shared_app,
     );
+    health::with_route_ownership_summary(&mut report, ownership_summary);
     let body = serde_json::to_vec(&ModuleControlResponse::from(report)).map_err(SubcError::Json)?;
     let response = Frame::build_with_version(
         frame.header.ver,
@@ -8347,7 +8395,9 @@ async fn handle_control_request(
                     )
                     .await;
                 }
-                if !matches!(bind_trust, BindTrust::FirstParty) {
+                if !matches!(bind_trust, BindTrust::FirstParty)
+                    && diagnostics_findings::admit_flow(scope.as_ref()).is_err()
+                {
                     return send_route_bind_error(
                         tx,
                         frame,
@@ -8357,6 +8407,14 @@ async fn handle_control_request(
                     )
                     .await;
                 }
+                let admission = if scope
+                    .as_ref()
+                    .is_some_and(diagnostics_findings::is_flow_scope)
+                {
+                    ManagementAdmission::FlowOnly
+                } else {
+                    ManagementAdmission::FirstParty
+                };
                 if let Some(installed_epoch) = installed_route_epochs.get(&route_channel).copied() {
                     if installed_epoch >= epoch {
                         return send_route_bind_error(
@@ -8418,7 +8476,11 @@ async fn handle_control_request(
                         ack,
                         ControlCompletion::ManagementAckWritten {
                             route: route_id,
-                            identity: ManagementIdentity { principal, scope },
+                            identity: ManagementIdentity {
+                                principal,
+                                scope,
+                                admission,
+                            },
                             corr: frame.header.corr,
                         },
                         metrics,
@@ -8565,6 +8627,12 @@ async fn handle_control_request(
                 .as_ref()
                 .is_some_and(|capabilities| capabilities.iter().any(|c| c == "elicitation"));
             let tool_result_body = result_body::accepts(consumer_capabilities.as_deref());
+            let held_update = cortexkit_role_tool_provider::consumer_reads_held_update_v1(
+                consumer_capabilities.as_deref(),
+            );
+            let held_reply = consumer_capabilities
+                .as_ref()
+                .is_some_and(|caps| caps.iter().any(|cap| cap == "held-reply/v1"));
             log::info!(
                 "subc attach: route {} harness={} principal={} trust={} elicitation={}",
                 route_channel,
@@ -8655,6 +8723,8 @@ async fn handle_control_request(
                 },
                 consumer_elicitation_capable,
                 tool_result_body,
+                held_reply,
+                held_update,
                 disabled_tools: bind_disabled_tools,
                 run_scope: OnceLock::new(),
                 call_mode: call_mode.unwrap_or(subc_protocol::call_mode::CallMode::Classic),
@@ -8824,6 +8894,16 @@ async fn handle_control_request(
                 pending_binds,
                 metrics,
                 health_rollup_cache,
+                route_census::snapshot(
+                    live_roots,
+                    root_channels,
+                    routes,
+                    active_tool_calls,
+                    executor,
+                    metrics,
+                    Instant::now(),
+                )
+                .summary(),
             )
             .await
         }
@@ -8839,6 +8919,7 @@ async fn handle_management_request(
     live_roots: &HashMap<ProjectRootId, RootMeta>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
     routes: &HashMap<RouteChannel, RouteIdentity>,
+    active_tool_calls: &ActiveToolCalls,
     health_rollup_cache: &Arc<HealthRollupCache>,
     metrics: &Arc<DispatchPathMetrics>,
     principal: Option<&Principal>,
@@ -8899,6 +8980,15 @@ async fn handle_management_request(
                 shared_app,
                 executor,
                 census_route_rows(live_roots, root_channels),
+                route_census::snapshot(
+                    live_roots,
+                    root_channels,
+                    routes,
+                    active_tool_calls,
+                    executor,
+                    metrics,
+                    Instant::now(),
+                ),
                 health_rollup_cache,
                 metrics,
             );
@@ -9092,6 +9182,7 @@ fn spawn_memory_census(
     shared_app: &Arc<App>,
     executor: &Arc<Executor>,
     route_rows: Vec<CensusRouteRow>,
+    ownership: route_census::Snapshot,
     health_rollup_cache: &Arc<HealthRollupCache>,
     metrics: &Arc<DispatchPathMetrics>,
 ) {
@@ -9105,7 +9196,8 @@ fn spawn_memory_census(
     tokio::spawn(async move {
         let _response_task = ResponseTaskGuard::new(&metrics);
         let census = health::fresh_memory_census(&cache, deadline).await;
-        let census = with_census_route_rows(census, &shared_app, &executor, &route_rows);
+        let mut census = with_census_route_rows(census, &shared_app, &executor, &route_rows);
+        census["route_ownership"] = ownership.render(&executor);
         if let Err(error) = send_management_response(
             &tx,
             &frame,
@@ -9222,9 +9314,11 @@ fn gh_relay_route_scopes(
     scopes
 }
 
-/// Run a gh shim relay request on its own task. The relay makes up to two
-/// network calls (prefrontal, then plexus); running them here keeps the subc frame
-/// loop free, and the relay holds no lock across them.
+mod gh_relay_wait;
+
+/// Run the relay off-loop, retaining ownership of its terminal frame even when
+/// cancellation or drain interrupts the provider wait.
+#[allow(clippy::too_many_arguments)]
 fn spawn_gh_relay(
     tx: &WriterSender,
     frame: &Frame,
@@ -9232,7 +9326,10 @@ fn spawn_gh_relay(
     metrics: &Arc<DispatchPathMetrics>,
     first_party: bool,
     route_scopes: crate::gh_shim_relay::RouteScopes,
+    requests: &gh_relay_wait::Requests,
+    draining: bool,
 ) {
+    let mut wait = requests.register(frame, draining);
     let tx = tx.clone();
     let frame = frame.clone();
     let relay = Arc::clone(relay);
@@ -9250,7 +9347,8 @@ fn spawn_gh_relay(
             .unwrap_or_default()
             .to_string();
         let params = decoded.get("params").cloned().unwrap_or_else(|| json!({}));
-        let reply = crate::gh_shim_relay::relay(
+        let relay_log = |line: &str| log::info!("{line}");
+        let relay_call = crate::gh_shim_relay::relay(
             &relay.transport,
             crate::gh_shim_relay::RelayCall {
                 operation: &operation,
@@ -9258,26 +9356,10 @@ fn spawn_gh_relay(
                 first_party,
                 route_scopes: &route_scopes,
             },
-            &|line| log::info!("{line}"),
-        )
-        .await;
-        let body = json!({
-            "op": operation,
-            "status": if reply.ok { "ok" } else { "error" },
-            "data": reply.data,
-        });
-        let Ok(body) = serde_json::to_vec(&body) else {
-            return;
-        };
-        let Ok(response) = Frame::build_with_version(
-            frame.header.ver,
-            FrameType::Response,
-            frame.header.flags,
-            frame.header.channel,
-            frame.header.epoch,
-            frame.header.corr,
-            body,
-        ) else {
+            &relay_log,
+        );
+        let response = gh_relay_wait::terminal(&frame, &operation, &mut wait, relay_call).await;
+        let Ok(response) = response else {
             return;
         };
         if let Err(error) =
@@ -9764,21 +9846,23 @@ fn occipital_carrier_route(identity: &RouteIdentity) -> bool {
         })
 }
 
-fn flow_scope_refusal(scope: Option<&subc_protocol::scope::ScopeStamp>) -> Option<ErrorBody> {
-    scope
-        .filter(|stamp| {
-            stamp
-                .attributes
-                .flow_id
-                .as_ref()
-                .is_some_and(|id| !id.is_empty())
-        })
-        .map(|_| {
-            ErrorBody::new(
-                "flow_scope_not_supported",
-                "a flow may call only diagnostics.findings on an AFT management route",
-            )
-        })
+fn admit_management_flow_request(
+    identity: &ManagementIdentity,
+    body: Option<&Value>,
+) -> Result<(), ErrorBody> {
+    if identity.admission != ManagementAdmission::FlowOnly {
+        return Ok(());
+    }
+    let operation = body
+        .and_then(|body| body.get("method").or_else(|| body.get("op")))
+        .and_then(Value::as_str);
+    if !operation.is_some_and(|operation| manifest::FLOW_OPERATIONS.contains(&operation)) {
+        return Err(ErrorBody::new(
+            "flow_scope_not_supported",
+            "a flow may call only diagnostics.findings on an AFT management route",
+        ));
+    }
+    diagnostics_findings::admit_flow(identity.scope.as_ref())
 }
 
 /// Whether a route request is a tool call: either `op: "tool.call"`, or the
@@ -10196,6 +10280,25 @@ impl PlainToolRun {
                 approved_io_window,
                 reply_deadline,
             } = run_spec;
+            if identity_for_run.run_owner.is_some() {
+                if let Err(response) = tool_provider::check_program_scope(
+                    ctx,
+                    &request_id_for_force,
+                    &identity_for_run,
+                ) {
+                    return response;
+                }
+                if let Some(key) = ledger_key.as_ref().filter(|_| approved_io_window.is_some()) {
+                    if let Err(response) = tool_provider::begin_approved_call(
+                        ctx,
+                        key,
+                        &request_id_for_force,
+                        &identity_for_run,
+                    ) {
+                        return response;
+                    }
+                }
+            }
             if matches!(ask_route, crate::access_policy::AskRoute::Plugin { .. }) {
                 if let Some(args) = arguments.as_object_mut() {
                     args.remove("permissions_granted");
@@ -10403,7 +10506,9 @@ async fn hold_for_consent(
         access_grants::ask_route(&plain_run.identity),
         crate::access_policy::AskRoute::Elicitation { .. }
     );
-    let reply_deadline = if elicitation {
+    let reply_deadline = if plain_run.identity.run_owner.is_some() {
+        consent::program_reply_deadline()
+    } else if elicitation {
         plain_run.reply_deadline
     } else {
         plain_run.io_budget.deadline
@@ -10420,8 +10525,22 @@ async fn hold_for_consent(
         active: Arc::clone(active_tool_calls),
         connection_cancel: connection_cancel.clone(),
         drain: module_drain.clone(),
+        ledger_key: plain_run.ledger_key.clone(),
+        shell_claim: None,
     };
-    let rerun = |ask_route| {
+    if plain_run.identity.run_owner.is_some() && plain_run.ledger_key.is_some() {
+        if consent::persist_permission_hold(&held).await.is_err() {
+            return Some((response, text));
+        }
+        let frame = consent::held_frame(ver, route, corr, flags).ok()?;
+        if send_reliable_writer_frame(writer, metrics, frame, "permission hold")
+            .await
+            .is_err()
+        {
+            return None;
+        }
+    }
+    let rerun = |ask_route, _shell| {
         let (done_tx, done_rx) = oneshot::channel::<ToolCallCompletion>();
         // Start the renewed allowance when the executor admits the approved
         // work. Queueing after approval must not spend its filesystem budget.
@@ -10453,12 +10572,24 @@ async fn hold_for_consent(
                     &format_context,
                 ),
             };
-            (response, text)
+            Some((response, text))
         }
     };
     let result = if elicitation {
-        standalone::run_with_elicitation(held, (response, text), rerun, writer, metrics, ver, flags)
-            .await
+        standalone::run_with_elicitation(
+            held,
+            (response, text),
+            |route| async move {
+                rerun(route, Vec::<String>::new())
+                    .await
+                    .expect("file reruns do not hand off tasks")
+            },
+            writer,
+            metrics,
+            ver,
+            flags,
+        )
+        .await
     } else {
         consent::run_with_consent(held, (response, text), rerun).await
     };
@@ -11276,6 +11407,12 @@ async fn handle_tool_call_with_capabilities(
         return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
     }
 
+    if is_subc_agent_core_tool(&bare_name) || is_subc_native_plumbing_tool(&bare_name) {
+        if let Some(meta) = live_roots.get_mut(&identity.root) {
+            route_census::note_tool_call(meta, route_id, Instant::now());
+        }
+    }
+
     if matches!(bare_name.as_str(), "bash" | "powershell") {
         // Subc answers bash on its own deferred path, not the shared tool-call
         // runner, so it captures the call for the repeat breaker here.
@@ -11311,9 +11448,14 @@ async fn handle_tool_call_with_capabilities(
             )?;
             return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
         }
-        if matches!(bind_trust, BindTrust::Untrusted) && identity.run_owner.is_some() {
-            // An untrusted head's shell call asks its consumer first; a
-            // program's run route has nobody to put that question to.
+        if matches!(bind_trust, BindTrust::Untrusted)
+            && matches!(
+                access_grants::ask_route(&identity),
+                crate::access_policy::AskRoute::Unavailable
+            )
+        {
+            // Worker programs and programs without held replies cannot carry
+            // an untrusted shell approval through the consent service.
             let error = subc_protocol::ErrorBody::new(
                 crate::access_policy::PERMISSION_ASK_UNAVAILABLE,
                 "this shell call needs an approval, and a codemode program can't ask for it",
@@ -11321,7 +11463,7 @@ async fn handle_tool_call_with_capabilities(
             .with_detail(json!({"permission": "bash", "resource": bare_name}));
             return send_provider_error(tx, metrics, frame, error).await;
         }
-        if matches!(bind_trust, BindTrust::Untrusted) {
+        if matches!(bind_trust, BindTrust::Untrusted) && identity.run_owner.is_none() {
             let plan = match bash::prepare_bash_elicitation_plan(
                 &arguments,
                 identity.project_root.as_path(),
@@ -13457,6 +13599,8 @@ pub(crate) mod test_support {
                 principal_id: Some("reserved:broca".into()),
             },
             consumer_elicitation_capable: false,
+            held_reply: false,
+            held_update: false,
             tool_result_body: false,
             disabled_tools: Arc::new(vec![]),
             run_scope: OnceLock::new(),
@@ -14736,6 +14880,8 @@ pub(crate) mod test_support {
                 }),
             },
             consumer_elicitation_capable: false,
+            held_reply: false,
+            held_update: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),
@@ -15678,6 +15824,7 @@ mod tests {
                 &HashMap::new(),
                 &metrics,
                 &health_rollup_cache,
+                json!({}),
             ));
             done_tx.send(result).expect("report health result");
         });
@@ -17710,6 +17857,23 @@ mod tests {
     }
 
     #[test]
+    fn idle_lsp_sweep_reaps_one_package_while_bound_root_is_busy() {
+        let fixture = crate::lsp::manager::regression_tests::IdleLspFixture::new();
+        let root = ProjectRootId::from_path(fixture.config.project_root.as_ref().unwrap()).unwrap();
+        fixture.ctx.mark_subc_bound();
+        let executor = Executor::new();
+        assert!(executor.register_actor(root.clone(), Arc::clone(&fixture.ctx)));
+        let mut roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+        for _ in 0..3 {
+            fixture.hover(&fixture.busy);
+            let now = Instant::now();
+            roots.get_mut(&root).unwrap().last_touched = now;
+            reap_idle_lsp_servers(now, &roots, &executor);
+        }
+        fixture.assert_only_busy();
+    }
+
+    #[test]
     fn quiesced_root_refuses_preserved_inspect_spawn_and_rebind_is_safe() {
         use crate::lsp::manager::ServerAttemptResult;
         use crate::lsp::registry::ServerKind;
@@ -17958,14 +18122,17 @@ mod tests {
             ctx.lsp_child_registry(),
         );
         assert_eq!(outcome.graceful + outcome.forced, 1, "{outcome:?}");
-        assert_eq!(outcome.unreaped, 0, "{outcome:?}");
-        // The forced kill does not wait; its worker thread reaps the child
-        // right after. Hang guard only.
+        // The shared budget bounds the caller, not its detached reapers. A slow
+        // Windows force-kill can leave the completion report pending at that
+        // deadline. Require eventual process exit and registry cleanup instead;
+        // neither a live leaked server nor a stale registry entry may remain.
         let deadline = Instant::now() + Duration::from_secs(30);
-        while crate::bash_background::process::is_process_alive(pid) {
+        while crate::bash_background::process::is_process_alive(pid)
+            || ctx.lsp_child_registry().pids().contains(&pid)
+        {
             assert!(
                 Instant::now() < deadline,
-                "exit sweep left server {pid} running"
+                "exit sweep did not reap server {pid}: {outcome:?}"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -19830,6 +19997,8 @@ mod tests {
             trust: BindTrust::FirstParty,
             spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,
+            held_reply: false,
+            held_update: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),
@@ -19962,6 +20131,8 @@ mod tests {
             trust: BindTrust::FirstParty,
             spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,
+            held_reply: false,
+            held_update: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),
@@ -22724,6 +22895,104 @@ mod tests {
         format!("Opens:\n{}", lines.join("\n"))
     }
 
+    /// Capture waits without taking the locks an open or a worker may be stuck
+    /// holding. Other roots' unfinished opens matter because the dedicated
+    /// database-open thread serves them in order.
+    fn rebind_wait_diagnostics(executor: &Executor, fixture: &ConfiguredRoot) -> String {
+        let (slot, _) = fixture.ctx.database_open_slot();
+        let database = match slot.try_lock() {
+            Some(slot) => format!(
+                "epoch={} committed_age_ms={} running={} pending={:?} ready_for={:?}",
+                slot.epoch,
+                slot.committed_at.elapsed().as_millis(),
+                slot.running,
+                slot.pending.as_ref().map(|request| (
+                    request.epoch,
+                    request.dispatched_at.map(|at| at.elapsed().as_millis()),
+                    &request.storage_root,
+                )),
+                slot.ready_for,
+            ),
+            None => "database-open slot locked (attach/publication may be in progress)".into(),
+        };
+        let opens = crate::database_open::recorded_opens_for_test()
+            .into_iter()
+            .filter(|open| open.root == fixture.canonical_root || open.finished_at.is_none())
+            .map(|open| {
+                format!(
+                    "root={} lane={:?} age_ms={} queued_ms={:?} finished={} floor_ms={} open_ms={} outcome={:?}",
+                    open.root.display(), open.runner, open.started_at.elapsed().as_millis(),
+                    open.dispatched_at.map(|at| open.started_at.saturating_duration_since(at).as_millis()),
+                    open.finished_at.is_some(), open.floor_check.as_millis(), open.open.as_millis(), open.outcome,
+                )
+            })
+            .collect::<Vec<_>>();
+        format!(
+            "database: {database}; opens: {opens:?}; root jobs (None means scheduler locked): {:?}; barriers: {:?}; dispatch: {:?}",
+            executor.try_root_job_snapshots(&fixture.root, None),
+            executor.try_bind_blocker_snapshot(&fixture.root, "subc-41-7"),
+            executor.try_dispatch_liveness_snapshot(),
+        )
+    }
+
+    struct RebindWaitDiagnostics<'a>(&'a Executor, &'a ConfiguredRoot);
+
+    impl Drop for RebindWaitDiagnostics<'_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                eprintln!(
+                    "rebind wait failure: {}",
+                    rebind_wait_diagnostics(self.0, self.1)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rebind_wait_diagnostics_name_active_job_without_waiting_on_database_slot() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let executor = Executor::new();
+        let fixture = ConfiguredRoot::unconfigured(&executor);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = executor.submit_async(
+            fixture.root.clone(),
+            Lane::Mutating,
+            "held-rebind-writer".into(),
+            Box::new(move |_| {
+                entered_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                Response::success("held-rebind-writer", json!({}))
+            }),
+        );
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (slot, _) = fixture.ctx.database_open_slot();
+        let locked = slot.lock();
+        // The job snapshot is a non-blocking read; while the scheduler holds
+        // its lock it reports None, by design. Retry while the slot stays
+        // held, so the assertions below check what the snapshot names rather
+        // than lock timing.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let diagnostic = loop {
+            let diagnostic = rebind_wait_diagnostics(&executor, &fixture);
+            if diagnostic.contains("held-rebind-writer") || std::time::Instant::now() >= deadline {
+                break diagnostic;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        drop(locked);
+        release_tx.send(()).unwrap();
+        assert!(writer.blocking_recv().unwrap().success);
+        for expected in [
+            "database-open slot locked",
+            "held-rebind-writer",
+            "lane: Mutating",
+            "started_age_ms:",
+        ] {
+            assert!(diagnostic.contains(expected), "{diagnostic}");
+        }
+    }
+
     /// A rebind can put a working root back into "initializing": here the
     /// rebind points the root at a different storage directory, and neither
     /// the post-reply dispatch nor the configure tail runs (the tail stands in
@@ -22736,6 +23005,9 @@ mod tests {
         let executor = Arc::new(Executor::new());
         let fixture = ConfiguredRoot::new(&executor);
         let _reap = ReapContextChildren(Arc::clone(&fixture.ctx));
+        // Diagnose panics inside database_wire_tool as well as failed response
+        // assertions. Run before child cleanup on unwind.
+        let _diagnostics = RebindWaitDiagnostics(&executor, &fixture);
         fixture.ctx.mark_subc_bound();
         start_post_ack_database_open(&executor, &fixture.root);
         assert!(
@@ -22783,6 +23055,11 @@ mod tests {
         );
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(other_storage.path().join("aft.db").is_file());
+        eprintln!(
+            "rebind bash completed in {}ms; {}",
+            started.elapsed().as_millis(),
+            rebind_wait_diagnostics(&executor, &fixture),
+        );
     }
 
     #[test]

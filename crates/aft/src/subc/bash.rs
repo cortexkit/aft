@@ -48,6 +48,7 @@ pub(super) struct BashDeferredCompletion {
     root: ProjectRootId,
     request_id: String,
     result: Option<ToolCallResult>,
+    held_frame: Option<Frame>,
     fatal: bool,
     /// True for the completion that removes the held request and decrements its
     /// root and route wait counts. A panic observed after a deadline reply sets
@@ -866,6 +867,51 @@ fn build_detached_frame(
     .map_err(SubcError::FrameBuild)
 }
 
+fn running_hold_route(identity: &RouteIdentity) -> bool {
+    identity.call_mode == subc_protocol::call_mode::CallMode::Codemode
+        && identity.held_reply
+        && identity.tool_result_body
+        && (identity.run_owner.is_some()
+            || identity
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.kind == subc_protocol::scope::ScopeKind::Ephemeral))
+}
+
+async fn running_hold_frame(
+    target: &drain::BashDetachTarget,
+    route: RouteChannel,
+    corr: u64,
+    include_structured: bool,
+) -> Result<Option<Frame>, SubcError> {
+    let frame = wire::build_held_frame(
+        target.ver,
+        route,
+        corr,
+        target.flags,
+        cortexkit_role_tool_provider::result::held_reasons::RUNNING,
+        Some(json!({"task_id": target.task_id})),
+    )?;
+    let registry = target.registry.clone();
+    let task = target.task_id.clone();
+    let body = frame.body.clone();
+    let persisted = tokio::task::spawn_blocking(move || {
+        registry.hold_running_call(&task, &body, include_structured)
+    })
+    .await;
+    match persisted {
+        Ok(Ok(publish)) => Ok(publish.then_some(frame)),
+        error => {
+            let registry = target.registry.clone();
+            let task = target.task_id.clone();
+            let session = target.session_id.clone();
+            let _ = tokio::task::spawn_blocking(move || registry.kill(&task, &session)).await;
+            log::warn!("call ledger running hold failed: {error:?}");
+            Err(SubcError::WriterClosed)
+        }
+    }
+}
+
 fn detach_held_bash_sync(target: drain::BashDetachTarget, cancelled: bool) {
     if cancelled && target.server_completion {
         let _ = target.registry.kill(&target.task_id, &target.session_id);
@@ -920,6 +966,18 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
         );
         let frame: Option<WriterFrame> = match (reason, routes.get(&route)) {
             (_, None) => None,
+            (drain::BashLoopAnswer::Drain, Some(identity))
+                if target.server_completion && running_hold_route(identity) =>
+            {
+                running_hold_frame(
+                    &target,
+                    route,
+                    corr,
+                    !matches!(identity.trust, BindTrust::Untrusted),
+                )
+                .await?
+                .map(WriterFrame::plain)
+            }
             (drain::BashLoopAnswer::Drain, Some(_)) if target.server_completion => Some(
                 build_detached_frame(
                     target.ver,
@@ -1064,7 +1122,9 @@ pub(super) fn prepare_bash_elicitation_plan(
     })
 }
 
-fn permission_grants_for_retry(asks: &[crate::bash_permissions::PermissionAsk]) -> Vec<String> {
+pub(super) fn permission_grants_for_retry(
+    asks: &[crate::bash_permissions::PermissionAsk],
+) -> Vec<String> {
     asks.iter()
         .flat_map(|ask| {
             if ask.always.is_empty() {
@@ -1257,6 +1317,13 @@ fn accepted_runon_launch_reply(
     response: &Response,
 ) -> Response {
     let mut reply = copy_response(response);
+    let admission_note = reply.data["remote_admission_note"]
+        .as_str()
+        .map(str::to_owned);
+    if let Some(data) = reply.data.as_object_mut() {
+        data.remove("remote_admission_note");
+        data.remove("remote_phase_note");
+    }
     reply.data["status"] = json!("running");
     if let Some(progress) = progress {
         let phase = progress.phase.tag();
@@ -1277,6 +1344,7 @@ fn accepted_runon_launch_reply(
         let mut output = output.to_owned();
         for warning in [
             crate::commands::bash_orchestrate::REMOTE_INPUT_CAPTURE_WARNING,
+            admission_note.as_deref().unwrap_or(""),
             REMOTE_ADMISSION_PENDING_NOTE,
         ] {
             if let Some(prefix) = output.strip_suffix(warning) {
@@ -1318,6 +1386,11 @@ fn cached_runon_launch_reply(
             return background_runon
                 .then(|| accepted_runon_launch_reply(Some(launch.progress), response));
         }
+        if let Some(note) = launch.admission_note {
+            let mut reply = copy_response(response);
+            reply.data["remote_admission_note"] = json!(note);
+            return Some(with_capture_warning(&reply));
+        }
     }
     Some(with_capture_warning(response))
 }
@@ -1353,7 +1426,8 @@ pub(super) const REMOTE_ADMISSION_PENDING_NOTE: &str = "The remote job is queued
 /// accepted it. Foreground calls reach this at the end of their wait window;
 /// explicit background calls reach it as soon as the task is registered and
 /// keep background launch wording rather than claiming a foreground wait. Both
-/// retain the admission-pending note. Every other reply passes through unchanged:
+/// show the latest admission progress, or the admission-pending note if none
+/// arrived. Every other reply passes through unchanged:
 /// a finished or refused task, an accepted job, or a reply returned early because
 /// AFT is restarting.
 fn foreground_runon_reply(
@@ -1393,10 +1467,14 @@ fn foreground_runon_reply(
             bash_watch_available,
         )
     };
+    let admission_note = response.data["remote_admission_note"]
+        .as_str()
+        .unwrap_or(REMOTE_ADMISSION_PENDING_NOTE);
     let reply = Response::success(
         &response.id,
         json!({
-            "output": format!("{guidance}\n{REMOTE_ADMISSION_PENDING_NOTE}"),
+            "output": format!("{guidance}\n{admission_note}"),
+            "remote_admission_note": response.data["remote_admission_note"],
             "task_id": task_id,
             "status": "starting",
             "remote_phase": crate::bash_background::registry::remote::RemotePhase::Submitting.tag(),
@@ -1612,11 +1690,10 @@ mod unanswered_deadline_tests {
     }
 }
 
-/// A codemode program's shell call that would need the user's approval
-/// (a scanned permission or a host escalation) is refused by name: nobody can
-/// be asked on the head agent's behalf from a run route yet.
-fn refuse_run_permission_ask(response: Response, run_scoped: bool) -> Response {
-    if !run_scoped
+/// Preserve the unavailable refusal for worker programs and run routes that
+/// cannot receive held replies. Capable agent programs use Cingulate instead.
+fn refuse_run_permission_ask(response: Response, unavailable: bool) -> Response {
+    if !unavailable
         || response.success
         || response.data.get("code").and_then(Value::as_str)
             != Some(crate::protocol::ERROR_PERMISSION_REQUIRED)
@@ -1703,6 +1780,224 @@ pub(super) fn submit_deferred_bash(
     reply_budget: impl Into<crate::commands::blocking_wait::ReplyBudget>,
 ) {
     let reply_budget = reply_budget.into();
+    let program = super::secret_consent::current_identity().filter(|identity| {
+        identity
+            .run_owner
+            .as_ref()
+            .is_some_and(|owner| matches!(owner.kind, super::codemode::RunKind::Agent { .. }))
+            && matches!(
+                super::access_grants::ask_route(identity),
+                crate::access_policy::AskRoute::Consent { .. }
+            )
+    });
+    if let Some(identity) = program.filter(|_| permissions_granted.is_none()) {
+        let executor = executor.clone();
+        let completion_tx = completion_tx.clone();
+        let poll_touch_tx = poll_touch_tx.clone();
+        let metrics = metrics.clone();
+        let initial_route = crate::access_policy::current_ask_route();
+        let request = request_id.clone();
+        let mut held = super::consent::HeldCall {
+            reply_deadline: super::consent::program_reply_deadline(),
+            identity: identity.clone(),
+            tool: "bash".into(),
+            arguments: arguments.clone(),
+            request_id: request_id.clone(),
+            executor: executor.clone(),
+            route,
+            corr,
+            active: Arc::default(),
+            connection_cancel: cancel.connection.clone(),
+            drain: cancel.drain.clone(),
+            ledger_key: call_key.as_ref().map(|key| crate::db::call_ledger::Key {
+                carrier: identity.run_owner.as_ref().unwrap().ledger_carrier(),
+                call_key: key.clone(),
+            }),
+            shell_claim: None,
+        };
+        tokio::spawn(async move {
+            let handed_off = Arc::new(AtomicBool::new(false));
+            let launch = |ask_route: crate::access_policy::AskRoute, permissions: Vec<String>| {
+                let approved_budget = if permissions.is_empty() {
+                    reply_budget
+                } else {
+                    crate::commands::blocking_wait::ReplyBudget::new(Instant::now(), None)
+                };
+                let (tx, mut rx) = mpsc::channel(2);
+                let _scope = crate::access_policy::scope_guard(Some(
+                    super::access_grants::policy_scope_key(&identity),
+                ));
+                let _grants = crate::access_policy::scope_grants_guard(
+                    super::access_grants::scope_grants_denial(&identity),
+                );
+                let _identity =
+                    super::secret_consent::SecretIdentityGuard::install(identity.clone());
+                let _ask = crate::access_policy::ask_route_guard(Some(ask_route));
+                // The program's permission wait has its own budget. Startup
+                // and command execution get their ordinary fresh reply window.
+                submit_deferred_bash(
+                    handles_progress,
+                    &executor,
+                    &tx,
+                    &poll_touch_tx,
+                    &metrics,
+                    dispatch,
+                    root.clone(),
+                    project_root.clone(),
+                    session_id.clone(),
+                    request_id.clone(),
+                    route,
+                    corr,
+                    flags,
+                    ver,
+                    arguments.clone(),
+                    format_context.clone(),
+                    cancel.clone(),
+                    bind_trust.clone(),
+                    spawn_principal.clone(),
+                    edit_slot_survives,
+                    call_key.clone(),
+                    schema_pin.clone(),
+                    Some(permissions),
+                    repeat.clone(),
+                    worker_session,
+                    worker_preset,
+                    worker_jail,
+                    server_completion,
+                    remote_source.clone(),
+                    approved_budget,
+                );
+                let metrics = metrics.clone();
+                let request_id = request_id.clone();
+                let completion_tx = completion_tx.clone();
+                let handed_off = handed_off.clone();
+                async move {
+                    match rx.recv().await {
+                        Some(done) => {
+                            decrement_counted_channel(&metrics.bash_deferred_queued);
+                            if done.result.is_none() {
+                                handed_off.store(true, Ordering::SeqCst);
+                                let _ = send_counted_channel(
+                                    &completion_tx,
+                                    &metrics.bash_deferred_queued,
+                                    done,
+                                )
+                                .await;
+                                None
+                            } else {
+                                done.result.map(|result| (result.response, result.text))
+                            }
+                        }
+                        None => Some((
+                            Response::error(&request_id, "internal_error", "executor dropped"),
+                            String::new(),
+                        )),
+                    }
+                }
+            };
+            let first = if matches!(bind_trust, BindTrust::Untrusted) {
+                let command = arguments
+                    .get("params")
+                    .unwrap_or(&arguments)
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                Some((
+                    Response::error_with_data(
+                        &request,
+                        crate::protocol::ERROR_PERMISSION_REQUIRED,
+                        "bash command requires permission",
+                        json!({"asks":[{
+                            "kind":"bash", "patterns":[command], "always":[],
+                        }]}),
+                    ),
+                    String::new(),
+                ))
+            } else {
+                launch(initial_route, Vec::new()).await
+            };
+            let Some(first) = first else {
+                return;
+            };
+            let _claim = metrics.held_bash_calls.insert(route, corr);
+            held.shell_claim = Some(_claim.clone());
+            if first.0.data["code"] == crate::protocol::ERROR_PERMISSION_REQUIRED
+                && call_key.is_some()
+            {
+                if super::consent::persist_permission_hold(&held)
+                    .await
+                    .is_err()
+                {
+                    send_bash_deferred_completion(
+                        &completion_tx,
+                        &metrics,
+                        route,
+                        corr,
+                        flags,
+                        ver,
+                        root,
+                        request_id,
+                        Some(ToolCallResult {
+                            response: first.0,
+                            text: first.1,
+                        }),
+                        false,
+                    )
+                    .await;
+                    return;
+                }
+                let _ = send_counted_channel(
+                    &completion_tx,
+                    &metrics.bash_deferred_queued,
+                    BashDeferredCompletion {
+                        route,
+                        corr,
+                        flags,
+                        ver,
+                        root: root.clone(),
+                        request_id: request_id.clone(),
+                        result: None,
+                        held_frame: None,
+                        fatal: false,
+                        settles_hold: false,
+                    },
+                )
+                .await;
+            }
+            let result = super::consent::run_with_consent(held, first, launch)
+                .await
+                .map(|(response, text)| {
+                    let text = text.unwrap_or_else(|| {
+                        crate::subc_format::format_response_with_context(
+                            "bash",
+                            &response,
+                            &format_context,
+                        )
+                    });
+                    ToolCallResult { response, text }
+                });
+            let fatal = result
+                .as_ref()
+                .is_some_and(|result| note_fatal_panic_response(&result.response));
+            if result.is_none() && handed_off.load(Ordering::SeqCst) {
+                return;
+            }
+            send_bash_deferred_completion(
+                &completion_tx,
+                &metrics,
+                route,
+                corr,
+                flags,
+                ver,
+                root,
+                request_id,
+                result,
+                fatal,
+            )
+            .await;
+        });
+        return;
+    }
     let received_at = reply_budget.received_at;
     // Granted permissions resume a call after a prompt, which may outlast the
     // startup allowance. Start admission now, but keep the caller's reply clock.
@@ -1719,6 +2014,14 @@ pub(super) fn submit_deferred_bash(
     let scope_stamp = cancel.scope.clone();
     let speech_seed = cancel.speech_seed.clone();
     let secret_identity = super::secret_consent::current_identity();
+    let program_held = secret_identity.as_ref().is_some_and(running_hold_route);
+    let program_call = secret_identity
+        .as_ref()
+        .is_some_and(|identity| identity.run_owner.is_some());
+    let program_approval = program_call
+        && permissions_granted
+            .as_ref()
+            .is_some_and(|permissions| !permissions.is_empty());
     let secret_scopes = secret_identity
         .as_ref()
         .map(super::secret_consent::call_scopes);
@@ -1730,6 +2033,8 @@ pub(super) fn submit_deferred_bash(
     let grant_scope = crate::access_policy::current_scope();
     let grant_denial = crate::access_policy::scope_grants_denial();
     let ask_route = crate::access_policy::current_ask_route();
+    let ask_unavailable =
+        run_scoped && matches!(ask_route, crate::access_policy::AskRoute::Unavailable);
     // The attested scope decides confinement independently of consent routing:
     // heads and workers both ask, but only worker shells require the jail.
     let spawn_ctx = match executor.try_actor_context(&root) {
@@ -2065,9 +2370,12 @@ pub(super) fn submit_deferred_bash(
                         }
                     };
                     if let Some(grants) = permissions_granted {
-                        translated
-                            .args
-                            .insert("permissions_requested".to_string(), Value::Bool(true));
+                        // Re-entering a trusted program's preflight does not
+                        // enable the Bash permission scanner when the same
+                        // command issued directly would not use that scanner.
+                        if !program_call || matches!(bind_trust, BindTrust::Untrusted) {
+                            translated.args.insert("permissions_requested".to_string(), Value::Bool(true));
+                        }
                         translated.args.insert(
                             "permissions_granted".to_string(),
                             Value::Array(grants.into_iter().map(Value::String).collect()),
@@ -2114,6 +2422,20 @@ pub(super) fn submit_deferred_bash(
                     lsp_hints: None,
                     session_id: Some(session_for_spawn.clone()),
                     params: Value::Object(translated.args), };
+                    if program_call {
+                        if let Err(response) = super::tool_provider::check_program_scope(ctx, &request_id_for_spawn, secret_identity.as_ref().expect("program call has an authenticated identity")) {
+                            return finish_bash_spawn_immediate(response, ctx, &session_for_spawn,
+                                &format_context_for_spawn, &mut spawn_text_tx, &mut spawn_control_tx, true, &mut repeat_for_spawn);
+                        }
+                    }
+                    if program_approval {
+                        if let Some(key) = &ledger_key {
+                            if let Err(response) = super::tool_provider::begin_approved_call(ctx, key, &request_id_for_spawn, secret_identity.as_ref().expect("program approval has an authenticated identity")) {
+                                return finish_bash_spawn_immediate(response, ctx, &session_for_spawn,
+                                    &format_context_for_spawn, &mut spawn_text_tx, &mut spawn_control_tx, true, &mut repeat_for_spawn);
+                            }
+                        }
+                    }
                     let (response, storage_dir) =
                         crate::sandbox_spawn::with_authenticated_principal(spawn_principal, || {
                             // Declared first so its test-only drop check runs after
@@ -2157,7 +2479,7 @@ pub(super) fn submit_deferred_bash(
                                                                   let response = crate::bash_background::with_schema_pin(schema_pin, run_dispatch);
                                                                   #[cfg(test)]
                                                                   let response = with_bash_timing_for_test(spawn_timing_for_test.clone(), || crate::bash_background::with_schema_pin(schema_pin, run_dispatch));
-                                                                  let response = refuse_run_permission_ask(response, run_scoped);
+                                                                   let response = refuse_run_permission_ask(response, ask_unavailable);
                                                                   // Registration and revocation can race across actors.
                                                                   // Recheck after dispatch so neither ordering loses the task.
                                                                   if let Some(scope) = &scope_stamp {
@@ -2496,7 +2818,7 @@ pub(super) fn submit_deferred_bash(
                     Some(response) => response,
                     None => {
                         let startup_steps = receipt.startup_step_snapshot();
-                        let response = startup_deadline_response(&request_id, &outcome, startup_window, blocking_cap_ms, server_completion, worker_session, format_context.bash_watch_available.unwrap_or(worker_session), &executor, &root_for_task, admitted.load(Ordering::Relaxed), startup_steps.current());
+                        let response = startup_deadline_response(&request_id, &outcome, startup_window, blocking_cap_ms, server_completion, worker_session, format_context.bash_watch_available.unwrap_or(worker_session), &executor, &root_for_task, &spawn_cancel, admitted.load(Ordering::Relaxed), startup_steps.current());
                         capture_target = register_capture_target(&response);
                         let response = if blocking_intent && capture_deadline.is_some() {
                             if let Some(task_id) = response.data["task_id"].as_str().map(str::to_owned) {
@@ -2768,6 +3090,23 @@ pub(super) fn submit_deferred_bash(
                         wait_for_bash_reply_deadline(reply_deadline).await;
                     } => {
                         if claim.claim_for_deadline_handoff() {
+                            if program_held {
+                                let held_frame = match running_hold_frame(&deadline_target, route, corr, !matches!(bind_trust, BindTrust::Untrusted)).await {
+                                    Ok(frame) => frame,
+                                    Err(error) => {
+                                        log::warn!("running hold could not be persisted: {error}");
+                                        let result = bash_result_from_response(Response::error(&request_id, "database_unavailable", "Call ledger is unavailable"), &deadline_target.format_context);
+                                        send_bash_deferred_completion(&completion_tx, &task_metrics, route, corr, flags, ver, root_for_task, request_id, Some(result), false).await;
+                                        return;
+                                    }
+                                };
+                                detach_held_bash_in_background(deadline_target, false);
+                                let _ = send_counted_channel(&completion_tx, &task_metrics.bash_deferred_queued, BashDeferredCompletion {
+                                    route, corr, flags, ver, root: root_for_task, request_id,
+                                    result: None, held_frame, fatal: false, settles_hold: true,
+                                }).await;
+                                return;
+                            }
                             let response = blocking_handoff_response.unwrap_or_else(|| deadline_handoff_response(&request_id, &deadline_target.task_id, wait_window_ms, worker_session, deadline_target.format_context.bash_watch_available.unwrap_or(worker_session)));
                             // Status-bar formatting can wait on diagnostic-cache or
                             // fleet-reader mutexes, so omit it from the deadline reply.
@@ -2864,6 +3203,7 @@ fn startup_deadline_response(
     bash_watch_available: bool,
     executor: &Executor,
     root: &ProjectRootId,
+    cancellation: &JobCancellation,
     admitted: bool,
     slow_step: crate::bash_background::BashStartupStep,
 ) -> Response {
@@ -2906,10 +3246,13 @@ fn startup_deadline_response(
                 INLINE_STARTUP_SETTLE.as_millis()
             ),
         ),
-        StartupOutcome::Refused => Response::error(
+        StartupOutcome::Refused => startup_refusal_response(
             request_id,
-            "bash_start_deadline",
-            startup_refusal_reason(executor, root, admitted, slow_step),
+            executor,
+            root,
+            cancellation,
+            admitted,
+            slow_step,
         ),
     }
 }
@@ -2917,23 +3260,50 @@ fn startup_deadline_response(
 /// Only called once the receipt is refused: process creation and in-process
 /// rewrites both commit through that receipt, and a refused receipt never
 /// commits, so every reason here can say the command was not started.
-fn startup_refusal_reason(
+fn startup_refusal_response(
+    request_id: &str,
     executor: &Executor,
     root: &ProjectRootId,
+    cancellation: &JobCancellation,
     admitted: bool,
     slow_step: crate::bash_background::BashStartupStep,
-) -> String {
+) -> Response {
     if admitted {
-        return format!(
+        return Response::error(request_id, "bash_start_deadline", format!(
             "bash startup reply budget expired during {} before process creation committed; process creation is now refused, so the command was not started and will not start",
             slow_step.description()
-        );
+        ));
     }
     if let Some(writer) = executor
-        .try_mutating_lane_snapshots()
-        .and_then(|writers| writers.into_iter().find(|writer| &writer.root_id == root))
+        .try_root_job_snapshots(root, Some(cancellation))
+        .and_then(|jobs| jobs.into_iter().find(|job| job.lane == Lane::Mutating))
     {
-        return format!("bash startup deadline: queued behind root Mutating job {} ({}); slow startup step: {}; command was not started", writer.request_id, writer.command, slow_step.description());
+        // The scheduler reserves the lane before the worker takes the epoch
+        // gate and enters the startup callback. That occupant can be this call,
+        // not a different job blocking it. Request IDs alone are not identity.
+        let message = if writer.is_current {
+            format!("bash startup deadline: queued for executor admission or scheduler lock; slow startup step: {}; command was not started", slow_step.description())
+        } else {
+            format!("bash startup deadline: queued behind root Mutating job {} ({}); slow startup step: {}; command was not started", writer.request_id, writer.command, slow_step.description())
+        };
+        crate::slog_warn!(
+            "bash startup admission: request_id={request_id} occupant_request_id={} lane={:?} job_id={} age_ms={} execution_started={} own_job={}",
+            writer.request_id, writer.lane, writer.job_id, writer.started_age_ms,
+            writer.execution_started, writer.is_current,
+        );
+        return Response::error_with_data(
+            request_id,
+            "bash_start_deadline",
+            message,
+            json!({
+                "detail": {
+                    "job_id": writer.job_id,
+                    "age_ms": writer.started_age_ms,
+                    "execution_started": writer.execution_started,
+                    "own_job": writer.is_current,
+                }
+            }),
+        );
     }
     if executor
         .try_dispatch_liveness_snapshot()
@@ -2941,9 +3311,9 @@ fn startup_refusal_reason(
             snapshot.running.interactive + snapshot.running.maintenance >= executor.pool_size()
         })
     {
-        return format!("bash startup deadline: executor workers saturated; slow startup step: {}; command was not started", slow_step.description());
+        return Response::error(request_id, "bash_start_deadline", format!("bash startup deadline: executor workers saturated; slow startup step: {}; command was not started", slow_step.description()));
     }
-    format!("bash startup deadline: queued for executor admission or scheduler lock; slow startup step: {}; command was not started", slow_step.description())
+    Response::error(request_id, "bash_start_deadline", format!("bash startup deadline: queued for executor admission or scheduler lock; slow startup step: {}; command was not started", slow_step.description()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3780,6 +4150,7 @@ async fn send_ready_bash_result(
                 result: None,
                 fatal: true,
                 settles_hold: false,
+                held_frame: None,
             },
         )
         .await;
@@ -3812,6 +4183,7 @@ async fn send_bash_deferred_completion(
             result,
             fatal,
             settles_hold: true,
+            held_frame: None,
         },
     )
     .await;
@@ -3827,6 +4199,13 @@ pub(super) async fn handle_bash_deferred_completion(
     metrics: &DispatchPathMetrics,
 ) -> Result<(), SubcError> {
     let route_id = done.route;
+    let held_frame = done.held_frame;
+    // A nonterminal completion with no result or fatal error is the program's
+    // permission hold. Its final result will settle the same ledger attachment.
+    if held_frame.is_none() && !done.settles_hold && !done.fatal && done.result.is_none() {
+        let frame = super::consent::held_frame(done.ver, done.route, done.corr, done.flags)?;
+        return send_reliable_writer_frame(tx, metrics, frame, "permission hold").await;
+    }
     if done.settles_hold {
         metrics.held_bash_calls.remove(done.route, done.corr);
         if let Some(meta) = live_roots.get_mut(&done.root) {
@@ -3844,6 +4223,10 @@ pub(super) async fn handle_bash_deferred_completion(
         }
     }
 
+    if let Some(frame) = held_frame {
+        // Task-backed holds are already durable before entering this channel.
+        return send_reliable_writer_frame(tx, metrics, frame, "running hold").await;
+    }
     if let Some(result) = done.result {
         if let Some(identity) = routes.get(&route_id) {
             let frame = build_tool_response_frame(
@@ -3897,6 +4280,7 @@ pub(super) fn bash_denied_untrusted_completion(
         result: Some(bash_result_from_response(response, &format_context)),
         fatal: false,
         settles_hold: true,
+        held_frame: None,
     }
 }
 
@@ -3925,6 +4309,7 @@ pub(super) fn bash_authorization_failed_completion(
         result: Some(bash_result_from_response(response, &format_context)),
         fatal: false,
         settles_hold: true,
+        held_frame: None,
     }
 }
 
@@ -3951,6 +4336,7 @@ pub(super) fn bash_module_draining_completion(
         result: Some(bash_result_from_response(response, &format_context)),
         fatal: false,
         settles_hold: true,
+        held_frame: None,
     }
 }
 
@@ -3976,6 +4362,7 @@ pub(super) fn bash_withdrawn_completion(
         result: None,
         fatal: false,
         settles_hold: true,
+        held_frame: None,
     }
 }
 
@@ -5934,6 +6321,42 @@ mod grant_path_tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn runon_progress_replaces_admission_text_in_launch_and_promotion_replies() {
+        let note =
+            "The remote job is waiting for a free build host (2m 10s so far): plain <detail>.";
+        for background in [false, true] {
+            let response = Response::success(
+                "progress",
+                json!({
+                    "task_id": "bash-progress", "status": "starting",
+                    "remote_admission_note": note,
+                }),
+            );
+            let reply = foreground_runon_reply(
+                response,
+                Some(Instant::now()),
+                background,
+                &capture_cancel(),
+                None,
+                1_000,
+                false,
+                true,
+            );
+            let output = reply.data["output"].as_str().unwrap();
+            assert!(output.contains(note), "{output}");
+            assert!(!output.contains(REMOTE_ADMISSION_PENDING_NOTE), "{output}");
+            assert!(output.contains("completion reminder"), "{output}");
+            assert_eq!(output.matches(REMOTE_INPUT_CAPTURE_WARNING).count(), 1);
+            let accepted = accepted_runon_launch_reply(None, &reply);
+            let output = accepted.data["output"].as_str().unwrap();
+            assert!(!output.contains(note), "{output}");
+            assert!(!output.contains(REMOTE_INPUT_CAPTURE_WARNING), "{output}");
+            assert!(accepted.data.get("remote_admission_note").is_none());
+        }
+    }
+
+    #[cfg(unix)]
     #[derive(Clone, Copy)]
     enum ReplyDecided {
         AfterAcceptance,
@@ -6170,6 +6593,118 @@ mod grant_path_tests {
             assert_eq!(done.response_for_test().data["remote_phase"], "submitting");
             assert!(!ctx.bash_background().is_task_terminal(&task_id));
             daemon.acceptance_gate.notify_one();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runon_pre_acceptance_refusal_ends_subc_worker_wait_promptly() {
+        use crate::exec_remote::wire_tests::Script;
+        for (reason, detail) in [
+            ("runner_full", Some("hosted_host_full")),
+            ("network_unsupported", None),
+            ("queue_wait_exceeded", None),
+        ] {
+            for mode in ["wait", "block_to_completion"] {
+                let (daemon, _dir, root, executor, ctx) =
+                    capture_fixture(Script::GatedPreStartRefusal { reason, detail }).await;
+                let mut args =
+                    json!({"command":"printf must-not-run", "runon":"linux", "compressed":false});
+                args[mode] = json!(true);
+                let mut rx =
+                    with_bash_timing_for_test(Some(BashTimingForTest::new(Instant::now())), || {
+                        deadline_test_call_controlled(
+                            &executor,
+                            &root,
+                            remote_runon_stub,
+                            args,
+                            Instant::now(),
+                            false,
+                            true,
+                            Arc::new(DispatchPathMetrics::new()),
+                            capture_cancel(),
+                        )
+                    });
+                daemon.wait_for_requests("exec.run", 1).await;
+                assert!(rx.try_recv().is_err());
+                daemon.acceptance_gate.notify_one();
+                let done = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                    .await
+                    .expect("a pre-start refusal must not consume the worker wait budget")
+                    .unwrap();
+                let response = done.response_for_test();
+                assert!(!response.success, "{response:?}");
+                assert_eq!(response.data["code"], "remote_unavailable", "{response:?}");
+                let task_id = response.data["task_id"].as_str().unwrap();
+                assert_eq!(
+                    ctx.bash_background()
+                        .runon_inputs_captured(task_id, "deadline-session"),
+                    Some(false)
+                );
+                let status = crate::commands::bash_status::handle(
+                    &RawRequest {
+                        id: "refusal-status".into(),
+                        command: "bash_status".into(),
+                        session_id: Some("deadline-session".into()),
+                        lsp_hints: None,
+                        params: json!({"task_id": task_id}),
+                    },
+                    &ctx,
+                );
+                assert_eq!(response.data["code"], status.data["code"]);
+                assert_eq!(response.data["message"], status.data["message"]);
+                assert!(!done
+                    .text_for_test()
+                    .unwrap()
+                    .contains(REMOTE_INPUT_CAPTURE_WARNING));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runon_pre_submission_failures_end_subc_worker_wait_promptly() {
+        use crate::exec_remote::wire_tests::Script;
+        for unavailable_connection in [false, true] {
+            let (daemon, _dir, root, executor, _ctx) =
+                capture_fixture_with_claims(Script::Plain, &["unrelated/v1"]).await;
+            if unavailable_connection {
+                std::fs::remove_file(&daemon.connection).unwrap();
+            }
+            let mut rx =
+                with_bash_timing_for_test(Some(BashTimingForTest::new(Instant::now())), || {
+                    deadline_test_call_controlled(
+                        &executor,
+                        &root,
+                        remote_runon_stub,
+                        json!({"command":"printf must-not-run", "runon":"linux", "wait":true}),
+                        Instant::now(),
+                        false,
+                        true,
+                        Arc::new(DispatchPathMetrics::new()),
+                        capture_cancel(),
+                    )
+                });
+            let done = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("a capability or connection refusal must end the worker wait")
+                .unwrap();
+            let response = done.response_for_test();
+            assert!(!response.success, "{response:?}");
+            assert_eq!(response.data["code"], "remote_unavailable", "{response:?}");
+            assert!(
+                response.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("command did not run"),
+                "{response:?}"
+            );
+            assert!(!daemon
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, body)| body["method"] == "exec.run"));
         }
     }
 
@@ -8079,6 +8614,106 @@ mod grant_path_tests {
         deadline_queue_case(false).await;
     }
 
+    #[test]
+    fn bash_deadline_distinguishes_own_admission_from_same_id_blocker() {
+        let (_dir, root) = super::super::test_support::test_root("bash-admission-identity");
+        let executor = Executor::new();
+        executor.register_actor(root.clone(), super::super::test_support::test_ctx());
+        let current = JobCancellation::new();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let done = executor.submit_tool_call_with_cancellation_async(
+            root.clone(),
+            Lane::Mutating,
+            "reused-call".into(),
+            "bash",
+            Box::new(move |_| {
+                entered_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                Response::success("reused-call", json!({}))
+            }),
+            current.clone(),
+        );
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // Model the scheduler/callback gap with admitted=false while keeping
+        // the occupant stable, without relying on operating-system scheduling.
+        // The job snapshot is a non-blocking read; while the scheduler holds
+        // its lock the refusal falls back to the generic sentence, by design.
+        // Retry until a read gets through, so the assertions below compare the
+        // own-job and other-job answers rather than lock timing.
+        let ((own, other), lines) = crate::logging::capture_log_lines(|| {
+            let refusal = |token: &JobCancellation| {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    let response = startup_deadline_response(
+                        "waiting-call",
+                        &crate::bash_background::StartupOutcome::Refused,
+                        80,
+                        None,
+                        false,
+                        false,
+                        false,
+                        &executor,
+                        &root,
+                        token,
+                        false,
+                        crate::bash_background::BashStartupStep::Admission,
+                    );
+                    if response.data.get("detail").is_some()
+                        || std::time::Instant::now() >= deadline
+                    {
+                        return response;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            };
+            (refusal(&current), refusal(&JobCancellation::new()))
+        });
+        release_tx.send(()).unwrap();
+        assert!(done.blocking_recv().unwrap().success);
+
+        assert_eq!(
+            own.data["message"],
+            "bash startup deadline: queued for executor admission or scheduler lock; slow startup step: executor admission; command was not started"
+        );
+        assert!(!own.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("queued behind root Mutating job"));
+        assert_eq!(
+            other.data["message"],
+            "bash startup deadline: queued behind root Mutating job reused-call (bash); slow startup step: executor admission; command was not started"
+        );
+        assert_eq!(own.data["detail"]["job_id"], other.data["detail"]["job_id"]);
+        let warnings = lines
+            .iter()
+            .filter(|line| line.starts_with("WARN ") && line.contains("bash startup admission:"))
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 2, "{lines:?}");
+        for (response, own_job) in [(&own, true), (&other, false)] {
+            assert!(!response.success);
+            assert_eq!(response.data["code"], "bash_start_deadline");
+            let detail = &response.data["detail"];
+            assert!(detail["job_id"].as_u64().is_some_and(|id| id > 0));
+            assert!(detail["age_ms"].as_u64().is_some());
+            assert_eq!(detail["execution_started"], true);
+            assert_eq!(detail["own_job"], own_job);
+            let expected = format!(
+                "job_id={} age_ms={} execution_started=true own_job={own_job}",
+                detail["job_id"], detail["age_ms"],
+            );
+            assert_eq!(
+                warnings
+                    .iter()
+                    .filter(|line| line.contains(&expected))
+                    .count(),
+                1,
+                "{lines:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn bash_deadline_refuses_executor_saturation() {
         deadline_queue_case(true).await;
@@ -8942,6 +9577,7 @@ mod grant_path_tests {
                 false,
                 &Executor::new(),
                 &root,
+                &JobCancellation::new(),
                 true,
                 receipt.startup_step_snapshot().current(),
             );

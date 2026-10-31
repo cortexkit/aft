@@ -164,9 +164,14 @@ impl ExecRemoteClient {
                 });
             }
         }
+        // Progress is optional display data. Older executors receive no opt-in,
+        // even if a saved request was created against a newer executor.
+        let request = request
+            .clone()
+            .with_progress(self.advertises(PROGRESS_CAPABILITY).await.unwrap_or(false));
         self.stream(
             "exec.run",
-            request,
+            &request,
             StreamConsumer::keyed_run(request.resume_from_seq()),
             diagnostics,
         )
@@ -248,6 +253,7 @@ impl ExecRemoteClient {
             consumer,
             finished: false,
             received_frame: false,
+            attached: method == "exec.attach",
             sent_at: (method == "exec.run").then_some(sent_at),
         })
     }
@@ -334,6 +340,7 @@ fn envelope<T: Serialize>(method: &str, params: &T) -> Result<Vec<u8>, Error> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum StreamProgress {
     Record,
+    AdmissionProgress,
     Complete(Verdict),
 }
 
@@ -345,10 +352,17 @@ pub struct RemoteStream {
     finished: bool,
     received_frame: bool,
     #[cfg_attr(not(unix), allow(dead_code))]
+    attached: bool,
+    #[cfg_attr(not(unix), allow(dead_code))]
     sent_at: Option<Instant>,
 }
 
 impl RemoteStream {
+    #[cfg(unix)]
+    pub(crate) fn is_attach(&self) -> bool {
+        self.attached
+    }
+
     #[cfg(unix)]
     pub(crate) fn sent_at(&self) -> Option<Instant> {
         self.sent_at
@@ -365,9 +379,10 @@ impl RemoteStream {
         self.received_frame
     }
 
-    /// Read one record into a durable sink. Outside output-gap recovery, a known
-    /// terminal followed by clean StreamEnd is required to complete a run;
-    /// loss/decode errors require status/attach. During output-gap recovery, the
+    /// Read one record into a sink; admission progress is display-only. Outside
+    /// output-gap recovery, a known terminal followed by clean StreamEnd is
+    /// required to complete a run; loss/decode errors require status/attach.
+    /// During output-gap recovery, the
     /// saved executor terminal still supplies the outcome even if a later attach
     /// closes with an error or does not repeat that terminal.
     /// There is no response deadline here: request timeout bounds remote run
@@ -377,9 +392,13 @@ impl RemoteStream {
             return self.consumer.finish().map(StreamProgress::Complete);
         }
         if let Some(bytes) = self.subscription.events().recv().await {
-            self.received_frame = true;
-            if let Err(error) = self.consumer.consume_bytes(&bytes, sink) {
-                return Err(self.consumer.recovery(error.to_string()));
+            match self.consumer.consume_frame(&bytes, sink) {
+                Ok(false) => return Ok(StreamProgress::AdmissionProgress),
+                Ok(true) => self.received_frame = true,
+                Err(error) => {
+                    self.received_frame = true;
+                    return Err(self.consumer.recovery(error.to_string()));
+                }
             }
             return Ok(StreamProgress::Record);
         }
@@ -405,13 +424,18 @@ impl RemoteStream {
 
 #[cfg(test)]
 mod capability_tests {
-    use super::{CAPABILITY, RETURN_CHUNKED_CAPABILITY, WINDOWS_CAPABILITY};
+    use super::{CAPABILITY, PROGRESS_CAPABILITY, RETURN_CHUNKED_CAPABILITY, WINDOWS_CAPABILITY};
 
     /// The daemon refuses a HELLO whose manifest names a capability outside the
     /// `<name>/v<N>` grammar, so AFT must check for names that can exist on the wire.
     #[test]
     fn checked_capabilities_pass_the_daemon_grammar() {
-        for capability in [CAPABILITY, WINDOWS_CAPABILITY, RETURN_CHUNKED_CAPABILITY] {
+        for capability in [
+            CAPABILITY,
+            WINDOWS_CAPABILITY,
+            RETURN_CHUNKED_CAPABILITY,
+            PROGRESS_CAPABILITY,
+        ] {
             assert!(
                 subc_protocol::manifest::is_valid_capability_identifier(capability),
                 "{capability} is not a capability name the daemon admits"

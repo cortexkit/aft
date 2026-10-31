@@ -33,12 +33,47 @@ use super::{Manifest, ManifestEntry, RegularPlanes, RelPath};
 /// Version 10 stores the parser's corrected symbols: Go type aliases, separate
 /// ranges for specs in a grouped `type (...)` block, and non-inverted ranges for
 /// HTML headings that share a row.
-pub const PRODUCER: &str = "ruled-callgraph-v12-rust-module-paths-and-function-references";
+pub const PRODUCER: &str = "ruled-callgraph-v13-python-import-bindings";
 
 #[derive(Clone, Debug)]
 pub struct CallgraphAttachment {
-    pub blob: Arc<CallgraphBlob>,
+    payload: Arc<std::sync::Mutex<Option<Arc<[u8]>>>>,
     pub key: FamilyKey,
+}
+
+impl CallgraphAttachment {
+    pub fn payload(&self) -> Option<Arc<[u8]>> {
+        self.payload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(super) fn retire(&self) {
+        self.payload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+}
+
+pub(super) fn retire_attachments(
+    entries: &BTreeMap<RelPath, LiveEntry>,
+    generation: &ComposedGeneration,
+) {
+    for (path, entry) in entries {
+        if let Some(attachment) = entry
+            .attachments
+            .get(&FamilyPlane::Callgraph)
+            .and_then(|a| a.downcast_ref::<CallgraphAttachment>())
+        {
+            if matches!(generation.plane_readiness(path, FamilyPlane::Callgraph),
+                Some(PlaneState::Ready { key }) if *key == attachment.key.to_hex())
+            {
+                attachment.retire();
+            }
+        }
+    }
 }
 
 /// Markdown has outline headings, not callable definitions or call references.
@@ -51,10 +86,42 @@ pub(crate) fn source_language(path: &Path) -> Option<crate::parser::LangId> {
 /// Whether a member needs a callgraph blob: a source file in a callgraph
 /// language, or resolver configuration such as `package.json`.
 pub(crate) fn applies_to(path: &RelPath) -> bool {
-    super::assembly::is_resolution_input(path.as_bytes())
-        || std::str::from_utf8(path.as_bytes())
+    applies_to_relative(path.as_bytes())
+}
+
+/// [`applies_to`] for a root-relative path with `/` separators.
+pub(crate) fn applies_to_relative(path: &[u8]) -> bool {
+    super::assembly::is_resolution_input(path)
+        || std::str::from_utf8(path)
             .ok()
             .is_some_and(|p| source_language(Path::new(p)).is_some())
+}
+
+/// The key a views call graph stores in `files.content_hash` for the file at
+/// root-relative `path` whose source hash is `source`: the call-graph blob key,
+/// not the source hash (materialization also stores size 0). `None` for a path
+/// the call graph does not index: neither a recognised source language nor a
+/// resolver configuration file such as `package.json`.
+pub(crate) fn graph_key(path: &[u8], source: blake3::Hash) -> Option<blake3::Hash> {
+    let language = if super::assembly::is_resolution_input(path) {
+        "config".to_owned()
+    } else {
+        let path = std::str::from_utf8(path).ok()?;
+        format!("{:?}", crate::parser::detect_language(Path::new(path))?).to_lowercase()
+    };
+    let key =
+        crate::blob_store::CallgraphKey::from_source_digest(*source.as_bytes(), language, PRODUCER)
+            .full_key();
+    Some(blake3::Hash::from_bytes(*key.as_bytes()))
+}
+
+/// The subset of a checkout's file identities a call graph is built from, so
+/// documents a call graph never holds do not count as files that differ.
+pub(crate) fn callgraph_inputs(
+    mut identities: std::collections::HashMap<String, (u64, blake3::Hash)>,
+) -> std::collections::HashMap<String, (u64, blake3::Hash)> {
+    identities.retain(|path, _| applies_to_relative(path.as_bytes()));
+    identities
 }
 
 /// Attach evidence computed from exactly the caller's already-read byte buffer.
@@ -82,7 +149,11 @@ pub fn attach(
     };
     let key = crate::blob_store::CallgraphKey::from_bytes(source, language, PRODUCER).full_key();
     let attachment = CallgraphAttachment {
-        blob: Arc::new(blob),
+        // The extraction-only AST index is intentionally absent from the
+        // existing payload encoding; do not retain it for the whole checkout.
+        payload: Arc::new(std::sync::Mutex::new(Some(
+            blob.to_bytes().map_err(error)?.into(),
+        ))),
         key: FamilyKey::from(&key),
     };
     entry
@@ -103,7 +174,19 @@ impl ManifestBlobReader for BlobReader {
 }
 
 /// Reads callgraph blobs from the family's v3 callgraph plane store.
-pub struct V3BlobReader(pub crate::blob_store::v3::PlaneReader);
+pub struct V3BlobReader {
+    reader: crate::blob_store::v3::PlaneReader,
+    decoded: crate::callgraph_store::join::DecodedBlobCache,
+}
+
+impl V3BlobReader {
+    pub fn new(reader: crate::blob_store::v3::PlaneReader) -> Self {
+        Self {
+            reader,
+            decoded: Default::default(),
+        }
+    }
+}
 
 pub(super) fn v3_error(error: crate::blob_store::v3::Error) -> PlaneError {
     if error.is_busy() {
@@ -117,9 +200,20 @@ impl ManifestBlobReader for V3BlobReader {
     fn read_callgraph_blob(&self, key: &str) -> Result<Option<Vec<u8>>, ManifestJoinError> {
         let bytes = parse_hex32(key)
             .ok_or_else(|| ManifestJoinError::InvalidBlob("invalid callgraph key".into()))?;
-        self.0
+        self.reader
             .get(&FamilyKey::new(FamilyPlane::Callgraph, bytes))
             .map_err(|e| ManifestJoinError::InvalidBlob(e.to_string()))
+    }
+
+    fn read_callgraph_blob_decoded(
+        &self,
+        key: &str,
+    ) -> Result<Option<Arc<CallgraphBlob>>, ManifestJoinError> {
+        self.decoded.read(key, || {
+            self.read_callgraph_blob(key)?
+                .map(|bytes| CallgraphBlob::from_bytes(&bytes).map(Arc::new))
+                .transpose()
+        })
     }
 }
 
@@ -374,13 +468,15 @@ impl PlaneAdapter for CallgraphPlane {
 pub(crate) struct CallgraphViewError {
     pub reason: String,
     pub busy: bool,
+    pub completion_busy: bool,
 }
 
 impl From<String> for CallgraphViewError {
     fn from(reason: String) -> Self {
         Self {
+            busy: super::trigram::bind_is_busy(&reason),
+            completion_busy: reason.contains(&format!("{V3_BASE_COMPLETION_BUSY}: Busy {{")),
             reason,
-            busy: false,
         }
     }
 }
@@ -396,11 +492,15 @@ impl From<PlaneError> for CallgraphViewError {
         let reason = reason
             .strip_prefix("family registry I/O error: ")
             .unwrap_or(reason);
+        let completion_busy = reason
+            .strip_prefix(V3_BASE_COMPLETION_BUSY)
+            .is_some_and(|outcome| outcome.starts_with(": Busy {"));
         Self {
             busy: reason.starts_with(DERIVED_STORE_BUSY)
                 || reason.starts_with(V3_STORE_BUSY)
-                || reason.starts_with(crate::blob_store::v3::BUSY_PREFIX)
-                || reason.starts_with(V3_BASE_COMPLETION_BUSY),
+                || super::trigram::bind_is_busy(reason)
+                || completion_busy,
+            completion_busy,
             reason: error.to_string(),
         }
     }
@@ -429,6 +529,19 @@ const V3_BASE_COMPLETION_BUSY: &str = "v3 base plane completion is owned elsewhe
 /// never substitute another store when acquisition fails.
 pub(crate) trait CallgraphReaderSource: Send + Sync {
     fn acquire(&self) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError>;
+    /// `acquire`, plus the source revision the reader's cut belongs to when
+    /// the source tracks one. The view keeps the reader under it.
+    fn acquire_with_revision(
+        &self,
+    ) -> Result<(Arc<ReadonlyCallGraphStore>, Option<u64>), CallgraphViewError> {
+        Ok((self.acquire()?, None))
+    }
+    /// The source revision when the cut last acquired is still current: see
+    /// `CheckoutDriver::steady_installed_revision`. `None` makes the next query
+    /// acquire a freshly verified reader.
+    fn steady_revision(&self) -> Option<u64> {
+        None
+    }
     fn record_change(&self, path: &Path);
     fn record_overflow(&self) {}
     fn record_cookie(&self, _: &Path) {}
@@ -462,6 +575,16 @@ pub(super) fn has_unpublished_changes(snapshot: &Snapshot) -> bool {
 
 impl CallgraphReaderSource for CheckoutCallgraphSource {
     fn acquire(&self) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError> {
+        self.acquire_with_revision().map(|(store, _)| store)
+    }
+
+    fn steady_revision(&self) -> Option<u64> {
+        self.driver.steady_installed_revision()
+    }
+
+    fn acquire_with_revision(
+        &self,
+    ) -> Result<(Arc<ReadonlyCallGraphStore>, Option<u64>), CallgraphViewError> {
         use super::first_load::FirstLoadDriver;
         let installed = self.driver.installed_snapshot();
         // After a restart, start from this checkout's own published worker
@@ -528,8 +651,9 @@ impl CallgraphReaderSource for CheckoutCallgraphSource {
         // Read the installed cut directly: `installed_snapshot` would mark a
         // checkout without a steady watcher subscription overflowed at once.
         // That mark only decides how the next bind reconciles; this cut was
-        // just verified against the disk.
-        let (snapshot, _) = self.driver.installed_cut();
+        // just verified against the disk. The cut and its revision are read
+        // together under the driver's install lock.
+        let (snapshot, revision) = self.driver.installed_cut();
         if snapshot.pending_intent().next().is_some()
             || snapshot.watcher() != super::snapshot::WatcherState::Healthy
             || has_unpublished_changes(&snapshot)
@@ -567,7 +691,7 @@ impl CallgraphReaderSource for CheckoutCallgraphSource {
                     .map_err(|error| error.to_string())?
             }
         };
-        Ok(reader.store.clone())
+        Ok((reader.store.clone(), Some(revision)))
     }
 
     fn record_change(&self, path: &Path) {
@@ -594,8 +718,17 @@ pub(crate) struct CallgraphView {
     family: String,
     policy: crate::blob_store::v2::TrigramPolicy,
     source: Arc<dyn CallgraphReaderSource>,
-    query: std::sync::Mutex<()>,
+    query: std::sync::Mutex<super::contracts::LoadRetry<CallgraphViewError>>,
+    /// The last reader with the source revision of the cut it reads. Taken
+    /// only under `query`. A query whose source still reports that revision
+    /// as steady reuses the reader instead of binding again.
+    steady: std::sync::Mutex<Option<(u64, Arc<ReadonlyCallGraphStore>)>>,
+    /// Verified acquisitions made, so tests can tell reuse from a new bind.
+    #[cfg(test)]
+    acquisitions: std::sync::atomic::AtomicUsize,
     ready: std::sync::atomic::AtomicBool,
+    legacy_import: Option<Arc<crate::migration::views_background::BackgroundImport>>,
+    current: crate::migration::v3_ledger::ImportControl,
 }
 
 /// The v3 member scope of a checkout's call-graph view.
@@ -618,14 +751,49 @@ impl CallgraphView {
             && self.storage == *storage
             && self.family == family
             && self.policy == policy
+            && (self.current)()
     }
 
+    #[cfg(test)]
     pub(crate) fn new(
         root: PathBuf,
         storage: crate::root_cache::StoragePaths,
         family: String,
         policy: crate::blob_store::v2::TrigramPolicy,
     ) -> Result<Self, CallgraphViewError> {
+        Self::new_with_import(
+            root,
+            storage,
+            family,
+            policy,
+            Arc::new(|| true),
+            crate::cold_build_limiter::global_limiter(),
+        )
+    }
+
+    pub(crate) fn new_with_import(
+        root: PathBuf,
+        storage: crate::root_cache::StoragePaths,
+        family: String,
+        policy: crate::blob_store::v2::TrigramPolicy,
+        current: crate::migration::v3_ledger::ImportControl,
+        limiter: Arc<crate::cold_build_limiter::ColdBuildLimiter>,
+    ) -> Result<Self, CallgraphViewError> {
+        if !current() {
+            return Err(CallgraphViewError {
+                reason: "checkout is unbound".into(),
+                busy: true,
+                completion_busy: false,
+            });
+        }
+        let legacy_import = crate::migration::views_background::BackgroundImport::start(
+            &storage.artifacts,
+            &family,
+            &root,
+            policy,
+            current.clone(),
+            limiter,
+        );
         let scope = view_scope(&root);
         let producers = super::manifest_v2::Producers {
             trigram: policy.fingerprint_hex(),
@@ -661,7 +829,10 @@ impl CallgraphView {
             scope,
             producers,
         });
-        Ok(Self::with_source(root, storage, family, policy, source))
+        let mut view = Self::with_source(root, storage, family, policy, source);
+        view.legacy_import = legacy_import;
+        view.current = current;
+        Ok(view)
     }
 
     pub(crate) fn with_source(
@@ -677,8 +848,13 @@ impl CallgraphView {
             family,
             policy,
             source,
-            query: std::sync::Mutex::new(()),
+            query: std::sync::Mutex::new(super::contracts::LoadRetry::default()),
+            steady: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            acquisitions: Default::default(),
             ready: std::sync::atomic::AtomicBool::new(false),
+            legacy_import: None,
+            current: Arc::new(|| true),
         }
     }
 
@@ -707,15 +883,73 @@ impl CallgraphView {
         self.source.extraction_count()
     }
 
+    #[cfg(test)]
+    pub(crate) fn retry_due_for_test(&self) {
+        if let Some((deadline, _)) = &mut self.query.lock().unwrap().pending {
+            *deadline = std::time::Instant::now();
+        }
+    }
+
     /// Acquires a reader pinned to one verified generation. Acquisitions are
     /// serialized so an installed membership and its graph come from the
     /// same reconciliation.
     pub(crate) fn reader(&self) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError> {
-        let _query = self
+        self.reader_with_clock(std::time::Instant::now)
+    }
+
+    fn reader_with_clock(
+        &self,
+        now: impl Fn() -> std::time::Instant,
+    ) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError> {
+        if !(self.current)() {
+            return Err(CallgraphViewError {
+                reason: "checkout is no longer bound to this generation".into(),
+                busy: true,
+                completion_busy: false,
+            });
+        }
+        if self
+            .legacy_import
+            .as_ref()
+            .is_some_and(|job| job.is_building())
+        {
+            return Err(CallgraphViewError {
+                reason: "legacy text and symbol import building".into(),
+                busy: true,
+                completion_busy: false,
+            });
+        }
+        let mut retry = self
             .query
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let result = self.source.acquire();
+        let mut steady = self
+            .steady
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let (Some((revision, store)), Some(current)) =
+            (steady.as_ref(), self.source.steady_revision())
+        {
+            if *revision == current {
+                self.ready.store(true, std::sync::atomic::Ordering::Release);
+                return Ok(store.clone());
+            }
+        }
+        let result = retry.run(
+            now,
+            |error| error.busy,
+            || {
+                #[cfg(test)]
+                self.acquisitions
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.source.acquire_with_revision()
+            },
+        );
+        *steady = match &result {
+            Ok((store, Some(revision))) => Some((*revision, store.clone())),
+            _ => None,
+        };
+        let result = result.map(|(store, _)| store);
         self.ready
             .store(result.is_ok(), std::sync::atomic::Ordering::Release);
         result
@@ -742,6 +976,28 @@ fn error(reason: impl std::fmt::Display) -> PlaneError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn packed_attachment_retires_payload_for_every_snapshot_clone() {
+        let source = b"fn target() {} fn caller() { target(); }";
+        let mut entry = super::LiveEntry::new(super::DiskState::of_bytes(source), 0);
+        let attachment = super::attach(&mut entry, source, "rust").unwrap();
+        let clone = attachment.clone();
+        let bytes = attachment.payload().unwrap();
+        let expected = super::CallgraphBlob::extract(
+            std::str::from_utf8(source).unwrap(),
+            "rust",
+            super::PRODUCER,
+        )
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+        assert_eq!(bytes.as_ref(), expected);
+        let weak = std::sync::Arc::downgrade(&bytes);
+        attachment.retire();
+        assert!(clone.payload().is_none());
+        drop(bytes);
+        assert!(weak.upgrade().is_none());
+    }
     use super::*;
 
     const FILES: &[(&str, &str)] = &[
@@ -790,6 +1046,55 @@ mod tests {
         super::super::donor::events_under(dir)
     }
 
+    /// With a steady watcher subscription and nothing recorded since the last
+    /// verified bind, a query reuses that bind's reader instead of binding
+    /// again. A recorded change, or a watcher gap that hides an edit, makes
+    /// the next query bind, and the gap's bind finds the unreported edit.
+    #[test]
+    fn steady_checkout_reuses_its_reader_until_a_change_or_gap() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let root = checkout(&temp.path().join("checkout"));
+        let _watcher = crate::watcher_backend::subscription::start(
+            &root,
+            crate::watcher_backend::InitialCoverage::Complete,
+        );
+        let graph = view(&root, &storage);
+        assert_eq!(callers(&graph.reader().unwrap(), "a.ts", "target").len(), 1);
+        assert_eq!(callers(&graph.reader().unwrap(), "a.ts", "target").len(), 1);
+        assert_eq!(
+            graph.acquisitions.load(Relaxed),
+            1,
+            "an unchanged steady checkout must not bind again"
+        );
+
+        let added = root.join("c.ts");
+        std::fs::write(
+            &added,
+            "import { caller } from './b';\nexport function top() { return caller(); }\n",
+        )
+        .unwrap();
+        graph.record_change(&added);
+        assert_eq!(callers(&graph.reader().unwrap(), "b.ts", "caller").len(), 1);
+        assert_eq!(
+            graph.acquisitions.load(Relaxed),
+            2,
+            "a recorded change binds"
+        );
+
+        // Nobody reports this edit; only the gap's strict bind can find it.
+        std::fs::write(
+            root.join("d.ts"),
+            "import { top } from './c';\nexport function deeper() { return top(); }\n",
+        )
+        .unwrap();
+        crate::watcher_backend::subscription::gap(&root);
+        assert_eq!(callers(&graph.reader().unwrap(), "c.ts", "top").len(), 1);
+        assert_eq!(graph.acquisitions.load(Relaxed), 3, "a watcher gap binds");
+    }
+
     #[test]
     fn v3_checkpoint_contention_reaches_checkout_reader_as_busy() {
         use crate::blob_store::v3;
@@ -832,6 +1137,7 @@ mod tests {
         );
         blocker.execute_batch("ROLLBACK").unwrap();
         drop(blocker);
+        graph.retry_due_for_test();
         assert_eq!(callers(&graph.reader().unwrap(), "b.ts", "caller").len(), 1);
     }
 
@@ -937,6 +1243,20 @@ mod tests {
     }
 
     #[test]
+    fn base_completion_refusal_is_not_live_owner_contention() {
+        let error = CallgraphViewError::from(PlaneError::loader(
+            super::super::contracts::LoaderStage::Driver,
+            format!("{V3_BASE_COMPLETION_BUSY}: CapReached {{ live_bases: 4 }}"),
+        ));
+        assert!(!error.busy);
+        assert!(!error.completion_busy);
+        assert!(matches!(
+            crate::context::checkout_view_callgraph_access(Some(Err(error))),
+            crate::context::CallgraphStoreAccess::Error(_)
+        ));
+    }
+
+    #[test]
     fn v3_base_completion_owned_by_another_driver_answers_building_then_ready() {
         use super::super::base_builder::{build_base, BaseBuild, BaseBuildInput};
         use super::super::eviction::DiskBudget;
@@ -960,7 +1280,12 @@ mod tests {
                 },
                 semantic_producer: None,
                 callgraph_producer: PRODUCER.into(),
-                ignore_fingerprint: None,
+                ignore_fingerprint: Some(
+                    super::super::verification::BindGuard::capture(&root, None)
+                        .unwrap()
+                        .policy
+                        .base_digest,
+                ),
                 history: None,
                 budget: DiskBudget::default(),
             },
@@ -977,10 +1302,9 @@ mod tests {
             _ => panic!("the live base owner must fence another completion driver"),
         };
         assert_eq!(owner_pid, std::process::id());
-        let error = CallgraphViewError::from(PlaneError::loader(
-            super::super::contracts::LoaderStage::Driver,
-            format!("{V3_BASE_COMPLETION_BUSY}: {outcome:?}"),
-        ));
+        let graph = view(&root, &storage);
+        let mut now = std::time::Instant::now();
+        let error = graph.reader_with_clock(|| now).unwrap_err();
         assert!(error.busy, "{error}");
         assert!(error.reason.contains(V3_BASE_COMPLETION_BUSY), "{error}");
         assert!(
@@ -989,20 +1313,547 @@ mod tests {
                 .contains(&format!("owner_pid: {}", std::process::id())),
             "{error}"
         );
+        assert!(!graph.is_ready());
         assert!(matches!(
             crate::context::checkout_view_callgraph_access(Some(Err(error))),
-            crate::context::CallgraphStoreAccess::Error(error)
-                if error.is_transient_lock_contention()
+            crate::context::CallgraphStoreAccess::Building
         ));
 
+        for (attempt, seconds) in [1, 2, 4, 8, 16, 30, 30].into_iter().enumerate() {
+            let deadline = now + std::time::Duration::from_secs(seconds);
+            assert_eq!(
+                graph.query.lock().unwrap().pending.as_ref().unwrap().0,
+                deadline
+            );
+            assert!(graph
+                .reader_with_clock(|| deadline - std::time::Duration::from_nanos(1))
+                .is_err());
+            assert_eq!(
+                graph.query.lock().unwrap().pending.as_ref().unwrap().0,
+                deadline
+            );
+            now = deadline;
+            if attempt < 6 {
+                assert!(matches!(
+                    crate::context::checkout_view_callgraph_access(Some(
+                        graph.reader_with_clock(|| now)
+                    )),
+                    crate::context::CallgraphStoreAccess::Building
+                ));
+            }
+        }
+
         claim.release().unwrap();
-        let graph = view(&root, &storage);
         let crate::context::CallgraphStoreAccess::Ready(ready) =
-            crate::context::checkout_view_callgraph_access(Some(graph.reader()))
+            crate::context::checkout_view_callgraph_access(Some(graph.reader_with_clock(|| now)))
         else {
             panic!("the completed base must serve a ready call graph")
         };
         assert_eq!(callers(&ready, "a.ts", "target").len(), 1);
+        assert!(graph.is_ready());
+        assert!(graph.query.lock().unwrap().pending.is_none());
+        assert!(graph.query.lock().unwrap().delay.is_zero());
+    }
+
+    #[test]
+    fn failed_base_completion_releases_claim_for_callgraph() {
+        use super::super::first_load::{
+            CallgraphBridge, CheckoutDriver, CompositePlane, ConfiguredMembershipWalker,
+            TrigramBridge,
+        };
+
+        struct FailedCompletion(CallgraphBridge);
+        impl CompositePlane for FailedCompletion {
+            fn plane(&self) -> FamilyPlane {
+                FamilyPlane::Callgraph
+            }
+            fn applies_to(&self, path: &RelPath) -> bool {
+                self.0.applies_to(path)
+            }
+            fn attachment(
+                &self,
+                path: &RelPath,
+                bytes: &[u8],
+            ) -> Result<super::super::snapshot::PlaneAttachment, PlaneError> {
+                self.0.attachment(path, bytes)
+            }
+            fn completes_fresh_base(&self) -> bool {
+                true
+            }
+            fn complete_v3_base(
+                &self,
+                _: &super::super::base_builder::BuildClaim,
+                _: &BTreeMap<RelPath, super::super::snapshot::LiveEntry>,
+            ) -> Result<(), PlaneError> {
+                Err(PlaneError::loader(
+                    super::super::contracts::LoaderStage::Driver,
+                    "injected base completion failure",
+                ))
+            }
+            fn materialize(
+                &self,
+                _: &super::super::registry::ViewRegistration,
+                _: &str,
+                _: &Snapshot,
+                _: &BTreeMap<RelPath, super::super::snapshot::LiveEntry>,
+                _: &mut super::super::manifest_v2::ManifestV2,
+                _: &mut crate::pins::LivePin,
+                _: bool,
+            ) -> Result<(), PlaneError> {
+                unreachable!("completion fails before worker materialization")
+            }
+            fn finish_generation(
+                &self,
+                _: &super::super::registry::ViewRegistration,
+                _: &str,
+                _: &str,
+            ) -> Result<(), PlaneError> {
+                unreachable!("completion fails before worker publication")
+            }
+        }
+
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let root = checkout(&temp.path().join("checkout"));
+        let storage = temp.path().join("storage");
+        let policy = crate::blob_store::v2::TrigramPolicy {
+            max_file_size: 1 << 20,
+        };
+        let failed = CheckoutDriver::new_v3(
+            &storage,
+            "donor-reuse",
+            "failed-callgraph",
+            &root,
+            super::super::manifest_v2::Producers {
+                trigram: policy.fingerprint_hex(),
+                semantic: None,
+                callgraph: PRODUCER.into(),
+            },
+            Arc::new(ConfiguredMembershipWalker),
+            vec![
+                Arc::new(TrigramBridge::new(storage.clone(), policy)),
+                Arc::new(FailedCompletion(CallgraphBridge::default())),
+            ],
+        )
+        .unwrap();
+        let error = failed
+            .verified_bind(
+                &failed.access(),
+                failed.installed_snapshot().generation().clone(),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected base completion failure"),
+            "{error}"
+        );
+
+        // Keep the failed completion driver alive: its process is still live, so
+        // another driver can finish the graph only if the failed bind released
+        // its completion claim rather than waiting for process-death takeover.
+        let graph = view(&root, &storage);
+        let ready = graph
+            .reader()
+            .expect("a failed bind must not strand a live claim");
+        assert_eq!(callers(&ready, "a.ts", "target").len(), 1);
+        assert_eq!(failed.installed_snapshot().generation().name(), "empty");
+    }
+
+    /// Runs a setup Git command with a fixed identity, so commits work on a
+    /// machine without one configured.
+    fn setup_git(root: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(root)
+            .args([
+                "-c",
+                "user.name=aft-test",
+                "-c",
+                "user.email=aft-test@example.invalid",
+                "-c",
+                "init.defaultBranch=main",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// `views.callgraph_copies`: a worktree past the limit borrows the main
+    /// checkout's graph while every copy is in use, and takes the place of a
+    /// copy once that copy's checkout lets go of it. A limit of 0 always
+    /// borrows, and a worktree whose files equal the main checkout's graph
+    /// borrows without counting, even under the limit.
+    #[test]
+    fn callgraph_copies_limit_borrows_when_full_and_evicts_an_idle_copy() {
+        use super::super::callgraph_copies::{self, Admission};
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let main = checkout(&temp.path().join("main"));
+        setup_git(&main, &["init", "-q"]);
+        setup_git(&main, &["config", "core.autocrlf", "false"]);
+        setup_git(&main, &["add", "-A"]);
+        setup_git(&main, &["commit", "-q", "-m", "fixture"]);
+        let worktree = |name: &str, edit: bool| {
+            let path = temp.path().join(name);
+            setup_git(
+                &main,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "--detach",
+                    path.to_str().unwrap(),
+                    "HEAD",
+                ],
+            );
+            let path = std::fs::canonicalize(&path).unwrap();
+            if edit {
+                std::fs::write(
+                    path.join("c.ts"),
+                    format!("export function {name}() {{ return 1; }}\n"),
+                )
+                .unwrap();
+            }
+            path
+        };
+        let first = worktree("first", true);
+        let second = worktree("second", true);
+        let clean = worktree("clean", false);
+        let policy = crate::blob_store::v2::TrigramPolicy {
+            max_file_size: 1 << 20,
+        };
+        let family = "donor-reuse";
+        let paths = crate::root_cache::StoragePaths::same(&storage);
+        let admit = |root: &Path, copies| {
+            callgraph_copies::admit(&paths, family, policy, root, copies, || None).unwrap()
+        };
+        let main_scope = view_scope(&main);
+        let borrow_main = Admission::Borrow {
+            root: main.clone(),
+            scope: main_scope.clone(),
+        };
+
+        let main_view = view(&main, &storage);
+        main_view.reader().unwrap();
+        assert_eq!(
+            admit(&main, 0),
+            Admission::Own,
+            "the main checkout always owns"
+        );
+        assert_eq!(admit(&first, 1), Admission::Own);
+        let first_view = view(&first, &storage);
+        first_view.reader().unwrap();
+        assert_eq!(
+            admit(&first, 1),
+            Admission::Own,
+            "a copy already held stays owned"
+        );
+
+        // `first` holds the one copy and is in use: `second` borrows.
+        assert_eq!(admit(&second, 1), borrow_main);
+        assert_eq!(admit(&second, 0), borrow_main);
+        let (borrowed, _) =
+            callgraph_copies::open_published(&storage, family, policy, &main_scope, &second)
+                .unwrap();
+        assert_eq!(
+            callers(&borrowed, "a.ts", "target"),
+            callers(&main_view.reader().unwrap(), "a.ts", "target"),
+        );
+        drop(borrowed);
+
+        // Identical files borrow without taking one of five free copies.
+        let identities = || {
+            Some(
+                FILES
+                    .iter()
+                    .map(|(name, text)| {
+                        (
+                            (*name).to_owned(),
+                            (
+                                text.len() as u64,
+                                crate::views::io::source_hash(text.as_bytes()),
+                            ),
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        // A views graph stores call-graph blob keys, not source hashes, so the
+        // comparison must map source hashes to keys: without the mapping
+        // identical files look different, with it only real edits differ.
+        let (store, _) =
+            callgraph_copies::open_published(&storage, family, policy, &main_scope, &clean)
+                .unwrap();
+        let graph = store.file_identities().unwrap();
+        let compare = |root: &Path, checkout, key: bool| {
+            crate::commands::callgraph_borrowed::compare_with_graph(
+                &graph,
+                callgraph_inputs(checkout),
+                root,
+                Some(&main),
+                64,
+                key.then_some(
+                    &crate::commands::callgraph_borrowed::views_graph_key
+                        as &dyn Fn(&str, blake3::Hash) -> Option<blake3::Hash>,
+                ),
+            )
+        };
+        let unmapped = compare(&clean, identities().unwrap(), false);
+        assert_eq!(unmapped.files, ["a.ts", "b.ts"]);
+        let mapped = compare(&clean, identities().unwrap(), true);
+        assert!(mapped.complete && mapped.files.is_empty(), "{mapped:?}");
+        let second_files = ["a.ts", "b.ts", "c.ts", "package.json", "notes.md"]
+            .into_iter()
+            .map(|name| {
+                let bytes = std::fs::read(second.join(name)).unwrap();
+                (
+                    name.to_owned(),
+                    (bytes.len() as u64, crate::views::io::source_hash(&bytes)),
+                )
+            })
+            .collect();
+        let edited = compare(&second, second_files, true);
+        assert_eq!(edited.files, ["c.ts"], "{edited:?}");
+        drop(store);
+        assert_eq!(
+            callgraph_copies::admit(&paths, family, policy, &clean, 5, identities).unwrap(),
+            borrow_main,
+        );
+
+        // Once `first` lets go of its view its copy is idle, and `second`
+        // evicts it to build its own.
+        let first_dir =
+            crate::blob_store::v3::view_dir(&storage, family, &view_scope(&first)).unwrap();
+        assert!(first_dir.exists());
+        drop(first_view);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut admission = admit(&second, 1);
+        while admission != Admission::Own && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            admission = admit(&second, 1);
+        }
+        assert_eq!(admission, Admission::Own, "the idle copy was not evicted");
+        assert!(
+            !first_dir.exists(),
+            "the evicted copy's view directory remains"
+        );
+    }
+
+    /// A linked worktree at the commit the main checkout already built has the
+    /// same files, so it must resolve the main checkout's base and clone its
+    /// sealed donor, parsing nothing. Base identity once hashed the policy
+    /// inputs' absolute paths and Git's config origins (`.git/config` in a
+    /// main checkout, an absolute path in a linked worktree), so every
+    /// checkout built a full base of its own. It also once hashed ignore
+    /// files, so a self-ignoring file a tool writes into the main checkout
+    /// only (OpenCode's `.opencode/.gitignore` is one) split the bases too.
+    #[test]
+    fn linked_worktree_at_the_same_commit_shares_the_base_and_its_donor() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let main = checkout(&temp.path().join("main"));
+        std::fs::write(main.join(".gitignore"), "dist/\n").unwrap();
+        setup_git(&main, &["init", "-q"]);
+        // Windows runners set core.autocrlf, which would check the linked
+        // worktree out with CRLF line endings: different bytes, so not the
+        // same commit's content as the main checkout's LF files.
+        setup_git(&main, &["config", "core.autocrlf", "false"]);
+        setup_git(&main, &["add", "-A"]);
+        setup_git(&main, &["commit", "-q", "-m", "fixture"]);
+        // Shared by every checkout of the repository.
+        std::fs::write(main.join(".git/info/exclude"), "scratch/\n").unwrap();
+        // A tool's folder that ignores itself, present in the main checkout
+        // only. It changes no member, so it must not change the base.
+        std::fs::create_dir(main.join(".tool")).unwrap();
+        std::fs::write(main.join(".tool/.gitignore"), "*\n").unwrap();
+        let linked = temp.path().join("linked");
+        setup_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let linked = std::fs::canonicalize(&linked).unwrap();
+
+        let main_view = view(&main, &storage);
+        let main_store = main_view.reader().unwrap();
+        assert_eq!(callers(&main_store, "a.ts", "target").len(), 1);
+        assert!(
+            main_view.extraction_count() > 0,
+            "the main checkout builds the base"
+        );
+
+        let linked_view = view(&linked, &storage);
+        let linked_store = linked_view.reader().unwrap();
+        assert_eq!(
+            callers(&linked_store, "a.ts", "target"),
+            callers(&main_store, "a.ts", "target")
+        );
+        assert_eq!(
+            linked_view.extraction_count(),
+            0,
+            "the linked worktree built its own base instead of sharing the main checkout's"
+        );
+        let producers = super::super::manifest_v2::Producers {
+            trigram: crate::blob_store::v2::TrigramPolicy {
+                max_file_size: 1 << 20,
+            }
+            .fingerprint_hex(),
+            semantic: None,
+            callgraph: PRODUCER.into(),
+        };
+        let base_of = |root: &Path| {
+            super::super::base_refs::open_foreign_v3(
+                &storage,
+                "donor-reuse",
+                &view_scope(root),
+                &producers,
+            )
+            .unwrap()
+            .unwrap()
+            .base_header()
+            .unwrap()
+            .scope
+            .clone()
+        };
+        assert_eq!(base_of(&linked), base_of(&main));
+        assert!(matches!(
+            events(
+                &crate::blob_store::v3::view_dir(&storage, "donor-reuse", &view_scope(&linked))
+                    .unwrap()
+            )
+            .as_slice(),
+            [super::super::donor::DonorEvent::Cloned(_)]
+        ));
+
+        // Ignore rules stay out of the base policy, but they still change the
+        // checkout's own location-bound digest that saved file stats check.
+        // Attribute sources still change the base policy: they can change
+        // how a member's bytes are interpreted without changing its content.
+        let policy = |root: &Path| {
+            super::super::verification::BindGuard::capture(root, None)
+                .unwrap()
+                .policy
+        };
+        assert_eq!(policy(&main).base_digest, policy(&linked).base_digest);
+        let before = policy(&linked);
+        std::fs::create_dir(linked.join(".tool")).unwrap();
+        std::fs::write(linked.join(".tool/.gitignore"), "other\n").unwrap();
+        let ignored = policy(&linked);
+        assert_eq!(ignored.base_digest, before.base_digest);
+        assert_ne!(ignored.digest, before.digest);
+        std::fs::write(linked.join(".gitattributes"), "*.ts text eol=crlf\n").unwrap();
+        assert_ne!(policy(&linked).base_digest, before.base_digest);
+    }
+
+    /// A worktree at another commit is another base. Its graph must start as
+    /// a clone of the sealed graph of the base it nearly equals, patched with
+    /// the difference, and answer exactly what a cold build of that commit
+    /// answers. Before, every commit's base resolved the whole graph again.
+    #[test]
+    fn a_new_commits_base_starts_from_the_nearest_sealed_base() {
+        use super::super::donor::DonorEvent;
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let main = checkout(&temp.path().join("main"));
+        setup_git(&main, &["init", "-q"]);
+        setup_git(&main, &["config", "core.autocrlf", "false"]);
+        setup_git(&main, &["add", "-A"]);
+        setup_git(&main, &["commit", "-q", "-m", "fixture"]);
+        let linked = temp.path().join("linked");
+        setup_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let linked = std::fs::canonicalize(&linked).unwrap();
+        // The worktree moves to its own commit with one more caller.
+        std::fs::write(
+            linked.join("c.ts"),
+            "import { target } from './a';\nexport function third() { return target(); }\n",
+        )
+        .unwrap();
+        setup_git(&linked, &["add", "-A"]);
+        setup_git(&linked, &["commit", "-q", "-m", "next"]);
+
+        let producers = super::super::manifest_v2::Producers {
+            trigram: crate::blob_store::v2::TrigramPolicy {
+                max_file_size: 1 << 20,
+            }
+            .fingerprint_hex(),
+            semantic: None,
+            callgraph: PRODUCER.into(),
+        };
+        let base_dir = |storage: &Path, root: &Path| {
+            let scope = super::super::base_refs::open_foreign_v3(
+                storage,
+                "donor-reuse",
+                &view_scope(root),
+                &producers,
+            )
+            .unwrap()
+            .unwrap()
+            .base_header()
+            .unwrap()
+            .scope
+            .clone();
+            crate::blob_store::v3::view_dir(storage, "donor-reuse", &scope).unwrap()
+        };
+
+        // Shared storage: main's base is built and sealed first.
+        let storage = temp.path().join("storage");
+        let main_view = view(&main, &storage);
+        assert_eq!(
+            callers(&main_view.reader().unwrap(), "a.ts", "target").len(),
+            1
+        );
+        let linked_view = view(&linked, &storage);
+        let patched = callers(&linked_view.reader().unwrap(), "a.ts", "target");
+        assert_eq!(patched.len(), 2, "{patched:?}");
+        assert_ne!(base_dir(&storage, &linked), base_dir(&storage, &main));
+        let base_events = events(&base_dir(&storage, &linked));
+        assert!(
+            base_events
+                .iter()
+                .any(|event| matches!(event, DonorEvent::Cloned(_))),
+            "the new commit's base resolved its whole graph cold: {base_events:?}"
+        );
+        assert!(
+            base_events.contains(&DonorEvent::Sealed),
+            "the patched base graph must still be sealed: {base_events:?}"
+        );
+
+        // A store with only the worktree builds the same base cold.
+        drop((main_view, linked_view));
+        let cold_storage = temp.path().join("cold-storage");
+        let cold_view = view(&linked, &cold_storage);
+        assert_eq!(
+            callers(&cold_view.reader().unwrap(), "a.ts", "target"),
+            patched
+        );
+        assert!(!events(&base_dir(&cold_storage, &linked))
+            .iter()
+            .any(|event| matches!(event, DonorEvent::Cloned(_))));
     }
 
     #[test]
