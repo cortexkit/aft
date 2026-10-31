@@ -40,13 +40,19 @@ fn confined_aft_child() {
         .unwrap();
     // Shared-library and /proc access let the daemon load, copy its running
     // executable and check process identity, without reading storage ancestors.
-    for path in ["/lib", "/lib64", "/usr/lib", "/usr/lib64", "/proc"] {
+    for path in ["/lib", "/lib64", "/usr/lib", "/usr/lib64"] {
         if Path::new(path).exists() {
             ruleset = ruleset
-                .add_rule(PathBeneath::new(PathFd::new(path).unwrap(), read))
+                .add_rule(PathBeneath::new(
+                    PathFd::new(path).unwrap(),
+                    read | AccessFs::Execute,
+                ))
                 .unwrap();
         }
     }
+    ruleset = ruleset
+        .add_rule(PathBeneath::new(PathFd::new("/proc").unwrap(), read))
+        .unwrap();
     for path in ["/etc/ld.so.cache", "/dev/null"] {
         if Path::new(path).exists() {
             ruleset = ruleset
