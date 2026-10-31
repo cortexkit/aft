@@ -109,6 +109,7 @@ import {
   piHashlineDowngrade,
   piHashlineEffective,
   refreshPiRevisionReadTools,
+  registerAftBinding,
   registerLatePowershellTool,
   registerPiToolSurface,
   reregisterBashTool,
@@ -954,6 +955,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
   ctx.ompRouter = await loadOmpInternalUrlRouter(pi);
   registerPiToolSurface(pi, ctx, surface);
+  // AFT interop contract v1 (OMP only; see registerAftBinding): installed
+  // here, at factory setup, so load order relative to consumer extensions
+  // never matters.
+  registerAftBinding(pi, ctx);
 
   // Pi binds its live tool registry after extension factories run. A modern Pi
   // can therefore reveal that its optional built-in PowerShell tool is active

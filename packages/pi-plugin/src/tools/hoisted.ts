@@ -196,7 +196,7 @@ async function searchPathExists(cwd: string, target: string): Promise<boolean> {
   }
 }
 
-async function splitSearchPathArg(cwd: string, raw: string): Promise<SearchPathArgSplit> {
+export async function splitSearchPathArg(cwd: string, raw: string): Promise<SearchPathArgSplit> {
   if ((await searchPathExists(cwd, raw)) || !/\s/.test(raw)) {
     return { paths: [raw], missing: [] };
   }
