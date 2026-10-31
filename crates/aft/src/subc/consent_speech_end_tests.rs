@@ -18,7 +18,9 @@ impl ScopeEndControl {
             pending.clone(),
             HELLO_CORR + 1,
         ));
-        Arc::get_mut(&mut run.0).unwrap().run_scope = OnceLock::new();
+        let identity = Arc::get_mut(&mut run.0).unwrap();
+        identity.scope.as_mut().unwrap().expires_at_ms = Some(ledger::now_ms() as u64 + 120_000);
+        identity.run_scope = OnceLock::new();
         let runs = Arc::new(run_scope::RunScopes::new(control.clone()));
         runs.bind(run).unwrap();
         let frame = Frame::build(
@@ -61,10 +63,17 @@ impl ScopeEndControl {
     }
 
     async fn next(&mut self) -> WriterFrame {
-        tokio::time::timeout(Duration::from_secs(10), self.frames.recv())
+        let frame = tokio::time::timeout(Duration::from_secs(10), self.frames.recv())
             .await
             .unwrap()
-            .unwrap()
+            .unwrap();
+        assert_eq!(
+            frame.header.ty,
+            FrameType::Request,
+            "{}",
+            String::from_utf8_lossy(&frame.body)
+        );
+        frame
     }
 
     fn reply(
