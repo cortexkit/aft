@@ -1768,6 +1768,7 @@ pub(crate) mod perf_tests;
 #[cfg(test)]
 pub(crate) mod position_identity_tests;
 mod refresh_wal;
+mod rust_manifest;
 pub use dead_code_projection::project_dead_code_snapshot;
 pub(crate) use dead_code_projection::{
     project_dead_code_snapshot_from_view, project_dead_code_snapshot_incremental_with_costs,
@@ -8434,6 +8435,11 @@ impl CallGraphStore {
         // counts as files or extrapolate its duration from extraction's rate.
         crate::cold_build_limiter::progress::phase("resolving", None);
         let workspace_crate_prefixes = WorkspaceCratePrefixCache::default();
+        let rust_manifest_inputs = rust_manifest::Inputs::build(&self.project_root);
+        let _ = workspace_crate_prefixes
+            .0
+            .set(rust_manifest_inputs.prefixes.clone().into_iter().collect());
+        rust_manifest_inputs.store(&conn)?;
         // Resolver lookups are shared by every caller and window: their inputs
         // are final once extraction ends (see `DiskProjectIndex`).
         let index_memos = DiskIndexMemos::default();
@@ -8932,24 +8938,42 @@ impl CallGraphStore {
             }
             resolution_importers = importers;
         }
-        // Cargo manifests control crate names, source roots and workspace
-        // membership. Re-resolve unchanged Rust callers when those inputs move.
-        if deleted
+        // Compare committed resolver inputs, not manifest bytes. A branch switch
+        // or dependency bump usually leaves every Rust binding unchanged.
+        let rust_manifest_inputs = if deleted
             .iter()
             .chain(changed_extracts.keys())
             .any(|path| invalidates_workspace_crate_prefix_cache(Path::new(path)))
         {
-            for caller in stored_rust_files(&conn)? {
+            let inputs = rust_manifest::Inputs::build(&self.project_root);
+            let previous = rust_manifest::Inputs::load(&conn)?;
+            let (importers, barrels) = inputs.affected_callers(&conn, previous.as_ref())?;
+            let _ = workspace_crate_prefixes
+                .0
+                .set(inputs.prefixes.clone().into_iter().collect());
+            for caller in importers {
                 if deleted.contains(&caller) {
                     continue;
                 }
+                resolution_importers.insert(caller.clone());
                 record_dependent_refs(
                     &mut selected_ref_ids,
                     &mut selected_refs_by_caller,
                     all_refs_of_caller(&conn, &caller)?,
                 );
             }
-        }
+            for barrel in barrels {
+                record_dependent_refs(
+                    &mut selected_ref_ids,
+                    &mut selected_refs_by_caller,
+                    ref_ids_depending_on(&conn, &self.project_root, &barrel, None, &memo)?,
+                );
+                surface_changes.push((barrel, None));
+            }
+            Some(inputs)
+        } else {
+            None
+        };
         // Time only the created-file scan here; the configuration selection
         // above belongs to dependency selection, which `started` still covers.
         let created_started = Instant::now();
@@ -9068,6 +9092,9 @@ impl CallGraphStore {
         conn.configure_refresh_wal()?;
         self.refresh_wal.lock().unwrap().before_begin(&conn);
         let tx = conn.transaction()?;
+        if let Some(inputs) = &rust_manifest_inputs {
+            inputs.store(&tx)?;
+        }
         #[cfg(test)]
         {
             let payload_bytes =
@@ -18029,6 +18056,14 @@ fn build_workspace_crate_prefixes(
     project_root: &Path,
     facts: &FactPaths<'_>,
 ) -> HashMap<String, String> {
+    build_workspace_crate_prefixes_with_manifests(project_root, facts, |_| {})
+}
+
+fn build_workspace_crate_prefixes_with_manifests(
+    project_root: &Path,
+    facts: &FactPaths<'_>,
+    mut visit_manifest: impl FnMut(&Path),
+) -> HashMap<String, String> {
     note_workspace_crate_prefix_build(project_root);
     let mut prefixes = HashMap::new();
     let mut stack = vec![project_root.to_path_buf()];
@@ -18039,6 +18074,7 @@ fn build_workspace_crate_prefixes(
         }
         let manifest = dir.join("Cargo.toml");
         if facts.is_file(&manifest) {
+            visit_manifest(&manifest);
             let crate_names = rust_manifest_crate_names(&manifest, facts);
             if !crate_names.is_empty() {
                 let src_prefix = relative_path(
