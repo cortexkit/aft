@@ -24,6 +24,18 @@ use tokio::sync::oneshot;
 use crate::lock_diagnostics::{LockDiagnostics, TrackedMutex};
 use crate::{context::AppContext, path_identity::ProjectRootId, protocol::Response};
 
+// Mutation lock order: the executor's per-root mutating lane and context epoch
+// gate precede source-file admission, then backup and checkpoint locks. Never
+// wait for source-file admission while holding a backup/checkpoint lock. The
+// scheduler mutex is not held by handlers.
+// Multi-file writers admit their complete set in one registry turn, sorted by
+// resolved names with native identities covering hard-link aliases; they never
+// hold one file while waiting for another. A patch (and a symbol move) may keep
+// not-yet-written files admitted during earlier hunks' formatter runs, bounded
+// by formatter timeouts. Completed files are released after their last write
+// or delete, before their formatter/LSP waits. Single-file writers release
+// admission immediately after the atomic write, before formatting/validation.
+
 pub use single_flight::SingleFlight;
 
 const JOB_COST: isize = 1;
