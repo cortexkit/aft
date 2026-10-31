@@ -1376,6 +1376,8 @@ pub(crate) struct RegistryInner {
     #[cfg(test)]
     reclaim_kill_attempts: AtomicUsize,
     #[cfg(test)]
+    completion_processing_attempts: AtomicUsize,
+    #[cfg(test)]
     reclaim_kill_noop: AtomicBool,
     /// Finished tasks whose scratch directory is kept on disk until its
     /// delete time, keyed by task id. See `scratch_retention`.
@@ -2010,6 +2012,8 @@ impl BgTaskRegistry {
                 watchdog_tasks: Mutex::new(HashMap::new()),
                 #[cfg(test)]
                 reclaim_kill_attempts: AtomicUsize::new(0),
+                #[cfg(test)]
+                completion_processing_attempts: AtomicUsize::new(0),
                 #[cfg(test)]
                 reclaim_kill_noop: AtomicBool::new(false),
                 retained_scratch: Mutex::new(HashMap::new()),
@@ -14014,6 +14018,11 @@ impl BgTaskRegistry {
             NoticeTarget::Nowhere => return,
         }
 
+        #[cfg(test)]
+        self.inner
+            .completion_processing_attempts
+            .fetch_add(1, Ordering::SeqCst);
+
         let owned_buffer = if buffer.is_none() && metadata.mode != BgMode::Pty {
             paths.map(|paths| BgBuffer::registered(paths, BgMode::Pipes))
         } else {
@@ -17843,6 +17852,55 @@ mod tests {
             assert_eq!(counts.original_tokens, None);
             assert_eq!(counts.compressed_tokens, None);
         }
+    }
+
+    #[test]
+    fn completion_missing_token_counts_only_warn_when_expected() {
+        let registry = BgTaskRegistry::default();
+        let mut metadata = PersistedTask::starting(
+            "bash-0000000000000100".into(),
+            "session".into(),
+            "true".into(),
+            PathBuf::from("."),
+            None,
+            None,
+            true,
+            false,
+        );
+        for (status, policy, level) in [
+            (BgTaskStatus::Killed, CompletionTokenPolicy::Count, "DEBUG "),
+            (
+                BgTaskStatus::TimedOut,
+                CompletionTokenPolicy::Count,
+                "DEBUG ",
+            ),
+            (BgTaskStatus::Failed, CompletionTokenPolicy::Skip, "DEBUG "),
+            (
+                BgTaskStatus::Completed,
+                CompletionTokenPolicy::Skip,
+                "DEBUG ",
+            ),
+            (
+                BgTaskStatus::Completed,
+                CompletionTokenPolicy::Count,
+                "WARN ",
+            ),
+        ] {
+            metadata.status = status;
+            let counts = registry.completion_token_counts(&metadata, None, None, None, policy);
+            let (_, lines) = crate::logging::capture_log_lines(|| {
+                registry.record_compression_event_if_applicable(&metadata, &counts);
+            });
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(lines[0].starts_with(level), "{lines:?}");
+        }
+
+        let counts = completion_counts_for_text("raw", None, |_| None);
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            registry.record_compression_event_if_applicable(&metadata, &counts);
+        });
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("WARN "), "{lines:?}");
     }
 
     #[test]

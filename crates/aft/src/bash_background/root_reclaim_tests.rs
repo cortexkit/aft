@@ -65,6 +65,36 @@ pub(crate) fn kill_attempts(registry: &BgTaskRegistry) -> usize {
     registry.inner.reclaim_kill_attempts.load(Ordering::SeqCst)
 }
 
+pub(crate) fn completion_attempts(registry: &BgTaskRegistry) -> usize {
+    registry
+        .inner
+        .completion_processing_attempts
+        .load(Ordering::SeqCst)
+}
+
+pub(crate) fn deliver_terminal_and_remove_output(registry: &BgTaskRegistry, id: &str) {
+    let task = registry.task_for_session(id, "reclaim").unwrap();
+    fs::write(&task.paths.stdout, "finished\n").unwrap();
+    fs::write(&task.paths.stderr, "").unwrap();
+    registry.post_terminal_transition(&task, true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !registry
+        .pending_completions_for_session("reclaim")
+        .iter()
+        .any(|completion| completion.task_id == id)
+    {
+        assert!(Instant::now() < deadline, "completion was not published");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        registry.ack_completions_for_session(Some("reclaim"), &[id.into()]),
+        vec![id.to_string()]
+    );
+    assert!(task.lock_state().unwrap().metadata.completion_delivered);
+    fs::remove_file(&task.paths.stdout).unwrap();
+    fs::remove_file(&task.paths.stderr).unwrap();
+}
+
 pub(crate) struct OwnedGroup(pub(crate) std::process::Child);
 
 impl OwnedGroup {

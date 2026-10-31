@@ -90,6 +90,58 @@ impl ReclaimFixture {
 }
 
 #[test]
+fn deleted_root_delivered_completions_settle_once_after_descendants_exit() {
+    let mut fixture = ReclaimFixture::new();
+    let registry = fixture.ctx.bash_background().clone();
+    registry.set_harness(crate::harness::Harness::Opencode);
+    let db = Arc::new(std::sync::Mutex::new(
+        crate::db::open(&fixture.storage.path().join("aft.db")).unwrap(),
+    ));
+    registry.set_db_pool(Arc::clone(&db));
+    for (id, status) in [
+        ("bash-0000000000000091", BgTaskStatus::Completed),
+        ("bash-0000000000000092", BgTaskStatus::Failed),
+    ] {
+        let group = OwnedGroup::spawn();
+        fixture.task(id, fixture.root.as_path(), status, Some(group.0.id()));
+        deliver_terminal_and_remove_output(&registry, id);
+        // Completion sampled a live group member. Its later exit leaves the
+        // saved descendant list stale, just as a short-lived child can exit
+        // between a command's completion and deleted-root reclamation.
+        drop(group);
+    }
+    assert_eq!(completion_attempts(&registry), 2);
+    assert_eq!(fixture.sweep().evicted, 0);
+    fixture.wait_for_kill();
+    assert_eq!(
+        completion_attempts(&registry),
+        2,
+        "reclaim reprocessed already-delivered terminal completions"
+    );
+    fixture.now += RECLAIM_KILL_RETRY;
+    let outcome = fixture.sweep();
+    fixture.assert_reclaimed(outcome);
+    for _ in 0..3 {
+        fixture.now += RECLAIM_KILL_RETRY;
+        assert_eq!(fixture.sweep().evicted, 0);
+    }
+    assert_eq!(kill_attempts(&registry), 1);
+    assert_eq!(completion_attempts(&registry), 2);
+    assert!(registry
+        .pending_completions_for_session("reclaim")
+        .is_empty());
+    let conn = db.lock().unwrap();
+    let delivered: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM bash_tasks WHERE completion_delivered = 1 AND status IN ('completed', 'failed')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(delivered, 2);
+}
+
+#[test]
 fn deleted_root_terminal_survivor_is_killed_and_reclaimed_in_two_sweeps() {
     assert_terminal_survivor_reclaimed(false);
 }
