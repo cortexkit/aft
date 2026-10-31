@@ -1739,7 +1739,7 @@ pub(super) fn submit_deferred_bash(
         let metrics = metrics.clone();
         let initial_route = crate::access_policy::current_ask_route();
         let request = request_id.clone();
-        let held = super::consent::HeldCall {
+        let mut held = super::consent::HeldCall {
             reply_deadline: super::consent::program_reply_deadline(),
             identity: identity.clone(),
             tool: "bash".into(),
@@ -1751,6 +1751,11 @@ pub(super) fn submit_deferred_bash(
             active: Arc::default(),
             connection_cancel: cancel.connection.clone(),
             drain: cancel.drain.clone(),
+            ledger_key: call_key.as_ref().map(|key| crate::db::call_ledger::Key {
+                carrier: identity.run_owner.as_ref().unwrap().ledger_carrier(),
+                call_key: key.clone(),
+            }),
+            shell_claim: None,
         };
         tokio::spawn(async move {
             let launch = |ask_route, permissions| {
@@ -1846,9 +1851,32 @@ pub(super) fn submit_deferred_bash(
                 launch(initial_route, Vec::new()).await
             };
             let _claim = metrics.held_bash_calls.insert(route, corr);
+            held.shell_claim = Some(_claim.clone());
             if first.0.data["code"] == crate::protocol::ERROR_PERMISSION_REQUIRED
                 && call_key.is_some()
             {
+                if super::consent::persist_permission_hold(&held)
+                    .await
+                    .is_err()
+                {
+                    send_bash_deferred_completion(
+                        &completion_tx,
+                        &metrics,
+                        route,
+                        corr,
+                        flags,
+                        ver,
+                        root,
+                        request_id,
+                        Some(ToolCallResult {
+                            response: first.0,
+                            text: first.1,
+                        }),
+                        false,
+                    )
+                    .await;
+                    return;
+                }
                 let _ = send_counted_channel(
                     &completion_tx,
                     &metrics.bash_deferred_queued,
@@ -1913,6 +1941,12 @@ pub(super) fn submit_deferred_bash(
     let scope_stamp = cancel.scope.clone();
     let speech_seed = cancel.speech_seed.clone();
     let secret_identity = super::secret_consent::current_identity();
+    let program_approval = secret_identity
+        .as_ref()
+        .is_some_and(|identity| identity.run_owner.is_some())
+        && permissions_granted
+            .as_ref()
+            .is_some_and(|permissions| !permissions.is_empty());
     let secret_scopes = secret_identity
         .as_ref()
         .map(super::secret_consent::call_scopes);
@@ -2310,6 +2344,14 @@ pub(super) fn submit_deferred_bash(
                     lsp_hints: None,
                     session_id: Some(session_for_spawn.clone()),
                     params: Value::Object(translated.args), };
+                    if program_approval {
+                        if let Some(key) = &ledger_key {
+                            if let Err(response) = super::tool_provider::begin_approved_call(ctx, key, &request_id_for_spawn) {
+                                return finish_bash_spawn_immediate(response, ctx, &session_for_spawn,
+                                    &format_context_for_spawn, &mut spawn_text_tx, &mut spawn_control_tx, true, &mut repeat_for_spawn);
+                            }
+                        }
+                    }
                     let (response, storage_dir) =
                         crate::sandbox_spawn::with_authenticated_principal(spawn_principal, || {
                             // Declared first so its test-only drop check runs after

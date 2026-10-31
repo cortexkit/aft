@@ -70,6 +70,33 @@ pub(super) fn ledger_carrier(principal: &crate::sandbox_spawn::AuthenticatedPrin
     }
 }
 
+pub(super) fn begin_approved_call(
+    ctx: &crate::context::AppContext,
+    key: &crate::db::call_ledger::Key,
+    request_id: &str,
+) -> Result<(), crate::protocol::Response> {
+    let started = (|| {
+        let db = ctx
+            .db()
+            .ok_or_else(|| "Call ledger is unavailable".to_owned())?;
+        let conn = db
+            .lock()
+            .map_err(|_| "Call ledger database mutex is poisoned".to_owned())?;
+        crate::db::call_ledger::begin_approved(&conn, key).map_err(|error| error.to_string())
+    })();
+    match started {
+        Ok(true) => Ok(()),
+        result => Err(crate::protocol::Response::error(
+            request_id,
+            "database_unavailable",
+            match result {
+                Err(error) => error,
+                _ => "Durable authorization transition was not applied".to_owned(),
+            },
+        )),
+    }
+}
+
 pub(super) fn describe() -> Value {
     serde_json::to_value(
         RoleDescribe::new(
@@ -2936,16 +2963,16 @@ impl LedgerEdge {
                             );
                         };
                         let row = ledger::get(&conn, &call.key).ok().flatten();
-                        let reason =
-                            row.as_ref()
-                                .filter(|row| row.state == State::Prepared)
-                                .map(|_| {
-                                    if std::time::Instant::now() >= call.expires_at {
-                                        "expired"
-                                    } else {
-                                        "denied"
-                                    }
-                                });
+                        let reason = row
+                            .as_ref()
+                            .filter(|row| row.state == State::Prepared && !detached)
+                            .map(|_| {
+                                if std::time::Instant::now() >= call.expires_at {
+                                    "expired"
+                                } else {
+                                    "denied"
+                                }
+                            });
                         let inferred = ledger::outcome(&record_for_job);
                         let outcome = if reason.is_some() {
                             "bash_denied_untrusted".into()

@@ -280,6 +280,23 @@ pub fn transition(conn: &Connection, key: &Key, from: State, to: State) -> rusql
     Ok(changed)
 }
 
+/// A permission preflight did not dispatch the requested action. Return it to
+/// the withdrawable state and retain its held-reply/v1 body before sending that
+/// permission-wait reply to the program.
+pub(crate) fn hold_permission(conn: &Connection, key: &Key, body: &[u8]) -> rusqlite::Result<bool> {
+    Ok(conn.execute("UPDATE call_ledger SET state='Prepared',frame_type='Response',frame_body=?3 WHERE carrier=?1 AND call_key=?2 AND state IN ('Prepared','DispatchStarted') AND task_id IS NULL", params![key.carrier,key.call_key,body])? == 1)
+}
+
+/// Only a still-live, withdrawable approval can start the action. Withdrawal
+/// and this transition are serialized by the owning database connection.
+pub(crate) fn begin_approved(conn: &Connection, key: &Key) -> rusqlite::Result<bool> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let changed = transition(&tx, key, State::Prepared, State::Authorized)?
+        && transition(&tx, key, State::Authorized, State::DispatchStarted)?;
+    tx.commit()?;
+    Ok(changed)
+}
+
 pub fn not_started(key: &Key, reason: &str) -> RecordedFrame {
     RecordedFrame { ty: FrameType::Error, body: serde_json::to_vec(&json!({"code":"not_started","message":"call was not started","detail":{"call_key":key.call_key,"reason":reason}})).unwrap() }
 }

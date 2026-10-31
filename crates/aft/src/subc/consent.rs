@@ -1052,6 +1052,25 @@ pub(super) struct HeldCall {
     pub(super) active: ActiveToolCalls,
     pub(super) connection_cancel: PersistentCancelSignal,
     pub(super) drain: drain::ModuleDrainWindow,
+    pub(super) ledger_key: Option<crate::db::call_ledger::Key>,
+    pub(super) shell_claim: Option<Arc<drain::BashCallClaim>>,
+}
+
+pub(super) async fn persist_permission_hold(call: &HeldCall) -> Result<(), String> {
+    let Some(key) = call.ledger_key.clone() else {
+        return Ok(());
+    };
+    let body = held_frame(PROTOCOL_VERSION, call.route, call.corr, control_flags())
+        .map_err(|error| error.to_string())?
+        .body;
+    with_db(call, move |conn, _| {
+        if crate::db::call_ledger::hold_permission(conn, &key, &body)? {
+            Ok(())
+        } else {
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        }
+    })
+    .await
 }
 
 /// What a held call does after its ask was handled.
@@ -2433,6 +2452,13 @@ fn stop_signal(call: &HeldCall, route_hold: &RouteHold) -> Option<Stop> {
         return Some(Stop::Detach);
     }
     if route_hold.closed() {
+        return Some(Stop::Withdraw);
+    }
+    if call
+        .shell_claim
+        .as_ref()
+        .is_some_and(|claim| claim.cancel_requested())
+    {
         return Some(Stop::Withdraw);
     }
     if call

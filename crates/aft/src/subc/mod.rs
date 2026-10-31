@@ -10246,6 +10246,15 @@ impl PlainToolRun {
                 approved_io_window,
                 reply_deadline,
             } = run_spec;
+            if identity_for_run.run_owner.is_some() && approved_io_window.is_some() {
+                if let Some(key) = &ledger_key {
+                    if let Err(response) =
+                        tool_provider::begin_approved_call(ctx, key, &request_id_for_force)
+                    {
+                        return response;
+                    }
+                }
+            }
             if matches!(ask_route, crate::access_policy::AskRoute::Plugin { .. }) {
                 if let Some(args) = arguments.as_object_mut() {
                     args.remove("permissions_granted");
@@ -10472,8 +10481,13 @@ async fn hold_for_consent(
         active: Arc::clone(active_tool_calls),
         connection_cancel: connection_cancel.clone(),
         drain: module_drain.clone(),
+        ledger_key: plain_run.ledger_key.clone(),
+        shell_claim: None,
     };
     if plain_run.identity.run_owner.is_some() && plain_run.ledger_key.is_some() {
+        if consent::persist_permission_hold(&held).await.is_err() {
+            return Some((response, text));
+        }
         let frame = consent::held_frame(ver, route, corr, flags).ok()?;
         if send_reliable_writer_frame(writer, metrics, frame, "permission hold")
             .await

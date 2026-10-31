@@ -415,6 +415,57 @@ mod program_approvals {
             );
         }
     }
+
+    #[tokio::test]
+    async fn program_timeout_sentences_are_pinned_for_read_and_bash() {
+        let _lock = CONSENT_TEST_LOCK.lock().await;
+        let f = fixture(FakeCingulate::up());
+        let call = scope_probe_call(&f, Path::new("/outside/file"));
+        let file = Permission::File(AccessGrant {
+            path: "/outside/file".into(),
+            kind: GrantKind::File,
+            operation: AccessOperation::Read,
+        });
+        let shell = Permission::Shell {
+            command: "printf test".into(),
+            cwd: "/project".into(),
+            permissions: vec!["printf test".into()],
+        };
+        assert_eq!(
+            refused_answer(&call, &file, ACCESS_TIMEOUT, None).data["message"],
+            "Outside access denied (access_timeout) for read /outside/file."
+        );
+        assert_eq!(
+            refused_answer(&call, &shell, ACCESS_TIMEOUT, None).data["message"],
+            "Outside access denied (access_timeout) for exec /project."
+        );
+    }
+
+    #[tokio::test]
+    async fn program_folder_answer_persists_on_the_head_not_the_run() {
+        let _lock = CONSENT_TEST_LOCK.lock().await;
+        let f = fixture(FakeCingulate::up());
+        let controlled = Controlled::install(f.fake.clone());
+        let run = program(&f, false, "run:folder");
+        let path = f.dir.path().join("elsewhere.txt");
+        let mut replies = f.send_read(&run, &path, 9060).await;
+        held(&mut replies).await;
+        let request = controlled.request(0).await;
+        controlled.answer(&request, "allow_scope");
+        assert_ne!(late(&f, &run, 9060).await["isError"], true);
+        let db = f.ctx.db().unwrap();
+        let conn = db.lock().unwrap();
+        assert!(
+            crate::db::access_grants::list(&conn, &access_grants::scope_key(&run))
+                .unwrap()
+                .is_empty()
+        );
+        let grants =
+            crate::db::access_grants::list(&conn, &access_grants::scope_key(&f.head)).unwrap();
+        assert!(grants
+            .iter()
+            .any(|grant| grant.covers(AccessOperation::Read, &path)));
+    }
 }
 
 // Consent workflow/vector cases use the consent service's '/'-rooted path
@@ -1294,6 +1345,8 @@ async fn consent_nonhost_carrier_cannot_save_agent_scope_grants() {
             active: f.active.clone(),
             connection_cancel: f.connection_cancel.clone(),
             drain: drain::ModuleDrainWindow::default(),
+            ledger_key: None,
+            shell_claim: None,
         };
         let mut first = Response::error(
             "nonhost-consent",
@@ -3152,6 +3205,8 @@ fn scope_probe_call(f: &Fixture, target: &Path) -> HeldCall {
         active: Arc::clone(&f.active),
         connection_cancel: f.connection_cancel.clone(),
         drain: drain::ModuleDrainWindow::default(),
+        ledger_key: None,
+        shell_claim: None,
     }
 }
 
@@ -5210,6 +5265,8 @@ async fn access_pending_renderer_wire_matches_golden_vector_without_consent() {
         active: Arc::clone(&f.active),
         connection_cancel: f.connection_cancel.clone(),
         drain: drain::ModuleDrainWindow::default(),
+        ledger_key: None,
+        shell_claim: None,
     };
     let grant = AccessGrant {
         path: outside.clone(),
@@ -6122,6 +6179,8 @@ async fn assert_unrepresentable_paths_send_nothing(paths: Vec<PathBuf>) {
             active: Arc::clone(&f.active),
             connection_cancel: f.connection_cancel.clone(),
             drain: drain::ModuleDrainWindow::default(),
+            ledger_key: None,
+            shell_claim: None,
         };
         let (response, _) = run_with_consent(call, (first, String::new()), |_, _| async {
             panic!("an unrepresentable consent path must never execute");
