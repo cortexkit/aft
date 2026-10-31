@@ -1,1 +1,1 @@
-- Grep and search now discover files inside directories moved into a watched macOS or Windows project without first editing each file through the file tools. While a watcher rescan catches up, text queries stop using the old index to rule out matches.
+- Grep and search now discover files in directories moved into macOS or Windows projects without an intervening edit. Bounded checks of the arriving subtree avoid whole-project rebuilds for ordinary or empty directory creation; oversized, slow, or unreadable trees use the existing rescan path.

@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use ignore::gitignore::Gitignore;
 
+mod directory_arrival;
+
 pub type SharedGitignore = Arc<RwLock<Option<Arc<Gitignore>>>>;
 
 pub const WATCHER_FLUSH_WINDOW: Duration = Duration::from_millis(250);
@@ -155,7 +157,7 @@ pub enum RescanReason {
     Unknown,
 }
 
-pub(crate) const DIRECTORY_RENAME_RESCAN_INFO: &str = "rescan: directory renamed";
+pub(crate) const DIRECTORY_ARRIVAL_INFO: &str = "directory arrival";
 
 impl RescanReason {
     fn from_event_info(info: Option<&str>) -> Self {
@@ -1286,7 +1288,6 @@ fn directory_size_signal(boundary: &WatcherWalkBoundary, path: &Path) -> usize {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(crate) fn exclusion_read_dir(path: &Path) -> std::io::Result<fs::ReadDir> {
     #[cfg(test)]
     EXCLUSION_TEST_OPENS.with(|opens| opens.borrow_mut().push(path.to_path_buf()));
@@ -2428,31 +2429,42 @@ impl WatcherFilterThread {
                     {
                         continue;
                     }
-                    if let Some(journal) = self.config.counters.bash_changes.get() {
-                        journal.event_for_root(&event, &self.config.project_root, &self.matcher);
+                    let arrival_counters = (event.info() == Some(DIRECTORY_ARRIVAL_INFO))
+                        .then(|| Arc::clone(&self.config.counters));
+                    // A query must see discovery as pending until its files enter
+                    // the normal flush window, or a rescan takes over on failure.
+                    let _arrival_pending = arrival_counters
+                        .as_ref()
+                        .map(|counters| counters.directory_arrival_guard());
+                    if arrival_counters.is_some() {
+                        match directory_arrival::expand(&self.config, &self.matcher, &event.paths) {
+                            Ok(paths) => {
+                                if !paths.is_empty() {
+                                    self.config.counters.note_directory_files_queued();
+                                }
+                                event = notify::Event::new(notify::EventKind::Create(
+                                    notify::event::CreateKind::File,
+                                ));
+                                event.paths = paths;
+                            }
+                            Err(failure) => {
+                                failure.report(&self.config);
+                                event = notify::Event::new(notify::EventKind::Other)
+                                    .set_flag(notify::event::Flag::Rescan);
+                            }
+                        }
                     }
-                    if event.need_rescan()
-                        && event.info() == Some(DIRECTORY_RENAME_RESCAN_INFO)
-                        && !event.paths.iter().any(|path| {
-                            let path = canonicalize_watcher_path(path.clone());
-                            path.starts_with(&self.config.project_root)
-                                && !watcher_path_is_infra_skip_under(
-                                    &self.config.project_root,
-                                    &path,
-                                )
-                                && !watcher_directory_is_ignored_by_matcher(
-                                    &self.matcher,
-                                    &path,
-                                    &self.config.project_root,
-                                )
-                        })
-                    {
-                        // Unlike a backend drop, a directory rename names its whole
-                        // affected subtree. Ignored build trees need no corpus scan.
-                        continue;
-                    }
-                    if event.need_rescan() && event.info() == Some(DIRECTORY_RENAME_RESCAN_INFO) {
-                        self.config.counters.note_directory_arrival();
+                    let empty_arrival = arrival_counters.is_some()
+                        && event.paths.is_empty()
+                        && !event.need_rescan();
+                    if !empty_arrival {
+                        if let Some(journal) = self.config.counters.bash_changes.get() {
+                            journal.event_for_root(
+                                &event,
+                                &self.config.project_root,
+                                &self.matcher,
+                            );
+                        }
                     }
                     if event.need_rescan() {
                         // Delay only this test's overflow notification so its
@@ -2484,6 +2496,7 @@ impl WatcherFilterThread {
                         {
                             return;
                         }
+                        self.config.counters.clear_directory_files_queued();
                         continue;
                     }
                     // Config file edits are recognised on the raw event, before
@@ -2492,7 +2505,7 @@ impl WatcherFilterThread {
                     // ancestor of the root) and resolve symlinked file names.
                     self.config.note_config_file_events(&event.paths);
                     self.record_recent_paths(&event.paths);
-                    if watcher_event_invalidates(&event.kind) {
+                    if !empty_arrival && watcher_event_invalidates(&event.kind) {
                         self.config.counters.note_invalidating_event();
                         let content_only = watcher_event_is_content_only(&event.kind);
                         if !self.push_raw_paths_with_kind(event.paths, content_only) {
@@ -3236,32 +3249,36 @@ pub(crate) fn take_watcher_overflow_logs_for_test() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn watcher_directory_rename_rescans_visible_but_not_ignored_trees() {
+    fn watcher_directory_arrival_uses_file_paths_and_skips_empty_and_ignored_trees() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::create_dir(root.join("empty")).unwrap();
+        std::fs::create_dir_all(root.join("crates/new")).unwrap();
+        let source = root.join("crates/new/lib.rs");
+        std::fs::write(&source, b"source").unwrap();
+        let config = WatcherFilterConfig::new(root.clone(), None);
+        let counters = Arc::clone(&config.counters);
         let (tx, rx) = watcher_dispatch_channel();
         let (raw_tx, raw_rx) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut filter = WatcherFilterThread::new(
-            WatcherFilterConfig::new(root.clone(), None),
+            config,
             shared_matcher(&root),
             Arc::new(AtomicU64::new(0)),
             tx,
             Arc::clone(&shutdown),
         );
         let worker = thread::spawn(move || filter.run(raw_rx));
-        let rename = |path| {
-            notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Name(
-                notify::event::RenameMode::Any,
-            )))
-            .set_flag(notify::event::Flag::Rescan)
-            .set_info(DIRECTORY_RENAME_RESCAN_INFO)
-            .add_path(path)
+        let arrival = |path| {
+            notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::Folder))
+                .set_info(DIRECTORY_ARRIVAL_INFO)
+                .add_path(path)
         };
-        raw_tx.send(Ok(rename(root.join("ignored")))).unwrap();
-        raw_tx.send(Ok(rename(root.join("target")))).unwrap();
-        let cookie = root.join(".aft-cookie-123-directory-rename");
+        raw_tx.send(Ok(arrival(root.join("ignored")))).unwrap();
+        raw_tx.send(Ok(arrival(root.join("target")))).unwrap();
+        raw_tx.send(Ok(arrival(root.join("empty")))).unwrap();
+        let cookie = root.join(".aft-cookie-123-directory-arrival");
         std::fs::write(&cookie, b"").unwrap();
         raw_tx
             .send(Ok(notify::Event::new(notify::EventKind::Create(
@@ -3271,14 +3288,28 @@ mod tests {
             .unwrap();
         assert_eq!(
             rx.recv_timeout(Duration::from_secs(5)).unwrap(),
-            WatcherDispatchEvent::CookieObserved(cookie),
-            "ignored directory renames must not request a corpus rebuild"
+            WatcherDispatchEvent::CookieObserved(cookie.clone())
         );
-        raw_tx.send(Ok(rename(root.join("crates/new")))).unwrap();
+        assert_eq!(counters.snapshot().directory_subtree_walks_total, 0);
+        assert_eq!(counters.snapshot().directory_empty_total, 1);
+        raw_tx.send(Ok(arrival(root.join("crates/new")))).unwrap();
+        std::fs::write(&cookie, b"").unwrap();
+        raw_tx
+            .send(Ok(notify::Event::new(notify::EventKind::Create(
+                notify::event::CreateKind::File,
+            ))
+            .add_path(cookie.clone())))
+            .unwrap();
         assert_eq!(
             rx.recv_timeout(Duration::from_secs(5)).unwrap(),
-            WatcherDispatchEvent::RescanRequired(RescanReason::Unknown)
+            WatcherDispatchEvent::Paths(vec![source])
         );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            WatcherDispatchEvent::CookieObserved(cookie)
+        );
+        assert_eq!(counters.snapshot().directory_subtree_walks_total, 1);
+        assert_eq!(counters.snapshot().rescans_unknown_total, 0);
         shutdown.store(true, Ordering::SeqCst);
         drop(raw_tx);
         worker.join().unwrap();

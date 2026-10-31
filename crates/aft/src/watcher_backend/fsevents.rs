@@ -761,6 +761,24 @@ fn translate_event(flags: fs::FSEventStreamEventFlags, path: &Path) -> Vec<Event
     if has_flag(flags, fs::kFSEventStreamEventFlagUnmount) {
         events.push(Event::new(EventKind::Remove(RemoveKind::Other)).set_info("unmount"));
     }
+    if has_flag(flags, fs::kFSEventStreamEventFlagItemIsDir)
+        && (has_flag(flags, fs::kFSEventStreamEventFlagItemCreated)
+            || has_flag(flags, fs::kFSEventStreamEventFlagItemRenamed))
+    {
+        // A populated directory can arrive without child notifications. One
+        // arrival marker discovers its files; redundant data flags must not
+        // also send the directory itself through per-file invalidation.
+        let kind = if has_flag(flags, fs::kFSEventStreamEventFlagItemRenamed) {
+            EventKind::Modify(ModifyKind::Name(RenameMode::Any))
+        } else {
+            EventKind::Create(CreateKind::Folder)
+        };
+        events.push(Event::new(kind).set_info(crate::watcher_filter::DIRECTORY_ARRIVAL_INFO));
+        return events
+            .into_iter()
+            .map(|event| event.add_path(path.to_path_buf()))
+            .collect();
+    }
     if has_flag(flags, fs::kFSEventStreamEventFlagItemCreated) {
         events.push(Event::new(EventKind::Create(item_create_kind(flags))));
     }
@@ -768,16 +786,9 @@ fn translate_event(flags: fs::FSEventStreamEventFlags, path: &Path) -> Vec<Event
         events.push(Event::new(EventKind::Remove(item_remove_kind(flags))));
     }
     if has_flag(flags, fs::kFSEventStreamEventFlagItemRenamed) {
-        let mut event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Any)));
-        if has_flag(flags, fs::kFSEventStreamEventFlagItemIsDir) {
-            // Moving a populated tree into the root can report only the directory,
-            // not its existing children. A per-file refresh of that path would
-            // silently omit every child, so reconcile the corpus instead.
-            event = event
-                .set_flag(Flag::Rescan)
-                .set_info(crate::watcher_filter::DIRECTORY_RENAME_RESCAN_INFO);
-        }
-        events.push(event);
+        events.push(Event::new(EventKind::Modify(ModifyKind::Name(
+            RenameMode::Any,
+        ))));
     }
     if has_flag(flags, fs::kFSEventStreamEventFlagItemInodeMetaMod) {
         events.push(Event::new(EventKind::Modify(ModifyKind::Metadata(
@@ -1159,7 +1170,10 @@ mod tests {
             renamed | fs::kFSEventStreamEventFlagItemIsDir,
             Path::new("/project/crates/new-crate"),
         );
-        assert!(directory.iter().any(Event::need_rescan));
+        assert!(directory
+            .iter()
+            .any(|event| event.info() == Some(crate::watcher_filter::DIRECTORY_ARRIVAL_INFO)));
+        assert!(directory.iter().all(|event| !event.need_rescan()));
         assert!(directory.iter().any(|event| {
             event.paths == [PathBuf::from("/project/crates/new-crate")]
                 && matches!(event.kind, EventKind::Modify(ModifyKind::Name(_)))
@@ -1169,6 +1183,9 @@ mod tests {
             Path::new("/project/crates/file.rs"),
         );
         assert!(file.iter().all(|event| !event.need_rescan()));
+        assert!(file
+            .iter()
+            .all(|event| event.info() != Some(crate::watcher_filter::DIRECTORY_ARRIVAL_INFO)));
     }
 
     #[test]
@@ -1202,9 +1219,17 @@ mod tests {
                 &foo,
             );
             assert!(events.iter().any(|event| event.kind == expected_kind));
-            assert!(events
-                .iter()
-                .any(|event| matches!(event.kind, EventKind::Modify(ModifyKind::Data(_)))));
+            if flag == fs::kFSEventStreamEventFlagItemRemoved {
+                assert!(events
+                    .iter()
+                    .any(|event| matches!(event.kind, EventKind::Modify(ModifyKind::Data(_)))));
+            } else {
+                assert_eq!(
+                    events.len(),
+                    1,
+                    "one directory arrival must start only one discovery"
+                );
+            }
             let changed: Vec<_> = events
                 .iter()
                 .flat_map(|event| state.refresh_event(event))

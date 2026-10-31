@@ -215,7 +215,11 @@ fn git(root: &Path, args: &[&str]) {
 }
 
 async fn assert_visible(daemon: &mut Daemon, relative: &str, marker: &str) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    wait_visible(daemon, relative, marker, Duration::from_secs(15)).await;
+}
+
+async fn wait_visible(daemon: &mut Daemon, relative: &str, marker: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
     loop {
         let grep = daemon
             .request("grep", json!({"pattern":marker, "path":"crates"}))
@@ -305,6 +309,28 @@ async fn external_changes_reach_indexed_grep_and_search(views: bool) {
         "initial_daemon_marker",
     )
     .await;
+    let before_empty = watcher_counts(&mut daemon).await;
+    std::fs::create_dir(root.join("crates/empty-native")).unwrap();
+    let empty_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let after = watcher_counts(&mut daemon).await;
+        if after["directory_empty_total"].as_u64().unwrap()
+            > before_empty["directory_empty_total"].as_u64().unwrap()
+        {
+            assert_eq!(
+                after["directory_subtree_walks_total"],
+                before_empty["directory_subtree_walks_total"]
+            );
+            assert_eq!(rescan_total(&after), rescan_total(&before_empty));
+            break;
+        }
+        assert!(
+            Instant::now() < empty_deadline,
+            "empty arrival not observed: {after}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let before_changes = watcher_counts(&mut daemon).await;
 
     // Search while each marker is absent so the test also detects whether the
     // watcher invalidates cached absence after the files arrive.
@@ -358,4 +384,99 @@ async fn external_changes_reach_indexed_grep_and_search(views: bool) {
     ] {
         assert_visible(&mut daemon, file, marker).await;
     }
+    let after_small = watcher_counts(&mut daemon).await;
+    assert_eq!(
+        rescan_total(&after_small),
+        rescan_total(&before_changes),
+        "small arrivals must remain incremental: {after_small}"
+    );
+    assert_eq!(
+        after_small["directory_walk_fallbacks_total"],
+        before_changes["directory_walk_fallbacks_total"]
+    );
+
+    // Exceed the 1,024-entry discovery limit and require a complete indexed
+    // answer after the rescan, not just the files visited before the limit.
+    let large = state.path().join("large");
+    std::fs::create_dir(&large).unwrap();
+    for i in 0..2049 {
+        std::fs::write(
+            large.join(format!("file-{i:04}.rs")),
+            "// bounded_large_common_marker\n",
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        large.join("target.rs"),
+        "// bounded_large_common_marker bounded_large_last_marker\n",
+    )
+    .unwrap();
+    std::fs::rename(&large, root.join("crates/large")).unwrap();
+    wait_visible(
+        &mut daemon,
+        "crates/large/target.rs",
+        "bounded_large_last_marker",
+        Duration::from_secs(60),
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let result = daemon.request("grep", json!({"pattern":"bounded_large_common_marker", "path":"crates/large", "offset":2049})).await;
+        let data = &result["structuredContent"];
+        if data["index_status"] == "Ready"
+            && data["complete"] == true
+            && data["total_matches"] == 2050
+        {
+            if views {
+                assert_eq!(data["files_read_directly"], 0, "{result}");
+            }
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "large arrival did not become complete: {result}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let after_large = watcher_counts(&mut daemon).await;
+    assert!(
+        after_large["directory_walk_fallbacks_total"]
+            .as_u64()
+            .unwrap()
+            > after_small["directory_walk_fallbacks_total"]
+                .as_u64()
+                .unwrap(),
+        "{after_large}"
+    );
+    assert!(
+        rescan_total(&after_large) > rescan_total(&after_small),
+        "{after_large}"
+    );
+    println!(
+        "daemon_arrivals views={views} small_rescans=0 large_rescans={} large_walk_fallbacks={}",
+        rescan_total(&after_large) - rescan_total(&after_small),
+        after_large["directory_walk_fallbacks_total"]
+            .as_u64()
+            .unwrap()
+            - after_small["directory_walk_fallbacks_total"]
+                .as_u64()
+                .unwrap()
+    );
+}
+
+async fn watcher_counts(daemon: &mut Daemon) -> Value {
+    let response = daemon.call("status", json!({})).await;
+    response["structuredContent"]["watcher"].clone()
+}
+
+fn rescan_total(counts: &Value) -> u64 {
+    [
+        "rescans_buffer_overflow_total",
+        "rescans_kernel_dropped_total",
+        "rescans_user_dropped_total",
+        "rescans_unknown_total",
+    ]
+    .into_iter()
+    .map(|key| counts[key].as_u64().unwrap())
+    .sum()
 }
