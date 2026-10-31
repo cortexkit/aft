@@ -959,12 +959,13 @@ impl Jail {
         session: &str,
         task: &str,
     ) -> aft::bash_background::persistence::TaskPaths {
-        aft::bash_background::persistence::task_paths(
+        aft::bash_background::persistence::resolve_task(
             &self.data.join("cortexkit/aft/cache/aft/runner"),
             session,
             task,
         )
         .unwrap()
+        .paths
     }
 
     // Runner replies intentionally contain no status or exit fields.
@@ -4334,7 +4335,11 @@ fn read_task_settled(metadata: &Path) -> aft::bash_background::persistence::Pers
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            other => return other.unwrap(),
+            other => {
+                return other.unwrap_or_else(|error| {
+                    panic!("reading task record {}: {error}", metadata.display())
+                })
+            }
         }
     }
     panic!("task record at {} kept being replaced", metadata.display());
