@@ -1,1 +1,1 @@
-Search starts faster after a restart by checking unchanged files' metadata instead of rereading their contents.
+- Search is ready sooner after AFT restarts: files that haven't changed since the last check are no longer reread.
