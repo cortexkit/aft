@@ -25,6 +25,11 @@ path = "src/lib.rs"
 name = "aft"
 path = "src/main.rs"
 
+[[bin]]
+name = "aft-test-scope-owner"
+path = "tests/helpers/scope_owner.rs"
+required-features = ["test-scope-owner"]
+
 [[test]]
 name = "engine"
 path = "tests/engine/main.rs"
@@ -101,6 +106,7 @@ path = "tests/search_index_build_memory.rs"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)', 'cfg(aft_fake_lsp_helper)'] }
 
 [features]
+test-scope-owner = []
 # Explicit opt-in for cross-process timing controls used by integration tests.
 test-timing-hooks = []
 # In-process integration fixtures need the real binary for native re-exec.
@@ -287,6 +293,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+subc-daemon = "=0.39.0"
 # Enable the launcher seam only in test builds, not ordinary aft binaries.
 agent-file-tools = { path = ".", features = ["test-sandbox-launcher", "test-conformance-result-inputs"] }
 graphql-parser = "0.4.1"

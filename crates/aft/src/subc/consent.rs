@@ -196,6 +196,7 @@ struct SubcConsentTransport {
 // and role versions are fixed for this transport's consent opens.
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct ConsentRouteKey {
+    project_root: PathBuf,
     harness: String,
     session: String,
     scope_owner: String,
@@ -204,8 +205,13 @@ struct ConsentRouteKey {
 }
 
 impl ConsentRouteKey {
-    fn new(identity: &subc_protocol::BindIdentity, scope: &ScopeSelector) -> Self {
+    fn new(
+        identity: &subc_protocol::BindIdentity,
+        scope: &ScopeSelector,
+        project_root: &Path,
+    ) -> Self {
         Self {
+            project_root: project_root.to_path_buf(),
             harness: identity.harness.clone(),
             session: identity.session.clone(),
             scope_owner: serde_json::to_string(&scope.owner)
@@ -395,7 +401,11 @@ impl SubcConsentTransport {
         // The SDK may return the same cached handle for overlapping calls with
         // the same scope stamp. Lease it until the last call settles, then close
         // immediately rather than leaving an idle consent route in the daemon.
-        let route_identity = self.route_identity(ConsentRouteKey::new(&identity, &call.scope));
+        let route_identity = self.route_identity(ConsentRouteKey::new(
+            &identity,
+            &call.scope,
+            &call.project_root,
+        ));
         let gate = route_identity.state.gate.lock().await;
         let route = match consumer
             .open_route_scoped(

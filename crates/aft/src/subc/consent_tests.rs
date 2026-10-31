@@ -6050,7 +6050,8 @@ async fn consent_real_transport_applies_receipt_before_releasing_lease() {
     let transport = authenticated_consent_transport(&daemon).await;
     let call = transport_consent_call("receipt-worker", "consent.await");
     let bind = subc_protocol::BindIdentity::new("aft-consent", call.session.clone());
-    let route = transport.route_identity(ConsentRouteKey::new(&bind, &call.scope));
+    let route =
+        transport.route_identity(ConsentRouteKey::new(&bind, &call.scope, &call.project_root));
     let state = Arc::clone(&route.state);
     let observed = Arc::new(AtomicBool::new(false));
     let received = Arc::clone(&observed);

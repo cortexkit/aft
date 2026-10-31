@@ -2766,7 +2766,7 @@ impl BgTaskRegistry {
                 }
                 let result = run_diagnosed(client, &sink.task, &request, timings).await;
                 #[cfg(test)]
-                let result = if result.is_ok() && tests::lose_submission_replies(root) {
+                let result = if result.is_ok() && tests::lose_submission_replies(_root) {
                     // A round trip confirms dispatch reached the fake executor
                     // before losing the caller's dispatch result.
                     let _ = client.status().await;
@@ -5193,7 +5193,7 @@ async fn send_owed_cancel(session_dir: &Path, task_id: &str) -> OwedCancelSend {
 /// retrying a failed connection or call with doubling waits.
 #[cfg(unix)]
 async fn cancel_with_backoff(
-    metadata: &PersistedTask,
+    _metadata: &PersistedTask,
     remote: &RemoteTask,
     task_id: &str,
     job_id: Uuid,

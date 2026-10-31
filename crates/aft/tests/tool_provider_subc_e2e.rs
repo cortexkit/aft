@@ -1,42 +1,23 @@
-//! Tool-provider v1 route selection through a real subc daemon.
+//! Tool-provider route selection and scoped project I/O through daemon 0.39.
 //!
-//! The consumer declares its role versions on `route.open`; the daemon
-//! forwards them, unverified, to AFT's bind. This test runs the configured
-//! `ck-subc` bytes from a stable content-addressed test cache under the
-//! `ckdev-subc` name (subc-daemon 0.29 or later, which advertises
-//! `route-role-versions/v1`) in a temporary, isolated home, runs it with the
-//! `aft` binary this package builds as its module, and checks from the
-//! consumer's side that:
+//! The daemon is embedded from the dev-only `subc-daemon` crate. It launches
+//! AFT and a test-only scope owner with isolated configuration and storage.
+//! The owner registers a workdir; project-free consumers then open scoped
+//! routes through daemon admission, which attaches the registered scope's
+//! workdir to the route bind AFT receives.
 //!
-//! - a route opened with `role_versions: {"tool-provider": "v1"}` is served
-//!   the catalog and admits calls under the v1 grammar;
-//! - a route opened without role versions, and one that declares only some
-//!   other role, keep the legacy plugin grammar, and an ordinary plugin call
-//!   on them returns the same bytes;
-//! - a tool-provider version AFT does not serve refuses the route.
-//!
-//! The TypeScript bridge rig cannot drive this: `@cortexkit/subc-client`
-//! 0.20 has no role-versions option on `routeOpen`, so the consumer here is
-//! `subc-client-rs`, whose `CallOptions::role_versions` sends the field.
-//!
-//! Ignored by default because it needs a daemon binary. Run with, e.g.:
+//! Run the opt-in tests with:
 //!
 //! ```text
-//! AFT_E2E_SUBC_BIN=~/.local/share/cortexkit/bin/ck-subc \
-//! cargo test -p agent-file-tools --test rest tool_provider_subc_e2e -- \
-//!     --ignored --nocapture
+//! cargo test -p agent-file-tools --features test-scope-owner --test rest \
+//!     tool_provider_subc_e2e -- --ignored --nocapture
 //! ```
-//!
-//! The daemon never touches the operator's own: every XDG directory, `HOME`
-//! and `TMPDIR` point into a temporary directory, the port is kernel-assigned,
-//! and the daemon runs in its own process group, which is killed at the end.
 
 #![cfg(unix)]
 
 use std::collections::BTreeMap;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -46,55 +27,36 @@ use subc_protocol::{BindIdentity, RouteTarget};
 #[path = "helpers/aft_binary.rs"]
 mod aft_binary;
 
-/// A `ckdev-subc` daemon in its own process group under an isolated home.
-/// Dropping it kills the group, which includes the aft module it spawned.
+/// An embedded daemon with supervised children, all using fixture-only paths.
+/// Aborting its task drops the supervisor and its kill-on-drop children.
 struct HermeticDaemon {
-    child: Child,
+    task: tokio::task::JoinHandle<Result<(), subc_daemon::bootstrap::BootstrapError>>,
     connection_file: PathBuf,
 }
 
 impl HermeticDaemon {
-    fn start(subc_bin: &Path, home: &Path) -> Self {
-        let runtime = home.join("runtime");
-        let connection_file = runtime.join("subc-connection.json");
-        let test_bin = cache_test_daemon(subc_bin);
-        let child = Command::new(&test_bin)
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-            .env("HOME", home.join("home"))
-            .env("XDG_RUNTIME_DIR", &runtime)
-            .env("XDG_CONFIG_HOME", home.join("config"))
-            .env("XDG_DATA_HOME", home.join("data"))
-            .env("XDG_STATE_HOME", home.join("state"))
-            .env("XDG_CACHE_HOME", home.join("cache"))
-            .env("TMPDIR", home.join("tmp"))
-            .env("SUBC_PORT", "0")
-            .process_group(0)
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(
-                std::fs::File::create(home.join("subc.stderr.log")).unwrap(),
-            ))
-            .spawn()
-            .expect("start hermetic ckdev-subc");
+    async fn start(home: &Path) -> Self {
+        let connection_file = home.join("runtime/subc-connection.json");
+        let config = subc_daemon::bootstrap::BootstrapConfig::new(&connection_file, 0)
+            .with_daemon_config_path(home.join("config/cortexkit/subc.jsonc"))
+            .expect("isolated daemon config")
+            .with_capture_logs_dir(home.join("logs"))
+            .with_terminal_journal_path(home.join("terminals.jsonl"));
+        let task = tokio::spawn(subc_daemon::bootstrap::run_with_config(config));
         let deadline = Instant::now() + Duration::from_secs(60);
         while !connection_file.exists() {
+            assert!(!task.is_finished(), "embedded daemon exited during startup");
             assert!(
                 Instant::now() < deadline,
-                "hermetic ckdev-subc did not publish its connection file"
+                "embedded daemon did not publish its connection file"
             );
-            std::thread::sleep(Duration::from_millis(100));
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
         Self {
-            child,
+            task,
             connection_file,
         }
     }
-}
-
-fn cache_test_daemon(subc_bin: &Path) -> PathBuf {
-    let bytes = std::fs::read(subc_bin).expect("read daemon for the executable cache");
-    crate::test_helpers::executable_cache::cached_executable_named(&bytes, "ckdev-subc")
-        .expect("cache immutable test daemon")
 }
 
 #[test]
@@ -121,12 +83,7 @@ fn cached_test_daemon_keeps_ckdev_name() {
 
 impl Drop for HermeticDaemon {
     fn drop(&mut self) {
-        // The daemon's pid is its process group id (process_group(0)), so
-        // this also stops the aft module the daemon spawned.
-        unsafe {
-            libc::killpg(self.child.id() as libc::pid_t, libc::SIGKILL);
-        }
-        let _ = self.child.wait();
+        self.task.abort();
     }
 }
 
@@ -145,6 +102,17 @@ fn hermetic_home() -> (tempfile::TempDir, PathBuf, PathBuf) {
     ] {
         std::fs::create_dir_all(home.join(dir)).unwrap();
     }
+    let module_env = json!({
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "HOME": home.join("home"),
+        "XDG_RUNTIME_DIR": home.join("runtime"),
+        "XDG_CONFIG_HOME": home.join("config"),
+        "XDG_DATA_HOME": home.join("data"),
+        "XDG_STATE_HOME": home.join("state"),
+        "XDG_CACHE_HOME": home.join("cache"),
+        "AFT_STORAGE_DIR": home.join("data/aft"),
+        "TMPDIR": home.join("tmp"),
+    });
     std::fs::write(
         home.join("config/cortexkit/subc.jsonc"),
         serde_json::to_vec_pretty(&json!({
@@ -154,6 +122,13 @@ fn hermetic_home() -> (tempfile::TempDir, PathBuf, PathBuf) {
                 "program": aft_binary::aft_binary(),
                 "args": [],
                 "enabled": true,
+                "env": module_env,
+            }, "aft-test-scope-owner": {
+                "program": option_env!("CARGO_BIN_EXE_aft-test-scope-owner")
+                    .expect("build the test with --features test-scope-owner"),
+                "args": [],
+                "enabled": true,
+                "env": module_env,
             }},
         }))
         .unwrap(),
@@ -199,13 +174,30 @@ async fn open(
     session: &str,
     role_versions: Option<&[(&str, &str)]>,
 ) -> Result<RouteHandle, CallError> {
+    let ready = project.parent().unwrap().join("scope-owner.ready");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !ready.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "test scope owner did not register its workdir"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let mut options = options(role_versions);
+    options.scope = Some(subc_protocol::scope::ScopeSelector::new(
+        subc_protocol::Principal::Reserved {
+            module_id: "aft-test-scope-owner".into(),
+        },
+        "e2e-project",
+        Some(1),
+    ));
     consumer
         .open_route(
             RouteTarget::ToolProvider {
                 module_id: "aft".into(),
             },
             BindIdentity::new("runner", session),
-            options(role_versions),
+            options,
         )
         .await
 }
@@ -213,8 +205,19 @@ async fn open(
 async fn request(
     consumer: &SubcConsumer,
     route: &RouteHandle,
-    body: Value,
+    mut body: Value,
 ) -> Result<Vec<u8>, CallError> {
+    // Scoped tool calls name their catalog preset; provider metadata does not.
+    if body
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| name != "tool.catalog")
+    {
+        body.as_object_mut()
+            .unwrap()
+            .entry("preset")
+            .or_insert(json!("head"));
+    }
     consumer
         .request(route, serde_json::to_vec(&body).unwrap(), options(None))
         .await
@@ -247,13 +250,10 @@ fn without_request_id(reply: &[u8], route: &RouteHandle) -> String {
 }
 
 #[tokio::test]
-#[ignore = "needs a real ck-subc daemon (subc-daemon 0.29+); set AFT_E2E_SUBC_BIN"]
+#[ignore = "opt-in daemon 0.39 integration; run with --features test-scope-owner"]
 async fn tool_provider_subc_e2e_role_versions_select_v1_and_leave_legacy_routes_unchanged() {
-    let subc_bin = PathBuf::from(
-        std::env::var_os("AFT_E2E_SUBC_BIN").expect("set AFT_E2E_SUBC_BIN to a ck-subc binary"),
-    );
     let (_temp, home, project) = hermetic_home();
-    let daemon = HermeticDaemon::start(&subc_bin, &home);
+    let daemon = HermeticDaemon::start(&home).await;
     let consumer = SubcConsumer::connect(&daemon.connection_file, ConsumerOptions::default())
         .await
         .expect("connect to the hermetic daemon");
@@ -392,5 +392,43 @@ async fn tool_provider_subc_e2e_role_versions_select_v1_and_leave_legacy_routes_
         legacy_bytes.len()
     );
     drop(consumer);
+    drop(daemon);
+}
+
+#[tokio::test]
+#[ignore = "opt-in daemon 0.39 integration; run with --features test-scope-owner"]
+async fn tool_provider_subc_e2e_project_free_bind_uses_owned_scope_workdir() {
+    let (_temp, home, project) = hermetic_home();
+    let daemon = HermeticDaemon::start(&home).await;
+    let consumer = SubcConsumer::connect(&daemon.connection_file, ConsumerOptions::default())
+        .await
+        .expect("connect embedded daemon 0.39");
+    let route = open(
+        &consumer,
+        &project,
+        "project-free-e2e",
+        Some(&[("tool-provider", "v1")]),
+    )
+    .await
+    .expect("open project-free scoped route");
+    for (name, arguments) in [
+        ("read", json!({"path":"seed.txt"})),
+        ("grep", json!({"pattern":"seed line one", "path":"."})),
+    ] {
+        let bytes = request(
+            &consumer,
+            &route,
+            json!({"name":name, "arguments":arguments}),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("scoped {name}: {error}"));
+        let reply: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_ne!(reply["isError"], true, "{reply}");
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("seed line one"),
+            "{reply}"
+        );
+    }
+    consumer.close().await;
     drop(daemon);
 }

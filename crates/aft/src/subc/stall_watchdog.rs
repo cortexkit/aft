@@ -858,7 +858,7 @@ mod tests {
         )
         .unwrap();
         metrics.mark_frame_loop_frame(&frame);
-        metrics.mark_frame_loop_control(&request, &frame);
+        metrics.mark_frame_loop_control(&serde_json::from_value(request).unwrap(), &frame);
         let diagnostics = crate::lock_diagnostics::LockDiagnostics::new("executor_holder.rs");
         let _held = diagnostics.hold();
         metrics.mark_frame_loop_wait(
