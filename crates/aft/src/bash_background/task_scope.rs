@@ -555,24 +555,34 @@ mod linux {
     }
 
     pub(crate) fn select_systemd_scope_launcher() -> Option<SystemdScopeLauncher> {
-        static LAUNCHER: std::sync::OnceLock<Option<SystemdScopeLauncher>> =
-            std::sync::OnceLock::new();
-        LAUNCHER
-            .get_or_init(|| {
-                let path = systemd_run_path_with(Path::is_file)?.to_owned();
-                probe_launcher(path)
-            })
-            .clone()
+        static LAUNCHER: std::sync::OnceLock<SystemdScopeLauncher> = std::sync::OnceLock::new();
+        static PROBE: Mutex<()> = Mutex::new(());
+        if let Some(launcher) = LAUNCHER.get() {
+            return Some(launcher.clone());
+        }
+        let _guard = PROBE.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(launcher) = LAUNCHER.get() {
+            return Some(launcher.clone());
+        }
+        let path = systemd_run_path_with(Path::is_file)?.to_owned();
+        let launcher = probe_launcher(path)?;
+        let _ = LAUNCHER.set(launcher.clone());
+        Some(launcher)
     }
 
     #[cfg(test)]
     thread_local! {
         static LAUNCHER_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static FAIL_NEXT_LAUNCHER_PROBE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     fn probe_launcher(path: PathBuf) -> Option<SystemdScopeLauncher> {
         #[cfg(test)]
         LAUNCHER_PROBES.with(|count| count.set(count.get() + 1));
+        #[cfg(test)]
+        if FAIL_NEXT_LAUNCHER_PROBE.with(|fail| fail.replace(false)) {
+            return None;
+        }
         let supports_expand_environment = probe_systemd_scope(&path, Duration::from_secs(1))?;
         let version = run(
             user_manager_command(&path).arg("--version"),
@@ -1242,7 +1252,10 @@ mod linux {
         fn task_scope_launcher_ignores_process_path() {
             const INNER: &str = "AFT_TEST_SCOPE_TRUSTED_LAUNCHER";
             if std::env::var_os(INNER).is_some() {
-                let selected = select_systemd_scope_launcher().unwrap();
+                FAIL_NEXT_LAUNCHER_PROBE.with(|fail| fail.set(true));
+                assert!(select_systemd_scope_launcher().is_none());
+                let selected =
+                    select_systemd_scope_launcher().expect("failed probe was cached permanently");
                 let first = LAUNCHER_PROBES.with(|count| count.get());
                 assert!(first > 0);
                 select_systemd_scope_launcher().unwrap();
