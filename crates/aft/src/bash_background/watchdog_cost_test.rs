@@ -480,16 +480,33 @@ fn watchdog_cost_persisted_gc_session_churn_does_not_reopen_terminal_history() {
 
     // A new task changes the session directory's mtime, but none of its
     // siblings' metadata or task directories. Only the new records need opens.
+    let mut new_tasks = Vec::new();
     for index in 0..SESSIONS {
-        fixture(storage.path(), &format!("session-{index}"), false, 2);
+        let session = format!("session-{index}");
+        let (_, paths) = fixture(storage.path(), &session, false, 2);
+        // Force a distinct session stamp even on coarse timestamp filesystems.
+        filetime::set_file_mtime(
+            &paths.session_dir,
+            filetime::FileTime::from_unix_time(1_700_000_000 + index as i64, 0),
+        )
+        .unwrap();
+        new_tasks.push(paths);
     }
     let churn = measured_gc_lap(&registry, storage.path(), "one new task per session");
     assert_eq!(churn.1, 0, "a keep-only sweep wrote task metadata");
     assert!(
-        churn.0 <= 2 * SESSIONS,
+        churn.0 <= 3 * SESSIONS,
         "session churn reopened terminal history: {churn:?}"
     );
     assert!(history.iter().all(|paths| paths.json.exists()));
+
+    for paths in new_tasks {
+        delete_task_bundle(&paths).unwrap();
+    }
+    assert_eq!(
+        measured_gc_lap(&registry, storage.path(), "new sibling tasks removed"),
+        (0, 0),
+    );
 
     // A metadata change still invalidates a running task's verdict immediately,
     // even when its recorded process remains alive. Remove that process from

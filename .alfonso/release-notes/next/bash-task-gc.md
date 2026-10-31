@@ -1,0 +1,1 @@
+- Lower idle CPU when collecting background-task history in active sessions, and avoid duplicate writes when terminal persistence retries overlap.

@@ -1417,7 +1417,7 @@ pub(crate) struct RegistryInner {
     /// check that a held foreground bash call's periodic task checks build none.
     #[cfg(test)]
     pub(crate) snapshots_built: AtomicU64,
-    /// Name of the thread the once-per-process persisted GC ran on. Lets the
+    /// Name of the thread the per-storage-root persisted GC ran on. Lets the
     /// integration suite pin that the GC stays off the configure/replay thread
     /// (the replay caller is the standalone request loop).
     persisted_gc_thread: Mutex<Option<String>>,
@@ -11660,7 +11660,9 @@ impl BgTaskRegistry {
         let state = task
             .lock_state()
             .unwrap_or_else(|poison| poison.into_inner());
-        if state.metadata.is_terminal() {
+        // Another retry or scratch-cleanup write may have succeeded after
+        // the fast check above. Dirty state is changed under this same lock.
+        if task.terminal_persist_dirty.load(Ordering::SeqCst) && state.metadata.is_terminal() {
             self.persist_task_locked(task, &state.metadata, &mut db)?;
             task.terminal_persist_dirty.store(false, Ordering::SeqCst);
         }
