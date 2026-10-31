@@ -366,6 +366,7 @@ pub(crate) fn task_environment(
     if let Some(value) = environment.get_mut(std::ffi::OsStr::new("PATH")) {
         let entries = std::env::split_paths(value)
             .map(|path| redirect(&path))
+            .filter(|path| !is_dead_pin_path(path))
             .collect::<Vec<_>>();
         if let Ok(path) = std::env::join_paths(entries) {
             *value = path;
@@ -677,6 +678,7 @@ mod tests {
                     "PATH".to_owned(),
                     std::env::join_paths([
                         pin.directory.join("shims"),
+                        storage.join("run/aft-pinned-99-99/shims"),
                         PathBuf::from("/usr/bin"),
                         PathBuf::from("/bin"),
                     ])
@@ -695,7 +697,7 @@ mod tests {
             ]);
             let command = format!(
                 ": > ready-{mode}; while [ ! -f release ]; do /bin/sleep 0.02; done; \
-                 printf '%s\\n' \"$(command -v gh)\" \"$AFT_GH_SHIMS_DIR\" \"$AFT_GH_SHIM_BINARY\" > resolved-{mode}; \
+                 printf '%s\\n' \"$(command -v gh)\" \"$AFT_GH_SHIMS_DIR\" \"$AFT_GH_SHIM_BINARY\" \"$PATH\" > resolved-{mode}; \
                  gh --list pinned_executable_cleanup_preserves_live_owner > output-{mode} 2>&1; \
                  shim_status=$?; \"$AFT_GH_SHIM_BINARY\" --list pinned_executable_cleanup_preserves_live_owner > binary-output-{mode} 2>&1; \
                  printf '%s:%s' \"$shim_status\" \"$?\" > status-{mode}.tmp; /bin/mv status-{mode}.tmp status-{mode}"
@@ -828,10 +830,11 @@ mod tests {
             assert_eq!(
                 std::fs::read_to_string(storage.join(format!("resolved-{mode}"))).unwrap(),
                 format!(
-                    "{}\n{}\n{}\n",
+                    "{}\n{}\n{}\n{}:/usr/bin:/bin\n",
                     image.join("shims/gh").display(),
                     image.join("shims").display(),
-                    image.join("aft").display()
+                    image.join("aft").display(),
+                    image.join("shims").display()
                 ),
                 "{mode}",
             );
