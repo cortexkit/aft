@@ -5,7 +5,7 @@ use crate::config::{
 };
 use crate::context::SemanticIndexStatus;
 use crate::fs_lock;
-use crate::parser::{detect_language, extract_symbols_from_tree, parse_source_with_cached_parser};
+use crate::parser::{extract_symbols_from_tree, language_for_extension, parse_resolved_source};
 use crate::search_index::{
     cache_relative_path, cached_path_under_root_with_memo, ParentCanonicalizationMemo,
 };
@@ -1662,8 +1662,12 @@ pub struct SemanticIndexFingerprint {
 }
 
 fn default_chunking_version() -> u32 {
+    // Fingerprints without an explicit version predate header resolution.
     2
 }
+
+// Header language resolution changes the symbols used as chunk boundaries.
+const CURRENT_CHUNKING_VERSION: u32 = 3;
 
 /// Per-file key revision for capped summaries; it does not change model identity.
 pub(crate) const FILE_SUMMARY_BUDGET_KEY_FORMAT: u32 = 1;
@@ -1696,7 +1700,7 @@ impl SemanticIndexFingerprint {
             model: config.model.clone(),
             base_url,
             dimension,
-            chunking_version: default_chunking_version(),
+            chunking_version: CURRENT_CHUNKING_VERSION,
             embed_text_caps: EmbedTextCaps::from_config(config),
             synapse_fingerprint: None,
             synapse_table_epoch: None,
@@ -10625,7 +10629,8 @@ fn collect_semantic_file_uncached(
         if !is_semantic_indexed_extension(file) {
             return Err(SemanticCollectError::UnsupportedExtension);
         }
-        let lang = detect_language(file).ok_or(SemanticCollectError::UnsupportedExtension)?;
+        let lang =
+            language_for_extension(file).ok_or(SemanticCollectError::UnsupportedExtension)?;
 
         let mut indexed_metadata = IndexedFileMetadata {
             mtime,
@@ -10678,14 +10683,15 @@ pub fn collect_file_chunks_for_census(
     if !is_semantic_indexed_extension(file) {
         return Err("unsupported file extension".to_string());
     }
-    let lang = detect_language(file).ok_or_else(|| "unsupported file extension".to_string())?;
+    let lang =
+        language_for_extension(file).ok_or_else(|| "unsupported file extension".to_string())?;
     if fs::metadata(file).is_ok_and(|metadata| metadata.len() > MAX_SEMANTIC_FILE_BYTES) {
         return Ok((Vec::new(), Vec::new()));
     }
 
     let source = crate::project_content::read_to_string(file).map_err(|error| error.to_string())?;
-    let tree =
-        parse_source_with_cached_parser(file, &source, lang).map_err(|error| error.to_string())?;
+    let (tree, lang) =
+        parse_resolved_source(file, &source, lang).map_err(|error| error.to_string())?;
     let symbols =
         extract_symbols_from_tree(&source, &tree, lang).map_err(|error| error.to_string())?;
     let today = symbols_to_chunks(file, &symbols, &source, project_root);
@@ -10698,7 +10704,8 @@ fn collect_file_chunks(project_root: &Path, file: &Path) -> Result<Vec<SemanticC
     if !is_semantic_indexed_extension(file) {
         return Err("unsupported file extension".to_string());
     }
-    let lang = detect_language(file).ok_or_else(|| "unsupported file extension".to_string())?;
+    let lang =
+        language_for_extension(file).ok_or_else(|| "unsupported file extension".to_string())?;
     // OOM backstop: skip oversized files before the read + parse (tracked with
     // zero chunks by the caller, so freshness won't re-read them every refresh).
     if fs::metadata(file).is_ok_and(|m| m.len() > MAX_SEMANTIC_FILE_BYTES) {
@@ -10736,10 +10743,9 @@ fn collect_file_chunks_from_source_timed(
     #[cfg(test)]
     LANE_PAUSE_CHUNK_CALLS.with(|count| count.set(count.get() + 1));
     let parse_started = Instant::now();
-    let tree_result =
-        parse_source_with_cached_parser(file, source, lang).map_err(|error| error.to_string());
+    let tree_result = parse_resolved_source(file, source, lang).map_err(|error| error.to_string());
     phases.parse += parse_started.elapsed();
-    let tree = tree_result?;
+    let (tree, lang) = tree_result?;
 
     let extract_started = Instant::now();
     let symbols_result =
@@ -11195,7 +11201,7 @@ fn chunk_view_file_uncached(
     if !is_semantic_indexed_extension(&file) {
         return Ok(None);
     }
-    let Some(lang) = detect_language(&file) else {
+    let Some(lang) = language_for_extension(&file) else {
         return Ok(None);
     };
     if bytes.len() as u64 > MAX_SEMANTIC_FILE_BYTES {
@@ -11510,6 +11516,20 @@ pub(crate) use tests::saved_pre_budget_summary_fixture;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn h_header_view_chunking_uses_snapshot_language() {
+        let root = tempfile::tempdir().unwrap();
+        let path = Path::new("widget.h");
+        fs::write(root.path().join(path), "int old_c_symbol(void);\n").unwrap();
+        let source = b"namespace api { class Widget { public: int value() { return 42; } }; }\n";
+        let chunks = chunk_view_file_uncached(root.path(), path, source, EmbedTextCaps::default())
+            .unwrap()
+            .unwrap();
+        assert!(chunks.iter().any(|chunk| chunk.name == "Widget"));
+        assert!(chunks.iter().any(|chunk| chunk.name == "value"));
+        assert!(!chunks.iter().any(|chunk| chunk.name == "old_c_symbol"));
+    }
+
     fn no_pause_checkpoint_fixture(
         files: usize,
         symbols: usize,

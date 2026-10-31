@@ -343,7 +343,7 @@ impl DeadCodeFileAnalyzer {
             || needs_rust_attribute_entry_points
             || needs_rust_macro_token_refs;
         let tree = needs_tree
-            .then(|| self.parse_source(lang, &source))
+            .then(|| self.parse_source(file, lang, &source))
             .flatten();
 
         let type_ref_names = if needs_type_refs {
@@ -494,7 +494,15 @@ impl DeadCodeFileAnalyzer {
         analysis
     }
 
-    fn parse_source(&mut self, lang: LangId, source: &str) -> Option<tree_sitter::Tree> {
+    fn parse_source(
+        &mut self,
+        path: &Path,
+        lang: LangId,
+        source: &str,
+    ) -> Option<tree_sitter::Tree> {
+        if path.extension().and_then(|ext| ext.to_str()) == Some("h") {
+            return crate::parser::parse_source_with_cached_parser(path, source, lang).ok();
+        }
         let parser = match self.parsers.entry(lang) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {

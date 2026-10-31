@@ -27,7 +27,7 @@ use crate::calls::{extract_calls_full, extract_rust_value_references};
 use crate::edit::line_col_to_byte;
 use crate::error::AftError;
 use crate::imports::{self, ImportBlock};
-use crate::parser::{detect_language, grammar_for, LangId};
+use crate::parser::{detect_language, detect_language_from_source, grammar_for, LangId};
 use crate::symbols::{Range, Symbol, SymbolKind};
 
 // ---------------------------------------------------------------------------
@@ -1384,25 +1384,22 @@ impl CallGraph {
 
 /// Build call data for a single file.
 pub(crate) fn build_file_data(path: &Path) -> Result<FileCallData, AftError> {
-    let lang = detect_language(path).ok_or_else(|| AftError::InvalidRequest {
-        message: format!("unsupported file for call graph: {}", path.display()),
-    })?;
-
     let source =
         crate::project_content::read_to_string(path).map_err(|e| AftError::FileNotFound {
             path: format!("{}: {}", path.display(), e),
         })?;
 
-    build_file_data_from_source_with_lang(path, &source, lang)
+    build_file_data_from_source(path, &source)
 }
 
 pub(crate) fn build_file_data_from_source(
     path: &Path,
     source: &str,
 ) -> Result<FileCallData, AftError> {
-    let lang = detect_language(path).ok_or_else(|| AftError::InvalidRequest {
-        message: format!("unsupported file for call graph: {}", path.display()),
-    })?;
+    let lang =
+        detect_language_from_source(path, source).ok_or_else(|| AftError::InvalidRequest {
+            message: format!("unsupported file for call graph: {}", path.display()),
+        })?;
     build_file_data_from_source_with_lang(path, source, lang)
 }
 
@@ -1658,19 +1655,7 @@ pub(crate) fn build_file_data_from_source_with_lang(
     source: &str,
     lang: LangId,
 ) -> Result<FileCallData, AftError> {
-    let grammar = grammar_for(lang);
-    let mut parser = Parser::new();
-    parser
-        .set_language(&grammar)
-        .map_err(|e| AftError::ParseError {
-            message: format!("grammar init failed for {:?}: {}", lang, e),
-        })?;
-
-    let tree = parser
-        .parse(&source, None)
-        .ok_or_else(|| AftError::ParseError {
-            message: format!("parse failed for {}", path.display()),
-        })?;
+    let (tree, lang) = crate::parser::parse_resolved_source(path, source, lang)?;
 
     let line_index = SourceLineIndex::new(source);
     build_file_data_from_tree(path, source, lang, &tree, &line_index)

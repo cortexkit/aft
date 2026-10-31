@@ -13499,7 +13499,8 @@ fn ensure_database_ready(conn: &Connection) -> Result<()> {
 ///   completion does not duplicate documented methods.
 /// - v13: known interface contracts and their implementation fan-out retain
 ///   exact/dispatch provenance; a concrete trait call has only its actual target.
-const BUILD_OUTPUT_VERSION: &str = "v22-python-import-bindings";
+/// - v23: `.h` definitions and references use their content-resolved language.
+const BUILD_OUTPUT_VERSION: &str = "v23-h-header-language";
 
 fn staging_file_name(project_key: &str) -> String {
     format!("{project_key}.{BUILD_OUTPUT_VERSION}.staging.sqlite.tmp.resume")
@@ -20506,10 +20507,8 @@ fn parse_dispatch_source(
     lang: LangId,
 ) -> Option<ParsedDispatchSource> {
     let source = crate::project_content::read_to_string(project_root.join(caller_file)).ok()?;
-    let grammar = crate::parser::grammar_for(lang);
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&grammar).ok()?;
-    let tree = parser.parse(&source, None)?;
+    let tree =
+        parse_source_with_cached_parser(&project_root.join(caller_file), &source, lang).ok()?;
     Some(ParsedDispatchSource { source, tree })
 }
 

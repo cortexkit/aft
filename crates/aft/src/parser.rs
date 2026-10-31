@@ -1,7 +1,7 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::SystemTime;
 
 #[cfg(test)]
@@ -760,8 +760,48 @@ pub enum LangId {
     Toml,
 }
 
-/// Maps file extension to language identifier.
+/// Detect a file's language, resolving ambiguous headers from their contents.
 pub fn detect_language(path: &Path) -> Option<LangId> {
+    if is_h_header(path) {
+        return read_source(path)
+            .ok()
+            .and_then(|source| detect_language_from_source(path, &source))
+            .or(Some(LangId::C));
+    }
+    language_for_extension(path)
+}
+
+/// Detect against the caller's source snapshot rather than reopening the file.
+pub(crate) fn detect_language_from_source(path: &Path, source: &str) -> Option<LangId> {
+    let lang = language_for_extension(path)?;
+    if is_h_header(path) {
+        return parse_resolved_source(path, source, lang)
+            .ok()
+            .map(|(_, lang)| lang);
+    }
+    Some(lang)
+}
+
+fn is_h_header(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("h")
+}
+
+/// Language for a stored-content key, without reading a possibly newer file.
+/// An unresolved header is a cache miss; its source must be parsed before a key
+/// can be chosen safely.
+pub(crate) fn language_for_content_hash(path: &Path, hash: blake3::Hash) -> Option<LangId> {
+    if is_h_header(path) {
+        return HEADER_PARSE_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .get(&hash)
+            .map(|(_, lang)| *lang);
+    }
+    language_for_extension(path)
+}
+
+pub(crate) fn language_for_extension(path: &Path) -> Option<LangId> {
     if path.file_name().and_then(|name| name.to_str()) == Some("Jenkinsfile") {
         return Some(LangId::Groovy);
     }
@@ -1044,6 +1084,74 @@ pub(crate) fn parse_source_with_cached_parser(
     source: &str,
     lang: LangId,
 ) -> Result<Tree, AftError> {
+    parse_resolved_source(path, source, lang).map(|(tree, _)| tree)
+}
+
+#[derive(Default)]
+struct HeaderParseCache {
+    entries: HashMap<blake3::Hash, (Tree, LangId)>,
+    order: VecDeque<blake3::Hash>,
+}
+
+// FileParser instances are request-local. Share header trees by content so a
+// language-only consumer and a later symbol/graph consumer use the same verdict
+// without repeating the fallback parses. Eviction affects reuse, not results.
+static HEADER_PARSE_CACHE: LazyLock<Mutex<HeaderParseCache>> =
+    LazyLock::new(|| Mutex::new(HeaderParseCache::default()));
+
+/// Reuse a resolved header tree in path-free extraction without changing the
+/// caller's already-resolved language.
+pub(crate) fn cached_header_tree(source: &str, lang: LangId) -> Option<Tree> {
+    if !matches!(lang, LangId::C | LangId::Cpp | LangId::ObjC) {
+        return None;
+    }
+    HEADER_PARSE_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entries
+        .get(&cache_freshness::hash_bytes(source.as_bytes()))
+        .filter(|(_, resolved)| *resolved == lang)
+        .map(|(tree, _)| tree.clone())
+}
+
+pub(crate) fn parse_resolved_source(
+    path: &Path,
+    source: &str,
+    lang: LangId,
+) -> Result<(Tree, LangId), AftError> {
+    if !is_h_header(path) {
+        return parse_source_with_parser(path, source, lang).map(|tree| (tree, lang));
+    }
+    let hash = cache_freshness::hash_bytes(source.as_bytes());
+    let mut cache = HEADER_PARSE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(parsed) = cache.entries.get(&hash) {
+        return Ok(parsed.clone());
+    }
+
+    let c_tree = parse_source_with_parser(path, source, LangId::C)?;
+    let mut resolved = (c_tree.clone(), LangId::C);
+    if c_tree.root_node().has_error() {
+        for candidate in [LangId::Cpp, LangId::ObjC] {
+            let tree = parse_source_with_parser(path, source, candidate)?;
+            // has_error includes both ERROR nodes and inserted MISSING nodes.
+            if !tree.root_node().has_error() {
+                resolved = (tree, candidate);
+                break;
+            }
+        }
+    }
+    // Bound retained trees independently of the number of FileParser instances.
+    if cache.entries.len() == 128 {
+        if let Some(oldest) = cache.order.pop_front() {
+            cache.entries.remove(&oldest);
+        }
+    }
+    cache.order.push_back(hash);
+    cache.entries.insert(hash, resolved.clone());
+    Ok(resolved)
+}
+
+fn parse_source_with_parser(path: &Path, source: &str, lang: LangId) -> Result<Tree, AftError> {
     #[cfg(test)]
     work_counters::CACHED_PARSER_PARSES.with(|count| count.set(count.get() + 1));
     REUSABLE_PARSERS.with(|parsers| {
@@ -1078,6 +1186,7 @@ struct CachedTree {
     size: u64,
     content_hash: blake3::Hash,
     tree: Tree,
+    lang: LangId,
     source: Option<Arc<String>>,
 }
 
@@ -1836,7 +1945,7 @@ impl FileParser {
     /// Parse a file, returning the tree and detected language. Uses cache if
     /// the file hasn't been modified since last parse.
     pub fn parse(&mut self, path: &Path) -> Result<(&Tree, LangId), AftError> {
-        let lang = detect_language(path).ok_or_else(|| AftError::InvalidRequest {
+        let lang = language_for_extension(path).ok_or_else(|| AftError::InvalidRequest {
             message: format!(
                 "unsupported file extension: {}",
                 path.extension()
@@ -1875,7 +1984,9 @@ impl FileParser {
                 path: format!("{}: {}", path.display(), e),
             })?;
 
-            let tree = Self::parse_source(path, &source, lang)?;
+            let (tree, lang) = parse_resolved_source(path, &source, lang)?;
+            #[cfg(test)]
+            work_counters::TREE_PARSES.with(|count| count.set(count.get() + 1));
 
             self.cache.insert(
                 canon.clone(),
@@ -1884,6 +1995,7 @@ impl FileParser {
                     size: source.len() as u64,
                     content_hash: content_hash_for_source(&source),
                     tree,
+                    lang,
                     source: self.capture_source.then(|| captured_source(source)),
                 },
             );
@@ -1892,7 +2004,7 @@ impl FileParser {
         let cached = self.cache.get(&canon).ok_or_else(|| AftError::ParseError {
             message: format!("parser cache missing entry for {}", path.display()),
         })?;
-        Ok((&cached.tree, lang))
+        Ok((&cached.tree, cached.lang))
     }
 
     /// Like [`FileParser::parse`] but returns an owned `Tree` clone.
@@ -2109,7 +2221,7 @@ impl FileParser {
         size: u64,
         content_hash: blake3::Hash,
     ) -> Result<(&Tree, LangId), AftError> {
-        let lang = detect_language(path).ok_or_else(|| AftError::InvalidRequest {
+        let lang = language_for_extension(path).ok_or_else(|| AftError::InvalidRequest {
             message: format!(
                 "unsupported file extension: {}",
                 path.extension()
@@ -2131,7 +2243,9 @@ impl FileParser {
         };
 
         if needs_reparse {
-            let tree = Self::parse_source(path, source, lang)?;
+            let (tree, lang) = parse_resolved_source(path, source, lang)?;
+            #[cfg(test)]
+            work_counters::TREE_PARSES.with(|count| count.set(count.get() + 1));
 
             self.cache.insert(
                 canon.clone(),
@@ -2140,6 +2254,7 @@ impl FileParser {
                     size,
                     content_hash,
                     tree,
+                    lang,
                     source: self
                         .capture_source
                         .then(|| captured_source(source.to_owned())),
@@ -2150,7 +2265,7 @@ impl FileParser {
         let cached = self.cache.get(&canon).ok_or_else(|| AftError::ParseError {
             message: format!("parser cache missing entry for {}", path.display()),
         })?;
-        Ok((&cached.tree, lang))
+        Ok((&cached.tree, cached.lang))
     }
 
     /// Extract symbols from a file using language-specific query patterns.
@@ -9451,6 +9566,105 @@ mod tests {
         let symbols = parser.extract_symbols(&path).unwrap();
         assert!(symbols.iter().any(|symbol| symbol.name == "Widget"));
         assert!(symbols.iter().any(|symbol| symbol.name == "value"));
+    }
+
+    #[test]
+    fn h_header_fallback_budget_and_cross_consumer_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("budget.h");
+        for (body, expected, parses) in [
+            ("int plain(void);", LangId::C, 1),
+            (
+                "namespace api { class Widget { public: void run(); }; }",
+                LangId::Cpp,
+                2,
+            ),
+            (
+                "@interface Greeter\n@property int value;\n- (void)run;\n@end",
+                LangId::ObjC,
+                3,
+            ),
+            ("namespace api { class Broken {", LangId::C, 3),
+        ] {
+            let source = format!("// {}\n{body}\n", path.display());
+            std::fs::write(&path, &source).unwrap();
+            let before = work_counters::cached_parser_parses();
+            let (tree, lang) = parse_resolved_source(&path, &source, LangId::C).unwrap();
+            assert_eq!(lang, expected, "{body}");
+            assert_eq!(
+                work_counters::cached_parser_parses() - before,
+                parses,
+                "{body}"
+            );
+            assert_eq!(detect_language(&path), Some(expected));
+            let mut parser = FileParser::new();
+            assert_eq!(parser.parse(&path).unwrap().1, expected);
+            parser.extract_symbols(&path).unwrap();
+            let label = format!("{expected:?}").to_lowercase();
+            crate::callgraph_store::join::CallgraphBlob::extract(&source, &label, "header-test")
+                .unwrap();
+            let ast_lang = match expected {
+                LangId::C => crate::ast_grep_lang::AstGrepLang::C,
+                LangId::Cpp => crate::ast_grep_lang::AstGrepLang::Cpp,
+                LangId::ObjC => crate::ast_grep_lang::AstGrepLang::ObjC,
+                _ => unreachable!(),
+            };
+            assert!(ast_lang.matches_path(&path));
+            assert_eq!(
+                crate::lsp::manager::language_id_for_path(&path, Some(&source)),
+                match expected {
+                    LangId::ObjC => "objective-c",
+                    LangId::Cpp => "cpp",
+                    _ => "c",
+                }
+            );
+            let path_for_thread = path.clone();
+            let source_for_thread = source.clone();
+            std::thread::spawn(move || {
+                let before = work_counters::cached_parser_parses();
+                assert_eq!(
+                    detect_language_from_source(&path_for_thread, &source_for_thread),
+                    Some(expected)
+                );
+                assert_eq!(work_counters::cached_parser_parses(), before);
+            })
+            .join()
+            .unwrap();
+            assert_eq!(work_counters::cached_parser_parses() - before, parses);
+            if expected == LangId::C && parses == 3 {
+                let old_c = parse_source_with_parser(&path, &source, LangId::C).unwrap();
+                assert_eq!(tree.root_node().to_sexp(), old_c.root_node().to_sexp());
+                assert!(tree.root_node().has_error());
+            }
+        }
+    }
+
+    #[test]
+    fn h_header_missing_nodes_count_as_errors_and_keep_c_when_all_fail() {
+        let source = "int missing_semicolon(void)";
+        let old_c = parse_source_with_parser(Path::new("missing.c"), source, LangId::C).unwrap();
+        assert!(old_c.root_node().has_error());
+        assert!(old_c.root_node().to_sexp().contains("MISSING"));
+        let (tree, lang) =
+            parse_resolved_source(Path::new("missing.h"), source, LangId::C).unwrap();
+        assert_eq!(lang, LangId::C);
+        assert_eq!(tree.root_node().to_sexp(), old_c.root_node().to_sexp());
+    }
+
+    #[test]
+    fn h_header_source_snapshot_overrides_disk_language() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("snapshot.h");
+        std::fs::write(&path, "int c_function(void);\n").unwrap();
+        let source = "class Snapshot { public: int value() { return 7; } };\n";
+        let mut parser = FileParser::new();
+        let hash = content_hash_for_source(source);
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let (tree, lang) = parser
+            .parse_with_source(&path, source, mtime, source.len() as u64, hash)
+            .unwrap();
+        assert_eq!(lang, LangId::Cpp);
+        assert!(!tree.root_node().has_error());
     }
 
     #[test]

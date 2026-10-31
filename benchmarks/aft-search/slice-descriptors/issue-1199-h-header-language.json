@@ -1,0 +1,11 @@
+{
+  "slice_class": "ranking",
+  "targeted_mechanism": "other",
+  "kind": "ranking",
+  "fixtures": [
+    "crates/aft/src/parser.rs::tests::h_header_cpp_resolution",
+    "crates/aft/src/semantic_index.rs::tests::h_header_view_chunking_uses_snapshot_language",
+    "crates/aft/tests/integration/outline_languages_test.rs::h_header_cpp_outline_zoom_and_method_callers"
+  ],
+  "note": "parser.rs and semantic_index.rs cross RANKING_FENCE_PREFIXES: C++ and Objective-C .h files now contribute symbols and semantic chunks using the first error-free C, C++, Objective-C parse. Clean C headers retain their C symbols and chunk boundaries. No scoring or routing weights change. The named regressions cover header symbol recovery and snapshot-based semantic chunking; search-quality replay is deferred to the integrating train rather than claimed as measured benchmark evidence."
+}

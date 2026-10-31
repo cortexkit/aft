@@ -311,6 +311,10 @@ fn scan_file(job: &InspectJob, path: &Path) -> Result<Option<FileScan>, String> 
 }
 
 fn parse_source(path: &Path, lang: LangId, source: &str) -> Result<Tree, String> {
+    if path.extension().and_then(|ext| ext.to_str()) == Some("h") {
+        return crate::parser::parse_source_with_cached_parser(path, source, lang)
+            .map_err(|error| error.to_string());
+    }
     DUPLICATES_PARSERS.with(|parsers| {
         let mut parsers = parsers.borrow_mut();
         if let std::collections::hash_map::Entry::Vacant(entry) = parsers.entry(lang) {
