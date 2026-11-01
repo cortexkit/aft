@@ -23,6 +23,10 @@ use subc_transport::{
 };
 use tokio::net::{TcpListener, TcpStream};
 
+// The router-host probes also open SDK routes through this daemon. Protocol
+// 0.34 clients require its connection metadata to advertise daemon 0.39.0.
+const FAKE_DAEMON_VERSION: &str = "0.39.0";
+
 #[path = "helpers/aft_binary.rs"]
 mod aft_binary;
 #[path = "helpers/executable_cache.rs"]
@@ -642,7 +646,7 @@ impl Jail {
             key: vec![0x42; subc_transport::KEY_LEN],
             daemon_id: [0x24; subc_transport::DAEMON_ID_LEN],
             pid: std::process::id(),
-            daemon_ver: "worker-jail".into(),
+            daemon_ver: FAKE_DAEMON_VERSION.into(),
         };
         let connection_path = if custom_layout {
             let auth = base.join("custom-relay/auth");
@@ -705,7 +709,7 @@ impl Jail {
             &mut stream,
             &[0x42; subc_transport::KEY_LEN],
             &[0x24; subc_transport::DAEMON_ID_LEN],
-            "worker-jail",
+            FAKE_DAEMON_VERSION,
             Duration::from_secs(5),
         )
         .await
