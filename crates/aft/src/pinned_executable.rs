@@ -1135,13 +1135,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn pinned_executable_procfs_image_on_same_device_is_linked_without_copying() {
-        use std::os::fd::AsRawFd;
         use std::os::unix::fs::MetadataExt;
-        let storage = tempfile::tempdir().unwrap();
-        let image = storage.path().join("source-image");
-        std::fs::write(&image, b"immutable startup image").unwrap();
-        let mut source = std::fs::File::open(&image).unwrap();
-        let proc_image = PathBuf::from(format!("/proc/self/fd/{}", source.as_raw_fd()));
+        let executable = std::env::current_exe().unwrap();
+        let storage = tempfile::tempdir_in(executable.parent().unwrap()).unwrap();
+        let proc_image = linux_image_path();
+        let mut source = std::fs::File::open(&proc_image).unwrap();
         let destination = storage.path().join("pin");
         materialize(&proc_image, &mut source, &destination, link_image).unwrap();
         let held = source.metadata().unwrap();
@@ -1152,10 +1150,7 @@ mod tests {
             pinned.ino(),
             "same-device procfs image was copied"
         );
-        assert_eq!(
-            std::fs::read(&destination).unwrap(),
-            b"immutable startup image"
-        );
+        assert_eq!(held.len(), pinned.len());
     }
 
     #[cfg(unix)]
