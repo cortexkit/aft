@@ -45,6 +45,7 @@ fn call_while_probe_is_held(project_evidence: bool) -> Value {
         ("AFT_TEST_STANDALONE_INITIAL_REQUEST_COUNT", "2".as_ref()),
         ("AFT_TEST_ADMISSION_STARTED", started.as_os_str()),
         ("AFT_TEST_ADMISSION_RELEASE", release.as_os_str()),
+        ("AFT_TEST_ADMISSION_TRACE", "1".as_ref()),
     ]);
     // Both frames are queued before configure's post-ACK maintenance can run.
     aft.send_silent(&configure(&project, &dir.path().join("storage"), "bind").to_string());
@@ -67,7 +68,11 @@ fn call_while_probe_is_held(project_evidence: bool) -> Value {
     }
     drop(release_on_drop);
     let tool = response(&mut aft, "first-tool");
-    assert!(aft.shutdown().success());
+    let (status, stderr) = aft.stderr_output();
+    if tool["success"] != true {
+        eprintln!("{stderr}");
+    }
+    assert!(status.success(), "{stderr}");
     tool
 }
 

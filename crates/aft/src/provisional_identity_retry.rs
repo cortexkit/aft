@@ -404,6 +404,13 @@ pub(crate) fn poll(ctx: &AppContext) -> Option<PreparedReplay> {
         }
     };
     if stale_reason(ctx, &retry).is_some() {
+        #[cfg(debug_assertions)]
+        if retry.kind == RetryKind::FolderAdmission {
+            crate::folder_admission_runtime::trace_for_test(format_args!(
+                "retry dropped: {:?}",
+                stale_reason(ctx, &retry)
+            ));
+        }
         let mut pending = slot.0.lock();
         if pending.as_ref().is_some_and(|current| {
             current.generation == retry.generation
@@ -418,6 +425,10 @@ pub(crate) fn poll(ctx: &AppContext) -> Option<PreparedReplay> {
     if retry.kind == RetryKind::FolderAdmission {
         match crate::folder_admission_runtime::resolve(ctx) {
             crate::folder_admission_runtime::ResolveResult::Ready(generation) => {
+                #[cfg(debug_assertions)]
+                crate::folder_admission_runtime::trace_for_test(format_args!(
+                    "replay ready generation={generation}"
+                ));
                 retry.generation = generation
             }
             crate::folder_admission_runtime::ResolveResult::Wait => {

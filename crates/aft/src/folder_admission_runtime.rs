@@ -113,6 +113,13 @@ pub fn wait_budget() -> Duration {
     ProbeBudgets::default().time + Duration::from_millis(250)
 }
 
+#[cfg(debug_assertions)]
+pub fn trace_for_test(event: std::fmt::Arguments<'_>) {
+    if std::env::var_os("AFT_TEST_ADMISSION_TRACE").is_some() {
+        eprintln!("[folder-admission] {event}");
+    }
+}
+
 pub fn waiting(ctx: &AppContext) -> bool {
     reason(ctx).as_deref() == Some("folder_admission_pending")
 }
@@ -1090,6 +1097,11 @@ fn probe_cache(
     live_generation: &std::sync::atomic::AtomicU64,
     generation: u64,
 ) -> ProbeResult {
+    #[cfg(debug_assertions)]
+    trace_for_test(format_args!(
+        "worker start generation={generation} root={}",
+        root.display()
+    ));
     let lock = root_probe_lock(root);
     let Some(_guard) = lock.try_lock_for(ProbeBudgets::default().time) else {
         return ProbeResult::Exhausted;
@@ -1133,6 +1145,11 @@ fn probe_cache(
     if live_generation.load(Ordering::Acquire) == generation {
         persist(config, root, &cache);
     }
+    #[cfg(debug_assertions)]
+    trace_for_test(format_args!(
+        "worker complete generation={generation} classification={:?}",
+        cache.decision.classification
+    ));
     ProbeResult::Complete(cache, false)
 }
 
@@ -1338,6 +1355,10 @@ pub(crate) fn resolve(ctx: &AppContext) -> ResolveResult {
     drop(slot);
     *task = None;
     drop(task);
+    #[cfg(debug_assertions)]
+    trace_for_test(format_args!(
+        "decision generation={apply_generation} negative={negative} cap={wait_cap_exceeded}"
+    ));
     if wait_cap_exceeded {
         log::warn!(
             "folder admission wait ended without a complete decision for {} (cap {:?}); refusing with incomplete evidence",

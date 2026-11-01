@@ -3952,6 +3952,12 @@ pub(crate) fn handle_folder_admission_replay(req: &RawRequest, ctx: &AppContext)
         return Response::success(&req.id, json!({}));
     };
     let mut response = handle_configure_inner(req, ctx, None, Some(&config));
+    #[cfg(debug_assertions)]
+    crate::folder_admission_runtime::trace_for_test(format_args!(
+        "replay returned success={} folder={:?}",
+        response.success,
+        crate::folder_admission_runtime::snapshot(ctx)
+    ));
     if response.success {
         crate::folder_admission_runtime::after_configure(ctx, req);
     }
