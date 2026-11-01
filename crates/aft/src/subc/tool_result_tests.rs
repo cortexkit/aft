@@ -60,6 +60,7 @@ fn opted_in(trust: BindTrust) -> wire::ToolResponsePolicy {
     wire::ToolResponsePolicy {
         trust,
         tool_result_body: true,
+        model_only: false,
     }
 }
 
@@ -877,6 +878,7 @@ fn tool_result_retained_legacy_replies_use_the_current_route() {
                 wire::ToolResponsePolicy {
                     trust,
                     tool_result_body: enabled,
+                    model_only: false,
                 },
                 None,
             );
@@ -1109,7 +1111,11 @@ async fn tool_result_ledger_records_before_projection_and_replays_by_route() {
     output.await.unwrap().unwrap();
 }
 
-async fn assert_keyed_projection_replay_is_exact(result: ToolCallResult, trust: BindTrust) {
+async fn assert_keyed_projection_replay_is_exact(
+    result: ToolCallResult,
+    trust: BindTrust,
+    runner_principal: Option<&str>,
+) {
     use crate::db::call_ledger as ledger;
     let (dir, root) = test_support::test_root("exact-projection-replay");
     let ctx = test_support::test_ctx();
@@ -1124,8 +1130,18 @@ async fn assert_keyed_projection_replay_is_exact(result: ToolCallResult, trust: 
         data.role = tool_provider::RouteRole::ToolProviderV1;
         data.trust = trust;
         data.tool_result_body = enabled;
+        if let Some(principal) = runner_principal {
+            let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut data.spawn_principal
+            else {
+                unreachable!("fixture route bind")
+            };
+            *principal_id = Some(principal.into());
+        }
         identity
     };
+    let expect_model_only = runner_principal.is_some();
+    assert_eq!(identity(true).reply_policy().model_only, expect_model_only);
+    let include_structured = trust != BindTrust::Untrusted && !expect_model_only;
     let key = tool_provider::LedgerEdge::key(&identity(true), "exact-result");
     let (edge, mut ready) = tool_provider::LedgerEdge::new();
     let metrics = Arc::new(DispatchPathMetrics::new());
@@ -1188,7 +1204,7 @@ async fn assert_keyed_projection_replay_is_exact(result: ToolCallResult, trust: 
         7,
         control_flags(),
         &result,
-        opted_in(trust),
+        &identity(true),
     )
     .unwrap();
     send_reliable_writer_frame(&writer, &metrics, outgoing, "exact-replay test")
@@ -1212,14 +1228,23 @@ async fn assert_keyed_projection_replay_is_exact(result: ToolCallResult, trust: 
     let first_value: Value = serde_json::from_slice(&first.body).unwrap();
     assert_eq!(
         first_value.get("structuredContent").is_some(),
-        trust != BindTrust::Untrusted
+        include_structured
     );
-    if result.response.success {
+    assert_eq!(first_value["content"][0]["text"], result.text);
+    assert_eq!(first_value["isError"], !result.response.success);
+    if expect_model_only {
+        assert_eq!(
+            first_value.as_object().unwrap().len(),
+            if result.response.success { 2 } else { 3 }
+        );
+    }
+    if result.response.data.get("attachments").is_some() {
         assert_eq!(
             first_value["content"][1]["data"],
             result.response.data["attachments"][0]["data"]
         );
-    } else {
+    }
+    if !result.response.success {
         assert_eq!(first_value["errorCode"], "path_outside_root");
     }
     assert_eq!(
@@ -1245,11 +1270,22 @@ async fn assert_keyed_projection_replay_is_exact(result: ToolCallResult, trust: 
     let rendered = retained_result::render(
         &retained,
         &legacy,
-        trust != BindTrust::Untrusted,
+        include_structured,
         result_body::MAX_RESULT_BYTES,
     )
     .unwrap();
     assert_eq!(rendered.bytes, first.body);
+    let full =
+        retained_result::render(&retained, &legacy, true, result_body::MAX_RESULT_BYTES).unwrap();
+    let full: Value = serde_json::from_slice(&full.bytes).unwrap();
+    for field in ["metadata", "output", "output_preview"] {
+        if let Some(expected) = result.response.data.get(field) {
+            assert_eq!(
+                &full["structuredContent"][field], expected,
+                "native retention must keep {field}"
+            );
+        }
+    }
     drop(conn);
     // A new ledger edge and database connection rule out an in-memory replay cache.
     let (restarted, _ready) = tool_provider::LedgerEdge::new();
@@ -1270,6 +1306,8 @@ async fn assert_keyed_projection_replay_is_exact(result: ToolCallResult, trust: 
             replay.body,
             if enabled {
                 first.body.clone()
+            } else if expect_model_only {
+                wire::tests::legacy_tool_response_body(&result, false)
             } else {
                 legacy.clone()
             },
@@ -1291,7 +1329,7 @@ async fn tool_result_keyed_image_replay_is_exact_on_untrusted_and_trusted_routes
         .unwrap();
     let data = base64::engine::general_purpose::STANDARD.encode(bytes.into_inner());
     for trust in [BindTrust::Untrusted, BindTrust::FirstParty] {
-        assert_keyed_projection_replay_is_exact(ToolCallResult { text: "read image".into(), response: Response::success("exact-id", json!({"attachments":[{"kind":"image","mime":"image/png","data":data,"width":8,"height":7,"alt":"native image description, not the call path"}]})) }, trust).await;
+        assert_keyed_projection_replay_is_exact(ToolCallResult { text: "read image".into(), response: Response::success("exact-id", json!({"attachments":[{"kind":"image","mime":"image/png","data":data,"width":8,"height":7,"alt":"native image description, not the call path"}]})) }, trust, None).await;
     }
 }
 
@@ -1304,8 +1342,51 @@ async fn tool_result_keyed_error_replay_is_exact_on_untrusted_and_trusted_routes
                 response: Response::error("exact-id", "path_outside_root", "outside root"),
             },
             trust,
+            None,
         )
         .await;
+    }
+}
+
+#[tokio::test]
+async fn tool_result_runner_keyed_native_replays_are_slim() {
+    use base64::Engine;
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 7))
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+    let image = base64::engine::general_purpose::STANDARD.encode(bytes.into_inner());
+    for principal in ["reserved:broca", "reserved:thalamus-harness"] {
+        for result in [
+            ToolCallResult {
+                text: "Edited fixture.rs".into(),
+                response: Response::success(
+                    "edit-id",
+                    json!({"metadata":{"diff":"--- a/fixture.rs\n+++ b/fixture.rs\n-old\n+new\n"},"path":"fixture.rs"}),
+                ),
+            },
+            ToolCallResult {
+                text: "command output".into(),
+                response: Response::success(
+                    "bash-id",
+                    json!({"output":"command output","output_preview":"command output","text":"command output","exit_code":0}),
+                ),
+            },
+            ToolCallResult {
+                text: "read image".into(),
+                response: Response::success(
+                    "image-id",
+                    json!({"attachments":[{"kind":"image","mime":"image/png","data":image,"width":8,"height":7,"alt":"native image description, not the call path"}]}),
+                ),
+            },
+            ToolCallResult {
+                text: "outside root".into(),
+                response: Response::error("error-id", "path_outside_root", "outside root"),
+            },
+        ] {
+            assert_keyed_projection_replay_is_exact(result, BindTrust::FirstParty, Some(principal))
+                .await;
+        }
     }
 }
 
@@ -1400,7 +1481,8 @@ fn tool_result_retention_is_bounded_trust_independent_and_keeps_legacy_view() {
             frame,
             wire::ToolResponsePolicy {
                 trust: BindTrust::FirstParty,
-                tool_result_body: false
+                tool_result_body: false,
+                model_only: false,
             },
             None,
             Some(vec![0xff])

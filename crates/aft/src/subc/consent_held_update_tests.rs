@@ -154,7 +154,13 @@ async fn approval_held_update_is_gated_durable_and_followed_by_one_terminal() {
         assert_ne!(late(&f, &run, 9200).await["isError"], true);
         let key = tool_provider::LedgerEdge::key(&run, "program-9200");
         let db = f.ctx.db().unwrap();
-        let row = ledger::get(&db.lock().unwrap(), &key).unwrap().unwrap();
+        let row = ledger::get_for_replay(&db.lock().unwrap(), &key)
+            .unwrap()
+            .unwrap();
+        assert!(
+            row.tool_result_source.is_some(),
+            "a consent-held terminal must retain its native source for exact keyed replay"
+        );
         let owner = row.scope.unwrap().owner;
         let feed = |conn: &rusqlite::Connection, incarnation: &str| -> Value {
             serde_json::from_slice(
@@ -256,5 +262,68 @@ async fn approval_held_update_is_gated_durable_and_followed_by_one_terminal() {
         let acked = feed(&reopened, "after-restart");
         assert_eq!(acked["entries"].as_array().unwrap().len(), 1);
         assert_eq!(acked["entries"][0]["kind"], "result");
+    }
+}
+
+#[tokio::test]
+async fn classic_runner_consent_completion_is_slim_after_writer_projection() {
+    fn dispatch(request: RawRequest, ctx: &AppContext) -> Response {
+        let mut response = read_dispatch(request, ctx);
+        if response.success {
+            response.data["metadata"] = json!({"diff":"--- a/file\n+++ b/file\n-old display-only line\n+new display-only line\n"});
+        }
+        response
+    }
+
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    for principal in ["reserved:broca", "reserved:thalamus-harness"] {
+        let f = fixture(FakeCingulate::up());
+        set_hold_budget_for_test(Some(Duration::from_secs(3)));
+        let path = f.head_root.join("runner-visible.txt");
+        std::fs::write(&path, "visible content\n").unwrap();
+        let mut worker = identity(&f.worker.project_root, f.worker.scope.clone());
+        let data = Arc::get_mut(&mut worker.0).unwrap();
+        data.harness = "opencode".into();
+        data.tool_result_body = true;
+        data.held_reply = true;
+        data.held_update = true;
+        let AuthenticatedPrincipal::RouteBind {
+            principal_id,
+            harness,
+            ..
+        } = &mut data.spawn_principal
+        else {
+            unreachable!("fixture route bind")
+        };
+        *principal_id = Some(principal.into());
+        *harness = "opencode".into();
+        let mut replies = f.send_with(&worker, &path, 9300, dispatch).await;
+        wait_for(|| f.fake.calls("consent.request").len() == 1).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), replies.recv())
+                .await
+                .is_err(),
+            "a Classic runner must not be switched to a program held reply"
+        );
+        let request = f.fake.calls("consent.request")[0].clone();
+        f.fake.answer(
+            request["call_key"].as_str().unwrap(),
+            json!({"state":"settled", "outcome":"allow_once", "answered_by":"user"}),
+        );
+        let mut reply = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let retained: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert!(retained["structuredContent"]["metadata"]["diff"]
+            .as_str()
+            .unwrap()
+            .contains("display-only line"));
+        reply.project_tool_result().unwrap();
+        let delivered: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(delivered["isError"], false, "{delivered}");
+        assert_eq!(delivered.as_object().unwrap().len(), 2, "{delivered}");
+        assert!(text(&delivered).contains("visible content"), "{delivered}");
+        assert!(!delivered.to_string().contains("display-only line"));
     }
 }

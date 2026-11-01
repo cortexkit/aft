@@ -1,0 +1,592 @@
+<sources>
+  <source name="features.luau">
+    <chunk srow="0" scol="0" erow="42" ecol="0">
+      <comment srow="0" scol="0" erow="0" ecol="9">
+        --
+        <comment_content field="content" srow="0" scol="2" erow="0" ecol="9">!strict</comment_content>
+      </comment>
+      <comment srow="1" scol="0" erow="1" ecol="28">
+        --
+        <comment_content field="content" srow="1" scol="2" erow="1" ecol="28"> TODO: single-line comment</comment_content>
+      </comment>
+      <comment srow="2" scol="0" erow="4" ecol="3">
+        --[=[
+        <comment_content field="content" srow="2" scol="5" erow="4" ecol="0">
+TODO: block comment with a scanner delimiter
+</comment_content>
+        ]=]
+      </comment>
+      <type_alias_declaration srow="5" scol="0" erow="5" ecol="49">
+        export
+        type
+        <type_identifier field="name" srow="5" scol="12" erow="5" ecol="15">Box</type_identifier>
+        &lt;
+        <generic_type_list_with_defaults field="type_parameters" srow="5" scol="16" erow="5" ecol="17">
+          <generic_type_parameter srow="5" scol="16" erow="5" ecol="17">
+            <type_identifier srow="5" scol="16" erow="5" ecol="17">T</type_identifier>
+          </generic_type_parameter>
+        </generic_type_list_with_defaults>
+        &gt;
+        =
+        <table_type field="type" srow="5" scol="21" erow="5" ecol="49">
+          {
+          <table_property_list srow="5" scol="23" erow="5" ecol="47">
+            <table_property srow="5" scol="23" erow="5" ecol="31">
+              <field_identifier field="left" srow="5" scol="23" erow="5" ecol="28">value</field_identifier>
+              :
+              <type_reference field="right" srow="5" scol="30" erow="5" ecol="31">
+                <type_identifier field="name" srow="5" scol="30" erow="5" ecol="31">T</type_identifier>
+              </type_reference>
+            </table_property>
+            ,
+            <table_property srow="5" scol="33" erow="5" ecol="47">
+              <field_identifier field="left" srow="5" scol="33" erow="5" ecol="38">label</field_identifier>
+              :
+              <optional_type field="right" srow="5" scol="40" erow="5" ecol="47">
+                <type_reference srow="5" scol="40" erow="5" ecol="46">
+                  <type_identifier field="name" srow="5" scol="40" erow="5" ecol="46">string</type_identifier>
+                </type_reference>
+                ?
+              </optional_type>
+            </table_property>
+          </table_property_list>
+          }
+        </table_type>
+      </type_alias_declaration>
+      <type_alias_declaration srow="6" scol="0" erow="6" ecol="55">
+        type
+        <type_identifier field="name" srow="6" scol="5" erow="6" ecol="13">Callback</type_identifier>
+        =
+        <function_type field="type" srow="6" scol="16" erow="6" ecol="55">
+          (
+          <bound_type_list field="parameters" srow="6" scol="17" erow="6" ecol="34">
+            <type_binding srow="6" scol="17" erow="6" ecol="23">
+              <type_reference field="type" srow="6" scol="17" erow="6" ecol="23">
+                <type_identifier field="name" srow="6" scol="17" erow="6" ecol="23">number</type_identifier>
+              </type_reference>
+            </type_binding>
+            ,
+            <variadic_type_pack srow="6" scol="25" erow="6" ecol="34">
+              ...
+              <type_reference srow="6" scol="28" erow="6" ecol="34">
+                <type_identifier field="name" srow="6" scol="28" erow="6" ecol="34">string</type_identifier>
+              </type_reference>
+            </variadic_type_pack>
+          </bound_type_list>
+          )
+          -&gt;
+          <type_pack field="return_type" srow="6" scol="39" erow="6" ecol="55">
+            (
+            <type_reference srow="6" scol="40" erow="6" ecol="46">
+              <type_identifier field="name" srow="6" scol="40" erow="6" ecol="46">number</type_identifier>
+            </type_reference>
+            ,
+            <type_reference srow="6" scol="48" erow="6" ecol="54">
+              <type_identifier field="name" srow="6" scol="48" erow="6" ecol="54">string</type_identifier>
+            </type_reference>
+            )
+          </type_pack>
+        </function_type>
+      </type_alias_declaration>
+      <local_variable_declaration srow="8" scol="0" erow="8" ecol="50">
+        local
+        <binding_list srow="8" scol="6" erow="8" ecol="10">
+          <binding srow="8" scol="6" erow="8" ecol="10">
+            <identifier field="name" srow="8" scol="6" erow="8" ecol="10">text</identifier>
+          </binding>
+        </binding_list>
+        =
+        <expression_list srow="8" scol="13" erow="8" ecol="50">
+          <string srow="8" scol="13" erow="8" ecol="50">
+            [==[
+            <string_content field="content" srow="8" scol="17" erow="8" ecol="46">a long string with ]=] inside</string_content>
+            ]==]
+          </string>
+        </expression_list>
+      </local_variable_declaration>
+      <local_variable_declaration srow="9" scol="0" erow="9" ecol="62">
+        local
+        <binding_list srow="9" scol="6" erow="9" ecol="13">
+          <binding srow="9" scol="6" erow="9" ecol="13">
+            <identifier field="name" srow="9" scol="6" erow="9" ecol="13">escaped</identifier>
+          </binding>
+        </binding_list>
+        =
+        <expression_list srow="9" scol="16" erow="9" ecol="62">
+          <string srow="9" scol="16" erow="9" ecol="62">
+            "
+            <string_content field="content" srow="9" scol="17" erow="9" ecol="61">quoted \"value\" and whitespace\z  continued</string_content>
+            "
+          </string>
+        </expression_list>
+      </local_variable_declaration>
+      <local_function_declaration srow="10" scol="0" erow="12" ecol="3">
+        local
+        function
+        <identifier field="name" srow="10" scol="15" erow="10" ecol="21">choose</identifier>
+        &lt;
+        <generic_type_list field="type_parameters" srow="10" scol="22" erow="10" ecol="23">
+          <generic_type_parameter srow="10" scol="22" erow="10" ecol="23">
+            <type_identifier srow="10" scol="22" erow="10" ecol="23">T</type_identifier>
+          </generic_type_parameter>
+        </generic_type_list>
+        &gt;
+        <parameters field="parameters" srow="10" scol="24" erow="10" ecol="47">
+          (
+          <binding srow="10" scol="25" erow="10" ecol="33">
+            <identifier field="name" srow="10" scol="25" erow="10" ecol="30">value</identifier>
+            :
+            <type_reference field="type" srow="10" scol="32" erow="10" ecol="33">
+              <type_identifier field="name" srow="10" scol="32" erow="10" ecol="33">T</type_identifier>
+            </type_reference>
+          </binding>
+          ,
+          <binding srow="10" scol="35" erow="10" ecol="46">
+            <identifier field="name" srow="10" scol="35" erow="10" ecol="43">fallback</identifier>
+            :
+            <type_reference field="type" srow="10" scol="45" erow="10" ecol="46">
+              <type_identifier field="name" srow="10" scol="45" erow="10" ecol="46">T</type_identifier>
+            </type_reference>
+          </binding>
+          )
+        </parameters>
+        :
+        <type_reference field="return_type" srow="10" scol="49" erow="10" ecol="50">
+          <type_identifier field="name" srow="10" scol="49" erow="10" ecol="50">T</type_identifier>
+        </type_reference>
+        <block field="body" srow="11" scol="4" erow="11" ecol="51">
+          <return_statement srow="11" scol="4" erow="11" ecol="51">
+            return
+            <expression_list srow="11" scol="11" erow="11" ecol="51">
+              <if_else_expression srow="11" scol="11" erow="11" ecol="51">
+                if
+                <binary_expression field="condition" srow="11" scol="14" erow="11" ecol="26">
+                  <identifier field="left" srow="11" scol="14" erow="11" ecol="19">value</identifier>
+                  ~=
+                  <nil field="right" srow="11" scol="23" erow="11" ecol="26">nil</nil>
+                </binary_expression>
+                then
+                <identifier field="consequence" srow="11" scol="32" erow="11" ecol="37">value</identifier>
+                else
+                <identifier field="alternative" srow="11" scol="43" erow="11" ecol="51">fallback</identifier>
+              </if_else_expression>
+            </expression_list>
+          </return_statement>
+        </block>
+        end
+      </local_function_declaration>
+      <local_variable_declaration srow="14" scol="0" erow="14" ecol="36">
+        local
+        <binding_list srow="14" scol="6" erow="14" ecol="7">
+          <binding srow="14" scol="6" erow="14" ecol="7">
+            <identifier field="name" srow="14" scol="6" erow="14" ecol="7">M</identifier>
+          </binding>
+        </binding_list>
+        =
+        <expression_list srow="14" scol="10" erow="14" ecol="36">
+          <table_constructor srow="14" scol="10" erow="14" ecol="36">
+            {
+            <field srow="14" scol="12" erow="14" ecol="34">
+              <field_identifier field="name" srow="14" scol="12" erow="14" ecol="18">nested</field_identifier>
+              =
+              <table_constructor field="value" srow="14" scol="21" erow="14" ecol="34">
+                {
+                <field srow="14" scol="23" erow="14" ecol="32">
+                  <field_identifier field="name" srow="14" scol="23" erow="14" ecol="28">value</field_identifier>
+                  =
+                  <number field="value" srow="14" scol="31" erow="14" ecol="32">1</number>
+                </field>
+                }
+              </table_constructor>
+            </field>
+            }
+          </table_constructor>
+        </expression_list>
+      </local_variable_declaration>
+      <function_declaration srow="15" scol="0" erow="17" ecol="3">
+        function
+        <dot_index_expression field="name" srow="15" scol="9" erow="15" ecol="14">
+          <identifier field="table" srow="15" scol="9" erow="15" ecol="10">M</identifier>
+          .
+          <field_identifier field="field" srow="15" scol="11" erow="15" ecol="14">add</field_identifier>
+        </dot_index_expression>
+        <parameters field="parameters" srow="15" scol="14" erow="15" ecol="36">
+          (
+          <binding srow="15" scol="15" erow="15" ecol="24">
+            <identifier field="name" srow="15" scol="15" erow="15" ecol="16">a</identifier>
+            :
+            <type_reference field="type" srow="15" scol="18" erow="15" ecol="24">
+              <type_identifier field="name" srow="15" scol="18" erow="15" ecol="24">number</type_identifier>
+            </type_reference>
+          </binding>
+          ,
+          <binding srow="15" scol="26" erow="15" ecol="35">
+            <identifier field="name" srow="15" scol="26" erow="15" ecol="27">b</identifier>
+            :
+            <type_reference field="type" srow="15" scol="29" erow="15" ecol="35">
+              <type_identifier field="name" srow="15" scol="29" erow="15" ecol="35">number</type_identifier>
+            </type_reference>
+          </binding>
+          )
+        </parameters>
+        :
+        <type_reference field="return_type" srow="15" scol="38" erow="15" ecol="44">
+          <type_identifier field="name" srow="15" scol="38" erow="15" ecol="44">number</type_identifier>
+        </type_reference>
+        <block field="body" srow="16" scol="4" erow="16" ecol="16">
+          <return_statement srow="16" scol="4" erow="16" ecol="16">
+            return
+            <expression_list srow="16" scol="11" erow="16" ecol="16">
+              <binary_expression srow="16" scol="11" erow="16" ecol="16">
+                <identifier field="left" srow="16" scol="11" erow="16" ecol="12">a</identifier>
+                +
+                <identifier field="right" srow="16" scol="15" erow="16" ecol="16">b</identifier>
+              </binary_expression>
+            </expression_list>
+          </return_statement>
+        </block>
+        end
+      </function_declaration>
+      <function_declaration srow="18" scol="0" erow="35" ecol="3">
+        function
+        <method_index_expression field="name" srow="18" scol="9" erow="18" ecol="17">
+          <identifier field="table" srow="18" scol="9" erow="18" ecol="10">M</identifier>
+          :
+          <field_identifier field="method" srow="18" scol="11" erow="18" ecol="17">method</field_identifier>
+        </method_index_expression>
+        <parameters field="parameters" srow="18" scol="17" erow="18" ecol="32">
+          (
+          <binding srow="18" scol="18" erow="18" ecol="31">
+            <identifier field="name" srow="18" scol="18" erow="18" ecol="23">count</identifier>
+            :
+            <type_reference field="type" srow="18" scol="25" erow="18" ecol="31">
+              <type_identifier field="name" srow="18" scol="25" erow="18" ecol="31">number</type_identifier>
+            </type_reference>
+          </binding>
+          )
+        </parameters>
+        <block field="body" srow="19" scol="4" erow="34" ecol="26">
+          <local_variable_declaration srow="19" scol="4" erow="19" ecol="19">
+            local
+            <binding_list srow="19" scol="10" erow="19" ecol="15">
+              <binding srow="19" scol="10" erow="19" ecol="15">
+                <identifier field="name" srow="19" scol="10" erow="19" ecol="15">total</identifier>
+              </binding>
+            </binding_list>
+            =
+            <expression_list srow="19" scol="18" erow="19" ecol="19">
+              <number srow="19" scol="18" erow="19" ecol="19">0</number>
+            </expression_list>
+          </local_variable_declaration>
+          <for_statement srow="20" scol="4" erow="28" ecol="7">
+            for
+            <for_numeric_clause field="clause" srow="20" scol="8" erow="20" ecol="20">
+              <binding field="binding" srow="20" scol="8" erow="20" ecol="9">
+                <identifier field="name" srow="20" scol="8" erow="20" ecol="9">i</identifier>
+              </binding>
+              =
+              <number field="start" srow="20" scol="12" erow="20" ecol="13">1</number>
+              ,
+              <identifier field="end" srow="20" scol="15" erow="20" ecol="20">count</identifier>
+            </for_numeric_clause>
+            do
+            <block field="body" srow="21" scol="8" erow="27" ecol="11">
+              <if_statement srow="21" scol="8" erow="27" ecol="11">
+                if
+                <binary_expression field="condition" srow="21" scol="11" erow="21" ecol="21">
+                  <binary_expression field="left" srow="21" scol="11" erow="21" ecol="16">
+                    <identifier field="left" srow="21" scol="11" erow="21" ecol="12">i</identifier>
+                    %
+                    <number field="right" srow="21" scol="15" erow="21" ecol="16">2</number>
+                  </binary_expression>
+                  ==
+                  <number field="right" srow="21" scol="20" erow="21" ecol="21">0</number>
+                </binary_expression>
+                then
+                <block field="consequence" srow="22" scol="12" erow="22" ecol="20">
+                  <continue_statement srow="22" scol="12" erow="22" ecol="20">
+                    continue
+                  </continue_statement>
+                </block>
+                <elseif_statement field="alternative" srow="23" scol="8" erow="24" ecol="17">
+                  elseif
+                  <binary_expression field="condition" srow="23" scol="15" erow="23" ecol="21">
+                    <identifier field="left" srow="23" scol="15" erow="23" ecol="16">i</identifier>
+                    &gt;
+                    <number field="right" srow="23" scol="19" erow="23" ecol="21">20</number>
+                  </binary_expression>
+                  then
+                  <block field="consequence" srow="24" scol="12" erow="24" ecol="17">
+                    <break_statement srow="24" scol="12" erow="24" ecol="17">break</break_statement>
+                  </block>
+                </elseif_statement>
+                <else_statement field="alternative" srow="25" scol="8" erow="26" ecol="22">
+                  else
+                  <block field="body" srow="26" scol="12" erow="26" ecol="22">
+                    <compound_assignment_statement srow="26" scol="12" erow="26" ecol="22">
+                      <identifier field="left" srow="26" scol="12" erow="26" ecol="17">total</identifier>
+                      <compound_operator field="operator" srow="26" scol="18" erow="26" ecol="20">
+                        +=
+                      </compound_operator>
+                      <identifier field="right" srow="26" scol="21" erow="26" ecol="22">i</identifier>
+                    </compound_assignment_statement>
+                  </block>
+                </else_statement>
+                end
+              </if_statement>
+            </block>
+            end
+          </for_statement>
+          <while_statement srow="29" scol="4" erow="29" ecol="41">
+            while
+            <binary_expression field="condition" srow="29" scol="10" erow="29" ecol="23">
+              <identifier field="left" srow="29" scol="10" erow="29" ecol="15">total</identifier>
+              &lt;
+              <identifier field="right" srow="29" scol="18" erow="29" ecol="23">count</identifier>
+            </binary_expression>
+            do
+            <block field="body" srow="29" scol="27" erow="29" ecol="37">
+              <compound_assignment_statement srow="29" scol="27" erow="29" ecol="37">
+                <identifier field="left" srow="29" scol="27" erow="29" ecol="32">total</identifier>
+                <compound_operator field="operator" srow="29" scol="33" erow="29" ecol="35">
+                  +=
+                </compound_operator>
+                <number field="right" srow="29" scol="36" erow="29" ecol="37">1</number>
+              </compound_assignment_statement>
+            </block>
+            end
+          </while_statement>
+          <repeat_statement srow="30" scol="4" erow="30" ecol="42">
+            repeat
+            <block field="body" srow="30" scol="11" erow="30" ecol="21">
+              <compound_assignment_statement srow="30" scol="11" erow="30" ecol="21">
+                <identifier field="left" srow="30" scol="11" erow="30" ecol="16">total</identifier>
+                <compound_operator field="operator" srow="30" scol="17" erow="30" ecol="19">
+                  -=
+                </compound_operator>
+                <number field="right" srow="30" scol="20" erow="30" ecol="21">1</number>
+              </compound_assignment_statement>
+            </block>
+            until
+            <binary_expression field="condition" srow="30" scol="28" erow="30" ecol="42">
+              <identifier field="left" srow="30" scol="28" erow="30" ecol="33">total</identifier>
+              &lt;=
+              <identifier field="right" srow="30" scol="37" erow="30" ecol="42">count</identifier>
+            </binary_expression>
+          </repeat_statement>
+          <for_statement srow="31" scol="4" erow="33" ecol="7">
+            for
+            <for_generic_clause field="clause" srow="31" scol="8" erow="31" ecol="40">
+              <binding_list srow="31" scol="8" erow="31" ecol="18">
+                <binding srow="31" scol="8" erow="31" ecol="11">
+                  <identifier field="name" srow="31" scol="8" erow="31" ecol="11">key</identifier>
+                </binding>
+                ,
+                <binding srow="31" scol="13" erow="31" ecol="18">
+                  <identifier field="name" srow="31" scol="13" erow="31" ecol="18">value</identifier>
+                </binding>
+              </binding_list>
+              in
+              <expression_list srow="31" scol="22" erow="31" ecol="40">
+                <function_call srow="31" scol="22" erow="31" ecol="40">
+                  <identifier field="name" srow="31" scol="22" erow="31" ecol="27">pairs</identifier>
+                  <arguments field="arguments" srow="31" scol="27" erow="31" ecol="40">
+                    (
+                    <dot_index_expression srow="31" scol="28" erow="31" ecol="39">
+                      <identifier field="table" srow="31" scol="28" erow="31" ecol="32">self</identifier>
+                      .
+                      <field_identifier field="field" srow="31" scol="33" erow="31" ecol="39">nested</field_identifier>
+                    </dot_index_expression>
+                    )
+                  </arguments>
+                </function_call>
+              </expression_list>
+            </for_generic_clause>
+            do
+            <block field="body" srow="32" scol="8" erow="32" ecol="25">
+              <function_call srow="32" scol="8" erow="32" ecol="25">
+                <identifier field="name" srow="32" scol="8" erow="32" ecol="13">print</identifier>
+                <arguments field="arguments" srow="32" scol="13" erow="32" ecol="25">
+                  (
+                  <identifier srow="32" scol="14" erow="32" ecol="17">key</identifier>
+                  ,
+                  <identifier srow="32" scol="19" erow="32" ecol="24">value</identifier>
+                  )
+                </arguments>
+              </function_call>
+            </block>
+            end
+          </for_statement>
+          <return_statement srow="34" scol="4" erow="34" ecol="26">
+            return
+            <expression_list srow="34" scol="11" erow="34" ecol="26">
+              <type_assertion_expression srow="34" scol="11" erow="34" ecol="26">
+                <identifier field="left" srow="34" scol="11" erow="34" ecol="16">total</identifier>
+                ::
+                <type_reference field="right" srow="34" scol="20" erow="34" ecol="26">
+                  <type_identifier field="name" srow="34" scol="20" erow="34" ecol="26">number</type_identifier>
+                </type_reference>
+              </type_assertion_expression>
+            </expression_list>
+          </return_statement>
+        </block>
+        end
+      </function_declaration>
+      <assignment_statement srow="36" scol="0" erow="36" ecol="41">
+        <variable_list srow="36" scol="0" erow="36" ecol="10">
+          <dot_index_expression field="name" srow="36" scol="0" erow="36" ecol="10">
+            <identifier field="table" srow="36" scol="0" erow="36" ecol="1">M</identifier>
+            .
+            <field_identifier field="field" srow="36" scol="2" erow="36" ecol="10">callback</field_identifier>
+          </dot_index_expression>
+        </variable_list>
+        =
+        <expression_list srow="36" scol="13" erow="36" ecol="41">
+          <function_definition field="value" srow="36" scol="13" erow="36" ecol="41">
+            function
+            <parameters field="parameters" srow="36" scol="21" erow="36" ecol="26">
+              (
+              <variadic_parameter srow="36" scol="22" erow="36" ecol="25">
+                ...
+              </variadic_parameter>
+              )
+            </parameters>
+            <block field="body" srow="36" scol="27" erow="36" ecol="37">
+              <return_statement srow="36" scol="27" erow="36" ecol="37">
+                return
+                <expression_list srow="36" scol="34" erow="36" ecol="37">
+                  <vararg_expression srow="36" scol="34" erow="36" ecol="37">
+                    ...
+                  </vararg_expression>
+                </expression_list>
+              </return_statement>
+            </block>
+            end
+          </function_definition>
+        </expression_list>
+      </assignment_statement>
+      <local_variable_declaration srow="37" scol="0" erow="37" ecol="36">
+        local
+        <binding_list srow="37" scol="6" erow="37" ecol="13">
+          <binding srow="37" scol="6" erow="37" ecol="13">
+            <identifier field="name" srow="37" scol="6" erow="37" ecol="13">sibling</identifier>
+          </binding>
+        </binding_list>
+        =
+        <expression_list srow="37" scol="16" erow="37" ecol="36">
+          <function_call srow="37" scol="16" erow="37" ecol="36">
+            <identifier field="name" srow="37" scol="16" erow="37" ecol="23">require</identifier>
+            <arguments field="arguments" srow="37" scol="23" erow="37" ecol="36">
+              (
+              <string srow="37" scol="24" erow="37" ecol="35">
+                "
+                <string_content field="content" srow="37" scol="25" erow="37" ecol="34">./sibling</string_content>
+                "
+              </string>
+              )
+            </arguments>
+          </function_call>
+        </expression_list>
+      </local_variable_declaration>
+      <local_variable_declaration srow="38" scol="0" erow="38" ecol="38">
+        local
+        <binding_list srow="38" scol="6" erow="38" ecol="11">
+          <binding srow="38" scol="6" erow="38" ecol="11">
+            <identifier field="name" srow="38" scol="6" erow="38" ecol="11">alias</identifier>
+          </binding>
+        </binding_list>
+        =
+        <expression_list srow="38" scol="14" erow="38" ecol="38">
+          <function_call srow="38" scol="14" erow="38" ecol="38">
+            <identifier field="name" srow="38" scol="14" erow="38" ecol="21">require</identifier>
+            <arguments field="arguments" srow="38" scol="21" erow="38" ecol="38">
+              (
+              <string srow="38" scol="22" erow="38" ecol="37">
+                "
+                <string_content field="content" srow="38" scol="23" erow="38" ecol="36">@shared/utils</string_content>
+                "
+              </string>
+              )
+            </arguments>
+          </function_call>
+        </expression_list>
+      </local_variable_declaration>
+      <local_variable_declaration srow="39" scol="0" erow="39" ecol="63">
+        local
+        <binding_list srow="39" scol="6" erow="39" ecol="14">
+          <binding srow="39" scol="6" erow="39" ecol="14">
+            <identifier field="name" srow="39" scol="6" erow="39" ecol="14">instance</identifier>
+          </binding>
+        </binding_list>
+        =
+        <expression_list srow="39" scol="17" erow="39" ecol="63">
+          <function_call srow="39" scol="17" erow="39" ecol="63">
+            <identifier field="name" srow="39" scol="17" erow="39" ecol="24">require</identifier>
+            <arguments field="arguments" srow="39" scol="24" erow="39" ecol="63">
+              (
+              <function_call srow="39" scol="25" erow="39" ecol="62">
+                <method_index_expression field="name" srow="39" scol="25" erow="39" ecol="51">
+                  <dot_index_expression field="table" srow="39" scol="25" erow="39" ecol="38">
+                    <identifier field="table" srow="39" scol="25" erow="39" ecol="31">script</identifier>
+                    .
+                    <field_identifier field="field" srow="39" scol="32" erow="39" ecol="38">Parent</field_identifier>
+                  </dot_index_expression>
+                  :
+                  <field_identifier field="method" srow="39" scol="39" erow="39" ecol="51">WaitForChild</field_identifier>
+                </method_index_expression>
+                <arguments field="arguments" srow="39" scol="51" erow="39" ecol="62">
+                  (
+                  <string srow="39" scol="52" erow="39" ecol="61">
+                    "
+                    <string_content field="content" srow="39" scol="53" erow="39" ecol="60">Sibling</string_content>
+                    "
+                  </string>
+                  )
+                </arguments>
+              </function_call>
+              )
+            </arguments>
+          </function_call>
+        </expression_list>
+      </local_variable_declaration>
+      <local_variable_declaration srow="40" scol="0" erow="40" ecol="47">
+        local
+        <binding_list srow="40" scol="6" erow="40" ecol="11">
+          <binding srow="40" scol="6" erow="40" ecol="11">
+            <identifier field="name" srow="40" scol="6" erow="40" ecol="11">index</identifier>
+          </binding>
+        </binding_list>
+        =
+        <expression_list srow="40" scol="14" erow="40" ecol="47">
+          <function_call srow="40" scol="14" erow="40" ecol="47">
+            <identifier field="name" srow="40" scol="14" erow="40" ecol="21">require</identifier>
+            <arguments field="arguments" srow="40" scol="21" erow="40" ecol="47">
+              (
+              <bracket_index_expression srow="40" scol="22" erow="40" ecol="46">
+                <dot_index_expression field="table" srow="40" scol="22" erow="40" ecol="35">
+                  <identifier field="table" srow="40" scol="22" erow="40" ecol="28">script</identifier>
+                  .
+                  <field_identifier field="field" srow="40" scol="29" erow="40" ecol="35">Parent</field_identifier>
+                </dot_index_expression>
+                [
+                <string field="field" srow="40" scol="36" erow="40" ecol="45">
+                  "
+                  <string_content field="content" srow="40" scol="37" erow="40" ecol="44">Sibling</string_content>
+                  "
+                </string>
+                ]
+              </bracket_index_expression>
+              )
+            </arguments>
+          </function_call>
+        </expression_list>
+      </local_variable_declaration>
+      <return_statement srow="41" scol="0" erow="41" ecol="8">
+        return
+        <expression_list srow="41" scol="7" erow="41" ecol="8">
+          <identifier srow="41" scol="7" erow="41" ecol="8">M</identifier>
+        </expression_list>
+      </return_statement>
+    </chunk>
+  </source>
+</sources>

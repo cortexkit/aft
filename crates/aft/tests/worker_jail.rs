@@ -34,6 +34,31 @@ fn flags() -> Flags {
     Flags::new(false, Priority::Interactive, false)
 }
 
+fn model_text(reply: &Value) -> String {
+    reply["content"]
+        .as_array()
+        .expect("runner reply has content parts")
+        .iter()
+        .filter_map(|part| part["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn bash_task_id(reply: &Value) -> String {
+    assert!(reply.get("structuredContent").is_none(), "{reply}");
+    let text = model_text(reply);
+    let task = text
+        .lines()
+        .rev()
+        .find_map(|line| {
+            line.strip_prefix("[task ")
+                .and_then(|id| id.strip_suffix(']'))
+        })
+        .unwrap_or_else(|| panic!("bash reply has no model-facing task marker: {reply}"));
+    aft::bash_background::persistence::validate_task_id(task).unwrap();
+    task.to_owned()
+}
+
 fn quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
@@ -925,8 +950,47 @@ impl Jail {
 
     async fn submit_held_bash(&mut self, arguments: Value) -> u64 {
         let warm = self.tool_reply("bash", json!({"command":"true"})).await;
-        assert_eq!(warm["structuredContent"]["exit_code"], 0, "{warm}");
+        self.assert_bash_completed("worker-session", &warm);
         self.submit_tool("bash", arguments).await
+    }
+
+    fn task_paths(
+        &self,
+        session: &str,
+        task: &str,
+    ) -> aft::bash_background::persistence::TaskPaths {
+        aft::bash_background::persistence::resolve_task(
+            &self.data.join("cortexkit/aft/cache/aft/runner"),
+            session,
+            task,
+        )
+        .unwrap()
+        .paths
+    }
+
+    // Runner replies intentionally contain no status or exit fields.
+    // The fixture owns the isolated storage, so check those facts on AFT's record.
+    fn task_record(
+        &self,
+        session: &str,
+        reply: &Value,
+    ) -> aft::bash_background::persistence::PersistedTask {
+        let task = bash_task_id(reply);
+        let record = read_task_settled(&self.task_paths(session, &task).json);
+        assert_eq!(record.task_id, task);
+        assert_eq!(record.session_id, session);
+        record
+    }
+
+    fn assert_bash_completed(&self, session: &str, reply: &Value) {
+        assert_eq!(reply["isError"], false, "{reply}");
+        let record = self.task_record(session, reply);
+        assert_eq!(
+            record.status,
+            aft::bash_background::BgTaskStatus::Completed,
+            "{record:?}: {reply}"
+        );
+        assert_eq!(record.exit_code, Some(0), "{record:?}: {reply}");
     }
 
     async fn submit_tool_on_channel(&mut self, channel: u16, name: &str, arguments: Value) -> u64 {
@@ -1014,7 +1078,12 @@ impl Jail {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
-            return serde_json::from_slice(&frame.body).expect("JSON tool reply");
+            let reply: Value = serde_json::from_slice(&frame.body).expect("JSON tool reply");
+            assert!(
+                reply.get("structuredContent").is_none(),
+                "runner reply must be model-only: {reply}"
+            );
+            return reply;
         }
         panic!("database initialization never completed");
     }
@@ -2313,11 +2382,8 @@ async fn worker_jail_commits_and_deletes_packed_ref_preserving_config() {
             }),
         )
         .await;
-    let result = &deleted["structuredContent"];
-    assert_eq!(result["success"].as_bool(), Some(true), "{deleted}");
-    assert_eq!(result["status"].as_str(), Some("completed"), "{deleted}");
-    assert_eq!(result["exit_code"].as_i64(), Some(0), "{deleted}");
-    let output = result["output"].as_str().expect("completed bash output");
+    jail.assert_bash_completed("worker-session", &deleted);
+    let output = model_text(&deleted);
     assert!(
         output.lines().any(|line| line.trim() == "PACKED_DELETE_2"),
         "{deleted}"
@@ -2325,7 +2391,7 @@ async fn worker_jail_commits_and_deletes_packed_ref_preserving_config() {
     // Git deletes the ref before trying to remove its branch config section.
     // Shared config stays read-only so a worker cannot redirect core.hooksPath
     // and bypass hooks; tolerate only that exact lock error/warning pair.
-    packed_ref_delete_diagnostics(output, &config)
+    packed_ref_delete_diagnostics(&output, &config)
         .unwrap_or_else(|error| panic!("{error}\n{deleted}"));
     assert_eq!(
         std::fs::read(&config).unwrap(),
@@ -2785,14 +2851,14 @@ async fn worker_jail_private_hook_chain_executes_read_only() {
             let reply = jail
                 .tool_reply("bash", json!({"command": command, "timeout": 300_000}))
                 .await;
-            let result = &reply["structuredContent"];
-            let output = result["output"].as_str().unwrap_or_default();
+            let result = jail.task_record("worker-session", &reply);
+            let output = model_text(&reply);
             eprintln!(
-                "Hook immutability {key} {operation}: status={} exit_code={}\n{output}",
-                result["status"], result["exit_code"]
+                "Hook immutability {key} {operation}: status={:?} exit_code={:?}\n{output}",
+                result.status, result.exit_code
             );
             assert_eq!(
-                result["success"], true,
+                reply["isError"], false,
                 "{key} {operation} did not launch: {reply}"
             );
             assert!(
@@ -2804,11 +2870,12 @@ async fn worker_jail_private_hook_chain_executes_read_only() {
                 "{key} {operation} resolved the wrong directory: {reply}"
             );
             assert_eq!(
-                result["status"], "failed",
+                result.status,
+                aft::bash_background::BgTaskStatus::Failed,
                 "{key} {operation} unexpectedly succeeded: {reply}"
             );
             assert!(
-                result["exit_code"].as_i64().is_some_and(|code| code != 0),
+                result.exit_code.is_some_and(|code| code != 0),
                 "{key} {operation} has no failing child exit status: {reply}"
             );
             let kernel_denial = if cfg!(target_os = "macos") {
@@ -3156,10 +3223,7 @@ else:
     assert!(read.to_string().contains("original"), "{read}");
     jail.bind_grant_head().await;
     let head = jail.head_shell_read(&first.join("sentinel")).await;
-    assert_eq!(
-        head["structuredContent"]["exit_code"], 0,
-        "head shell access stays unchanged: {head}"
-    );
+    jail.assert_bash_completed("head-session", &head);
     assert!(head.to_string().contains("original"), "{head}");
     assert!(head.to_string().contains("HEAD_SHELL_READ"), "{head}");
 }
@@ -3204,11 +3268,10 @@ mod session_output;
 async fn session_output_jail() -> (Jail, session_output::SessionOutput) {
     let mut jail = Jail::start().await;
     let ready = jail.tool_reply("bash", json!({"command": "true"})).await;
-    let capture = PathBuf::from(
-        ready["structuredContent"]["output_path"]
-            .as_str()
-            .unwrap_or_else(|| panic!("missing task capture: {ready}")),
-    );
+    jail.assert_bash_completed("worker-session", &ready);
+    let capture = jail
+        .task_paths("worker-session", &bash_task_id(&ready))
+        .stdout;
     let storage = capture
         .ancestors()
         .nth(6)
@@ -3511,7 +3574,7 @@ echo TWO_READS_OK
         .tool_reply("bash", json!({"command":command,"timeout":300_000}))
         .await;
     let reply = response.to_string();
-    assert_eq!(response["structuredContent"]["exit_code"], 0, "{reply}");
+    jail.assert_bash_completed("worker-session", &response);
     assert!(reply.contains("CREDENTIALS_DENIED"), "{reply}");
     assert!(reply.contains("TWO_READS_OK"), "{reply}");
     assert!(reply.matches("worker-bound-read").count() >= 2, "{reply}");
@@ -3532,9 +3595,7 @@ echo TWO_READS_OK
         2,
         "both reads need their own audit record: {trace}"
     );
-    let task_id = response["structuredContent"]["task_id"]
-        .as_str()
-        .expect("command task id");
+    let task_id = bash_task_id(&response);
     assert!(
         trace.contains(&format!(
             "gh_shim worker_read: session=worker-session task={task_id} "
@@ -3571,7 +3632,7 @@ async fn worker_gh_read_log_failed_whole_job_fallback_through_sandboxed_gh() {
         )
         .await;
     let text = response.to_string();
-    assert_eq!(response["structuredContent"]["exit_code"], 0, "{text}");
+    jail.assert_bash_completed("worker-session", &response);
     let expected = log
         .lines()
         .map(|line| format!("Landing policy\tUNKNOWN STEP\t{line}\n"))
@@ -3634,10 +3695,7 @@ async fn worker_gh_read_t8_live_scope_rebind_refuses_before_upstream() {
     assert_ne!(wait_test_file(&outcome).await.trim(), "0");
     let finished = jail.reply_frame(1, corr).await;
     let finished: Value = serde_json::from_slice(&finished.body).unwrap();
-    assert_eq!(
-        finished["structuredContent"]["exit_code"], 0,
-        "the probe itself must complete: {finished}"
-    );
+    jail.assert_bash_completed("worker-session", &finished);
     assert!(jail.read_holder.lock().unwrap().calls.is_empty());
     assert!(
         jail.read_holder.lock().unwrap().dials.is_empty(),
@@ -3764,8 +3822,8 @@ async fn cross_command_broker_isolation(profile: &str) {
     let status = jail
         .tool_reply("bash_status", json!({"taskId":first_task}))
         .await;
-    assert_eq!(
-        status["structuredContent"]["status"], "running",
+    assert!(
+        model_text(&status).starts_with(&format!("Task {first_task}: running\n")),
         "probe a live capability, not only retained scratch: {status}"
     );
     let other_root = jail.base.join("other-repo");
@@ -3865,8 +3923,8 @@ printf 'ISOLATION_OK\n'
     let status = jail
         .tool_reply("bash_status", json!({"taskId":first_task}))
         .await;
-    assert_eq!(
-        status["structuredContent"]["status"], "running",
+    assert!(
+        model_text(&status).starts_with(&format!("Task {first_task}: running\n")),
         "the foreign listener must still belong to a live command: {status}"
     );
     // The launch environment contains only capability-file/socket paths, never
@@ -3886,7 +3944,7 @@ printf 'ISOLATION_OK\n'
     std::fs::write(finish, "finish").unwrap();
     let finished = jail.reply_frame(1, corr).await;
     let finished: Value = serde_json::from_slice(&finished.body).unwrap();
-    assert_eq!(finished["structuredContent"]["exit_code"], 0, "{finished}");
+    jail.assert_bash_completed("worker-session", &finished);
     assert!(jail.read_holder.lock().unwrap().calls.is_empty());
     assert!(!other_root.join("native-gh.log").exists());
 }
@@ -4136,9 +4194,9 @@ PY
             .unwrap_or_else(|_| panic!("{mode}: broker socket survived terminal state"));
             let finished = jail.reply_frame(1, corr).await;
             let finished: Value = serde_json::from_slice(&finished.body).unwrap();
-            assert_eq!(finished["structuredContent"]["task_id"], task, "{finished}");
+            assert_eq!(bash_task_id(&finished), task, "{finished}");
             if mode == "end" {
-                assert_eq!(finished["structuredContent"]["exit_code"], 0, "{finished}");
+                jail.assert_bash_completed("worker-session", &finished);
             }
         }
         std::fs::write(&go, "go").unwrap();
@@ -4217,7 +4275,7 @@ async fn worker_gh_read_t10_cancel_midflight_terminates_reader_without_output() 
         loop {
             let status = jail.tool_reply("bash_status", json!({"taskId":task})).await;
             assert_ne!(status["isError"], true, "{status}");
-            if status["structuredContent"]["status"] == "killed" {
+            if model_text(&status).starts_with(&format!("Task {task}: killed")) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -4234,12 +4292,12 @@ async fn worker_gh_read_t10_cancel_midflight_terminates_reader_without_output() 
     assert_eq!(jail.read_holder.lock().unwrap().calls.len(), 1);
     let finished = jail.reply_frame(1, corr).await;
     let finished: Value = serde_json::from_slice(&finished.body).unwrap();
-    assert_eq!(finished["structuredContent"]["task_id"], task, "{finished}");
+    assert_eq!(bash_task_id(&finished), task, "{finished}");
     assert!(!jail.worktree.join("native-gh.log").exists());
 }
 
 #[tokio::test]
-async fn gh_shim_router_host_v1_background_reply_is_terminal_and_flat() {
+async fn gh_shim_router_host_v1_background_reply_is_terminal_and_model_only() {
     let mut jail = Jail::start().await;
     jail.bind_grant_head().await;
     let ready = jail.base.join("v1-ready");
@@ -4247,27 +4305,24 @@ async fn gh_shim_router_host_v1_background_reply_is_terminal_and_flat() {
     let warm = jail
         .tool_reply_on_channel(2, "bash", json!({"command":"true"}))
         .await;
-    assert_eq!(warm["structuredContent"]["exit_code"], 0, "{warm}");
+    jail.assert_bash_completed("head-session", &warm);
     let corr = jail.submit_tool_on_channel(2, "bash", json!({"command":format!("echo ready > {}; while ! test -f {}; do sleep .02; done", quote(&ready), quote(&release)),"background":true,"timeout":10_000})).await;
     wait_test_file(&ready).await;
-    let pending = jail.reply_frame(2, corr);
-    tokio::pin!(pending);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), pending.as_mut())
-            .await
-            .is_err(),
-        "V1 must not send an early background launch response"
-    );
-    std::fs::write(release, "release").unwrap();
-    let frame = pending.await;
+    let frame = {
+        let pending = jail.reply_frame(2, corr);
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), pending.as_mut())
+                .await
+                .is_err(),
+            "V1 must not send an early background launch response"
+        );
+        std::fs::write(release, "release").unwrap();
+        pending.await
+    };
     let reply: Value = serde_json::from_slice(&frame.body).unwrap();
-    assert_eq!(reply["structuredContent"]["status"], "completed", "{reply}");
-    assert_eq!(reply["structuredContent"]["exit_code"], 0, "{reply}");
-    assert!(reply["structuredContent"]["task_id"]
-        .as_str()
-        .unwrap()
-        .starts_with("bash-"));
-    assert!(reply["structuredContent"].get("data").is_none());
+    jail.assert_bash_completed("head-session", &reply);
+    assert_eq!(reply.as_object().unwrap().len(), 2, "{reply}");
 }
 
 /// Reads a task record the daemon may be rewriting at that moment. The daemon
@@ -4280,7 +4335,11 @@ fn read_task_settled(metadata: &Path) -> aft::bash_background::persistence::Pers
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            other => return other.unwrap(),
+            other => {
+                return other.unwrap_or_else(|error| {
+                    panic!("reading task record {}: {error}", metadata.display())
+                })
+            }
         }
     }
     panic!("task record at {} kept being replaced", metadata.display());
@@ -4342,7 +4401,10 @@ async fn worker_gh_read_t10_promotion_keeps_the_original_command_grant() {
     let status = jail
         .tool_reply_on_channel(2, "bash_status", json!({"taskId":task}))
         .await;
-    assert_eq!(status["structuredContent"]["status"], "running", "{status}");
+    assert!(
+        model_text(&status).starts_with(&format!("Task {task}: running\n")),
+        "{status}"
+    );
     std::fs::write(release, "release").unwrap();
     let body = wait_test_file(&output).await;
     assert!(body.contains("worker-bound-read"), "{body}");
@@ -4404,7 +4466,7 @@ async fn gh_shim_router_host_read_uses_served_catalog_arguments() {
     let head_fixture = jail.base.join("head-read-key.txt");
     std::fs::write(&head_fixture, "head-command-key-sentinel\n").unwrap();
     let head = jail.head_shell_read(&head_fixture).await;
-    assert_eq!(head["structuredContent"]["exit_code"], 0, "{head}");
+    jail.assert_bash_completed("head-session", &head);
     assert!(
         head.to_string().contains("head-command-key-sentinel"),
         "{head}"
@@ -4523,10 +4585,7 @@ async fn worker_gh_read_revocation_suppresses_reply_to_surviving_observer() {
     std::fs::write(finish, "finish").unwrap();
     let frame = jail.reply_frame(1, corr).await;
     let terminal: Value = serde_json::from_slice(&frame.body).unwrap();
-    assert_eq!(
-        terminal["structuredContent"]["exit_code"], 0,
-        "end the command naturally, not by killing its reader: {terminal}"
-    );
+    jail.assert_bash_completed("worker-session", &terminal);
     hold.notify_one();
     let received = tokio::time::timeout(Duration::from_secs(5), observer.read_u32())
         .await

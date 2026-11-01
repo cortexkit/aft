@@ -1140,25 +1140,32 @@ impl ProjectReplayBatch<'_> {
     pub(crate) fn replay_session_for_project(
         self,
         storage_dir: &Path,
+        harness: &Harness,
         session_id: &str,
         project_root: &Path,
     ) -> Result<(), String> {
-        self.registry
-            .replay_session_for_project(storage_dir, session_id, project_root)
+        self.registry.replay_session_in_harness(
+            storage_dir,
+            session_id,
+            Some(project_root),
+            Some(&harness.storage_segment()),
+        )
     }
 
     pub(crate) fn continue_project_replay(
         self,
         storage_dir: &Path,
+        harness: &Harness,
         session_id: &str,
         project_root: &Path,
         retry_due_failures: bool,
     ) -> Result<bool, String> {
-        self.registry.continue_project_replay(
+        self.registry.continue_project_replay_in_harness(
             storage_dir,
             session_id,
             project_root,
             retry_due_failures,
+            Some(&harness.storage_segment()),
         )
     }
 }
@@ -6608,12 +6615,31 @@ impl BgTaskRegistry {
 
     /// Continue only the saved disk walk. The configure tail schedules one
     /// batch at a time, releasing recovery guards and locks between batches.
+    #[cfg(test)]
     pub(crate) fn continue_project_replay(
         &self,
         storage_dir: &Path,
         session_id: &str,
         project_root: &Path,
         retry_due_failures: bool,
+    ) -> Result<bool, String> {
+        let harness = self.db_harness_for_session(session_id);
+        self.continue_project_replay_in_harness(
+            storage_dir,
+            session_id,
+            project_root,
+            retry_due_failures,
+            harness.as_deref(),
+        )
+    }
+
+    fn continue_project_replay_in_harness(
+        &self,
+        storage_dir: &Path,
+        session_id: &str,
+        project_root: &Path,
+        retry_due_failures: bool,
+        harness: Option<&str>,
     ) -> Result<bool, String> {
         if self.project_replay_pending(storage_dir, project_root) {
             // Only a continuation resumed by a later maintenance tick may retry
@@ -6630,7 +6656,7 @@ impl BgTaskRegistry {
                     cursor.retry_due_failures();
                 }
             }
-            self.replay_session_batch(storage_dir, session_id, Some(project_root), true)?;
+            self.replay_session_batch(storage_dir, session_id, Some(project_root), true, harness)?;
         }
         Ok(self.project_replay_pending(storage_dir, project_root))
     }
@@ -6734,8 +6760,8 @@ impl BgTaskRegistry {
         task_id: &str,
         task_harness: Option<&str>,
     ) -> bool {
-        // Project replay reads all harnesses. Delete under the row's own
-        // namespace, not the route that happened to discover the orphan.
+        // Keep deletion tied to the persisted owner even if the root's
+        // configured harness has changed since the replay was scheduled.
         let harness = task_harness
             .map(str::to_owned)
             .or_else(|| self.db_harness_for_session(originating_session_id));
@@ -6860,7 +6886,18 @@ impl BgTaskRegistry {
         session_id: &str,
         project_root: Option<&Path>,
     ) -> Result<(), String> {
-        self.replay_session_batch(storage_dir, session_id, project_root, false)
+        let harness = self.db_harness_for_session(session_id);
+        self.replay_session_in_harness(storage_dir, session_id, project_root, harness.as_deref())
+    }
+
+    fn replay_session_in_harness(
+        &self,
+        storage_dir: &Path,
+        session_id: &str,
+        project_root: Option<&Path>,
+        harness: Option<&str>,
+    ) -> Result<(), String> {
+        self.replay_session_batch(storage_dir, session_id, project_root, false, harness)
     }
 
     fn replay_session_batch(
@@ -6869,6 +6906,7 @@ impl BgTaskRegistry {
         session_id: &str,
         project_root: Option<&Path>,
         continuation: bool,
+        harness: Option<&str>,
     ) -> Result<(), String> {
         // Held for the whole call: from here on this session's task directory is
         // being rewritten, and the persisted GC below sweeps the same storage
@@ -6913,7 +6951,7 @@ impl BgTaskRegistry {
         let database_replay = if continuation {
             None
         } else {
-            self.replay_session_from_db(session_id, project_root)
+            self.replay_session_from_db(session_id, project_root, harness)
         };
         // A failed task-list query means every later acknowledgement lookup on
         // this pool would fail for the same reason. Remember that across the
@@ -7104,6 +7142,21 @@ impl BgTaskRegistry {
             }
         };
 
+        // A shared root can have records for several harnesses. Reject foreign
+        // metadata before recovery guards, retirement or quarantine use this
+        // replay's harness directory, including records found by disk fallback.
+        let tasks = tasks
+            .into_iter()
+            .filter(|metadata| {
+                harness.is_none_or(|harness| {
+                    metadata
+                        .harness
+                        .as_deref()
+                        .is_none_or(|owner| owner == harness)
+                })
+            })
+            .collect::<Vec<_>>();
+
         // A project-scoped replay restores tasks from sessions other than the
         // one being bound, so guard those directories too before the loop
         // touches them.
@@ -7265,6 +7318,15 @@ impl BgTaskRegistry {
                 &metadata.task_id,
                 || read_task_at(&resolved),
             ) {
+                Ok(disk)
+                    if harness.is_some_and(|harness| {
+                        disk.harness
+                            .as_deref()
+                            .is_some_and(|owner| owner != harness)
+                    }) =>
+                {
+                    continue
+                }
                 Ok(disk)
                     if disk.task_id == metadata.task_id
                         && disk.session_id == metadata.session_id =>
@@ -7534,7 +7596,7 @@ impl BgTaskRegistry {
         }
         #[cfg(unix)]
         if metadata.remote.is_some() && !metadata.is_terminal() {
-            return self.restore_claimed_remote_task(metadata, paths);
+            return self.restore_claimed_remote_task(metadata, paths, false);
         }
         // A finished remote task can still owe its runner a cancellation (an
         // owner pause marks the task finished before its worker sends it).
@@ -7703,6 +7765,7 @@ impl BgTaskRegistry {
         &self,
         session_id: &str,
         project_root: Option<&Path>,
+        harness: Option<&str>,
     ) -> Option<Result<Vec<PersistedTask>, String>> {
         let pool = self
             .inner
@@ -7710,30 +7773,22 @@ impl BgTaskRegistry {
             .read()
             .ok()
             .and_then(|slot| slot.clone())?;
-        let harness = self.db_harness_for_session(session_id)?;
+        let harness = harness?;
         let conn = match pool.lock() {
             Ok(conn) => conn,
             Err(_) => return Some(Err("db mutex poisoned".to_string())),
         };
         let rows = if let Some(project_root) = project_root {
             let project_key = crate::path_identity::project_scope_key(project_root);
-            // Disk discovery skips every DB-owned task, so recover this
-            // project's indexed rows from every harness sharing the store.
-            crate::db::bash_tasks::bash_task_harnesses(&conn).and_then(|harnesses| {
-                let mut rows = Vec::new();
-                for harness in harnesses {
-                    rows.extend(
-                        crate::db::bash_tasks::list_replayable_bash_tasks_for_project(
-                            &conn,
-                            &harness,
-                            &project_key,
-                        )?,
-                    );
-                }
-                Ok(rows)
-            })
+            // Resolve only rows owned by the harness whose task directory this
+            // replay scans. A different harness's missing path is not a lost task.
+            crate::db::bash_tasks::list_replayable_bash_tasks_for_project(
+                &conn,
+                harness,
+                &project_key,
+            )
         } else {
-            crate::db::bash_tasks::list_bash_tasks_for_session(&conn, &harness, session_id)
+            crate::db::bash_tasks::list_bash_tasks_for_session(&conn, harness, session_id)
         };
         Some(
             rows.map(|rows| rows.into_iter().map(PersistedTask::from).collect())
@@ -9239,11 +9294,15 @@ impl BgTaskRegistry {
         Some(self.snapshot_with_terminal_cache(&task, preview_bytes))
     }
 
+    // Remote restoration starts a worker, so reject an out-of-scope match
+    // before registering it rather than leaving that check to the caller.
     fn status_relaxed_task(
         &self,
         task_id: &str,
         project_root: &Path,
         storage_dir: &Path,
+        resume_remote: bool,
+        accept: impl Fn(&PersistedTask) -> bool,
     ) -> Option<Arc<BgTask>> {
         validate_task_id(task_id).ok()?;
         let canonical_project = canonicalized_path(project_root);
@@ -9261,6 +9320,7 @@ impl BgTaskRegistry {
                                 .map(canonicalized_path)
                                 .as_deref()
                                 == Some(canonical_project.as_path())
+                                && accept(&state.metadata)
                         })
                         .unwrap_or(false);
                     return matches_project.then_some(task);
@@ -9274,8 +9334,25 @@ impl BgTaskRegistry {
                 if disk.task_id != metadata.task_id || disk.session_id != metadata.session_id {
                     return None;
                 }
+                // Remote output and its replay cursor commit to disk together;
+                // the database row can still describe an older checkpoint.
+                let metadata = if disk.remote.is_some() || metadata.remote.is_some() {
+                    disk
+                } else {
+                    metadata
+                };
+                if !accept(&metadata)
+                    || metadata
+                        .project_root
+                        .as_deref()
+                        .map(canonicalized_path)
+                        .as_deref()
+                        != Some(canonical_project.as_path())
+                {
+                    return None;
+                }
                 if self
-                    .insert_rehydrated_task(metadata, resolved.paths, true)
+                    .restore_relaxed_task(metadata, resolved.paths, resume_remote)
                     .is_err()
                 {
                     return None;
@@ -9351,6 +9428,9 @@ impl BgTaskRegistry {
             if metadata_project.as_deref() != Some(canonical_project.as_path()) {
                 continue;
             }
+            if !accept(&metadata) {
+                continue;
+            }
             if let Some(task) = self.task(task_id) {
                 let matches_project = task
                     .lock_state()
@@ -9362,12 +9442,13 @@ impl BgTaskRegistry {
                             .map(canonicalized_path)
                             .as_deref()
                             == Some(canonical_project.as_path())
+                            && accept(&state.metadata)
                     })
                     .unwrap_or(false);
                 return matches_project.then_some(task);
             }
             if self
-                .insert_rehydrated_task(metadata, resolved.paths, true)
+                .restore_relaxed_task(metadata, resolved.paths, resume_remote)
                 .is_err()
             {
                 return None;
@@ -9375,6 +9456,33 @@ impl BgTaskRegistry {
             return self.task(task_id);
         }
         None
+    }
+
+    fn restore_relaxed_task(
+        &self,
+        metadata: PersistedTask,
+        paths: TaskPaths,
+        resume_remote: bool,
+    ) -> Result<(), String> {
+        #[cfg(unix)]
+        if !resume_remote && metadata.remote.is_some() && !metadata.is_terminal() {
+            // Kill settlement also needs a worker, but its cancellation must
+            // be durable before the worker can consider a local fallback.
+            self.restore_claimed_remote_task(metadata, paths, true)?;
+            self.start_watchdog();
+            return Ok(());
+        }
+        if resume_remote && metadata.remote.is_some() {
+            // Registering a saved remote task is not enough: its worker must
+            // attach to the runner. Session recovery shares one worker across
+            // registries and lets an owner's pending pause reach it first.
+            let session_id = metadata.session_id.clone();
+            self.rehydrate_resolved_task(metadata, paths, &session_id)?;
+            self.start_watchdog();
+            Ok(())
+        } else {
+            self.insert_rehydrated_task(metadata, paths, true)
+        }
     }
 
     fn lookup_relaxed_task_from_db(
@@ -9428,7 +9536,11 @@ impl BgTaskRegistry {
         .and_then(Result::ok)
         .flatten()
         .filter(|row| task_bundle_is_absent(storage_dir, &row.session_id, &row.task_id));
-        if let Some(task) = self.status_relaxed_task(task_id, project_root, storage_dir) {
+        if let Some(task) =
+            self.status_relaxed_task(task_id, project_root, storage_dir, true, |metadata| {
+                metadata.session_id == session_id || metadata.scope.is_none()
+            })
+        {
             if task.session_id != session_id
                 && task
                     .lock_state()
@@ -9470,7 +9582,9 @@ impl BgTaskRegistry {
         storage_dir: &Path,
     ) -> Result<BgTaskSnapshot, RegistryError> {
         let task = self
-            .status_relaxed_task(task_id, project_root, storage_dir)
+            .status_relaxed_task(task_id, project_root, storage_dir, false, |metadata| {
+                metadata.scope.is_none()
+            })
             .ok_or_else(|| RegistryError::TaskNotFound(task_id.into()))?;
         if task
             .lock_state()
@@ -12406,11 +12520,14 @@ impl BgTaskRegistry {
     /// recorded through either registry reaches the one state every worker
     /// check reads, and it starts no worker of its own while the owner holds
     /// the task or a worker runs.
+    /// A kill records its cancellation in that shared task before permitting
+    /// a recovery worker to start, so recovery cannot launch a local fallback.
     #[cfg(unix)]
     fn restore_claimed_remote_task(
         &self,
         metadata: PersistedTask,
         paths: TaskPaths,
+        cancel_before_resume: bool,
     ) -> Result<(), String> {
         let task_id = metadata.task_id.clone();
         let canonical_project_root = canonicalized_path(
@@ -12432,10 +12549,13 @@ impl BgTaskRegistry {
                 claim.adopters.push(Arc::downgrade(&self.inner));
                 let held = claim.held;
                 let publishes = self.register_claimed_task(&task)?;
+                let resume_allowed =
+                    !cancel_before_resume || self.record_remote_cancel_owed(&task, false)?;
                 // The owner's worker stopped without finishing the task: run
                 // it here, unless this registry is itself holding tasks for a
                 // pause, which must reach a task before its worker does.
-                if !held
+                if resume_allowed
+                    && !held
                     && !self.holds_remote_workers()
                     && !task.remote_worker_running.load(Ordering::Acquire)
                     && !task.is_terminal()
@@ -12453,6 +12573,9 @@ impl BgTaskRegistry {
         let task = self
             .task(&task_id)
             .ok_or_else(|| format!("{task_id}: restored remote task missing"))?;
+        if cancel_before_resume && !self.record_remote_cancel_owed(&task, false)? {
+            return Ok(());
+        }
         let held = self.hold_remote_worker(&task_id);
         if !self.inner.saved_task_recovery.load(Ordering::Acquire) {
             *task
@@ -20004,7 +20127,51 @@ mod tests {
     }
 
     #[test]
-    fn project_replay_restores_indexed_live_tasks_from_other_harnesses() {
+    fn project_replay_uses_scheduled_harness_after_root_harness_changes() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let namespace = storage.path().join("opencode");
+        let (registry, db, _) = registry_with_db_and_frames(storage.path());
+        registry
+            .inner
+            .persisted_gc_started
+            .store(true, Ordering::SeqCst);
+        let session = "scheduled-opencode-replay";
+        let task_id = "bash-000000000000c11d";
+        write_running_project_task(&namespace, project.path(), session, task_id);
+        let paths = task_paths(&namespace, session, task_id).unwrap();
+        let mut metadata = read_task(&paths.json).unwrap();
+        metadata.harness = Some("opencode".into());
+        metadata.child_pid = None;
+        metadata.completion_has_env_secrets = Some(false);
+        metadata.completion_has_non_ticket_env_secrets = Some(false);
+        write_task(&paths.json, &metadata).unwrap();
+        fs::write(&paths.exit, "19").unwrap();
+        crate::db::bash_tasks::upsert_bash_task(
+            &db.lock().unwrap(),
+            &metadata.to_bash_task_row("opencode", &paths).unwrap(),
+        )
+        .unwrap();
+
+        // A later bind changes the shared root's fallback before the queued
+        // opencode replay runs. The replay still belongs to its saved harness.
+        registry.set_harness(Harness::Runner);
+        registry
+            .claim_project_replay_batch()
+            .unwrap()
+            .replay_session_for_project(&namespace, &Harness::Opencode, session, project.path())
+            .unwrap();
+        let completions = registry.drain_completions_for_session(Some(session));
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].task_id, task_id);
+        assert_eq!(completions[0].status, BgTaskStatus::Failed);
+        assert_eq!(completions[0].exit_code, Some(19));
+        assert_eq!(read_task(&paths.json).unwrap().exit_code, Some(19));
+        registry.detach();
+    }
+
+    #[test]
+    fn project_replay_ignores_indexed_tasks_from_other_harnesses() {
         let storage = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         let (registry, db, _) = registry_with_db_and_frames(storage.path());
@@ -20037,14 +20204,21 @@ mod tests {
         )
         .unwrap();
         let rows = registry
-            .replay_session_from_db(session, Some(project.path()))
+            .replay_session_from_db(session, Some(project.path()), Some("opencode"))
             .unwrap()
             .unwrap();
         assert_eq!(
             rows.len(),
-            1,
-            "the DB project filter must exclude unrelated live rows before recovery"
+            0,
+            "the DB namespace filter must exclude another harness's project rows"
         );
+        registry
+            .replay_session_for_project(storage.path(), session, project.path())
+            .unwrap();
+        assert!(registry.task_for_session(task_id, session).is_none());
+        assert!(registry.task_for_session(other_task, session).is_none());
+
+        registry.set_harness(Harness::Pi);
         registry
             .replay_session_for_project(storage.path(), session, project.path())
             .unwrap();
@@ -27669,6 +27843,23 @@ mod tests {
             .replay_session_for_project(storage.path(), "session", storage.path())
             .unwrap();
         assert!(replay.drain_completions().is_empty());
+        let untouched =
+            crate::db::bash_tasks::get_bash_task(&db.lock().unwrap(), "pi", "session", &task_id)
+                .unwrap()
+                .unwrap();
+        assert!(untouched.completion_delivered);
+        assert!(
+            !serde_json::from_str::<PersistedTask>(&untouched.metadata)
+                .unwrap()
+                .completion_delivered,
+            "another harness must not rewrite the task's acknowledgement snapshot"
+        );
+
+        replay.set_harness(Harness::Pi);
+        replay
+            .replay_session_for_project(storage.path(), "session", storage.path())
+            .unwrap();
+        assert!(replay.drain_completions().is_empty());
         let checkpoint =
             crate::db::bash_tasks::get_bash_task(&db.lock().unwrap(), "pi", "session", &task_id)
                 .unwrap()
@@ -27679,7 +27870,7 @@ mod tests {
                 .completion_delivered
         );
         assert!(replay
-            .replay_session_from_db("session", Some(storage.path()))
+            .replay_session_from_db("session", Some(storage.path()), Some("pi"))
             .unwrap()
             .unwrap()
             .is_empty());

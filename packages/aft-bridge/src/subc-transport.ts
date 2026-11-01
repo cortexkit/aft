@@ -3048,7 +3048,11 @@ export class SubcTransportPool implements AftTransportPool {
           });
           retry = state.bindPending;
         } else {
-          retry = this.hostScope(client, record.identity);
+          retry = this.hostScope(client, record.identity).finally(() => {
+            // A timer can wake before retryAt. Re-arm even when the lookup only saw backoff,
+            // otherwise a session with persistent routes would never try core again.
+            this.scheduleHostScopeRetry(session, state);
+          });
         }
         void retry.catch((error) => {
           warn(
@@ -3310,7 +3314,7 @@ export class SubcTransportPool implements AftTransportPool {
     return this.openScopedHostToolRoute(client, identity, record, entry, channel);
   }
 
-  private bindHostToolRoute(
+  private async bindHostToolRoute(
     client: SubcClientLike,
     identity: BindIdentity,
     channel: HostRouteChannel,
@@ -3321,10 +3325,27 @@ export class SubcTransportPool implements AftTransportPool {
       `subc head scope: session=${identity.session} bind=${scope ? "scoped" : "unscoped"} channel=${channel} root=${identity.project_root} reason=${reason}` +
         (scope ? ` ref=${scope.ref.slice(0, 8)} epoch=${scope.scopeEpoch}` : ""),
     );
-    return client.routeOpen({ kind: "tool_provider", module_id: AFT_MODULE_ID }, identity, {
-      consumerIdentity: this.consumerIdentity,
-      ...(scope ? { scope } : {}),
-    });
+    const route = await client.routeOpen(
+      { kind: "tool_provider", module_id: AFT_MODULE_ID },
+      identity,
+      {
+        consumerIdentity: this.consumerIdentity,
+        ...(scope ? { scope } : {}),
+      },
+    );
+    const state = this.hostScopeCache.get(identity.session);
+    if (
+      scope &&
+      state?.unscopedReason &&
+      state.answer?.result === "scope" &&
+      state.answer.scope === scope
+    ) {
+      log(
+        `subc head scope: session=${identity.session} route=upgraded from=unscoped ref=${scope.ref.slice(0, 8)} epoch=${scope.scopeEpoch}`,
+      );
+      state.unscopedReason = undefined;
+    }
+    return route;
   }
 
   private async openScopedHostToolRoute(
