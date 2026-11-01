@@ -267,6 +267,9 @@ impl AppContext {
                                     "refreshing_count": refreshing_count,
                                     "entries": idx.entry_count(),
                                     "dimension": idx.dimension(),
+                                    "skipped_chunks": idx.skipped_rows(),
+                                    "skipped_chunks_summary": idx.skipped_chunks_summary(),
+                                    "skipped_chunk_reason": if idx.skipped_rows() > 0 { Some(idx.skipped_chunk_reason()) } else { None },
                                     "backend": idx.backend_label().unwrap_or(config.semantic_backend_label()),
                                     "model": idx.model_label().unwrap_or(config.semantic.model.as_str()),
                                 })

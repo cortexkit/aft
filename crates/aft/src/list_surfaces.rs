@@ -391,6 +391,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "Internal metadata evidence, not a query result list. FolderAdmission carries observed lower bounds and typed coverage/cuts; a cut cannot admit a sampled source tree or claim complete workspace inventory.",
     },
     ExclusionEntry {
+        file: "semantic_index.rs",
+        enclosing_item: "format_skipped_chunks_summary",
+        location_or_primitive: ".take(5)",
+        reason: "Diagnostic preview of refused-input paths; skipped chunks and omitted file counts are disclosed alongside the first five paths.",
+    },
+    ExclusionEntry {
         file: "db/call_ledger.rs",
         enclosing_item: "late_results_for_consumer",
         location_or_primitive: "LATE_RESULTS_PAGE_MAX (256), SQL LIMIT cap + 1, take(cap), max_body",

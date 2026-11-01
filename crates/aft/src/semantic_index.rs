@@ -19,7 +19,7 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::error::Error;
 use std::fmt::Display;
@@ -358,7 +358,7 @@ struct ColdPauseCheckpoint {
     entries: Vec<EmbeddingEntry>,
     next_chunk: usize,
     dimension: Option<usize>,
-    skipped: usize,
+    skipped: SkippedEmbeddingRows,
 }
 
 struct ReusePauseCheckpoint {
@@ -367,7 +367,7 @@ struct ReusePauseCheckpoint {
     next_miss: usize,
     completed: usize,
     dimension: Option<usize>,
-    skipped: usize,
+    skipped: SkippedEmbeddingRows,
     /// The files the interrupted refresh covered, with the content identity
     /// each had when it was read. A retry resumes only the files that still
     /// match it.
@@ -443,6 +443,7 @@ impl ReusePauseCheckpoint {
 
 struct ViewPauseCheckpoint {
     runs: Vec<Vec<EmbeddingEntry>>,
+    refused_files: Vec<usize>,
     pending: Vec<(usize, SemanticChunk)>,
     next_chunk: usize,
     dimension: Option<usize>,
@@ -795,6 +796,7 @@ pub(crate) fn retry_lane_pause_while<T>(
     mut attempt: impl FnMut() -> Result<T, String>,
     current: &mut impl FnMut() -> bool,
 ) -> Result<T, String> {
+    let _refusal_run = EmbeddingRefusalRunScope::new();
     let _prepared = PreparedPauseJobScope::new();
     let may_wait = LANE_PAUSE_RETRY_POLICY.with(|policy| policy.borrow().is_some())
         && crate::executor::current_job_cancellation().is_none()
@@ -1303,7 +1305,7 @@ fn finish_semantic_index_build(
                 .field("elapsed_ms", scope.elapsed_ms())
                 .field("files", index.file_mtimes.len())
                 .field("chunks", index.entries.len())
-                .field("skipped_rows", index.skipped_rows)
+                .field("skipped_chunks", index.skipped_rows())
                 .field("embed_ms", embedding_timing.total_ms())
                 .field("embed_max_ms", embedding_timing.max_ms()),
             );
@@ -1426,6 +1428,8 @@ const SEMANTIC_INDEX_VERSION_V5: u8 = 5;
 const SEMANTIC_INDEX_VERSION_V6: u8 = 6;
 /// V7 adds qualified symbol names for ranking metadata without changing embeddings.
 const SEMANTIC_INDEX_VERSION_V7: u8 = 7;
+/// V8 appends skipped-row counts and refused-input file identities.
+const SEMANTIC_INDEX_VERSION_V8: u8 = 8;
 /// A V6/V7 base snapshot may be followed by these checksummed delta frames.
 /// The base stays independently readable, so an incomplete final frame can be discarded.
 const SEMANTIC_SEGMENT_MAGIC: &[u8; 8] = b"AFTSEG01";
@@ -1456,7 +1460,7 @@ fn semantic_segment_refusal(
     )
 }
 /// Highest semantic base snapshot format this build reads (and writes).
-pub const SEMANTIC_BASE_FORMAT_VERSION: u32 = SEMANTIC_INDEX_VERSION_V7 as u32;
+pub const SEMANTIC_BASE_FORMAT_VERSION: u32 = SEMANTIC_INDEX_VERSION_V8 as u32;
 /// Highest semantic delta segment format this build reads (and writes).
 pub const SEMANTIC_SEGMENT_FORMAT_VERSION: u32 = SEMANTIC_SEGMENT_VERSION as u32;
 const SEMANTIC_SEGMENT_FRAME_HEADER_BYTES: usize = 8 + 8 + 32;
@@ -1481,6 +1485,12 @@ const BUILD_EMBEDDING_TIMEOUT_MARKER_SUFFIX: &str = "]";
 const ROW_TOO_LONG_MARKER_PREFIX: &str = "[row-too-long:";
 const ROW_TOO_LONG_MARKER_SUFFIX: &str = "]";
 const MAX_ROW_SHRINK_ATTEMPTS: usize = 4;
+const PROVIDER_REFUSAL_MARKER: &str = "[provider-refused-input]";
+pub(crate) const PROVIDER_REFUSAL_REASON: &str = "provider refused the input";
+// A few refused rows must not poison a short request. Only widespread refusals
+// across a whole build or refresh indicate a bad model or request configuration.
+const MIN_REFUSED_ROWS_BEFORE_ABORT: usize = 8;
+const MAX_REFUSED_ROWS_DENOMINATOR: usize = 2;
 const ROW_SHRINK_RATIO_MARGIN: f64 = 0.9;
 const BUILD_PER_ITEM_EMA_ALPHA: f64 = 0.25;
 const BUILD_PER_ITEM_SAFETY_FACTOR: f64 = 2.0;
@@ -1497,6 +1507,136 @@ struct BuildEmbeddingRowMetadata {
 struct AdaptiveBuildRow {
     metadata: BuildEmbeddingRowMetadata,
     vector: Option<Vec<f32>>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct EmbeddingRefusalRun {
+    attempted: usize,
+    refused: usize,
+}
+
+thread_local! {
+    static EMBEDDING_REFUSAL_RUN: RefCell<Option<EmbeddingRefusalRun>> = const { RefCell::new(None) };
+}
+
+/// Nested batch and retry helpers join the caller's run instead of resetting
+/// its allowance. The outermost scope clears it before another job can start.
+pub(crate) struct EmbeddingRefusalRunScope {
+    owns_run: bool,
+    same_thread: std::marker::PhantomData<Rc<()>>,
+}
+
+impl EmbeddingRefusalRunScope {
+    pub(crate) fn new() -> Self {
+        let owns_run = EMBEDDING_REFUSAL_RUN.with(|run| {
+            let mut run = run.borrow_mut();
+            if run.is_some() {
+                false
+            } else {
+                *run = Some(EmbeddingRefusalRun::default());
+                true
+            }
+        });
+        Self {
+            owns_run,
+            same_thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for EmbeddingRefusalRunScope {
+    fn drop(&mut self) {
+        if self.owns_run {
+            EMBEDDING_REFUSAL_RUN.with(|run| run.borrow_mut().take());
+        }
+    }
+}
+
+fn provider_refusal_limit_exceeded() -> bool {
+    EMBEDDING_REFUSAL_RUN.with(|run| {
+        let mut run = run.borrow_mut();
+        let run = run.as_mut().expect("embedding refusal run scope");
+        run.refused = run.refused.saturating_add(1);
+        run.refused > MIN_REFUSED_ROWS_BEFORE_ABORT
+            && run.refused > run.attempted / MAX_REFUSED_ROWS_DENOMINATOR
+    })
+}
+
+#[derive(Clone, Debug, Default)]
+struct SkippedEmbeddingRows {
+    total: usize,
+    refused: BTreeMap<PathBuf, usize>,
+    context_exceeded: BTreeMap<PathBuf, usize>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SemanticSkipReason {
+    ProviderRefusedInput,
+    InputExceededModelContext,
+}
+
+impl SkippedEmbeddingRows {
+    fn record(&mut self, chunk: &SemanticChunk, reason: &str) {
+        self.total += 1;
+        if reason == PROVIDER_REFUSAL_REASON {
+            *self.refused.entry(chunk.file.clone()).or_default() += 1;
+        } else {
+            *self.context_exceeded.entry(chunk.file.clone()).or_default() += 1;
+        }
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.total += other.total;
+        self.refused.extend(other.refused);
+        self.context_exceeded.extend(other.context_exceeded);
+    }
+
+    fn remove(&mut self, path: &Path) {
+        if let Some(count) = self.refused.remove(path) {
+            self.total = self.total.saturating_sub(count);
+        }
+        if let Some(count) = self.context_exceeded.remove(path) {
+            self.total = self.total.saturating_sub(count);
+        }
+    }
+}
+
+impl Display for SkippedEmbeddingRows {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.total.fmt(f)
+    }
+}
+
+pub(crate) fn format_skipped_chunks_summary(
+    root: &Path,
+    files: &BTreeMap<PathBuf, usize>,
+    reason: &str,
+) -> Option<String> {
+    if files.is_empty() {
+        return None;
+    }
+    let count: usize = files.values().sum();
+    let preview = files
+        .keys()
+        .take(5)
+        .map(|path| {
+            path.strip_prefix(root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let omitted = files.len().saturating_sub(5);
+    let more = if omitted > 0 {
+        format!(" (+{omitted} more files)")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "semantic search is incomplete: {count} chunks skipped because {reason}: {preview}{more}"
+    ))
 }
 
 thread_local! {
@@ -3088,7 +3228,10 @@ where
             return Ok(raw);
         }
 
-        if let Some(details) = embedding_response_row_too_long(status, &raw) {
+        if let Some(details) = matches!(status.as_u16(), 400 | 422)
+            .then(|| embedding_response_row_too_long(status, &raw))
+            .flatten()
+        {
             return Err(format!(
                 "{}{} request failed (HTTP {}): {}",
                 row_too_long_marker(details),
@@ -3114,6 +3257,8 @@ where
         // user must fix; no marker.
         let marker = if is_retryable_embedding_status(status) || body_transient {
             TRANSIENT_EMBEDDING_MARKER
+        } else if matches!(status.as_u16(), 400 | 422) && !raw.trim().is_empty() {
+            PROVIDER_REFUSAL_MARKER
         } else {
             ""
         };
@@ -3396,11 +3541,33 @@ impl SemanticEmbeddingModel {
         &mut self,
         texts: Vec<String>,
     ) -> Result<Vec<AdaptiveBuildRow>, String> {
-        let budget = self.build_request_budget(texts.len());
-        match self.embed_texts(texts.clone(), EmbeddingRequestPolicy::Build(budget)) {
+        self.embed_rows_resilient(texts, None)
+    }
+
+    fn embed_rows_resilient(
+        &mut self,
+        texts: Vec<String>,
+        policy: Option<EmbeddingRequestPolicy>,
+    ) -> Result<Vec<AdaptiveBuildRow>, String> {
+        let max_depth = texts.len().max(1).next_power_of_two().ilog2();
+        self.embed_rows_resilient_inner(texts, policy, max_depth)
+    }
+
+    fn embed_rows_resilient_inner(
+        &mut self,
+        texts: Vec<String>,
+        policy: Option<EmbeddingRequestPolicy>,
+        remaining_depth: u32,
+    ) -> Result<Vec<AdaptiveBuildRow>, String> {
+        let request_policy = policy.unwrap_or_else(|| {
+            EmbeddingRequestPolicy::Build(self.build_request_budget(texts.len()))
+        });
+        match self.embed_texts(texts.clone(), request_policy) {
             Ok(vectors) => {
                 validate_embedding_batch(&vectors, texts.len(), "embedding backend")?;
-                crate::cold_build_limiter::progress::embedded(texts.len());
+                if policy.is_none() {
+                    crate::cold_build_limiter::progress::embedded(texts.len());
+                }
                 Ok(texts
                     .into_iter()
                     .zip(vectors)
@@ -3414,16 +3581,64 @@ impl SemanticEmbeddingModel {
                     .collect())
             }
             Err(error) => {
+                if error.starts_with(PROVIDER_REFUSAL_MARKER) {
+                    if policy.is_some() {
+                        return Err(error
+                            .trim_start_matches(PROVIDER_REFUSAL_MARKER)
+                            .to_string());
+                    }
+                    if texts.len() > 1 {
+                        if remaining_depth == 0 {
+                            return Err(error
+                                .trim_start_matches(PROVIDER_REFUSAL_MARKER)
+                                .to_string());
+                        }
+                        let midpoint = texts.len().div_ceil(2);
+                        let mut rows = self.embed_rows_resilient_inner(
+                            texts[..midpoint].to_vec(),
+                            policy,
+                            remaining_depth - 1,
+                        )?;
+                        rows.extend(self.embed_rows_resilient_inner(
+                            texts[midpoint..].to_vec(),
+                            policy,
+                            remaining_depth - 1,
+                        )?);
+                        return Ok(rows);
+                    }
+                    if provider_refusal_limit_exceeded() {
+                        return Err(error
+                            .trim_start_matches(PROVIDER_REFUSAL_MARKER)
+                            .to_string());
+                    }
+                    return Ok(vec![AdaptiveBuildRow {
+                        metadata: BuildEmbeddingRowMetadata {
+                            embedded_text: texts.into_iter().next().expect("refused input row"),
+                            skipped_reason: Some(PROVIDER_REFUSAL_REASON.to_string()),
+                        },
+                        vector: None,
+                    }]);
+                }
                 let Some(details) = row_too_long_details(&error) else {
                     return Err(error);
                 };
 
+                if policy.is_some() {
+                    return Err(error);
+                }
+
                 if texts.len() > 1 {
                     let right = texts.len().div_ceil(2);
-                    let mut left_rows =
-                        self.embed_http_batch_overflow_resilient(texts[..right].to_vec())?;
-                    let mut right_rows =
-                        self.embed_http_batch_overflow_resilient(texts[right..].to_vec())?;
+                    let mut left_rows = self.embed_rows_resilient_inner(
+                        texts[..right].to_vec(),
+                        policy,
+                        remaining_depth.saturating_sub(1),
+                    )?;
+                    let mut right_rows = self.embed_rows_resilient_inner(
+                        texts[right..].to_vec(),
+                        policy,
+                        remaining_depth.saturating_sub(1),
+                    )?;
                     left_rows.append(&mut right_rows);
                     return Ok(left_rows);
                 }
@@ -3480,6 +3695,7 @@ impl SemanticEmbeddingModel {
         clear_http_build_metadata();
         let mut rows = Vec::with_capacity(texts.len());
         let mut cursor = 0usize;
+        let mut attempted_until = 0usize;
 
         while cursor < texts.len() {
             let batch_size = self
@@ -3487,6 +3703,16 @@ impl SemanticEmbeddingModel {
                 .max(1)
                 .min(texts.len() - cursor);
             let batch = texts[cursor..cursor + batch_size].to_vec();
+            // Count input rows once, not each bisection probe or a timeout's
+            // smaller retry over rows already sent in the original request.
+            EMBEDDING_REFUSAL_RUN.with(|run| {
+                let mut run = run.borrow_mut();
+                let run = run.as_mut().expect("embedding refusal run scope");
+                run.attempted = run
+                    .attempted
+                    .saturating_add((cursor + batch_size).saturating_sub(attempted_until));
+            });
+            attempted_until = attempted_until.max(cursor + batch_size);
             let started = Instant::now();
             match self.embed_http_batch_overflow_resilient(batch) {
                 Ok(mut batch_rows) => {
@@ -3572,7 +3798,18 @@ impl SemanticEmbeddingModel {
 
     pub fn embed(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
         if self.uses_http_embedding_backend() {
-            self.embed_build_http_adaptive(texts)
+            let _refusal_run = EmbeddingRefusalRunScope::new();
+            let checkpoint = EMBEDDING_REFUSAL_RUN.with(|run| *run.borrow());
+            let result = self.embed_build_http_adaptive(texts);
+            if result
+                .as_ref()
+                .is_err_and(|error| crate::synapse_embed::LanePause::from_error(error).is_some())
+            {
+                // The caller retains only completed outer batches on pause.
+                // Reattempting this batch must not count its discarded work twice.
+                EMBEDDING_REFUSAL_RUN.with(|run| *run.borrow_mut() = checkpoint);
+            }
+            result
         } else {
             let budget = self.build_request_budget(texts.len());
             self.embed_texts(texts, EmbeddingRequestPolicy::Build(budget))
@@ -3606,10 +3843,14 @@ impl SemanticEmbeddingModel {
             self.query_instruction_logged = true;
         }
         let query_text = query_embedding_text(query, self.query_instruction.as_deref());
-        self.embed_texts(vec![query_text], EmbeddingRequestPolicy::Query(budget))?
-            .into_iter()
-            .next()
-            .ok_or_else(|| "embedding model returned no query vector".to_string())
+        self.embed_rows_resilient(
+            vec![query_text],
+            Some(EmbeddingRequestPolicy::Query(budget)),
+        )?
+        .into_iter()
+        .next()
+        .and_then(|row| row.vector)
+        .ok_or_else(|| "embedding model returned no query vector".to_string())
     }
 
     pub fn query_embedding_cache_stats(&self) -> (u64, u64, usize) {
@@ -4820,7 +5061,7 @@ where
 
 fn format_skipped_row_warning(chunk: &SemanticChunk, embedded_text: &str, reason: &str) -> String {
     format!(
-        "semantic embed skipped row: file={} symbol={} chars={} reason={}",
+        "semantic embed skipped chunk: file={} symbol={} chars={} reason={}",
         chunk.file.display(),
         chunk.name,
         embedded_text.chars().count(),
@@ -4849,6 +5090,7 @@ fn take_test_skipped_row_warnings() -> Vec<String> {
 #[derive(Debug, Default)]
 pub struct SemanticVectors {
     entries: Vec<EmbeddingEntry>,
+    pub(crate) provider_refused_chunks: usize,
 }
 
 impl SemanticVectors {
@@ -4858,6 +5100,7 @@ impl SemanticVectors {
     #[cfg(test)]
     pub(crate) fn synthetic_for_test(file: &Path, chunks: usize, dimension: usize) -> Self {
         Self {
+            provider_refused_chunks: 0,
             entries: (0..chunks)
                 .map(|ordinal| {
                     EmbeddingEntry::new(
@@ -4956,7 +5199,7 @@ struct SharedSemanticBase {
     fingerprint: Option<SemanticIndexFingerprint>,
     summary_budget_limited: bool,
     deferred_files: HashSet<PathBuf>,
-    skipped_rows: usize,
+    skipped_rows: SkippedEmbeddingRows,
     persistence: Arc<Mutex<Option<SemanticPersistenceState>>>,
 }
 
@@ -5159,7 +5402,7 @@ fn borrowed_artifact_identity(data_path: &Path) -> Result<(String, blake3::Hash)
     header
         .read_exact(&mut fixed)
         .map_err(|error| error.to_string())?;
-    if fixed[0] != SEMANTIC_INDEX_VERSION_V6 && fixed[0] != SEMANTIC_INDEX_VERSION_V7 {
+    if !(SEMANTIC_INDEX_VERSION_V6..=SEMANTIC_INDEX_VERSION_V8).contains(&fixed[0]) {
         return Err(format!(
             "unsupported semantic artifact version {}",
             fixed[0]
@@ -5263,7 +5506,7 @@ pub struct SemanticIndex {
     persistence: Arc<Mutex<Option<SemanticPersistenceState>>>,
     last_append_read_bytes: Arc<AtomicUsize>,
     /// Rows rejected by the backend even after bounded body shrinking.
-    skipped_rows: usize,
+    skipped_rows: SkippedEmbeddingRows,
     #[cfg(test)]
     removal_retain_passes: usize,
 }
@@ -5289,7 +5532,7 @@ impl Clone for SemanticIndex {
             dirty_paths: Arc::new(Mutex::new(self.dirty_paths_snapshot())),
             persistence: Arc::clone(&self.persistence),
             last_append_read_bytes: Arc::clone(&self.last_append_read_bytes),
-            skipped_rows: self.skipped_rows,
+            skipped_rows: self.skipped_rows.clone(),
             #[cfg(test)]
             removal_retain_passes: self.removal_retain_passes,
         };
@@ -5700,7 +5943,21 @@ impl SemanticIndex {
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             )),
             last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
-            skipped_rows: shared_base.skipped_rows,
+            skipped_rows: SkippedEmbeddingRows {
+                total: shared_base.skipped_rows.total,
+                refused: shared_base
+                    .skipped_rows
+                    .refused
+                    .iter()
+                    .map(|(path, count)| (project_root.join(path), *count))
+                    .collect(),
+                context_exceeded: shared_base
+                    .skipped_rows
+                    .context_exceeded
+                    .iter()
+                    .map(|(path, count)| (project_root.join(path), *count))
+                    .collect(),
+            },
             shared_base: Some(Arc::clone(&shared_base)),
             tombstones: HashSet::new(),
             view_runs: Vec::new(),
@@ -5811,6 +6068,8 @@ impl SemanticIndex {
                 .keys()
                 .chain(self.file_sizes.keys())
                 .chain(self.file_hashes.keys())
+                .chain(self.skipped_rows.refused.keys())
+                .chain(self.skipped_rows.context_exceeded.keys())
                 .chain(self.deferred_files.iter())
                 .all(|path| shareable(path))
             && self
@@ -5856,6 +6115,18 @@ impl SemanticIndex {
         for (entry, file) in self.entries.iter_mut().zip(entry_files) {
             entry.chunk.file = file;
         }
+        self.skipped_rows.refused = self
+            .skipped_rows
+            .refused
+            .into_iter()
+            .map(|(path, count)| (relative(&path).expect("validated refused path"), count))
+            .collect();
+        self.skipped_rows.context_exceeded = self
+            .skipped_rows
+            .context_exceeded
+            .into_iter()
+            .map(|(path, count)| (relative(&path).expect("validated skipped path"), count))
+            .collect();
         let persistence = *self
             .persistence
             .lock()
@@ -5869,6 +6140,7 @@ impl SemanticIndex {
                 .collect(),
             entry_count: self.entries.len(),
             segments: vec![Arc::new(SemanticVectors {
+                provider_refused_chunks: 0,
                 entries: self.entries,
             })],
             file_mtimes,
@@ -6033,7 +6305,7 @@ impl SemanticIndex {
             dirty_paths: Arc::new(Mutex::new(None)),
             persistence: Arc::new(Mutex::new(None)),
             last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
-            skipped_rows: 0,
+            skipped_rows: SkippedEmbeddingRows::default(),
             #[cfg(test)]
             removal_retain_passes: 0,
         }
@@ -6041,7 +6313,78 @@ impl SemanticIndex {
 
     /// Number of rows omitted because the backend still rejected their header floor.
     pub fn skipped_rows(&self) -> usize {
-        self.skipped_rows
+        self.skipped_rows.total
+    }
+
+    pub(crate) fn skipped_chunks_summary(&self) -> Option<String> {
+        let summaries = [
+            format_skipped_chunks_summary(
+                &self.project_root,
+                &self.skipped_rows.refused,
+                "the embedding provider refused them",
+            ),
+            format_skipped_chunks_summary(
+                &self.project_root,
+                &self.skipped_rows.context_exceeded,
+                "they exceed the model's input limit",
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        (!summaries.is_empty()).then(|| summaries.join("\n"))
+    }
+
+    pub(crate) fn skipped_chunk_reason(&self) -> SemanticSkipReason {
+        if self.skipped_rows.refused.is_empty() {
+            SemanticSkipReason::InputExceededModelContext
+        } else {
+            SemanticSkipReason::ProviderRefusedInput
+        }
+    }
+
+    pub(crate) fn refused_rows_for_paths(&self, paths: &[PathBuf]) -> BTreeMap<PathBuf, usize> {
+        paths
+            .iter()
+            .filter_map(|path| {
+                self.skipped_rows
+                    .refused
+                    .get(path)
+                    .map(|count| (path.clone(), *count))
+            })
+            .collect()
+    }
+
+    pub fn apply_refused_rows_update(&mut self, refused: BTreeMap<PathBuf, usize>) {
+        for (path, count) in refused {
+            if let Some(previous) = self.skipped_rows.refused.remove(&path) {
+                self.skipped_rows.total = self.skipped_rows.total.saturating_sub(previous);
+            }
+            self.skipped_rows.total += count;
+            self.skipped_rows.refused.insert(path, count);
+        }
+    }
+
+    pub(crate) fn context_skipped_for_paths(&self, paths: &[PathBuf]) -> BTreeMap<PathBuf, usize> {
+        paths
+            .iter()
+            .filter_map(|path| {
+                self.skipped_rows
+                    .context_exceeded
+                    .get(path)
+                    .map(|count| (path.clone(), *count))
+            })
+            .collect()
+    }
+
+    pub fn apply_context_skips_update(&mut self, skipped: BTreeMap<PathBuf, usize>) {
+        for (path, count) in skipped {
+            if let Some(previous) = self.skipped_rows.context_exceeded.remove(&path) {
+                self.skipped_rows.total = self.skipped_rows.total.saturating_sub(previous);
+            }
+            self.skipped_rows.total += count;
+            self.skipped_rows.context_exceeded.insert(path, count);
+        }
     }
 
     /// Number of embedded symbol entries.
@@ -6526,11 +6869,12 @@ impl SemanticIndex {
         initial_observed_dimension: Option<usize>,
         refresh_label: &str,
         progress: &mut P,
-    ) -> Result<(Vec<EmbeddingEntry>, Option<usize>, usize), String>
+    ) -> Result<(Vec<EmbeddingEntry>, Option<usize>, SkippedEmbeddingRows), String>
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
         P: FnMut(usize, usize),
     {
+        let _refusal_run = EmbeddingRefusalRunScope::new();
         let total_chunks = chunks.len();
         progress(0, total_chunks);
 
@@ -6586,7 +6930,14 @@ impl SemanticIndex {
             }
             let completed = total_chunks.saturating_sub(misses.len());
             let dimension = initial_observed_dimension.or(paused_dimension);
-            (entries, misses, completed, dimension, 0, 0)
+            (
+                entries,
+                misses,
+                completed,
+                dimension,
+                SkippedEmbeddingRows::default(),
+                0,
+            )
         };
         if completed > 0 {
             progress(completed, total_chunks);
@@ -6643,7 +6994,7 @@ impl SemanticIndex {
                         reason,
                     } => {
                         log_skipped_row_warning(&chunk, &embedded_text, &reason);
-                        skipped_rows = skipped_rows.saturating_add(1);
+                        skipped_rows.record(&chunk, &reason);
                     }
                 }
             }
@@ -6673,6 +7024,7 @@ impl SemanticIndex {
         P: FnMut(usize, usize),
         C: FnMut() -> bool,
     {
+        let _refusal_run = EmbeddingRefusalRunScope::new();
         debug_assert!(project_root.is_absolute());
         let total_chunks = chunks.len();
         crate::cold_build_limiter::progress::phase("embedding", Some(file_metadata.len()));
@@ -6715,7 +7067,7 @@ impl SemanticIndex {
                 dirty_paths: Arc::new(Mutex::new(None)),
                 persistence: Arc::new(Mutex::new(None)),
                 last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
-                skipped_rows: 0,
+                skipped_rows: SkippedEmbeddingRows::default(),
                 #[cfg(test)]
                 removal_retain_passes: 0,
             });
@@ -6730,7 +7082,12 @@ impl SemanticIndex {
                     state.skipped,
                     state.next_chunk,
                 ),
-                None => (Vec::with_capacity(chunks.len()), None, 0, 0),
+                None => (
+                    Vec::with_capacity(chunks.len()),
+                    None,
+                    SkippedEmbeddingRows::default(),
+                    0,
+                ),
             };
         let batch_size = max_batch_size.max(1);
         let embed_started = std::time::Instant::now();
@@ -6796,7 +7153,7 @@ impl SemanticIndex {
                         reason,
                     } => {
                         log_skipped_row_warning(&chunk, &embedded_text, &reason);
-                        skipped_rows = skipped_rows.saturating_add(1);
+                        skipped_rows.record(&chunk, &reason);
                     }
                 }
             }
@@ -6842,7 +7199,7 @@ impl SemanticIndex {
             .unwrap_or(0) as u64;
         let embedding_timing = embedding_timing.snapshot();
         slog_info!(
-            "semantic embed: {} chunks in {} batches, {} ms ({} chunks/s), skipped_rows={} elapsed_ms={} embed_ms={} embed_max_ms={}",
+            "semantic embed: {} chunks in {} batches, {} ms ({} chunks/s), skipped_chunks={} elapsed_ms={} embed_ms={} embed_max_ms={}",
             total_chunks,
             batch_count,
             embed_phase_ms,
@@ -7469,7 +7826,10 @@ impl SemanticIndex {
                 return Err(error);
             }
         };
-        self.skipped_rows = self.skipped_rows.saturating_add(skipped_rows);
+        for file in fresh_metadata.keys() {
+            self.skipped_rows.remove(file);
+        }
+        self.skipped_rows.extend(skipped_rows);
 
         let successful_files: HashSet<PathBuf> = fresh_metadata.keys().cloned().collect();
         for file in &successful_files {
@@ -7808,7 +8168,10 @@ impl SemanticIndex {
                 return Err(error);
             }
         };
-        self.skipped_rows = self.skipped_rows.saturating_add(skipped_rows);
+        for file in fresh_metadata.keys() {
+            self.skipped_rows.remove(file);
+        }
+        self.skipped_rows.extend(skipped_rows);
 
         let added_entries = new_entries.clone();
         self.entries.extend(new_entries);
@@ -7940,6 +8303,7 @@ impl SemanticIndex {
             }
         });
         for path in metadata_files {
+            self.skipped_rows.remove(path);
             self.file_mtimes.remove(path);
             self.file_sizes.remove(path);
             self.file_hashes.remove(path);
@@ -8416,7 +8780,7 @@ impl SemanticIndex {
         let mut fixed = [0_u8; HEADER_BYTES_V2];
         file.read_exact(&mut fixed)
             .map_err(|error| error.to_string())?;
-        if fixed[0] != SEMANTIC_INDEX_VERSION_V6 && fixed[0] != SEMANTIC_INDEX_VERSION_V7 {
+        if !(SEMANTIC_INDEX_VERSION_V6..=SEMANTIC_INDEX_VERSION_V8).contains(&fixed[0]) {
             return Err(format!(
                 "unsupported on-disk semantic version: {}",
                 fixed[0]
@@ -8609,7 +8973,15 @@ impl SemanticIndex {
         let mut delta = Self::new(self.project_root.clone(), self.dimension);
         delta.fingerprint = self.fingerprint.clone();
         delta.summary_budget_limited = self.summary_budget_limited;
-        delta.skipped_rows = self.skipped_rows;
+        delta.skipped_rows = self.skipped_rows.clone();
+        delta
+            .skipped_rows
+            .refused
+            .retain(|path, _| paths.contains(path));
+        delta
+            .skipped_rows
+            .context_exceeded
+            .retain(|path, _| paths.contains(path));
         delta.entries = self
             .live_entries()
             .filter(|(path, _)| paths.contains(path.as_ref()))
@@ -9300,6 +9672,15 @@ impl SemanticIndex {
             index.file_mtimes.extend(delta.file_mtimes);
             index.file_sizes.extend(delta.file_sizes);
             index.file_hashes.extend(delta.file_hashes);
+            index.skipped_rows.total = delta.skipped_rows.total;
+            index
+                .skipped_rows
+                .refused
+                .extend(delta.skipped_rows.refused);
+            index
+                .skipped_rows
+                .context_exceeded
+                .extend(delta.skipped_rows.context_exceeded);
             index.any_missing_sizes = index
                 .file_mtimes
                 .keys()
@@ -9336,7 +9717,7 @@ impl SemanticIndex {
             .read_exact(&mut version_buf)
             .map_err(|error| error.to_string())?;
         let version = version_buf[0];
-        if version != SEMANTIC_INDEX_VERSION_V6 && version != SEMANTIC_INDEX_VERSION_V7 {
+        if !(SEMANTIC_INDEX_VERSION_V6..=SEMANTIC_INDEX_VERSION_V8).contains(&version) {
             return Err(format!("unsupported on-disk semantic version: {version}"));
         }
         // Base rows, tombstones, and delta rows all resolve within this one load.
@@ -9405,11 +9786,11 @@ impl SemanticIndex {
             .read_exact(&mut version_buf)
             .ok()?;
         let version = version_buf[0];
-        if version != SEMANTIC_INDEX_VERSION_V6 && version != SEMANTIC_INDEX_VERSION_V7 {
+        if !(SEMANTIC_INDEX_VERSION_V6..=SEMANTIC_INDEX_VERSION_V8).contains(&version) {
             slog_info!(
                 "cached semantic index version {} is not compatible with {}, rebuilding without deleting the shared artifact",
                 version,
-                SEMANTIC_INDEX_VERSION_V7
+                SEMANTIC_INDEX_VERSION_V8
             );
             return None;
         }
@@ -9728,8 +10109,8 @@ impl SemanticIndex {
 
         // Header: version(1) + dimension(4) + entry_count(4) + fingerprint_len(4) + fingerprint
         //
-        // V7 is the single write format. Layout extends V6 with per-entry
-        // qualified_name metadata while preserving the embedding fingerprint:
+        // V8 extends V7 with skipped-row metadata after the vectors, preserving
+        // the embedding fingerprint and all stored chunk text:
         //   - fingerprint is always represented (absent ⇒ fingerprint_len=0,
         //     no bytes follow). Uniform format simplifies the reader.
         //   - paths are relative to project_root.
@@ -9739,8 +10120,8 @@ impl SemanticIndex {
         // V1/V2 remain readable for backward compatibility (see from_bytes).
         // V3/V4 load as compatible formats but are rejected on disk so snippets
         // and file sizes are rebuilt once. V6 remains accepted on disk and
-        // yields qualified_name=None until the next V7 write.
-        let version = SEMANTIC_INDEX_VERSION_V7;
+        // yields qualified_name=None until the next write.
+        let version = SEMANTIC_INDEX_VERSION_V8;
         write_counted(writer, &[version], &mut bytes_written)?;
         write_counted(
             writer,
@@ -9876,6 +10257,37 @@ impl SemanticIndex {
             }
         }
 
+        write_counted(
+            writer,
+            &(self.skipped_rows.total as u64).to_le_bytes(),
+            &mut bytes_written,
+        )?;
+        for skipped_files in [
+            &self.skipped_rows.refused,
+            &self.skipped_rows.context_exceeded,
+        ] {
+            let skipped = skipped_files
+                .iter()
+                .filter_map(|(path, count)| {
+                    cache_relative_path(&self.project_root, path).map(|relative| (relative, count))
+                })
+                .collect::<Vec<_>>();
+            write_counted(
+                writer,
+                &(skipped.len() as u32).to_le_bytes(),
+                &mut bytes_written,
+            )?;
+            for (path, count) in skipped {
+                let path = path.to_string_lossy();
+                write_counted(
+                    writer,
+                    &(path.len() as u32).to_le_bytes(),
+                    &mut bytes_written,
+                )?;
+                write_counted(writer, path.as_bytes(), &mut bytes_written)?;
+                write_counted(writer, &(*count as u64).to_le_bytes(), &mut bytes_written)?;
+            }
+        }
         Ok(bytes_written)
     }
 
@@ -9935,6 +10347,7 @@ impl SemanticIndex {
             && version != SEMANTIC_INDEX_VERSION_V5
             && version != SEMANTIC_INDEX_VERSION_V6
             && version != SEMANTIC_INDEX_VERSION_V7
+            && version != SEMANTIC_INDEX_VERSION_V8
         {
             return Err(format!("unsupported version: {}", version));
         }
@@ -9946,7 +10359,7 @@ impl SemanticIndex {
             || version == SEMANTIC_INDEX_VERSION_V4
             || version == SEMANTIC_INDEX_VERSION_V5
             || version == SEMANTIC_INDEX_VERSION_V6
-            || version == SEMANTIC_INDEX_VERSION_V7)
+            || version >= SEMANTIC_INDEX_VERSION_V7)
             && total_len.is_some_and(|len| len < HEADER_BYTES_V2)
         {
             return Err("data too short for semantic index v2/v3/v4/v5/v6/v7 header".to_string());
@@ -9969,7 +10382,7 @@ impl SemanticIndex {
             || version == SEMANTIC_INDEX_VERSION_V4
             || version == SEMANTIC_INDEX_VERSION_V5
             || version == SEMANTIC_INDEX_VERSION_V6
-            || version == SEMANTIC_INDEX_VERSION_V7;
+            || version >= SEMANTIC_INDEX_VERSION_V7;
         let (fingerprint, summary_budget_limited, header_languages_resolved) =
             if has_fingerprint_field {
                 let fingerprint_len = read_u32_stream(&mut reader)? as usize;
@@ -10029,7 +10442,7 @@ impl SemanticIndex {
                 || version == SEMANTIC_INDEX_VERSION_V4
                 || version == SEMANTIC_INDEX_VERSION_V5
                 || version == SEMANTIC_INDEX_VERSION_V6
-                || version == SEMANTIC_INDEX_VERSION_V7
+                || version >= SEMANTIC_INDEX_VERSION_V7
             {
                 read_u32_stream(&mut reader)?
             } else {
@@ -10037,24 +10450,23 @@ impl SemanticIndex {
             };
             let size = if version == SEMANTIC_INDEX_VERSION_V5
                 || version == SEMANTIC_INDEX_VERSION_V6
-                || version == SEMANTIC_INDEX_VERSION_V7
+                || version >= SEMANTIC_INDEX_VERSION_V7
             {
                 Some(read_u64_stream(&mut reader)?)
             } else {
                 None
             };
-            let content_hash =
-                if version == SEMANTIC_INDEX_VERSION_V6 || version == SEMANTIC_INDEX_VERSION_V7 {
-                    let mut hash_bytes = [0u8; 32];
-                    read_exact_stream(
-                        &mut reader,
-                        &mut hash_bytes,
-                        "unexpected end of data reading content hash",
-                    )?;
-                    blake3::Hash::from_bytes(hash_bytes)
-                } else {
-                    cache_freshness::zero_hash()
-                };
+            let content_hash = if version >= SEMANTIC_INDEX_VERSION_V6 {
+                let mut hash_bytes = [0u8; 32];
+                read_exact_stream(
+                    &mut reader,
+                    &mut hash_bytes,
+                    "unexpected end of data reading content hash",
+                )?;
+                blake3::Hash::from_bytes(hash_bytes)
+            } else {
+                cache_freshness::zero_hash()
+            };
             // Hardening against corrupt / maliciously crafted cache files
             // (v0.15.2). `Duration::new(secs, nanos)` can panic when the
             // nanosecond carry overflows the second counter, and
@@ -10076,17 +10488,16 @@ impl SemanticIndex {
                         secs, nanos
                     )
                 })?;
-            let path =
-                if version == SEMANTIC_INDEX_VERSION_V6 || version == SEMANTIC_INDEX_VERSION_V7 {
-                    cached_path_under_root_with_memo(
-                        current_canonical_root,
-                        &PathBuf::from(path),
-                        canonical_parents,
-                    )
-                    .ok_or_else(|| "cached semantic mtime path escapes project root".to_string())?
-                } else {
-                    PathBuf::from(path)
-                };
+            let path = if version >= SEMANTIC_INDEX_VERSION_V6 {
+                cached_path_under_root_with_memo(
+                    current_canonical_root,
+                    &PathBuf::from(path),
+                    canonical_parents,
+                )
+                .ok_or_else(|| "cached semantic mtime path escapes project root".to_string())?
+            } else {
+                PathBuf::from(path)
+            };
             file_mtimes.insert(path.clone(), mtime);
             if let Some(size) = size {
                 file_sizes.insert(path.clone(), size);
@@ -10104,19 +10515,18 @@ impl SemanticIndex {
         let mut vector_bytes = vec![0u8; vec_bytes];
         for _ in 0..entry_count {
             let raw_file = PathBuf::from(read_string_stream(&mut reader, total_len)?);
-            let file =
-                if version == SEMANTIC_INDEX_VERSION_V6 || version == SEMANTIC_INDEX_VERSION_V7 {
-                    cached_path_under_root_with_memo(
-                        current_canonical_root,
-                        &raw_file,
-                        canonical_parents,
-                    )
-                    .ok_or_else(|| "cached semantic entry path escapes project root".to_string())?
-                } else {
-                    raw_file
-                };
+            let file = if version >= SEMANTIC_INDEX_VERSION_V6 {
+                cached_path_under_root_with_memo(
+                    current_canonical_root,
+                    &raw_file,
+                    canonical_parents,
+                )
+                .ok_or_else(|| "cached semantic entry path escapes project root".to_string())?
+            } else {
+                raw_file
+            };
             let name = read_string_stream(&mut reader, total_len)?;
-            let qualified_name = if version == SEMANTIC_INDEX_VERSION_V7 {
+            let qualified_name = if version >= SEMANTIC_INDEX_VERSION_V7 {
                 let qualified_name = read_string_stream(&mut reader, total_len)?;
                 if qualified_name.is_empty() {
                     None
@@ -10187,6 +10597,46 @@ impl SemanticIndex {
         let any_missing_sizes = file_mtimes
             .keys()
             .any(|path| !file_sizes.contains_key(path));
+        let mut skipped_rows = SkippedEmbeddingRows::default();
+        if version >= SEMANTIC_INDEX_VERSION_V8 {
+            skipped_rows.total = usize::try_from(read_u64_stream(&mut reader)?)
+                .map_err(|_| "skipped chunk count overflow")?;
+            let mut decoded_total = 0usize;
+            for files in [
+                &mut skipped_rows.refused,
+                &mut skipped_rows.context_exceeded,
+            ] {
+                let count = read_u32_stream(&mut reader)? as usize;
+                if count > MAX_ENTRIES {
+                    return Err("too many skipped semantic files".to_string());
+                }
+                for _ in 0..count {
+                    let raw = read_string_stream(&mut reader, total_len)?;
+                    let path = cached_path_under_root_with_memo(
+                        current_canonical_root,
+                        Path::new(&raw),
+                        canonical_parents,
+                    )
+                    .ok_or_else(|| {
+                        "cached semantic skipped path escapes project root".to_string()
+                    })?;
+                    let rows = usize::try_from(read_u64_stream(&mut reader)?)
+                        .map_err(|_| "refused chunk count overflow")?;
+                    decoded_total = decoded_total
+                        .checked_add(rows)
+                        .ok_or("refused chunk count overflow")?;
+                    if rows == 0
+                        || files.insert(path.clone(), rows).is_some()
+                        || !file_mtimes.contains_key(&path)
+                    {
+                        return Err("invalid skipped semantic file metadata".to_string());
+                    }
+                }
+            }
+            if decoded_total > skipped_rows.total {
+                return Err("skipped chunk count exceeds total skipped chunks".to_string());
+            }
+        }
         let bytes_read = reader.bytes_read();
         let mut index = Self {
             entries,
@@ -10205,7 +10655,7 @@ impl SemanticIndex {
             dirty_paths: Arc::new(Mutex::new(None)),
             persistence: Arc::new(Mutex::new(None)),
             last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
-            skipped_rows: 0,
+            skipped_rows,
             #[cfg(test)]
             removal_retain_passes: 0,
         };
@@ -11252,7 +11702,10 @@ impl SemanticVectors {
         if cursor != payload.len() {
             return Err("semantic view payload has trailing bytes".to_string());
         }
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            provider_refused_chunks: 0,
+        })
     }
 
     /// Drops the embedded text after a fill stored this run, so a run a fill
@@ -11396,6 +11849,7 @@ pub(crate) fn embed_view_files_with_rows_at_offset<F>(
 where
     F: FnMut(usize, Vec<String>) -> Result<Vec<BuildEmbeddingRow>, String>,
 {
+    let _refusal_run = EmbeddingRefusalRunScope::new();
     let resume = prepared_pause_job()
         .and_then(|job| job.borrow_mut().view.take())
         .filter(|state| {
@@ -11409,20 +11863,28 @@ where
                         .enumerate()
                         .flat_map(|(file, chunks)| chunks.iter().map(move |chunk| (file, chunk))))
         });
-    let (mut runs, pending, mut dimension, next_chunk) = if let Some(state) = resume {
-        (state.runs, state.pending, state.dimension, state.next_chunk)
-    } else {
-        let runs = files
-            .iter()
-            .map(|chunks| Vec::with_capacity(chunks.len()))
-            .collect::<Vec<Vec<EmbeddingEntry>>>();
-        let pending = files
-            .into_iter()
-            .enumerate()
-            .flat_map(|(file, chunks)| chunks.into_iter().map(move |chunk| (file, chunk)))
-            .collect::<Vec<_>>();
-        (runs, pending, None, 0)
-    };
+    let (mut runs, mut refused_files, pending, mut dimension, next_chunk) =
+        if let Some(state) = resume {
+            (
+                state.runs,
+                state.refused_files,
+                state.pending,
+                state.dimension,
+                state.next_chunk,
+            )
+        } else {
+            let refused_files = vec![0usize; files.len()];
+            let runs = files
+                .iter()
+                .map(|chunks| Vec::with_capacity(chunks.len()))
+                .collect::<Vec<Vec<EmbeddingEntry>>>();
+            let pending = files
+                .into_iter()
+                .enumerate()
+                .flat_map(|(file, chunks)| chunks.into_iter().map(move |chunk| (file, chunk)))
+                .collect::<Vec<_>>();
+            (runs, refused_files, pending, None, 0)
+        };
     let batch_size = max_batch_size.max(1);
     for batch_start in (next_chunk..pending.len()).step_by(batch_size) {
         let batch = &pending[batch_start..(batch_start + batch_size).min(pending.len())];
@@ -11437,6 +11899,7 @@ where
                     checkpoint_work(0, 1, 0);
                     job.borrow_mut().view = Some(ViewPauseCheckpoint {
                         runs,
+                        refused_files,
                         pending,
                         next_chunk: batch_start,
                         dimension,
@@ -11468,13 +11931,20 @@ where
                 BuildEmbeddingRow::Skipped {
                     embedded_text,
                     reason,
-                } => log_skipped_row_warning(&chunk, &embedded_text, &reason),
+                } => {
+                    refused_files[*file] += usize::from(reason == PROVIDER_REFUSAL_REASON);
+                    log_skipped_row_warning(&chunk, &embedded_text, &reason);
+                }
             }
         }
     }
     Ok(runs
         .into_iter()
-        .map(|entries| SemanticVectors { entries })
+        .zip(refused_files)
+        .map(|(entries, provider_refused_chunks)| SemanticVectors {
+            entries,
+            provider_refused_chunks,
+        })
         .collect())
 }
 
@@ -11511,7 +11981,7 @@ impl ViewSemanticBase {
                 fingerprint: None,
                 deferred_files: HashSet::new(),
                 summary_budget_limited: false,
-                skipped_rows: 0,
+                skipped_rows: SkippedEmbeddingRows::default(),
                 persistence: Arc::new(Mutex::new(None)),
             }),
         }
@@ -11646,7 +12116,65 @@ fn u8_to_symbol_kind(v: u8) -> Result<SymbolKind, String> {
 pub(crate) use tests::saved_pre_budget_summary_fixture;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    #[test]
+    fn v8_refused_chunks_and_header_identity_round_trip_preserves_append_scan() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        let header = root.join("widget.h");
+        let refused_file = root.join("partial.rs");
+        fs::write(
+            &header,
+            "template <typename T>\nclass Widget {\npublic:\n    T value(T x) {\n        return x;\n    }\n};\n",
+        )
+        .unwrap();
+        write_rust_file(&refused_file, "retained");
+        let mut index = build_test_index(&root, &[header.clone(), refused_file.clone()]);
+        let fingerprint = SemanticIndexFingerprint::for_config_dimension(
+            &SemanticBackendConfig::default(),
+            index.dimension(),
+        );
+        index.set_fingerprint(fingerprint.clone());
+        let refused = BTreeMap::from([(refused_file, 2)]);
+        index.apply_refused_rows_update(refused.clone());
+        assert!(index.write_to_disk(storage.path(), "v8-header-refused"));
+
+        let data_path = storage
+            .path()
+            .join("semantic/v8-header-refused/semantic.bin");
+        let bytes = fs::read(&data_path).unwrap();
+        assert_eq!(bytes[0], SEMANTIC_INDEX_VERSION_V8);
+        let identity_len = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
+        let identity: serde_json::Value =
+            serde_json::from_slice(&bytes[13..13 + identity_len]).unwrap();
+        assert_eq!(identity["header_languages_resolved"], true);
+
+        let restored = SemanticIndex::read_from_disk(
+            storage.path(),
+            "v8-header-refused",
+            &root,
+            false,
+            Some(&fingerprint.as_string()),
+        )
+        .unwrap();
+        assert_eq!(restored.skipped_rows(), 2);
+        assert_eq!(restored.skipped_rows.refused, refused);
+        // Reading this marker must preserve the recorded freshness of resolved C++ headers.
+        assert!(restored.recorded_file_freshness(&header).is_some());
+        assert_eq!(restored.to_bytes(), bytes);
+
+        let layout = SemanticIndex::scan_artifact_for_append(
+            &data_path,
+            restored.persistence_snapshot().unwrap(),
+            &fingerprint.as_string(),
+            restored.dimension(),
+            false,
+        )
+        .expect("V8 append identity must ignore the stored header migration marker");
+        assert!(layout.bytes_read < bytes.len());
+    }
+
     #[test]
     fn h_header_marker_preserves_non_header_incremental_append_scan() {
         let project = tempfile::tempdir().unwrap();
@@ -13721,11 +14249,23 @@ mod tests {
     }
 
     enum TestEmbeddingRejection {
-        Oversize { max_bytes: usize },
-        Always { body: String },
+        Oversize {
+            max_bytes: usize,
+        },
+        Always {
+            body: String,
+        },
+        Contains {
+            marker: String,
+            status: &'static str,
+        },
+        Status {
+            status: &'static str,
+            body: String,
+        },
     }
 
-    struct OverflowEmbeddingServer {
+    pub(crate) struct OverflowEmbeddingServer {
         base_url: String,
         requests: Arc<Mutex<Vec<Vec<String>>>>,
         shutdown: Arc<AtomicBool>,
@@ -13733,6 +14273,12 @@ mod tests {
     }
 
     impl OverflowEmbeddingServer {
+        pub(crate) fn refusing_text(marker: &str) -> Self {
+            Self::start(TestEmbeddingRejection::Contains {
+                marker: marker.into(),
+                status: "400 Bad Request",
+            })
+        }
         fn rejecting_oversize(max_bytes: usize) -> Self {
             Self::start(TestEmbeddingRejection::Oversize { max_bytes })
         }
@@ -13774,7 +14320,7 @@ mod tests {
             }
         }
 
-        fn requests(&self) -> Vec<Vec<String>> {
+        pub(crate) fn requests(&self) -> Vec<Vec<String>> {
             self.requests.lock().unwrap().clone()
         }
     }
@@ -13857,10 +14403,22 @@ mod tests {
                     .to_string()
                 }),
             TestEmbeddingRejection::Always { body } => Some(body.clone()),
+            TestEmbeddingRejection::Status { body, .. } => Some(body.clone()),
+            TestEmbeddingRejection::Contains { marker, .. } => inputs
+                .iter()
+                .any(|text| text.contains(marker))
+                .then(|| r#"{"error":"provider refused the input"}"#.to_string()),
         };
 
         let (status, response_body) = if let Some(body) = rejected {
-            ("400 Bad Request", body)
+            (
+                match rejection {
+                    TestEmbeddingRejection::Contains { status, .. }
+                    | TestEmbeddingRejection::Status { status, .. } => *status,
+                    _ => "400 Bad Request",
+                },
+                body,
+            )
         } else {
             let data = inputs
                 .iter()
@@ -13872,7 +14430,14 @@ mod tests {
                     })
                 })
                 .collect::<Vec<_>>();
-            ("200 OK", serde_json::json!({"data": data}).to_string())
+            let embeddings = data
+                .iter()
+                .map(|row| row["embedding"].clone())
+                .collect::<Vec<_>>();
+            (
+                "200 OK",
+                serde_json::json!({"data": data, "embeddings": embeddings}).to_string(),
+            )
         };
         let response = format!(
             "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -16032,9 +16597,11 @@ Connection: close
         .unwrap();
         assert_eq!(loaded.to_bytes(), bytes);
         assert_eq!(read, bytes.len());
-        for total_len in [None, Some(bytes.len() - 1)] {
+        // The empty V8 skipped-chunk section follows the last vector (8 + 4 + 4 bytes).
+        let vector_end = bytes.len() - 16;
+        for total_len in [None, Some(vector_end - 1)] {
             let error = SemanticIndex::from_reader_after_version(
-                ShortReader(&bytes[1..bytes.len() - 1]),
+                ShortReader(&bytes[1..vector_end - 1]),
                 bytes[0],
                 &root,
                 total_len,
@@ -16341,7 +16908,10 @@ Connection: close
             fingerprint_before
         );
 
-        let v7_bytes = index.to_bytes();
+        let current_bytes = index.to_bytes();
+        assert_eq!(current_bytes[0], SEMANTIC_INDEX_VERSION_V8);
+        let mut v7_bytes = current_bytes[..current_bytes.len() - 16].to_vec();
+        v7_bytes[0] = SEMANTIC_INDEX_VERSION_V7;
         assert_eq!(v7_bytes[0], SEMANTIC_INDEX_VERSION_V7);
         assert_ne!(v7_bytes, legacy_bytes);
         let restored = SemanticIndex::from_bytes(&v7_bytes, &project_root).unwrap();
@@ -16361,7 +16931,7 @@ Connection: close
         index.write_to_disk(storage.path(), "proj");
         let data_path = storage.path().join("semantic/proj/semantic.bin");
         let persisted = fs::read(&data_path).expect("read semantic.bin");
-        assert_eq!(persisted[0], SEMANTIC_INDEX_VERSION_V7);
+        assert_eq!(persisted[0], SEMANTIC_INDEX_VERSION_V8);
 
         let loaded = SemanticIndex::read_from_disk(
             storage.path(),
@@ -16821,6 +17391,7 @@ public class Greeter {
         assert_eq!(views[0].entry_count(), 2048);
         assert_eq!(base.estimated_memory(), expected);
         let replacement = ViewSemanticBase::new(vec![Arc::new(SemanticVectors {
+            provider_refused_chunks: 0,
             entries: changed.entries,
         })]);
         assert_eq!(replacement.base.estimated_memory().counts["entries"], 1);
@@ -17963,7 +18534,7 @@ public class Greeter {
         );
     }
 
-    fn overflow_http_config(server: &OverflowEmbeddingServer) -> SemanticBackendConfig {
+    pub(crate) fn overflow_http_config(server: &OverflowEmbeddingServer) -> SemanticBackendConfig {
         SemanticBackendConfig {
             backend: SemanticBackend::OpenAiCompatible,
             model: "overflow-test-embedding".to_string(),
@@ -17996,6 +18567,15 @@ public class Greeter {
         chunks: Vec<SemanticChunk>,
         model: &mut SemanticEmbeddingModel,
     ) -> Result<SemanticIndex, String> {
+        build_chunks_with_model_and_batch(root, chunks, model, 64)
+    }
+
+    fn build_chunks_with_model_and_batch(
+        root: &Path,
+        chunks: Vec<SemanticChunk>,
+        model: &mut SemanticEmbeddingModel,
+        max_batch_size: usize,
+    ) -> Result<SemanticIndex, String> {
         let file_metadata = chunks
             .iter()
             .map(|chunk| {
@@ -18018,7 +18598,7 @@ public class Greeter {
             chunks,
             file_metadata,
             &mut embed,
-            64,
+            max_batch_size,
             Option::<&mut fn(usize, usize)>::None,
             &mut should_continue,
             elapsed_started,
@@ -18072,7 +18652,7 @@ public class Greeter {
         assert!(
             events
                 .iter()
-                .any(|line| line.contains("kind=build_ready") && line.contains("skipped_rows=0")),
+                .any(|line| line.contains("kind=build_ready") && line.contains("skipped_chunks=0")),
             "semantic ready event must disclose zero skipped rows: {events:?}",
         );
         let mut full_rows = 0usize;
@@ -18162,19 +18742,417 @@ public class Greeter {
             .all(|entry| entry.chunk.name != "symbol_1"));
         let warnings = take_test_skipped_row_warnings();
         assert_eq!(warnings.len(), 1, "warnings={warnings:?}");
-        assert!(warnings[0].contains("semantic embed skipped row:"));
+        assert!(warnings[0].contains("semantic embed skipped chunk:"));
         assert!(warnings[0].contains(&format!("file={skipped_file}")));
         assert!(warnings[0].contains("symbol=symbol_1"));
         assert!(
             events
                 .iter()
-                .any(|line| line.contains("kind=build_ready") && line.contains("skipped_rows=1")),
+                .any(|line| line.contains("kind=build_ready") && line.contains("skipped_chunks=1")),
             "semantic ready event must disclose skipped rows: {events:?}",
         );
     }
 
     #[test]
-    fn unknown_4xx_still_aborts_semantic_build() {
+    fn image_data_uri_build_and_query_are_neutralized_only_on_wire() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("image.py");
+        let source = "def to_uri(x):\n    return f\"data:image/png;base64,{x}\"\n";
+        fs::write(&file, source).unwrap();
+        let server = OverflowEmbeddingServer::start(TestEmbeddingRejection::Contains {
+            marker: "data:image/".into(),
+            status: "400 Bad Request",
+        });
+        let config = overflow_http_config(&server);
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let index = SemanticIndex::build(
+            root.path(),
+            &[file.clone()],
+            &mut |texts| model.embed(texts),
+            64,
+        )
+        .unwrap();
+        assert!(index
+            .entries
+            .iter()
+            .any(|entry| entry.chunk.embed_text.contains("data:image/")));
+        assert_eq!(fs::read_to_string(file).unwrap(), source);
+        assert_eq!(index.skipped_rows(), 0);
+        model
+            .embed_query_cached(
+                "find data:image/png;base64,",
+                QueryBudget::from_config(&config),
+            )
+            .unwrap();
+        let requests = server.requests();
+        assert!(requests
+            .iter()
+            .flatten()
+            .all(|text| !text.contains("data:image/")));
+        assert!(requests
+            .iter()
+            .flatten()
+            .any(|text| text.contains("data-uri:image/")));
+    }
+
+    #[test]
+    fn refused_rows_build_embeds_healthy_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let server = OverflowEmbeddingServer::start(TestEmbeddingRejection::Contains {
+            marker: "AFT_POISON".into(),
+            status: "422 Unprocessable Entity",
+        });
+        let mut model =
+            SemanticEmbeddingModel::from_config(&overflow_http_config(&server)).unwrap();
+        let chunks = (0..16)
+            .map(|i| {
+                overflow_test_chunk(
+                    root.path(),
+                    i,
+                    if i == 7 {
+                        "AFT_POISON".into()
+                    } else {
+                        format!("healthy {i}")
+                    },
+                )
+            })
+            .collect();
+        let index = build_chunks_with_model(root.path(), chunks, &mut model).unwrap();
+        assert_eq!(index.entry_count(), 15);
+        assert_eq!(index.skipped_rows(), 1);
+        assert!(index
+            .entries
+            .iter()
+            .all(|entry| entry.chunk.name != "symbol_7"));
+        assert!(server.requests().len() <= 9);
+    }
+
+    #[test]
+    fn refused_rows_ollama_keeps_text_verbatim_and_isolates_poison() {
+        let root = tempfile::tempdir().unwrap();
+        let server = OverflowEmbeddingServer::refusing_text("AFT_POISON");
+        let mut config = overflow_http_config(&server);
+        config.backend = SemanticBackend::Ollama;
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let original = "data:image/png;base64,not-an-image";
+        let chunks = (0..8)
+            .map(|i| {
+                overflow_test_chunk(
+                    root.path(),
+                    i,
+                    if i == 3 {
+                        "AFT_POISON".to_string()
+                    } else {
+                        original.to_string()
+                    },
+                )
+            })
+            .collect();
+        let index = build_chunks_with_model(root.path(), chunks, &mut model).unwrap();
+        assert_eq!((index.entry_count(), index.skipped_rows()), (7, 1));
+        assert!(index
+            .entries
+            .iter()
+            .all(|entry| entry.chunk.embed_text == original));
+        assert!(server
+            .requests()
+            .iter()
+            .flatten()
+            .all(|text| text == original || text == "AFT_POISON"));
+        model
+            .embed_query_cached(original, QueryBudget::from_config(&config))
+            .unwrap();
+        assert_eq!(server.requests().last().unwrap(), &[original.to_string()]);
+    }
+
+    #[test]
+    fn refused_rows_do_not_split_auth_server_or_empty_body_errors() {
+        for (status, body, attempts) in [
+            ("401 Unauthorized", "invalid input", 1),
+            ("403 Forbidden", "invalid input", 1),
+            ("404 Not Found", "invalid input", 1),
+            ("500 Internal Server Error", "invalid input", 3),
+            ("400 Bad Request", "", 1),
+        ] {
+            let server = OverflowEmbeddingServer::start(TestEmbeddingRejection::Status {
+                status,
+                body: body.into(),
+            });
+            let mut model =
+                SemanticEmbeddingModel::from_config(&overflow_http_config(&server)).unwrap();
+            let error = model.embed(embedding_inputs(8)).unwrap_err();
+            assert!(error.contains(status), "{error}");
+            assert_eq!(
+                server.requests().iter().map(Vec::len).collect::<Vec<_>>(),
+                vec![8; attempts]
+            );
+        }
+    }
+
+    #[test]
+    fn refused_rows_abandon_widespread_refusals_with_bounded_requests() {
+        let server = OverflowEmbeddingServer::rejecting_all("invalid model");
+        let mut model =
+            SemanticEmbeddingModel::from_config(&overflow_http_config(&server)).unwrap();
+        let error = model.embed(embedding_inputs(16)).unwrap_err();
+        assert!(error.contains("invalid model"));
+        let requests = server.requests();
+        assert!(requests.len() < 2 * 16 - 1, "{requests:?}");
+        assert_eq!(requests.iter().filter(|rows| rows.len() == 1).count(), 9);
+    }
+
+    #[test]
+    fn skipped_chunk_summaries_pin_approved_text_and_persist_both_reasons() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("src")).unwrap();
+        let mut index = SemanticIndex::new(root.path().to_path_buf(), 2);
+        let files = ('a'..='g')
+            .map(|name| root.path().join(format!("src/{name}.rs")))
+            .collect::<Vec<_>>();
+        for (ordinal, file) in files.iter().enumerate() {
+            add_invalidation_fixture_entry(&mut index, file.clone(), ordinal as u64);
+        }
+        index.apply_refused_rows_update(files.iter().map(|file| (file.clone(), 1)).collect());
+        let refused = "semantic search is incomplete: 7 chunks skipped because the embedding provider refused them: src/a.rs, src/b.rs, src/c.rs, src/d.rs, src/e.rs (+2 more files)";
+        assert_eq!(index.skipped_chunks_summary().as_deref(), Some(refused));
+        index.apply_context_skips_update(BTreeMap::from([(files[2].clone(), 1)]));
+        let expected = format!("{refused}\nsemantic search is incomplete: 1 chunks skipped because they exceed the model's input limit: src/c.rs");
+        assert_eq!(index.skipped_rows(), 8);
+        assert_eq!(
+            index.skipped_chunks_summary().as_deref(),
+            Some(expected.as_str())
+        );
+        let restored = SemanticIndex::from_bytes(&index.to_bytes(), root.path()).unwrap();
+        assert_eq!(
+            restored.skipped_chunks_summary().as_deref(),
+            Some(expected.as_str())
+        );
+        let base = Arc::new(
+            restored
+                .into_shared_base()
+                .unwrap_or_else(|_| panic!("shareable fixture")),
+        );
+        let sibling = tempfile::tempdir().unwrap();
+        let shared = SemanticIndex::from_shared_base(sibling.path().to_path_buf(), base);
+        assert_eq!(
+            shared.skipped_chunks_summary().as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn refused_singleton_refresh_completes_and_records_file() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("only.rs");
+        fs::write(&file, "pub fn healthy() {}\n").unwrap();
+        let server = OverflowEmbeddingServer::refusing_text("AFT_POISON");
+        let config = overflow_http_config(&server);
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let mut index = SemanticIndex::build(
+            root.path(),
+            &[file.clone()],
+            &mut |texts| model.embed(texts),
+            64,
+        )
+        .unwrap();
+        assert_eq!(index.entry_count(), 1);
+        fs::write(&file, "pub fn AFT_POISON() {}\n").unwrap();
+        let chunks = collect_file_chunks(root.path(), &file).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].embed_text.contains("AFT_POISON"));
+        let summary = index
+            .refresh_stale_files(
+                root.path(),
+                &[file.clone()],
+                &mut |texts| model.embed(texts),
+                64,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        assert_eq!(summary.changed, 1);
+        assert_eq!((index.entry_count(), index.skipped_rows()), (0, 1));
+        assert_eq!(
+            index.skipped_rows.refused,
+            BTreeMap::from([(file.clone(), 1)])
+        );
+        let requests = server.requests().len();
+        assert!(index
+            .refresh_stale_files(
+                root.path(),
+                &[file],
+                &mut |texts| model.embed(texts),
+                64,
+                &mut |_, _| {}
+            )
+            .unwrap()
+            .is_noop());
+        assert_eq!(server.requests().len(), requests);
+    }
+
+    #[test]
+    fn refused_singleton_last_build_batch_completes() {
+        let root = tempfile::tempdir().unwrap();
+        let server = OverflowEmbeddingServer::refusing_text("AFT_POISON");
+        let mut model =
+            SemanticEmbeddingModel::from_config(&overflow_http_config(&server)).unwrap();
+        let chunks = (0..65)
+            .map(|i| {
+                overflow_test_chunk(
+                    root.path(),
+                    i,
+                    if i == 64 {
+                        "AFT_POISON".into()
+                    } else {
+                        format!("healthy {i}")
+                    },
+                )
+            })
+            .collect();
+        let index = build_chunks_with_model(root.path(), chunks, &mut model).unwrap();
+        assert_eq!((index.entry_count(), index.skipped_rows()), (64, 1));
+        assert_eq!(
+            server.requests().last().unwrap(),
+            &["AFT_POISON".to_string()]
+        );
+    }
+
+    #[test]
+    fn refused_singleton_batches_use_run_totals_and_reset_between_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let server = OverflowEmbeddingServer::refusing_text("AFT_POISON");
+        let mut config = overflow_http_config(&server);
+        config.max_batch_size = 1;
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let chunks = (0..41)
+            .map(|i| {
+                overflow_test_chunk(
+                    root.path(),
+                    i,
+                    if i >= 32 {
+                        "AFT_POISON".into()
+                    } else {
+                        format!("healthy {i}")
+                    },
+                )
+            })
+            .collect();
+        let index = build_chunks_with_model_and_batch(root.path(), chunks, &mut model, 1).unwrap();
+        assert_eq!((index.entry_count(), index.skipped_rows()), (32, 9));
+
+        let before = server.requests().len();
+        let chunks = (0..16)
+            .map(|i| overflow_test_chunk(root.path(), i, "AFT_POISON".into()))
+            .collect();
+        let error =
+            build_chunks_with_model_and_batch(root.path(), chunks, &mut model, 1).unwrap_err();
+        assert!(error.contains("HTTP 400 Bad Request"), "{error}");
+        assert_eq!(server.requests().len() - before, 9);
+
+        let index = build_chunks_with_model_and_batch(
+            root.path(),
+            vec![overflow_test_chunk(root.path(), 0, "AFT_POISON".into())],
+            &mut model,
+            1,
+        )
+        .unwrap();
+        assert_eq!((index.entry_count(), index.skipped_rows()), (0, 1));
+        EMBEDDING_REFUSAL_RUN.with(|run| assert!(run.borrow().is_none()));
+    }
+
+    #[test]
+    fn refused_adaptive_singletons_abort_at_the_run_floor() {
+        let server = OverflowEmbeddingServer::refusing_text("AFT_POISON");
+        let mut config = overflow_http_config(&server);
+        config.max_batch_size = 1;
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let error = model.embed(vec!["AFT_POISON".into(); 16]).unwrap_err();
+        assert!(error.contains("HTTP 400 Bad Request"), "{error}");
+        assert_eq!(server.requests().len(), 9);
+        assert!(server.requests().iter().all(|rows| rows.len() == 1));
+    }
+
+    #[test]
+    fn refused_rows_saved_index_is_reused_without_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let files = (0..8)
+            .map(|i| {
+                let file = root.path().join(format!("file_{i}.rs"));
+                fs::write(
+                    &file,
+                    if i == 3 {
+                        "fn poisoned() {\n    AFT_POISON();\n}\n".to_string()
+                    } else {
+                        format!("fn healthy_{i}() {{}}")
+                    },
+                )
+                .unwrap();
+                file
+            })
+            .collect::<Vec<_>>();
+        let server = OverflowEmbeddingServer::start(TestEmbeddingRejection::Contains {
+            marker: "AFT_POISON".into(),
+            status: "400 Bad Request",
+        });
+        let config = overflow_http_config(&server);
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let mut index =
+            SemanticIndex::build(root.path(), &files, &mut |texts| model.embed(texts), 64).unwrap();
+        index.set_fingerprint(model.fingerprint(&config).unwrap());
+        assert_eq!(index.skipped_rows(), 1);
+        assert_eq!(
+            index.skipped_rows.refused,
+            BTreeMap::from([(files[3].clone(), 1)])
+        );
+        assert!(index.write_to_disk(storage.path(), "refused"));
+        let before = server.requests().len();
+        let mut loaded = SemanticIndex::read_from_disk(
+            storage.path(),
+            "refused",
+            root.path(),
+            false,
+            Some(&index.fingerprint().unwrap().as_string()),
+        )
+        .unwrap();
+        assert_eq!(loaded.skipped_rows(), 1);
+        assert_eq!(loaded.skipped_rows.refused, index.skipped_rows.refused);
+        assert!(loaded
+            .refresh_stale_files(
+                root.path(),
+                &files,
+                &mut |texts| model.embed(texts),
+                64,
+                &mut |_, _| {}
+            )
+            .unwrap()
+            .is_noop());
+        assert_eq!(server.requests().len(), before);
+        fs::write(&files[3], "fn healed() {}\n").unwrap();
+        loaded
+            .refresh_stale_files(
+                root.path(),
+                &files,
+                &mut |texts| model.embed(texts),
+                64,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        assert_eq!(loaded.skipped_rows(), 0);
+        assert!(loaded.skipped_rows.refused.is_empty());
+        assert!(loaded.write_to_disk(storage.path(), "refused"));
+        let healed = SemanticIndex::read_from_disk(
+            storage.path(),
+            "refused",
+            root.path(),
+            false,
+            Some(&index.fingerprint().unwrap().as_string()),
+        )
+        .unwrap();
+        assert_eq!(healed.skipped_rows(), 0);
+    }
+
+    #[test]
+    fn unknown_4xx_aborts_after_run_refusal_floor() {
         let root = tempfile::tempdir().expect("project root");
         let server = OverflowEmbeddingServer::rejecting_all(r#"{"error":"model not found"}"#);
         let config = overflow_http_config(&server);
@@ -18188,7 +19166,7 @@ public class Greeter {
             ),
         );
 
-        let error = build_chunks_with_model(root.path(), vec![chunk], &mut model).unwrap_err();
+        let error = build_chunks_with_model(root.path(), vec![chunk; 16], &mut model).unwrap_err();
 
         assert!(error.contains("HTTP 400 Bad Request"), "{error}");
         assert!(error.contains("model not found"), "{error}");
@@ -19828,6 +20806,7 @@ mod embedding_backend_retry_status_tests {
         };
         let run = SemanticVectors {
             entries: audit10_vector_index(vec![vec![f32::NAN, 1.0]]).entries,
+            provider_refused_chunks: 0,
         };
         let bytes = run.encode_view_payload(&producer);
         assert!(
@@ -19836,6 +20815,7 @@ mod embedding_backend_retry_status_tests {
         );
         let valid = SemanticVectors {
             entries: audit10_vector_index(vec![vec![1.0, 0.0]]).entries,
+            provider_refused_chunks: 0,
         };
         let bytes = valid.encode_view_payload(&producer);
         let decoded =
@@ -19853,6 +20833,7 @@ mod embedding_backend_retry_status_tests {
         };
         let run = SemanticVectors {
             entries: audit10_vector_index(vec![vec![1.0, 0.0]]).entries,
+            provider_refused_chunks: 0,
         };
         let mut bytes = run.encode_view_payload(&producer);
         let name = b"audit_vector_0";

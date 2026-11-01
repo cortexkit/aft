@@ -65,6 +65,19 @@ class EmbedBodyCapRunnerTests(unittest.TestCase):
         self.assertEqual(metrics["total_embed_chars"], len("file:résumé") + len("body:λ"))
         self.assertEqual(metrics["fingerprint"]["embed_text_caps"]["body_chars"], 1001)
 
+    def test_semantic_bin_v8_reads_refused_row_section(self) -> None:
+        payload = b"".join([
+            b"\x08", struct.pack("<III", 2, 0, 0), struct.pack("<I", 1),
+            packed_string("poison.rs"), bytes(8 + 4 + 8 + 32),
+            struct.pack("<QI", 2, 1), packed_string("poison.rs"), struct.pack("<Q", 2),
+            struct.pack("<I", 0),
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "semantic.bin"
+            path.write_bytes(payload)
+            metrics = semantic_bin_metrics(path)
+        self.assertEqual(metrics["rows"], 0)
+
     def test_most_moved_reports_rank_changes_in_both_directions(self) -> None:
         def arm(first_rank, second_rank, name="arm"):
             return {
