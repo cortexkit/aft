@@ -21,7 +21,7 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     if req.command == "configure" {
         return crate::commands::configure::handle_configure(&req, ctx);
     }
-    let corr = req.params["test_corr"].as_u64().unwrap();
+    let corr = req.params["pattern"].as_str().unwrap().parse().unwrap();
     let job = JOBS.lock().unwrap().remove(&corr).unwrap();
     let token = crate::executor::current_job_cancellation().unwrap();
     let _ = job.ack.send(());
@@ -175,7 +175,7 @@ impl Harness {
                 1,
                 corr,
                 serde_json::to_vec(
-                    &json!({"name":"grep", "arguments":{"pattern":"x", "test_corr":corr}}),
+                    &json!({"name":"grep", "preset":"head", "arguments":{"pattern":corr.to_string()}}),
                 )
                 .unwrap(),
             )
@@ -183,10 +183,19 @@ impl Harness {
         )
         .await
         .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), ack.recv())
-            .await
-            .unwrap()
-            .expect("job started");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    started = ack.recv() => { started.expect("job started"); break; }
+                    frame = read_frame(&mut daemon) => {
+                        let frame = frame.unwrap().unwrap();
+                        if frame.header.corr == corr && frame.header.channel == 7 {
+                            panic!("call ended before test job started: {:?}: {}", frame.header.ty, String::from_utf8_lossy(&frame.body));
+                        }
+                    }
+                }
+            }
+        }).await.expect("job admission");
         Self {
             daemon,
             module,
