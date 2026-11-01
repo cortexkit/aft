@@ -880,7 +880,14 @@ impl AftProcess {
         loop {
             let status = self.send(r#"{"id":"fixture-folder-admission","command":"status"}"#);
             assert_eq!(status["success"], true, "status failed: {status}");
-            if status["folder"]["state"] == "decided" {
+            let replay_pending = status["degraded_reasons"]
+                .as_array()
+                .is_some_and(|reasons| {
+                    reasons
+                        .iter()
+                        .any(|reason| reason == "folder_admission_pending")
+                });
+            if status["folder"]["state"] == "decided" && !replay_pending {
                 return status["folder"].clone();
             }
             assert!(
