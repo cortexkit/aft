@@ -23,7 +23,9 @@ prepush_step dependencies bun install --frozen-lockfile --offline
 # (.github/actions/integration-shard/action.yml).
 prepush_step pyright-install npm install --prefix target/prepush-pyright --no-save --fetch-retries=5 pyright@1.1.411
 export PATH="$PWD/target/prepush-pyright/node_modules/.bin:$PATH"
-prepush_step typescript-server-cache bash scripts/install-typescript-test-servers.sh "$PWD/target/prepush-typescript" --offline
+# Fetched like CI does: the runner image's package cache has no pinned
+# TypeScript 7 server, and this lane runs with network.
+prepush_step typescript-server-install bash scripts/install-typescript-test-servers.sh "$PWD/target/prepush-typescript"
 export AFT_TEST_TS7_NODE_MODULES="$PWD/target/prepush-typescript/ts7/node_modules"
 export AFT_TEST_TS5_NODE_MODULES="$PWD/target/prepush-typescript/ts5/node_modules"
 prepush_step debug-binary cargo build -p agent-file-tools --bin aft

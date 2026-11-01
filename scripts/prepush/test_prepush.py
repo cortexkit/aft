@@ -214,7 +214,8 @@ class PrepushTests(unittest.TestCase):
         self.assertIn("bun install --frozen-lockfile --offline", rust_lane)
         # pyright is the one network fetch, pinned to the version CI installs.
         self.assertIn("--no-save --fetch-retries=5 pyright@1.1.411", rust_lane)
-        self.assertIn('"$PWD/target/prepush-typescript" --offline', rust_lane)
+        # The TypeScript test servers are fetched online, pinned by the installer.
+        self.assertIn('install-typescript-test-servers.sh "$PWD/target/prepush-typescript"\n', rust_lane)
 
     def test_typescript_server_installer_only_requests_offline_when_selected(self):
         scratch = Path("target/scratch")
