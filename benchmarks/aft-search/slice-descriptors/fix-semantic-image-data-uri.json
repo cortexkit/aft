@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/semantic_index.rs"
+  ],
+  "slices": [
+    "fix-semantic-image-data-uri"
+  ],
+  "note": "The ranking fence hits semantic_index.rs. This change rewrites image data-URI text only inside OpenAI-compatible embedding request inputs; ranking and scoring mechanisms are unchanged. The benchmark corpus embeds locally and contains no such inputs, so canonical-checkout ranked rows must remain byte-identical to the committed reference."
+}
