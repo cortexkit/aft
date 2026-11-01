@@ -18,7 +18,7 @@ pub(super) fn channel(
     let route = route_key(frame.header.channel, frame.header.epoch);
     let corr = frame.header.corr;
     let flags = frame.header.flags;
-    let send = move || {
+    let send = move |key| {
         let Some(active) = active.upgrade() else {
             return false;
         };
@@ -27,7 +27,7 @@ pub(super) fn channel(
         };
         if !calls
             .get(&(route, corr))
-            .is_some_and(|call| !call.answering)
+            .is_some_and(|call| !call.answering && call.cancellation.has_progress_channel(key))
         {
             return false;
         }

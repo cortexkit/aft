@@ -600,6 +600,14 @@ impl JobCancellation {
         *self.inner.progress.lock() = Some(progress);
     }
 
+    pub(crate) fn has_progress_channel(&self, key: usize) -> bool {
+        self.inner
+            .progress
+            .lock()
+            .as_ref()
+            .is_some_and(|progress| progress.key() == key)
+    }
+
     pub(crate) fn report_progress(&self) {
         if !self.cancel_already_requested() {
             let progress = self.inner.progress.lock().clone();

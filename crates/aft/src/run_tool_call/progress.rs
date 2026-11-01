@@ -10,7 +10,7 @@ pub(crate) struct Progress(Arc<Inner>);
 struct Inner {
     last_sent: Mutex<Instant>,
     clock: Box<dyn Fn() -> Instant + Send + Sync>,
-    send: Box<dyn Fn() -> bool + Send + Sync>,
+    send: Box<dyn Fn(usize) -> bool + Send + Sync>,
 }
 
 impl std::fmt::Debug for Progress {
@@ -20,13 +20,13 @@ impl std::fmt::Debug for Progress {
 }
 
 impl Progress {
-    pub(crate) fn new(send: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+    pub(crate) fn new(send: impl Fn(usize) -> bool + Send + Sync + 'static) -> Self {
         Self::with_clock(Instant::now, send)
     }
 
     pub(crate) fn with_clock(
         clock: impl Fn() -> Instant + Send + Sync + 'static,
-        send: impl Fn() -> bool + Send + Sync + 'static,
+        send: impl Fn(usize) -> bool + Send + Sync + 'static,
     ) -> Self {
         Self(Arc::new(Inner {
             last_sent: Mutex::new(clock()),
@@ -40,10 +40,14 @@ impl Progress {
         let mut last = self.0.last_sent.lock().unwrap_or_else(|e| e.into_inner());
         if now.saturating_duration_since(*last)
             >= Duration::from_millis(cortexkit_role_tool_provider::KEEPALIVE_INTERVAL_MS)
-            && (self.0.send)()
+            && (self.0.send)(self.key())
         {
             *last = now;
         }
+    }
+
+    pub(crate) fn key(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
     }
 }
 
@@ -95,7 +99,7 @@ mod tests {
             },
             {
                 let sent = sent.clone();
-                move || {
+                move |_| {
                     sent.fetch_add(1, Ordering::SeqCst);
                     true
                 }

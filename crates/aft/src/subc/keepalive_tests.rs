@@ -338,7 +338,7 @@ async fn runner_cancel_stops_call_keepalive_job_and_sends_terminal() {
     assert_eq!(terminal.header.ty, FrameType::Error);
     assert_eq!(
         serde_json::from_slice::<Value>(&terminal.body).unwrap()["code"],
-        "request_cancelled"
+        "cancelled"
     );
     tokio::time::timeout(Duration::from_secs(5), async {
         while !harness.stopped.load(Ordering::SeqCst) {
@@ -349,4 +349,58 @@ async fn runner_cancel_stops_call_keepalive_job_and_sends_terminal() {
     .unwrap();
     harness.quiet().await;
     harness.finish().await;
+}
+
+#[test]
+fn completed_call_keepalive_cannot_follow_a_reused_correlation() {
+    let corr = NEXT.fetch_add(1, Ordering::SeqCst);
+    let now = Arc::new(AtomicU64::new(0));
+    CLOCKS.lock().unwrap().insert(corr, now.clone());
+    let (_dir, root) = test_support::test_root("reused-keepalive-corr");
+    let active: ActiveToolCalls = Arc::default();
+    let route = route_key(7, 1);
+    let token = JobCancellation::new();
+    let call = |cancellation| ActiveToolCall {
+        root_id: root.clone(),
+        cancellation,
+        detach_policy: RouteDetachPolicy::CancelOnDetach,
+        tool: "grep".into(),
+        started_at: Instant::now(),
+        request: test_support::test_request_meta(),
+        answering: false,
+    };
+    active
+        .lock()
+        .unwrap()
+        .insert((route, corr), call(token.clone()));
+    let (writer, mut frames) = mpsc::channel(8);
+    let frame = Frame::build(FrameType::Request, control_flags(), 7, 1, corr, Vec::new()).unwrap();
+    let progress = channel(
+        &writer,
+        &Arc::new(DispatchPathMetrics::new()),
+        &active,
+        &frame,
+        true,
+    )
+    .unwrap();
+    token.set_progress(progress);
+    now.store(30_000, Ordering::SeqCst);
+    token.report_progress();
+    assert!(frames.try_recv().is_ok());
+    assert!(claim_active_tool_call(&active, route, corr));
+    now.store(60_000, Ordering::SeqCst);
+    token.report_progress();
+    assert!(frames.try_recv().is_err());
+    finish_active_tool_call(&active, route, corr);
+    active
+        .lock()
+        .unwrap()
+        .insert((route, corr), call(JobCancellation::new()));
+    now.store(90_000, Ordering::SeqCst);
+    token.report_progress();
+    assert!(
+        frames.try_recv().is_err(),
+        "old work sent progress on a new call"
+    );
+    CLOCKS.lock().unwrap().remove(&corr);
 }
