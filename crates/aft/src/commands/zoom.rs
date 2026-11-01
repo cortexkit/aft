@@ -3638,7 +3638,7 @@ function helper(value: number): number {
   return value * 2;
 }
 "#;
-        let grammar = crate::parser::grammar_for(LangId::TypeScript);
+        let grammar = crate::parser::grammar_for(LangId::TypeScript).unwrap();
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&grammar).unwrap();
         let tree = parser.parse(source, None).unwrap();

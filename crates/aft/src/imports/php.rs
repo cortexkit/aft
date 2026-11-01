@@ -511,7 +511,7 @@ mod tests {
     use crate::parser::{grammar_for, LangId};
 
     fn parse_php(src: &str) -> (Tree, ImportBlock) {
-        let g = grammar_for(LangId::Php);
+        let g = grammar_for(LangId::Php).unwrap();
         let mut p = tree_sitter::Parser::new();
         p.set_language(&g).unwrap();
         let tree = p.parse(src, None).unwrap();

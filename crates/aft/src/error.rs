@@ -9,6 +9,13 @@ pub(crate) const FILE_CHANGED_SINCE_READ_MESSAGE: &str =
 /// and a human-readable `message`.
 #[derive(Debug)]
 pub enum AftError {
+    GrammarUnavailable {
+        language: String,
+        state: crate::grammar::GrammarState,
+        message: String,
+        cause: Option<crate::grammar::FailureCause>,
+        retry_after_ms: Option<u64>,
+    },
     SymbolNotFound {
         name: String,
         file: String,
@@ -68,6 +75,7 @@ impl AftError {
     /// Returns the error code string used in JSON error responses.
     pub fn code(&self) -> &'static str {
         match self {
+            AftError::GrammarUnavailable { .. } => "grammar_unavailable",
             AftError::SymbolNotFound { .. } => "symbol_not_found",
             AftError::AmbiguousSymbol { .. } => "ambiguous_symbol",
             AftError::ParseError { .. } => "parse_error",
@@ -89,6 +97,25 @@ impl AftError {
     ///
     /// Shape: `{ "code": "...", "message": "..." }`
     pub fn to_error_json(&self) -> serde_json::Value {
+        if let Self::GrammarUnavailable {
+            language,
+            state,
+            message,
+            cause,
+            retry_after_ms,
+        } = self
+        {
+            let mut value = serde_json::json!({
+                "code": self.code(), "language": language, "state": state, "message": message,
+            });
+            if let Some(cause) = cause {
+                value["cause"] = serde_json::json!(cause);
+            }
+            if let Some(retry_after_ms) = retry_after_ms {
+                value["retry_after_ms"] = serde_json::json!(retry_after_ms);
+            }
+            return value;
+        }
         serde_json::json!({
             "code": self.code(),
             "message": self.to_string(),
@@ -99,6 +126,7 @@ impl AftError {
 impl fmt::Display for AftError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            AftError::GrammarUnavailable { message, .. } => f.write_str(message),
             AftError::DeniedFloor { path } => {
                 f.write_str(&crate::access_policy::aft_storage_denial_message(path))
             }

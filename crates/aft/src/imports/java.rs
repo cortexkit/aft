@@ -155,7 +155,7 @@ mod tests {
     use tree_sitter::Parser;
 
     fn parse_java(source: &str) -> (Tree, ImportBlock) {
-        let grammar = grammar_for(LangId::Java);
+        let grammar = grammar_for(LangId::Java).unwrap();
         let mut parser = Parser::new();
         parser.set_language(&grammar).unwrap();
         let tree = parser.parse(source, None).unwrap();
@@ -185,7 +185,7 @@ mod tests {
     /// on. If the grammar updates and renames these, this test fails loudly.
     #[test]
     fn java_grammar_node_kinds_are_stable() {
-        let grammar = grammar_for(LangId::Java);
+        let grammar = grammar_for(LangId::Java).unwrap();
         let mut parser = Parser::new();
         parser.set_language(&grammar).unwrap();
         let src = "package com.example;\n\nimport java.util.List;\nimport static java.util.Collections.emptyList;\nimport java.util.*;\nimport static java.util.Arrays.*;\n\nclass C {}\n";

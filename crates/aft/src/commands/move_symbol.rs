@@ -2231,7 +2231,9 @@ enum IdentifierNamespace {
 }
 
 fn content_references_identifier(content: &str, lang: LangId, symbol_name: &str) -> bool {
-    let grammar = grammar_for(lang);
+    let Ok(grammar) = grammar_for(lang) else {
+        return false;
+    };
     let mut parser = tree_sitter::Parser::new();
     if parser.set_language(&grammar).is_err() {
         return false;

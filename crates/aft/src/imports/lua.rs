@@ -280,7 +280,7 @@ mod tests {
     use tree_sitter::Parser;
 
     fn parse_lua(source: &str) -> (Tree, ImportBlock) {
-        let grammar = grammar_for(LangId::Lua);
+        let grammar = grammar_for(LangId::Lua).unwrap();
         let mut parser = Parser::new();
         parser.set_language(&grammar).unwrap();
         let tree = parser.parse(source, None).unwrap();

@@ -979,6 +979,7 @@ fn lang_key(lang: LangId) -> &'static str {
         LangId::Swift => "swift",
         LangId::Php => "php",
         LangId::Lua => "lua",
+        LangId::Luau => "luau",
         LangId::Perl => "perl",
         LangId::Html => "html",
         LangId::Markdown => "markdown",
@@ -1181,7 +1182,8 @@ fn formatter_candidates_with_pyproject(
         | LangId::R
         | LangId::Groovy
         | LangId::ObjC
-        | LangId::Toml => Vec::new(),
+        | LangId::Toml
+        | LangId::Luau => Vec::new(),
         LangId::Html | LangId::Markdown | LangId::Yaml => Vec::new(),
     }
 }
@@ -1259,7 +1261,8 @@ fn checker_candidates(
         | LangId::R
         | LangId::Groovy
         | LangId::ObjC
-        | LangId::Toml => Vec::new(),
+        | LangId::Toml
+        | LangId::Luau => Vec::new(),
         LangId::Html | LangId::Markdown | LangId::Yaml => Vec::new(),
     }
 }

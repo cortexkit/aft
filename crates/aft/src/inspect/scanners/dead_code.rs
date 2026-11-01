@@ -531,7 +531,7 @@ impl DeadCodeFileAnalyzer {
         let parser = match self.parsers.entry(lang) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
-                let grammar = grammar_for(lang);
+                let grammar = grammar_for(lang).ok()?;
                 let mut parser = tree_sitter::Parser::new();
                 if parser.set_language(&grammar).is_err() {
                     return None;

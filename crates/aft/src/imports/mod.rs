@@ -598,7 +598,8 @@ pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
         | LangId::R
         | LangId::Groovy
         | LangId::ObjC
-        | LangId::Toml => None,
+        | LangId::Toml
+        | LangId::Luau => None,
     }
 }
 
@@ -3388,7 +3389,7 @@ mod tests {
     }
 
     fn parse_ts(source: &str) -> (Tree, ImportBlock) {
-        let grammar = grammar_for(LangId::TypeScript);
+        let grammar = grammar_for(LangId::TypeScript).unwrap();
         let mut parser = Parser::new();
         parser.set_language(&grammar).unwrap();
         let tree = parser.parse(source, None).unwrap();
@@ -3397,7 +3398,7 @@ mod tests {
     }
 
     fn parse_js(source: &str) -> (Tree, ImportBlock) {
-        let grammar = grammar_for(LangId::JavaScript);
+        let grammar = grammar_for(LangId::JavaScript).unwrap();
         let mut parser = Parser::new();
         parser.set_language(&grammar).unwrap();
         let tree = parser.parse(source, None).unwrap();
@@ -3406,7 +3407,7 @@ mod tests {
     }
 
     fn parse_vue(source: &str) -> (Tree, ImportBlock) {
-        let grammar = grammar_for(LangId::Vue);
+        let grammar = grammar_for(LangId::Vue).unwrap();
         let mut parser = Parser::new();
         parser.set_language(&grammar).unwrap();
         let tree = parser.parse(source, None).unwrap();
@@ -3421,7 +3422,7 @@ mod tests {
     #[test]
     fn vue_grammar_node_kinds_are_stable() {
         let src = "<template>\n  <div />\n</template>\n\n<script setup lang=\"ts\">\nimport { ref } from 'vue'\n</script>\n";
-        let grammar = grammar_for(LangId::Vue);
+        let grammar = grammar_for(LangId::Vue).unwrap();
         let mut parser = Parser::new();
         parser.set_language(&grammar).unwrap();
         let tree = parser.parse(src, None).unwrap();
@@ -3812,7 +3813,7 @@ import { c } from 'charlie';
     // --- Python parsing ---
 
     fn parse_py(source: &str) -> (Tree, ImportBlock) {
-        let grammar = grammar_for(LangId::Python);
+        let grammar = grammar_for(LangId::Python).unwrap();
         let mut parser = Parser::new();
         parser.set_language(&grammar).unwrap();
         let tree = parser.parse(source, None).unwrap();
@@ -3961,7 +3962,7 @@ import { c } from 'charlie';
     // --- Rust parsing ---
 
     fn parse_rust(source: &str) -> (Tree, ImportBlock) {
-        let grammar = grammar_for(LangId::Rust);
+        let grammar = grammar_for(LangId::Rust).unwrap();
         let mut parser = Parser::new();
         parser.set_language(&grammar).unwrap();
         let tree = parser.parse(source, None).unwrap();
@@ -4034,7 +4035,7 @@ import { c } from 'charlie';
     // --- Go parsing ---
 
     fn parse_go(source: &str) -> (Tree, ImportBlock) {
-        let grammar = grammar_for(LangId::Go);
+        let grammar = grammar_for(LangId::Go).unwrap();
         let mut parser = Parser::new();
         parser.set_language(&grammar).unwrap();
         let tree = parser.parse(source, None).unwrap();
@@ -4110,7 +4111,7 @@ import { c } from 'charlie';
     // --- Solidity ---
 
     fn parse_solidity(source: &str) -> (Tree, ImportBlock) {
-        let grammar = grammar_for(LangId::Solidity);
+        let grammar = grammar_for(LangId::Solidity).unwrap();
         let mut parser = Parser::new();
         parser.set_language(&grammar).unwrap();
         let tree = parser.parse(source, None).unwrap();
@@ -4123,7 +4124,7 @@ import { c } from 'charlie';
     /// fails loudly before the parser silently mis-parses.
     #[test]
     fn solidity_grammar_node_kinds_are_stable() {
-        let grammar = grammar_for(LangId::Solidity);
+        let grammar = grammar_for(LangId::Solidity).unwrap();
         let mut parser = Parser::new();
         parser.set_language(&grammar).unwrap();
         let src = "import { Foo, Bar as Baz } from \"./A.sol\";\nimport * as N from \"./B.sol\";\nimport \"./C.sol\" as C;\nimport \"./D.sol\";\n";

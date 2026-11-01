@@ -5525,6 +5525,7 @@ fn language_name(language: crate::parser::LangId) -> &'static str {
         crate::parser::LangId::Swift => "swift",
         crate::parser::LangId::Php => "php",
         crate::parser::LangId::Lua => "lua",
+        crate::parser::LangId::Luau => "luau",
         crate::parser::LangId::Perl => "perl",
         crate::parser::LangId::Pascal => "pascal",
         crate::parser::LangId::R => "r",

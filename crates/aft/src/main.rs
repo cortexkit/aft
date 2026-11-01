@@ -337,6 +337,16 @@ fn main() {
         }
     }
 
+    if std::env::args().nth(1).as_deref() == Some("grammar-smoke") {
+        match cli::grammar_smoke::run(std::env::args_os().skip(2).collect()) {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // `aft setup` prints the feature plan (stdout must stay pure JSON) or
     // writes the user's base choices, then exits. Like `index`, it runs
     // before logging and never starts the application.

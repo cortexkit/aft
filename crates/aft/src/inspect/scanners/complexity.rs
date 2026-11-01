@@ -324,7 +324,8 @@ fn language_spec(language: LangId) -> Option<LanguageSpec> {
         | LangId::Json
         | LangId::Yaml
         | LangId::Toml
-        | LangId::Pascal => return None,
+        | LangId::Pascal
+        | LangId::Luau => return None,
     };
     Some(spec)
 }

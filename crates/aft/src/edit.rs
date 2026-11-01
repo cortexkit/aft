@@ -1167,6 +1167,9 @@ pub fn validate_syntax_str(content: &str, path: &Path) -> Option<bool> {
 /// path validates it. Outline keeps using [`validate_syntax`]: it only needs
 /// to know whether tree-sitter could recover the symbols.
 pub(crate) fn validate_edited_file_syntax(path: &Path) -> Result<Option<bool>, AftError> {
+    if detect_language(path).is_none() {
+        return Ok(None);
+    }
     let verdict = validate_syntax(path)?;
     if verdict != Some(true) || detect_language(path) != Some(LangId::Python) {
         return Ok(verdict);

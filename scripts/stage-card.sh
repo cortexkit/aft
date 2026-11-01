@@ -164,6 +164,32 @@ if [ "$(uname -s)" = "Darwin" ]; then
     exit 2
   fi
 
+  # Use the production stored-load path, offline and without test seams. A
+  # throwaway whole storage root works even without a second cache volume.
+  echo "==> smoke: pinned grammar compile under the signed card (offline)"
+  mkdir -p "$REPO_ROOT/target/scratch"
+  GRAMMAR_SMOKE="$(mktemp -d "$REPO_ROOT/target/scratch/grammar-smoke.XXXXXX")"
+  GRAMMAR_HASH="$(python3 -c 'import json; print(json.load(open("crates/aft/src/grammar/manifest.json"))["sha256"])')"
+  mkdir -p "$GRAMMAR_SMOKE/storage/grammars" "$GRAMMAR_SMOKE/home" "$GRAMMAR_SMOKE/config" "$GRAMMAR_SMOKE/cache" "$GRAMMAR_SMOKE/state" "$GRAMMAR_SMOKE/data" "$GRAMMAR_SMOKE/tmp"
+  cp "crates/aft/tests/fixtures/grammars/$GRAMMAR_HASH.wasm" "$GRAMMAR_SMOKE/storage/grammars/$GRAMMAR_HASH.wasm"
+  if ! sandbox-exec -p '(version 1) (allow default) (deny network*)' env \
+      HOME="$GRAMMAR_SMOKE/home" XDG_CONFIG_HOME="$GRAMMAR_SMOKE/config" \
+      XDG_CACHE_HOME="$GRAMMAR_SMOKE/cache" XDG_STATE_HOME="$GRAMMAR_SMOKE/state" \
+      XDG_DATA_HOME="$GRAMMAR_SMOKE/data" TMPDIR="$GRAMMAR_SMOKE/tmp" \
+      "$TMP" grammar-smoke --storage-dir "$GRAMMAR_SMOKE/storage" > "$GRAMMAR_SMOKE/result.json"; then
+    rm -rf "$GRAMMAR_SMOKE"
+    rm -f "$TMP"
+    echo "stage-card: signed grammar load failed; refusing to stage" >&2
+    exit 2
+  fi
+  if ! python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); assert not v["test_seams"]; assert v["hash"] == sys.argv[2]; assert v["tree"].startswith("(chunk ")' "$GRAMMAR_SMOKE/result.json" "$GRAMMAR_HASH"; then
+    rm -rf "$GRAMMAR_SMOKE"
+    rm -f "$TMP"
+    echo "stage-card: grammar smoke did not verify the production grammar" >&2
+    exit 2
+  fi
+  rm -rf "$GRAMMAR_SMOKE"
+
   IMAGE_UUID="$(dwarfdump --uuid "$TMP" | awk 'NR == 1 { gsub(/-/, "", $2); print toupper($2) }')"
   DSYM_UUID="$(dwarfdump --uuid "$DSYM" | awk 'NR == 1 { gsub(/-/, "", $2); print toupper($2) }')"
   if [ -z "$IMAGE_UUID" ] || [ -z "$DSYM_UUID" ] || [ "$IMAGE_UUID" != "$DSYM_UUID" ]; then

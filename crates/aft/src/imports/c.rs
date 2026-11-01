@@ -268,7 +268,7 @@ mod tests {
     use tree_sitter::Parser;
 
     fn parse_c_like(source: &str, lang: LangId) -> (Tree, ImportBlock) {
-        let grammar = grammar_for(lang);
+        let grammar = grammar_for(lang).unwrap();
         let mut parser = Parser::new();
         parser.set_language(&grammar).unwrap();
         let tree = parser.parse(source, None).unwrap();

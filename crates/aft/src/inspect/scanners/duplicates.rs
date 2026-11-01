@@ -346,7 +346,7 @@ fn parse_source(path: &Path, lang: LangId, source: &str) -> Result<Tree, String>
     DUPLICATES_PARSERS.with(|parsers| {
         let mut parsers = parsers.borrow_mut();
         if let std::collections::hash_map::Entry::Vacant(entry) = parsers.entry(lang) {
-            let grammar = grammar_for(lang);
+            let grammar = grammar_for(lang).map_err(|error| error.to_string())?;
             let mut parser = Parser::new();
             parser
                 .set_language(&grammar)
@@ -1308,6 +1308,7 @@ fn language_name(lang: LangId) -> &'static str {
         LangId::Swift => "swift",
         LangId::Php => "php",
         LangId::Lua => "lua",
+        LangId::Luau => "luau",
         LangId::Perl => "perl",
         LangId::Pascal => "pascal",
         LangId::R => "r",

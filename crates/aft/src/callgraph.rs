@@ -836,7 +836,8 @@ pub fn is_entry_point(name: &str, kind: &SymbolKind, exported: bool, lang: LangI
         | LangId::R
         | LangId::Groovy
         | LangId::ObjC
-        | LangId::Toml => false,
+        | LangId::Toml
+        | LangId::Luau => false,
     }
 }
 
@@ -4066,7 +4067,7 @@ thread_local! {
 fn parse_reexport_source(source: &str, lang: LangId) -> Option<tree_sitter::Tree> {
     #[cfg(test)]
     REEXPORT_PARSE_COUNT.with(|count| count.set(count.get() + 1));
-    let grammar = grammar_for(lang);
+    let grammar = grammar_for(lang).ok()?;
     let mut parser = Parser::new();
     parser.set_language(&grammar).ok()?;
     parser.parse(source, None)
@@ -4784,7 +4785,7 @@ mod tests {
 
     fn parse_symbols(source: &str, lang: LangId) -> (tree_sitter::Tree, Vec<Symbol>) {
         let mut parser = Parser::new();
-        parser.set_language(&grammar_for(lang)).unwrap();
+        parser.set_language(&grammar_for(lang).unwrap()).unwrap();
         let tree = parser.parse(source, None).unwrap();
         let symbols = crate::parser::extract_symbols_from_tree(source, &tree, lang).unwrap();
         (tree, symbols)

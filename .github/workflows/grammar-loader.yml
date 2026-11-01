@@ -1,0 +1,95 @@
+name: Grammar loader
+
+on:
+  pull_request:
+    paths:
+      - crates/aft/**
+      - Cargo.lock
+      - scripts/stage-card.sh
+      - scripts/ck-aft.entitlements.plist
+      - .github/workflows/grammar-loader.yml
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  published-asset:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Check production hash and size against immutable release bytes
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, urllib.request
+          from pathlib import Path
+          manifest = json.loads(Path('crates/aft/src/grammar/manifest.json').read_text())
+          assert manifest['url'].startswith('https://github.com/cortexkit/aft/releases/download/grammars-')
+          with urllib.request.urlopen(manifest['url'], timeout=60) as response:
+              body = response.read(manifest['size'] + 1)
+          assert len(body) == manifest['size'], (len(body), manifest['size'])
+          assert hashlib.sha256(body).hexdigest() == manifest['sha256']
+          assert body == Path('crates/aft/tests/fixtures/grammars', manifest['sha256'] + '.wasm').read_bytes()
+          print('Published production grammar: SHA-256, size and checked-in bytes match')
+          PY
+
+  loader:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: rustup update stable && rustup default stable
+      - name: Loader state and compile tests
+        run: cargo test --locked -p agent-file-tools --lib -- grammar::tests::
+      - name: Process restart and concurrent publication
+        run: cargo test --locked -p agent-file-tools --test integration -- grammar_loader
+      - name: No native disk cache and one Wasmtime version
+        run: |
+          cargo tree --locked -p agent-file-tools -e features > grammar-features.txt
+          cargo tree --locked -p agent-file-tools --prefix none > grammar-dependencies.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          features = Path('grammar-features.txt').read_text()
+          assert 'wasmtime feature "cache"' not in features
+          dependencies = Path('grammar-dependencies.txt').read_text()
+          assert set(re.findall(r'^wasmtime v([^ ]+)', dependencies, re.M)) == {'36.0.6'}
+          print('Wasmtime 36.0.6 only; cache feature absent')
+          PY
+
+  windows-arm64:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Target toolchain
+        run: rustup target add aarch64-pc-windows-msvc
+      - name: ARM64 compile without runtime dependency
+        run: |
+          cargo check --locked -p agent-file-tools --tests --target aarch64-pc-windows-msvc
+          cargo tree --locked -p agent-file-tools --target aarch64-pc-windows-msvc --edges normal,build --prefix none > grammar-arm-dependencies.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          dependencies = Path('grammar-arm-dependencies.txt').read_text()
+          assert 'wasmtime' not in dependencies
+          print('Windows ARM64: no Wasmtime dependency')
+          PY

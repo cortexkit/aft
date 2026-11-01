@@ -58,7 +58,8 @@ impl IndentStyle {
             | LangId::Swift
             | LangId::Php
             | LangId::Perl
-            | LangId::Groovy => IndentStyle::Spaces(4),
+            | LangId::Groovy
+            | LangId::Luau => IndentStyle::Spaces(4),
             LangId::Html => IndentStyle::Spaces(2),
             LangId::Markdown => IndentStyle::Spaces(4),
             LangId::Pascal | LangId::R => IndentStyle::Spaces(2),

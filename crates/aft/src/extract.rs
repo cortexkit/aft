@@ -1464,7 +1464,9 @@ pub fn detect_scope_conflicts(
 
     // 3. Collect declarations in the body being inlined
     let mut body_decls: HashSet<String> = HashSet::new();
-    let body_grammar = grammar_for(lang);
+    let Ok(body_grammar) = grammar_for(lang) else {
+        return Vec::new();
+    };
     let mut body_parser = tree_sitter::Parser::new();
     if body_parser.set_language(&body_grammar).is_ok() {
         if let Some(body_tree) = body_parser.parse(body_text.as_bytes(), None) {
@@ -1572,7 +1574,9 @@ pub fn substitute_params(
         return body_text.to_string();
     }
 
-    let grammar = grammar_for(lang);
+    let Ok(grammar) = grammar_for(lang) else {
+        return body_text.to_string();
+    };
     let mut parser = tree_sitter::Parser::new();
     if parser.set_language(&grammar).is_err() {
         return body_text.to_string();
@@ -1825,7 +1829,7 @@ mod tests {
     }
 
     fn parse_source(source: &str, lang: LangId) -> Tree {
-        let grammar = grammar_for(lang);
+        let grammar = grammar_for(lang).unwrap();
         let mut parser = Parser::new();
         parser.set_language(&grammar).unwrap();
         parser.parse(source.as_bytes(), None).unwrap()

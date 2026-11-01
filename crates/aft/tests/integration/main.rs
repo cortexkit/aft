@@ -8,6 +8,7 @@ mod context_storage_test;
 #[path = "../helpers/mod.rs"]
 mod test_helpers;
 
+mod grammar_loader_test;
 mod helpers;
 
 mod aft_search_contract_test;

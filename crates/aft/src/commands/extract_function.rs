@@ -159,7 +159,10 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    let grammar = grammar_for(lang);
+    let grammar = match grammar_for(lang) {
+        Ok(grammar) => grammar,
+        Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
+    };
     let mut parser = Parser::new();
     if parser.set_language(&grammar).is_err() {
         return Response::error(
