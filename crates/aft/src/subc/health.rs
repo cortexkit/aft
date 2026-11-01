@@ -5480,7 +5480,14 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let report = read_report();
-            if report.detail.as_deref() != Some(EXECUTOR_SCHEDULER_CONTENTION_DETAIL) {
+            // Indexing started by other tests in the process can prefix the
+            // detail ("<indexing>; <contention>"), so match the contention
+            // text anywhere; an exact match would return a contended report.
+            let contended = report
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains(EXECUTOR_SCHEDULER_CONTENTION_DETAIL));
+            if !contended {
                 return report;
             }
             assert!(
@@ -6968,9 +6975,16 @@ mod tests {
             &app,
         );
         assert_eq!(report.status, HealthStatus::Degraded);
-        assert_eq!(
-            report.detail.as_deref(),
-            Some(EXECUTOR_SCHEDULER_CONTENTION_DETAIL)
+        // Indexing that other tests run in this process can prefix the detail
+        // ("<indexing>; <contention>"), so require the contention text, not
+        // an exact detail.
+        assert!(
+            report
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains(EXECUTOR_SCHEDULER_CONTENTION_DETAIL)),
+            "{:?}",
+            report.detail
         );
         let metrics = report.metrics.unwrap();
         assert_eq!(metrics["generated_at_ms"], 1_000);
