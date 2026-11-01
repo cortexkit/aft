@@ -840,8 +840,12 @@ impl Jail {
         .await;
     }
 
-    async fn bind(&mut self, bind: ModuleControlRequest) {
-        let binding = match &bind {
+    async fn bind<T: serde::Serialize>(&mut self, bind: T) {
+        // Preserve retired project fields in the wire payload. Decode a copy
+        // only for tracking the identity and scope this fixture binds.
+        let body = serde_json::to_value(bind).unwrap();
+        let request: ModuleControlRequest = serde_json::from_value(body.clone()).unwrap();
+        let binding = match &request {
             ModuleControlRequest::RouteBind {
                 identity, scope, ..
             } => Some((identity.session.clone(), scope.clone())),
@@ -857,7 +861,7 @@ impl Jail {
                 0,
                 0,
                 corr,
-                serde_json::to_vec(&bind).unwrap(),
+                serde_json::to_vec(&body).unwrap(),
             )
             .unwrap(),
         )
