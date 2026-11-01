@@ -7,6 +7,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use subc_protocol::{BindIdentity, Frame, FrameType, ModuleHelloAckBody, PROTOCOL_VERSION};
 
+// Protocol 0.34 clients require numeric daemon versions of at least 0.39.0
+// before sending project-free opens. Keep this stand-in's metadata compatible
+// so its scripts exercise executor traffic rather than the version refusal.
+const FAKE_DAEMON_VERSION: &str = "0.39.0";
+
 pub(crate) fn id() -> Uuid {
     "0192a64a-1234-7000-8000-000000000001".parse().unwrap()
 }
@@ -333,7 +338,7 @@ pub(crate) async fn daemon_with_capabilities(
                 &mut socket,
                 &server_key,
                 &daemon_id,
-                "exec-client-test",
+                FAKE_DAEMON_VERSION,
                 Duration::from_secs(5),
             )
             .await
@@ -1004,7 +1009,7 @@ pub(crate) async fn daemon_with_capabilities(
             key,
             daemon_id,
             pid: std::process::id(),
-            daemon_ver: "exec-client-test".into(),
+            daemon_ver: FAKE_DAEMON_VERSION.into(),
         },
     )
     .unwrap();
@@ -1208,7 +1213,7 @@ async fn outage_daemon_with(started: bool, replay: OutageReplay) -> OutageDaemon
                     &mut socket,
                     &key,
                     &daemon_id,
-                    "exec-client-test",
+                    FAKE_DAEMON_VERSION,
                     Duration::from_secs(5),
                 )
                 .await
@@ -1377,7 +1382,7 @@ async fn outage_daemon_with(started: bool, replay: OutageReplay) -> OutageDaemon
             key,
             daemon_id,
             pid: std::process::id(),
-            daemon_ver: "exec-client-test".into(),
+            daemon_ver: FAKE_DAEMON_VERSION.into(),
         },
     )
     .unwrap();
