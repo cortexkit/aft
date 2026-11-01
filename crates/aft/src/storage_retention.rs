@@ -2059,9 +2059,7 @@ fn domain_paths(storage: &StoragePaths) -> io::Result<Vec<(PathBuf, bool)>> {
     for entry in bounded_dirs(&storage.durable, 128)? {
         let name = entry.file_name().to_string_lossy().into_owned();
         if entry.file_type()?.is_dir()
-            && (matches!(name.as_str(), "opencode" | "pi" | "runner")
-                || name.starts_with("mcp--")
-                || name.starts_with("fed--"))
+            && crate::bash_background::persistence::is_harness_store_name(&name)
         {
             for domain in ["callgraph", "inspect"] {
                 result.push((entry.path().join(domain), true));

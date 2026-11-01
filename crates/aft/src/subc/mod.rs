@@ -4428,6 +4428,11 @@ fn run_subc_mode_on_runtime_thread(
         let shared_app = ctx.app();
         // Stall captures land under `<storage>/diagnostics`.
         let storage_dir = ctx.storage_dir();
+        let base_task_scope_runtime = Some((
+            ctx.bash_background().clone(),
+            Duration::from_secs(ctx.config().bash.linux_scope_max_runtime_secs),
+            ctx.storage_dir(),
+        ));
         drop(ctx);
         // Saved paused tasks may still owe their runner a cancel; send those
         // now rather than when (if ever) their projects bind again.
@@ -4443,7 +4448,7 @@ fn run_subc_mode_on_runtime_thread(
         );
         let (read_half, write_half) = tokio::io::split(stream);
         heap_module_future(|| {
-            run_module_loop(
+            run_module_loop_with_task_scopes(
                 read_half,
                 write_half,
                 connection_file_path,
@@ -4455,6 +4460,7 @@ fn run_subc_mode_on_runtime_thread(
                 tool_response_body_limit,
                 lifecycle_probe,
                 &storage_dir,
+                base_task_scope_runtime,
                 // The exit phase below takes and shuts down every root's servers.
                 QuiescedLsp::LeaveForExitSweep,
                 #[cfg(test)]
@@ -5172,10 +5178,51 @@ fn heap_module_future<F: std::future::Future>(build: impl FnOnce() -> F) -> std:
     Box::pin(build())
 }
 
-/// ModuleHello → HelloAck → control/route loop. Runs until the daemon closes
-/// the connection (EOF), sends channel-0 Goodbye, or a fatal mutating executor
-/// response requests whole-connection teardown.
+/// Test entry point for the module frame loop.
+#[cfg(test)]
 async fn run_module_loop<R, W>(
+    read: R,
+    write: W,
+    connection_file_path: &Path,
+    shared_app: Arc<App>,
+    executor: Arc<Executor>,
+    dispatch: DispatchFn,
+    user_config_path: Option<PathBuf>,
+    allow_native_passthrough: bool,
+    tool_response_body_limit: usize,
+    lifecycle_probe: Option<SubcTestLifecycleProbe>,
+    storage_dir: &Path,
+    connection_end_lsp: QuiescedLsp,
+    standing_actor_override: Option<Arc<standing::StandingActor>>,
+    watchdog_test: Option<stall_watchdog::FrameLoopTestHooks>,
+) -> Result<ModuleLoopExit, SubcError>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    run_module_loop_with_task_scopes(
+        read,
+        write,
+        connection_file_path,
+        shared_app,
+        executor,
+        dispatch,
+        user_config_path,
+        allow_native_passthrough,
+        tool_response_body_limit,
+        lifecycle_probe,
+        storage_dir,
+        None,
+        connection_end_lsp,
+        standing_actor_override,
+        watchdog_test,
+    )
+    .await
+}
+
+/// Runs the `ModuleHello` → `HelloAck` sequence and the control/route loop.
+/// Stops on connection EOF, channel-0 Goodbye, or an executor response that requests whole-connection teardown.
+async fn run_module_loop_with_task_scopes<R, W>(
     mut read: R,
     mut write: W,
     connection_file_path: &Path,
@@ -5187,6 +5234,7 @@ async fn run_module_loop<R, W>(
     tool_response_body_limit: usize,
     lifecycle_probe: Option<SubcTestLifecycleProbe>,
     storage_dir: &Path,
+    base_task_scope_runtime: Option<(crate::bash_background::BgTaskRegistry, Duration, PathBuf)>,
     connection_end_lsp: QuiescedLsp,
     #[cfg(test)] standing_actor_override: Option<Arc<standing::StandingActor>>,
     #[cfg(test)] mut watchdog_test: Option<stall_watchdog::FrameLoopTestHooks>,
@@ -5262,6 +5310,13 @@ where
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(probe);
     }
     shared_app.set_subc_connection_file(connection_file_path.to_path_buf());
+    if let Some((registry, max_runtime, storage_dir)) = base_task_scope_runtime.as_ref() {
+        registry.configure_task_scope_runtime(
+            shared_app.subc_connection_file().is_some(),
+            *max_runtime,
+        );
+        registry.start_task_scope_cleanup(storage_dir);
+    }
     #[cfg(test)]
     let dispatch_path_metrics = watchdog_test
         .as_ref()
@@ -23867,7 +23922,7 @@ mod compile_fence_tests {
     fn frame_loop_contains_no_direct_stderr_io() {
         let source = include_str!("mod.rs");
         let body = source
-            .split_once("async fn run_module_loop<")
+            .split_once("async fn run_module_loop_with_task_scopes<")
             .unwrap()
             .1
             .split_once("fn classify_connection_end(")
@@ -24222,7 +24277,7 @@ mod writer_setup_tests {
             .unwrap();
         assert!(!reader.contains("tool_received"));
         let loop_source = source
-            .split("async fn run_module_loop<R, W>(")
+            .split("async fn run_module_loop_with_task_scopes<")
             .nth(1)
             .unwrap()
             .split("fn classify_connection_end")
