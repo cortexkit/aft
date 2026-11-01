@@ -368,12 +368,48 @@ fn remote_launch_log_captures() -> &'static Mutex<HashMap<PathBuf, RemoteLaunchL
 
 pub(super) fn capture_remote_launch_logs<R>(task: &BgTask, run: impl FnOnce() -> R) -> R {
     let root = task.state.lock().unwrap().metadata.project_root.clone();
+    // Metadata retains the caller's spelling, but capture keys are canonical.
+    // macOS temporary roots can name the same directory through /var or /private/var.
+    let root = root.as_deref().map(canonicalized_path);
     let capture = root.and_then(|root| remote_launch_log_captures().lock().unwrap().remove(&root));
     if let Some(capture) = capture {
         crate::logging::capture_log_lines_into(capture, run)
     } else {
         run()
     }
+}
+
+#[test]
+fn runon_restart_reattach_log_capture_matches_symlinked_project_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir(&project).unwrap();
+    let alias = dir.path().join("project-alias");
+    std::os::unix::fs::symlink(&project, &alias).unwrap();
+    let (registry, task_id, _) = persist_accepted_with_snapshot(
+        &alias,
+        dir.path().join("unused-connection"),
+        "printf capture-proof",
+    );
+    let task = registry.task(&task_id).unwrap();
+    assert_ne!(
+        task.state.lock().unwrap().metadata.project_root.as_deref(),
+        Some(project.canonicalize().unwrap().as_path()),
+    );
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    remote_launch_log_captures()
+        .lock()
+        .unwrap()
+        .insert(project.canonicalize().unwrap(), capture.clone());
+    capture_remote_launch_logs(&task, || {
+        crate::slog_info!("runon: aliased-root capture proof")
+    });
+    let lines = capture.lock().unwrap();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains("runon: aliased-root capture proof"),
+        "{lines:?}"
+    );
 }
 
 fn exited_remote_workers() -> &'static Mutex<HashSet<String>> {
