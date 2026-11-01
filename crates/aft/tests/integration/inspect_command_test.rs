@@ -237,6 +237,60 @@ fn configured_context_with_diagnostics_timeout(root: &Path, timeout_ms: u64) -> 
     ctx
 }
 
+#[test]
+#[ignore = "manual cold-checkout timing with installed language servers"]
+fn scoped_inspect_cold_checkout_phase_timings() {
+    let root = PathBuf::from(std::env::var_os("AFT_INSPECT_REPRO_ROOT").expect("checkout root"));
+    let started = Instant::now();
+    let ctx = configured_context(&root);
+    eprintln!("configure_ms={}", started.elapsed().as_millis());
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let monitor_finished = finished.clone();
+    let monitor = thread::spawn(move || {
+        let started = Instant::now();
+        let mut previous = String::new();
+        while !monitor_finished.load(std::sync::atomic::Ordering::Acquire) {
+            if let Some(log) = inspect_phase_log_for_request("cold-checkout-timings") {
+                let current = format!("{:?}", log.records);
+                if current != previous {
+                    eprintln!(
+                        "elapsed_ms={} phases={current}",
+                        started.elapsed().as_millis()
+                    );
+                    previous = current;
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+    let started = Instant::now();
+    let response = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "cold-checkout-timings", "command": "inspect", "worker_session": true,
+            "sections": "diagnostics",
+            "scope": ["crates/aft/src/commands/inspect.rs", "packages/opencode-plugin/src/tools/inspect.ts"]
+        }),
+    );
+    finished.store(true, std::sync::atomic::Ordering::Release);
+    monitor.join().unwrap();
+    eprintln!(
+        "inspect_ms={} response={response:#}",
+        started.elapsed().as_millis()
+    );
+    for phase in inspect_phase_log_for_request("cold-checkout-timings")
+        .unwrap()
+        .records
+    {
+        eprintln!(
+            "phase={:?} duration_ms={:?} error={:?}",
+            phase.entry,
+            phase.duration_ms(),
+            phase.terminal_error
+        );
+    }
+}
+
 fn drain_callgraph_store_for_test(ctx: &AppContext) {
     let (latest, disconnected) = {
         let rx_ref = ctx.callgraph_store_rx().lock();
@@ -6055,6 +6109,95 @@ fn scoped_blocking_inspect_pipelined_pulls_stay_within_the_request_budget() {
     assert_eq!(
         response["summary"]["diagnostics"]["complete"], false,
         "unanswered pulls are gaps: {response:#}"
+    );
+}
+
+#[test]
+fn bounded_scoped_inspect_slow_server_returns_partial_before_transport_deadline() {
+    let (_temp, root, _lib) = single_crate_fixture("bounded-slow-inspect");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_SERVER_STATUS", "1");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PULL_DELAY_MS", "60000");
+
+    let started = Instant::now();
+    let response = scoped_diagnostics_inspect(&ctx, "bounded-slow-inspect", "src/lib.rs");
+    assert!(started.elapsed() < Duration::from_secs(30), "{response:#}");
+    assert_eq!(response["inspect_terminal"], "partial", "{response:#}");
+    assert_eq!(
+        response["summary"]["diagnostics"]["complete"], false,
+        "{response:#}"
+    );
+    assert_eq!(uncovered_files(&response).len(), 1, "{response:#}");
+    assert!(
+        response.to_string().contains(
+            "no diagnostics for the current file content arrived in time; retry aft_inspect"
+        ),
+        "{response:#}"
+    );
+}
+
+#[test]
+fn bounded_scoped_inspect_abandoned_pull_releases_reader_for_same_root_rebind() {
+    use aft::executor::{Executor, Lane};
+    use aft::path_identity::ProjectRootId;
+
+    let (_temp, root, _lib) = single_crate_fixture("bounded-abandoned-inspect");
+    let ctx = Arc::new(configured_context(&root));
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PULL_DELAY_MS", "60000");
+    let signal = root.join("pull-started");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PULL_DELAY_SIGNAL", signal.to_str().unwrap());
+    let executor = Executor::new();
+    let root_id = ProjectRootId::from_path(&root).unwrap();
+    executor.register_actor(root_id.clone(), ctx.clone());
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let (_reply, cancellation) = executor.submit_tool_call_cancellable_async(
+        root_id.clone(),
+        Lane::SerialLspStatus,
+        "abandoned-inspect".into(),
+        "inspect",
+        Box::new(move |ctx| {
+            let response = handle_inspect_tool_call(
+                &request(json!({
+                    "id": "abandoned-inspect", "command": "inspect",
+                    "scope": "src/lib.rs", "sections": "diagnostics"
+                })),
+                ctx,
+            );
+            done_tx.send(response.data.clone()).unwrap();
+            response
+        }),
+    );
+    wait_for_path_event(&signal, "the language server's in-flight pull");
+    let bind = executor.submit(
+        root_id.clone(),
+        Lane::Mutating,
+        "subc-bind-after-abandon".into(),
+        Box::new(|_| aft::protocol::Response::success("subc-bind-after-abandon", json!({}))),
+    );
+    assert!(
+        matches!(
+            bind.recv_timeout(Duration::ZERO),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout)
+        ),
+        "the active inspect must hold its reader"
+    );
+    // Route release and explicit CANCEL both signal this exact job token.
+    executor.cancel_job(&root_id, &cancellation);
+    let response = done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("abandoned inspect stops without waiting for its diagnostics deadline");
+    assert_eq!(response["inspect_terminal"], "interrupted", "{response:?}");
+    assert!(
+        bind.recv_timeout(Duration::from_secs(2))
+            .expect("same-root bind proceeds after the abandoned reader exits")
+            .success
     );
 }
 
