@@ -2340,6 +2340,18 @@ impl FileParser {
         &mut self,
         path: &Path,
     ) -> Result<(Arc<Vec<Symbol>>, bool, bool), AftError> {
+        // A shared symbol cache cannot opt a built-in-only context into a
+        // dynamic language after another context has populated that cache.
+        if !self.dynamic_languages && language_for_extension(path).is_none() {
+            return Err(AftError::InvalidRequest {
+                message: format!(
+                    "unsupported file extension: {}",
+                    path.extension()
+                        .and_then(|ext| ext.to_str())
+                        .unwrap_or("<none>")
+                ),
+            });
+        }
         // Bound contention retries without growing the stack. The last attempt
         // bypasses the symbol-cache snapshot and parses one coherent source read.
         for attempt in 0..=3 {
@@ -2593,7 +2605,7 @@ fn extract_symbols_from_tree_unbounded<'tree>(
         LangId::Groovy => extract_groovy_symbols(source, &root, query),
         LangId::ObjC => extract_objc_symbols(source, &root, query),
         LangId::Luau => Err(AftError::InvalidRequest {
-            message: "Luau symbol extraction is not registered".into(),
+            message: format!("no query patterns implemented for {:?} yet", lang),
         }),
         LangId::Rust
         | LangId::Html
@@ -8991,9 +9003,12 @@ pub struct TreeSitterProvider {
 pub(crate) fn list_symbols_shared(
     provider: &dyn crate::language::LanguageProvider,
     file: &Path,
+    dynamic_languages: bool,
 ) -> Result<Arc<Vec<Symbol>>, AftError> {
     if let Some(provider) = provider.as_any().downcast_ref::<TreeSitterProvider>() {
-        FileParser::with_symbol_cache(provider.symbol_cache()).extract_symbols_shared(file)
+        FileParser::with_symbol_cache(provider.symbol_cache())
+            .with_dynamic_languages(dynamic_languages)
+            .extract_symbols_shared(file)
     } else {
         provider.list_symbols(file).map(Arc::new)
     }
@@ -9543,6 +9558,31 @@ impl crate::language::LanguageProvider for TreeSitterProvider {
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 mod tests {
     #[test]
+    fn grammar_builtin_only_parser_rejects_dynamic_shared_cache_hits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cached.luau");
+        let source = "local function f() end";
+        std::fs::write(&path, source).unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mut parser = FileParser::new();
+        parser.symbol_cache.write().unwrap().insert(
+            path.clone(),
+            mtime,
+            source.len() as u64,
+            blake3::hash(source.as_bytes()),
+            Vec::new(),
+        );
+        assert!(matches!(
+            parser.extract_symbols_shared(&path),
+            Err(AftError::InvalidRequest { .. })
+        ));
+        assert!(matches!(
+            parser.parse(&path),
+            Err(AftError::InvalidRequest { .. })
+        ));
+    }
+
+    #[test]
     fn captured_source_keeps_the_owned_read_buffer() {
         let source = "// padding\n".repeat(10_000);
         let pointer = source.as_bytes().as_ptr();
@@ -9810,11 +9850,11 @@ mod tests {
             .collect();
         std::fs::write(&file, source).unwrap();
         let provider = TreeSitterProvider::new();
-        let original = list_symbols_shared(&provider, &file).unwrap();
+        let original = list_symbols_shared(&provider, &file, false).unwrap();
         let serialized = serde_json::to_vec(original.as_ref()).unwrap();
         let before = work_counters::CACHED_SYMBOL_COPIES.with(|count| count.get());
         for _ in 0..10 {
-            let hit = list_symbols_shared(&provider, &file).unwrap();
+            let hit = list_symbols_shared(&provider, &file, false).unwrap();
             assert!(
                 Arc::ptr_eq(&original, &hit),
                 "a cache hit must share the table allocation"

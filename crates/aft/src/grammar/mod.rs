@@ -11,6 +11,8 @@ use std::time::Instant;
 use parking_lot::{Condvar, Mutex, RwLock};
 use tree_sitter::Language;
 
+#[cfg(feature = "test-grammar-seams")]
+pub use manifest::initialize_test_identity;
 pub use manifest::{extractor_version, manifest, GrammarManifest, PRODUCTION_MANIFEST};
 pub use state::{FailureCause, GrammarState, GrammarUnavailable};
 

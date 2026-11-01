@@ -54,7 +54,13 @@ impl Storage {
             return None;
         }
         let name = format!("{}.wasm", manifest.sha256);
-        let mut file = dir.repair_read_file(OsStr::new(&name)).ok()?;
+        let mut file = match dir.repair_read_file(OsStr::new(&name)) {
+            Ok(file) => file,
+            Err(_) => {
+                let _ = dir.repair_remove_file(OsStr::new(&name));
+                return None;
+            }
+        };
         let mut bytes = Vec::new();
         let mut buffer = [0; 8192];
         // A stored artifact is untrusted too. Do not allocate for its on-disk size.

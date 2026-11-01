@@ -52,3 +52,13 @@ pub fn extractor_version() -> u32 {
     #[cfg(not(feature = "test-grammar-seams"))]
     LUAU_EXTRACTOR_VERSION
 }
+
+/// Initialize the test manifest's hash/URL and the Luau extractor version in
+/// their process-wide LazyLocks. The binary calls this before handling any
+/// requests, so later environment changes cannot change its grammar identity.
+/// Production has no environment-controlled manifest or extractor version.
+#[cfg(feature = "test-grammar-seams")]
+pub fn initialize_test_identity() {
+    let _ = manifest();
+    let _ = extractor_version();
+}

@@ -68,7 +68,7 @@ pub fn build_container_outline(
     resolved_file_path: &Path,
     target: &Symbol,
 ) -> Result<ContainerOutline, crate::error::AftError> {
-    let symbols = crate::parser::list_symbols_shared(ctx.provider(), resolved_file_path)?;
+    let symbols = crate::parser::list_symbols_shared(ctx.provider(), resolved_file_path, false)?;
     let entries = build_outline_tree(&symbols);
     let entry = find_outline_entry(&entries, target)
         .cloned()
