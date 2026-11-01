@@ -2876,7 +2876,7 @@ impl BgTaskRegistry {
                 .or_insert(OwedCancelOwner::Worker);
         }
         #[cfg(test)]
-        tests::note_remote_worker_start(&task.task_id);
+        tests::note_remote_worker_start(&task);
         let registry = self.clone();
         let spawned = Arc::clone(&task);
         std::thread::Builder::new()

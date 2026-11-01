@@ -404,13 +404,29 @@ fn remote_worker_counts() -> &'static Mutex<HashMap<String, (usize, usize)>> {
 }
 
 /// Called as a remote worker thread for `task` is about to be spawned.
-pub(super) fn note_remote_worker_start(task: &str) {
+pub(super) fn note_remote_worker_start(task: &BgTask) {
+    cancellation_at_worker_start().lock().unwrap().insert(
+        task.task_id.clone(),
+        task.state
+            .lock()
+            .unwrap()
+            .metadata
+            .remote
+            .as_ref()
+            .is_some_and(|remote| remote.cancel_requested),
+    );
     remote_worker_counts()
         .lock()
         .unwrap()
-        .entry(task.to_owned())
+        .entry(task.task_id.clone())
         .or_default()
         .0 += 1;
+}
+
+fn cancellation_at_worker_start() -> &'static Mutex<HashMap<String, bool>> {
+    static CANCELLATIONS: std::sync::OnceLock<Mutex<HashMap<String, bool>>> =
+        std::sync::OnceLock::new();
+    CANCELLATIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// How many remote workers were started for `task`, and how many stopped.
@@ -3969,7 +3985,7 @@ async fn runon_restart_reattach_unknown_job_ends_the_first_watch() {
 }
 
 #[tokio::test]
-async fn runon_restart_reattach_relaxed_kill_withholds_the_recovery_worker() {
+async fn runon_restart_reattach_relaxed_kill_records_stop_before_recovery() {
     let daemon = daemon(Script::Cancel, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
     let (original, task_id, paths) = persist_accepted_with_snapshot(
@@ -3998,9 +4014,17 @@ async fn runon_restart_reattach_relaxed_kill_withholds_the_recovery_worker() {
             .await
             .unwrap();
     assert!(stopped.info.status.is_terminal(), "{stopped:?}");
-    // A saved refusal can permit a local fallback. A kill must record its
-    // stop without first starting the worker that could launch that fallback.
-    assert_eq!(remote_workers(&task_id), (0, 0));
+    remote_worker_exited(&task_id).await;
+    // A saved refusal can permit a local fallback. Its worker must already
+    // see a durable stop when it starts, so it can settle without launching.
+    assert_eq!(remote_workers(&task_id), (1, 1));
+    assert_eq!(
+        cancellation_at_worker_start().lock().unwrap().get(&task_id),
+        Some(&true)
+    );
+    let saved = read_task(&paths.json).unwrap();
+    assert!(!saved.local_fallback_started);
+    assert!(saved.remote.unwrap().cancel_requested);
 }
 
 #[tokio::test]
