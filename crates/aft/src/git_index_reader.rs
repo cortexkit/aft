@@ -1170,11 +1170,17 @@ mod tests {
             "delete-pending index.lock metadata",
             || fs::symlink_metadata(&lock),
         );
-        assert!(enforced, "the fixture must expose the delete-pending error");
-        let error = fs::symlink_metadata(&lock).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert_eq!(error.raw_os_error(), Some(5));
-        eprintln!("delete-pending index.lock metadata: {error:?}");
+        // Some machines (GitHub's hosted Windows runners) don't apply the deny,
+        // so std's listing fallback still answers and the error 5 path can't be
+        // reached there; the helper has already printed that. The wait and
+        // recovery checks below still hold: the lock reads as present until its
+        // handle closes.
+        if enforced {
+            let error = fs::symlink_metadata(&lock).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(error.raw_os_error(), Some(5));
+            eprintln!("delete-pending index.lock metadata: {error:?}");
+        }
 
         let options = ReadOptions {
             lock_wait: Duration::from_millis(20),
