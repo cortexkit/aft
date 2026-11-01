@@ -1429,11 +1429,6 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
     }
     if diff_omitted {
         crate::mutation_diff::mark_omitted(&mut result);
-        result["output"] = json!(format!(
-            "{}\n{}",
-            result["output"].as_str().unwrap(),
-            crate::mutation_diff::DIFF_OMITTED_NOTICE
-        ));
     }
     if !write_warnings.is_empty() {
         result["warnings"] = json!(write_warnings);

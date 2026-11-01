@@ -38,12 +38,12 @@ impl DiffBudget {
         })
     }
 
-    pub(crate) fn patch_from_diff(
+    pub(crate) fn patch_from_diff<'a>(
         &mut self,
         file: &str,
         before: &str,
         after: &str,
-        diff: &similar::TextDiff<'_, '_, '_, str>,
+        diff: &similar::TextDiff<'a, 'a, 'a, str>,
         copies: usize,
     ) -> Option<String> {
         self.render(before.len().saturating_add(after.len()), copies, |out| {
@@ -98,11 +98,11 @@ impl DiffBudget {
     }
 }
 
-fn write_patch(
+fn write_patch<'a>(
     out: &mut WireWriter,
     file: &str,
     identical: bool,
-    diff: &similar::TextDiff<'_, '_, '_, str>,
+    diff: &similar::TextDiff<'a, 'a, 'a, str>,
 ) -> io::Result<()> {
     write!(
         out,
@@ -159,6 +159,15 @@ pub(crate) fn mark_omitted(result: &mut serde_json::Value) {
     result["diff_omitted"] = serde_json::json!(true);
     result["metadata"]["diff_omitted"] = serde_json::json!(true);
     result["diff_notice"] = serde_json::json!(DIFF_OMITTED_NOTICE);
+    if let Some(output) = result
+        .get("output")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+    {
+        if !output.lines().any(|line| line == DIFF_OMITTED_NOTICE) {
+            result["output"] = serde_json::json!(format!("{output}\n{DIFF_OMITTED_NOTICE}"));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -246,10 +255,10 @@ mod tests {
         for index in 0..40 {
             if let Some(patch) = budget.patch("é\"\\.txt", "", &content, 2) {
                 assert!(patch.contains("é🦀"));
-                files.push(json!({"filePath": index, "patch": patch}));
+                files.push(json!({"file": index, "patch": patch}));
                 patches.push(patch);
             } else {
-                files.push(json!({"filePath": index, "diff_omitted": true}));
+                files.push(json!({"file": index, "diff_omitted": true}));
                 omitted += 1;
             }
         }
