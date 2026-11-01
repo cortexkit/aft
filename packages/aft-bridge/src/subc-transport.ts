@@ -3048,7 +3048,11 @@ export class SubcTransportPool implements AftTransportPool {
           });
           retry = state.bindPending;
         } else {
-          retry = this.hostScope(client, record.identity);
+          retry = this.hostScope(client, record.identity).finally(() => {
+            // A timer can wake before retryAt. Re-arm even when the lookup only saw backoff,
+            // otherwise a session with persistent routes would never try core again.
+            this.scheduleHostScopeRetry(session, state);
+          });
         }
         void retry.catch((error) => {
           warn(
@@ -3150,19 +3154,31 @@ export class SubcTransportPool implements AftTransportPool {
   }
 
   private promoteHostScope(session: string): void {
+    let upgraded = false;
     for (const record of this.sessions.values()) {
       const entry = record.routeEntry;
       if (record.identity.session !== session) continue;
       // Retirement stops new dispatches; the existing request counter defers closure of held waits.
-      if (entry?.handle && !entry.hostScope) this.retireHostToolRoute(record);
+      if (entry?.handle && !entry.hostScope) {
+        upgraded = true;
+        this.retireHostToolRoute(record);
+      }
       const sub = record.bgSub;
       if (!sub?.attachedRoute) continue;
+      upgraded = true;
       // The old subscription must finish closing before its normal attach path opens a scoped one.
       void sub.stop().then(() => {
         if (record.bgSub !== sub) return;
         record.bgSub = null;
         this.ensureBgSubscription(record.identity, record);
       });
+    }
+    const state = this.hostScopeCache.get(session);
+    if (upgraded && state?.unscopedReason && state.answer?.result === "scope") {
+      log(
+        `subc head scope: session=${session} route=upgraded from=unscoped ref=${state.answer.scope.ref.slice(0, 8)} epoch=${state.answer.scope.scopeEpoch}`,
+      );
+      state.unscopedReason = undefined;
     }
   }
 
