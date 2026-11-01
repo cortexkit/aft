@@ -34,8 +34,9 @@ const MAX_TOP_K: usize = 100;
 // The remaining reasons stay in the body and structured gaps. This is a
 // presentation limit, not a limit on analysis or completion accounting.
 const MAX_INSPECT_HEADER_PARTS: usize = 3;
-// Give each waiting phase at most half the remaining work time so a slow
-// producer leaves room for other categories and final freshness verification.
+// Early waits use at most half the remaining work time so a slow producer
+// leaves room for other categories. Concurrent compiler checks and diagnostics
+// collected last can use the remaining request work budget.
 // The cap avoids turning large configured budgets into equally long waits.
 const INSPECT_PHASE_WAIT_CAP: Duration = Duration::from_secs(60);
 // Ordinary tool calls have a 25s client deadline (subc/health.rs). Cap every
@@ -1022,7 +1023,7 @@ fn handle_inspect_payload(
     // Diagnostics goes last: a blocking scoped request spends part of the
     // budget asking language servers to analyze the scoped files, and the
     // other categories' scans must not find their shared deadline already
-    // used up by that wait.
+    // used up by that wait. Once they finish, diagnostics can use what remains.
     let ordered_categories = InspectCategory::active()
         .iter()
         .filter(|category| **category != InspectCategory::Diagnostics)
@@ -1045,7 +1046,7 @@ fn handle_inspect_payload(
         } else if *category == InspectCategory::Diagnostics {
             // Read the warm LSP store with named gaps for producers whose wait
             // expired. A blocking scoped request first has its started servers
-            // analyze the scoped files, within half the remaining budget.
+            // analyze the scoped files within the remaining request budget.
             run_diagnostics_category(
                 ctx,
                 &snapshot,
@@ -1057,7 +1058,7 @@ fn handle_inspect_payload(
                 not_applicable,
                 expected_producers,
                 indexing_gaps,
-                request_deadline.map(|deadline| deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP)),
+                request_deadline.map(InspectRequestDeadline::work_at),
                 rust_checks.take().unwrap_or_default(),
             )
         } else if category.is_tier2() {
@@ -1997,11 +1998,8 @@ fn run_blocking_inspect_body(
     // cargo check inspect runs itself. Start it before category collection,
     // so other scans and any root wait do not spend its analysis budget.
     // The diagnostics phase collects the outcome under the shared deadline.
-    let rust_checks = start_inspect_rust_checks(
-        ctx,
-        &start_outcomes.successful,
-        deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP),
-    );
+    let rust_checks =
+        start_inspect_rust_checks(ctx, &start_outcomes.successful, deadline.work_at());
     // Scoped files still need the producer's workspace-load verdict: a file
     // report cannot reveal a failed metadata load, and provisional reports must
     // survive an indexing timeout without becoming authoritative. Keep this
