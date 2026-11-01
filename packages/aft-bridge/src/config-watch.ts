@@ -12,8 +12,19 @@
  * and apply at the next host restart; they are reported as deferred.
  */
 
-import { type FSWatcher, readFileSync, statSync, watch } from "node:fs";
-import { basename, dirname } from "node:path";
+import { createHash } from "node:crypto";
+import {
+  closeSync,
+  fstatSync,
+  type FSWatcher,
+  openSync,
+  readFileSync,
+  readSync,
+  realpathSync,
+  statSync,
+  watch,
+} from "node:fs";
+import { basename, dirname, resolve } from "node:path";
 
 /** How long a burst of file events must be quiet before the files are read. */
 export const CONFIG_WATCH_DEBOUNCE_MS = 150;
@@ -247,6 +258,29 @@ const CONFIG_WATCH_REVALIDATE_MS = 2_000;
 const CONFIG_WATCH_REJECTED_RETRIES = 3;
 /** Longest a stream of events may postpone a check. */
 const CONFIG_WATCH_MAX_DELAY_MS = 1_000;
+const CONFIG_READ_LIMIT = 1024 * 1024;
+
+/** A bounded fallback for a symlink target whose directory cannot be watched. */
+function contentFingerprint(path: string): string | null {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r");
+    const metadata = fstatSync(fd, { bigint: true });
+    const bytes = Buffer.alloc(Math.min(Number(metadata.size), CONFIG_READ_LIMIT));
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = readSync(fd, bytes, offset, bytes.length - offset, null);
+      if (read === 0) break;
+      offset += read;
+    }
+    const hash = createHash("sha256").update(bytes.subarray(0, offset)).digest("hex");
+    return `${metadata.size}:${metadata.mtimeNs}:${hash}`;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
 
 /**
  * A directory's identity, which changes when the directory is replaced under
@@ -287,7 +321,9 @@ function watchDirFor(file: string): string {
 /**
  * Watch config files the way editors save them: the parent directory is
  * watched, because an editor replaces the file by renaming a temporary
- * sibling over it. A directory that does not exist yet is watched through its
+ * sibling over it. Symlinks also watch the resolved target's directory, since
+ * editing a target elsewhere sends no event to the link's directory. A
+ * directory that does not exist yet is watched through its
  * nearest existing ancestor until it appears, and a watch whose directory was
  * replaced or failed is re-armed. Every event in a watched directory wakes
  * the check (platforms may coalesce several changes into one event naming a
@@ -311,6 +347,8 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
     string,
     { watcher: FSWatcher; identity: string | null; stale: boolean }
   >();
+  const targets = new Map<string, string>();
+  const fallbackSeen = new Map<string, string | null>();
 
   const watchImpl = options.watchImpl ?? watch;
   let rejectedRetries = 0;
@@ -366,6 +404,23 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
   function revalidate(): boolean {
     const wanted = new Set(options.paths.map(watchDirFor));
     let moved = false;
+    for (const path of options.paths) {
+      try {
+        // realpath follows links in any component, not just aft.jsonc itself.
+        const resolved = realpathSync(path);
+        const target = resolved === resolve(path) ? undefined : resolved;
+        if (targets.get(path) !== target) {
+          if (target) targets.set(path, target);
+          else targets.delete(path);
+          fallbackSeen.delete(path);
+          moved = true;
+        }
+      } catch {
+        // A dangling link retains its old target watch, so recreating the
+        // target is noticed without an event in the link's directory.
+      }
+    }
+    for (const target of targets.values()) wanted.add(watchDirFor(target));
     for (const [dir, entry] of watchers) {
       // A directory that is no longer wanted (its child appeared) or that was
       // replaced under the watch is dropped and, if still wanted, re-armed.
@@ -412,6 +467,17 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
         // The directory vanished between the check and the watch; the next
         // revalidation finds its nearest existing ancestor.
       }
+    }
+    for (const [path, target] of targets) {
+      if (watchers.has(dirname(target))) {
+        fallbackSeen.delete(path);
+        continue;
+      }
+      // Do not read all configs on the interval: only the single file behind
+      // a symlink whose target directory could not be attached needs polling.
+      const fingerprint = contentFingerprint(path);
+      if (!fallbackSeen.has(path) || fallbackSeen.get(path) !== fingerprint) moved = true;
+      fallbackSeen.set(path, fingerprint);
     }
     return moved;
   }

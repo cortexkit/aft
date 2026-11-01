@@ -1,7 +1,17 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  utimesSync,
+  watch,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -228,16 +238,111 @@ describe("watchAftConfigFiles", () => {
     writeFileSync(target, "{}");
     symlinkSync(target, file, "file");
     let changes = 0;
+    const watched: string[] = [];
     const stop = watchAftConfigFiles({
       paths: [file],
+      debounceMs: 20,
+      watchImpl: ((
+        path: string,
+        options: { persistent: boolean },
+        listener: (event: string, filename: string | null) => void,
+      ) => {
+        watched.push(String(path));
+        return watch(path, options, listener);
+      }) as unknown as typeof watch,
+      onChange: () => {
+        changes += 1;
+      },
+    });
+    try {
+      expect(watched).toContain(dotfiles);
+      writeFileSync(target, '{ "bash": { "env": { "TEST": "edited" } } }');
+      await waitUntil(() => changes >= 1, "symlink target edit reloaded");
+
+      const replacement = join(dotfiles, "save.jsonc");
+      writeFileSync(replacement, '{ "bash": { "env": { "TEST": "atomic" } } }');
+      renameSync(replacement, target);
+      await waitUntil(() => changes >= 2, "rename-over target reloaded");
+      rmSync(target);
+      await waitUntil(() => changes >= 3, "missing target noticed");
+      writeFileSync(target, "{}");
+      await waitUntil(() => changes >= 4, "missing target recovered");
+
+      const other = join(dir, "other-dotfiles");
+      mkdirSync(other);
+      const alternate = join(other, "alternate.jsonc");
+      writeFileSync(alternate, '{ "bash": { "env": { "TEST": "retargeted" } } }');
+      rmSync(file);
+      symlinkSync(alternate, file, "file");
+      await waitUntil(() => changes >= 5, "retargeted link reloaded");
+      expect(watched).toContain(other);
+      writeFileSync(alternate, '{ "bash": { "env": { "TEST": "edited again" } } }');
+      await waitUntil(() => changes >= 6, "new target edit reloaded");
+    } finally {
+      stop();
+    }
+  });
+
+  test("a symlinked config directory watches its resolved target", async () => {
+    const dir = tempDir();
+    const dotfiles = join(dir, "dotfiles");
+    mkdirSync(dotfiles);
+    const target = join(dotfiles, "aft.jsonc");
+    writeFileSync(target, "{}");
+    const configDir = join(dir, "cortexkit");
+    symlinkSync(dotfiles, configDir, "dir");
+    let changes = 0;
+    const stop = watchAftConfigFiles({
+      paths: [join(configDir, "aft.jsonc")],
       debounceMs: 20,
       onChange: () => {
         changes += 1;
       },
     });
     try {
-      writeFileSync(target, '{ "bash": { "env": { "TEST": "edited" } } }');
-      await waitUntil(() => changes >= 1, "symlink target edit reloaded");
+      writeFileSync(target, '{ "bash": { "enabled": false } }');
+      await waitUntil(() => changes >= 1, "target under a directory symlink reloaded");
+    } finally {
+      stop();
+    }
+  });
+
+  test("an unwatchable symlink target is polled even when size and mtime match", async () => {
+    const dir = tempDir();
+    const dotfiles = join(dir, "dotfiles");
+    const configDir = join(dir, "cortexkit");
+    mkdirSync(dotfiles);
+    mkdirSync(configDir);
+    const file = join(configDir, "aft.jsonc");
+    const target = join(dotfiles, "settings.jsonc");
+    writeFileSync(target, '{ "value": "before" }');
+    const metadata = statSync(target);
+    symlinkSync(target, file, "file");
+    let changes = 0;
+    let attempted = false;
+    const stop = watchAftConfigFiles({
+      paths: [file],
+      debounceMs: 20,
+      watchImpl: ((
+        path: string,
+        options: { persistent: boolean },
+        listener: (event: string, filename: string | null) => void,
+      ) => {
+        if (String(path) === dotfiles) {
+          attempted = true;
+          throw new Error("target watch unavailable");
+        }
+        return watch(path, options, listener);
+      }) as unknown as typeof watch,
+      onChange: () => {
+        changes += 1;
+      },
+    });
+    try {
+      expect(attempted).toBe(true);
+      writeFileSync(target, '{ "value": "after!" }');
+      utimesSync(target, metadata.atime, metadata.mtime);
+      await waitUntil(() => changes >= 1, "unwatchable target edit reloaded");
     } finally {
       stop();
     }

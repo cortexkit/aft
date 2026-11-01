@@ -1314,7 +1314,7 @@ fn watcher_config_user_dropped_rescans_without_creating_streams() {
             .set_flag(Flag::Rescan)
             .set_info("rescan: user dropped")
             .add_path(root.clone());
-        handle_config_watch_event(&dir, &event, &mut attachment, &rescan);
+        handle_config_watch_event(&dir.join("aft.jsonc"), &event, &mut attachment, &rescan);
         attach(&mut attachment);
     }
     assert_eq!(
@@ -1359,6 +1359,57 @@ fn publishing_inside_update_config_panics_instead_of_deadlocking() {
     );
     ctx.update_config(|config| config.format_on_edit = true);
     assert!(ctx.config().format_on_edit);
+}
+
+#[test]
+fn config_target_fallback_hashes_bounded_content_and_stops_when_attached() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("settings.jsonc");
+    std::fs::write(&file, "before").unwrap();
+    let modified =
+        filetime::FileTime::from_last_modification_time(&std::fs::metadata(&file).unwrap());
+    let mut target = ConfigTargetWatch {
+        file: file.clone(),
+        watcher: None,
+        attachment: DirAttachment::new(dir.path().to_path_buf()),
+        fingerprint: None,
+    };
+    assert!(target.poll_if_unattached(&file));
+    assert!(!target.poll_if_unattached(&file));
+    std::fs::write(&file, "after!").unwrap();
+    filetime::set_file_mtime(&file, modified).unwrap();
+    assert!(
+        target.poll_if_unattached(&file),
+        "same size and mtime still need a hash"
+    );
+    std::fs::remove_file(&file).unwrap();
+    assert!(target.poll_if_unattached(&file));
+    std::fs::write(&file, "return").unwrap();
+    assert!(target.poll_if_unattached(&file));
+
+    let bytes = vec![b'a'; CONFIG_READ_LIMIT + 32];
+    std::fs::write(&file, &bytes).unwrap();
+    let before = config_file_fingerprint(&file).unwrap();
+    let mut bytes = bytes;
+    bytes[CONFIG_READ_LIMIT] = b'b';
+    std::fs::write(&file, bytes).unwrap();
+    filetime::set_file_mtime(
+        &file,
+        filetime::FileTime::from_system_time(before.modified.unwrap()),
+    )
+    .unwrap();
+    assert_eq!(
+        config_file_fingerprint(&file).unwrap().hash,
+        before.hash,
+        "fallback reads no more than the config size limit"
+    );
+
+    assert!(target.attachment.attach(&mut |_| Ok(())));
+    assert!(!target.poll_if_unattached(&file));
+    assert!(
+        target.fingerprint.is_none(),
+        "an attached target does not retain a polling snapshot"
+    );
 }
 
 #[test]

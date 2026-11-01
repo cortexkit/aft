@@ -111,7 +111,7 @@ fn config_symlink(target: &Path, link: &Path) {
 fn write_env_config(path: &Path, value: &str) {
     fs::write(
         path,
-        json!({ "bash": { "env": { "AFT_CONFIG_SYMLINK_TEST": value } } }).to_string(),
+        json!({ "bash": { "env": { "SYMLINK_CONFIG_MARK": value } } }).to_string(),
     )
     .unwrap();
 }
@@ -121,7 +121,7 @@ fn bash_env(aft: &mut AftProcess) -> Value {
         &json!({
             "id": "live-reload-env",
             "command": "bash",
-            "params": { "command": "printf '%s' \"$AFT_CONFIG_SYMLINK_TEST\"" }
+            "params": { "command": "printf '%s' \"$SYMLINK_CONFIG_MARK\"" }
         })
         .to_string(),
     )
@@ -177,7 +177,9 @@ fn symlinked_user_config_target_edits_apply_live() {
 
     fs::remove_file(&target).unwrap();
     thread::sleep(Duration::from_millis(700));
-    assert!(bash_env(&mut aft).to_string().contains("symlink-after-atomic"));
+    assert!(bash_env(&mut aft)
+        .to_string()
+        .contains("symlink-after-atomic"));
     write_env_config(&target, "symlink-recovered");
     wait_for_bash_env(&mut aft, "symlink-recovered");
 
@@ -190,4 +192,30 @@ fn symlinked_user_config_target_edits_apply_live() {
     wait_for_bash_env(&mut aft, "symlink-retargeted");
     write_env_config(&other_target, "symlink-retarget-edit");
     wait_for_bash_env(&mut aft, "symlink-retarget-edit");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn symlinked_project_config_directory_target_edits_apply_live() {
+    let _watcher_guard = crate::helpers::watcher_serial_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    let dotfiles = dir.path().join("dotfiles");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&dotfiles).unwrap();
+    let target = dotfiles.join("aft.jsonc");
+    write_env_config(&target, "project-symlink-initial");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&dotfiles, root.join(".cortexkit")).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&dotfiles, root.join(".cortexkit")).unwrap();
+    let user_config = dir.path().join("user.jsonc");
+    fs::write(&user_config, "{}").unwrap();
+
+    // AftProcess gives each child its own throwaway HOME and XDG directories.
+    let mut aft = AftProcess::spawn_with_real_watcher();
+    configure(&mut aft, &root, &user_config);
+    wait_for_bash_env(&mut aft, "project-symlink-initial");
+    write_env_config(&target, "project-symlink-edited");
+    wait_for_bash_env(&mut aft, "project-symlink-edited");
 }
