@@ -24,6 +24,7 @@ pub(super) fn transport_fixture_arguments(root: &Path, description: &str) -> Val
 pub(super) const REWRITE_FIXTURE_FILE: &str = "historian.repeat-fixture";
 
 pub(super) fn write_rewritten_grep_fixture(root: &Path) {
+    crate::test_helpers::project::mark_project(root).expect("mark rewritten grep project");
     std::fs::write(
         root.join(REWRITE_FIXTURE_FILE),
         "historian response dumped\n",
