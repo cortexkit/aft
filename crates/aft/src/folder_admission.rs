@@ -243,6 +243,45 @@ pub struct TrackedCount {
     pub index_identity: String,
 }
 
+/// A worker that cannot finish an OS operation has observed no complete tree.
+/// Keep that absence of coverage distinct from a completed negative probe.
+pub(crate) fn exhausted(
+    root: &Path,
+    mode: DetectionMode,
+    budgets: ProbeBudgets,
+) -> FolderAdmission {
+    FolderAdmission {
+        policy_version: POLICY_VERSION,
+        canonical_root: Some(root.to_path_buf()),
+        classification: FolderClassification::NotProject,
+        reason: AdmissionReason::EvidenceBudgetExhausted,
+        observed: Observed::default(),
+        coverage: ProbeCoverage {
+            complete: false,
+            count_kind: CountKind::LowerBound,
+            root_listing_complete: false,
+            workspace_complete: false,
+            stop: ProbeStop::Time,
+            entry_budget: budgets.entries,
+            time_budget_ms: millis(budgets.time),
+            depth_budget: budgets.depth,
+            per_directory_budget: budgets.per_directory,
+            directory_cuts: 0,
+            depth_cuts: 0,
+            elapsed_ms: millis(budgets.time),
+        },
+        override_mode: mode,
+        tracked: None,
+        child_roots: Vec::new(),
+        immediate_directories: Vec::new(),
+        observed_directories: Vec::new(),
+        immediate_entries: Vec::new(),
+        evidence_markers: Vec::new(),
+        git_controls: Vec::new(),
+        outside_paths: Vec::new(),
+    }
+}
+
 struct Probe {
     result: FolderAdmission,
     start: Instant,

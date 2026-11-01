@@ -8372,6 +8372,14 @@ pub(crate) fn drain_standalone_configure_prefix(
     ctx: &AppContext,
     state: &mut ConfigureMaintenanceState,
 ) -> bool {
+    // Reapply the admitted configuration before storage and artifact
+    // housekeeping so a queued first tool does not wait for unrelated work.
+    if crate::provisional_identity_retry::folder_due(ctx) {
+        crate::provisional_identity_retry::drain_inline(ctx);
+    }
+    if crate::folder_admission_runtime::waiting(ctx) {
+        return false;
+    }
     state.absorb_enqueued(ctx);
     let jobs_to_visit = state.jobs.len();
     let mut ran_prefix = false;
@@ -8493,6 +8501,10 @@ pub(crate) fn drain_standalone_configure_unit(
     ctx: &Arc<AppContext>,
     state: &mut ConfigureMaintenanceState,
 ) -> bool {
+    if crate::folder_admission_runtime::waiting(ctx) {
+        crate::provisional_identity_retry::drain_inline(ctx);
+        return true;
+    }
     state.absorb_enqueued(ctx);
     drop_superseded_parked_continuations(ctx, state);
     if state.jobs.is_empty() && crate::provisional_identity_retry::drain_inline(ctx) {

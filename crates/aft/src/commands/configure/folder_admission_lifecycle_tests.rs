@@ -55,6 +55,7 @@ fn settle(ctx: &Arc<AppContext>) {
             return;
         }
         maintenance.drain_one(ctx);
+        std::thread::sleep(Duration::from_millis(1));
     }
     panic!("folder configure maintenance did not settle");
 }
@@ -86,6 +87,59 @@ fn scratch(root: &Path) {
 #[test]
 fn folder_admission_off_notice_is_pinned_byte_for_byte() {
     assert_eq!(admission::OFF_TEXT, "Indexing is off: this folder does not look like a project. grep and glob still work, with limits. To index it, set project_detection in your AFT user config.");
+}
+
+#[test]
+fn folder_admission_timeout_is_incomplete_in_health_and_can_reconnect() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("Makefile"), "").unwrap();
+    let ctx = context(storage.path());
+    let (started, release) = admission::gate_probe_for_test(&ctx);
+    let ack = configure(root.path(), storage.path(), &ctx, false, false);
+    assert!(ack.success);
+    assert_eq!(admission::probe_counts_for_test(&ctx), (0, 0));
+    assert!(!admission::poll_wait(&ctx));
+    started.recv_timeout(Duration::from_secs(1)).unwrap();
+    while !admission::poll_wait(&ctx) {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let health = serde_json::to_value(ctx.try_health_snapshot(root.path())).unwrap();
+    assert_eq!(health["folder"]["classification"], "not_project");
+    assert_eq!(health["folder"]["reason"], "evidence_budget_exhausted");
+    assert_eq!(health["folder"]["coverage"]["complete"], false);
+    assert_eq!(health["folder"]["coverage"]["count_kind"], "lower_bound");
+    let refusal = admission::refusal(&ctx, "timed-out", "session").unwrap();
+    assert_eq!(refusal.data["message"], admission::OFF_TEXT);
+    release.send(()).unwrap();
+    assert!(configure(root.path(), storage.path(), &ctx, false, false).success);
+    settle(&ctx);
+    assert_eq!(
+        admission::snapshot(&ctx).unwrap()["classification"],
+        "project"
+    );
+}
+
+#[test]
+fn fresh_connect_rechecks_changed_evidence_without_cache_cooldown() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(storage.path());
+    isolated(root.path(), || {
+        assert!(configure(root.path(), storage.path(), &ctx, false, false).success);
+        settle(&ctx);
+        assert_eq!(
+            admission::snapshot(&ctx).unwrap()["classification"],
+            "not_project"
+        );
+        std::fs::write(root.path().join("Makefile"), "").unwrap();
+        assert!(configure(root.path(), storage.path(), &ctx, false, false).success);
+        settle(&ctx);
+        assert_eq!(
+            admission::snapshot(&ctx).unwrap()["classification"],
+            "project"
+        );
+    });
 }
 
 #[test]
