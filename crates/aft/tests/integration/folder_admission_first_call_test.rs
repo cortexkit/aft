@@ -93,6 +93,11 @@ fn call_while_probe_is_held(project_evidence: bool, full_validation: bool) -> Va
     }
     drop(release_on_drop);
     let tool = response(&mut aft, "first-tool");
+    if full_validation {
+        let status = aft.send(r#"{"id":"admitted-status","command":"status"}"#);
+        assert_eq!(status["folder"]["state"], "decided", "{status}");
+        assert_eq!(status["folder"]["classification"], "project", "{status}");
+    }
     let (status, stderr) = aft.stderr_output();
     if tool["success"] != true {
         eprintln!("{stderr}");
@@ -125,7 +130,12 @@ fn tool_from_same_burst_waits_for_negative_decision_and_gets_approved_refusal() 
 #[test]
 fn full_validation_call_does_not_starve_its_admission_replay() {
     let tool = call_while_probe_is_held(true, true);
-    assert_eq!(tool["success"], true, "{tool}");
+    // Persistence opens independently after bind. Its existing initializing
+    // refusal is valid here; an admission refusal or timeout is not.
+    assert!(
+        tool["success"] == true || tool["code"] == "database_initializing",
+        "{tool}"
+    );
     assert_ne!(tool["code"], "folder_not_admitted", "{tool}");
 }
 
