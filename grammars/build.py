@@ -2,8 +2,10 @@
 """Build only pinned generated C; verify repeatability and Zed parse parity."""
 
 import argparse
+import gzip
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -90,11 +92,19 @@ def run(args, *, cwd, env):
     return subprocess.check_output([str(a) for a in args], cwd=cwd, env=env, text=True)
 
 
-def parse(runtime, module, source, *, cwd, env):
-    # The verifier loads explicit WASM bytes, with no grammar discovery or build.
-    tree = run([shutil.which("node"), ROOT / "grammars/parse.cjs", runtime, module, source], cwd=cwd, env=env)
-    parsed = json.loads(tree)
-    if parsed["type"] != "chunk" or parsed.get("hasError") or parsed.get("isMissing"):
+def parse(cli, module, source, *, cwd, env):
+    # The CLI's --lib-path loads native libraries, even with --wasm. Populate
+    # only its isolated WASM cache instead; compiler discovery is disabled.
+    cache = cwd / "cache"
+    cache.mkdir(exist_ok=True)
+    cached = cache / "luau.wasm"
+    data = module.read_bytes()
+    cached.write_bytes(data)
+    parse_env = dict(env, TREE_SITTER_LIBDIR=str(cache), PATH="",
+                     WASI_SDK_PATH=str(cwd / "no-compiler"))
+    tree = run([cli, "parse", "--wasm", "--xml", source], cwd=cwd, env=parse_env)
+    require_equal(cached.read_bytes(), data, "loaded WASM bytes")
+    if not tree.strip() or "<ERROR" in tree or "<MISSING" in tree:
         raise ValueError(f"empty or invalid parse: {source}")
     return tree
 
@@ -181,20 +191,29 @@ def build(output, write_fixtures=False):
     elif zed["comparison"] != "parse_trees" or not zed.get("exemption"):
         raise ValueError("Zed comparison requires matching toolchain or reviewed exemption")
     verifier = pin["verifier"]
-    runtime_archive = fetch(verifier["url"], verifier["sha256"], downloads / "web-tree-sitter.tar.gz")
-    runtime = work / "web-tree-sitter.cjs"
-    runtime.write_bytes(archive_member(runtime_archive, "./web-tree-sitter.cjs"))
-    (work / "web-tree-sitter.wasm").write_bytes(archive_member(runtime_archive, "./web-tree-sitter.wasm"))
-    verifier_version = f"Web Tree-sitter {verifier['release']}; " + run([shutil.which("node"), "--version"], cwd=work, env=env).strip()
+    cli_archive = fetch(verifier["url"], verifier["sha256"], downloads / "tree-sitter.gz")
+    cli = work / "tree-sitter"
+    cli.write_bytes(gzip.decompress(cli_archive.read_bytes()))
+    cli.chmod(0o755)
+    verifier_version = run([cli, "--version"], cwd=work, env=env).strip()
     empty = work / "parse"
-    empty.mkdir(exist_ok=True)
+    (empty / "src").mkdir(parents=True, exist_ok=True)
+    json_write(empty / "src/grammar.json", {"name": "luau"})
+    json_write(empty / "tree-sitter.json", {"grammars": [{"name": "luau", "scope": "source.luau",
+               "path": ".", "file-types": ["luau"]}], "metadata": {"version": "0.0.0",
+               "license": "MIT", "description": "Pinned artifact verification", "authors": [],
+               "links": {"repository": "https://github.com/cortexkit/aft"}}})
+    shutil.copyfile(source / "src/parser.c", empty / "src/parser.c")
+    # The loader compares the parser's timestamp to its cache before loading.
+    # No scanner or compiler is present in this verification directory.
+    os.utime(empty / "src/parser.c", (0, 0))
     corpus = json.loads((ROOT / "grammars/corpus/manifest.json").read_text())
     if not corpus["files"]:
         raise ValueError("empty parse corpus")
     for entry in corpus["files"]:
         path = ROOT / "grammars/corpus" / entry["file"]
         require_equal(digest(path.read_bytes()), entry["sha256"], "corpus bytes")
-        trees = [parse(runtime, module, path, cwd=empty, env=env) for module in
+        trees = [parse(cli, module, path, cwd=empty, env=env) for module in
                  (artifacts / manifests[0]["file"], artifacts / manifests[1]["file"], zed_path)]
         require_equal(trees[0], trees[1], f"A/B parse tree: {entry['file']}")
         require_equal(trees[0], trees[2], f"A/Zed parse tree: {entry['file']}")

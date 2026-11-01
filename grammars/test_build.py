@@ -71,18 +71,35 @@ class BuildTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "one size-capped"):
             build.archive_member(archive, "./grammars/luau.wasm")
 
-    def test_parsing_uses_explicit_wasm_not_grammar_discovery(self):
-        with patch.object(build, "run", return_value='{"type":"chunk"}\n') as run:
-            build.parse("runtime", "module.wasm", "input.luau", cwd=self.work, env={})
-        self.assertEqual(run.call_args.args[0][1:], [build.ROOT / "grammars/parse.cjs",
-                         "runtime", "module.wasm", "input.luau"])
+    def test_parsing_uses_isolated_wasm_cache_with_compilers_disabled(self):
+        module = self.work / "module.wasm"
+        module.write_bytes(b"exact module bytes")
+        with patch.object(build, "run", return_value="<chunk/>\n") as run:
+            build.parse("cli", module, "input.luau", cwd=self.work, env={})
+        self.assertEqual(run.call_args.args[0], ["cli", "parse", "--wasm", "--xml", "input.luau"])
+        self.assertEqual((self.work / "cache/luau.wasm").read_bytes(), b"exact module bytes")
+        self.assertEqual(run.call_args.kwargs["env"]["PATH"], "")
+        self.assertEqual(run.call_args.kwargs["env"]["WASI_SDK_PATH"], str(self.work / "no-compiler"))
+
+    def test_verifier_refuses_a_replaced_cached_module(self):
+        module = self.work / "module.wasm"
+        module.write_bytes(b"exact module bytes")
+
+        def replace_cache(*args, **kwargs):
+            (self.work / "cache/luau.wasm").write_bytes(b"other bytes")
+            return "<chunk/>\n"
+
+        with patch.object(build, "run", side_effect=replace_cache):
+            with self.assertRaisesRegex(ValueError, "loaded WASM bytes"):
+                build.parse("cli", module, "source", cwd=self.work, env={})
 
     def test_empty_or_error_trees_are_not_parity(self):
-        for tree in ('{}', '{"type":"ERROR"}', '{"type":"chunk","hasError":true}',
-                     '{"type":"chunk","isMissing":true}'):
+        module = self.work / "module.wasm"
+        module.write_bytes(b"exact module bytes")
+        for tree in ("", "<chunk><ERROR/></chunk>", "<chunk><MISSING/></chunk>"):
             with self.subTest(tree=tree), patch.object(build, "run", return_value=tree):
-                with self.assertRaises((ValueError, KeyError)):
-                    build.parse("runtime", "module", "source", cwd=self.work, env={})
+                with self.assertRaises(ValueError):
+                    build.parse("cli", module, "source", cwd=self.work, env={})
 
     def test_different_trees_fail(self):
         with self.assertRaisesRegex(ValueError, "differs"):

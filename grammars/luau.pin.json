@@ -29,8 +29,8 @@
   },
   "verifier": {
     "release": "v0.27.1",
-    "url": "https://github.com/tree-sitter/tree-sitter/releases/download/v0.27.1/web-tree-sitter.tar.gz",
-    "sha256": "0a1c8c6a369c5483bbc5385ef1ae9a0d68793553c59f83458fa5973f5de0568a"
+    "url": "https://github.com/tree-sitter/tree-sitter/releases/download/v0.27.1/tree-sitter-linux-x64.gz",
+    "sha256": "d01042f94ba3d6827ddc9788e235f75d8366431be42bdf90ade534d960c98b7d"
   },
   "zed": {
     "extension_repository": "https://github.com/4teapo/zed-luau",
@@ -47,6 +47,6 @@
   "provenance_notes": [
     "Ufuk approved this grammar revision, official wasi-sdk 34 archive checksum, two-C-file build and Zed parse-tree exemption. Zed does not publish its compiler release and flags, so CI requires identical fixed-corpus parse trees rather than claiming byte identity with Zed.",
     "Source revision and build flags follow the frozen wasm-grammars benchmark at AFT 42d0ddeff357b73b2b10254cf309a1f98ae3217c; the release archive's extension.toml independently names the same grammar revision.",
-    "The verifier uses the checksum-pinned prebuilt official Web Tree-sitter runtime. Neither it nor the compiler is built from source in this job; no extension code, build.rs or package-manager hooks execute."
+    "The verifier uses the checksum-pinned prebuilt official tree-sitter CLI with an isolated WASM-only parser cache and compiler discovery disabled. Neither it nor the compiler is built from source in this job; no extension code, build.rs or package-manager hooks execute."
   ]
 }
