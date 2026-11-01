@@ -735,6 +735,7 @@ for (const harness of ["opencode", "pi"]) {
       });
     await settle();
     client.toolGate = undefined;
+    let releaseScoped = () => {};
     try {
       expect(client.toolChannels.at(-1)).toBe(fallback);
       // Timers can wake just before the wall-clock deadline, leaving one millisecond of backoff.
@@ -742,6 +743,13 @@ for (const harness of ["opencode", "pi"]) {
       expect(client.reads).toHaveLength(1);
       expect(lines.some((line) => line.includes("reason=backoff retry_in=1ms"))).toBe(true);
       expect(clock.pending.size).toBe(1);
+      client.scopedOpenGate = new Promise<void>((resolve) => {
+        releaseScoped = resolve;
+      });
+      await clock.tick(1);
+      expect(client.activeSubscriptionChannels).toEqual([]);
+      expect(lines.filter((line) => line.includes("route=upgraded"))).toHaveLength(0);
+      // A completion queued while the old stream is closed must replay on the scoped stream.
       const completion = { task_id: "bg-before-upgrade", status: "completed" };
       client.toolReplies.set("bash_drain_completions", {
         success: true,
@@ -749,7 +757,8 @@ for (const harness of ["opencode", "pi"]) {
         bg_completions: [completion],
         pending_matches: [],
       });
-      await clock.tick(1);
+      client.scopedOpenGate = undefined;
+      releaseScoped();
       await settle();
       await Promise.all(drains);
       expect(client.reads).toHaveLength(2);
@@ -782,6 +791,7 @@ for (const harness of ["opencode", "pi"]) {
       expect(notices).toEqual([completion, laterCompletion]);
       expect(lines.filter((line) => line.includes("route=upgraded"))).toHaveLength(1);
     } finally {
+      releaseScoped();
       releaseHeld();
       expect((await held).text).toBe("ok");
     }
