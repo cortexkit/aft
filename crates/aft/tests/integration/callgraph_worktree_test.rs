@@ -213,7 +213,7 @@ fn views_worktree_family_writes_publish_without_legacy_denial() {
     assert!(health.view_load_failure_last.is_none(), "{health:?}");
     assert!(!ctx
         .degraded_reasons()
-        .contains(&aft::context::VIEW_LOAD_DEGRADED_REASON.to_string()));
+        .contains(&"view_load_failed".to_string()));
     println!("worker view published; callers succeeded; view load failures: 0");
 }
 
