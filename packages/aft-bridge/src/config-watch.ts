@@ -15,8 +15,8 @@
 import { createHash } from "node:crypto";
 import {
   closeSync,
-  fstatSync,
   type FSWatcher,
+  fstatSync,
   openSync,
   readFileSync,
   readSync,
