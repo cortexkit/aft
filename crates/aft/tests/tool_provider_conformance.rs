@@ -1024,7 +1024,14 @@ impl Harness for Subject {
         let mut guard = ChildGuard(Some(child));
         let (mut stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
             .await
-            .map_err(harness_error)?
+            .map_err(|error| {
+                let status = guard.0.as_mut().unwrap().try_wait();
+                let stderr = std::fs::read_to_string(root.join("daemon.stderr"))
+                    .unwrap_or_else(|read| format!("cannot read provider stderr: {read}"));
+                HarnessError::new(format!(
+                    "provider connection deadline: {error}; child status={status:?}; stderr:\n{stderr}"
+                ))
+            })?
             .map_err(harness_error)?;
         authenticate_server(
             &mut stream,
