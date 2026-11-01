@@ -90,6 +90,41 @@ fn folder_admission_off_notice_is_pinned_byte_for_byte() {
 }
 
 #[test]
+fn folder_admission_replay_does_not_force_a_callgraph_generation() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    let storage = temp.path().join("storage");
+    std::fs::create_dir_all(&root).unwrap();
+    crate::test_project::mark_project(&root).unwrap();
+    isolated(&root, || {
+        let ctx = context(&storage);
+        let req = request(
+            "configure",
+            json!({
+                "project_root": root, "storage_dir": storage, "harness": "opencode",
+                "config": [{"tier": "user", "source": "folder fixture", "doc": json!({
+                    "indexes": {"trigram": false, "semantic": false, "callgraph": true},
+                    "views": {"enabled": false}
+                }).to_string()}]
+            }),
+        );
+        assert!(super::handle_configure(&req, &ctx).success);
+        assert!(!ctx.config().indexes.callgraph);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let replay = loop {
+            if let Some(replay) = crate::provisional_identity_retry::poll(&ctx) {
+                break replay;
+            }
+            assert!(std::time::Instant::now() < deadline, "probe did not finish");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert!(replay.run(&ctx, |_| {}).success);
+        assert!(ctx.config().indexes.callgraph);
+        assert_eq!(ctx.pending_callgraph_store_force_token(), None);
+    });
+}
+
+#[test]
 fn folder_admission_timeout_is_incomplete_in_health_and_can_reconnect() {
     let root = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();

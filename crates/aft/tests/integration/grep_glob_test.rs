@@ -1736,7 +1736,10 @@ fn explicit_symlink_escaping_root_is_refused_when_restricted() {
 #[test]
 fn filtered_scope_distinguishes_no_files_from_no_matches() {
     for indexed in [false, true] {
-        let project = setup_project(&[("src/a.txt", "hello\n"), ("src/b.rs", "hello\n")]);
+        let project = crate::test_helpers::project::git_project_tempdir();
+        fs::create_dir(project.path().join("src")).unwrap();
+        fs::write(project.path().join("src/a.txt"), "hello\n").unwrap();
+        fs::write(project.path().join("src/b.rs"), "hello\n").unwrap();
         fs::create_dir(project.path().join("empty")).unwrap();
         let mut aft = AftProcess::spawn();
         if indexed {

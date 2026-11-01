@@ -5418,7 +5418,14 @@ fn handle_configure_inner(
             // root (linked worktree, borrowed index family) follows the
             // owner's published store; a token here would never be fulfilled
             // and would keep every later callgraph query Unavailable.
-            if previous_project_root.as_ref() == Some(&root_path) && ctx.callgraph_writer() {
+            // Once the folder probe admits a project, configure is replayed to
+            // restore indexes disabled only while that probe was pending. This
+            // is still their first real bind: validate and reuse an existing
+            // store rather than forcing a new generation.
+            if admission_config.is_none()
+                && previous_project_root.as_ref() == Some(&root_path)
+                && ctx.callgraph_writer()
+            {
                 ctx.mark_callgraph_store_force_rebuild(
                     "callgraph build inputs changed (storage, enablement, or worktree topology)",
                 );
