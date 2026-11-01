@@ -1,1 +1,1 @@
-Large patch, edit, write and approval diffs now share an 8 MiB budget while file outcomes and line counts remain complete.
+- A patch, edit or write whose diff is too large to send no longer loses its result: file results and line counts are kept, and only the oversized diff is left out.
