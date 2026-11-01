@@ -11865,7 +11865,8 @@ async fn handle_tool_call_with_capabilities(
 
     // Catalog role controls tool behavior, but a stamped worker must never
     // enable Cargo indirectly by selecting a head catalog on its route.
-    if access_grants::alfonso_worker(&identity) {
+    // Inspect applies the policy inside its deadline-bounded deferred body.
+    if access_grants::alfonso_worker(&identity) && bare_name != "inspect" {
         if let Some(ctx) = executor.actor_context(&identity.root) {
             ctx.disable_rust_cargo_for_worker();
         }
@@ -12013,7 +12014,13 @@ async fn handle_tool_call_with_capabilities(
                         });
                         response
                     }
-                    Ok(prepared) => {
+                    Ok(mut prepared) => {
+                        if bare_name_for_run == "inspect"
+                            && access_grants::alfonso_worker(&identity_for_run)
+                        {
+                            prepared.request.params[crate::protocol::WORKER_SESSION_FIELD] =
+                                Value::Bool(true);
+                        }
                         let outcome = if bare_name_for_run == "inspect" {
                             crate::commands::inspect::handle_inspect_deferred_with_reply_deadline(
                                 &prepared.request,
