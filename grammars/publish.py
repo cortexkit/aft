@@ -32,7 +32,9 @@ def publish(artifact, entry, repository, tag, scratch):
         # Authentication and network failures must not be mistaken for a new release.
         if "release not found" not in result.stderr.lower():
             raise RuntimeError(result.stderr)
+        # Grammar assets must not displace application versions as "latest".
         checked(["release", "create", tag, "--repo", repository, "--target", "main",
+                 "--latest=false", "--prerelease",
                  "--title", "Grammar artifacts", "--notes", "Immutable content-addressed grammar assets."])
         assets = []
     else:

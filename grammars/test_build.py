@@ -134,14 +134,19 @@ class PublicationTests(unittest.TestCase):
         self.artifact.write_bytes(self.data)
         self.entry = {"sha256": sha, "size": len(self.data)}
         self.remote = None
+        self.release_exists = True
         self.calls = []
 
     def gh(self, args):
         self.calls.append(args)
         operation = args[1]
         if operation == "view":
+            if not self.release_exists:
+                return subprocess.CompletedProcess(args, 1, "", "release not found")
             assets = [] if self.remote is None else [{"name": self.artifact.name}]
             return subprocess.CompletedProcess(args, 0, json.dumps({"assets": assets}), "")
+        if operation == "create":
+            self.release_exists = True
         if operation == "download":
             directory = Path(args[args.index("--dir") + 1])
             (directory / self.artifact.name).write_bytes(self.remote)
@@ -159,6 +164,16 @@ class PublicationTests(unittest.TestCase):
         self.calls.clear()
         self.assertEqual(self.invoke(), "verified_existing")
         self.assertEqual([call[1] for call in self.calls], ["view", "download"])
+
+    def test_new_grammar_release_is_prerelease_and_never_latest(self):
+        self.release_exists = False
+        self.assertEqual(self.invoke(), "uploaded")
+        self.assertEqual([call[1] for call in self.calls], ["view", "create", "upload"])
+        self.assertEqual(self.calls[1], [
+            "release", "create", "grammars-1", "--repo", "cortexkit/aft", "--target", "main",
+            "--latest=false", "--prerelease", "--title", "Grammar artifacts", "--notes",
+            "Immutable content-addressed grammar assets.",
+        ])
 
     def test_existing_different_bytes_fail_without_replacement(self):
         self.remote = b"different bytes"
