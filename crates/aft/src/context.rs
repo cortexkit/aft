@@ -19357,10 +19357,15 @@ mod callgraph_store_for_ops_tests {
 
         let _serial = v3::serial_for_test();
         let (_dirs, ctx) = cold_build_context();
+        let root = ctx
+            .callgraph_project_root()
+            .unwrap()
+            .canonicalize()
+            .unwrap();
         let mut config = (*ctx.config()).clone();
+        config.project_root = Some(root.clone());
         config.views.enabled = true;
         ctx.set_config(config);
-        let root = ctx.callgraph_project_root().unwrap();
         ctx.set_canonical_cache_root(root.clone());
         assert!(matches!(
             ctx.callgraph_store_for_ops(),
