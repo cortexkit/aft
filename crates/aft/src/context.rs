@@ -4759,6 +4759,10 @@ pub struct AppContext {
         parking_lot::Mutex<Option<(PathBuf, BTreeMap<PathBuf, Option<String>>)>>,
     callgraph_store_rx:
         parking_lot::Mutex<Option<crossbeam_channel::Receiver<CallGraphStoreBuildEvent>>>,
+    /// Serialize build-event consumption through resident-store installation.
+    /// A query may wait here within its budget; maintenance drains only try
+    /// to acquire this lock.
+    pub(crate) callgraph_store_install: parking_lot::Mutex<()>,
     // Unit tests must observe only this context's admissions and wait policy:
     // another root can start a worker or request an inline wait concurrently.
     #[cfg(test)]
@@ -5681,6 +5685,7 @@ impl AppContext {
             callgraph_catch_up: Arc::default(),
             workspace_resolution_manifests: parking_lot::Mutex::new(None),
             callgraph_store_rx: parking_lot::Mutex::new(None),
+            callgraph_store_install: parking_lot::Mutex::new(()),
             #[cfg(test)]
             callgraph_cold_build_spawn_count: AtomicUsize::new(0),
             #[cfg(test)]
@@ -11398,6 +11403,25 @@ impl AppContext {
         CallgraphStoreAccess::Building
     }
 
+    fn resident_callgraph_store_for_ops(&self) -> Option<Arc<ReadonlyCallGraphStore>> {
+        if self.callgraph_force_token_for_build().is_some() {
+            return None;
+        }
+        let store = self
+            .callgraph_store
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(Arc::clone)?;
+        self.clear_callgraph_store_build_denied();
+        self.schedule_legacy_callgraph_migration_if_needed(
+            store.as_ref(),
+            store.project_root().to_path_buf(),
+            self.callgraph_store_dir(),
+        );
+        Some(store)
+    }
+
     fn callgraph_store_for_ops_with_wait(
         &self,
         wait: Duration,
@@ -11556,24 +11580,26 @@ impl AppContext {
                 return CallgraphStoreAccess::Building;
             }
         }
-        let force_token = self.callgraph_force_token_for_build();
-        if force_token.is_none() {
-            if let Some(store) = {
-                let guard = self
-                    .callgraph_store
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                guard.as_ref().map(Arc::clone)
-            } {
-                self.clear_callgraph_store_build_denied();
-                self.schedule_legacy_callgraph_migration_if_needed(
-                    store.as_ref(),
-                    store.project_root().to_path_buf(),
-                    self.callgraph_store_dir(),
-                );
-                return CallgraphStoreAccess::Ready(store);
-            }
+        if let Some(store) = self.resident_callgraph_store_for_ops() {
+            return CallgraphStoreAccess::Ready(store);
         }
+        // A drain must not consume a waiting query's completion or clear its
+        // receiver before that query installs the store. Conversely, a query
+        // joins a drain already installing the completion within the same wait
+        // budget, then checks the resident store rather than a drained channel.
+        // Ready readers above never need this installation lock.
+        let install_started = Instant::now();
+        let Some(install) = self.callgraph_store_install.try_lock_for(wait) else {
+            return self
+                .resident_callgraph_store_for_ops()
+                .map(CallgraphStoreAccess::Ready)
+                .unwrap_or(CallgraphStoreAccess::Building);
+        };
+        let wait = wait.saturating_sub(install_started.elapsed());
+        if let Some(store) = self.resident_callgraph_store_for_ops() {
+            return CallgraphStoreAccess::Ready(store);
+        }
+        let force_token = self.callgraph_force_token_for_build();
 
         if let Some(suspension) = self.callgraph_store_build_suspension() {
             return CallgraphStoreAccess::Suspended(suspension);
@@ -11841,8 +11867,9 @@ impl AppContext {
                             );
                         },
                     );
+                    drop(install);
                     crate::runtime_drain::drain_callgraph_store_events(self);
-                    return CallgraphStoreAccess::Building;
+                    return self.callgraph_store_for_ops_with_wait(Duration::ZERO, demand, None);
                 }
                 Ok(CallGraphStoreBuildEvent::Suspended { suspension }) => {
                     let suspended = self.with_current_callgraph_store_rx(
