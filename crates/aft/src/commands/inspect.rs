@@ -1868,7 +1868,6 @@ fn run_blocking_inspect_body(
     let quiescence = start_outcomes
         .successful
         .iter()
-        .filter(|_| !scoped_request)
         .map(|server| {
             phase_log.start(InspectPhaseEntry::lsp(
                 InspectPhaseId::LspQuiescence,
@@ -1885,19 +1884,13 @@ fn run_blocking_inspect_body(
         &start_outcomes.successful,
         deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP),
     );
-    // Unscoped requests must settle the root before reading stored diagnostics.
-    // A scoped sweep opens its files and checks which reports describe their
-    // current content below.
-    // Waiting for workspace-wide publications before didOpen can spend the
-    // entire phase budget on a server which only analyzes opened documents.
-    let wait_outcome = if diagnostics_requested && !scoped_request {
+    // Scoped files still need the producer's workspace-load verdict: a file
+    // report cannot reveal a failed metadata load, and provisional reports must
+    // survive an indexing timeout without becoming authoritative. Keep this
+    // wait inside the shared request cap; the later scoped sweep establishes
+    // current-content authority and waits for Rust's compiler check separately.
+    let wait_outcome = if diagnostics_requested {
         wait_for_root_quiescence(ctx, &start_outcomes.successful, deadline, !scoped_request)
-    } else if diagnostics_requested {
-        Ok((
-            ctx.lsp().drain_events().accepted_snapshots,
-            false,
-            Vec::new(),
-        ))
     } else {
         Ok((Vec::new(), false, Vec::new()))
     };
