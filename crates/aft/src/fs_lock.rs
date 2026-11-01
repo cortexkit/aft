@@ -2862,6 +2862,60 @@ pub(crate) fn process_alive(_pid: u32) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "opt-in live-owner wait CPU measurement"]
+    fn measurement_live_owner_wait_cpu() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("held.lock");
+        let _owner = acquire(&path).unwrap();
+        let sleeps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _observer = observe_retry_sleeps_for_test(Arc::clone(&sleeps));
+        let cpu = || {
+            let mut time = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            assert_eq!(
+                unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
+                0
+            );
+            time.tv_sec as f64 + time.tv_nsec as f64 / 1e9
+        };
+        let cpu_started = cpu();
+        let started = Instant::now();
+        assert!(matches!(
+            try_acquire(&path, Duration::from_millis(1050)),
+            Err(AcquireError::Timeout)
+        ));
+        eprintln!(
+            "LOCK_WAIT_MEASUREMENT poll_ms={} sleeps={} wall_ms={:.3} thread_cpu_ms={:.3}",
+            POLL_INTERVAL_MS,
+            sleeps.load(Ordering::SeqCst),
+            started.elapsed().as_secs_f64() * 1000.0,
+            (cpu() - cpu_started) * 1000.0
+        );
+        assert!(sleeps.load(Ordering::SeqCst) > 0);
+    }
+
+    #[test]
+    fn live_owner_poll_sleeps_to_the_original_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("held.lock");
+        let _owner = acquire(&path).unwrap();
+        let clock = retry_clock::Guard::install(Duration::ZERO);
+        assert!(matches!(
+            try_acquire(&path, Duration::from_millis(1050)),
+            Err(AcquireError::Timeout)
+        ));
+        let (elapsed, sleeps, attempts) = clock.observations();
+        assert_eq!(elapsed, Duration::from_millis(1050));
+        assert_eq!(attempts, 11);
+        let mut expected = vec![Duration::from_millis(100); 10];
+        expected.push(Duration::from_millis(50));
+        assert_eq!(sleeps, expected);
+    }
+
     fn macos_snapshot_bytes(state: u8, flags: u32) -> [u8; 648] {
         let mut bytes = [0; 648];
         bytes[0..8].copy_from_slice(&1_700_000_000_i64.to_ne_bytes());
