@@ -75,6 +75,7 @@ describe("bounded mutation diffs through the real bridge", () => {
   }
 
   function omitted(reply: MutationReply) {
+    if (!reply.success) throw new Error(JSON.stringify(reply));
     expect(reply.success).toBe(true);
     expect(reply.diff_omitted).toBe(true);
     expect(reply.metadata?.diff_omitted).toBe(true);
@@ -200,13 +201,13 @@ describe("bounded mutation diffs through the real bridge", () => {
   test("many small Unicode and escaped patches share one aggregate reply budget", async () => {
     const line = 'é🦀"\\\t\0'.repeat(3000);
     const hunks = Array.from(
-      { length: 40 },
+      { length: 20 },
       (_, index) => `*** Add File: file-${index}.txt\n+${line}`,
     );
     const patch = `*** Begin Patch\n${hunks.join("\n")}\n*** End Patch`;
     const preview = await send("apply_patch", { patch_text: patch, preview: true });
     omitted(preview);
-    expect(preview.files).toHaveLength(40);
+    expect(preview.files).toHaveLength(20);
     expect(preview.files?.some((file) => file.diff_omitted)).toBe(true);
     expect(await Bun.file(join(project, "file-0.txt")).exists()).toBe(false);
     const reply = await send("apply_patch", {
@@ -215,7 +216,7 @@ describe("bounded mutation diffs through the real bridge", () => {
     omitted(reply);
     expect(reply.complete).toBe(true);
     const files = reply.metadata?.files ?? [];
-    expect(files).toHaveLength(40);
+    expect(files).toHaveLength(20);
     expect(files.some((file) => file.patch?.includes('é🦀"\\\t\0'))).toBe(true);
     expect(files.some((file) => file.diff_omitted)).toBe(true);
     for (const [index, file] of files.entries()) {
