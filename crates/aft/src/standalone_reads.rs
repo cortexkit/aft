@@ -5,7 +5,6 @@ use aft::executor::{Executor, ExecutorConfig, JobCancellation, Lane};
 use aft::path_identity::ProjectRootId;
 use aft::protocol::{RawRequest, Response};
 use aft::response_finalize::{DispatchOutcome, PendingResponse};
-use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -18,50 +17,9 @@ const LANE_CAP: usize = 256;
 const STANDALONE_READS_BUSY: &str =
     "Too many calls are waiting on this project; retry after some finish.";
 
-type QueryPending = (bool, Option<aft::context::CallgraphUnappliedChanges>);
-
-struct PreparedQuery {
-    context: usize,
-    command: String,
-    pending: QueryPending,
-}
-
-thread_local! {
-    static PREPARED_QUERY: RefCell<Option<PreparedQuery>> = const { RefCell::new(None) };
-}
-
-struct PreparedQueryScope(Option<PreparedQuery>);
-
-impl PreparedQueryScope {
-    fn install(prepared: PreparedQuery) -> Self {
-        Self(PREPARED_QUERY.with(|slot| slot.replace(Some(prepared))))
-    }
-}
-
-impl Drop for PreparedQueryScope {
-    fn drop(&mut self) {
-        PREPARED_QUERY.with(|slot| slot.replace(self.0.take()));
-    }
-}
-
 pub(super) fn request_command(req: &RawRequest) -> &str {
     let command = super::tool_call_name(req).unwrap_or(&req.command);
     command.strip_prefix("aft_").unwrap_or(command)
-}
-
-pub(super) fn query_pending(ctx: &AppContext, command: &str) -> QueryPending {
-    PREPARED_QUERY
-        .with(|slot| {
-            let mut slot = slot.borrow_mut();
-            if slot.as_ref().is_some_and(|prepared| {
-                prepared.context == ctx as *const AppContext as usize && prepared.command == command
-            }) {
-                slot.take().map(|prepared| prepared.pending)
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| aft::response_finalize::query_pending(ctx, command))
 }
 
 pub(super) struct StandaloneReads {
@@ -151,14 +109,10 @@ impl StandaloneReads {
         // The frame loop has just applied its bounded pre-read drains. Capture
         // pending watcher and callgraph changes before maintenance resumes:
         // even an empty watcher drain is conservatively pending while in
-        // flight. Wrapped tools consume this snapshot in their inner dispatch,
-        // not in the tool_call envelope.
-        let query_command = request_command(&req);
-        let prepared = PreparedQuery {
-            context: Arc::as_ptr(ctx) as usize,
-            command: query_command.to_owned(),
-            pending: aft::response_finalize::query_pending(ctx, query_command),
-        };
+        // flight. Wrapped tools reuse this snapshot in both the tool runner
+        // and the inner command dispatch.
+        let prepared =
+            aft::response_finalize::QueryPendingSnapshot::capture(ctx, request_command(&req));
         #[cfg(test)]
         let probe = self.probe.clone();
         self.executor.submit_tool_call_with_completion(
@@ -173,7 +127,7 @@ impl StandaloneReads {
                 let _publication = aft::executor::install_standalone_scope(worker_ctx);
                 let _ask_route = ask_route.install();
                 let _config = ctx.pin_config_to(config);
-                let _prepared = PreparedQueryScope::install(prepared);
+                let _prepared = prepared.install();
                 if expired(deadline) {
                     return deadline_response(&req.id);
                 }
