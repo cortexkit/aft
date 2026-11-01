@@ -7715,10 +7715,7 @@ fn import_legacy_set_into_v3(
     keep_going: crate::migration::v3_ledger::ImportControl,
 ) -> bool {
     let (storage, key) = (&config.storage.artifacts, &config.family);
-    if !crate::root_cache::ArtifactAccess::for_root(&config.root)
-        .allows_write(key, &storage.join("blobs/v3").join(key))
-        || !crate::migration::per_checkout::has_importable_legacy_artifact(storage, key)
-    {
+    if !crate::migration::per_checkout::has_importable_legacy_artifact(storage, key) {
         return true;
     }
     if !keep_going() {
