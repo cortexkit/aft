@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "language": "luau",
+  "extensions": ["luau"],
+  "grammar": {
+    "repository": "https://github.com/4teapo/tree-sitter-luau",
+    "commit": "4f09f79945de3d5575b079103d86a515030c62ab",
+    "abi": 15,
+    "license": "MIT",
+    "files": {
+      "LICENSE": "16df13e14fa2123910ca156d6c1c32c32d7284f907a5521aaac2047ceb4e060f",
+      "src/parser.c": "227e1425e1893b181bf6349ba9cb20c5ee81ecfd74fef51055528e98b5e42954",
+      "src/scanner.c": "a157bb5210454add058a08ce53eabcccad41aab6dac7006def2554e5cfebd376",
+      "src/tree_sitter/alloc.h": "b29c1c9fb7cc82f58c84b376df1297d6e2737a1d655fd356db0859e3c29c2fea",
+      "src/tree_sitter/array.h": "5bdf6ed1a78e3409fd443e085ca967a64c188a5d082aaf7f819bccd53a471c94",
+      "src/tree_sitter/parser.h": "11b654fbba7770b1c710cc14b169be2deb5d89c0f87233d4605037c26c1ff657"
+    }
+  },
+  "wasi_sdk": {
+    "release": "wasi-sdk-34",
+    "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz",
+    "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4",
+    "root": "wasi-sdk-34.0-x86_64-linux"
+  },
+  "build": {
+    "flags": ["-fPIC", "-shared", "-Os", "-Wl,--export=tree_sitter_luau", "-Wl,--max-memory=4294967296"],
+    "include": "src",
+    "sources": ["src/parser.c", "src/scanner.c"]
+  },
+  "verifier": {
+    "release": "v0.27.1",
+    "url": "https://github.com/tree-sitter/tree-sitter/releases/download/v0.27.1/tree-sitter-linux-x64.gz",
+    "sha256": "d01042f94ba3d6827ddc9788e235f75d8366431be42bdf90ade534d960c98b7d"
+  },
+  "zed": {
+    "extension_repository": "https://github.com/4teapo/zed-luau",
+    "extension_commit": "8074b0b860301957f131957f0c09fc49071adf13",
+    "extension_version": "0.3.8",
+    "url": "https://api.zed.dev/extensions/luau/0.3.8/download",
+    "sha256": "ff48ac3439f0aa8d527176f902187a87360b67c78cedcbb3ee5b0ea5480e07e7",
+    "grammar_member": "./grammars/luau.wasm",
+    "grammar_sha256": "d645c6193255faa2a93060ed14920ea63308f946dbc8bc66ae6731c69bf33fbc",
+    "comparison": "parse_trees",
+    "exemption": "Ufuk approved fixed-corpus parse-tree equality because Zed's released archive does not attest its compiler release or flags. No matching-toolchain byte-identity claim is made."
+  },
+  "publication": {"repository": "cortexkit/aft", "tag": "grammars-1"},
+  "provenance_notes": [
+    "Ufuk approved this grammar revision, official wasi-sdk 34 archive checksum, two-C-file build and Zed parse-tree exemption. Zed does not publish its compiler release and flags, so CI requires identical fixed-corpus parse trees rather than claiming byte identity with Zed.",
+    "Source revision and build flags follow the frozen wasm-grammars benchmark at AFT 42d0ddeff357b73b2b10254cf309a1f98ae3217c; the release archive's extension.toml independently names the same grammar revision.",
+    "The verifier is a checksum-pinned prebuilt official tree-sitter CLI. Neither it nor the compiler is built from source in this job; no extension code, build.rs or package-manager hooks execute."
+  ]
+}

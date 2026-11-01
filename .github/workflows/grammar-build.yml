@@ -1,0 +1,59 @@
+name: Grammar build
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/grammar-build.yml
+      - grammars/**
+      - crates/aft/tests/fixtures/grammars/**
+  push:
+    branches: [main]
+    paths: [grammars/luau.pin.json]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Test build and immutable publication controls
+        run: |
+          python3 --version
+          python3 -m unittest discover -s grammars -p 'test_*.py' -v
+      - name: Compile twice and verify fixtures and Zed parse trees
+        run: python3 grammars/build.py --output target/grammar-build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-luau-grammar
+          path: target/grammar-build/artifacts/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    # Dispatches on unreviewed branches can verify, but cannot publish.
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    concurrency:
+      group: grammar-publish
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-luau-grammar
+          path: target/grammar-build/artifacts/
+      - name: Upload missing hash or verify existing bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 grammars/publish.py --artifacts target/grammar-build/artifacts
