@@ -254,6 +254,104 @@ fn query_context(root: &Path, storage: &Path) -> AppContext {
 }
 
 #[test]
+fn views_import_building_retries_callgraph_without_load_failures_then_answers() {
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let (_checkout, storage, root) = warm_fixture();
+    let ctx = query_context(&root, storage.path());
+    let mut config = (*ctx.config()).clone();
+    config.indexes.callgraph = true;
+    ctx.set_config(config);
+    ctx.mark_subc_bound();
+    let family = ctx.memoized_artifact_cache_key(&root);
+    crate::root_cache::configure_artifact_access(&root, &family, false);
+    let destination = storage.path().join("index").join(&family);
+    std::fs::create_dir_all(&destination).unwrap();
+    std::fs::copy(
+        storage.path().join("index").join(KEY).join("cache.bin"),
+        destination.join("cache.bin"),
+    )
+    .unwrap();
+    ctx.isolate_cold_build_limiter_for_test(1);
+    let slot = ctx.take_cold_build_slot_for_test().unwrap();
+
+    let error = ctx.callgraph_view_reader().unwrap().unwrap_err();
+    assert_eq!(error.reason, "legacy text and symbol import building");
+    assert!(error.busy, "{error}");
+    let request = |command: &str, params| RawRequest {
+        id: format!("import-building-{command}"),
+        command: command.into(),
+        lsp_hints: None,
+        session_id: None,
+        params,
+    };
+    let callers_request = request(
+        "callers",
+        serde_json::json!({"file": root.join("lib.rs"), "symbol": "beta"}),
+    );
+    let callers = crate::commands::callers::handle_callers(&callers_request, &ctx);
+    assert!(!callers.success, "{:?}", callers.data);
+    assert_eq!(callers.data["code"], "callgraph_building");
+    let zoom_request = request(
+        "zoom",
+        serde_json::json!({"file": root.join("lib.rs"), "symbol": "alpha", "callgraph": true}),
+    );
+    let zoom = crate::commands::zoom::handle_zoom(&zoom_request, &ctx);
+    assert!(zoom.success, "{:?}", zoom.data);
+    assert_eq!(zoom.data["callgraph"]["code"], "callgraph_building");
+    let inspect = crate::commands::inspect::handle_inspect(
+        &request(
+            "inspect",
+            serde_json::json!({"scope": root, "sections": ["dead_code", "unused_exports"]}),
+        ),
+        &ctx,
+    );
+    assert!(inspect.success, "{:?}", inspect.data);
+    assert_eq!(inspect.data["complete"], false, "{:?}", inspect.data);
+    assert!(
+        inspect.data.to_string().contains("callgraph_building"),
+        "{:?}",
+        inspect.data
+    );
+    for response in [&callers, &zoom, &inspect] {
+        assert!(!response.data.to_string().contains("This is an AFT bug"));
+    }
+    let health = ctx.try_health_snapshot(&root);
+    assert!(health.view_load_failures.is_empty(), "{health:?}");
+    assert!(health.view_load_failure_last.is_none(), "{health:?}");
+    assert!(!ctx
+        .degraded_reasons()
+        .contains(&crate::context::VIEW_LOAD_DEGRADED_REASON.to_string()));
+
+    drop(slot);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        ctx.view_load_retry_due_for_test();
+        let response = crate::commands::callers::handle_callers(&callers_request, &ctx);
+        if response.success {
+            assert!(
+                response.data.to_string().contains("alpha"),
+                "{:?}",
+                response.data
+            );
+            break;
+        }
+        assert_eq!(
+            response.data["code"], "callgraph_building",
+            "{:?}",
+            response.data
+        );
+        assert!(Instant::now() < deadline, "legacy import did not finish");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let zoom = crate::commands::zoom::handle_zoom(&zoom_request, &ctx);
+    assert!(zoom.success, "{:?}", zoom.data);
+    assert!(zoom.data.get("callgraph").is_none(), "{:?}", zoom.data);
+    let health = ctx.try_health_snapshot(&root);
+    assert!(health.view_load_failures.is_empty(), "{health:?}");
+    assert!(health.view_load_failure_last.is_none(), "{health:?}");
+}
+
+#[test]
 fn views_import_building_serves_lexical_results_without_load_failures() {
     let _serial = crate::blob_store::v3::serial_for_test();
     let (_checkout, storage, root) = warm_fixture();

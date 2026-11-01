@@ -1057,6 +1057,7 @@ mod tests {
     #[test]
     fn planned_callgraph_load_states_use_bounded_backoff_then_reset() {
         for reason in [
+            "legacy text and symbol import building",
             "callgraph view has unverified writes (pending=[RelPath([97, 46, 116, 115])], watcher=Healthy, unpublished=[])",
             "view loader [driver]: checkout changed before snapshot installation: v3 worker publication failed or may have landed; revalidate: base unavailable",
         ] {
