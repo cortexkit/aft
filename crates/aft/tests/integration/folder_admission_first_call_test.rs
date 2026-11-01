@@ -3,10 +3,11 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-fn configure(root: &Path, storage: &Path, id: &str) -> Value {
+fn configure(root: &Path, storage: &Path, id: &str, full_validation: bool) -> Value {
     json!({"id":id,"command":"configure","harness":"opencode",
         "project_root":root,"storage_dir":storage,
         "config":user_config(json!({"views":{"enabled":false},
+            "validate_on_edit": if full_validation { "full" } else { "off" },
             "indexes":{"trigram":false,"semantic":false,"callgraph":false}}))})
 }
 
@@ -26,7 +27,9 @@ fn response(aft: &mut AftProcess, id: &str) -> Value {
     }
 }
 
-fn call_while_probe_is_held(project_evidence: bool) -> Value {
+// These cases use the production wall-clock budget, so their child startups
+// are serialized instead of competing for that budget with each other.
+fn call_while_probe_is_held(project_evidence: bool, full_validation: bool) -> Value {
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path().join("project");
     std::fs::create_dir(&project).unwrap();
@@ -48,8 +51,22 @@ fn call_while_probe_is_held(project_evidence: bool) -> Value {
         ("AFT_TEST_ADMISSION_TRACE", "1".as_ref()),
     ]);
     // Both frames are queued before configure's post-ACK maintenance can run.
-    aft.send_silent(&configure(&project, &dir.path().join("storage"), "bind").to_string());
-    aft.send_silent(&search("first-tool").to_string());
+    aft.send_silent(
+        &configure(
+            &project,
+            &dir.path().join("storage"),
+            "bind",
+            full_validation,
+        )
+        .to_string(),
+    );
+    let first_tool = if full_validation {
+        json!({"id":"first-tool", "command":"tool_call", "name":"write",
+            "arguments":{"path":"first.txt", "content":"admitted\n"}})
+    } else {
+        search("first-tool")
+    };
+    aft.send_silent(&first_tool.to_string());
     let ack = response(&mut aft, "bind");
     assert_eq!(ack["success"], true, "{ack}");
     assert_eq!(ack["folder"]["state"], "pending", "{ack}");
@@ -77,16 +94,18 @@ fn call_while_probe_is_held(project_evidence: bool) -> Value {
 }
 
 #[test]
+#[serial_test::serial(folder_admission_timing)]
 fn tool_from_same_burst_waits_for_pending_admission() {
-    let tool = call_while_probe_is_held(true);
+    let tool = call_while_probe_is_held(true, false);
     assert_eq!(tool["success"], true, "{tool}");
     assert_ne!(tool["code"], "folder_not_admitted", "{tool}");
     assert!(tool["text"].as_str().unwrap().contains("callee"), "{tool}");
 }
 
 #[test]
+#[serial_test::serial(folder_admission_timing)]
 fn tool_from_same_burst_waits_for_negative_decision_and_gets_approved_refusal() {
-    let tool = call_while_probe_is_held(false);
+    let tool = call_while_probe_is_held(false, false);
     assert_eq!(tool["success"], false, "{tool}");
     assert_eq!(tool["code"], "folder_not_admitted", "{tool}");
     assert_eq!(tool["reason"], "no_project_evidence", "{tool}");
@@ -98,6 +117,15 @@ fn tool_from_same_burst_waits_for_negative_decision_and_gets_approved_refusal() 
 }
 
 #[test]
+#[serial_test::serial(folder_admission_timing)]
+fn full_validation_call_does_not_starve_its_admission_replay() {
+    let tool = call_while_probe_is_held(true, true);
+    assert_eq!(tool["success"], true, "{tool}");
+    assert_ne!(tool["code"], "folder_not_admitted", "{tool}");
+}
+
+#[test]
+#[serial_test::serial(folder_admission_timing)]
 fn timed_out_admission_is_incomplete_and_next_connect_rechecks() {
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path().join("project");
@@ -111,7 +139,7 @@ fn timed_out_admission_is_incomplete_and_next_connect_rechecks() {
         ("AFT_TEST_STANDALONE_INITIAL_REQUEST_COUNT", "2".as_ref()),
         ("AFT_TEST_ADMISSION_DELAY_FILE", delay.as_os_str()),
     ]);
-    aft.send_silent(&configure(&project, &storage, "slow-bind").to_string());
+    aft.send_silent(&configure(&project, &storage, "slow-bind", false).to_string());
     aft.send_silent(&search("slow-tool").to_string());
     assert_eq!(response(&mut aft, "slow-bind")["success"], true);
     let refused = response(&mut aft, "slow-tool");
@@ -140,7 +168,7 @@ fn timed_out_admission_is_incomplete_and_next_connect_rechecks() {
     );
     assert_eq!(status["folder"]["coverage"]["complete"], false);
     std::fs::write(&delay, "0").unwrap();
-    aft.send_silent(&configure(&project, &storage, "fast-bind").to_string());
+    aft.send_silent(&configure(&project, &storage, "fast-bind", false).to_string());
     aft.send_silent(&search("fast-tool").to_string());
     assert_eq!(response(&mut aft, "fast-bind")["success"], true);
     let tool = response(&mut aft, "fast-tool");

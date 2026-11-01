@@ -732,9 +732,14 @@ fn main() {
                     continue;
                 }
                 LoopInput::Timeout if gated => {
-                    // Runtime drains stay paused while the edit finishes,
-                    // exactly as they were while an edit ran inline; only the
-                    // edit's own deferred response is polled.
+                    // Folder admission must finish before validation. Advance the
+                    // configure work needed to apply that decision, but pause
+                    // other runtime drains until the edit finishes.
+                    if aft::folder_admission_runtime::waiting(registry.current()) {
+                        configure_maintenance.drain_prefix(registry.current());
+                    }
+                    // Once validation starts, only the edit's own deferred
+                    // response is polled, as when the edit ran inline.
                     if let Err(e) = write_ready_pending(registry.current(), &mut pending) {
                         aft::slog_error!("stdout write error: {}", e);
                         break;
@@ -742,6 +747,9 @@ fn main() {
                     continue;
                 }
                 LoopInput::Disconnected if gated => {
+                    if aft::folder_admission_runtime::waiting(registry.current()) {
+                        configure_maintenance.drain_prefix(registry.current());
+                    }
                     // Stdin closed with requests still held behind the edit:
                     // finish the edit and replay them before shutting down.
                     let _ = deferred_wake_rx.recv_timeout(VALIDATION_GATE_POLL_INTERVAL);
