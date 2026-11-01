@@ -247,7 +247,10 @@ pub fn lookup(
     content: ContentHash,
     path: &Path,
 ) -> Result<Option<Arc<Vec<Symbol>>>, String> {
-    let Some(language) = language_of(path) else {
+    let Some(language) =
+        crate::parser::language_for_content_hash(path, blake3::Hash::from(*content.as_bytes()))
+            .map(language_id)
+    else {
         return Ok(None);
     };
     let producer = SymbolProducer::current();

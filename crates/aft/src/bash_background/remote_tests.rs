@@ -368,12 +368,48 @@ fn remote_launch_log_captures() -> &'static Mutex<HashMap<PathBuf, RemoteLaunchL
 
 pub(super) fn capture_remote_launch_logs<R>(task: &BgTask, run: impl FnOnce() -> R) -> R {
     let root = task.state.lock().unwrap().metadata.project_root.clone();
+    // Metadata retains the caller's spelling, but capture keys are canonical.
+    // macOS temporary roots can name the same directory through /var or /private/var.
+    let root = root.as_deref().map(canonicalized_path);
     let capture = root.and_then(|root| remote_launch_log_captures().lock().unwrap().remove(&root));
     if let Some(capture) = capture {
         crate::logging::capture_log_lines_into(capture, run)
     } else {
         run()
     }
+}
+
+#[test]
+fn runon_restart_reattach_log_capture_matches_symlinked_project_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir(&project).unwrap();
+    let alias = dir.path().join("project-alias");
+    std::os::unix::fs::symlink(&project, &alias).unwrap();
+    let (registry, task_id, _) = persist_accepted_with_snapshot(
+        &alias,
+        dir.path().join("unused-connection"),
+        "printf capture-proof",
+    );
+    let task = registry.task(&task_id).unwrap();
+    assert_ne!(
+        task.state.lock().unwrap().metadata.project_root.as_deref(),
+        Some(project.canonicalize().unwrap().as_path()),
+    );
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    remote_launch_log_captures()
+        .lock()
+        .unwrap()
+        .insert(project.canonicalize().unwrap(), capture.clone());
+    capture_remote_launch_logs(&task, || {
+        crate::slog_info!("runon: aliased-root capture proof")
+    });
+    let lines = capture.lock().unwrap();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains("runon: aliased-root capture proof"),
+        "{lines:?}"
+    );
 }
 
 fn exited_remote_workers() -> &'static Mutex<HashSet<String>> {
@@ -404,13 +440,29 @@ fn remote_worker_counts() -> &'static Mutex<HashMap<String, (usize, usize)>> {
 }
 
 /// Called as a remote worker thread for `task` is about to be spawned.
-pub(super) fn note_remote_worker_start(task: &str) {
+pub(super) fn note_remote_worker_start(task: &BgTask) {
+    cancellation_at_worker_start().lock().unwrap().insert(
+        task.task_id.clone(),
+        task.state
+            .lock()
+            .unwrap()
+            .metadata
+            .remote
+            .as_ref()
+            .is_some_and(|remote| remote.cancel_requested),
+    );
     remote_worker_counts()
         .lock()
         .unwrap()
-        .entry(task.to_owned())
+        .entry(task.task_id.clone())
         .or_default()
         .0 += 1;
+}
+
+fn cancellation_at_worker_start() -> &'static Mutex<HashMap<String, bool>> {
+    static CANCELLATIONS: std::sync::OnceLock<Mutex<HashMap<String, bool>>> =
+        std::sync::OnceLock::new();
+    CANCELLATIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// How many remote workers were started for `task`, and how many stopped.
@@ -3596,6 +3648,419 @@ async fn exec_remote_bash_deadline_is_not_cancel() {
 #[tokio::test]
 async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps() {
     restart_uses_persisted_seq_without_duplicates_or_gaps(false).await;
+}
+
+fn runon_restart_context(project: &Path, storage: &Path) -> Arc<crate::context::AppContext> {
+    Arc::new(crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            project_root: Some(project.into()),
+            storage_dir: Some(storage.into()),
+            harness: Some(crate::harness::Harness::Runner),
+            experimental_bash_background: true,
+            ..Default::default()
+        },
+    ))
+}
+
+fn runon_restart_principal(project: &Path) -> crate::sandbox_spawn::AuthenticatedPrincipal {
+    crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind {
+        trust: crate::sandbox_spawn::PrincipalTrust::FirstParty,
+        route_channel: 41,
+        route_epoch: 1,
+        project_root: project.into(),
+        harness: "runner".into(),
+        session_id: "session".into(),
+        principal_id: Some("reserved:broca".into()),
+    }
+}
+
+#[tokio::test]
+async fn runon_restart_reattach_drain_child() {
+    let Some(root) = std::env::var_os("AFT_RUNON_RESTART_FIXTURE") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let project = root.join("project");
+    let ctx = runon_restart_context(&project, &root.join("storage"));
+    ctx.bash_background()
+        .set_harness(crate::harness::Harness::Runner);
+    let storage = crate::bash_background::task_storage_dir(&ctx);
+    let mut launch = launch(PathBuf::from(
+        std::env::var_os("AFT_RUNON_RESTART_CONNECTION").unwrap(),
+    ));
+    launch.explicit_runon = true;
+    launch.harness = "runner".into();
+    let task_id = super::super::with_scope_spawn(Some(owner_scope("restart-worker")), || {
+        ctx.bash_background()
+            .spawn_remote(
+                launch,
+                SpawnPlan::Unsandboxed,
+                "printf remote-restart-proof",
+                resolve_posix_shell(),
+                "session".into(),
+                project.clone(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(60)),
+                None,
+                storage,
+                crate::bash_background::TaskSlot::Background { max: 10 },
+                true,
+                false,
+                Some(project.clone()),
+            )
+            .unwrap()
+    });
+    wait_for(
+        "the remote job must be accepted and started before drain",
+        || {
+            let task = ctx.bash_background().task(&task_id).unwrap();
+            let state = task.state.lock().unwrap();
+            state.metadata.remote.as_ref().and_then(|remote| {
+                (remote.accepted
+                    && remote.started.is_some()
+                    && remote.last_seq == Some(0)
+                    && remote.submission.is_some())
+                .then_some(())
+            })
+        },
+    )
+    .await;
+    // Module drain detaches, not cancels, accepted jobs. Exiting this child
+    // also removes its worker threads and in-memory task ownership, so the
+    // replacement must recover from disk rather than share the old task.
+    ctx.bash_background().detach();
+    fs::write(root.join("task-id"), task_id).unwrap();
+}
+
+async fn runon_restart_first_watch_reattaches(
+    watch_before_replay: bool,
+    relaxed_lookup: Option<bool>,
+    auth_refusals: u32,
+    lost: bool,
+) {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+        Script::RestartRunning {
+            auth_refusals,
+            lost,
+        },
+        &["exec-remote/v1", "exec-remote-submission-key/v1"],
+        2,
+    )
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    fs::create_dir(&project).unwrap();
+    ensure_git_fixture(&project);
+    let fixture_root = root.path().to_path_buf();
+    let connection = daemon.connection.clone();
+    let child = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "bash_background::registry::remote::tests::runon_restart_reattach_drain_child",
+                "--nocapture",
+            ])
+            .env("AFT_RUNON_RESTART_FIXTURE", fixture_root)
+            .env("AFT_RUNON_RESTART_CONNECTION", connection)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(child.status.success(), "{child:?}");
+    let task_id = fs::read_to_string(root.path().join("task-id")).unwrap();
+    let ctx = runon_restart_context(&project, &root.path().join("storage"));
+    ctx.bash_background()
+        .set_harness(crate::harness::Harness::Runner);
+    let storage = crate::bash_background::task_storage_dir(&ctx);
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    remote_launch_log_captures()
+        .lock()
+        .unwrap()
+        .insert(project.canonicalize().unwrap(), capture.clone());
+    let saved = resolve_task_layout(&session_tasks_dir(&storage, "session"), &task_id).unwrap();
+    let saved = read_task_at(&saved).unwrap();
+    assert!(saved.scope.is_some());
+    assert!(!saved.remote.unwrap().submission.unwrap().reattached);
+    if let Some(database) = relaxed_lookup {
+        if database {
+            let db = Arc::new(Mutex::new(
+                crate::db::open(&root.path().join("aft.db")).unwrap(),
+            ));
+            ctx.bash_background().set_db_pool(db);
+            let resolved =
+                resolve_task_layout(&session_tasks_dir(&storage, "session"), &task_id).unwrap();
+            let mut old = read_task_at(&resolved).unwrap();
+            // The remote stream checkpoint on disk may be newer than its row.
+            old.remote.as_mut().unwrap().last_seq = None;
+            old.remote.as_mut().unwrap().started = None;
+            ctx.bash_background().dual_write_task(&resolved.paths, &old);
+        }
+        assert!(ctx
+            .bash_background()
+            .status_relaxed(
+                &task_id,
+                "foreign-session",
+                &project,
+                &storage,
+                0,
+                false,
+                Duration::ZERO,
+            )
+            .is_none());
+        assert!(ctx
+            .bash_background()
+            .kill_relaxed(&task_id, &project, &storage)
+            .is_err());
+        assert!(!ctx.bash_background().holds_task(&task_id));
+        assert_eq!(remote_workers(&task_id), (0, 0));
+        let snapshot = ctx.bash_background().status_relaxed(
+            &task_id,
+            "session",
+            &project,
+            &storage,
+            0,
+            false,
+            Duration::ZERO,
+        );
+        assert!(snapshot.is_some(), "relaxed lookup must find the saved job");
+    }
+    let executor = crate::executor::Executor::new();
+    let root_id = crate::path_identity::ProjectRootId::from_path(&project).unwrap();
+    assert!(executor.register_actor(root_id.clone(), ctx.clone()));
+    let bind_request = serde_json::from_value::<crate::protocol::RawRequest>(serde_json::json!({
+        "id": "subc-bind-restart-runner",
+        "command": "configure",
+        "project_root": project,
+        "storage_dir": root.path().join("storage"),
+        "harness": "runner",
+        "session_id": "session",
+        "config": [{
+            "tier": "user", "source": "/u/aft.jsonc",
+            "doc": "{\"indexes\":{\"semantic\":false,\"trigram\":false,\"callgraph\":false}}"
+        }],
+    }))
+    .unwrap();
+    let principal = runon_restart_principal(&project);
+    let bound = executor
+        .submit_bind_cancellable_async(
+            root_id,
+            bind_request.id.clone(),
+            Arc::new(move |ctx| {
+                crate::sandbox_spawn::with_authenticated_principal(principal.clone(), || {
+                    crate::commands::configure::handle_configure(&bind_request, ctx)
+                })
+            }),
+        )
+        .0
+        .await
+        .unwrap();
+    assert!(bound.success, "{bound:?}");
+    let mut gate = watch_before_replay.then(|| {
+        crate::commands::configure::gate_configure_tail_stage_for_test(
+            ctx.canonical_cache_root(),
+            "replay_claimed",
+        )
+    });
+    let tail_ctx = ctx.clone();
+    let mut tail = tokio::task::spawn_blocking(move || {
+        crate::commands::configure::drain_deferred_configure_maintenance(&tail_ctx);
+    });
+    if let Some((_, reached, _)) = &gate {
+        let reached = reached.clone();
+        tokio::task::spawn_blocking(move || reached.recv_timeout(Duration::from_secs(30)).unwrap())
+            .await
+            .unwrap();
+    } else {
+        // The session bind's real configure tail, not a direct registry replay,
+        // must restore the job before this order's first watch is dispatched.
+        (&mut tail).await.unwrap();
+    }
+    let request = serde_json::from_value(serde_json::json!({
+        "id": "first-watch-after-drain",
+        "command": "bash_watch",
+        "session_id": "session",
+        "worker_session": true,
+        "task_id": task_id,
+        "timeout_ms": 30_000,
+    }))
+    .unwrap();
+    let outcome = crate::sandbox_spawn::with_authenticated_principal(
+        runon_restart_principal(&project),
+        || crate::commands::bash_watch::handle_deferred(&request, ctx.clone()),
+    );
+    daemon
+        .wait_for_requests("exec.attach", auth_refusals as usize + 1)
+        .await;
+    if let Some((guard, _, release)) = gate.take() {
+        drop(guard);
+        release.send(()).unwrap();
+        tail.await.unwrap();
+    }
+    let response = match outcome {
+        crate::response_finalize::DispatchOutcome::Immediate(response) => response,
+        crate::response_finalize::DispatchOutcome::Deferred(mut pending) => {
+            wait_for("the first watch must return the recovered result", || {
+                (pending.poll)(&ctx)
+            })
+            .await
+        }
+    };
+    if lost {
+        assert_eq!(response.data["status"], "fate_unknown", "{response:?}");
+    } else {
+        assert_eq!(response.data["status"], "completed", "{response:?}");
+        assert_eq!(response.data["exit_code"], 0, "{response:?}");
+        assert!(
+            response.data["output"]
+                .as_str()
+                .unwrap()
+                .contains("remote-restart-proof"),
+            "{response:?}"
+        );
+    }
+    assert_eq!(response.data["waited"]["reason"], "exited", "{response:?}");
+    remote_worker_exited(&task_id).await;
+    assert_eq!(remote_workers(&task_id), (1, 1));
+    let task = ctx.bash_background().task(&task_id).unwrap();
+    let completed = read_task(&task.paths.json).unwrap();
+    if lost {
+        assert!(completed
+            .status_reason
+            .as_deref()
+            .unwrap()
+            .contains("remote outcome unknown"));
+    }
+    assert!(completed.remote.unwrap().submission.unwrap().reattached);
+    let lines = capture.lock().unwrap();
+    let warnings: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("runon: remote attach failed "))
+        .collect();
+    assert_eq!(warnings.len(), auth_refusals as usize, "{lines:?}");
+    for (index, warning) in warnings.iter().enumerate() {
+        assert!(
+            warning.contains(&format!("task_id={task_id} job_id={}", id())),
+            "{warning}"
+        );
+        assert!(
+            warning.contains(&format!(
+                "attempt={} next_backoff_ms={}",
+                index + 1,
+                100 << index
+            )),
+            "{warning}"
+        );
+        assert!(warning.contains("auth"), "{warning}");
+    }
+    let successes: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("runon: remote attach succeeded "))
+        .collect();
+    assert_eq!(successes.len(), 1, "{lines:?}");
+    assert!(
+        successes[0].contains(&format!(
+            "task_id={task_id} job_id={} attempt={}",
+            id(),
+            auth_refusals + 1
+        )),
+        "{successes:?}"
+    );
+    let log = daemon.log.lock().unwrap();
+    let attaches: Vec<_> = log
+        .iter()
+        .filter(|(_, body)| body["method"] == "exec.attach")
+        .collect();
+    assert_eq!(attaches.len(), auth_refusals as usize + 1);
+    for (_, attach) in attaches {
+        assert_eq!(attach["params"]["job_id"], id().to_string());
+        assert_eq!(attach["params"]["from_seq"], 1);
+    }
+    assert_eq!(
+        log.iter()
+            .filter(|(_, body)| body["method"] == "exec.run")
+            .count(),
+        1
+    );
+    assert!(!log.iter().any(|(_, body)| body["method"] == "exec.cancel"));
+}
+
+#[tokio::test]
+async fn runon_restart_reattach_first_watch_before_replay() {
+    runon_restart_first_watch_reattaches(true, None, 0, false).await;
+}
+
+#[tokio::test]
+async fn runon_restart_reattach_first_watch_after_replay() {
+    runon_restart_first_watch_reattaches(false, None, 0, false).await;
+}
+
+#[tokio::test]
+async fn runon_restart_reattach_relaxed_lookup_before_first_watch() {
+    for database in [false, true] {
+        runon_restart_first_watch_reattaches(true, Some(database), 0, false).await;
+    }
+}
+
+#[tokio::test]
+async fn runon_restart_reattach_relaxed_lookup_before_replay() {
+    for database in [false, true] {
+        runon_restart_first_watch_reattaches(false, Some(database), 0, false).await;
+    }
+}
+
+#[tokio::test]
+async fn runon_restart_reattach_logs_each_auth_refusal_then_success() {
+    runon_restart_first_watch_reattaches(true, None, 2, false).await;
+}
+
+#[tokio::test]
+async fn runon_restart_reattach_unknown_job_ends_the_first_watch() {
+    runon_restart_first_watch_reattaches(true, None, 0, true).await;
+}
+
+#[tokio::test]
+async fn runon_restart_reattach_relaxed_kill_records_stop_before_recovery() {
+    let daemon = daemon(Script::Cancel, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (original, task_id, paths) = persist_accepted_with_snapshot(
+        dir.path(),
+        daemon.connection.clone(),
+        "printf must-not-run",
+    );
+    let mut metadata = read_task(&paths.json).unwrap();
+    metadata.remote.as_mut().unwrap().terminal = Some(TerminalRecord::new(
+        id(),
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::Unreachable,
+        },
+        1,
+        0,
+        0,
+    ));
+    write_task(&paths.json, &metadata).unwrap();
+    original.detach();
+    let restarted = registry();
+    let kill_id = task_id.clone();
+    let root = dir.path().to_path_buf();
+    let killer = restarted.clone();
+    let stopped =
+        tokio::task::spawn_blocking(move || killer.kill_relaxed(&kill_id, &root, &root).unwrap())
+            .await
+            .unwrap();
+    assert!(stopped.info.status.is_terminal(), "{stopped:?}");
+    remote_worker_exited(&task_id).await;
+    // A saved refusal can permit a local fallback. Its worker must already
+    // see a durable stop when it starts, so it can settle without launching.
+    assert_eq!(remote_workers(&task_id), (1, 1));
+    assert_eq!(
+        cancellation_at_worker_start().lock().unwrap().get(&task_id),
+        Some(&true)
+    );
+    let saved = read_task(&paths.json).unwrap();
+    assert!(!saved.local_fallback_started);
+    assert!(saved.remote.unwrap().cancel_requested);
 }
 
 #[tokio::test]

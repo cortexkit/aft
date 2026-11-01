@@ -227,23 +227,51 @@ fn refusal_code(error: &CallError) -> Option<String> {
         .or_else(|| error.route_open_refusal().map(|body| body.code.clone()))
 }
 
-/// The reply's raw text with its request id, `subc-<channel>-<corr>`, replaced
-/// by a placeholder. The id must name this route's channel; every other byte
-/// is compared as sent.
-fn without_request_id(reply: &[u8], route: &RouteHandle) -> String {
+/// Compare model-only replies as sent. Plugin replies additionally carry an
+/// internal request id; normalize only that id, checking its route channel.
+fn without_request_id(reply: &[u8], channel: u16) -> String {
     let text = String::from_utf8(reply.to_vec()).expect("reply is UTF-8");
-    let id = serde_json::from_str::<Value>(&text).unwrap()["structuredContent"]["id"]
+    let body: Value = serde_json::from_str(&text).unwrap();
+    assert!(body["content"].is_array(), "{text}");
+    assert!(body["isError"].is_boolean(), "{text}");
+    let Some(structured) = body.get("structuredContent") else {
+        return text;
+    };
+    let id = structured["id"]
         .as_str()
-        .expect("reply carries a request id")
+        .expect("plugin reply carries a request id")
         .to_string();
     assert!(
-        id.starts_with(&format!("subc-{}-", route.channel)),
-        "{id} names route channel {}",
-        route.channel
+        id.starts_with(&format!("subc-{channel}-")),
+        "{id} names route channel {channel}",
     );
     let quoted = format!("\"{id}\"");
     assert_eq!(text.matches(&quoted).count(), 1, "{text}");
     text.replace(&quoted, "\"<request-id>\"")
+}
+
+#[test]
+fn legacy_reply_comparison_preserves_model_only_bytes() {
+    let reply = br#"{ "content":[{"type":"text","text":"seed.txt"}], "isError":false }"#;
+    assert_eq!(without_request_id(reply, 7).as_bytes(), reply);
+}
+
+#[test]
+fn legacy_reply_comparison_normalizes_only_the_plugin_request_id() {
+    let reply = br#"{"content":[{"type":"text","text":"seed.txt"}],"isError":false,"structuredContent":{"id":"subc-7-42","success":true,"text":"seed.txt"}}"#;
+    assert_eq!(
+        without_request_id(reply, 7),
+        r#"{"content":[{"type":"text","text":"seed.txt"}],"isError":false,"structuredContent":{"id":"<request-id>","success":true,"text":"seed.txt"}}"#
+    );
+}
+
+#[test]
+#[should_panic(expected = "names route channel")]
+fn legacy_reply_comparison_rejects_a_plugin_id_from_another_route() {
+    without_request_id(
+        br#"{"content":[],"isError":false,"structuredContent":{"id":"subc-8-42"}}"#,
+        7,
+    );
 }
 
 #[tokio::test]
@@ -362,8 +390,8 @@ async fn tool_provider_subc_e2e_role_versions_select_v1_and_leave_legacy_routes_
         .await
         .expect("glob on the other-role route");
     assert_eq!(
-        without_request_id(&legacy_bytes, &legacy),
-        without_request_id(&other_role_bytes, &other_role)
+        without_request_id(&legacy_bytes, legacy.channel),
+        without_request_id(&other_role_bytes, other_role.channel)
     );
     assert!(String::from_utf8_lossy(&legacy_bytes).contains("seed.txt"));
 

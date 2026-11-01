@@ -1863,6 +1863,12 @@ pub(crate) struct WatcherCountersSnapshot {
     pub(crate) paths_after_gitignore_since_last_rescan: u64,
     pub(crate) paths_dispatched_total: u64,
     pub(crate) paths_dispatched_since_last_rescan: u64,
+    /// Shared arrival recovery on every platform. Linux also registers new
+    /// watches and reports files found there before acknowledging watcher cookies.
+    pub(crate) directory_arrivals_total: u64,
+    pub(crate) directory_subtree_walks_total: u64,
+    pub(crate) directory_empty_total: u64,
+    pub(crate) directory_walk_fallbacks_total: u64,
     pub(crate) overflows_total: u64,
     pub(crate) watch_lost_races_total: u64,
     pub(crate) overflows_during_rescan: u64,
@@ -1900,6 +1906,12 @@ pub(crate) struct WatcherCounters {
     paths_after_gitignore_since_last_rescan: AtomicU64,
     paths_dispatched_total: AtomicU64,
     paths_dispatched_since_last_rescan: AtomicU64,
+    directory_arrivals_total: AtomicU64,
+    directory_subtree_walks_total: AtomicU64,
+    directory_empty_total: AtomicU64,
+    directory_walk_fallbacks_total: AtomicU64,
+    directory_arrivals_in_flight: AtomicUsize,
+    directory_files_unflushed: AtomicBool,
     overflows_total: AtomicU64,
     watch_lost_races_total: AtomicU64,
     overflows_during_rescan: AtomicU64,
@@ -1930,7 +1942,58 @@ pub(crate) struct WatcherRescanInterval {
     pub(crate) raw_events: u64,
 }
 
+pub(crate) struct DirectoryArrivalGuard<'a>(&'a WatcherCounters);
+
+impl Drop for DirectoryArrivalGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .directory_arrivals_in_flight
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl WatcherCounters {
+    pub(crate) fn note_directory_arrival(&self) {
+        self.directory_arrivals_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn directory_arrival_guard(&self) -> DirectoryArrivalGuard<'_> {
+        self.directory_arrivals_in_flight
+            .fetch_add(1, Ordering::AcqRel);
+        DirectoryArrivalGuard(self)
+    }
+
+    pub(crate) fn note_directory_walk(&self) {
+        self.directory_subtree_walks_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_empty_directory(&self) {
+        self.directory_empty_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_directory_walk_fallback(&self) {
+        self.directory_walk_fallbacks_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_directory_files_queued(&self) {
+        self.directory_files_unflushed
+            .store(true, Ordering::Release);
+    }
+
+    pub(crate) fn clear_directory_files_queued(&self) {
+        self.directory_files_unflushed
+            .store(false, Ordering::Release);
+    }
+
+    fn query_delivery_pending(&self) -> bool {
+        self.directory_arrivals_in_flight.load(Ordering::Acquire) > 0
+            || self.directory_files_unflushed.load(Ordering::Acquire)
+            || self.dispatch_backlog() > 0
+    }
+
     pub(crate) fn note_overflow_ignore_relevance(&self, relevant: bool) {
         self.overflow_ignore_evidence
             .fetch_or(if relevant { 3 } else { 1 }, Ordering::AcqRel);
@@ -1999,6 +2062,7 @@ impl WatcherCounters {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        self.clear_directory_files_queued();
     }
 
     pub(crate) fn unflushed_paths(&self) -> BTreeSet<PathBuf> {
@@ -2240,6 +2304,14 @@ impl WatcherCounters {
                 .paths_after_gitignore_since_last_rescan
                 .load(Ordering::Relaxed),
             paths_dispatched_total: self.paths_dispatched_total.load(Ordering::Relaxed),
+            directory_arrivals_total: self.directory_arrivals_total.load(Ordering::Relaxed),
+            directory_subtree_walks_total: self
+                .directory_subtree_walks_total
+                .load(Ordering::Relaxed),
+            directory_empty_total: self.directory_empty_total.load(Ordering::Relaxed),
+            directory_walk_fallbacks_total: self
+                .directory_walk_fallbacks_total
+                .load(Ordering::Relaxed),
             paths_dispatched_since_last_rescan: self
                 .paths_dispatched_since_last_rescan
                 .load(Ordering::Relaxed),
@@ -7305,17 +7377,18 @@ impl AppContext {
     /// pending too, even while the channel itself is momentarily empty.
     pub fn watcher_query_has_pending_changes(&self) -> bool {
         let activity = self.watcher_drain_activity.load(Ordering::Acquire);
-        // Dispatch sends held events before clearing the backlog count. Read
-        // that count first so a handoff cannot hide events from both probes.
-        let backlog_pending = match self.watcher_counters.try_read() {
-            Ok(counters) => counters.dispatch_backlog() > 0,
+        // Directory discovery publishes children to the flush window before
+        // ending its pending guard; dispatch publishes before clearing that
+        // window or its backlog. Read these stages before the channel below.
+        let intake_pending = match self.watcher_counters.try_read() {
+            Ok(counters) => counters.query_delivery_pending(),
             Err(std::sync::TryLockError::Poisoned(counters)) => {
-                counters.into_inner().dispatch_backlog() > 0
+                counters.into_inner().query_delivery_pending()
             }
             // Contended: assume events may be held, as the probes below do.
             Err(std::sync::TryLockError::WouldBlock) => true,
         };
-        backlog_pending
+        intake_pending
             || self.watcher_drain_has_work()
             || self.watcher_drains_in_flight.load(Ordering::Acquire) > 0
             || self.watcher_drain_activity.load(Ordering::Acquire) != activity
@@ -25724,5 +25797,52 @@ mod worker_rust_cargo_policy_tests {
                 "a repeated worker call waited for the LSP manager lock"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod directory_arrival_pending_tests {
+    use super::*;
+
+    #[test]
+    fn watcher_directory_discovery_pending_survives_handoff() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.path().to_path_buf()),
+                ..Default::default()
+            },
+        );
+        let counters = ctx.watcher_counters();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        *ctx.watcher_rx().lock() = Some(rx);
+        let discovery = counters.directory_arrival_guard();
+        assert!(ctx.watcher_query_has_pending_changes());
+        counters.note_directory_files_queued();
+        drop(discovery);
+        assert!(ctx.watcher_query_has_pending_changes());
+        tx.send(crate::watcher_filter::WatcherDispatchEvent::Paths(vec![
+            root.path().join("new.rs"),
+        ]))
+        .unwrap();
+        counters.clear_unflushed_paths();
+        assert!(
+            ctx.watcher_query_has_pending_changes(),
+            "dispatch must take over before discovery stops being pending"
+        );
+        ctx.watcher_rx()
+            .lock()
+            .as_ref()
+            .unwrap()
+            .try_recv()
+            .unwrap();
+        assert!(!ctx.watcher_query_has_pending_changes());
+        let empty_probe = counters.directory_arrival_guard();
+        drop(empty_probe);
+        assert!(
+            !ctx.watcher_query_has_pending_changes(),
+            "an empty arrival leaves no pending files"
+        );
     }
 }

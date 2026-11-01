@@ -96,7 +96,11 @@ def verify_lineage(oid: str, line: str, seen: set[str] | None = None) -> None:
         raise ValueError("cyclic release provenance")
     seen.add(oid)
     message = git("show", "-s", "--format=%B", oid)
-    match = re.fullmatch(r"release: v([0-9]+\.[0-9]+\.[0-9]+)\n+Release-retry-from: (v[0-9]+\.[0-9]+\.[0-9]+)\s*", message)
+    # Commit hooks may add trailers after Release-retry-from (this repository's
+    # adds a Co-authored-by line to every commit). Only trailer lines may follow;
+    # what the bump commit may change is proven from its tree below, not its text.
+    match = re.fullmatch(r"release: v([0-9]+\.[0-9]+\.[0-9]+)\n+Release-retry-from: (v[0-9]+\.[0-9]+\.[0-9]+)"
+                         r"(?:\n+[A-Za-z][A-Za-z0-9-]*: [^\n]+)*\s*", message)
     if not match:
         raise ValueError("release head is not a version/notes retry bump")
     version, tag = match.groups()

@@ -724,7 +724,19 @@ fn translate_buffer(
         let path = directory.join(PathBuf::from(OsString::from_wide(&filename)));
         if exact_file.is_none_or(|expected| expected == path) {
             if let Some(kind) = event_kind(action) {
-                events.push(Event::new(kind).add_path(path));
+                // A directory moved from outside this watch can arrive as ADDED;
+                // moves within the watch use RENAMED_NEW_NAME. Neither action
+                // lists existing children, so request bounded subtree discovery.
+                let directory_arrival =
+                    matches!(action, FILE_ACTION_ADDED | FILE_ACTION_RENAMED_NEW_NAME)
+                        && std::fs::symlink_metadata(&path).is_ok_and(|metadata| {
+                            metadata.is_dir() && !metadata.file_type().is_symlink()
+                        });
+                let mut event = Event::new(kind).add_path(path);
+                if directory_arrival {
+                    event = event.set_info(crate::watcher_filter::DIRECTORY_ARRIVAL_INFO);
+                }
+                events.push(event);
             }
         }
 
@@ -911,6 +923,36 @@ mod tests {
         let mut empty = vec![0; 12];
         empty[4..8].copy_from_slice(&FILE_ACTION_ADDED.to_le_bytes());
         assert_eq!(translate_buffer(&empty, root, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn notification_parser_marks_directory_arrivals_only() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("incoming")).unwrap();
+        std::fs::write(root.path().join("file.rs"), b"source").unwrap();
+        let notification = |action: u32, name: &str| {
+            let filename: Vec<_> = name.encode_utf16().collect();
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&action.to_le_bytes());
+            bytes.extend_from_slice(&(filename.len() as u32 * 2).to_le_bytes());
+            for word in filename {
+                bytes.extend_from_slice(&word.to_le_bytes());
+            }
+            translate_buffer(&bytes, root.path(), None)
+                .unwrap()
+                .remove(0)
+        };
+        for action in [FILE_ACTION_ADDED, FILE_ACTION_RENAMED_NEW_NAME] {
+            let directory = notification(action, "incoming");
+            assert!(!directory.need_rescan());
+            assert_eq!(
+                directory.info(),
+                Some(crate::watcher_filter::DIRECTORY_ARRIVAL_INFO)
+            );
+            assert_eq!(notification(action, "file.rs").info(), None);
+        }
+        assert!(!notification(FILE_ACTION_MODIFIED, "incoming").need_rescan());
     }
 
     #[test]

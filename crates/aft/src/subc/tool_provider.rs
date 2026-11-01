@@ -2551,6 +2551,22 @@ impl LedgerEdge {
                     if let Some(key) = reply.withdrawn_key {
                         edge.end_withdrawn_held_calls(&key, "withdrawn");
                     }
+                    let body = match identity.reply_policy().project_custody_body(reply.body) {
+                        Ok(body) => body,
+                        Err(_) => {
+                            let _ = send_provider_error(
+                                &writer,
+                                &metrics,
+                                &request,
+                                ErrorBody::new(
+                                    "internal_error",
+                                    "retained tool reply could not be decoded",
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
+                    };
                     if let Ok(frame) = subc_protocol::Frame::build_with_version(
                         request.header.ver,
                         FrameType::Response,
@@ -2558,7 +2574,7 @@ impl LedgerEdge {
                         request.header.channel,
                         request.header.epoch,
                         request.header.corr,
-                        reply.body,
+                        body,
                     ) {
                         let _ =
                             send_reliable_writer_frame(&writer, &metrics, frame, "custody reply")
@@ -3005,17 +3021,19 @@ impl LedgerEdge {
                 }
                 let actual = actual.clone();
                 let detached = call.detached;
+                // Save the complete tool-result data before projecting the
+                // outgoing frame for a detached held call's terminal body.
+                let (tool_body_for_job, projection_error) =
+                    match outgoing.tool_result_source_for_retention() {
+                        Ok(body) => (body, None),
+                        Err(error) => (None, Some(error.to_string())),
+                    };
                 if detached {
                     if let Err(error) = outgoing.project_tool_result() {
                         log::warn!("held terminal projection failed: {error}");
                         continue;
                     }
                 }
-                let (tool_body_for_job, projection_error) =
-                    match outgoing.tool_result_source_for_retention() {
-                        Ok(body) => (body, None),
-                        Err(error) => (None, Some(error.to_string())),
-                    };
                 let recorded = RecordedFrame {
                     ty: outgoing.header.ty,
                     body: copy_terminal_body(&outgoing.body),
@@ -3112,7 +3130,7 @@ impl LedgerEdge {
                             outgoing.header.corr,
                             settled.data
                         );
-                        outgoing.frame = uncertain_settlement_frame(&outgoing.frame);
+                        outgoing.frame = uncertain_settlement_frame(&outgoing);
                     }
                     if !detached && actual.send(outgoing).await.is_err() {
                         return;
@@ -3146,13 +3164,14 @@ pub(super) const AUTHORIZATION_FAILURE_MESSAGE: &str =
 
 const SETTLEMENT_RESULT_EXCERPT_BYTES: usize = 8192;
 
-fn uncertain_settlement_frame(original: &subc_protocol::Frame) -> subc_protocol::Frame {
-    // Untrusted routes already omit native structured fields from this wire
-    // body. Excerpt that filtered body; do not rebuild it from a native response.
-    let prefix_len = original.body.len().min(SETTLEMENT_RESULT_EXCERPT_BYTES);
-    let prefix = String::from_utf8_lossy(&original.body[..prefix_len]);
+fn uncertain_settlement_frame(original: &super::WriterFrame) -> subc_protocol::Frame {
+    // Preserve existing excerpts except where the receiving runner is entitled
+    // only to the model-facing projection, not the retained structured result.
+    let body = original.settlement_error_body();
+    let prefix_len = body.len().min(SETTLEMENT_RESULT_EXCERPT_BYTES);
+    let prefix = String::from_utf8_lossy(&body[..prefix_len]);
     let end = prefix.floor_char_boundary(SETTLEMENT_RESULT_EXCERPT_BYTES);
-    let truncated = prefix_len < original.body.len() || end < prefix.len();
+    let truncated = prefix_len < body.len() || end < prefix.len();
     super::build_error_frame_with_detail(original.header.ver, original.header.channel,
         original.header.epoch, original.header.corr, original.header.flags,
         "outcome_unknown",
@@ -6638,16 +6657,9 @@ pub(in crate::subc) mod route_tests {
                 |request, ctx| crate::commands::bash_status::handle(&request, ctx),
             ).await;
             let reply: Value = serde_json::from_slice(&reply.body).unwrap();
-            assert_eq!(reply["structuredContent"]["status"], "running", "{reply}");
-            let output = reply["structuredContent"]["output_preview"]
-                .as_str()
-                .unwrap();
-            for stream in ["stdout", "stderr"] {
-                let expected = format!("{stream} {phase} restart");
-                assert!(output.contains(&expected), "{reply}");
-            }
+            assert!(reply.get("structuredContent").is_none(), "{reply}");
             // Piped status text deliberately hides running previews to avoid
-            // encouraging polling. The structured reply still retains them.
+            // encouraging polling. AFT's native response still retains them.
             assert_eq!(
                 reply["content"][0]["text"],
                 format!("Task {task_id}: running\nTo wait for it, call bash_watch; don't poll.")
@@ -6661,6 +6673,17 @@ pub(in crate::subc) mod route_tests {
             })).unwrap();
             let resumed = crate::commands::bash_status::handle(&request, &ctx);
             assert!(resumed.success, "{:?}", resumed.data);
+            assert_eq!(resumed.data["status"], "running");
+            for stream in ["stdout", "stderr"] {
+                assert!(
+                    resumed.data["output_preview"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&format!("{stream} {phase} restart")),
+                    "{:?}",
+                    resumed.data
+                );
+            }
             for (index, (stream, chunk, cursor)) in [
                 ("stdout", "output_chunk_base64", "output_next_offset"),
                 ("stderr", "stderr_chunk_base64", "stderr_next_offset"),
@@ -6696,7 +6719,14 @@ pub(in crate::subc) mod route_tests {
         )
         .await;
         let reply: Value = serde_json::from_slice(&reply.body).unwrap();
-        assert_eq!(reply["structuredContent"]["status"], "completed", "{reply}");
+        assert!(reply.get("structuredContent").is_none(), "{reply}");
+        let request = serde_json::from_value(json!({
+            "id": "runner-completed-output", "command": "bash_status", "session_id": "runner-restore",
+            "params": {"task_id": task_id},
+        })).unwrap();
+        let completed = crate::commands::bash_status::handle(&request, &ctx);
+        assert!(completed.success, "{:?}", completed.data);
+        assert_eq!(completed.data["status"], "completed");
         let text = reply["content"][0]["text"].as_str().unwrap();
         assert!(
             text.starts_with(&format!("Task {task_id}: completed (exit 0)")),
@@ -6706,7 +6736,7 @@ pub(in crate::subc) mod route_tests {
             for phase in ["before", "after"] {
                 let expected = format!("{stream} {phase} restart");
                 assert!(
-                    reply["structuredContent"]["output_preview"]
+                    completed.data["output_preview"]
                         .as_str()
                         .unwrap()
                         .contains(&expected),
@@ -7013,6 +7043,197 @@ pub(in crate::subc) mod route_tests {
         assert_eq!(error.code, "invalid_request");
         assert_eq!(error.detail.unwrap()["field"], "arguments");
         assert_eq!(ACTIONS.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn runner_late_results_are_slim_but_the_ledger_stays_complete() {
+        use crate::db::call_ledger::{self as ledger, Key, RecordedFrame, ScopeIdentity, State};
+        for principal in ["reserved:broca", "reserved:thalamus-harness"] {
+            for tool_result_body in [false, true] {
+                let (dir, root) = test_support::test_root("runner-late-results");
+                let db = Arc::new(std::sync::Mutex::new(
+                    crate::db::open(&dir.path().join("aft.db")).unwrap(),
+                ));
+                let result = ToolCallResult {
+                    text: "Edited fixture.rs".into(),
+                    response: Response::success(
+                        "edit-id",
+                        json!({
+                            "metadata": {"diff": "--- a/fixture.rs\n+++ b/fixture.rs\n-old\n+new\n"},
+                            "path": "fixture.rs",
+                            "output": "internal output", "output_preview": "internal output",
+                        }),
+                    ),
+                };
+                let mut native = build_tool_response_frame(
+                    PROTOCOL_VERSION,
+                    route_key(41, 1),
+                    7,
+                    control_flags(),
+                    &result,
+                    wire::ToolResponsePolicy::for_retention(),
+                )
+                .unwrap();
+                let legacy = RecordedFrame {
+                    ty: FrameType::Response,
+                    body: native.frame.body.clone(),
+                };
+                let source = native.tool_result_source_for_retention().unwrap().unwrap();
+                let full = project_held_ledger_result(&legacy, Some(&source), true)
+                    .unwrap()
+                    .body;
+                let held =
+                    consent::held_frame(PROTOCOL_VERSION, route_key(41, 1), 7, control_flags())
+                        .unwrap();
+                let held_body: Value = serde_json::from_slice(&held.body).unwrap();
+                assert_eq!(held_body["held"]["reason"], "consent");
+                assert_eq!(held_body["content"][0]["text"], "");
+                assert!(
+                    held_body.get("structuredContent").is_none()
+                        && held_body.get("isError").is_none()
+                );
+                let key = Key {
+                    carrier: principal.into(),
+                    call_key: "late-edit".into(),
+                };
+                let scope = ScopeIdentity {
+                    owner: principal.into(),
+                    scope_ref: "work".into(),
+                    scope_epoch: 1,
+                };
+                {
+                    let conn = db.lock().unwrap();
+                    ledger::admit(&conn, &key, "digest", Some(&scope), State::DispatchStarted)
+                        .unwrap();
+                    assert!(ledger::hold_permission(&conn, &key, &held.body, true).unwrap());
+                    assert!(ledger::record_running_update(
+                        &conn,
+                        &key,
+                        "approval",
+                        ledger::now_ms()
+                    )
+                    .unwrap());
+                    assert!(ledger::transition(
+                        &conn,
+                        &key,
+                        State::Prepared,
+                        State::DispatchStarted
+                    )
+                    .unwrap());
+                    ledger::settle_with_tool_result_source(
+                        &conn,
+                        &key,
+                        &RecordedFrame {
+                            ty: FrameType::Response,
+                            body: full.clone(),
+                        },
+                        "ok",
+                        None,
+                        ledger::now_ms(),
+                        Some(&source),
+                    )
+                    .unwrap();
+                }
+                let ctx = test_support::test_ctx();
+                ctx.set_db(db.clone());
+                let executor = Arc::new(Executor::new());
+                assert!(executor.register_actor(root.clone(), ctx.clone()));
+                let mut identity = test_support::route_identity(&root, "runner");
+                let data = Arc::get_mut(&mut identity.0).unwrap();
+                data.role = RouteRole::ToolProviderV1;
+                data.tool_result_body = tool_result_body;
+                data.held_reply = tool_result_body;
+                data.held_update = tool_result_body;
+                data.scope = Some(serde_json::from_value(json!({
+                    "owner": {"kind":"reserved", "module_id":principal.strip_prefix("reserved:").unwrap()},
+                    "ref":scope.scope_ref, "scope_epoch":scope.scope_epoch,
+                    "kind":"head", "owner_authorized":true,
+                })).unwrap());
+                let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
+                    &mut data.spawn_principal
+                else {
+                    unreachable!()
+                };
+                *principal_id = Some(principal.into());
+                let routes = HashMap::from([(route_key(41, 1), identity)]);
+                let (edge, _ready) = LedgerEdge::new();
+                for body in [
+                    json!({"name":"late_results", "arguments":{"since":null}}),
+                    json!({"name":"tool.withdraw", "arguments":{"call_key":"late-edit"}}),
+                ] {
+                    let decoded = DecodedFrame {
+                        parsed_body: Default::default(),
+                        confinement: None,
+                        launch_restore: None,
+                        codemode_policies: None,
+                        frame: Frame::build(
+                            FrameType::Request,
+                            control_flags(),
+                            41,
+                            1,
+                            7,
+                            serde_json::to_vec(&body).unwrap(),
+                        )
+                        .unwrap(),
+                        phase_trace: PhaseTrace::new(Instant::now()),
+                    };
+                    let (writer, mut replies) = mpsc::channel(8);
+                    edge.defer(
+                        decoded,
+                        &routes,
+                        &executor,
+                        &writer,
+                        &Arc::new(DispatchPathMetrics::new()),
+                    )
+                    .ok()
+                    .expect("v1 route serves custody operations");
+                    let reply = tokio::time::timeout(Duration::from_secs(5), replies.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        reply.header.ty,
+                        FrameType::Response,
+                        "{}",
+                        String::from_utf8_lossy(&reply.body)
+                    );
+                    let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+                    let delivered = if body["name"] == "late_results" {
+                        let entries = reply["entries"].as_array().unwrap();
+                        assert_eq!(entries.len(), if tool_result_body { 2 } else { 1 });
+                        if tool_result_body {
+                            assert_eq!(entries[0]["kind"], "held");
+                            assert_eq!(entries[0]["held"], json!({"reason":"running"}));
+                            assert!(
+                                entries[0].get("result").is_none()
+                                    && entries[0].get("structuredContent").is_none()
+                            );
+                        }
+                        &entries.last().unwrap()["result"]
+                    } else {
+                        assert_eq!(reply["answer"], "completed");
+                        &reply["result"]
+                    };
+                    assert_eq!(
+                        delivered,
+                        &json!({"content":[{"type":"text","text":"Edited fixture.rs"}], "isError":false})
+                    );
+                }
+                let row = ledger::get_for_replay(&db.lock().unwrap(), &key)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(row.tool_result_source.as_deref(), Some(source.as_slice()));
+                assert_eq!(row.frame.unwrap().body, full);
+                let entry: Value =
+                    serde_json::from_str(row.late_entry.as_deref().unwrap()).unwrap();
+                assert_eq!(
+                    entry["result"]["structuredContent"]["metadata"]["diff"],
+                    result.response.data["metadata"]["diff"]
+                );
+                ctx.clear_db();
+                executor.remove_actor(&root);
+            }
+        }
     }
 
     /// Legacy routes keep refusing the custody ops by name: the ledger edge
@@ -7434,7 +7655,8 @@ pub(in crate::subc) mod route_tests {
         }).await;
         assert_eq!(reply.header.ty, FrameType::Response);
         let result: Value = serde_json::from_slice(&reply.body).unwrap();
-        assert_eq!(result["structuredContent"]["success"], true, "{result}");
+        assert_eq!(result["isError"], false, "{result}");
+        assert!(result.get("structuredContent").is_none(), "{result}");
         assert!(String::from_utf8_lossy(&reply.body).contains("pinned_symbol"));
         for name in ["bash", "inspect", "write"] {
             let reply = exchange_with_actor(
@@ -8543,6 +8765,11 @@ mod settlement_failure_tests {
     use crate::subc::*;
 
     async fn failed_settlement(case: &str, body: Vec<u8>) -> Frame {
+        let original = Frame::build(FrameType::Response, control_flags(), 42, 3, 7, body).unwrap();
+        failed_settlement_frame(case, original.into()).await
+    }
+
+    async fn failed_settlement_frame(case: &str, original: WriterFrame) -> Frame {
         let (_dir, root) = test_support::test_root("ledger-settlement-failure");
         let executor = Arc::new(Executor::new());
         let key = crate::db::call_ledger::Key {
@@ -8573,7 +8800,7 @@ mod settlement_failure_tests {
                             &key,
                             &crate::db::call_ledger::RecordedFrame {
                                 ty: FrameType::Response,
-                                body: body.clone(),
+                                body: original.frame.body.clone(),
                             },
                             "ok",
                             None,
@@ -8613,7 +8840,6 @@ mod settlement_failure_tests {
         let metrics = Arc::new(DispatchPathMetrics::new());
         let (actual, mut receiver) = tokio::sync::mpsc::channel(4);
         let (writer, proxy) = edge.proxy(actual, executor.clone(), metrics.clone());
-        let original = Frame::build(FrameType::Response, control_flags(), 42, 3, 7, body).unwrap();
         send_reliable_writer_frame(&writer, &metrics, original, "settlement fixture")
             .await
             .unwrap();
@@ -8707,6 +8933,77 @@ mod settlement_failure_tests {
         let excerpt = error["detail"]["original_result_excerpt"].as_str().unwrap();
         assert!(excerpt.len() <= 8192);
         assert_eq!(error["detail"]["original_result_truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn runner_settlement_failure_excerpt_is_model_only_and_plugin_excerpt_is_unchanged() {
+        use subc_protocol::call_mode::CallMode;
+        let (_dir, root) = test_support::test_root("runner-settlement-excerpt");
+        let result = ToolCallResult {
+            text: "Edited fixture.rs".into(),
+            response: Response::success(
+                "edit-id",
+                json!({
+                    "metadata":{"diff":"--- a/fixture.rs\n+++ b/fixture.rs\n-old private line\n+new private line\n"},
+                    "output":"internal output", "output_preview":"internal output",
+                }),
+            ),
+        };
+        for (principal, mode, model_only) in [
+            ("reserved:broca", CallMode::Classic, true),
+            ("reserved:thalamus-harness", CallMode::Classic, true),
+            ("direct", CallMode::Classic, false),
+            ("reserved:broca", CallMode::Codemode, false),
+            ("reserved:broca", CallMode::Flow, false),
+            (
+                "reserved:broca",
+                CallMode::Unknown("future-mode".into()),
+                false,
+            ),
+        ] {
+            for tool_result_body in [false, true] {
+                let mut identity = test_support::route_identity(&root, "settlement-excerpt");
+                let data = Arc::get_mut(&mut identity.0).unwrap();
+                data.tool_result_body = tool_result_body;
+                data.call_mode = mode.clone();
+                let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
+                    &mut data.spawn_principal
+                else {
+                    unreachable!("fixture route bind")
+                };
+                *principal_id = Some(principal.into());
+                let outgoing = build_tool_response_frame(
+                    PROTOCOL_VERSION,
+                    route_key(42, 3),
+                    7,
+                    control_flags(),
+                    &result,
+                    &identity,
+                )
+                .unwrap();
+                let original = outgoing.frame.body.clone();
+                let terminal = failed_settlement_frame("sql", outgoing).await;
+                let error: Value = serde_json::from_slice(&terminal.body).unwrap();
+                assert_eq!(error["code"], "outcome_unknown");
+                assert_eq!(error["message"], "The request produced a terminal result, but AFT could not confirm that it was durably recorded. Its durable outcome is uncertain; replay is not guaranteed.");
+                assert_eq!(error["detail"]["original_result_truncated"], false);
+                let excerpt = error["detail"]["original_result_excerpt"].as_str().unwrap();
+                if model_only {
+                    assert_eq!(
+                        excerpt,
+                        r#"{"content":[{"type":"text","text":"Edited fixture.rs"}],"isError":false}"#
+                    );
+                    assert!(
+                        !excerpt.contains("private line") && !excerpt.contains("internal output")
+                    );
+                } else {
+                    assert_eq!(excerpt.as_bytes(), original);
+                    assert!(
+                        excerpt.contains("private line") && excerpt.contains("internal output")
+                    );
+                }
+            }
+        }
     }
 }
 

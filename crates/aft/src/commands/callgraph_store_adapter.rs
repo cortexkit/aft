@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use serde::Serialize;
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
 use crate::callgraph::{self, TraceToSymbolCandidate};
 use crate::callgraph_store::{
@@ -17,7 +17,8 @@ use crate::feature_status::{cause, IndexObservation};
 use crate::inspect::job::is_test_file;
 use crate::list_envelope::{ListEnvelope, Unit};
 use crate::parser::{
-    detect_language, extract_symbols_from_tree, grammar_for, FileParser, SharedSymbolCache,
+    detect_language_from_source, extract_symbols_from_tree, parse_resolved_source, FileParser,
+    SharedSymbolCache,
 };
 use crate::protocol::Response;
 use crate::symbols::Symbol;
@@ -1580,22 +1581,11 @@ impl TraceFileFacts {
             return Ok(cached.clone());
         }
         let source = std::fs::read_to_string(file)?;
-        let parsed = match detect_language(file) {
+        let parsed = match detect_language_from_source(file, &source) {
             Some(lang) => {
                 #[cfg(test)]
                 TRACE_FILE_PARSES.with(|count| count.set(count.get() + 1));
-                let grammar = grammar_for(lang);
-                let mut parser = Parser::new();
-                parser
-                    .set_language(&grammar)
-                    .map_err(|error| AftError::ParseError {
-                        message: format!("grammar init failed for {:?}: {}", lang, error),
-                    })?;
-                let tree = parser
-                    .parse(&source, None)
-                    .ok_or_else(|| AftError::ParseError {
-                        message: format!("parse failed for {}", file.display()),
-                    })?;
+                let (tree, lang) = parse_resolved_source(file, &source, lang)?;
                 let symbols = extract_symbols_from_tree(&source, &tree, lang)?;
                 Some(Rc::new(TraceFile {
                     content_hash: crate::cache_freshness::hash_bytes(source.as_bytes()),
