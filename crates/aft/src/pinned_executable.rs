@@ -1132,6 +1132,51 @@ mod tests {
         assert!(output.status.success(), "{output:?}");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_executable_procfs_image_on_same_device_is_linked_without_copying() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let storage = tempfile::tempdir().unwrap();
+        let image = storage.path().join("source-image");
+        std::fs::write(&image, b"immutable startup image").unwrap();
+        let mut source = std::fs::File::open(&image).unwrap();
+        let proc_image = PathBuf::from(format!("/proc/self/fd/{}", source.as_raw_fd()));
+        let destination = storage.path().join("pin");
+        materialize(&proc_image, &mut source, &destination, link_image).unwrap();
+        let held = source.metadata().unwrap();
+        let pinned = std::fs::metadata(&destination).unwrap();
+        assert_eq!(held.dev(), pinned.dev());
+        assert_eq!(
+            held.ino(),
+            pinned.ino(),
+            "same-device procfs image was copied"
+        );
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"immutable startup image"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_executable_rejects_a_link_to_a_replaced_image() {
+        let storage = tempfile::tempdir().unwrap();
+        let image = storage.path().join("image");
+        std::fs::write(&image, b"original").unwrap();
+        let mut source = std::fs::File::open(&image).unwrap();
+        std::fs::rename(&image, storage.path().join("held-original")).unwrap();
+        std::fs::write(&image, b"replacement").unwrap();
+        let destination = storage.path().join("pin");
+        let error = materialize(&image, &mut source, &destination, |source, destination| {
+            std::fs::hard_link(source, destination)
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("deployment image changed"));
+        assert!(!destination.exists(), "mismatched image was retained");
+        assert_eq!(std::fs::read(image).unwrap(), b"replacement");
+    }
+
     #[cfg(unix)]
     #[test]
     fn pinned_executable_hard_link_holds_original_inode_after_replacement() {
