@@ -252,7 +252,14 @@ fn grammar_stored_first_single_compile_rayon_and_lifetime() {
         registry.identity()
     );
     std::fs::remove_file(stored_path(directory.path(), &PRODUCTION_MANIFEST)).unwrap();
-    registry.request().unwrap();
+    let language = registry.request().unwrap();
+    let mut parser = tree_sitter::Parser::new();
+    prepare_parser(&mut parser).unwrap();
+    parser.set_language(&language).unwrap();
+    let after_delete = parser
+        .parse("local function f() return 1 end", None)
+        .unwrap();
+    assert_eq!(after_delete.root_node().to_sexp(), trees[0]);
     assert_eq!(registry.compile_count(), 1);
     assert!(std::fs::read_dir(directory.path().join("grammars"))
         .unwrap()

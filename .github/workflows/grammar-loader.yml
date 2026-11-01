@@ -54,7 +54,8 @@ jobs:
       - name: Toolchain
         run: rustup update stable && rustup default stable
       - name: Loader state and compile tests
-        run: cargo test --locked -p agent-file-tools --lib -- grammar::tests::
+        run: |
+          cargo test --locked -p agent-file-tools --lib -- grammar::tests::
       - name: Process restart and concurrent publication
         run: cargo test --locked -p agent-file-tools --test integration -- grammar_
       - name: No native disk cache and one Wasmtime version

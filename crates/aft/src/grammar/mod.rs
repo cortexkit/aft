@@ -246,14 +246,14 @@ impl GrammarRegistry {
 
     #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
     fn load(&self, entry: &mut Entry, bytes: Vec<u8>) {
-        let start = Instant::now();
         let result = (|| {
             let engine = ENGINE.as_ref().map_err(Clone::clone)?;
             let mut store = tree_sitter::WasmStore::new(engine).map_err(|e| e.to_string())?;
             entry.compiles += 1;
-            let language = store
-                .load_language(&self.manifest.language, &bytes)
-                .map_err(|e| e.to_string())?;
+            let start = Instant::now();
+            let language = store.load_language(&self.manifest.language, &bytes);
+            entry.compile_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let language = language.map_err(|e| e.to_string())?;
             if language.abi_version() != self.manifest.abi {
                 return Err("grammar ABI differs from manifest".into());
             }
@@ -262,7 +262,6 @@ impl GrammarRegistry {
             }
             Ok::<_, String>(language)
         })();
-        entry.compile_ms = start.elapsed().as_secs_f64() * 1000.0;
         match result {
             Ok(language) => {
                 entry.language = Some(language);

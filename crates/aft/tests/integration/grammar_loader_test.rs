@@ -39,8 +39,49 @@ fn command(root: &Path, download: bool) -> Command {
         .env_remove("AFT_TEST_GRAMMAR_FAULT")
         .env_remove("AFT_TEST_GRAMMAR_QUERIES")
         .env_remove("AFT_TEST_GRAMMAR_CLOCK_FILE")
+        .env_remove("AFT_TEST_GRAMMAR_EXTRACTOR_VERSION")
         .env_remove("AFT_TEST_GRAMMAR_TRANSPORT_FILE");
     command
+}
+
+#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
+#[test]
+fn grammar_loader_retained_file_parsers_compile_once_and_never_download() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("storage/grammars");
+    std::fs::create_dir_all(&directory).unwrap();
+    let stored = directory.join(format!("{HASH}.wasm"));
+    std::fs::copy(fixture(), &stored).unwrap();
+    let source = root.path().join("source.luau");
+    std::fs::write(&source, "local function f() return 1 end").unwrap();
+    let first = result(
+        command(root.path(), false)
+            .arg("--file")
+            .arg(&source)
+            .arg("--parallel")
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(first["compile_count"], 1);
+    let second = result(
+        command(root.path(), false)
+            .arg("--file")
+            .arg(&source)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(second["compile_count"], 1);
+    assert_eq!(first["tree"], second["tree"]);
+    std::fs::remove_file(stored).unwrap();
+    let missing = command(root.path(), false)
+        .arg("--file")
+        .arg(&source)
+        .env("AFT_TEST_GRAMMAR_TRANSPORT_FILE", fixture())
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("\"state\":\"not_downloaded\""));
+    assert!(!directory.join(format!("{HASH}.wasm")).exists());
 }
 
 fn result(output: Output) -> serde_json::Value {
