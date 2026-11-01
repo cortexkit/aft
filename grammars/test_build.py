@@ -41,6 +41,16 @@ class BuildTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "HTTPS"):
             build.fetch("http://example.invalid/artifact", "0" * 64, self.work / "artifact")
 
+    def test_download_identifies_client_and_avoids_cached_expired_redirects(self):
+        response = io.BytesIO(b"verified")
+        response.url = "https://example.invalid/archive"
+        with patch.object(build.urllib.request, "urlopen", return_value=response) as urlopen:
+            path = build.fetch(response.url, build.digest(b"verified"), self.work / "archive")
+        self.assertEqual(path.read_bytes(), b"verified")
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.get_header("User-agent"), "AFT-grammar-build/1")
+        self.assertEqual(request.get_header("Cache-control"), "no-cache")
+
     def test_archive_refuses_symlink_instead_of_following_it(self):
         archive = self.work / "extension.tar"
         with tarfile.open(archive, "w") as tar:

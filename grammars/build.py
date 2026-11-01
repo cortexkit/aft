@@ -36,7 +36,9 @@ def fetch(url, sha256, destination, limit=512 * 1024 * 1024):
         return destination
     temporary = destination.with_suffix(destination.suffix + ".partial")
     try:
-        with urllib.request.urlopen(url, timeout=60) as response, temporary.open("wb") as output:
+        request = urllib.request.Request(url, headers={"User-Agent": "AFT-grammar-build/1",
+                                                      "Cache-Control": "no-cache"})
+        with urllib.request.urlopen(request, timeout=60) as response, temporary.open("wb") as output:
             if not response.url.startswith("https://"):
                 raise ValueError("download redirected away from HTTPS")
             size = 0
