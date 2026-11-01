@@ -202,6 +202,44 @@ fn views_import_unbound_roots_do_not_start_imports() {
     assert!(!storage.path().join("migration/v3").exists());
 }
 
+#[test]
+fn views_import_semantic_prefill_borrower_uses_family_ledger() {
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let (_checkout, storage, root) = warm_fixture();
+    crate::root_cache::configure_artifact_access(&root, KEY, true);
+    let config = crate::views::semantic_runtime::WorkerConfig {
+        root: root.clone(),
+        storage: crate::root_cache::StoragePaths::same(storage.path()),
+        family: KEY.into(),
+        scope: crate::path_identity::project_scope_key(&root),
+        semantic: crate::config::SemanticBackendConfig::default(),
+        trigram_policy: crate::blob_store::v2::TrigramPolicy {
+            max_file_size: LIMIT,
+        },
+        status: Arc::new(std::sync::RwLock::new(SemanticIndexStatus::Disabled)),
+        drivers: crate::views::semantic_runtime::InstalledDriver::default(),
+        schedule: crate::views::semantic_runtime::FillSchedule {
+            root,
+            quiet_window: Duration::ZERO,
+            retry_initial: Duration::from_millis(1),
+            retry_max: Duration::from_millis(1),
+            limiter: crate::cold_build_limiter::isolated_limiter(1),
+            paused: Box::new(|| false),
+            max_batch: 1,
+        },
+    };
+    assert!(import_legacy_set_into_v3(&config, Arc::new(|| true)));
+    let rows = crate::migration::v3_ledger::read_rows(storage.path(), KEY)
+        .unwrap()
+        .expect("semantic prefill must import rather than skip borrowed donors");
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(
+        rows.iter()
+            .all(|row| row.state == crate::migration::per_checkout::ImportState::Done),
+        "{rows:?}"
+    );
+}
+
 fn query_context(root: &Path, storage: &Path) -> AppContext {
     let mut config = crate::config::Config::default();
     config.project_root = Some(root.to_path_buf());
