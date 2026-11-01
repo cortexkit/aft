@@ -27,6 +27,7 @@ function gate() {
 async function rig(
   boundary: "session" | "permission" | "edit" | "bash",
   dependencies: AcquireBridgeDependencies = {},
+  rpcCleanup?: { entered: ReturnType<typeof gate>; resume: ReturnType<typeof gate> },
 ) {
   _resetSubagentCacheForTest();
   const directory = process.cwd();
@@ -170,7 +171,13 @@ async function rig(
           },
         };
       },
-      registerRpc: () => Effect.succeed({ dispose: async () => {} }),
+      registerRpc: () =>
+        Effect.succeed({
+          dispose: async () => {
+            rpcCleanup?.entered.open();
+            await rpcCleanup?.resume.promise;
+          },
+        }),
       registerPromptHook: () => Effect.void,
       registerToolHooks: () => Effect.void,
       registerWorkflowHints: () => Effect.void,
@@ -255,6 +262,23 @@ test("V2 stale tool closure refuses after disposal without lookup or dispatch", 
   );
   expect(r.calls).toEqual([]);
   expect(r.lookups()).toBe(0);
+});
+
+test("V2 disposal closes admission before asynchronous registration cleanup", async () => {
+  const cleanup = { entered: gate(), resume: gate() };
+  const r = await rig("permission", {}, cleanup);
+  r.resume.open();
+  const disposal = r.dispose();
+  try {
+    await cleanup.entered.promise;
+    const error = await r.invoke().catch((error: unknown) => error);
+    expect(error).toMatchObject({ kind: "not_sent", code: "aft_module_unavailable" });
+    expect(r.calls).toEqual([]);
+    expect(r.lookups()).toBe(0);
+  } finally {
+    cleanup.resume.open();
+    await disposal;
+  }
 });
 
 test("V2 composite bash interrupted after spawning reports unknown, never not-started", async () => {

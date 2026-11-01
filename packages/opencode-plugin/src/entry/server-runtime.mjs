@@ -240,12 +240,15 @@ export function makeServerEffect(overrides = {}) {
       // finalizer logs when the host disposes the Location.
       const logRuntimeStop = logRuntimeStart(location);
       yield* Effect.addFinalizer(() => Effect.sync(logRuntimeStop));
-      // Session ownership must outlive tool registration: a draining bash call
-      // can still record or kill a background task after the host unregisters it.
-      const sessionScope = yield* Effect.acquireRelease(
+      // Release the Location before tearing down registrations, so admission closes
+      // before asynchronous cleanup. Draining calls keep the session records they
+      // need to record or kill a late background task.
+      const registrationScope = yield* Effect.acquireRelease(
         Scope.make(),
         (scope) => Scope.close(scope, Exit.succeed(undefined)),
       );
+      const register = (effect) =>
+        effect.pipe(Effect.provideService(Scope.Scope, registrationScope));
       // The host runs this program under Effect.ignoreCause, so a rejected boot
       // would otherwise leave the Location without AFT and without any log.
       // Interruption is the host disposing the Location mid-boot, not a failure.
@@ -280,17 +283,19 @@ export function makeServerEffect(overrides = {}) {
       if (!runtime) return;
 
       if (runtime.configError !== undefined) {
-        const rpc = yield* dependencies.registerConfigErrorRpc(context, runtime.configError);
-        yield* Effect.addFinalizer(() => Effect.promise(() => rpc.dispose()));
-        yield* dependencies.registerTools(context, location, runtime.tools, runtime.consumers);
+        const rpc = yield* register(
+          dependencies.registerConfigErrorRpc(context, runtime.configError),
+        );
+        yield* register(Effect.addFinalizer(() => Effect.promise(() => rpc.dispose())));
+        yield* register(
+          dependencies.registerTools(context, location, runtime.tools, runtime.consumers),
+        );
         return;
       }
 
-      const rpc = yield* dependencies.registerRpc(context, location, runtime.pool);
-      yield* Effect.addFinalizer(() => Effect.promise(() => rpc.dispose()));
-      yield* registerV2SessionLifecycle(context, runtime.toolContext).pipe(
-        Effect.provideService(Scope.Scope, sessionScope),
-      );
+      const rpc = yield* register(dependencies.registerRpc(context, location, runtime.pool));
+      yield* register(Effect.addFinalizer(() => Effect.promise(() => rpc.dispose())));
+      yield* register(registerV2SessionLifecycle(context, runtime.toolContext));
       // OpenCode 2 has no chat.message hook; its session prompt hook is where a
       // new message detaches a waiting bash, as chat.message does on OpenCode 1.
       // The config is read through the tool context so live reloads apply.
@@ -298,31 +303,34 @@ export function makeServerEffect(overrides = {}) {
       // Location's own directory; for a Location in a linked git worktree that
       // is the worktree, not the canonical main checkout. Other bridges are
       // still tried after it.
-      yield* dependencies.registerPromptHook(context, {
-        pool: runtime.pool,
-        projectRoot: runtime.directory,
-        getConfig: () => runtime.toolContext.config,
-        registerSession: runtime.consumers.registerSession,
-      });
-      yield* dependencies.registerTools(
-        context,
-        location,
-        runtime.tools,
-        runtime.consumers,
+      yield* register(
+        dependencies.registerPromptHook(context, {
+          pool: runtime.pool,
+          projectRoot: runtime.directory,
+          getConfig: () => runtime.toolContext.config,
+          registerSession: runtime.consumers.registerSession,
+        }),
       );
-      yield* dependencies.registerToolHooks(
-        context,
-        runtime.toolContext,
-        new Set(Object.keys(runtime.tools)),
-        runtime.tools.bash?.description,
+      yield* register(
+        dependencies.registerTools(context, location, runtime.tools, runtime.consumers),
       );
-      yield* dependencies.registerWorkflowHints(context, runtime.hintsBlock);
-      if (runtime.subcWakes) {
-        yield* Effect.forkScoped(recoverV2SubcSessions(
+      yield* register(
+        dependencies.registerToolHooks(
           context,
-          runtime.directory,
-          runtime.subcWakes.restoreSession,
-        ));
+          runtime.toolContext,
+          new Set(Object.keys(runtime.tools)),
+          runtime.tools.bash?.description,
+        ),
+      );
+      yield* register(dependencies.registerWorkflowHints(context, runtime.hintsBlock));
+      if (runtime.subcWakes) {
+        yield* register(
+          Effect.forkScoped(recoverV2SubcSessions(
+            context,
+            runtime.directory,
+            runtime.subcWakes.restoreSession,
+          )),
+        );
       }
     });
   };
